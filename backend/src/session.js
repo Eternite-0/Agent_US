@@ -23,7 +23,8 @@ export async function runSession({store,task,session,model,adapter,persona,input
   const events=agent.session.snapshotEvents();const end=events.findLast(e=>e.type==='turn/end');
   const last=events.findLast(e=>e.type==='assistant/message');
   const text=last?.data.message.content.filter(b=>b.type==='text').map(b=>b.text).join('');
-  if(!text||!end||last.data.interrupted||events.at(-1)?.type==='assistant/attempt')throw new Fault('MODEL_DID_NOT_FINISH');
+  if(!text||end?.data.reason.kind!=='completed'||last.data.interrupted||events.at(-1)?.type==='assistant/attempt')throw new Fault('MODEL_DID_NOT_FINISH');
   return text;
  }finally{signal.removeEventListener('abort',abort);await ctx.fiber.dispose();}
 }
+

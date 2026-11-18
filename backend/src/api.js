@@ -1,3 +1,4 @@
+import {decide} from './tools.js';
 import Fastify from 'fastify';
 import {z,ZodError} from 'zod';
 import {timingSafeEqual,createHash} from 'node:crypto';
@@ -20,5 +21,7 @@ export function api(store, token) {
     app.get(`/api/v1/${kind}/:id`,async req=>store.get(kind,uuid.parse(req.params.id)));
     app.get(`/api/v1/${kind}`,async req=>store.list(kind,z.strictObject({taskId:uuid.optional(),projectId:uuid.optional(),limit:z.coerce.number().int().min(1).max(200).optional(),offset:z.coerce.number().int().min(0).optional()}).parse(req.query)));
   }
+  app.post('/api/v1/approvals/:id/decision',async req=>decide(store,uuid.parse(req.params.id),z.strictObject({version:z.number().int().positive(),decision:z.enum(['approve','deny'])}).parse(req.body)));
   return app;
 }
+
