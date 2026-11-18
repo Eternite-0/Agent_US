@@ -17,10 +17,14 @@ def send(message):
     proc.stdin.write(json.dumps(message) + '\n')
     proc.stdin.flush()
 
+streamed = {'stdout': bytearray(), 'stderr': bytearray()}
 def rpc(i, method, params):
     send({'id': i, 'method': method, 'params': params})
     for line in proc.stdout:
         item = json.loads(line)
+        if item.get('method') == 'command/exec/outputDelta':
+            params=item['params']; key=params['stream']; target=streamed[key]
+            target.extend(base64.b64decode(params['deltaBase64'])[:max(0,8192-len(target))])
         if item.get('id') == i:
             if 'error' in item:
                 raise RuntimeError(method + ': ' + str(item['error'])[:500])
@@ -37,8 +41,6 @@ proc.terminate()
 files = {}
 total = 0
 for path in work.rglob('*'):
-    if '.git' in path.relative_to(work).parts:
-        continue
     mode = path.lstat().st_mode
     if stat.S_ISDIR(mode):
         continue
@@ -49,4 +51,4 @@ for path in work.rglob('*'):
     if total > 262144:
         raise ValueError('workspace limit')
     files[str(path.relative_to(work))] = base64.b64encode(data).decode()
-print(json.dumps({'exitCode':result['exitCode'], 'stdout':result['stdout'][:8192], 'stderr':result['stderr'][:8192], 'files': files}))
+print(json.dumps({'exitCode':result['exitCode'], 'stdout':(result['stdout'] or streamed['stdout'].decode(errors='replace'))[:8192], 'stderr':(result['stderr'] or streamed['stderr'].decode(errors='replace'))[:8192], 'files': files}))

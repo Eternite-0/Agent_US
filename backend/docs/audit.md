@@ -9,3 +9,7 @@
 | Codex | `codex-rs/core/src/tools/orchestrator.rs`、`approvals.rs`、`unified_exec/mod.rs`。分别检查权限裁决、执行、进程生命周期。集成点选择无模型的 command/exec。|
 | Claude Code | 官方公开 hooks 示例和 mod-tests 工作流用于理解输入事件与生命周期。社区研究 README 标明其分析涉及泄露源码，排除其分析正文、bundle 与 prompt。|
 | Magpie | `main.go` → `internal/cli` → `serve`，`internal/cli/healthcheck_cli.go` 检查根路由标识，`account_discovery_cli.go` 确认 `MAGPIE_NO_ACCOUNTS`，`internal/provider/provider.go` 定义显式配置协议。|
+
+## 运行时对应版本
+
+DSH 源码审计同时核对了发布标签的 `agent-loop/tests/loop.spec.ts`、安装包类型定义和实际调用。Codex 使用 npm Linux amd64 发布文件 `0.139.0-linux-x64`，`command/exec` 的行为参考 `app-server/tests/suite/v2/command_exec.rs`。Magpie 的审计提交与运行时发布标签分别记录在锁定表，二进制 SHA-256 保存在 `magpie-release.json`。运行时引用 npm 或上游发行文件，项目源码仅含自有插件和适配器。

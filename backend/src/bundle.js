@@ -8,16 +8,31 @@ import * as Native from '@deepseek-ai/dsh-tool-executor-native';
 import Agents from '@deepseek-ai/dsh-agent';
 import Loop from '@deepseek-ai/dsh-agent-loop';
 
-export const TaskPlugin = {name:'agent-us-task-engine', apply(ctx, {store}) { ctx.provide('taskEngine',store); }};
-export async function bundle(store, persona='') {
-  const ctx=new Context();
+export const TaskPlugin = {
+  name: 'agent-us-task-engine',
+  apply(ctx, { store }) {
+    ctx.provide('taskEngine', store);
+  },
+};
+export const BackendBundle = {
+  name: 'agent-us-backend-bundle',
+  async apply(ctx, { store, persona = '' }) {
+    for (const plugin of [Llm, Sessions, Projections]) await ctx.plugin(plugin);
+    await ctx.plugin(Prompt, { personaPrefix: persona });
+    for (const plugin of [Tools, Native, Agents]) await ctx.plugin(plugin);
+    await ctx.plugin(Loop, { agents: [] });
+    await ctx.plugin(TaskPlugin, { store });
+  },
+};
+export default BackendBundle;
+export async function bundle(store, persona = '') {
+  const ctx = new Context();
   try {
-    for(const plugin of [Llm,Sessions,Projections]) await ctx.plugin(plugin);
-    await ctx.plugin(Prompt,{personaPrefix:persona});
-    for(const plugin of [Tools,Native,Agents]) await ctx.plugin(plugin);
-    await ctx.plugin(Loop,{agents:[]});
-    await ctx.plugin(TaskPlugin,{store});
-    if(!ctx.agentLoop || !ctx.taskEngine) throw Error('BUNDLE_UNAVAILABLE');
+    await ctx.plugin(BackendBundle, { store, persona });
+    if (!ctx.agentLoop || !ctx.taskEngine) throw Error('BUNDLE_UNAVAILABLE');
     return ctx;
-  } catch(error) { await ctx.fiber.dispose(); throw error; }
+  } catch (error) {
+    await ctx.fiber.dispose();
+    throw error;
+  }
 }
