@@ -1,0 +1,12 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {createServer} from 'node:http';import {once} from 'node:events';import {mkdtempSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';import {randomBytes} from 'node:crypto';
+import {Magpie} from '../src/magpie.js';import {ChatAdapter} from '../src/provider.js';import {seal,unseal} from '../src/vault.js';
+test('real Magpie process discovers explicit models, streams through configured provider and shuts down',async t=>{
+ const http=createServer(async(req,res)=>{for await(const _ of req){};if(req.url.endsWith('/models'))return res.end(JSON.stringify({object:'list',data:[{id:'sample',object:'model'}]}));res.writeHead(200,{'Content-Type':'text/event-stream'});
+ for(const part of [{delta:{role:'assistant',content:'hello'},finish_reason:null},{delta:{},finish_reason:'stop'}])res.write('data: '+JSON.stringify({id:'r1',object:'chat.completion.chunk',model:'sample',choices:[{index:0,...part}]})+'\n\n');res.end('data: [DONE]\n\n');});
+ http.listen(0,'0.0.0.0');await once(http,'listening');t.after(()=>http.close());const port=http.address().port;
+ const magpie=new Magpie([{id:'custom',name:'Custom',key:'fixture-key',chat:`http://host.docker.internal:${port}/v1`,models:['sample'],listOff:true}]);t.after(()=>magpie.stop());await magpie.start();assert.ok(await magpie.healthy());
+ const route={id:'magpie',endpoint:magpie.base+'/v1',key:magpie.token,wireModel:'custom/sample'};const adapter=new ChatAdapter(()=>[route]);assert.ok((await adapter.discover(route)).some(x=>x.includes('sample')));
+ const opts={provider:'custom',model:'sample',messages:[{role:'user',content:[{type:'text',text:'x'}]}],signal:AbortSignal.timeout(25000)};const parts=await Array.fromAsync(adapter.stream(opts));assert.equal(parts.find(x=>x.type==='block-end').block.text,'hello');
+ await magpie.stop();const fallback=new ChatAdapter(()=>[{...route,endpoint:'http://127.0.0.1:1/v1'},{id:'native',endpoint:`http://127.0.0.1:${port}/v1`,key:'fixture-key'}]);assert.equal((await Array.fromAsync(fallback.stream(opts))).at(-1).reason.kind,'stop');
+});
+test('vault verifies authenticated ciphertext',()=>{const file=join(mkdtempSync(join(tmpdir(),'vault-')),'keys');process.env.BACKEND_MASTER_KEY=randomBytes(32).toString('base64');seal(file,{EXAMPLE:'test'});assert.equal(unseal(file).EXAMPLE,'test');process.env.BACKEND_MASTER_KEY=randomBytes(32).toString('base64');assert.throws(()=>unseal(file));delete process.env.BACKEND_MASTER_KEY;});

@@ -1,0 +1,6 @@
+{
+  "api": "https://api.github.com/repos/yetone/magpie/releases/assets/764154911",
+  "url": "https://github.com/yetone/magpie/releases/download/v0.1.4490/magpie-cli-linux-amd64",
+  "digest": "sha256:278687623f7c4e73a3485b78e3545daadcea8b90301bda36d687e2d0417e2091",
+  "tag": "v0.1.4490"
+}
