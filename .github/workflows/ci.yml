@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }} / Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: ['24']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix backend ci
+          npm --prefix frontend ci
+
+      - name: Install dependencies (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm --prefix backend ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix frontend ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Backend syntax and TypeScript SDK check (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd backend
+          npm run check
+
+      - name: Backend syntax and TypeScript SDK check (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-Location backend
+          npm run check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Backend core and regression test suites (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd backend
+          echo "::group::Core & Non-Env-Gated Backend Regression Suites"
+          shopt -s nullglob
+          TESTS=()
+          for f in test/*.test.js; do
+            base="$(basename "$f")"
+            case "$base" in
+              security.test.js|providers.test.js|integration.test.js)
+                continue
+                ;;
+              *)
+                TESTS+=("$f")
+                ;;
+            esac
+          done
+          if [ "${#TESTS[@]}" -eq 0 ]; then
+            echo "No backend test files discovered" >&2
+            exit 1
+          fi
+          echo "Running ${#TESTS[@]} backend test files (--test-timeout=60000)"
+          node --test --test-timeout=60000 "${TESTS[@]}"
+          echo "::endgroup::"
+
+      - name: Backend core and regression test suites (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-Location backend
+          Write-Host "::group::Core & Non-Env-Gated Backend Regression Suites"
+          $envGated = @('security.test.js', 'providers.test.js', 'integration.test.js')
+          $tests = @(
+            Get-ChildItem -Path 'test/*.test.js' |
+              Where-Object { $envGated -notcontains $_.Name } |
+              Sort-Object Name |
+              ForEach-Object { "test/$($_.Name)" }
+          )
+          if ($tests.Count -eq 0) {
+            Write-Error "No backend test files discovered"
+            exit 1
+          }
+          Write-Host "Running $($tests.Count) backend test files (--test-timeout=60000)"
+          node --test --test-timeout=60000 @tests
+          $code = $LASTEXITCODE
+          Write-Host "::endgroup::"
+          if ($code -ne 0) { exit $code }
+
+      - name: Env-gated suites status — Docker & Magpie (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Env-Gated Backend Suites (Docker / Magpie)"
+          echo "[SKIP] backend/test/security.test.js — requires Docker Engine and prebuilt Codex sandbox image (not provisioned on standard CI runners)"
+          echo "[SKIP] backend/test/providers.test.js — requires local Magpie sidecar binary and Docker host networking (not provisioned on standard CI runners)"
+          echo "[SKIP] backend/test/integration.test.js — requires both Magpie sidecar and Docker Codex sandbox image (not provisioned on standard CI runners)"
+          echo "::endgroup::"
+
+      - name: Env-gated suites status — Docker & Magpie (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Write-Host "::group::Env-Gated Backend Suites (Docker / Magpie)"
+          Write-Host "[SKIP] backend/test/security.test.js — requires Docker Engine and prebuilt Codex sandbox image (not provisioned on standard CI runners)"
+          Write-Host "[SKIP] backend/test/providers.test.js — requires local Magpie sidecar binary and Docker host networking (not provisioned on standard CI runners)"
+          Write-Host "[SKIP] backend/test/integration.test.js — requires both Magpie sidecar and Docker Codex sandbox image (not provisioned on standard CI runners)"
+          Write-Host "::endgroup::"
+
+      - name: Frontend TypeScript check and build (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd frontend
+          npx tsc --noEmit
+          npm run build
+
+      - name: Frontend TypeScript check and build (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-Location frontend
+          npx tsc --noEmit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Desktop syntax check (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check desktop/main.mjs
+          node --check desktop/pack-win.mjs
+          node --check desktop/after-pack.cjs
+
+      - name: Desktop syntax check (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          node --check desktop/main.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check desktop/pack-win.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check desktop/after-pack.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -3,6 +3,7 @@ import type {
   ChildNotificationRecord,
   RuntimeOverviewRecord,
   ScheduleRunRecord,
+  SwarmArtifactRecord,
   SwarmReplanRecord,
   SwarmRunRecord,
   SwarmSubmitResponse,
@@ -76,6 +77,52 @@ export function createRuntimeClient(req: ReqFn) {
       return data.items ?? [];
     },
 
+    async listSwarmArtifacts(
+      runId: string,
+      params?: { nodeKey?: string; limit?: number },
+    ): Promise<SwarmArtifactRecord[]> {
+      const data = await req<{ items?: SwarmArtifactRecord[] }>(
+        'GET',
+        `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts`,
+        { query: { nodeKey: params?.nodeKey, limit: params?.limit } },
+      );
+      return data.items ?? [];
+    },
+
+    getSwarmArtifact(
+      runId: string,
+      artifactId: string,
+      path?: string,
+    ): Promise<SwarmArtifactRecord | Record<string, unknown>> {
+      return req(
+        'GET',
+        `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
+        { query: { path } },
+      );
+    },
+
+    verifySwarmArtifact(
+      runId: string,
+      artifactId: string,
+    ): Promise<{ ok: boolean; artifactId: string; bundleSha256?: string; reasons?: string[] }> {
+      return req(
+        'POST',
+        `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/verify`,
+      );
+    },
+
+    applySwarmArtifact(
+      runId: string,
+      artifactId: string,
+      input?: { permissionMode?: string; approved?: boolean; targetWorkspaceRoot?: string },
+    ): Promise<Record<string, unknown>> {
+      return req(
+        'POST',
+        `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/apply`,
+        { body: input ?? {} },
+      );
+    },
+
     async listSessionNotifications(
       sessionId: string,
       unreadOnly = false,
@@ -121,6 +168,9 @@ export function createRuntimeClient(req: ReqFn) {
         concurrencyPolicy: string;
         misfirePolicy: string;
         maxConcurrency: number;
+        workspaceRoot: string | null;
+        model: string | null;
+        permissionMode: string;
         enabled: boolean;
       }>,
     ): Promise<BackendScheduleRecord> {
@@ -133,6 +183,7 @@ export function createRuntimeClient(req: ReqFn) {
 
     runScheduleNow(id: string): Promise<{
       schedule: BackendScheduleRecord;
+      run?: ScheduleRunRecord;
       session: { id: string };
       turn: { id: string };
     }> {

@@ -16,6 +16,11 @@ import { SearchPalette } from './components/SearchPalette';
 import { SettingsView } from './components/SettingsView';
 import { Sidebar } from './components/Sidebar';
 import { TasksView, type ScheduledTaskItem } from './components/TasksView';
+import {
+  buildCreateSchedulePayload,
+  buildUpdateSchedulePayload,
+  hydrateScheduleItem,
+} from './utils/schedulePayload';
 import { ThreadView } from './components/ThreadView';
 import { ToastHost } from './components/ToastHost';
 import { TopBar } from './components/TopBar';
@@ -322,27 +327,7 @@ export const App: React.FC = () => {
         setMemory(memList);
         setUsage(usgList);
         if (schedList) {
-          setScheduledTasks(
-            schedList.map((s) => ({
-              id: s.id,
-              title: s.name,
-              prompt: s.prompt,
-              projectId: null,
-              frequency:
-                s.scheduleKind === 'hourly' ||
-                s.scheduleKind === 'daily' ||
-                s.scheduleKind === 'weekly' ||
-                s.scheduleKind === 'cron'
-                  ? s.scheduleKind
-                  : 'cron',
-              time: /^\d{1,2}:\d{2}$/.test(s.scheduleExpr) ? s.scheduleExpr : '09:00',
-              weekday: '一',
-              cronExpr: s.scheduleExpr,
-              paused: !s.enabled,
-              lastRunTaskIds: (s.runHistory ?? []).map((h) => h.sessionId).filter(Boolean),
-              createdAt: s.createdAt ?? Date.now(),
-            })),
-          );
+          setScheduledTasks(schedList.map(hydrateScheduleItem));
         }
         if (evList.length) {
           setRecentEvents((prev) => {
@@ -1406,57 +1391,64 @@ export const App: React.FC = () => {
                 tasks={tasks}
                 projects={projects}
                 selectedProjectId={selectedProject?.id ?? null}
-                onCreateScheduled={(item) => {
+                onCreateScheduled={async (item) => {
                   if (client.createSchedule) {
-                    const expr =
-                      item.frequency === 'daily'
-                        ? item.time
-                        : item.frequency === 'weekly'
-                          ? `${item.weekday} ${item.time}`
-                          : item.frequency === 'hourly'
-                            ? '0 * * * *'
-                            : item.cronExpr;
-                    void client
-                      .createSchedule({
-                        name: item.title,
-                        prompt: item.prompt,
-                        scheduleKind: item.frequency,
-                        scheduleExpr: expr,
-                        workspaceRoot: workspaceRoot || undefined,
-                        model: selectedModel || undefined,
-                        permissionMode,
-                        enabled: !item.paused,
-                      })
-                      .then((saved) => {
-                        setScheduledTasks((prev) => [
-                          { ...item, id: saved.id, lastRunTaskIds: [], createdAt: saved.createdAt ?? Date.now() },
-                          ...prev,
-                        ]);
-                        pushToast(`已保存定时任务「${item.title}」`, 'success');
-                      })
-                      .catch((e) => {
-                        pushToast(`创建定时任务失败：${e instanceof Error ? e.message : '请求失败'}`, 'danger');
-                      });
+                    const payload = buildCreateSchedulePayload(item, {
+                      workspaceRoot: workspaceRoot || undefined,
+                      model: selectedModel || undefined,
+                      permissionMode,
+                    });
+                    try {
+                      const saved = await client.createSchedule(payload);
+                      const hydrated = {
+                        ...hydrateScheduleItem(saved),
+                        projectId: item.projectId,
+                      };
+                      setScheduledTasks((prev) => [hydrated, ...prev]);
+                      pushToast(`已保存定时任务「${hydrated.title}」`, 'success');
+                    } catch (e) {
+                      const msg = e instanceof Error ? e.message : '请求失败';
+                      pushToast(`创建定时任务失败：${msg}`, 'danger');
+                      throw e;
+                    }
                     return;
                   }
                   const created: ScheduledTaskItem = {
                     ...item,
                     id: `sched-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                    nextRunAt: null,
+                    lastRunAt: null,
+                    lastStatus: null,
                     lastRunTaskIds: [],
                     createdAt: Date.now(),
                   };
                   setScheduledTasks((prev) => [created, ...prev]);
                   pushToast(`已创建定时任务「${created.title}」`, 'success');
                 }}
-                onUpdateScheduled={(id, patch) => {
+                onUpdateScheduled={async (id, patch) => {
+                  const current = scheduledTasks.find((s) => s.id === id) ?? null;
                   if (client.updateSchedule) {
-                    void client
-                      .updateSchedule(id, {
-                        ...(patch.title !== undefined ? { name: patch.title } : {}),
-                        ...(patch.prompt !== undefined ? { prompt: patch.prompt } : {}),
-                        ...(patch.paused !== undefined ? { enabled: !patch.paused } : {}),
-                      })
-                      .catch(() => {});
+                    const payload = buildUpdateSchedulePayload(patch, current);
+                    try {
+                      const saved = await client.updateSchedule(id, payload);
+                      const hydrated = {
+                        ...hydrateScheduleItem(saved),
+                        projectId: patch.projectId !== undefined ? patch.projectId : (current?.projectId ?? null),
+                      };
+                      setScheduledTasks((prev) =>
+                        prev.map((s) => (s.id === id ? hydrated : s)),
+                      );
+                      if (patch.paused !== undefined) {
+                        pushToast(patch.paused ? '已暂停定时任务' : '已恢复定时任务');
+                      } else {
+                        pushToast(`已更新定时任务「${hydrated.title}」`, 'success');
+                      }
+                    } catch (e) {
+                      const msg = e instanceof Error ? e.message : '更新失败';
+                      pushToast(`更新定时任务失败：${msg}`, 'danger');
+                      throw e;
+                    }
+                    return;
                   }
                   setScheduledTasks((prev) =>
                     prev.map((s) => (s.id === id ? { ...s, ...patch } : s)),
@@ -1465,19 +1457,30 @@ export const App: React.FC = () => {
                     pushToast(patch.paused ? '已暂停定时任务' : '已恢复定时任务');
                   }
                 }}
-                onDeleteScheduled={(id) => {
+                onDeleteScheduled={async (id) => {
                   if (client.deleteSchedule) {
-                    void client.deleteSchedule(id).catch(() => {});
+                    try {
+                      await client.deleteSchedule(id);
+                    } catch (e) {
+                      const msg = e instanceof Error ? e.message : '删除失败';
+                      pushToast(`删除定时任务失败：${msg}`, 'danger');
+                      throw e;
+                    }
                   }
                   setScheduledTasks((prev) => prev.filter((s) => s.id !== id));
                   pushToast('已删除定时任务');
                 }}
                 onRunScheduledNow={async (item) => {
                   if (client.runScheduleNow) {
-                    const out = await client.runScheduleNow(item.id);
-                    await refreshWorkspace(false);
-                    pushToast(`已触发定时任务「${item.title}」`, 'success');
-                    navigate({ kind: 'thread', taskId: out.session.id });
+                    try {
+                      const out = await client.runScheduleNow(item.id);
+                      await refreshWorkspace(false);
+                      pushToast(`已触发定时任务「${item.title}」`, 'success');
+                      navigate({ kind: 'thread', taskId: out.session.id });
+                    } catch (e) {
+                      const msg = e instanceof Error ? e.message : '触发失败';
+                      pushToast(`触发定时任务失败：${msg}`, 'danger');
+                    }
                     return;
                   }
                   let projectId = item.projectId ?? selectedProject?.id ?? null;

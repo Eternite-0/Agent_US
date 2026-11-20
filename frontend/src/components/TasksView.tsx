@@ -1,6 +1,14 @@
 import React, { useMemo, useState } from 'react';
 import type { Project, Task } from '../types/backend';
 import { fmtClock, fmtRelative, fmtStatusLabel, taskTitle } from '../utils/format';
+import {
+  formatNextRunAt,
+  getDefaultTimezone,
+  getTimezoneOptions,
+  normalizeHourlyMinute,
+  type ScheduleDraftInput,
+  type ScheduledTaskItem,
+} from '../utils/schedulePayload';
 import { Collapsible } from './Collapsible';
 import {
   IconChevronRight,
@@ -12,28 +20,16 @@ import {
   IconSearch,
 } from './Icons';
 
-export interface ScheduledTaskItem {
-  id: string;
-  title: string;
-  prompt: string;
-  projectId: string | null;
-  frequency: 'daily' | 'weekly' | 'hourly' | 'cron';
-  time: string;
-  weekday: string;
-  cronExpr: string;
-  paused: boolean;
-  lastRunTaskIds: string[];
-  createdAt: number;
-}
+export type { ScheduledTaskItem };
 
 interface TasksViewProps {
   scheduledTasks: ScheduledTaskItem[];
   tasks: Task[];
   projects: Project[];
   selectedProjectId: string | null;
-  onCreateScheduled: (item: Omit<ScheduledTaskItem, 'id' | 'lastRunTaskIds' | 'createdAt'>) => void;
-  onUpdateScheduled: (id: string, patch: Partial<ScheduledTaskItem>) => void;
-  onDeleteScheduled: (id: string) => void;
+  onCreateScheduled: (item: ScheduleDraftInput) => Promise<void> | void;
+  onUpdateScheduled: (id: string, patch: Partial<ScheduledTaskItem>) => Promise<void> | void;
+  onDeleteScheduled: (id: string) => Promise<void> | void;
   onRunScheduledNow: (item: ScheduledTaskItem) => Promise<void>;
   onSelectTask: (taskId: string) => void;
 }
@@ -60,7 +56,10 @@ const IconFilterLines: React.FC = () => (
 );
 
 function fmtScheduleSummary(item: ScheduledTaskItem): string {
-  if (item.frequency === 'hourly') return '每小时执行';
+  if (item.frequency === 'hourly') {
+    const min = normalizeHourlyMinute(item.hourlyMinute);
+    return min === 0 ? '每小时整点 (:00)' : `每小时第 ${String(min).padStart(2, '0')} 分`;
+  }
   if (item.frequency === 'daily') return `每天 ${item.time}`;
   if (item.frequency === 'weekly') return `每周${item.weekday} ${item.time}`;
   return item.cronExpr || '0 9 * * *';
@@ -82,17 +81,26 @@ export const TasksView: React.FC<TasksViewProps> = ({
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [filterMode, setFilterMode] = useState<'all' | 'active' | 'paused'>('all');
-  const [creating, setCreating] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
   const [runningId, setRunningId] = useState<string | null>(null);
 
-  // Create form state
+  const systemTimezone = useMemo(() => getDefaultTimezone(), []);
+
+  // Create / Edit form state
   const [title, setTitle] = useState('');
   const [prompt, setPrompt] = useState('');
   const [projectId, setProjectId] = useState<string>(selectedProjectId || projects[0]?.id || '');
   const [frequency, setFrequency] = useState<ScheduledTaskItem['frequency']>('daily');
+  const [hourlyMinute, setHourlyMinute] = useState<number>(0);
   const [time, setTime] = useState('09:00');
   const [weekday, setWeekday] = useState('一');
   const [cronExpr, setCronExpr] = useState('0 9 * * 1-5');
+  const [timezone, setTimezone] = useState<string>(systemTimezone);
+
+  const timezoneOptions = useMemo(() => getTimezoneOptions(timezone), [timezone]);
 
   const projectNameById = useMemo(
     () => new Map(projects.map((p) => [p.id, p.name])),
@@ -108,7 +116,8 @@ export const TasksView: React.FC<TasksViewProps> = ({
       if (!q) return true;
       return (
         item.title.toLowerCase().includes(q) ||
-        item.prompt.toLowerCase().includes(q)
+        item.prompt.toLowerCase().includes(q) ||
+        item.timezone.toLowerCase().includes(q)
       );
     });
   }, [scheduledTasks, search, filterMode]);
@@ -118,30 +127,78 @@ export const TasksView: React.FC<TasksViewProps> = ({
   const selectedItem = scheduledTasks.find((i) => i.id === selectedId) ?? null;
 
   const openNewModal = () => {
+    setEditingId(null);
     setTitle('');
     setPrompt('');
     setProjectId(selectedProjectId || projects[0]?.id || '');
     setFrequency('daily');
+    setHourlyMinute(0);
     setTime('09:00');
     setWeekday('一');
     setCronExpr('0 9 * * 1-5');
-    setCreating(true);
+    setTimezone(getDefaultTimezone());
+    setFormError(null);
+    setModalOpen(true);
   };
 
-  const handleSaveNew = (e: React.FormEvent) => {
+  const openEditModal = (item: ScheduledTaskItem) => {
+    setEditingId(item.id);
+    setTitle(item.title);
+    setPrompt(item.prompt);
+    setProjectId(item.projectId || '');
+    setFrequency(item.frequency);
+    setHourlyMinute(normalizeHourlyMinute(item.hourlyMinute));
+    setTime(item.time || '09:00');
+    setWeekday(item.weekday || '一');
+    setCronExpr(item.cronExpr || '0 9 * * 1-5');
+    // Strictly preserve the schedule's explicitly saved timezone — never overwrite with browser default
+    setTimezone(item.timezone || 'UTC');
+    setFormError(null);
+    setModalOpen(true);
+  };
+
+  const handleSaveModal = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!prompt.trim()) return;
-    onCreateScheduled({
-      title: title.trim() || taskTitle(prompt.trim()),
-      prompt: prompt.trim(),
-      projectId: projectId || null,
-      frequency,
-      time,
-      weekday,
-      cronExpr,
-      paused: false,
-    });
-    setCreating(false);
+    if (!prompt.trim() || saving) return;
+    setSaving(true);
+    setFormError(null);
+    try {
+      const cleanPrompt = prompt.trim();
+      const cleanTitle = title.trim() || taskTitle(cleanPrompt);
+      const cleanTz = timezone.trim() || getDefaultTimezone();
+
+      if (editingId) {
+        await onUpdateScheduled(editingId, {
+          title: cleanTitle,
+          prompt: cleanPrompt,
+          projectId: projectId || null,
+          frequency,
+          hourlyMinute: normalizeHourlyMinute(hourlyMinute),
+          time,
+          weekday,
+          cronExpr,
+          timezone: cleanTz,
+        });
+      } else {
+        await onCreateScheduled({
+          title: cleanTitle,
+          prompt: cleanPrompt,
+          projectId: projectId || null,
+          frequency,
+          hourlyMinute: normalizeHourlyMinute(hourlyMinute),
+          time,
+          weekday,
+          cronExpr,
+          timezone: cleanTz,
+          paused: false,
+        });
+      }
+      setModalOpen(false);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : '保存定时任务失败，请检查配置');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleRunNow = async (item: ScheduledTaskItem) => {
@@ -361,6 +418,7 @@ export const TasksView: React.FC<TasksViewProps> = ({
                   style={{
                     display: 'flex',
                     alignItems: 'center',
+                    flexWrap: 'wrap',
                     gap: 8,
                     fontSize: 12.5,
                     color: 'var(--text-tertiary)',
@@ -373,6 +431,8 @@ export const TasksView: React.FC<TasksViewProps> = ({
                   <span>{selectedItem.paused ? '已暂停' : '已启用'}</span>
                   <span>·</span>
                   <span>{fmtScheduleSummary(selectedItem)}</span>
+                  <span>·</span>
+                  <span>{selectedItem.timezone}</span>
                   {selectedItem.projectId && (
                     <>
                       <span>·</span>
@@ -400,8 +460,18 @@ export const TasksView: React.FC<TasksViewProps> = ({
                   type="button"
                   className="codex-toolbar-btn"
                   data-variant="outline"
+                  onClick={() => openEditModal(selectedItem)}
+                >
+                  编辑
+                </button>
+                <button
+                  type="button"
+                  className="codex-toolbar-btn"
+                  data-variant="outline"
                   onClick={() =>
-                    onUpdateScheduled(selectedItem.id, { paused: !selectedItem.paused })
+                    void Promise.resolve(
+                      onUpdateScheduled(selectedItem.id, { paused: !selectedItem.paused }),
+                    ).catch(() => {})
                   }
                 >
                   {selectedItem.paused ? <IconPlay size={13} /> : <IconPause size={13} />}
@@ -413,8 +483,9 @@ export const TasksView: React.FC<TasksViewProps> = ({
                   data-variant="outline"
                   style={{ color: 'var(--color-danger)' }}
                   onClick={() => {
-                    onDeleteScheduled(selectedItem.id);
-                    setSelectedId(null);
+                    void Promise.resolve(onDeleteScheduled(selectedItem.id))
+                      .then(() => setSelectedId(null))
+                      .catch(() => {});
                   }}
                 >
                   删除
@@ -443,6 +514,43 @@ export const TasksView: React.FC<TasksViewProps> = ({
                 </div>
                 <span className="codex-status-chip">{fmtScheduleSummary(selectedItem)}</span>
               </div>
+              <div className="codex-settings-row">
+                <div className="codex-settings-row-meta">
+                  <div className="codex-settings-label">执行时区</div>
+                  <div className="codex-settings-desc">后端按此 IANA 时区计算触发时刻</div>
+                </div>
+                <span className="codex-status-chip" style={{ fontFamily: 'var(--font-mono)' }}>
+                  {selectedItem.timezone}
+                </span>
+              </div>
+              <div className="codex-settings-row">
+                <div className="codex-settings-row-meta">
+                  <div className="codex-settings-label">下次执行</div>
+                  <div className="codex-settings-desc">
+                    {selectedItem.paused
+                      ? '任务已暂停，恢复后重新计算触发时间'
+                      : `按 ${selectedItem.timezone} 时区显示的下一次计划触发时间`}
+                  </div>
+                </div>
+                <span className="codex-status-chip tabular-nums">
+                  {selectedItem.paused
+                    ? '已暂停'
+                    : formatNextRunAt(selectedItem.nextRunAt, selectedItem.timezone)}
+                </span>
+              </div>
+              {selectedItem.lastStatus && (
+                <div className="codex-settings-row">
+                  <div className="codex-settings-row-meta">
+                    <div className="codex-settings-label">最近状态</div>
+                    <div className="codex-settings-desc">
+                      {selectedItem.lastRunAt
+                        ? `上次触发于 ${formatNextRunAt(selectedItem.lastRunAt, selectedItem.timezone)}`
+                        : '最近一次运行的最终收敛状态'}
+                    </div>
+                  </div>
+                  <span className="codex-status-chip">{fmtStatusLabel(selectedItem.lastStatus)}</span>
+                </div>
+              )}
             </div>
 
             <div className="codex-modal-section-label" style={{ marginTop: 22 }}>
@@ -493,30 +601,53 @@ export const TasksView: React.FC<TasksViewProps> = ({
         )}
       </div>
 
-      {/* Create Scheduled Task Modal */}
-      {creating && (
+      {/* Create / Edit Scheduled Task Modal */}
+      {modalOpen && (
         <div
           className="codex-modal-backdrop"
           role="dialog"
           aria-modal="true"
-          aria-label="新建定时任务"
+          aria-label={editingId ? '编辑定时任务' : '新建定时任务'}
           onClick={(e) => {
-            if (e.target === e.currentTarget) setCreating(false);
+            if (e.target === e.currentTarget && !saving) setModalOpen(false);
           }}
         >
-          <form className="codex-modal-card" style={{ width: 'min(480px, 100%)' }} onSubmit={handleSaveNew}>
+          <form
+            className="codex-modal-card"
+            style={{ width: 'min(480px, 100%)' }}
+            onSubmit={(e) => void handleSaveModal(e)}
+          >
             <div className="codex-modal-header">
-              <h2 className="codex-modal-title">新建定时任务</h2>
+              <h2 className="codex-modal-title">{editingId ? '编辑定时任务' : '新建定时任务'}</h2>
               <button
                 type="button"
                 className="codex-icon-btn"
                 style={{ width: 26, height: 26 }}
                 aria-label="关闭"
-                onClick={() => setCreating(false)}
+                disabled={saving}
+                onClick={() => setModalOpen(false)}
               >
                 <IconClose size={15} />
               </button>
             </div>
+
+            {formError && (
+              <div
+                role="alert"
+                style={{
+                  marginBottom: 12,
+                  padding: '8px 12px',
+                  borderRadius: 'var(--radius-md)',
+                  border: '1px solid var(--color-danger)',
+                  color: 'var(--color-danger)',
+                  fontSize: 12.5,
+                  lineHeight: '18px',
+                  background: 'color-mix(in srgb, var(--color-danger) 8%, transparent)',
+                }}
+              >
+                {formError}
+              </div>
+            )}
 
             <div className="codex-modal-input-box" style={{ marginBottom: 12 }}>
               <input
@@ -582,6 +713,23 @@ export const TasksView: React.FC<TasksViewProps> = ({
               </div>
             </div>
 
+            {frequency === 'hourly' && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+                <span style={{ fontSize: 12.5, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+                  每小时触发分钟 (0-59)
+                </span>
+                <input
+                  type="number"
+                  min={0}
+                  max={59}
+                  className="codex-input"
+                  style={{ height: 34, width: 96 }}
+                  value={hourlyMinute}
+                  onChange={(e) => setHourlyMinute(normalizeHourlyMinute(e.target.value))}
+                />
+              </div>
+            )}
+
             {(frequency === 'daily' || frequency === 'weekly') && (
               <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
                 {frequency === 'weekly' && (
@@ -618,20 +766,39 @@ export const TasksView: React.FC<TasksViewProps> = ({
               />
             )}
 
+            <div style={{ marginTop: 12 }}>
+              <div className="codex-modal-section-label" style={{ marginTop: 0 }}>
+                执行时区 (IANA)
+              </div>
+              <select
+                className="codex-select"
+                style={{ width: '100%', height: 34, fontFamily: 'var(--font-mono)' }}
+                value={timezone}
+                onChange={(e) => setTimezone(e.target.value)}
+              >
+                {timezoneOptions.map((tz) => (
+                  <option key={tz} value={tz}>
+                    {tz === systemTimezone ? `${tz} (系统默认)` : tz}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <div className="codex-modal-footer">
               <button
                 type="button"
                 className="codex-modal-cancel-btn"
-                onClick={() => setCreating(false)}
+                disabled={saving}
+                onClick={() => setModalOpen(false)}
               >
                 取消
               </button>
               <button
                 type="submit"
                 className="codex-modal-primary-btn"
-                disabled={!prompt.trim()}
+                disabled={!prompt.trim() || saving}
               >
-                保存定时任务
+                {saving ? '保存中…' : editingId ? '保存修改' : '保存定时任务'}
               </button>
             </div>
           </form>

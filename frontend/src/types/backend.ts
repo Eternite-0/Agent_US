@@ -697,8 +697,41 @@ export interface SwarmNodeRecord {
   status: string;
   priority: number;
   resultText?: string | null;
+  artifactUris?: string[];
+  latestArtifactId?: string | null;
   errorCode?: string | null;
   errorMessage?: string | null;
+}
+
+export interface SwarmArtifactFileEntry {
+  path: string;
+  status: string;
+  previousPath?: string | null;
+  sizeBytes?: number;
+  mode?: string | null;
+  binary?: boolean;
+  sha256?: string | null;
+  baseSha256?: string | null;
+}
+
+export interface SwarmArtifactRecord {
+  id: string;
+  uri: string;
+  runId: string;
+  nodeId: string;
+  nodeKey: string;
+  attempt: number;
+  ownerId: string;
+  baseCommit?: string | null;
+  baseRef?: string | null;
+  bundleSha256: string;
+  fileCount: number;
+  totalBytes: number;
+  status: string;
+  files: SwarmArtifactFileEntry[];
+  appliedAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface SwarmRunRecord {
@@ -757,10 +790,13 @@ export interface ScheduleRunRecord {
   sessionId?: string | null;
   turnId?: string | null;
   status: string;
+  runSeq?: number;
+  trigger?: string;
   error?: string | null;
   startedAt?: number | null;
   finishedAt?: number | null;
   createdAt: number;
+  updatedAt?: number | null;
 }
 
 export interface BackendScheduleRecord {
@@ -780,8 +816,12 @@ export interface BackendScheduleRecord {
   lastRunAt?: number | null;
   nextRunAt?: number | null;
   lastSessionId?: string | null;
-  runHistory: Array<{ sessionId: string; turnId: string; at: number; trigger: string }>;
+  lastStatus?: string | null;
+  lastStatusRunSeq?: number;
+  lastStatusRunId?: string | null;
+  runHistory: Array<{ runId?: string; sessionId: string; turnId: string; at: number; trigger: string }>;
   createdAt: number;
+  updatedAt?: number;
 }
 
 export interface RuntimeOverviewRecord {

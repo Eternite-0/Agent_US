@@ -192,10 +192,15 @@ export function validateScheduleConfig({
   }
 
   if (kind === 'hourly') {
+    if (expr && !/^:?(\d{1,2})$/.test(expr)) {
+      throw new Fault('INVALID_SCHEDULE_CONFIG', 400, {
+        message: `Invalid hourly minute "${expr}" (expected 0-59)`,
+      });
+    }
     const min = expr ? Number(expr.replace(/^:/, '')) : 0;
     if (!Number.isInteger(min) || min < 0 || min > 59) {
       throw new Fault('INVALID_SCHEDULE_CONFIG', 400, {
-        message: `Invalid hourly minute "${expr}"`,
+        message: `Invalid hourly minute "${expr}" (expected 0-59)`,
       });
     }
     return { kind, expr: String(min), tz, minute: min, maxConc };
@@ -286,6 +291,7 @@ export function computeNextRunAt(
     return fromMs + cfg.intervalMs;
   }
 
+  const fromParts = getZonedParts(fromMs, cfg.tz);
   let cursor = fromMs - (fromMs % 60_000) + 60_000;
   const maxCursor = fromMs + 366 * 86_400_000;
 
@@ -297,7 +303,15 @@ export function computeNextRunAt(
       continue;
     }
     if (cfg.kind === 'daily') {
-      if (p.hour === cfg.hour && p.minute === cfg.minute) return cursor;
+      if (p.hour === cfg.hour && p.minute === cfg.minute) {
+        const sameDayAlreadyMatched =
+          fromParts.year === p.year &&
+          fromParts.month === p.month &&
+          fromParts.day === p.day &&
+          fromParts.hour === cfg.hour &&
+          fromParts.minute === cfg.minute;
+        if (!sameDayAlreadyMatched) return cursor;
+      }
       if (p.hour !== cfg.hour) {
         cursor += (60 - p.minute) * 60_000;
       } else {
@@ -306,7 +320,16 @@ export function computeNextRunAt(
       continue;
     }
     if (cfg.kind === 'weekly') {
-      if (p.weekday === cfg.dow && p.hour === cfg.hour && p.minute === cfg.minute) return cursor;
+      if (p.weekday === cfg.dow && p.hour === cfg.hour && p.minute === cfg.minute) {
+        const sameDayAlreadyMatched =
+          fromParts.year === p.year &&
+          fromParts.month === p.month &&
+          fromParts.day === p.day &&
+          fromParts.weekday === cfg.dow &&
+          fromParts.hour === cfg.hour &&
+          fromParts.minute === cfg.minute;
+        if (!sameDayAlreadyMatched) return cursor;
+      }
       if (p.weekday !== cfg.dow || p.hour !== cfg.hour) {
         cursor += (60 - p.minute) * 60_000;
       } else {

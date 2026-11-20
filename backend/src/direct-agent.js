@@ -6,6 +6,7 @@ import { Fault, id as uuid } from './store.js';
 import { excerpt } from './context.js';
 import { AgentRuntimeKernel } from './kernel/runtime.js';
 import { EvidenceVerifier } from './governance/verifier.js';
+import { convergeScheduledRunForTurn } from './governance/scheduler.js';
 import { RecoveryError, classifyError } from './kernel/errors.js';
 import { RUNTIME_EVENTS } from './kernel/events.js';
 import { classifyFailureKind, safeIsolateSideEffect } from './kernel/verdict.js';
@@ -721,6 +722,10 @@ export class DirectAgentRuntime {
             "UPDATE direct_approvals SET status='expired', resolvedAt=? WHERE turnId=? AND status='pending'",
           )
           .run(now, turnId);
+        convergeScheduledRunForTurn(this.store, turnId, {
+          status: 'cancelled',
+          finishedAt: now,
+        });
         return true;
       });
       if (cancelled) {
@@ -1178,6 +1183,11 @@ export class DirectAgentRuntime {
                 finishedAt,
               );
           }
+          convergeScheduledRunForTurn(this.store, turnId, {
+            status: 'failed',
+            error: errorMessage.slice(0, 1000),
+            finishedAt,
+          });
           return true;
         });
 
@@ -1273,6 +1283,10 @@ export class DirectAgentRuntime {
             durationMs,
             finishedAt,
           );
+        convergeScheduledRunForTurn(this.store, turnId, {
+          status: 'completed',
+          finishedAt,
+        });
         return true;
       });
 
@@ -1380,6 +1394,11 @@ export class DirectAgentRuntime {
               "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
             )
             .run(nextState, finishedAt, sessionId);
+          convergeScheduledRunForTurn(this.store, turnId, {
+            status: nextState,
+            error: isCancelled ? null : message.slice(0, 1000),
+            finishedAt,
+          });
           return true;
         });
       } catch (txErr) {

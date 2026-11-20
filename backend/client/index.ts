@@ -177,8 +177,55 @@ export interface SwarmNode {
   status: string;
   priority: number;
   resultText?: string | null;
+  artifactUris?: string[];
+  latestArtifactId?: string | null;
   errorCode?: string | null;
   errorMessage?: string | null;
+}
+
+export interface SwarmArtifactFileEntry {
+  path: string;
+  status: string;
+  previousPath?: string | null;
+  sizeBytes?: number;
+  mode?: string | null;
+  binary?: boolean;
+  sha256?: string | null;
+  baseSha256?: string | null;
+}
+
+export interface SwarmArtifact {
+  id: string;
+  uri: string;
+  runId: string;
+  nodeId: string;
+  nodeKey: string;
+  attempt: number;
+  ownerId: string;
+  baseCommit?: string | null;
+  baseRef?: string | null;
+  bundleSha256: string;
+  fileCount: number;
+  totalBytes: number;
+  status: string;
+  files: SwarmArtifactFileEntry[];
+  appliedAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SwarmArtifactVerifyResult {
+  ok: boolean;
+  artifactId: string;
+  bundleSha256?: string;
+  reasons?: string[];
+}
+
+export interface SwarmArtifactApplyResult {
+  applied: boolean;
+  artifactId: string;
+  appliedFiles?: string[];
+  conflicts?: Array<{ path: string; reason: string }>;
 }
 
 export interface SwarmRun {
@@ -237,10 +284,13 @@ export interface ScheduledTaskRun {
   sessionId?: string | null;
   turnId?: string | null;
   status: string;
+  runSeq?: number;
+  trigger?: string;
   error?: string | null;
   startedAt?: number | null;
   finishedAt?: number | null;
   createdAt: number;
+  updatedAt?: number | null;
 }
 
 export interface ScheduledTask {
@@ -249,7 +299,7 @@ export interface ScheduledTask {
   prompt: string;
   scheduleKind: string;
   scheduleExpr: string;
-  timezone?: string;
+  timezone: string;
   concurrencyPolicy?: string;
   misfirePolicy?: string;
   maxConcurrency?: number;
@@ -260,7 +310,12 @@ export interface ScheduledTask {
   lastRunAt?: number | null;
   nextRunAt?: number | null;
   lastSessionId?: string | null;
-  runHistory: Array<{ sessionId: string; turnId: string; at: number; trigger: string }>;
+  lastStatus?: string | null;
+  lastStatusRunSeq?: number;
+  lastStatusRunId?: string | null;
+  runHistory: Array<{ runId?: string; sessionId: string; turnId: string; at: number; trigger: string }>;
+  createdAt?: number;
+  updatedAt?: number;
 }
 
 export interface RuntimeOverview {
@@ -347,8 +402,9 @@ export function connectRuntime(base: string, token: string) {
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
+      const msgPart = data.error?.message ? `: ${data.error.message}` : '';
       throw Error(
-        `${data.error?.code ?? res.status} (${data.error?.requestId ?? 'unknown'})`,
+        `${data.error?.code ?? res.status}${msgPart} (${data.error?.requestId ?? 'unknown'})`,
       );
     }
     return res.json() as Promise<T>;
@@ -380,12 +436,38 @@ export function connectRuntime(base: string, token: string) {
       req<SwarmRun>('POST', `swarm/runs/${encodeURIComponent(id)}/resume`),
     listSwarmReplans: (id: string) =>
       req<{ items: SwarmReplan[] }>('GET', `swarm/runs/${encodeURIComponent(id)}/replans`),
+    listSwarmArtifacts: (runId: string, nodeKey?: string) =>
+      req<{ items: SwarmArtifact[] }>(
+        'GET',
+        `swarm/runs/${encodeURIComponent(runId)}/artifacts${nodeKey ? `?nodeKey=${encodeURIComponent(nodeKey)}` : ''}`,
+      ),
+    getSwarmArtifact: (runId: string, artifactId: string, path?: string) =>
+      req<SwarmArtifact | { artifactId: string; uri: string; entry: SwarmArtifactFileEntry; deleted: boolean; text?: string | null; base64?: string | null; verified: boolean }>(
+        'GET',
+        `swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}${path ? `?path=${encodeURIComponent(path)}` : ''}`,
+      ),
+    verifySwarmArtifact: (runId: string, artifactId: string) =>
+      req<SwarmArtifactVerifyResult>(
+        'POST',
+        `swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/verify`,
+      ),
+    applySwarmArtifact: (
+      runId: string,
+      artifactId: string,
+      body?: { permissionMode?: string; approved?: boolean; targetWorkspaceRoot?: string },
+    ) =>
+      req<SwarmArtifactApplyResult>(
+        'POST',
+        `swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/apply`,
+        body ?? {},
+      ),
     listSessionNotifications: (sessionId: string, unreadOnly = false) =>
       req<{ items: ChildNotification[] }>(
         'GET',
         `sessions/${encodeURIComponent(sessionId)}/notifications${unreadOnly ? '?unreadOnly=true' : ''}`,
       ),
     schedules: () => req<{ items: ScheduledTask[] }>('GET', 'schedules'),
+    getSchedule: (id: string) => req<ScheduledTask>('GET', `schedules/${encodeURIComponent(id)}`),
     createSchedule: (body: {
       name?: string;
       prompt: string;
@@ -395,9 +477,35 @@ export function connectRuntime(base: string, token: string) {
       concurrencyPolicy?: string;
       misfirePolicy?: string;
       maxConcurrency?: number;
+      workspaceRoot?: string | null;
+      model?: string | null;
+      permissionMode?: string;
+      enabled?: boolean;
     }) => req<ScheduledTask>('POST', 'schedules', body),
+    updateSchedule: (
+      id: string,
+      patch: Partial<{
+        name: string;
+        prompt: string;
+        scheduleKind: string;
+        scheduleExpr: string;
+        timezone: string;
+        concurrencyPolicy: string;
+        misfirePolicy: string;
+        maxConcurrency: number;
+        workspaceRoot: string | null;
+        model: string | null;
+        permissionMode: string;
+        enabled: boolean;
+      }>,
+    ) => req<ScheduledTask>('PATCH', `schedules/${encodeURIComponent(id)}`, patch),
+    deleteSchedule: (id: string) =>
+      req<{ id: string; deleted: boolean }>('DELETE', `schedules/${encodeURIComponent(id)}`),
     runSchedule: (id: string) =>
-      req<{ schedule: ScheduledTask; session: RuntimeSession; turn: RuntimeTurn }>('POST', `schedules/${encodeURIComponent(id)}/run`),
+      req<{ schedule: ScheduledTask; run?: ScheduledTaskRun; session: RuntimeSession; turn: RuntimeTurn }>(
+        'POST',
+        `schedules/${encodeURIComponent(id)}/run`,
+      ),
     listScheduleRuns: (id: string, limit = 50) =>
       req<{ items: ScheduledTaskRun[] }>('GET', `schedules/${encodeURIComponent(id)}/runs?limit=${limit}`),
     cancelScheduleRun: (id: string, runId: string) =>

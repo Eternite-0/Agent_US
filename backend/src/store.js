@@ -493,6 +493,65 @@ export class Store {
         );
       }
       // --- End 2.1.1 Group 3: Budget Ledger ---
+      // --- 2.1.1 Group 4: Scheduler Durability ---
+      ensureColumns('scheduled_tasks', [
+        ['lastStatusRunSeq', 'INTEGER NOT NULL DEFAULT 0'],
+        ['lastStatusRunId', 'TEXT'],
+      ]);
+      ensureColumns('scheduled_task_runs', [
+        ['runSeq', 'INTEGER NOT NULL DEFAULT 0'],
+        ['trigger', "TEXT NOT NULL DEFAULT 'schedule'"],
+        ['updatedAt', 'INTEGER'],
+      ]);
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS scheduled_task_runs_sched_seq ON scheduled_task_runs(scheduleId, runSeq DESC);
+        CREATE INDEX IF NOT EXISTS scheduled_task_runs_turn ON scheduled_task_runs(turnId);
+        CREATE INDEX IF NOT EXISTS scheduled_task_runs_status ON scheduled_task_runs(status, scheduleId);
+        CREATE INDEX IF NOT EXISTS direct_turns_client_turn ON direct_turns(clientTurnId) WHERE clientTurnId IS NOT NULL;
+      `);
+      const unsequencedSchedules = this.db
+        .prepare(
+          'SELECT DISTINCT scheduleId FROM scheduled_task_runs WHERE runSeq IS NULL OR runSeq <= 0',
+        )
+        .all();
+      for (const { scheduleId } of unsequencedSchedules) {
+        let nextSeq =
+          Number(
+            this.db
+              .prepare(
+                'SELECT COALESCE(MAX(runSeq), 0) AS m FROM scheduled_task_runs WHERE scheduleId=? AND runSeq > 0',
+              )
+              .get(scheduleId)?.m ?? 0,
+          ) + 1;
+        const rows = this.db
+          .prepare(
+            'SELECT id FROM scheduled_task_runs WHERE scheduleId=? AND (runSeq IS NULL OR runSeq <= 0) ORDER BY createdAt ASC, rowid ASC',
+          )
+          .all(scheduleId);
+        for (const r of rows) {
+          this.db
+            .prepare(
+              'UPDATE scheduled_task_runs SET runSeq=?, updatedAt=COALESCE(updatedAt, finishedAt, startedAt, createdAt) WHERE id=?',
+            )
+            .run(nextSeq++, r.id);
+        }
+      }
+      const tasksToBackfill = this.db
+        .prepare('SELECT id FROM scheduled_tasks WHERE lastStatusRunSeq = 0')
+        .all();
+      for (const t of tasksToBackfill) {
+        const latestRun = this.db
+          .prepare(
+            "SELECT id, runSeq FROM scheduled_task_runs WHERE scheduleId=? AND status IN ('running','completed','failed','cancelled') ORDER BY runSeq DESC, createdAt DESC LIMIT 1",
+          )
+          .get(t.id);
+        if (latestRun) {
+          this.db
+            .prepare('UPDATE scheduled_tasks SET lastStatusRunSeq=?, lastStatusRunId=? WHERE id=?')
+            .run(latestRun.runSeq, latestRun.id, t.id);
+        }
+      }
+      // --- End 2.1.1 Group 4: Scheduler Durability ---
       this.db.exec('PRAGMA user_version=7');
     });
   }

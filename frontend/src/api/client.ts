@@ -35,6 +35,7 @@ import type {
   SessionHistoryItem,
   SessionRecord,
   Submission,
+  SwarmArtifactRecord,
   SwarmReplanRecord,
   SwarmRunRecord,
   SwarmSubmitResponse,
@@ -140,6 +141,24 @@ export interface AgentBackendClient {
   getSwarmRun?: (id: string) => Promise<SwarmRunRecord>;
   resumeSwarmRun?: (id: string) => Promise<SwarmRunRecord>;
   listSwarmReplans?: (id: string) => Promise<SwarmReplanRecord[]>;
+  listSwarmArtifacts?: (
+    runId: string,
+    params?: { nodeKey?: string; limit?: number },
+  ) => Promise<SwarmArtifactRecord[]>;
+  getSwarmArtifact?: (
+    runId: string,
+    artifactId: string,
+    path?: string,
+  ) => Promise<SwarmArtifactRecord | Record<string, unknown>>;
+  verifySwarmArtifact?: (
+    runId: string,
+    artifactId: string,
+  ) => Promise<{ ok: boolean; artifactId: string; bundleSha256?: string; reasons?: string[] }>;
+  applySwarmArtifact?: (
+    runId: string,
+    artifactId: string,
+    input?: { permissionMode?: string; approved?: boolean; targetWorkspaceRoot?: string },
+  ) => Promise<Record<string, unknown>>;
   listSessionNotifications?: (sessionId: string, unreadOnly?: boolean) => Promise<ChildNotificationRecord[]>;
   listSchedules?: () => Promise<BackendScheduleRecord[]>;
   createSchedule?: (input: {
@@ -167,12 +186,16 @@ export interface AgentBackendClient {
       concurrencyPolicy: string;
       misfirePolicy: string;
       maxConcurrency: number;
+      workspaceRoot: string | null;
+      model: string | null;
+      permissionMode: string;
       enabled: boolean;
     }>,
   ) => Promise<BackendScheduleRecord>;
   deleteSchedule?: (id: string) => Promise<{ id: string; deleted: boolean }>;
   runScheduleNow?: (id: string) => Promise<{
     schedule: BackendScheduleRecord;
+    run?: ScheduleRunRecord;
     session: { id: string };
     turn: { id: string };
   }>;
@@ -890,6 +913,26 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.rt.listSwarmReplans(id);
   }
 
+  listSwarmArtifacts(runId: string, params?: { nodeKey?: string; limit?: number }) {
+    return this.rt.listSwarmArtifacts(runId, params);
+  }
+
+  getSwarmArtifact(runId: string, artifactId: string, path?: string) {
+    return this.rt.getSwarmArtifact(runId, artifactId, path);
+  }
+
+  verifySwarmArtifact(runId: string, artifactId: string) {
+    return this.rt.verifySwarmArtifact(runId, artifactId);
+  }
+
+  applySwarmArtifact(
+    runId: string,
+    artifactId: string,
+    input?: { permissionMode?: string; approved?: boolean; targetWorkspaceRoot?: string },
+  ) {
+    return this.rt.applySwarmArtifact(runId, artifactId, input);
+  }
+
   listSessionNotifications(sessionId: string, unreadOnly = false) {
     return this.rt.listSessionNotifications(sessionId, unreadOnly);
   }
@@ -926,6 +969,9 @@ export class LiveBackendClient implements AgentBackendClient {
       concurrencyPolicy: string;
       misfirePolicy: string;
       maxConcurrency: number;
+      workspaceRoot: string | null;
+      model: string | null;
+      permissionMode: string;
       enabled: boolean;
     }>,
   ) {
