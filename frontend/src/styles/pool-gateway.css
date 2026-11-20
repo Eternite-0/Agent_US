@@ -1501,3 +1501,21 @@
   font-size: 12px;
   color: var(--text-tertiary);
 }
+
+/* Compact model inventory behavior used by the settings workspace on narrow windows. */
+@media (max-width: 1100px) {
+  .a2a-models-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.a2a-models-table {
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.a2a-models-thead,
+.a2a-models-row {
+  min-width: 900px;
+}

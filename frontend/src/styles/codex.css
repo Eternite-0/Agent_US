@@ -5664,3 +5664,215 @@ button:focus-visible {
 .codex-branch-submit-btn:hover:not(:disabled) {
   opacity: 0.88;
 }
+
+/* Compact settings navigation on narrow windows; keep every section reachable. */
+@media (max-width: 820px) {
+  .codex-main-surface:has(.codex-settings) { min-width: 0; }
+  .codex-settings-page { width: 100%; min-width: 0; flex: 1 1 auto; flex-direction: column; }
+  .codex-settings-page .codex-settings-nav {
+    width: 100%; max-height: 176px; flex: none;
+    padding: 8px 12px 4px;
+  }
+  .codex-settings-page .codex-settings-nav-title { margin-bottom: 6px; font-size: 16px; line-height: 22px; }
+  .codex-settings-page .codex-settings-search { max-width: 360px; margin: 0 4px 6px; }
+  .codex-settings-page .codex-settings-nav-list {
+    display: flex;
+    flex: none;
+    flex-direction: row;
+    gap: 12px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 2px 0 6px;
+    scrollbar-width: thin;
+  }
+  .codex-settings-page .codex-settings-nav-list > div {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center;
+    gap: 4px !important;
+    flex: none;
+  }
+  .codex-settings-page .codex-settings-nav-list > div::before {
+    content: attr(data-group);
+    display: inline-flex;
+    align-items: center;
+    min-width: max-content;
+    padding: 0 6px;
+    color: var(--text-tertiary);
+    font-size: 11px;
+  }
+  .codex-settings-page .codex-settings-group-label { display: none; }
+  .codex-settings-page .codex-settings-nav-item { width: auto; min-width: max-content; height: 32px; padding-inline: 10px; }
+  .codex-settings-page .codex-settings-body {
+    min-height: 0; padding: 20px 16px 40px;
+    border-left: 0; border-top-left-radius: 0;
+  }
+  .codex-settings-page .codex-settings-inner { width: 100%; }
+  .codex-settings-page .codex-settings-heading { flex-direction: column; align-items: stretch; gap: 10px; }
+}
+@media (max-width: 560px) {
+  .codex-settings-page .codex-settings-nav { max-height: 158px; padding-inline: 8px; }
+  .codex-settings-page .codex-settings-nav-item { font-size: 12px; }
+  .codex-settings-page .codex-settings-body { padding: 16px 12px 32px; }
+}
+@media (max-width: 1100px) {
+  .a2a-models-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Make the multi-column model inventory scroll instead of compressing headers. */
+.a2a-models-table { overflow-x: auto; overflow-y: hidden; }
+.a2a-models-thead,
+.a2a-models-row { min-width: 900px; }
+
+@media (max-width: 560px) {
+  .codex-topbar {
+    padding-inline: 6px;
+    gap: 2px;
+  }
+
+  .codex-topbar-left {
+    min-width: 0;
+    gap: 2px;
+  }
+
+  .codex-topbar-nav {
+    gap: 0;
+  }
+
+  .codex-menubar {
+    gap: 0;
+    padding-left: 0;
+  }
+
+  .codex-menu-trigger {
+    padding-inline: 5px;
+    font-size: 12px;
+  }
+
+  .codex-topbar-right {
+    min-width: 0;
+    gap: 2px;
+  }
+
+  .codex-conn-pill {
+    max-width: 92px;
+    padding-inline: 5px;
+    gap: 4px;
+    font-size: 11px;
+  }
+
+  .codex-conn-pill > span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .codex-settings-page .codex-settings-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .codex-settings-page .codex-settings-row > div:not(.codex-settings-row-info) {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .codex-settings-page .codex-settings-row > div:not(.codex-settings-row-info) > * {
+    min-width: 0;
+  }
+
+  .codex-settings-page .codex-settings-row .codex-input,
+  .codex-settings-page .codex-settings-row .codex-select {
+    width: 100% !important;
+  }
+}
+  .codex-settings-page .codex-settings-row > div:not(.codex-settings-row-info) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .codex-settings-page .codex-settings-row > div:not(.codex-settings-row-info) > button {
+    flex: none;
+    white-space: nowrap;
+  }
+
+  .codex-settings-page .codex-settings-row .codex-input {
+    flex: 1 1 160px;
+    width: auto !important;
+  }
+
+  .codex-settings-page .codex-settings-row .codex-select {
+    flex: 1 1 auto;
+  }
+@media (max-width: 560px) {
+  .codex-custom-page {
+    padding: 20px 16px 32px;
+  }
+
+  .codex-custom-inner {
+    width: 100%;
+    gap: 16px;
+  }
+
+  .codex-custom-topbar,
+  .codex-custom-actions {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .codex-custom-topbar {
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .codex-custom-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .codex-custom-search {
+    width: auto;
+    min-width: 0;
+    flex: 1 1 150px;
+  }
+
+  .codex-custom-install-btn {
+    padding-inline: 8px;
+  }
+}
+@media (max-width: 820px) {
+  .codex-body[data-capabilities-view="true"] .codex-custom-inner {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 560px) {
+  .codex-body[data-capabilities-view="true"] .codex-settings {
+    flex-direction: column;
+  }
+  .codex-body[data-capabilities-view="true"] .codex-settings-nav[aria-label="自定义导航"] {
+    width: 100%;
+    max-height: 190px;
+    padding: 8px 12px 4px;
+  }
+  .codex-body[data-capabilities-view="true"] .codex-settings-nav[aria-label="自定义导航"] .codex-sidebar-scroll {
+    max-height: 44px;
+  }
+  .codex-body[data-capabilities-view="true"] .codex-settings-body {
+    width: 100%;
+    min-height: 0;
+    padding: 16px;
+    border-left: 0;
+    border-top-left-radius: 0;
+  }
+}
+@media (max-width: 560px) {
+  .codex-body[data-capabilities-view="true"] .codex-settings-body {
+    padding: 20px 16px 32px;
+  }
+}

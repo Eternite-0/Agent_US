@@ -1170,7 +1170,7 @@ ${draftInjection.text}`
                   </button>
                   {models.length === 0 ? (
                     <div style={{ padding: '8px 10px', fontSize: 12, color: 'var(--text-tertiary)' }}>
-                      后端尚未配置模型目录，可在「设置 → 供应商与网关」查看配置指引。
+                      后端尚未配置模型目录，可在「设置 → 模型与网关」查看配置指引。
                     </div>
                   ) : (
                     models.map((m) => (

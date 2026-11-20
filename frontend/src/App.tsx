@@ -1238,7 +1238,11 @@ export const App: React.FC = () => {
         }}
       />
 
-      <div className="codex-body">
+      <div
+        className="codex-body"
+        data-settings-view={view.kind === 'settings' ? 'true' : undefined}
+        data-capabilities-view={view.kind === 'capabilities' ? 'true' : undefined}
+      >
         <Sidebar
           view={view}
           collapsed={sidebarCollapsed}
@@ -1283,7 +1287,6 @@ export const App: React.FC = () => {
           onTogglePin={handleTogglePin}
           onArchiveTask={handleArchiveTask}
           onDecideApproval={handleDecideApproval}
-          onToggleTheme={toggleTheme}
           onToast={(msg) => pushToast(msg)}
         />
 
@@ -1759,7 +1762,22 @@ export const App: React.FC = () => {
                     next.mode === 'demo' ? '已切换至本地演示引擎' : '已保存实时后端连接配置',
                   );
                 }}
-                onTestConnection={async () => {
+                onTestConnection={async (next) => {
+                  if (next && next.mode === 'live') {
+                    const probeClient = new LiveBackendClient(next);
+                    const health = await probeClient.health();
+                    if (health.ok === false) throw new Error('后端健康检查未通过');
+                    await probeClient.listModels();
+                    await probeClient.providersHealth();
+                    if (
+                      next.baseUrl.trim() !== connection.baseUrl.trim() ||
+                      next.token.trim() !== connection.token.trim() ||
+                      connection.mode !== 'live'
+                    ) {
+                      pushToast('连接参数已更新，正在使用新端点刷新工作区', 'success');
+                      return;
+                    }
+                  }
                   await refreshWorkspace(true);
                 }}
                 onDecideApproval={handleDecideApproval}

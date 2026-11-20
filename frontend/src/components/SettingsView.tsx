@@ -90,7 +90,7 @@ interface SettingsViewProps {
   onChangeReducedMotion: (v: boolean) => void;
   onChangePermissionMode: (mode: PermissionMode) => void;
   onUpdateConnection: (conn: ConnectionSettings) => void;
-  onTestConnection: () => Promise<void>;
+  onTestConnection: (next?: ConnectionSettings) => Promise<void>;
   onDecideApproval: (approval: Approval, decision: 'approve' | 'deny') => Promise<void>;
   onRestoreArchived: (taskId: string) => void;
   onOpenTask: (taskId: string) => void;
@@ -104,7 +104,7 @@ const NAV_GROUPS: Array<{
   items: Array<{ id: string; label: string; icon: React.ReactNode }>;
 }> = [
   {
-    group: '号池与网关',
+    group: '模型与网关',
     items: [
       { id: 'providers', label: '账号号池', icon: <IconGlobe size={15} /> },
       { id: 'models', label: '模型管理', icon: <IconCpu size={15} /> },
@@ -233,7 +233,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     })).filter((g) => g.items.length > 0);
   }, [navSearch]);
 
-  const activeSection = section || 'providers';
+  const validSections = new Set(NAV_GROUPS.flatMap((group) => group.items.map((item) => item.id)));
+  const activeSection = validSections.has(section) ? section : 'general';
   const isWide = WIDE_SECTIONS.has(activeSection);
   const pendingApprovals = approvals.filter((a) => a.status === 'pending');
 
@@ -245,24 +246,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleSaveConnection = async (e: React.FormEvent) => {
     e.preventDefault();
-    onUpdateConnection({
+    const nextConnection: ConnectionSettings = {
       mode: 'live',
       baseUrl: draftBaseUrl.trim(),
       token: draftToken.trim(),
-    });
+    };
+    onUpdateConnection(nextConnection);
     setTesting(true);
     try {
-      await onTestConnection();
+      await onTestConnection(nextConnection);
+    } catch (error) {
+      onToast(`连接校验失败：${error instanceof Error ? error.message : '未知错误'}`, 'danger');
     } finally {
       setTesting(false);
     }
   };
 
   return (
-    <div className="codex-settings">
+    <div className="codex-settings codex-settings-page">
       {/* Left Settings Navigation */}
       <div className="codex-settings-nav">
-        <h2 className="codex-settings-nav-title">设置与网关</h2>
+        <h2 className="codex-settings-nav-title">设置</h2>
 
         <div className="codex-settings-search">
           <IconSearch size={14} />
@@ -274,9 +278,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           />
         </div>
 
-        <div className="codex-settings-nav-list">
+        <nav className="codex-settings-nav-list" aria-label="设置分类">
           {filteredGroups.map((g) => (
-            <div key={g.group} style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            <div key={g.group} data-group={g.group} style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
               <div className="codex-settings-group-label">{g.group}</div>
               {g.items.map((item) => (
                 <button
@@ -318,7 +322,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               ))}
             </div>
           ))}
-        </div>
+        </nav>
       </div>
 
       {/* Right Settings Body (widens automatically for Account Pool / Models / Check-in) */}

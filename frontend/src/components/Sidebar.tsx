@@ -9,11 +9,9 @@ import {
   IconCheck,
   IconChevronDown,
   IconChevronRight,
-  IconCompose,
-  IconCpu,
   IconDotsHorizontal,
+  IconCompose,
   IconFolder,
-  IconGlobe,
   IconPin,
   IconPlus,
   IconRailClock,
@@ -49,7 +47,6 @@ interface SidebarProps {
   onTogglePin: (taskId: string) => void;
   onArchiveTask: (taskId: string) => void;
   onDecideApproval: (approval: Approval, decision: 'approve' | 'deny') => Promise<void>;
-  onToggleTheme: () => void;
   onToast: (msg: string) => void;
 }
 
@@ -83,7 +80,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onTogglePin,
   onArchiveTask,
   onDecideApproval,
-  onToggleTheme,
   onToast,
 }) => {
   const [resizing, setResizing] = useState(false);
@@ -93,7 +89,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
   const [bellOpen, setBellOpen] = useState(false);
   const [modeOpen, setModeOpen] = useState(false);
-  const [moreOpen, setMoreOpen] = useState(false);
   const [expandedProjectLists, setExpandedProjectLists] = useState<Record<string, boolean>>({});
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
@@ -107,12 +102,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   }, [collapsed]);
 
   useEffect(() => {
-    if (!bellOpen && !modeOpen && !moreOpen && !contextMenu) return;
+    if (!bellOpen && !modeOpen && !contextMenu) return;
     const close = (e: MouseEvent) => {
       if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
         setBellOpen(false);
         setModeOpen(false);
-        setMoreOpen(false);
         setContextMenu(null);
       }
     };
@@ -120,7 +114,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
       if (e.key === 'Escape') {
         setBellOpen(false);
         setModeOpen(false);
-        setMoreOpen(false);
         setContextMenu(null);
       }
     };
@@ -130,7 +123,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       document.removeEventListener('mousedown', close);
       document.removeEventListener('keydown', onKey);
     };
-  }, [bellOpen, modeOpen, moreOpen, contextMenu]);
+  }, [bellOpen, modeOpen, contextMenu]);
 
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -274,53 +267,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <div style={{ display: 'flex', flex: 'none', minHeight: 0 }} ref={popoverRef}>
-      {/* Far-left 52px Codex Icon Rail */}
+      {/* Far-left Codex navigation rail */}
       <nav className="codex-rail" aria-label="主导航">
         <div className="codex-rail-group">
           <button
             type="button"
             className="codex-rail-btn"
             data-active={isHomeRail ? 'true' : undefined}
-            aria-label="对话"
+            aria-label="主页"
             title="主页与会话"
             onClick={() => onSelectHome()}
           >
             <IconRailHome size={20} active={isHomeRail} />
           </button>
-
-          <button
-            type="button"
-            className="codex-rail-btn"
-            data-active={view.kind === 'settings' && view.section === 'providers' ? 'true' : undefined}
-            aria-label="账号号池"
-            title="账号号池（添加账号与顺位调度）"
-            onClick={() => onOpenSettings('providers')}
-          >
-            <IconGlobe size={19} />
-          </button>
-
-          <button
-            type="button"
-            className="codex-rail-btn"
-            data-active={view.kind === 'settings' && view.section === 'models' ? 'true' : undefined}
-            aria-label="模型管理"
-            title="模型管理（获取模型与别名映射）"
-            onClick={() => onOpenSettings('models')}
-          >
-            <IconCpu size={19} />
-          </button>
-
-          <button
-            type="button"
-            className="codex-rail-btn"
-            data-active={view.kind === 'settings' && view.section === 'checkin' ? 'true' : undefined}
-            aria-label="签到中心"
-            title="签到中心（每日签到与定时补签）"
-            onClick={() => onOpenSettings('checkin')}
-          >
-            <IconCheck size={19} />
-          </button>
-
           <button
             type="button"
             className="codex-rail-btn"
@@ -331,97 +290,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             <IconRailClock size={20} />
           </button>
-
           <button
             type="button"
             className="codex-rail-btn"
             data-active={view.kind === 'capabilities' ? 'true' : undefined}
-            aria-label="自定义（插件与技能）"
-            title="自定义：插件中心与技能"
+            aria-label="插件"
+            title="插件与技能"
             onClick={onSelectCapabilities}
           >
             <IconRailPlugins size={20} />
           </button>
-
-          <div style={{ position: 'relative' }}>
-            <button
-              type="button"
-              className="codex-rail-btn"
-              aria-label="更多"
-              title="更多功能"
-              onClick={() => setMoreOpen((v) => !v)}
-            >
-              <IconDotsHorizontal size={20} />
-            </button>
-            {moreOpen && (
-              <div
-                className="codex-popover"
-                data-side="bottom"
-                style={{ left: 42, top: 0, minWidth: 196 }}
-              >
-                <button
-                  type="button"
-                  className="codex-popover-item"
-                  onClick={() => {
-                    setMoreOpen(false);
-                    onOpenSettings('memory');
-                  }}
-                >
-                  <span>记忆中心</span>
-                </button>
-                <button
-                  type="button"
-                  className="codex-popover-item"
-                  onClick={() => {
-                    setMoreOpen(false);
-                    onOpenSettings('usage');
-                  }}
-                >
-                  <span>用量与费用</span>
-                </button>
-                <button
-                  type="button"
-                  className="codex-popover-item"
-                  onClick={() => {
-                    setMoreOpen(false);
-                    onOpenSettings('archived');
-                  }}
-                >
-                  <span>已归档的聊天</span>
-                  {archivedIds.length > 0 && (
-                    <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-                      {archivedIds.length}
-                    </span>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  className="codex-popover-item"
-                  onClick={() => {
-                    setMoreOpen(false);
-                    onOpenSearch();
-                  }}
-                >
-                  <span>命令面板</span>
-                  <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>Ctrl+K</span>
-                </button>
-                <div className="codex-popover-divider" />
-                <button
-                  type="button"
-                  className="codex-popover-item"
-                  onClick={() => {
-                    setMoreOpen(false);
-                    onToggleTheme();
-                  }}
-                >
-                  <span>切换明暗外观</span>
-                  <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>Ctrl+Shift+L</span>
-                </button>
-              </div>
-            )}
-          </div>
         </div>
-
         <div className="codex-rail-group">
           <button
             type="button"
@@ -435,7 +314,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </button>
         </div>
       </nav>
-
       {/* Left-edge Hover Peek Trigger when sidebar is collapsed */}
       {collapsed && !hidePanel && !peeking && (
         <div
