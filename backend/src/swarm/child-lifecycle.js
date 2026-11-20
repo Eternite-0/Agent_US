@@ -1,6 +1,6 @@
 import { Fault, id as uuid } from '../store.js';
 import { excerpt } from '../context.js';
-import { CancellationError, RecoveryError, RuntimeError } from '../kernel/errors.js';
+import { BudgetError, CancellationError, RecoveryError, RuntimeError } from '../kernel/errors.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import {
   assertLeaseInTx,
@@ -11,6 +11,15 @@ import { filterToolsByPolicy, intersectAllowlists, intersectPolicies } from '../
 import { ISOLATION_MODES } from '../tools/sandbox.js';
 import { WORKSPACE_TOOL_META } from '../workspace-tools.js';
 import { createSwarmArtifactTools } from './artifacts.js';
+import {
+  BUDGET_SCOPES,
+  TaskTreeBudgetLedger,
+  computeEffectiveNodeBudget,
+  isBudgetErrorCode,
+  minDefinedLimit,
+  normalizeBudgetLimit,
+  normalizeNodeBudget,
+} from './budget-ledger.js';
 
 const MAX_FORK_DEPTH = 2;
 
@@ -40,6 +49,7 @@ export class ChildAgentManager {
     worktreeIsolator,
     artifactManager = null,
     jobQueue = null,
+    budgetLedger = null,
     getWorkspaceTools,
     getDefaultModel,
   }) {
@@ -51,6 +61,7 @@ export class ChildAgentManager {
     this.worktreeIsolator = worktreeIsolator;
     this.artifactManager = artifactManager;
     this.jobQueue = jobQueue;
+    this.budgetLedger = budgetLedger ?? (store ? new TaskTreeBudgetLedger(store) : null);
     this.getWorkspaceTools = getWorkspaceTools;
     this.getDefaultModel = getDefaultModel;
     this.activeChildren = new Map(); // childSessionId -> { controller, parentSessionId, paused, shuttingDown, model }
@@ -111,35 +122,71 @@ export class ChildAgentManager {
     }
   }
 
-  #clampChildBudget(parentSessionId, requestedBudget = {}) {
-    const out = { ...requestedBudget };
-    if (!parentSessionId || !this.store?.db?.isOpen) return out;
+  #clampChildBudget(parentSessionId, requestedBudget = {}, { runId = null, budgetLedger = null } = {}) {
+    const activeLedger = budgetLedger ?? this.budgetLedger;
+    const req = normalizeNodeBudget(requestedBudget);
+    if (runId && activeLedger) {
+      const snap = activeLedger.getSnapshot(runId);
+      return {
+        effectiveBudget: computeEffectiveNodeBudget(req, snap),
+        activeLedger,
+        treeId: runId,
+      };
+    }
+    if (!parentSessionId || !this.store?.db?.isOpen) {
+      return { effectiveBudget: req, activeLedger: null, treeId: null };
+    }
     const parent = this.sessionRepo.getSession(parentSessionId);
+    const rootId = parent?.rootSessionId || parentSessionId;
+    const rootSess =
+      rootId === parentSessionId ? parent : this.sessionRepo.getSession(rootId);
+    const rootBudget = rootSess?.budget ?? null;
     const parentBudget = parent?.budget ?? null;
-    if (!parentBudget || typeof parentBudget !== 'object') return out;
+    const treeBudget = {
+      maxTotalSteps: minDefinedLimit(
+        minDefinedLimit(rootBudget?.maxTotalSteps, rootBudget?.maxSteps),
+        minDefinedLimit(parentBudget?.maxTotalSteps, parentBudget?.maxSteps),
+      ),
+      maxTotalTokens: minDefinedLimit(
+        minDefinedLimit(rootBudget?.maxTotalTokens, rootBudget?.maxTokens),
+        minDefinedLimit(parentBudget?.maxTotalTokens, parentBudget?.maxTokens),
+      ),
+      maxOutputTokens: minDefinedLimit(rootBudget?.maxOutputTokens, parentBudget?.maxOutputTokens),
+      maxDurationMs: minDefinedLimit(rootBudget?.maxDurationMs, parentBudget?.maxDurationMs),
+    };
+    const hasTreeLimit =
+      treeBudget.maxTotalSteps !== null ||
+      treeBudget.maxTotalTokens !== null ||
+      treeBudget.maxOutputTokens !== null;
+    if (!hasTreeLimit || !activeLedger) {
+      return { effectiveBudget: req, activeLedger: null, treeId: null };
+    }
 
-    const rootId = parent.rootSessionId || parentSessionId;
     const treeIds = [rootId, ...this.#collectDescendantIds(rootId)];
     const ph = treeIds.map(() => '?').join(',');
     const usedRow = this.store.db
       .prepare(
-        `SELECT COALESCE(SUM(inputTokens + outputTokens), 0) AS usedTokens,
+        `SELECT COALESCE(SUM(inputTokens), 0) AS usedInputTokens,
+                COALESCE(SUM(outputTokens), 0) AS usedOutputTokens,
                 COALESCE(SUM(step), 0) AS usedSteps
          FROM direct_turns WHERE sessionId IN (${ph})`,
       )
       .get(...treeIds);
-
-    if (parentBudget.maxTokens > 0) {
-      const remaining = Math.max(0, Number(parentBudget.maxTokens) - Number(usedRow?.usedTokens ?? 0));
-      out.maxTokens =
-        out.maxTokens > 0 ? Math.min(Number(out.maxTokens), remaining) : remaining;
-    }
-    if (parentBudget.maxSteps > 0) {
-      const remainingSteps = Math.max(1, Number(parentBudget.maxSteps) - Number(usedRow?.usedSteps ?? 0));
-      out.maxSteps =
-        out.maxSteps > 0 ? Math.min(Number(out.maxSteps), remainingSteps) : remainingSteps;
-    }
-    return out;
+    const snap = activeLedger.ensureLedger({
+      treeId: rootId,
+      rootSessionId: rootId,
+      budget: treeBudget,
+      initialUsage: {
+        steps: usedRow?.usedSteps ?? 0,
+        inputTokens: usedRow?.usedInputTokens ?? 0,
+        outputTokens: usedRow?.usedOutputTokens ?? 0,
+      },
+    });
+    return {
+      effectiveBudget: computeEffectiveNodeBudget(req, snap, treeBudget),
+      activeLedger,
+      treeId: rootId,
+    };
   }
 
   #resolveTools({
@@ -290,6 +337,8 @@ export class ChildAgentManager {
     workerId = null,
     predecessorArtifacts = [],
     budget = {},
+    budgetLedger = null,
+    budgetScope = BUDGET_SCOPES.NODE_EXECUTION,
     leaseGuard = null,
     initialStep = 0,
     resumeTurnId = null,
@@ -298,7 +347,11 @@ export class ChildAgentManager {
     resumeMode = false,
   }) {
     this.#assertAncestorsActive(parentSessionId);
-    const effectiveBudget = this.#clampChildBudget(parentSessionId, budget);
+    const {
+      effectiveBudget,
+      activeLedger,
+      treeId: budgetTreeId,
+    } = this.#clampChildBudget(parentSessionId, budget, { runId, budgetLedger });
 
     const subId = `sub_${childSessionId.slice(0, 8)}`;
     const controller = new AbortController();
@@ -392,7 +445,11 @@ export class ChildAgentManager {
         runId,
         nodeId,
       }) ?? baseLeaseGuard;
-    const maxSteps = Math.min(20, Math.max(1, Number(effectiveBudget.maxSteps ?? profile?.defaultMaxSteps ?? 8)));
+    const explicitMaxSteps = normalizeBudgetLimit(effectiveBudget.maxSteps);
+    const maxSteps =
+      explicitMaxSteps !== null
+        ? Math.min(20, explicitMaxSteps)
+        : Math.min(20, Math.max(1, Number(profile?.defaultMaxSteps ?? 8)));
     const resolvedModel = model || this.getDefaultModel();
 
     this.eventRouter?.emitPersisted({
@@ -580,10 +637,28 @@ export class ChildAgentManager {
         denyTools: [...new Set([...(effectivePolicy.denyTools ?? []), 'spawn_subagent'])],
         messages: assembled.messages,
         tools,
+        budgetLedger: activeLedger,
+        budgetContext: budgetTreeId
+          ? {
+              treeId: budgetTreeId,
+              scope: budgetScope,
+              nodeId,
+              nodeKey,
+              attempt,
+            }
+          : null,
         budget: {
           maxSteps,
-          maxOutputTokens: Number(effectiveBudget.maxOutputTokens ?? 2048),
-          maxTokens: effectiveBudget.maxTokens,
+          maxOutputTokens:
+            normalizeBudgetLimit(effectiveBudget.maxOutputTokens) !== null
+              ? normalizeBudgetLimit(effectiveBudget.maxOutputTokens)
+              : 2048,
+          ...(normalizeBudgetLimit(effectiveBudget.maxTokens) !== null
+            ? { maxTokens: normalizeBudgetLimit(effectiveBudget.maxTokens) }
+            : {}),
+          ...(normalizeBudgetLimit(effectiveBudget.maxDurationMs) !== null
+            ? { maxDurationMs: normalizeBudgetLimit(effectiveBudget.maxDurationMs) }
+            : {}),
         },
         onAssistantMessage: ({ text, reasoning, toolCalls }) => {
           this.store.tx(() => {
@@ -638,7 +713,8 @@ export class ChildAgentManager {
       }
 
       if (!state.paused && result.status === 'failed') {
-        throw new RuntimeError(result.errorCode || 'VERIFICATION_FAILED', {
+        const ErrCtor = isBudgetErrorCode(result.errorCode) ? BudgetError : RuntimeError;
+        throw new ErrCtor(result.errorCode || 'VERIFICATION_FAILED', {
           message: result.errorMessage || 'Child turn failed verification',
           detail: {
             verdict: result.verdict,
@@ -802,6 +878,9 @@ export class ChildAgentManager {
       if (this.store?.db?.isOpen) {
         const errAt = Date.now();
         const errVerdictJson = err?.detail?.verdict ? JSON.stringify(err.detail.verdict) : null;
+        const partialIn = Number(err?.usage?.inputTokens ?? err?.detail?.usage?.inputTokens ?? 0);
+        const partialOut = Number(err?.usage?.outputTokens ?? err?.detail?.usage?.outputTokens ?? 0);
+        const partialSteps = Number(err?.steps ?? err?.detail?.steps ?? 0);
         try {
           committed = this.store.tx(() => {
             assertLeaseInTx(turnLeaseGuard);
@@ -809,9 +888,9 @@ export class ChildAgentManager {
               .prepare(
                 `UPDATE direct_turns
                  SET state=?, phase=?, error=?,
-                     inputTokens=COALESCE(?, inputTokens),
-                     outputTokens=COALESCE(?, outputTokens),
-                     step=COALESCE(?, step),
+                     inputTokens=MAX(inputTokens, ?),
+                     outputTokens=MAX(outputTokens, ?),
+                     step=MAX(step, ?),
                      verdictJson=COALESCE(?, verdictJson),
                      finishedAt=?, activeFence=NULL
                  WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
@@ -820,9 +899,9 @@ export class ChildAgentManager {
                 nextState,
                 nextState,
                 String(err?.detail?.message ?? err?.message ?? err).slice(0, 500),
-                err?.detail?.usage?.inputTokens ?? null,
-                err?.detail?.usage?.outputTokens ?? null,
-                err?.detail?.steps ?? null,
+                partialIn,
+                partialOut,
+                partialSteps,
                 errVerdictJson,
                 nextState === 'reconciling' || nextState === 'paused' ? null : errAt,
                 turnId,
@@ -905,6 +984,8 @@ export class ChildAgentManager {
     attempt = 1,
     workerId = null,
     predecessorArtifacts = [],
+    budgetLedger = null,
+    budgetScope = BUDGET_SCOPES.NODE_EXECUTION,
     existingChildSessionId = null,
     resumeTurnId = null,
     initialStep = 0,
@@ -974,6 +1055,8 @@ export class ChildAgentManager {
       workerId,
       predecessorArtifacts,
       budget,
+      budgetLedger,
+      budgetScope,
       leaseGuard,
       initialStep,
       resumeTurnId,

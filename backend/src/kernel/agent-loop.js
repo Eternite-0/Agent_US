@@ -6,6 +6,11 @@ import { RUNTIME_EVENTS } from './events.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
 import { resolveTurnOutcome } from './verdict.js';
 import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
+import {
+  BUDGET_SCOPES,
+  estimateRequestInputTokens,
+  normalizeBudgetLimit,
+} from '../swarm/budget-ledger.js';
 
 /**
  * Default DecisionEngine handles premature-stop detection, verification gate,
@@ -190,6 +195,8 @@ export class AgentLoop {
     leaseGuard = null,
     parentGuard = null,
     budget = {},
+    budgetLedger = null,
+    budgetContext = null,
     initialStep = 0,
     signal,
     workspaceRoot = null,
@@ -214,13 +221,21 @@ export class AgentLoop {
       leaseGuard,
     });
 
-    const maxSteps = Math.min(60, Math.max(1, Number(budget.maxSteps ?? profile?.defaultMaxSteps ?? 24)));
-    const deadlineAt = budget.maxDurationMs ? Date.now() + Number(budget.maxDurationMs) : null;
-    const maxTotalTokens = budget.maxTokens ? Number(budget.maxTokens) : null;
+    const explicitMaxSteps = normalizeBudgetLimit(budget.maxSteps);
+    const maxSteps =
+      explicitMaxSteps !== null
+        ? Math.min(60, explicitMaxSteps)
+        : Math.min(60, Math.max(1, Number(profile?.defaultMaxSteps ?? 24)));
+    const explicitMaxDuration = normalizeBudgetLimit(budget.maxDurationMs);
+    const deadlineAt = explicitMaxDuration !== null ? Date.now() + explicitMaxDuration : null;
+    const maxTotalTokens = normalizeBudgetLimit(budget.maxTokens);
+    const explicitMaxOutput = normalizeBudgetLimit(budget.maxOutputTokens);
+    const baseMaxOutputTokens = explicitMaxOutput !== null ? explicitMaxOutput : 4096;
     const verifierEvents = [];
     const argStrikes = new Map();
 
     let steps = Number(initialStep || 0);
+    let executedStepsThisTurn = 0;
     let stopContinuedOnce = false;
     let repairedOnce = false;
     let repairRound = 0;
@@ -231,6 +246,28 @@ export class AgentLoop {
     let idleDecisionAction = null;
 
     try {
+      if (explicitMaxSteps === 0) {
+        throw new BudgetError('STEP_BUDGET', {
+          message: '步骤预算为 0，拒绝执行推理步骤',
+          detail: { maxSteps: 0 },
+        });
+      }
+      if (explicitMaxDuration === 0) {
+        throw new BudgetError('TASK_DEADLINE', { message: '任务时间预算为 0' });
+      }
+      if (maxTotalTokens === 0) {
+        throw new BudgetError('TOKEN_BUDGET', {
+          message: 'Token 预算为 0，拒绝执行推理步骤',
+          detail: { maxTokens: 0 },
+        });
+      }
+      if (explicitMaxOutput === 0) {
+        throw new BudgetError('TOKEN_BUDGET', {
+          message: '输出 Token 预算为 0，拒绝执行推理步骤',
+          detail: { maxOutputTokens: 0 },
+        });
+      }
+
       tm.saveCheckpoint({
         step: steps,
         phase: sm.phase,
@@ -240,10 +277,10 @@ export class AgentLoop {
       while (steps < maxSteps) {
         signal?.throwIfAborted?.();
         leaseGuard?.();
-        if (deadlineAt && Date.now() > deadlineAt) {
+        if (deadlineAt !== null && Date.now() > deadlineAt) {
           throw new BudgetError('TASK_DEADLINE', { message: '任务执行超出时间预算' });
         }
-        if (maxTotalTokens && tm.totalIn + tm.totalOut >= maxTotalTokens) {
+        if (maxTotalTokens !== null && tm.totalIn + tm.totalOut >= maxTotalTokens) {
           throw new BudgetError('TOKEN_BUDGET', { message: '任务执行超出 Token 预算' });
         }
 
@@ -283,7 +320,7 @@ export class AgentLoop {
           effort,
           messages,
           tools,
-          maxTokens: budget.maxOutputTokens ?? 4096,
+          maxTokens: baseMaxOutputTokens,
           signal,
         };
         if (contextManager) {
@@ -305,32 +342,147 @@ export class AgentLoop {
           }
         }
 
+        // Pre-inference budget admission, atomic reservation & controllable maxOutputTokens clamping
+        const estimatedInputTokens = estimateRequestInputTokens(requestOptions);
+        const nodeBudgetCaps = {
+          maxSteps: explicitMaxSteps,
+          maxTokens: maxTotalTokens,
+          maxOutputTokens: explicitMaxOutput,
+        };
+        let activeReservation = null;
+        if (budgetLedger && budgetContext?.treeId) {
+          activeReservation = budgetLedger.reserveInference({
+            treeId: budgetContext.treeId,
+            scope: budgetContext.scope || BUDGET_SCOPES.NODE_EXECUTION,
+            nodeId: budgetContext.nodeId || null,
+            nodeKey: budgetContext.nodeKey || null,
+            sessionId,
+            turnId,
+            attempt: budgetContext.attempt ?? 1,
+            estimatedInputTokens,
+            requestedMaxOutputTokens: requestOptions.maxTokens ?? baseMaxOutputTokens,
+            nodeBudget: nodeBudgetCaps,
+            nodeUsedSteps: executedStepsThisTurn,
+            nodeUsedTokens: tm.totalIn + tm.totalOut,
+            defaultMaxOutputTokens: baseMaxOutputTokens,
+            leaseGuard,
+          });
+          requestOptions = {
+            ...requestOptions,
+            maxTokens: activeReservation.constrainedMaxOutputTokens,
+          };
+        } else if (maxTotalTokens !== null) {
+          const localRemaining = Math.max(0, maxTotalTokens - (tm.totalIn + tm.totalOut));
+          if (localRemaining <= 0 || estimatedInputTokens >= localRemaining) {
+            throw new BudgetError('TOKEN_BUDGET', {
+              message: `预估输入 Token (${estimatedInputTokens}) 超出剩余 Token 预算 (${localRemaining})`,
+              detail: { estimatedInputTokens, remainingTokens: localRemaining, maxTotalTokens },
+            });
+          }
+          requestOptions = {
+            ...requestOptions,
+            maxTokens: Math.min(
+              requestOptions.maxTokens ?? baseMaxOutputTokens,
+              Math.max(1, localRemaining - estimatedInputTokens),
+            ),
+          };
+        }
+
         // Model inference phase
         sm.transition(TURN_PHASES.INFERENCE, { step: steps, persist: profile?.persistTurn !== false });
-        const stepResult = await this.inferenceEngine.streamStep({
-          ...requestOptions,
-          onTextDelta: (_delta, full) => {
-            if (profile?.streamDeltas !== false) {
-              this.eventRouter.emitEphemeral({
-                sessionId,
-                turnId,
-                type: RUNTIME_EVENTS.ASSISTANT_DELTA,
-                data: { turnId, sessionId, delta: _delta, text: full },
+        let stepResult;
+        try {
+          stepResult = await this.inferenceEngine.streamStep({
+            ...requestOptions,
+            onRetryBudget:
+              budgetLedger && budgetContext?.treeId
+                ? ({ attempt: retryAttempt, usage: partialUsage, error: retryErr }) => {
+                    if (activeReservation?.reservationId) {
+                      budgetLedger.settleReservation(activeReservation.reservationId, {
+                        status: 'failed',
+                        actualSteps: 1,
+                        actualInputTokens: partialUsage?.inputTokens ?? 0,
+                        actualOutputTokens: partialUsage?.outputTokens ?? 0,
+                        errorCode: retryErr?.code || 'TRANSIENT_UPSTREAM_ERROR',
+                        leaseGuard,
+                      });
+                      activeReservation = null;
+                    }
+                    tm.addUsage(partialUsage);
+                    executedStepsThisTurn++;
+                    activeReservation = budgetLedger.reserveInference({
+                      treeId: budgetContext.treeId,
+                      scope: budgetContext.scope || BUDGET_SCOPES.NODE_EXECUTION,
+                      nodeId: budgetContext.nodeId || null,
+                      nodeKey: budgetContext.nodeKey || null,
+                      sessionId,
+                      turnId,
+                      attempt: (budgetContext.attempt ?? 1) + retryAttempt,
+                      estimatedInputTokens,
+                      requestedMaxOutputTokens: requestOptions.maxTokens ?? baseMaxOutputTokens,
+                      nodeBudget: nodeBudgetCaps,
+                      nodeUsedSteps: executedStepsThisTurn,
+                      nodeUsedTokens: tm.totalIn + tm.totalOut,
+                      defaultMaxOutputTokens: baseMaxOutputTokens,
+                      leaseGuard,
+                    });
+                    return activeReservation.constrainedMaxOutputTokens;
+                  }
+                : null,
+            onTextDelta: (_delta, full) => {
+              if (profile?.streamDeltas !== false) {
+                this.eventRouter.emitEphemeral({
+                  sessionId,
+                  turnId,
+                  type: RUNTIME_EVENTS.ASSISTANT_DELTA,
+                  data: { turnId, sessionId, delta: _delta, text: full },
+                });
+              }
+            },
+            onReasoningDelta: (_delta, full) => {
+              if (profile?.streamDeltas !== false) {
+                this.eventRouter.emitEphemeral({
+                  sessionId,
+                  turnId,
+                  type: RUNTIME_EVENTS.REASONING_DELTA,
+                  data: { turnId, sessionId, delta: _delta, text: full },
+                });
+              }
+            },
+          });
+          executedStepsThisTurn++;
+          tm.addUsage(stepResult.usage);
+          if (activeReservation?.reservationId) {
+            budgetLedger.settleReservation(activeReservation.reservationId, {
+              status: 'settled',
+              actualSteps: 1,
+              actualInputTokens: stepResult.usage?.inputTokens ?? 0,
+              actualOutputTokens: stepResult.usage?.outputTokens ?? 0,
+              leaseGuard,
+            });
+            activeReservation = null;
+          }
+        } catch (infErr) {
+          if (infErr?.partialUsage) {
+            tm.addUsage(infErr.partialUsage);
+          }
+          if (activeReservation?.reservationId && checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
+            try {
+              budgetLedger.settleReservation(activeReservation.reservationId, {
+                status: 'failed',
+                actualSteps: 1,
+                actualInputTokens: infErr?.partialUsage?.inputTokens ?? 0,
+                actualOutputTokens: infErr?.partialUsage?.outputTokens ?? 0,
+                errorCode: infErr?.code || 'INFERENCE_FAILED',
+                leaseGuard,
               });
+            } catch (settleErr) {
+              if (!isLeaseLostError(settleErr)) throw settleErr;
             }
-          },
-          onReasoningDelta: (_delta, full) => {
-            if (profile?.streamDeltas !== false) {
-              this.eventRouter.emitEphemeral({
-                sessionId,
-                turnId,
-                type: RUNTIME_EVENTS.REASONING_DELTA,
-                data: { turnId, sessionId, delta: _delta, text: full },
-              });
-            }
-          },
-        });
-        tm.addUsage(stepResult.usage);
+            activeReservation = null;
+          }
+          throw infErr;
+        }
         signal?.throwIfAborted?.();
         leaseGuard?.();
 
@@ -641,6 +793,13 @@ export class AgentLoop {
       };
     } catch (err) {
       const classified = classifyError(err);
+      classified.usage = {
+        inputTokens: tm.totalIn,
+        outputTokens: tm.totalOut,
+        cacheReadTokens: tm.totalCacheRead,
+        cacheWriteTokens: tm.totalCacheWrite,
+      };
+      classified.steps = steps;
       // Fix D6: On LEASE_LOST (or if lease was already lost before error), exit cleanly without corrupting turn phase
       if (isLeaseLostError(classified) || !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
         throw isLeaseLostError(classified)

@@ -23,8 +23,10 @@ export class InferenceEngine {
     signal,
     onTextDelta = null,
     onReasoningDelta = null,
+    onRetryBudget = null,
   }) {
     let attempt = 0;
+    let activeMaxTokens = maxTokens;
     for (;;) {
       signal?.throwIfAborted?.();
       let text = '';
@@ -47,7 +49,7 @@ export class InferenceEngine {
           effort,
           messages,
           tools,
-          maxTokens,
+          maxTokens: activeMaxTokens,
           signal,
         })) {
           signal?.throwIfAborted?.();
@@ -82,7 +84,11 @@ export class InferenceEngine {
           usage,
         };
       } catch (err) {
-        if (signal?.aborted) throw classifyError(err);
+        if (signal?.aborted) {
+          const cancelled = classifyError(err);
+          cancelled.partialUsage = usage;
+          throw cancelled;
+        }
         const classified = classifyError(err);
         if (
           !emittedAnything &&
@@ -90,18 +96,27 @@ export class InferenceEngine {
           attempt < this.maxRetries
         ) {
           attempt++;
+          if (typeof onRetryBudget === 'function') {
+            const nextCap = onRetryBudget({ attempt, usage, error: classified });
+            if (typeof nextCap === 'number' && Number.isFinite(nextCap)) {
+              activeMaxTokens = nextCap;
+            }
+          }
           await delay(this.retryDelayMs * attempt, undefined, { signal });
           continue;
         }
-        throw classified instanceof InferenceError
-          ? classified
-          : classified.retryable
-            ? new InferenceError('INFERENCE_STREAM_FAILED', {
-                message: classified.message,
-                retryable: true,
-                cause: err,
-              })
-            : classified;
+        const outErr =
+          classified instanceof InferenceError
+            ? classified
+            : classified.retryable
+              ? new InferenceError('INFERENCE_STREAM_FAILED', {
+                  message: classified.message,
+                  retryable: true,
+                  cause: err,
+                })
+              : classified;
+        outErr.partialUsage = usage;
+        throw outErr;
       }
     }
   }

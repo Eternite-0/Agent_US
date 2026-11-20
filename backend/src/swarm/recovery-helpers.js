@@ -254,6 +254,7 @@ export function recoverInterruptedSwarmRuns({
   reconciler,
   artifactManager = null,
   eventRouter,
+  budgetLedger = null,
   getRun,
   cancelRun,
 }) {
@@ -263,8 +264,13 @@ export function recoverInterruptedSwarmRuns({
     reconcilingNodes: [],
     skippedTerminal: 0,
     skippedLiveOwners: 0,
+    budgetReconciliation: null,
   };
   if (!store?.db?.isOpen || !jobQueue) return report;
+
+  if (budgetLedger?.reconcileAfterRestart) {
+    report.budgetReconciliation = budgetLedger.reconcileAfterRestart();
+  }
 
   // Ensure cancelled runs never retain pending/active jobs
   store.tx(() => {
@@ -379,6 +385,13 @@ export function recoverInterruptedSwarmRuns({
     const hasPendingOrLive = (kind) => pendingKinds.has(kind) || liveKinds.has(kind);
     const run = getRun(runRow.id);
     if (!run) continue;
+
+    budgetLedger?.ensureLedger?.({
+      treeId: run.id,
+      rootSessionId: run.sessionId,
+      budget: run.budget,
+      initialUsage: run.usage,
+    });
 
     if (run.status === SWARM_RUN_STATES.PENDING || run.status === SWARM_RUN_STATES.PLANNING) {
       if (run.nodes.length === 0) {

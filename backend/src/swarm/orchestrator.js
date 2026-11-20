@@ -1,5 +1,5 @@
 import { id as uuid } from '../store.js';
-import { RuntimeError } from '../kernel/errors.js';
+import { BudgetError, RuntimeError } from '../kernel/errors.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import {
   classifyFailureKind,
@@ -11,6 +11,12 @@ import {
   checkLeaseHeld,
   isLeaseLostError,
 } from '../durable/lease-guard.js';
+import {
+  BUDGET_SCOPES,
+  TaskTreeBudgetLedger,
+  computeEffectiveNodeBudget,
+  isBudgetErrorCode,
+} from './budget-ledger.js';
 import { SWARM_JOB_KINDS, enqueueSwarmJob } from './jobs.js';
 import {
   SWARM_NODE_STATES,
@@ -52,6 +58,7 @@ export class AdaptiveSwarmOrchestrator {
     evidenceVerifier = null,
     modelFeedback = null,
     replanner = null,
+    budgetLedger = null,
   }) {
     this.store = store;
     this.jobQueue = jobQueue;
@@ -66,6 +73,13 @@ export class AdaptiveSwarmOrchestrator {
     this.evidenceVerifier = evidenceVerifier;
     this.modelFeedback = modelFeedback;
     this.replanner = replanner;
+    this.budgetLedger = budgetLedger ?? (store ? new TaskTreeBudgetLedger(store) : null);
+    if (this.replanner && !this.replanner.budgetLedger) {
+      this.replanner.budgetLedger = this.budgetLedger;
+    }
+    if (this.childManager && !this.childManager.budgetLedger) {
+      this.childManager.budgetLedger = this.budgetLedger;
+    }
     this.waiters = new Map(); // runId -> Set<fn>
     this.activeControllers = new Map(); // runId -> AbortController
   }
@@ -167,6 +181,11 @@ export class AdaptiveSwarmOrchestrator {
           now,
           now,
         );
+      this.budgetLedger?.ensureLedger({
+        treeId: runId,
+        rootSessionId: sessionId,
+        budget: budget ?? {},
+      });
       if (routedSpecs.length) {
         this.#insertNodes(runId, routedSpecs, parentPermissionMode, 1, now);
       }
@@ -378,6 +397,7 @@ export class AdaptiveSwarmOrchestrator {
       reconciler: this.reconciler,
       artifactManager: this.artifactManager,
       eventRouter: this.eventRouter,
+      budgetLedger: this.budgetLedger,
       getRun: (id) => this.getRun(id),
       cancelRun: (id) => this.cancelRun(id),
     });
@@ -420,7 +440,43 @@ export class AdaptiveSwarmOrchestrator {
     if (!run || isTerminalRunState(run.status)) return;
 
     if (run.nodes.length === 0) {
-      const planned = await this.planner.decompose({ goal: goal || run.goal, signal });
+      this.budgetLedger?.ensureLedger({
+        treeId: runId,
+        rootSessionId: run.sessionId,
+        budget: run.budget,
+        initialUsage: run.usage,
+      });
+      let planned;
+      try {
+        planned = await this.planner.decompose({
+          goal: goal || run.goal,
+          signal,
+          budgetLedger: this.budgetLedger,
+          treeId: runId,
+          sessionId: run.sessionId,
+        });
+      } catch (err) {
+        if (err instanceof BudgetError || err?.category === 'budget' || isBudgetErrorCode(err?.code)) {
+          transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.FAILED, {
+            patch: {
+              currentPhase: SWARM_RUN_STATES.FAILED,
+              errorCode: 'BUDGET_EXCEEDED',
+              errorMessage: String(err?.message ?? 'Planning blocked by task-tree budget'),
+            },
+          });
+          const settled = this.getRun(runId);
+          this.eventRouter?.emitPersisted({
+            sessionId: run.sessionId,
+            turnId: run.rootTurnId,
+            type: RUNTIME_EVENTS.SWARM_RUN_COMPLETED,
+            data: { runId, status: SWARM_RUN_STATES.FAILED, usage: settled.usage },
+            audit: true,
+          });
+          this.#notifyWaiters(settled);
+          return;
+        }
+        throw err;
+      }
       leaseGuard?.();
       this.planner.validateDag(planned);
       const routedSpecs = this.#prepareNodeSpecs(planned, run.budget);
@@ -472,19 +528,29 @@ export class AdaptiveSwarmOrchestrator {
       return;
     }
 
-    const budget = run.budget || {};
-    const usage = run.usage || {};
-    const overToken =
-      budget.maxTotalTokens > 0 &&
-      Number(usage.inputTokens || 0) + Number(usage.outputTokens || 0) >= budget.maxTotalTokens;
-    const overSteps = budget.maxTotalSteps > 0 && Number(usage.steps || 0) >= budget.maxTotalSteps;
-    if (overToken || overSteps) {
+    const ledgerSnap = this.budgetLedger?.ensureLedger({
+      treeId: runId,
+      rootSessionId: run.sessionId,
+      budget: run.budget,
+      initialUsage: run.usage,
+    });
+    const budgetExhausted = Boolean(
+      ledgerSnap?.isPermanentlyExhausted ||
+        (ledgerSnap?.isStepExhausted && ledgerSnap.reservedSteps === 0) ||
+        (ledgerSnap?.isTokenExhausted && ledgerSnap.reservedTokens === 0),
+    );
+    if (budgetExhausted) {
       for (const n of run.nodes) {
         if (n.status === SWARM_NODE_STATES.PENDING || n.status === SWARM_NODE_STATES.READY) {
           transitionSwarmNode(this.store, this.eventRouter, n.id, SWARM_NODE_STATES.CANCELLED, {
             sessionId: run.sessionId,
             rootTurnId: run.rootTurnId,
-            patch: { errorCode: 'BUDGET_EXCEEDED', errorMessage: 'Tree budget reached' },
+            patch: {
+              errorCode: 'BUDGET_EXCEEDED',
+              errorMessage: ledgerSnap?.exhaustedReason
+                ? `Tree budget reached (${ledgerSnap.exhaustedReason})`
+                : 'Tree budget reached',
+            },
           });
         }
       }
@@ -537,7 +603,11 @@ export class AdaptiveSwarmOrchestrator {
     ).length;
     const maxConc = Math.max(1, Number(run.strategy?.maxConcurrency ?? 3));
     const readyNodes = run.nodes.filter((n) => n.status === SWARM_NODE_STATES.READY);
-    const picked = readyNodes.slice(0, Math.max(0, maxConc - inFlight));
+    const liveSnap = this.budgetLedger?.getSnapshot(runId);
+    const stepSlots =
+      liveSnap && liveSnap.remainingSteps !== null ? liveSnap.remainingSteps : maxConc;
+    const dispatchSlots = Math.max(0, Math.min(maxConc - inFlight, stepSlots));
+    const picked = readyNodes.slice(0, dispatchSlots);
 
     if (picked.length > 0) {
       for (const n of picked) {
@@ -717,10 +787,16 @@ export class AdaptiveSwarmOrchestrator {
       const fullObjective = [...depResults, ...inboxMsgs, node.objective].join('\n\n');
 
       const cp = node.childTurnId ? this.checkpointStore?.loadLatest?.(node.childTurnId) : null;
-      const remainingSteps =
-        run.budget?.maxTotalSteps > 0
-          ? Math.max(1, Number(run.budget.maxTotalSteps) - Number(run.usage?.steps ?? 0))
-          : undefined;
+      const treeSnap = this.budgetLedger?.ensureLedger({
+        treeId: runId,
+        rootSessionId: run.sessionId,
+        budget: run.budget,
+        initialUsage: run.usage,
+      });
+      const effectiveNodeBudget = computeEffectiveNodeBudget(node.budget, treeSnap, run.budget);
+      const budgetScope = ['review', 'verification'].includes(node.taskType)
+        ? BUDGET_SCOPES.REVIEW_VERIFICATION
+        : BUDGET_SCOPES.NODE_EXECUTION;
       const parentSessRow = this.store.db
         .prepare('SELECT workspaceRoot, toolAllowJson FROM direct_sessions WHERE id=?')
         .get(run.sessionId);
@@ -738,10 +814,7 @@ export class AdaptiveSwarmOrchestrator {
         parentPermissionMode: run.permissionMode || 'auto-safe',
         parentAllowTools,
         allowedTools: node.toolAllow,
-        budget: {
-          ...(node.budget ?? {}),
-          ...(remainingSteps !== undefined ? { maxSteps: remainingSteps } : {}),
-        },
+        budget: effectiveNodeBudget,
         workspaceRoot: fallbackWorkspace,
         isolationMode: node.isolationMode,
         allowIsolationFallback: Boolean(node.allowIsolationFallback),
@@ -751,6 +824,8 @@ export class AdaptiveSwarmOrchestrator {
         attempt: nextAttempt,
         workerId,
         predecessorArtifacts,
+        budgetLedger: this.budgetLedger,
+        budgetScope,
         existingChildSessionId: node.childSessionId || null,
         resumeTurnId: node.childTurnId || null,
         initialStep: cp?.step ?? 0,
@@ -788,7 +863,7 @@ export class AdaptiveSwarmOrchestrator {
         ]),
       ];
 
-      // Fix D5 / D7: Single atomic SQLite commit enforcing fence/attempt ownership for BOTH usage settlement & node completion!
+      // Fix D5 / D7 / Fix E: Single atomic SQLite commit enforcing fence/attempt ownership for BOTH ledger-synced usage & node completion!
       const committedNode = this.store.tx(() => {
         assertLeaseInTx(nodeGuard, { runId, nodeId: node.id });
         const curNode = this.store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(node.id);
@@ -803,17 +878,45 @@ export class AdaptiveSwarmOrchestrator {
           });
         }
         const now = Date.now();
-        const curRun = this.store.db.prepare('SELECT usageJson FROM swarm_runs WHERE id=?').get(runId);
+        const curRun = this.store.db.prepare('SELECT status, usageJson FROM swarm_runs WHERE id=?').get(runId);
         const curUsage = parseJsonSafe(curRun?.usageJson, {});
-        const nextUsage = {
-          inputTokens: Number(curUsage.inputTokens ?? 0) + Number(childRes.usage?.inputTokens ?? 0),
-          outputTokens: Number(curUsage.outputTokens ?? 0) + Number(childRes.usage?.outputTokens ?? 0),
-          steps: Number(curUsage.steps ?? 0) + Number(childRes.steps ?? 0),
-          completedNodes: Number(curUsage.completedNodes ?? 0) + 1,
-        };
-        this.store.db
-          .prepare('UPDATE swarm_runs SET usageJson=?, updatedAt=? WHERE id=?')
-          .run(JSON.stringify(nextUsage), now, runId);
+        const ledgerRow = this.budgetLedger
+          ? this.store.db.prepare('SELECT * FROM budget_ledgers WHERE treeId=?').get(runId)
+          : null;
+        const reconciledTotals = ledgerRow
+          ? this.store.db
+              .prepare(
+                `SELECT COALESCE(SUM(actualSteps), 0) AS steps,
+                        COALESCE(SUM(actualInputTokens), 0) AS inTok,
+                        COALESCE(SUM(actualOutputTokens), 0) AS outTok
+                 FROM budget_reservations
+                 WHERE treeId=? AND status='reconciled'`,
+              )
+              .get(runId)
+          : null;
+        const nextUsage = ledgerRow
+          ? {
+              inputTokens: Math.max(0, Number(ledgerRow.usedInputTokens ?? 0) - Number(reconciledTotals?.inTok ?? 0)),
+              outputTokens: Math.max(0, Number(ledgerRow.usedOutputTokens ?? 0) - Number(reconciledTotals?.outTok ?? 0)),
+              steps: Math.max(0, Number(ledgerRow.usedSteps ?? 0) - Number(reconciledTotals?.steps ?? 0)),
+              completedNodes: Number(curUsage.completedNodes ?? 0) + 1,
+              reservedSteps: Number(ledgerRow.reservedSteps ?? 0),
+              reservedTokens: Number(ledgerRow.reservedTokens ?? 0),
+              estimationErrorTokens: Number(ledgerRow.estimationErrorTokens ?? 0),
+              overageSteps: Number(ledgerRow.overageSteps ?? 0),
+              overageTokens: Number(ledgerRow.overageTokens ?? 0),
+            }
+          : {
+              inputTokens: Number(curUsage.inputTokens ?? 0) + Number(childRes.usage?.inputTokens ?? 0),
+              outputTokens: Number(curUsage.outputTokens ?? 0) + Number(childRes.usage?.outputTokens ?? 0),
+              steps: Number(curUsage.steps ?? 0) + Number(childRes.steps ?? 0),
+              completedNodes: Number(curUsage.completedNodes ?? 0) + 1,
+            };
+        if (curRun && !isTerminalRunState(curRun.status)) {
+          this.store.db
+            .prepare('UPDATE swarm_runs SET usageJson=?, updatedAt=? WHERE id=? AND status=?')
+            .run(JSON.stringify(nextUsage), now, runId, curRun.status);
+        }
         this.store.db
           .prepare(
             `UPDATE swarm_nodes
@@ -979,8 +1082,8 @@ export class AdaptiveSwarmOrchestrator {
           failureKind,
           timedOut: failureKind === 'timeout',
           latencyMs: Date.now() - startedAt,
-          inputTokens: err?.detail?.usage?.inputTokens ?? 0,
-          outputTokens: err?.detail?.usage?.outputTokens ?? 0,
+          inputTokens: err?.usage?.inputTokens ?? err?.detail?.usage?.inputTokens ?? 0,
+          outputTokens: err?.usage?.outputTokens ?? err?.detail?.usage?.outputTokens ?? 0,
           recovered: Boolean(job.reclaimedFromCrash || job.attempts > 1),
         });
       });
@@ -993,6 +1096,7 @@ export class AdaptiveSwarmOrchestrator {
               errorCode,
               errorMessage,
               maxReplans: freshRun.strategy?.maxReplans ?? 2,
+              budgetLedger: this.budgetLedger,
             })
             .catch(() => ({ replanned: false }))
         : { replanned: false };
@@ -1224,6 +1328,11 @@ export class AdaptiveSwarmOrchestrator {
       nodes: run.nodes,
       usage: run.usage,
       verdict: run.verdict,
+      planVersion: run.planVersion,
+      replanCount: run.replanCount,
+      errorCode: run.errorCode ?? null,
+      errorMessage: run.errorMessage ?? null,
+      budgetLedger: this.budgetLedger?.getSnapshot?.(run.id) ?? null,
     };
   }
 

@@ -1,4 +1,6 @@
 import { Fault, id as uuid } from '../store.js';
+import { BudgetError } from '../kernel/errors.js';
+import { BUDGET_SCOPES, estimateRequestInputTokens } from './budget-ledger.js';
 
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
@@ -102,6 +104,7 @@ export class DynamicTaskPlanner {
       isolationMode: n.isolationMode ? String(n.isolationMode) : null,
       allowIsolationFallback: Boolean(n.allowIsolationFallback),
       priority: Number(n.priority ?? 0),
+      budget: n.budget && typeof n.budget === 'object' ? { ...n.budget } : {},
     }));
   }
 
@@ -111,41 +114,75 @@ export class DynamicTaskPlanner {
     maxNodes = 6,
     model = null,
     signal = undefined,
+    budgetLedger = null,
+    treeId = null,
+    sessionId = null,
   }) {
+    if (budgetLedger && treeId && budgetLedger.isExhausted(treeId)) {
+      throw new BudgetError('BUDGET_EXCEEDED', {
+        message: 'Task-tree budget exhausted before planning',
+        detail: { treeId, scope: BUDGET_SCOPES.PLANNING },
+      });
+    }
     const picked = model || this.router?.select({ taskType: 'planning', objective: goal })?.model;
     if (this.adapter && picked) {
+      const messages = [
+        {
+          role: 'system',
+          content: [
+            {
+              type: 'text',
+              text:
+                'Decompose the engineering goal into an acyclic JSON DAG: ' +
+                '{"nodes":[{"nodeKey":"research","taskType":"research","objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":false,"priority":10}]}. ' +
+                `Keep <= ${maxNodes} nodes. Return JSON only.`,
+            },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: workspaceSummary ? `${goal}\n\nContext:\n${workspaceSummary}` : goal,
+            },
+          ],
+        },
+      ];
+      let reservation = null;
+      if (budgetLedger && treeId) {
+        reservation = budgetLedger.reserveInference({
+          treeId,
+          scope: BUDGET_SCOPES.PLANNING,
+          sessionId,
+          estimatedInputTokens: estimateRequestInputTokens({ messages }),
+          requestedMaxOutputTokens: 1200,
+          defaultMaxOutputTokens: 1200,
+        });
+      }
+      let txt = '';
+      const usage = { inputTokens: 0, outputTokens: 0 };
       try {
-        let txt = '';
         for await (const chunk of this.adapter.stream({
           provider: 'pool',
           model: picked,
-          messages: [
-            {
-              role: 'system',
-              content: [
-                {
-                  type: 'text',
-                  text:
-                    'Decompose the engineering goal into an acyclic JSON DAG: ' +
-                    '{"nodes":[{"nodeKey":"research","taskType":"research","objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":false,"priority":10}]}. ' +
-                    `Keep <= ${maxNodes} nodes. Return JSON only.`,
-                },
-              ],
-            },
-            {
-              role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text: workspaceSummary ? `${goal}\n\nContext:\n${workspaceSummary}` : goal,
-                },
-              ],
-            },
-          ],
-          maxTokens: 1200,
+          messages,
+          maxTokens: reservation?.constrainedMaxOutputTokens ?? 1200,
           signal,
         })) {
           if (chunk.type === 'text-delta') txt += chunk.text;
+          else if (chunk.type === 'usage' && chunk.usage) {
+            usage.inputTokens += Number(chunk.usage.inputTokens ?? 0);
+            usage.outputTokens += Number(chunk.usage.outputTokens ?? 0);
+          }
+        }
+        if (reservation?.reservationId) {
+          budgetLedger.settleReservation(reservation.reservationId, {
+            status: 'settled',
+            actualSteps: 1,
+            actualInputTokens: usage.inputTokens,
+            actualOutputTokens: usage.outputTokens,
+          });
         }
         const parsed = extractJsonBlock(txt);
         const rawList = Array.isArray(parsed) ? parsed : parsed?.nodes;
@@ -154,7 +191,19 @@ export class DynamicTaskPlanner {
           this.validateDag(normalized);
           return normalized;
         }
-      } catch {
+      } catch (err) {
+        if (reservation?.reservationId) {
+          budgetLedger.settleReservation(reservation.reservationId, {
+            status: 'failed',
+            actualSteps: 1,
+            actualInputTokens: usage.inputTokens,
+            actualOutputTokens: usage.outputTokens,
+            errorCode: err?.code || 'PLANNING_FAILED',
+          });
+        }
+        if (err instanceof BudgetError || err?.category === 'budget') {
+          throw err;
+        }
         // Fall through to deterministic heuristic decomposition
       }
     }

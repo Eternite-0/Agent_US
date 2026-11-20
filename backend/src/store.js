@@ -434,6 +434,65 @@ export class Store {
           CREATE INDEX IF NOT EXISTS model_feedback_model ON model_feedback(model, createdAt);
         `);
       }
+      // --- 2.1.1 Group 3: Budget Ledger ---
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS budget_ledgers(
+          treeId TEXT PRIMARY KEY,
+          rootSessionId TEXT,
+          maxTotalSteps INTEGER,
+          maxTotalTokens INTEGER,
+          maxOutputTokens INTEGER,
+          usedSteps INTEGER NOT NULL DEFAULT 0,
+          usedInputTokens INTEGER NOT NULL DEFAULT 0,
+          usedOutputTokens INTEGER NOT NULL DEFAULT 0,
+          reservedSteps INTEGER NOT NULL DEFAULT 0,
+          reservedTokens INTEGER NOT NULL DEFAULT 0,
+          estimationErrorTokens INTEGER NOT NULL DEFAULT 0,
+          overageSteps INTEGER NOT NULL DEFAULT 0,
+          overageTokens INTEGER NOT NULL DEFAULT 0,
+          exhausted INTEGER NOT NULL DEFAULT 0,
+          exhaustedReason TEXT,
+          createdAt INTEGER NOT NULL,
+          updatedAt INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS budget_reservations(
+          id TEXT PRIMARY KEY,
+          treeId TEXT NOT NULL REFERENCES budget_ledgers(treeId) ON DELETE CASCADE,
+          scope TEXT NOT NULL,
+          nodeId TEXT,
+          nodeKey TEXT,
+          sessionId TEXT,
+          turnId TEXT,
+          attempt INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL DEFAULT 'reserved',
+          reservedSteps INTEGER NOT NULL DEFAULT 1,
+          estimatedInputTokens INTEGER NOT NULL DEFAULT 0,
+          reservedOutputTokens INTEGER NOT NULL DEFAULT 0,
+          reservedTotalTokens INTEGER NOT NULL DEFAULT 0,
+          actualSteps INTEGER NOT NULL DEFAULT 0,
+          actualInputTokens INTEGER NOT NULL DEFAULT 0,
+          actualOutputTokens INTEGER NOT NULL DEFAULT 0,
+          estimationErrorTokens INTEGER NOT NULL DEFAULT 0,
+          overageTokens INTEGER NOT NULL DEFAULT 0,
+          errorCode TEXT,
+          createdAt INTEGER NOT NULL,
+          settledAt INTEGER,
+          updatedAt INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS budget_reservations_tree_status ON budget_reservations(treeId, status);
+        CREATE INDEX IF NOT EXISTS budget_reservations_turn ON budget_reservations(turnId, status);
+      `);
+      const hasDupReplanVersions = this.db
+        .prepare(
+          'SELECT 1 FROM swarm_replans GROUP BY runId, version HAVING COUNT(*) > 1 LIMIT 1',
+        )
+        .get();
+      if (!hasDupReplanVersions) {
+        this.db.exec(
+          'CREATE UNIQUE INDEX IF NOT EXISTS swarm_replans_run_version ON swarm_replans(runId, version)',
+        );
+      }
+      // --- End 2.1.1 Group 3: Budget Ledger ---
       this.db.exec('PRAGMA user_version=7');
     });
   }

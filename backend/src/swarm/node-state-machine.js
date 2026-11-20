@@ -72,6 +72,42 @@ export const RUN_TRANSITIONS = Object.freeze({
   cancelled: new Set([]),
 });
 
+const ALLOWED_NODE_PATCH_COLS = new Set([
+  'childSessionId',
+  'childTurnId',
+  'jobId',
+  'activeJobId',
+  'activeFence',
+  'activeAttempt',
+  'latestArtifactId',
+  'worktreeLeaseId',
+  'reconcileApprovalId',
+  'model',
+  'provider',
+  'priority',
+  'resultText',
+  'artifactUrisJson',
+  'errorCode',
+  'errorMessage',
+  'attempts',
+  'dependenciesJson',
+  'planVersion',
+  'budgetJson',
+  'isolationMode',
+  'worktreePath',
+]);
+
+const ALLOWED_RUN_PATCH_COLS = new Set([
+  'planVersion',
+  'currentPhase',
+  'replanCount',
+  'usageJson',
+  'budgetJson',
+  'verdictJson',
+  'errorCode',
+  'errorMessage',
+]);
+
 export function isTerminalNodeState(status) {
   return TERMINAL_NODE.has(status);
 }
@@ -92,76 +128,86 @@ export function transitionSwarmNode(
     allowReplanReset = false,
     leaseGuard = null,
     bindingOwnership = false,
+    expectedPlanVersion = undefined,
+    emitEvent = true,
   } = {},
 ) {
-  const updated = store.tx(() => {
+  const { updated, changed } = store.tx(() => {
     const row = store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(nodeId);
     if (!row) {
       throw new RuntimeError('SWARM_NODE_NOT_FOUND', { detail: { nodeId } });
     }
     assertLeaseInTx(leaseGuard, { runId: row.runId, nodeId: row.id, bindingOwnership });
     const from = row.status;
-    if (from === toStatus) return row;
+    const definedEntries = Object.entries(patch ?? {}).filter(([, v]) => v !== undefined);
+    const validEntries = definedEntries.filter(([k]) => ALLOWED_NODE_PATCH_COLS.has(k));
 
-    if (from === 'failed' && !allowReplanReset) {
-      throw new RuntimeError('INVALID_SWARM_TRANSITION', {
-        message: `Illegal swarm_node transition ${from} -> ${toStatus} without explicit replan reset`,
-        detail: { nodeId, from, toStatus },
-      });
-    }
-    const allowed = NODE_TRANSITIONS[from];
-    if (!allowed || !allowed.has(toStatus)) {
-      throw new RuntimeError('INVALID_SWARM_TRANSITION', {
-        message: `Illegal swarm_node transition: ${from} -> ${toStatus}`,
-        detail: { nodeId, nodeKey: row.nodeKey, from, toStatus },
-      });
+    if (from === toStatus) {
+      // Strictly protect terminal states (completed/failed/cancelled) from metadata overwrites
+      if (isTerminalNodeState(from)) {
+        if (definedEntries.length > 0) {
+          throw new RuntimeError('INVALID_SWARM_TRANSITION', {
+            message: `Cannot overwrite metadata on terminal swarm_node state (${from})`,
+            detail: { nodeId, nodeKey: row.nodeKey, from, toStatus },
+          });
+        }
+        return { updated: row, changed: false };
+      }
+      if (validEntries.length === 0 && expectedPlanVersion === undefined) {
+        return { updated: row, changed: false };
+      }
+    } else {
+      if (from === 'failed' && !allowReplanReset) {
+        throw new RuntimeError('INVALID_SWARM_TRANSITION', {
+          message: `Illegal swarm_node transition ${from} -> ${toStatus} without explicit replan reset`,
+          detail: { nodeId, from, toStatus },
+        });
+      }
+      const allowed = NODE_TRANSITIONS[from];
+      if (!allowed || !allowed.has(toStatus)) {
+        throw new RuntimeError('INVALID_SWARM_TRANSITION', {
+          message: `Illegal swarm_node transition: ${from} -> ${toStatus}`,
+          detail: { nodeId, nodeKey: row.nodeKey, from, toStatus },
+        });
+      }
     }
 
     const now = Date.now();
     const fields = ['status=?', 'updatedAt=?'];
     const values = [toStatus, now];
-    const allowedPatchCols = new Set([
-      'childSessionId',
-      'childTurnId',
-      'jobId',
-      'activeJobId',
-      'activeFence',
-      'activeAttempt',
-      'latestArtifactId',
-      'worktreeLeaseId',
-      'reconcileApprovalId',
-      'model',
-      'provider',
-      'priority',
-      'resultText',
-      'artifactUrisJson',
-      'errorCode',
-      'errorMessage',
-      'attempts',
-      'dependenciesJson',
-      'planVersion',
-      'isolationMode',
-      'worktreePath',
-    ]);
-    for (const [k, v] of Object.entries(patch ?? {})) {
-      if (!allowedPatchCols.has(k) || v === undefined) continue;
+    for (const [k, v] of validEntries) {
       fields.push(`${k}=?`);
       values.push(v);
     }
+
+    const where = ['id=?', 'status=?'];
     values.push(nodeId, from);
+    if (expectedPlanVersion !== undefined) {
+      where.push('planVersion=?');
+      values.push(Number(expectedPlanVersion));
+    }
+
     const res = store.db
-      .prepare(`UPDATE swarm_nodes SET ${fields.join(', ')} WHERE id=? AND status=?`)
+      .prepare(`UPDATE swarm_nodes SET ${fields.join(', ')} WHERE ${where.join(' AND ')}`)
       .run(...values);
     if (!res.changes) {
       throw new RuntimeError('INVALID_SWARM_TRANSITION', {
         message: `Concurrent swarm_node modification blocked for ${nodeId}`,
-        detail: { nodeId, from, toStatus },
+        detail: {
+          nodeId,
+          from,
+          toStatus,
+          ...(expectedPlanVersion !== undefined ? { expectedPlanVersion, casConflict: true } : {}),
+        },
       });
     }
-    return store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(nodeId);
+    return {
+      updated: store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(nodeId),
+      changed: true,
+    };
   });
 
-  if (sessionId && eventRouter) {
+  if (changed && emitEvent && sessionId && eventRouter) {
     eventRouter.emitPersisted({
       sessionId,
       turnId: rootTurnId,
@@ -184,7 +230,13 @@ export function transitionSwarmRun(
   store,
   runId,
   toStatus,
-  { patch = {}, allowResume = false, leaseGuard = null } = {},
+  {
+    patch = {},
+    allowResume = false,
+    leaseGuard = null,
+    expectedPlanVersion = undefined,
+    expectedReplanCount = undefined,
+  } = {},
 ) {
   return store.tx(() => {
     const row = store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);
@@ -193,44 +245,75 @@ export function transitionSwarmRun(
     }
     assertLeaseInTx(leaseGuard, { runId: row.id });
     const from = row.status;
-    if (from === toStatus) return row;
-    if (from === 'failed' && !allowResume) {
-      throw new RuntimeError('INVALID_SWARM_TRANSITION', {
-        message: `Illegal swarm_run transition ${from} -> ${toStatus} without explicit resume`,
-        detail: { runId, from, toStatus },
-      });
+    const definedEntries = Object.entries(patch ?? {}).filter(([, v]) => v !== undefined);
+    const validEntries = definedEntries.filter(([k]) => ALLOWED_RUN_PATCH_COLS.has(k));
+
+    if (from === toStatus) {
+      // Strictly protect terminal states (completed/failed/cancelled) from metadata overwrites
+      if (isTerminalRunState(from)) {
+        if (definedEntries.length > 0) {
+          throw new RuntimeError('INVALID_SWARM_TRANSITION', {
+            message: `Cannot overwrite metadata on terminal swarm_run state (${from})`,
+            detail: { runId, from, toStatus },
+          });
+        }
+        return row;
+      }
+      if (
+        validEntries.length === 0 &&
+        expectedPlanVersion === undefined &&
+        expectedReplanCount === undefined
+      ) {
+        return row;
+      }
+    } else {
+      if (from === 'failed' && !allowResume) {
+        throw new RuntimeError('INVALID_SWARM_TRANSITION', {
+          message: `Illegal swarm_run transition ${from} -> ${toStatus} without explicit resume`,
+          detail: { runId, from, toStatus },
+        });
+      }
+      const allowed = RUN_TRANSITIONS[from];
+      if (!allowed || !allowed.has(toStatus)) {
+        throw new RuntimeError('INVALID_SWARM_TRANSITION', {
+          message: `Illegal swarm_run transition: ${from} -> ${toStatus}`,
+          detail: { runId, from, toStatus },
+        });
+      }
     }
-    const allowed = RUN_TRANSITIONS[from];
-    if (!allowed || !allowed.has(toStatus)) {
-      throw new RuntimeError('INVALID_SWARM_TRANSITION', {
-        message: `Illegal swarm_run transition: ${from} -> ${toStatus}`,
-        detail: { runId, from, toStatus },
-      });
-    }
+
     const now = Date.now();
     const fields = ['status=?', 'updatedAt=?'];
     const values = [toStatus, now];
-    const allowedCols = new Set([
-      'planVersion',
-      'currentPhase',
-      'replanCount',
-      'usageJson',
-      'verdictJson',
-      'errorCode',
-      'errorMessage',
-    ]);
-    for (const [k, v] of Object.entries(patch ?? {})) {
-      if (!allowedCols.has(k) || v === undefined) continue;
+    for (const [k, v] of validEntries) {
       fields.push(`${k}=?`);
       values.push(v);
     }
+
+    const where = ['id=?', 'status=?'];
     values.push(runId, from);
+    if (expectedPlanVersion !== undefined) {
+      where.push('planVersion=?');
+      values.push(Number(expectedPlanVersion));
+    }
+    if (expectedReplanCount !== undefined) {
+      where.push('replanCount=?');
+      values.push(Number(expectedReplanCount));
+    }
+
     const res = store.db
-      .prepare(`UPDATE swarm_runs SET ${fields.join(', ')} WHERE id=? AND status=?`)
+      .prepare(`UPDATE swarm_runs SET ${fields.join(', ')} WHERE ${where.join(' AND ')}`)
       .run(...values);
     if (!res.changes) {
       throw new RuntimeError('INVALID_SWARM_TRANSITION', {
         message: `Concurrent swarm_run modification blocked for ${runId}`,
+        detail: {
+          runId,
+          from,
+          toStatus,
+          ...(expectedPlanVersion !== undefined ? { expectedPlanVersion, casConflict: true } : {}),
+          ...(expectedReplanCount !== undefined ? { expectedReplanCount, casConflict: true } : {}),
+        },
       });
     }
     return store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);

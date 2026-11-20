@@ -258,11 +258,34 @@ export function resolveSwarmOutcome({
     };
   }
 
+  const budgetCodes = new Set([
+    'BUDGET_EXCEEDED',
+    'TOKEN_BUDGET',
+    'STEP_BUDGET',
+    'STEP_BUDGET_EXHAUSTED',
+    'COST_BUDGET',
+    'TASK_DEADLINE',
+  ]);
+  const isBudgetCode = (code) => budgetCodes.has(String(code || ''));
+  const budgetNodes = activeNodes.filter((n) => isBudgetCode(n.errorCode));
+
   const failedNodes = activeNodes.filter((n) => n.status === 'failed');
   if (failedNodes.length > 0) {
+    const primaryFailed =
+      failedNodes.find((n) => n.errorCode !== 'DEPENDENCY_FAILED') ?? failedNodes[0] ?? null;
+    const isBudgetFail =
+      budgetNodes.length > 0 && (!primaryFailed || isBudgetCode(primaryFailed.errorCode));
+    const errorCode = isBudgetFail
+      ? 'BUDGET_EXCEEDED'
+      : primaryFailed?.errorCode || 'SWARM_NODE_FAILED';
+    const errorMessage = isBudgetFail
+      ? primaryFailed?.errorMessage ||
+        budgetNodes[0]?.errorMessage ||
+        'Task-tree budget exhausted before completion'
+      : primaryFailed?.errorMessage || primaryFailed?.errorCode || 'Swarm node failed';
     const reasons = [
       ...normalized.reasons,
-      `SWARM_NODE_FAILED: ${failedNodes.map((n) => `${n.nodeKey}(${n.errorCode || 'failed'})`).join(', ')}`,
+      `${errorCode}: ${failedNodes.map((n) => `${n.nodeKey}(${n.errorCode || 'failed'})`).join(', ')}${primaryFailed?.errorMessage ? ` - ${primaryFailed.errorMessage}` : ''}`,
     ];
     const failVerdict = normalizeVerdict(
       { ...normalized, verdict: VERDICT_KINDS.FAIL, accepted: false, reasons: [...new Set(reasons)] },
@@ -270,15 +293,15 @@ export function resolveSwarmOutcome({
     );
     return {
       status: TERMINAL_STATES.FAILED,
-      errorCode: 'SWARM_NODE_FAILED',
-      errorMessage: failVerdict.reasons.join('; '),
+      errorCode,
+      errorMessage,
       verdict: failVerdict,
     };
   }
 
   const incompleteNodes = activeNodes.filter((n) => n.status !== 'completed');
   if (incompleteNodes.length > 0) {
-    const budgetStopped = incompleteNodes.some((n) => n.errorCode === 'BUDGET_EXCEEDED');
+    const budgetStopped = incompleteNodes.some((n) => isBudgetCode(n.errorCode));
     const code = budgetStopped ? 'BUDGET_EXCEEDED' : 'SWARM_INCOMPLETE_NODES';
     const reasons = [
       ...normalized.reasons,
@@ -291,7 +314,7 @@ export function resolveSwarmOutcome({
     return {
       status: TERMINAL_STATES.FAILED,
       errorCode: code,
-      errorMessage: failVerdict.reasons.join('; '),
+      errorMessage: incompleteNodes[0]?.errorMessage || failVerdict.reasons.join('; '),
       verdict: failVerdict,
     };
   }
