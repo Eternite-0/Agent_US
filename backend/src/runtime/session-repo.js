@@ -21,6 +21,19 @@ function parseJsonSafe(str, fallback) {
   }
 }
 
+function parseAllowlistJson(str) {
+  if (str === null || str === undefined || str === '') return null;
+  try {
+    const parsed = JSON.parse(str);
+    if (parsed === null) return null;
+    if (Array.isArray(parsed)) return parsed.map(String);
+    return [];
+  } catch {
+    // Fail-closed: corrupted non-null allowlist never widens to unrestricted null
+    return [];
+  }
+}
+
 /**
  * Persistence repository for Direct Sessions, Turns, Messages, Nonces,
  * Pre-mutation Snapshots, and Deterministic Rewind.
@@ -51,6 +64,8 @@ export class DirectSessionRepo {
       plan: parseJsonSafe(row.planJson, null),
       approvedPrefixes: parseJsonSafe(row.approvedPrefixes, []),
       budget: parseJsonSafe(row.budgetJson, null),
+      toolAllow: parseAllowlistJson(row.toolAllowJson),
+      toolDeny: parseJsonSafe(row.toolDenyJson, []),
     };
   }
 
@@ -94,6 +109,8 @@ export class DirectSessionRepo {
     rootSessionId = null,
     agentProfile = 'default',
     budget = null,
+    toolAllow = null,
+    toolDeny = null,
   } = {}) {
     const sessionId = customId?.trim() || uuid();
     const now = Date.now();
@@ -102,13 +119,15 @@ export class DirectSessionRepo {
       ? resolve(String(workspaceRoot))
       : this.getWorkspaceRoot();
     const nonce = mintNonce();
+    const toolAllowJson = Array.isArray(toolAllow) ? JSON.stringify([...new Set(toolAllow.map(String))]) : null;
+    const toolDenyJson = Array.isArray(toolDeny) && toolDeny.length ? JSON.stringify([...new Set(toolDeny.map(String))]) : null;
     this.store.tx(() => {
       this.store.db
         .prepare(
           `INSERT INTO direct_sessions(
             id, title, workspaceRoot, model, mode, permissionMode, state, nonce, approvedPrefixes,
-            parentSessionId, rootSessionId, agentProfile, budgetJson, createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,'idle',?,'[]',?,?,?,?,?,?)`,
+            parentSessionId, rootSessionId, agentProfile, budgetJson, toolAllowJson, toolDenyJson, createdAt, updatedAt
+          ) VALUES(?,?,?,?,?,?,'idle',?,'[]',?,?,?,?,?,?,?,?)`,
         )
         .run(
           sessionId,
@@ -122,6 +141,8 @@ export class DirectSessionRepo {
           rootSessionId ?? (parentSessionId ? null : sessionId),
           agentProfile || 'default',
           budget ? JSON.stringify(budget) : null,
+          toolAllowJson,
+          toolDenyJson,
           now,
           now,
         );

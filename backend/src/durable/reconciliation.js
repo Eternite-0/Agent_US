@@ -263,6 +263,80 @@ export class UnknownOutcomeReconciler {
     };
   }
 
+  /**
+   * Ensures a pending reconciliation approval exists whenever a session has unresolved
+   * `outcome_unknown` receipts (e.g. when `block_reconciliation` parks a turn).
+   */
+  ensurePendingReconciliationForSession(sessionId, { turnId = null } = {}) {
+    if (!sessionId || !this.store?.db?.isOpen) return { approvalId: null, unknownReceipts: [] };
+    const unknown = this.store.db
+      .prepare(
+        "SELECT * FROM tool_receipts WHERE sessionId=? AND status='outcome_unknown' ORDER BY createdAt ASC",
+      )
+      .all(sessionId);
+    if (!unknown.length) return { approvalId: null, unknownReceipts: [] };
+
+    const existingPending = this.store.db
+      .prepare(
+        "SELECT id FROM direct_approvals WHERE sessionId=? AND kind='reconciliation' AND status='pending' LIMIT 1",
+      )
+      .get(sessionId);
+    if (existingPending) {
+      return { approvalId: existingPending.id, unknownReceipts: unknown };
+    }
+
+    const first = unknown[0];
+    const approvalId = uuid();
+    const now = Date.now();
+    const targetTurnId = turnId || first.turnId || null;
+    this.store.tx(() => {
+      this.store.db
+        .prepare(
+          `INSERT INTO direct_approvals(
+            id, sessionId, turnId, callId, tool, arguments, status, kind, receiptId,
+            riskLevel, effectClass, expiresAt, createdAt
+          ) VALUES(?,?,?,?,?,?,'pending','reconciliation',?,?,?,?,?)`,
+        )
+        .run(
+          approvalId,
+          sessionId,
+          targetTurnId,
+          first.callId,
+          first.toolName,
+          JSON.stringify({
+            receiptId: first.id,
+            unknownReceiptIds: unknown.map((u) => u.id),
+            callId: first.callId,
+            toolName: first.toolName,
+            effectClass: first.effectClass,
+            reason: '存在状态未知的外部副作用 (outcome_unknown)，需人工核对确认后方可继续。',
+          }),
+          first.id,
+          first.riskLevel,
+          first.effectClass,
+          now + 86_400_000,
+          now,
+        );
+    });
+
+    if (this.eventRouter) {
+      this.eventRouter.emitPersisted({
+        sessionId,
+        turnId: targetTurnId,
+        type: RUNTIME_EVENTS.RECONCILIATION_REQUIRED,
+        data: {
+          approvalId,
+          receiptId: first.id,
+          unknownReceiptIds: unknown.map((u) => u.id),
+          tool: first.toolName,
+          callId: first.callId,
+        },
+        audit: true,
+      });
+    }
+    return { approvalId, unknownReceipts: unknown };
+  }
+
   listReconciliations({ sessionId = null, status = null, limit = 100 } = {}) {
     const where = ["kind='reconciliation'"];
     const params = [];
@@ -425,6 +499,24 @@ export class UnknownOutcomeReconciler {
               "UPDATE runtime_jobs SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE turnId=? AND status IN ('reconciling','parked')",
             )
             .run(now, row.turnId);
+        }
+        const remainingUnknown =
+          this.store.db
+            .prepare(
+              "SELECT COUNT(*) AS n FROM tool_receipts WHERE sessionId=? AND status='outcome_unknown'",
+            )
+            .get(row.sessionId)?.n ?? 0;
+        if (remainingUnknown === 0) {
+          this.store.db
+            .prepare(
+              "UPDATE direct_turns SET state='running', phase='checkpoint' WHERE sessionId=? AND state='reconciling'",
+            )
+            .run(row.sessionId);
+          this.store.db
+            .prepare(
+              "UPDATE runtime_jobs SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE sessionId=? AND status IN ('reconciling','parked')",
+            )
+            .run(now, row.sessionId);
         }
         this.store.db
           .prepare(

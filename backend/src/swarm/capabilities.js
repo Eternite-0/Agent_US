@@ -240,8 +240,8 @@ export class AgentCapabilityRegistry {
     }
 
     const base = this.archetypes.get(baseKey);
-    const effectiveTools = Array.isArray(requiredTools) && requiredTools.length
-      ? [...new Set(requiredTools)]
+    const effectiveTools = Array.isArray(requiredTools)
+      ? [...new Set(requiredTools.map(String))]
       : [...base.toolAllow];
     const isReadOnly =
       readOnly !== undefined

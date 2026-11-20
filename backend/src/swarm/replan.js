@@ -182,7 +182,9 @@ export class DynamicReplanner {
             sub.objective,
             sub.acceptance,
             JSON.stringify(sub.dependencies),
-            failedNode.toolAllowJson || JSON.stringify(sel.profile.toolAllow),
+            failedNode.toolAllowJson !== undefined && failedNode.toolAllowJson !== null
+              ? failedNode.toolAllowJson
+              : JSON.stringify(sel.profile.toolAllow),
             failedNode.permissionMode,
             sub.taskType,
             sub.isolationMode || 'shared_readonly',

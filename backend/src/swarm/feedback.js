@@ -16,7 +16,10 @@ export class ModelFeedbackTracker {
     success = true,
     toolTotal = 0,
     toolSuccess = 0,
-    verifiedPass = true,
+    verifiedPass = null,
+    verificationStatus = null,
+    failureKind = null,
+    cancelled = false,
     latencyMs = 0,
     timedOut = false,
     inputTokens = 0,
@@ -26,13 +29,37 @@ export class ModelFeedbackTracker {
   }) {
     if (!model || !this.store?.db?.isOpen) return null;
     const now = Date.now();
+    const isCancelled = Boolean(cancelled || failureKind === 'cancelled');
+    const isTimedOut = Boolean(timedOut || failureKind === 'timeout');
+    const normVerifiedPass =
+      verifiedPass === true ? 1 : verifiedPass === false ? 0 : null;
+    const normVerStatus =
+      verificationStatus ||
+      (normVerifiedPass === 1
+        ? 'passed'
+        : normVerifiedPass === 0
+          ? 'failed'
+          : 'unverified');
+    const normFailureKind =
+      failureKind ||
+      (isCancelled
+        ? 'cancelled'
+        : isTimedOut
+          ? 'timeout'
+          : !success
+            ? normVerifiedPass === 0
+              ? 'verification_failure'
+              : 'task_failure'
+            : null);
+
     this.store.tx(() => {
       this.store.db
         .prepare(
           `INSERT INTO model_feedback(
             model, provider, taskType, success, toolTotal, toolSuccess, verifiedPass,
-            latencyMs, timedOut, inputTokens, outputTokens, contextWindow, recovered, createdAt
-          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            latencyMs, timedOut, inputTokens, outputTokens, contextWindow, recovered,
+            verificationStatus, failureKind, cancelled, createdAt
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           String(model),
@@ -41,13 +68,16 @@ export class ModelFeedbackTracker {
           success ? 1 : 0,
           Math.max(0, Number(toolTotal || 0)),
           Math.max(0, Number(toolSuccess || 0)),
-          verifiedPass ? 1 : 0,
+          normVerifiedPass,
           Math.max(0, Number(latencyMs || 0)),
-          timedOut ? 1 : 0,
+          isTimedOut ? 1 : 0,
           Math.max(0, Number(inputTokens || 0)),
           Math.max(0, Number(outputTokens || 0)),
           Math.max(1, Number(contextWindow || 128_000)),
           recovered ? 1 : 0,
+          normVerStatus,
+          normFailureKind,
+          isCancelled ? 1 : 0,
           now,
         );
     });
@@ -78,66 +108,119 @@ export class ModelFeedbackTracker {
     if (!n) return this.#emptyStats();
 
     let sumSuccess = 0;
+    let nonCancelledCount = 0;
     let sumToolTotal = 0;
     let sumToolSuccess = 0;
+    let toolSampleCount = 0;
     let sumVerified = 0;
+    let verifiedSampleCount = 0;
     let sumLatency = 0;
     let sumTimedOut = 0;
     let sumTokens = 0;
     let sumCtxUtil = 0;
     let sumRecovered = 0;
+    let sumCancelled = 0;
+    const failureBreakdown = {
+      task_failure: 0,
+      tool_failure: 0,
+      verification_failure: 0,
+      timeout: 0,
+      cancelled: 0,
+      budget: 0,
+    };
 
     for (const r of rows) {
-      sumSuccess += Number(r.success || 0);
-      sumToolTotal += Number(r.toolTotal || 0);
-      sumToolSuccess += Number(r.toolSuccess || 0);
-      sumVerified += Number(r.verifiedPass || 0);
+      const rowCancelled = Number(r.cancelled || 0) === 1 || r.failureKind === 'cancelled';
+      if (rowCancelled) {
+        sumCancelled++;
+      } else {
+        nonCancelledCount++;
+        sumSuccess += Number(r.success || 0);
+      }
+
+      const tt = Number(r.toolTotal || 0);
+      const ts = Number(r.toolSuccess || 0);
+      if (tt > 0) {
+        toolSampleCount++;
+        sumToolTotal += tt;
+        sumToolSuccess += ts;
+      }
+
+      const isUnverified =
+        r.verifiedPass === null ||
+        r.verifiedPass === undefined ||
+        r.verificationStatus === 'unverified';
+      if (!isUnverified && !rowCancelled) {
+        verifiedSampleCount++;
+        sumVerified += Number(r.verifiedPass || 0) ? 1 : 0;
+      }
+
       sumLatency += Number(r.latencyMs || 0);
       sumTimedOut += Number(r.timedOut || 0);
       const tok = Number(r.inputTokens || 0) + Number(r.outputTokens || 0);
       sumTokens += tok;
       sumCtxUtil += Math.min(1, tok / Math.max(1, Number(r.contextWindow || 128_000)));
       sumRecovered += Number(r.recovered || 0);
+
+      if (r.failureKind && Object.hasOwn(failureBreakdown, r.failureKind)) {
+        failureBreakdown[r.failureKind]++;
+      }
     }
 
-    const successRate = sumSuccess / n;
-    const toolSuccessRate = sumToolTotal > 0 ? Math.min(1, sumToolSuccess / sumToolTotal) : 1;
-    const verificationPassRate = sumVerified / n;
+    const successRate = nonCancelledCount > 0 ? sumSuccess / nonCancelledCount : null;
+    const toolSuccessRate = sumToolTotal > 0 ? Math.min(1, sumToolSuccess / sumToolTotal) : null;
+    const verificationPassRate = verifiedSampleCount > 0 ? sumVerified / verifiedSampleCount : null;
     const avgLatencyMs = sumLatency / n;
-    const timeoutRate = sumTimedOut / n;
+    const timeoutRate = nonCancelledCount > 0 ? sumTimedOut / nonCancelledCount : 0;
     const avgTokens = sumTokens / n;
     const contextUtilization = sumCtxUtil / n;
     const recoveryRate = sumRecovered / n;
+    const cancellationRate = sumCancelled / n;
     const confidence = Number((n / (n + CONFIDENCE_PRIOR_WEIGHT)).toFixed(4));
 
     const speedFactor = Math.max(0, 1 - avgLatencyMs / 60_000);
-    const empiricalScore = Number(
-      Math.max(
-        0,
-        Math.min(
-          1,
-          0.35 * successRate +
-            0.2 * toolSuccessRate +
-            0.2 * verificationPassRate +
-            0.15 * (1 - timeoutRate) +
-            0.1 * speedFactor,
-        ),
-      ).toFixed(4),
-    );
+    let weightedSum = 0;
+    let totalWeight = 0;
+    if (successRate !== null) {
+      weightedSum += 0.35 * successRate;
+      totalWeight += 0.35;
+    }
+    if (toolSuccessRate !== null) {
+      weightedSum += 0.2 * toolSuccessRate;
+      totalWeight += 0.2;
+    }
+    if (verificationPassRate !== null) {
+      weightedSum += 0.2 * verificationPassRate;
+      totalWeight += 0.2;
+    }
+    if (nonCancelledCount > 0) {
+      weightedSum += 0.15 * (1 - timeoutRate) + 0.1 * speedFactor;
+      totalWeight += 0.25;
+    }
+
+    const empiricalScore =
+      totalWeight > 0
+        ? Number(Math.max(0, Math.min(1, weightedSum / totalWeight)).toFixed(4))
+        : null;
 
     return {
       sampleCount: n,
       confidence,
       empiricalScore,
       metrics: {
-        successRate: Number(successRate.toFixed(4)),
-        toolSuccessRate: Number(toolSuccessRate.toFixed(4)),
-        verificationPassRate: Number(verificationPassRate.toFixed(4)),
+        successRate: successRate !== null ? Number(successRate.toFixed(4)) : null,
+        toolSuccessRate: toolSuccessRate !== null ? Number(toolSuccessRate.toFixed(4)) : null,
+        verificationPassRate:
+          verificationPassRate !== null ? Number(verificationPassRate.toFixed(4)) : null,
+        verifiedSampleCount,
+        toolSampleCount,
         avgLatencyMs: Math.round(avgLatencyMs),
         timeoutRate: Number(timeoutRate.toFixed(4)),
         avgTokens: Math.round(avgTokens),
         contextUtilization: Number(contextUtilization.toFixed(4)),
         recoveryRate: Number(recoveryRate.toFixed(4)),
+        cancellationRate: Number(cancellationRate.toFixed(4)),
+        failureBreakdown,
       },
     };
   }
@@ -151,11 +234,22 @@ export class ModelFeedbackTracker {
         successRate: null,
         toolSuccessRate: null,
         verificationPassRate: null,
+        verifiedSampleCount: 0,
+        toolSampleCount: 0,
         avgLatencyMs: 0,
         timeoutRate: 0,
         avgTokens: 0,
         contextUtilization: 0,
         recoveryRate: 0,
+        cancellationRate: 0,
+        failureBreakdown: {
+          task_failure: 0,
+          tool_failure: 0,
+          verification_failure: 0,
+          timeout: 0,
+          cancelled: 0,
+          budget: 0,
+        },
       },
     };
   }

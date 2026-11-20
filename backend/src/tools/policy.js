@@ -26,8 +26,50 @@ export const PERMISSION_RANK = Object.freeze({
 });
 
 /**
+ * Normalizes a tool allowlist with explicit semantics:
+ * - null / undefined => null (no extra allowlist restriction)
+ * - [] => [] (allow NO tools)
+ * - non-empty array => deduplicated list (allow ONLY listed tools)
+ */
+export function normalizeToolAllowlist(allowTools) {
+  if (allowTools === null || allowTools === undefined) return null;
+  if (!Array.isArray(allowTools)) return null;
+  return [...new Set(allowTools.map((t) => String(t)))];
+}
+
+export function intersectAllowlists(a, b) {
+  const normA = normalizeToolAllowlist(a);
+  const normB = normalizeToolAllowlist(b);
+  if (Array.isArray(normA) && Array.isArray(normB)) {
+    const bSet = new Set(normB);
+    return normA.filter((t) => bSet.has(t));
+  }
+  if (Array.isArray(normA)) return [...normA];
+  if (Array.isArray(normB)) return [...normB];
+  return null;
+}
+
+export function isToolAllowedByAllowlist(toolName, allowTools) {
+  const norm = normalizeToolAllowlist(allowTools);
+  if (norm === null) return true;
+  return norm.includes(String(toolName ?? ''));
+}
+
+export function filterToolsByPolicy(tools, { denyTools = [], allowTools = null } = {}) {
+  const denySet = new Set(denyTools ?? []);
+  const normAllow = normalizeToolAllowlist(allowTools);
+  const allowSet = Array.isArray(normAllow) ? new Set(normAllow) : null;
+  return tools.filter((t) => {
+    if (denySet.has(t.name)) return false;
+    if (allowSet !== null && !allowSet.has(t.name)) return false;
+    return true;
+  });
+}
+
+/**
  * Intersects parent and child permission policies so child agents can never
  * escalate permissions or bypass deny rules.
+ * Preserves explicit [] allowlist semantics (never widens [] to null).
  */
 export function intersectPolicies(parentPolicy = {}, childPolicy = {}) {
   const parentMode = parentPolicy.permissionMode ?? 'auto-safe';
@@ -39,15 +81,7 @@ export function intersectPolicies(parentPolicy = {}, childPolicy = {}) {
   const denyTools = [
     ...new Set([...(parentPolicy.denyTools ?? []), ...(childPolicy.denyTools ?? [])]),
   ];
-  let allowTools = null;
-  if (Array.isArray(parentPolicy.allowTools) && Array.isArray(childPolicy.allowTools)) {
-    const childSet = new Set(childPolicy.allowTools);
-    allowTools = parentPolicy.allowTools.filter((t) => childSet.has(t));
-  } else if (Array.isArray(parentPolicy.allowTools)) {
-    allowTools = [...parentPolicy.allowTools];
-  } else if (Array.isArray(childPolicy.allowTools)) {
-    allowTools = [...childPolicy.allowTools];
-  }
+  const allowTools = intersectAllowlists(parentPolicy.allowTools, childPolicy.allowTools);
 
   return {
     permissionMode: effectiveMode,
@@ -68,28 +102,48 @@ export class ToolPermissionPolicy {
     alwaysDenyRules = [],
     alwaysAllowRules = [],
     alwaysAskRules = [],
+    allowTools = null,
     allowOutwardInFullAccess = false,
   } = {}) {
     this.permissionMode = permissionMode;
     this.alwaysDenyRules = new Set(alwaysDenyRules);
     this.alwaysAllowRules = new Set(alwaysAllowRules);
     this.alwaysAskRules = new Set(alwaysAskRules);
+    this.allowTools = normalizeToolAllowlist(allowTools);
     this.allowOutwardInFullAccess = Boolean(allowOutwardInFullAccess);
   }
 
   evaluate(
     toolDef,
     args = {},
-    { approvedPrefixes = [], tainted = false, permissionMode = this.permissionMode } = {},
+    {
+      approvedPrefixes = [],
+      tainted = false,
+      permissionMode = this.permissionMode,
+      allowTools = undefined,
+      denyTools = undefined,
+    } = {},
   ) {
     const name = toolDef.name;
     const meta = toolDef.meta ?? {};
 
-    if (this.alwaysDenyRules.has(name)) {
+    if (this.alwaysDenyRules.has(name) || (Array.isArray(denyTools) && denyTools.includes(name))) {
       return {
         decision: 'deny',
         reason: `Tool "${name}" denied by policy rule`,
         rule: 'always_deny',
+      };
+    }
+
+    const effectiveAllow = intersectAllowlists(this.allowTools, allowTools);
+    if (Array.isArray(effectiveAllow) && !effectiveAllow.includes(name)) {
+      return {
+        decision: 'deny',
+        reason:
+          effectiveAllow.length === 0
+            ? `Tool "${name}" denied: empty tool allowlist`
+            : `Tool "${name}" is not in allowed tool allowlist`,
+        rule: effectiveAllow.length === 0 ? 'allowlist_empty' : 'allowlist_denied',
       };
     }
 

@@ -247,7 +247,7 @@ export class DynamicTaskPlanner {
           normalized.objective,
           normalized.acceptance,
           JSON.stringify(normalized.dependencies),
-          normalized.toolAllow ? JSON.stringify(normalized.toolAllow) : null,
+          Array.isArray(normalized.toolAllow) ? JSON.stringify(normalized.toolAllow) : null,
           normalized.priority,
           now,
           now,

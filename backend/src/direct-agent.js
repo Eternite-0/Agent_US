@@ -1,11 +1,13 @@
 import { execFile } from 'node:child_process';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { Fault, id as uuid } from './store.js';
 import { excerpt } from './context.js';
 import { AgentRuntimeKernel } from './kernel/runtime.js';
 import { EvidenceVerifier } from './governance/verifier.js';
-import { classifyError } from './kernel/errors.js';
+import { RecoveryError, classifyError } from './kernel/errors.js';
+import { RUNTIME_EVENTS } from './kernel/events.js';
+import { classifyFailureKind, safeIsolateSideEffect } from './kernel/verdict.js';
 import { DurableJobQueue } from './durable/job-queue.js';
 import { CheckpointStore } from './durable/checkpoint.js';
 import { UnknownOutcomeReconciler } from './durable/reconciliation.js';
@@ -22,6 +24,7 @@ import {
 import { McpHub } from './mcp-client.js';
 import { ToolDispatcher } from './tools/dispatcher.js';
 import { ToolPermissionPolicy } from './tools/policy.js';
+import { HookTrustManager } from './tools/hook-trust.js';
 import { GitWorktreeIsolator, HostSandboxAdapter } from './tools/sandbox.js';
 import { McpLifecycleManager } from './tools/mcp-lifecycle.js';
 import { DirectSessionRepo } from './runtime/session-repo.js';
@@ -110,6 +113,10 @@ export class DirectAgentRuntime {
 
     this.toolPolicy = new ToolPermissionPolicy();
     this.sandbox = new HostSandboxAdapter();
+    this.hookTrust = new HookTrustManager({
+      store: this.store,
+      eventRouter: this.eventRouter,
+    });
     this.kernel.setToolDispatcher(
       new ToolDispatcher({
         store: this.store,
@@ -219,12 +226,15 @@ export class DirectAgentRuntime {
       getWorkspaceTools: ({ workspaceRoot, sessionId, permissionMode, nonce, signal }) =>
         createWorkspaceTools({
           workspaceRoot,
+          dataRoot: this.dataRoot,
           store: this.store,
           sessionId,
           permissionMode,
           nonce,
           processManager: this.processManager,
           sandbox: this.sandbox,
+          onHookConfigMutated: ({ path, toolName }) =>
+            this.hookTrust.onConfigMutated({ filePath: path, toolName }),
           signal,
         }),
     });
@@ -366,6 +376,30 @@ export class DirectAgentRuntime {
   }
   decideApproval(approvalId, opts) {
     return this.approvalManager.decideApproval(approvalId, opts);
+  }
+
+  // ---- Explicit Hook Config Trust Boundary APIs ----
+
+  approveHookConfig(filePath = null, opts = {}) {
+    const target = filePath || join(this.getWorkspaceRoot(), '.agent-us', 'hooks.json');
+    return this.hookTrust.approveFile(target, {
+      workspaceRoot: opts.workspaceRoot ?? this.getWorkspaceRoot(),
+      ...opts,
+    });
+  }
+
+  revokeHookConfig(filePath = null, opts = {}) {
+    const target = filePath || join(this.getWorkspaceRoot(), '.agent-us', 'hooks.json');
+    return this.hookTrust.revokeFile(target, opts);
+  }
+
+  inspectHookConfig(filePath = null) {
+    const target = filePath || join(this.getWorkspaceRoot(), '.agent-us', 'hooks.json');
+    return this.hookTrust.inspectFile(target);
+  }
+
+  listHookTrust(opts = {}) {
+    return this.hookTrust.listApprovals(opts);
   }
 
   // ---- Mid-Turn Steering Queue ----
@@ -620,10 +654,13 @@ export class DirectAgentRuntime {
     this.childManager?.cancelDescendants?.(row.sessionId);
     if (['running', 'reconciling', 'parked'].includes(row.state)) {
       const now = Date.now();
-      this.store.tx(() => {
-        this.store.db
-          .prepare("UPDATE direct_turns SET state='cancelled', phase='cancelled', finishedAt=? WHERE id=?")
+      const cancelled = this.store.tx(() => {
+        const res = this.store.db
+          .prepare(
+            "UPDATE direct_turns SET state='cancelled', phase='cancelled', finishedAt=? WHERE id=? AND state IN ('running','reconciling','parked')",
+          )
           .run(now, turnId);
+        if ((res.changes ?? 0) === 0) return false;
         this.store.db
           .prepare("UPDATE direct_sessions SET state='cancelled', updatedAt=? WHERE id=?")
           .run(now, row.sessionId);
@@ -632,8 +669,11 @@ export class DirectAgentRuntime {
             "UPDATE direct_approvals SET status='expired', resolvedAt=? WHERE turnId=? AND status='pending'",
           )
           .run(now, turnId);
+        return true;
       });
-      this.#emitPersisted(row.sessionId, turnId, 'turn/cancelled', { turnId });
+      if (cancelled) {
+        this.#emitPersisted(row.sessionId, turnId, 'turn/cancelled', { turnId });
+      }
     }
     return this.store.db.prepare('SELECT * FROM direct_turns WHERE id=?').get(turnId);
   }
@@ -726,11 +766,17 @@ export class DirectAgentRuntime {
   }) {
     const started = Date.now();
     const nonce = this.sessionRepo.ensureSessionNonce(sessionId);
-    const hooks = new HookRunner(workspaceRoot, { dataRoot: this.dataRoot });
+    const hooks = new HookRunner(workspaceRoot, {
+      dataRoot: this.dataRoot,
+      store: this.store,
+      trustManager: this.hookTrust,
+    });
     let totalIn = 0;
     let totalOut = 0;
     let totalCacheRead = 0;
     let steps = initialStep;
+    let effectiveModel = model || null;
+    let contextWindow = 128_000;
 
     let readFileState = this.readFileStates.get(sessionId);
     if (!readFileState) {
@@ -750,7 +796,7 @@ export class DirectAgentRuntime {
     }
 
     try {
-      const effectiveModel = model || this.pool.getDefaultModel();
+      effectiveModel = model || this.pool.getDefaultModel() || null;
       if (!effectiveModel) {
         throw new Fault('NO_MODEL_CONFIGURED', 400, {
           message:
@@ -762,7 +808,7 @@ export class DirectAgentRuntime {
         detectGitBranch(workspaceRoot),
         this.mcpManager.discoverTools(workspaceRoot).catch(() => []),
         hooks
-          .run('SessionStart', { sessionId, turnId, input })
+          .run('SessionStart', { sessionId, turnId, input }, { signal, permissionMode })
           .catch(() => ({ blocked: false, additionalContexts: [] })),
       ]);
       const projectInstructions = discoverProjectInstructions(workspaceRoot);
@@ -774,6 +820,7 @@ export class DirectAgentRuntime {
 
       const tools = createWorkspaceTools({
         workspaceRoot,
+        dataRoot: this.dataRoot,
         store: this.store,
         sessionId,
         permissionMode,
@@ -784,6 +831,8 @@ export class DirectAgentRuntime {
         sandbox: this.sandbox,
         mcpTools,
         signal,
+        onHookConfigMutated: ({ path, toolName }) =>
+          this.hookTrust.onConfigMutated({ filePath: path, toolName }),
         requestApproval: ({ tool, arguments: args, callId, riskLevel, effectClass, argsDigest }) =>
           this.approvalManager.requestApproval({
             sessionId,
@@ -862,7 +911,7 @@ export class DirectAgentRuntime {
         hookContexts: startHook.additionalContexts ?? [],
       });
 
-      const contextWindow = this.pool.getModelContextWindow(effectiveModel);
+      contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
       const loopResult = await this.kernel.executeTurn({
         sessionId,
         turnId,
@@ -876,6 +925,8 @@ export class DirectAgentRuntime {
         tools,
         hooks,
         permissionMode,
+        allowTools: currentSession.toolAllow ?? undefined,
+        denyTools: currentSession.toolDeny?.length ? currentSession.toolDeny : undefined,
         getApprovedPrefixes: () => this.getSession(sessionId).approvedPrefixes ?? [],
         requestApproval: ({ tool, arguments: args, callId, riskLevel, effectClass, argsDigest }) =>
           this.approvalManager.requestApproval({
@@ -959,10 +1010,6 @@ export class DirectAgentRuntime {
           .get(sessionId, turnId)?.n ??
         0;
 
-      await hooks
-        .run('Stop', { sessionId, turnId, steps, text: excerpt(finalAssistantText, 1000) })
-        .catch(() => {});
-
       const durationMs = Date.now() - started;
       const finishedAt = Date.now();
       const totalTokens = totalIn + totalOut;
@@ -970,11 +1017,171 @@ export class DirectAgentRuntime {
       if (this.closed || !this.store.db?.isOpen) return;
       leaseGuard?.();
 
-      this.store.tx(() => {
-        this.store.db
+      const receiptStats = this.store.db
+        .prepare(
+          "SELECT COUNT(*) AS total, SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS ok, SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed FROM tool_receipts WHERE sessionId=? AND turnId=?",
+        )
+        .get(sessionId, turnId);
+
+      // 1. block_reconciliation -> park in recoverable reconciling state (NEVER completed)
+      if (loopResult.status === 'reconciling') {
+        const recEnsure = this.reconciler.ensurePendingReconciliationForSession(sessionId, {
+          turnId,
+        });
+        const parked = this.store.tx(() => {
+          const res = this.store.db
+            .prepare(
+              `UPDATE direct_turns
+               SET state='reconciling', phase='reconciling', inputTokens=?, outputTokens=?, durationMs=?,
+                   verdictJson=?, evidenceCount=?
+               WHERE id=? AND state IN ('running','reconciling','parked')`,
+            )
+            .run(
+              totalIn,
+              totalOut,
+              durationMs,
+              finalVerdict ? JSON.stringify(finalVerdict) : null,
+              Number(evidenceCount || 0),
+              turnId,
+            );
+          if ((res.changes ?? 0) === 0) return false;
+          this.store.db
+            .prepare(
+              "UPDATE direct_sessions SET state='reconciling', updatedAt=? WHERE id=? AND state!='cancelled'",
+            )
+            .run(finishedAt, sessionId);
+          return true;
+        });
+        if (parked) {
+          this.#emitPersisted(sessionId, turnId, RUNTIME_EVENTS.TURN_PARKED, {
+            turnId,
+            sessionId,
+            reason: 'block_reconciliation',
+            approvalId: recEnsure.approvalId ?? null,
+            verdict: finalVerdict,
+          });
+        }
+        throw new RecoveryError('RECONCILIATION_REQUIRED', {
+          message:
+            loopResult.errorMessage ||
+            '存在状态未知的外部副作用 (outcome_unknown)，需人工核对后方可完成',
+          detail: {
+            turnId,
+            sessionId,
+            approvalId: recEnsure.approvalId ?? null,
+            verdict: finalVerdict,
+            alreadyParked: true,
+          },
+        });
+      }
+
+      // 2. Verification failed / step limit exhausted / thrashing break -> commit failed (NEVER completed)
+      if (loopResult.status === 'failed') {
+        const errorMessage = String(
+          loopResult.errorMessage || loopResult.errorCode || 'VERIFICATION_FAILED',
+        );
+        const errorCode = String(loopResult.errorCode || 'VERIFICATION_FAILED');
+        const committed = this.store.tx(() => {
+          const res = this.store.db
+            .prepare(
+              `UPDATE direct_turns
+               SET state='failed', phase='failed', error=?, inputTokens=?, outputTokens=?, durationMs=?,
+                   verdictJson=?, evidenceCount=?, finishedAt=?
+               WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
+            )
+            .run(
+              errorMessage.slice(0, 1000),
+              totalIn,
+              totalOut,
+              durationMs,
+              finalVerdict ? JSON.stringify(finalVerdict) : null,
+              Number(evidenceCount || 0),
+              finishedAt,
+              turnId,
+            );
+          if ((res.changes ?? 0) === 0) return false;
+          this.store.db
+            .prepare(
+              "UPDATE direct_sessions SET state='failed', updatedAt=? WHERE id=? AND state!='cancelled'",
+            )
+            .run(finishedAt, sessionId);
+          if (totalTokens > 0) {
+            this.store.db
+              .prepare(
+                `INSERT INTO nexus_usage(
+                  sessionId, provider, model, day, inputTokens, outputTokens, tokens, costUsd, durationMs, createdAt
+                ) VALUES(?,'pool',?,?,?,?,?,0,?,?)`,
+              )
+              .run(
+                sessionId,
+                effectiveModel,
+                todayDateStr(),
+                totalIn,
+                totalOut,
+                totalTokens,
+                durationMs,
+                finishedAt,
+              );
+          }
+          return true;
+        });
+
+        if (committed) {
+          this.#emitPersisted(sessionId, turnId, 'turn/failed', {
+            turnId,
+            sessionId,
+            model: effectiveModel,
+            steps,
+            error: errorMessage,
+            code: errorCode,
+            verdict: finalVerdict,
+            evidenceCount: Number(evidenceCount || 0),
+            durationMs,
+          });
+          safeIsolateSideEffect(() =>
+            this.store.event('direct.turn.failed', null, null, {
+              sessionId,
+              turnId,
+              model: effectiveModel,
+              steps,
+              code: errorCode,
+              durationMs,
+            }),
+          );
+          safeIsolateSideEffect(() =>
+            this.modelFeedback.record({
+              model: effectiveModel,
+              provider: 'pool',
+              taskType: mode || 'direct',
+              success: false,
+              toolTotal: Number(receiptStats?.total ?? 0),
+              toolSuccess: Number(receiptStats?.ok ?? 0),
+              verifiedPass: loopResult.verifiedPass ?? false,
+              failureKind: loopResult.failureKind || 'verification_failure',
+              latencyMs: durationMs,
+              inputTokens: totalIn,
+              outputTokens: totalOut,
+              contextWindow,
+              recovered: Boolean(isRecovery),
+            }),
+          );
+        }
+        await safeIsolateSideEffect(() =>
+          hooks.run(
+            'Stop',
+            { sessionId, turnId, steps, status: 'failed', text: excerpt(finalAssistantText, 1000) },
+            { signal, permissionMode },
+          ),
+        );
+        return;
+      }
+
+      // 3. Verified completion (or explicit plain-text no-tool completion)
+      const committed = this.store.tx(() => {
+        const res = this.store.db
           .prepare(
             `UPDATE direct_turns
-             SET state='completed', inputTokens=?, outputTokens=?, durationMs=?,
+             SET state='completed', phase='completed', inputTokens=?, outputTokens=?, durationMs=?,
                  verdictJson=?, evidenceCount=?, finishedAt=?
              WHERE id=? AND state IN ('running','reconciling','parked')`,
           )
@@ -987,6 +1194,7 @@ export class DirectAgentRuntime {
             finishedAt,
             turnId,
           );
+        if ((res.changes ?? 0) === 0) return false;
         this.store.db
           .prepare(
             "UPDATE direct_sessions SET state='completed', updatedAt=? WHERE id=? AND state!='cancelled'",
@@ -1008,57 +1216,70 @@ export class DirectAgentRuntime {
             durationMs,
             finishedAt,
           );
+        return true;
       });
 
-      this.store.event('direct.turn.completed', null, null, {
-        sessionId,
-        turnId,
-        model: effectiveModel,
-        steps,
-        inputTokens: totalIn,
-        outputTokens: totalOut,
-        cacheReadTokens: totalCacheRead,
-        durationMs,
-        evidenceCount: Number(evidenceCount || 0),
-      });
+      if (committed) {
+        this.#emitPersisted(sessionId, turnId, 'turn/completed', {
+          turnId,
+          sessionId,
+          model: effectiveModel,
+          steps,
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+          cacheReadTokens: totalCacheRead,
+          durationMs,
+          verdict: finalVerdict,
+          evidenceCount: Number(evidenceCount || 0),
+          text: excerpt(finalAssistantText, 4000),
+        });
 
-      const receiptStats = this.store.db
-        .prepare(
-          "SELECT COUNT(*) AS total, SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS ok FROM tool_receipts WHERE sessionId=? AND turnId=?",
-        )
-        .get(sessionId, turnId);
-      this.modelFeedback.record({
-        model: effectiveModel,
-        provider: 'pool',
-        taskType: mode || 'direct',
-        success: true,
-        toolTotal: Number(receiptStats?.total ?? 0),
-        toolSuccess: Number(receiptStats?.ok ?? 0),
-        verifiedPass: finalVerdict ? Boolean(finalVerdict.accepted) : true,
-        latencyMs: durationMs,
-        inputTokens: totalIn,
-        outputTokens: totalOut,
-        contextWindow,
-        recovered: Boolean(isRecovery),
-      });
+        safeIsolateSideEffect(() =>
+          this.store.event('direct.turn.completed', null, null, {
+            sessionId,
+            turnId,
+            model: effectiveModel,
+            steps,
+            inputTokens: totalIn,
+            outputTokens: totalOut,
+            cacheReadTokens: totalCacheRead,
+            durationMs,
+            evidenceCount: Number(evidenceCount || 0),
+          }),
+        );
 
-      this.#emitPersisted(sessionId, turnId, 'turn/completed', {
-        turnId,
-        sessionId,
-        model: effectiveModel,
-        steps,
-        inputTokens: totalIn,
-        outputTokens: totalOut,
-        cacheReadTokens: totalCacheRead,
-        durationMs,
-        verdict: finalVerdict,
-        evidenceCount: Number(evidenceCount || 0),
-        text: excerpt(finalAssistantText, 4000),
-      });
+        safeIsolateSideEffect(() =>
+          this.modelFeedback.record({
+            model: effectiveModel,
+            provider: 'pool',
+            taskType: mode || 'direct',
+            success: true,
+            toolTotal: Number(receiptStats?.total ?? 0),
+            toolSuccess: Number(receiptStats?.ok ?? 0),
+            verifiedPass: loopResult.verifiedPass ?? null,
+            latencyMs: durationMs,
+            inputTokens: totalIn,
+            outputTokens: totalOut,
+            contextWindow,
+            recovered: Boolean(isRecovery),
+          }),
+        );
+      }
+
+      await safeIsolateSideEffect(() =>
+        hooks.run(
+          'Stop',
+          { sessionId, turnId, steps, status: 'completed', text: excerpt(finalAssistantText, 1000) },
+          { signal, permissionMode },
+        ),
+      );
     } catch (err) {
       if (this.closed || !this.store.db?.isOpen) return;
       const classified = classifyError(err);
       if (classified.code === 'LEASE_LOST') return;
+      if (classified.code === 'RECONCILIATION_REQUIRED' || classified.code === 'APPROVAL_PARKED') {
+        throw classified;
+      }
       const durationMs = Date.now() - started;
       const finishedAt = Date.now();
       const isCancelled = signal.aborted || classified.category === 'cancellation';
@@ -1076,12 +1297,13 @@ export class DirectAgentRuntime {
         throw classified;
       }
 
-      this.store.tx(() => {
-        this.store.db
+      const committed = this.store.tx(() => {
+        const res = this.store.db
           .prepare(
-            "UPDATE direct_turns SET state=?, error=?, inputTokens=?, outputTokens=?, durationMs=?, finishedAt=? WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
+            "UPDATE direct_turns SET state=?, phase=?, error=?, inputTokens=?, outputTokens=?, durationMs=?, finishedAt=? WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
           )
           .run(
+            nextState,
             nextState,
             isCancelled ? null : message.slice(0, 1000),
             totalIn,
@@ -1090,33 +1312,54 @@ export class DirectAgentRuntime {
             finishedAt,
             turnId,
           );
+        if ((res.changes ?? 0) === 0) return false;
         this.store.db
           .prepare(
             "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state!='cancelled'",
           )
           .run(nextState, finishedAt, sessionId);
+        return true;
       });
 
-      if (!isCancelled) {
-        this.modelFeedback.record({
-          model: effectiveModel,
-          provider: 'pool',
-          taskType: mode || 'direct',
-          success: false,
-          verifiedPass: false,
-          latencyMs: durationMs,
-          timedOut: classified.code === 'TIMEOUT' || /timeout/i.test(message),
-          inputTokens: totalIn,
-          outputTokens: totalOut,
-          contextWindow,
-          recovered: Boolean(isRecovery),
-        });
-        this.#emitPersisted(sessionId, turnId, 'turn/failed', {
-          turnId,
-          sessionId,
-          error: message,
-          code: classified.code,
-          durationMs,
+      if (committed) {
+        if (!isCancelled) {
+          this.#emitPersisted(sessionId, turnId, 'turn/failed', {
+            turnId,
+            sessionId,
+            error: message,
+            code: classified.code,
+            durationMs,
+          });
+        }
+
+        safeIsolateSideEffect(() => {
+          if (!effectiveModel) return;
+          const receiptStats = this.store.db
+            .prepare(
+              "SELECT COUNT(*) AS total, SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS ok, SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed FROM tool_receipts WHERE sessionId=? AND turnId=?",
+            )
+            .get(sessionId, turnId);
+          const failureKind = classifyFailureKind(classified, {
+            isCancelled,
+            hasToolFailure: Number(receiptStats?.failed ?? 0) > 0,
+          });
+          this.modelFeedback.record({
+            model: effectiveModel,
+            provider: 'pool',
+            taskType: mode || 'direct',
+            success: false,
+            toolTotal: Number(receiptStats?.total ?? 0),
+            toolSuccess: Number(receiptStats?.ok ?? 0),
+            verifiedPass: isCancelled ? null : false,
+            failureKind,
+            cancelled: isCancelled,
+            latencyMs: durationMs,
+            timedOut: failureKind === 'timeout',
+            inputTokens: totalIn,
+            outputTokens: totalOut,
+            contextWindow,
+            recovered: Boolean(isRecovery),
+          });
         });
       }
     } finally {

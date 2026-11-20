@@ -4,6 +4,7 @@ import { verifyTurn, buildRepairNote } from '../verifier.js';
 import { BudgetError, classifyError } from './errors.js';
 import { RUNTIME_EVENTS } from './events.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
+import { resolveTurnOutcome } from './verdict.js';
 
 /**
  * Default DecisionEngine handles premature-stop detection, verification gate,
@@ -57,14 +58,7 @@ export class DecisionEngine {
       }
     }
 
-    if (
-      this.verifier &&
-      !repairedOnce &&
-      repairRound < this.maxRepairRounds &&
-      verifierEvents.length > 0 &&
-      stepText &&
-      steps < maxSteps
-    ) {
+    if (this.verifier) {
       const verdict = await Promise.resolve(
         this.verifier({
           events: verifierEvents,
@@ -77,14 +71,17 @@ export class DecisionEngine {
         }),
       );
       if (verdict && verdict.verdict === 'block_reconciliation') {
-        return { action: 'complete', verdict };
+        return { action: 'reconcile', verdict };
       }
-      if (verdict && verdict.verdict !== 'pass') {
-        return {
-          action: 'repair',
-          verdict,
-          note: buildRepairNote(verdict),
-        };
+      if (verdict && (verdict.verdict !== 'pass' || verdict.accepted === false)) {
+        if (repairRound < this.maxRepairRounds && steps < maxSteps) {
+          return {
+            action: 'repair',
+            verdict,
+            note: buildRepairNote(verdict),
+          };
+        }
+        return { action: 'fail', verdict };
       }
       return { action: 'complete', verdict };
     }
@@ -180,6 +177,8 @@ export class AgentLoop {
     drainMailbox = null,
     hooks = null,
     permissionMode = null,
+    allowTools = undefined,
+    denyTools = undefined,
     getApprovedPrefixes = () => [],
     requestApproval = null,
     onAssistantMessage = null,
@@ -222,6 +221,8 @@ export class AgentLoop {
     let finalAssistantText = '';
     let finalVerdict = null;
     let stopReason = 'completed';
+    let hadToolCalls = false;
+    let idleDecisionAction = null;
 
     try {
       tm.saveCheckpoint({
@@ -428,13 +429,28 @@ export class AgentLoop {
             messages.push({ role: 'user', content: [{ type: 'text', text: decision.note }] });
             continue;
           }
+          if (decision.action === 'reconcile') {
+            finalVerdict = decision.verdict;
+            stopReason = 'block_reconciliation';
+            idleDecisionAction = 'reconcile';
+            break;
+          }
+          if (decision.action === 'fail') {
+            finalVerdict = decision.verdict;
+            stopReason = 'verification_failed';
+            idleDecisionAction = 'fail';
+            break;
+          }
           if (decision.verdict) {
             finalVerdict = decision.verdict;
           }
+          stopReason = 'completed';
+          idleDecisionAction = 'complete';
           break;
         }
 
         // Tools dispatch phase
+        hadToolCalls = true;
         sm.transition(TURN_PHASES.TOOLS, { step: steps, persist: profile?.persistTurn !== false });
         const executedBatch = await toolDispatcher.dispatchBatch({
           sessionId,
@@ -448,6 +464,8 @@ export class AgentLoop {
           parentGuard,
           verifierEvents,
           permissionMode,
+          allowTools,
+          denyTools,
           getApprovedPrefixes,
           requestApproval,
           tainted: Boolean(execution?.tainted),
@@ -539,19 +557,67 @@ export class AgentLoop {
         }
       }
 
-      if (steps >= maxSteps && !finalAssistantText) {
-        stopReason = 'max_steps';
+      // If the execution loop ended without a normal idle verification (step budget exhausted
+      // or anti-loop thrashing break), STILL run final verification so unknown side effects
+      // or failed checks are never skipped to falsely claim completion.
+      if (idleDecisionAction === null) {
+        if (stopReason !== 'thrashing_circuit_break') {
+          stopReason = 'max_steps';
+        }
+        if (this.decisionEngine?.verifier) {
+          if (sm.phase !== TURN_PHASES.VERIFYING && !sm.isTerminal()) {
+            sm.transition(TURN_PHASES.VERIFYING, {
+              step: steps,
+              reason: stopReason,
+              persist: profile?.persistTurn !== false,
+            });
+          }
+          const postLoopVerdict = await Promise.resolve(
+            this.decisionEngine.verifier({
+              events: verifierEvents,
+              text: finalAssistantText,
+              node,
+              execution,
+              sessionId,
+              turnId,
+              workspaceRoot,
+            }),
+          );
+          if (postLoopVerdict) {
+            finalVerdict = postLoopVerdict;
+            if (postLoopVerdict.verdict === 'block_reconciliation') {
+              stopReason = 'block_reconciliation';
+            }
+          }
+        }
       }
 
-      sm.transition(TURN_PHASES.COMPLETED, {
+      const outcome = resolveTurnOutcome({
+        loopStopReason: stopReason,
+        verdict: finalVerdict,
+        hasPendingReconciliation: finalVerdict?.verdict === 'block_reconciliation',
+        evidenceRequired: hadToolCalls || Boolean(finalVerdict?.evidenceRequired),
+        evidenceCount: finalVerdict?.evidenceCount ?? 0,
+      });
+
+      const targetPhase =
+        outcome.phase === 'reconciling'
+          ? TURN_PHASES.RECONCILING
+          : outcome.phase === 'failed'
+            ? TURN_PHASES.FAILED
+            : TURN_PHASES.COMPLETED;
+
+      sm.transition(targetPhase, {
         step: steps,
-        reason: stopReason,
+        reason: outcome.errorCode || stopReason,
         persist: profile?.persistTurn !== false,
       });
 
       return {
-        status: 'completed',
+        status: outcome.status,
         stopReason,
+        errorCode: outcome.errorCode,
+        errorMessage: outcome.errorMessage,
         text: finalAssistantText,
         steps,
         usage: {
@@ -560,7 +626,9 @@ export class AgentLoop {
           cacheReadTokens: tm.totalCacheRead,
           cacheWriteTokens: tm.totalCacheWrite,
         },
-        verdict: finalVerdict,
+        verdict: outcome.verdict,
+        verifiedPass: outcome.verifiedPass,
+        failureKind: outcome.failureKind,
         verifierEvents,
         phaseHistory: sm.history,
       };

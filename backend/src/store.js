@@ -35,7 +35,7 @@ export class Store {
   constructor(path) {
     this.db = new DatabaseSync(path);
     const userVersion = this.db.prepare('PRAGMA user_version').get().user_version;
-    if (userVersion > 6) {
+    if (userVersion > 7) {
       this.db.close();
       throw new Fault('UNSUPPORTED_DATABASE_SCHEMA');
     }
@@ -98,7 +98,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS swarm_replans_run ON swarm_replans(runId, version);
       CREATE TABLE IF NOT EXISTS child_notifications(id TEXT PRIMARY KEY, idempotencyKey TEXT NOT NULL UNIQUE, parentSessionId TEXT NOT NULL, childSessionId TEXT NOT NULL, runId TEXT, nodeKey TEXT, status TEXT NOT NULL, payloadJson TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, deliveredAt INTEGER);
       CREATE INDEX IF NOT EXISTS child_notifications_parent ON child_notifications(parentSessionId, delivered, createdAt);
-      CREATE TABLE IF NOT EXISTS model_feedback(id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, provider TEXT NOT NULL, taskType TEXT NOT NULL, success INTEGER NOT NULL, toolTotal INTEGER NOT NULL DEFAULT 0, toolSuccess INTEGER NOT NULL DEFAULT 0, verifiedPass INTEGER NOT NULL DEFAULT 1, latencyMs INTEGER NOT NULL DEFAULT 0, timedOut INTEGER NOT NULL DEFAULT 0, inputTokens INTEGER NOT NULL DEFAULT 0, outputTokens INTEGER NOT NULL DEFAULT 0, contextWindow INTEGER NOT NULL DEFAULT 128000, recovered INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS model_feedback(id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, provider TEXT NOT NULL, taskType TEXT NOT NULL, success INTEGER NOT NULL, toolTotal INTEGER NOT NULL DEFAULT 0, toolSuccess INTEGER NOT NULL DEFAULT 0, verifiedPass INTEGER, latencyMs INTEGER NOT NULL DEFAULT 0, timedOut INTEGER NOT NULL DEFAULT 0, inputTokens INTEGER NOT NULL DEFAULT 0, outputTokens INTEGER NOT NULL DEFAULT 0, contextWindow INTEGER NOT NULL DEFAULT 128000, recovered INTEGER NOT NULL DEFAULT 0, verificationStatus TEXT, failureKind TEXT, cancelled INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS model_feedback_model ON model_feedback(model, createdAt);
       CREATE TABLE IF NOT EXISTS scheduled_task_runs(id TEXT PRIMARY KEY, scheduleId TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE, scheduledFor INTEGER NOT NULL, idempotencyKey TEXT NOT NULL UNIQUE, jobId TEXT, sessionId TEXT, turnId TEXT, status TEXT NOT NULL DEFAULT 'queued', error TEXT, startedAt INTEGER, finishedAt INTEGER, createdAt INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS scheduled_task_runs_sched ON scheduled_task_runs(scheduleId, createdAt);`);
@@ -299,7 +299,71 @@ export class Store {
       } catch {
         this.ftsEnabled = false;
       }
-      this.db.exec('PRAGMA user_version=6');
+      // --- 2.1.1 Group 1: Hook Trust ---
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS hook_trust_approvals(
+          id TEXT PRIMARY KEY,
+          configPath TEXT NOT NULL,
+          workspaceRoot TEXT,
+          contentDigest TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'trusted',
+          approvedBy TEXT,
+          note TEXT,
+          approvedAt INTEGER NOT NULL,
+          revokedAt INTEGER,
+          updatedAt INTEGER NOT NULL,
+          UNIQUE(configPath, contentDigest)
+        );
+        CREATE INDEX IF NOT EXISTS hook_trust_path ON hook_trust_approvals(configPath, status);
+      `);
+      ensureColumns('direct_sessions', [
+        ['toolAllowJson', 'TEXT'],
+        ['toolDenyJson', 'TEXT'],
+      ]);
+      ensureColumns('model_feedback', [
+        ['verificationStatus', 'TEXT'],
+        ['failureKind', 'TEXT'],
+        ['cancelled', 'INTEGER NOT NULL DEFAULT 0'],
+      ]);
+      const mfCols = this.db.prepare('PRAGMA table_info(model_feedback)').all();
+      const vpCol = mfCols.find((c) => c.name === 'verifiedPass');
+      if (vpCol && vpCol.notnull === 1) {
+        this.db.exec(`
+          CREATE TABLE model_feedback_v7(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            taskType TEXT NOT NULL,
+            success INTEGER NOT NULL,
+            toolTotal INTEGER NOT NULL DEFAULT 0,
+            toolSuccess INTEGER NOT NULL DEFAULT 0,
+            verifiedPass INTEGER,
+            latencyMs INTEGER NOT NULL DEFAULT 0,
+            timedOut INTEGER NOT NULL DEFAULT 0,
+            inputTokens INTEGER NOT NULL DEFAULT 0,
+            outputTokens INTEGER NOT NULL DEFAULT 0,
+            contextWindow INTEGER NOT NULL DEFAULT 128000,
+            recovered INTEGER NOT NULL DEFAULT 0,
+            verificationStatus TEXT,
+            failureKind TEXT,
+            cancelled INTEGER NOT NULL DEFAULT 0,
+            createdAt INTEGER NOT NULL
+          );
+          INSERT INTO model_feedback_v7(
+            id, model, provider, taskType, success, toolTotal, toolSuccess, verifiedPass,
+            latencyMs, timedOut, inputTokens, outputTokens, contextWindow, recovered,
+            verificationStatus, failureKind, cancelled, createdAt
+          )
+          SELECT id, model, provider, taskType, success, toolTotal, toolSuccess, verifiedPass,
+                 latencyMs, timedOut, inputTokens, outputTokens, contextWindow, recovered,
+                 verificationStatus, failureKind, cancelled, createdAt
+          FROM model_feedback;
+          DROP TABLE model_feedback;
+          ALTER TABLE model_feedback_v7 RENAME TO model_feedback;
+          CREATE INDEX IF NOT EXISTS model_feedback_model ON model_feedback(model, createdAt);
+        `);
+      }
+      this.db.exec('PRAGMA user_version=7');
     });
   }
   searchDirectHistory(

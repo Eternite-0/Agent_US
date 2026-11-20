@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { UNTRUSTED_RULE_SECTION } from './envelope.js';
+import { killProcessTree, sanitizeChildEnv } from './tools/sandbox.js';
+import { HookTrustManager, normalizeHookConfigPath } from './tools/hook-trust.js';
 
 const INSTRUCTION_FILENAMES = [
   'AGENTS.md',
@@ -255,37 +257,83 @@ export function buildRuntimeContextMessage({
 
 // ---- Deterministic Lifecycle Hooks (Claude Code + Codex hook_runtime.rs) ----
 
-function loadHooksFile(filePath) {
-  if (!existsSync(filePath)) return {};
+function parseHooksBuffer(rawBuffer) {
   try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    const parsed = JSON.parse(rawBuffer.toString('utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {};
   }
 }
 
-function runShellHook(command, payload, cwd, timeoutMs = 10000) {
+function runShellHook(
+  command,
+  payload,
+  cwd,
+  { timeoutMs = 10000, maxTimeoutMs = 15000, signal = undefined } = {},
+) {
   return new Promise((resolveHook) => {
+    if (signal?.aborted) {
+      resolveHook({
+        exitCode: 130,
+        stdout: '',
+        stderr: '[hook aborted]',
+        aborted: true,
+        timedOut: false,
+      });
+      return;
+    }
+
+    const isWin = process.platform === 'win32';
     const child = spawn(command, {
       cwd,
       shell: true,
       windowsHide: true,
+      detached: !isWin,
+      env: sanitizeChildEnv(process.env),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
     let done = false;
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const effectiveTimeout = Math.min(
+      Math.max(500, Number(maxTimeoutMs || 15000)),
+      Math.max(100, Number(timeoutMs || 10000)),
+    );
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // ignore
-      }
-      resolveHook({ exitCode: 124, stdout, stderr: `${stderr}\n[hook timeout]`.trim() });
-    }, Math.min(15000, Math.max(500, timeoutMs)));
+      cleanup();
+      killProcessTree(child);
+      resolveHook({
+        exitCode: 124,
+        stdout,
+        stderr: `${stderr}\n[hook timeout]`.trim(),
+        aborted: false,
+        timedOut: true,
+      });
+    }, effectiveTimeout);
+
+    const onAbort = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      killProcessTree(child);
+      resolveHook({
+        exitCode: 130,
+        stdout,
+        stderr: `${stderr}\n[hook aborted]`.trim(),
+        aborted: true,
+        timedOut: false,
+      });
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     child.stdout.on('data', (c) => {
       if (stdout.length < 32768) stdout += c.toString('utf8');
@@ -296,14 +344,26 @@ function runShellHook(command, payload, cwd, timeoutMs = 10000) {
     child.on('error', (err) => {
       if (done) return;
       done = true;
-      clearTimeout(timer);
-      resolveHook({ exitCode: 1, stdout, stderr: String(err?.message ?? err) });
+      cleanup();
+      resolveHook({
+        exitCode: 1,
+        stdout,
+        stderr: String(err?.message ?? err),
+        aborted: false,
+        timedOut: false,
+      });
     });
     child.on('close', (code) => {
       if (done) return;
       done = true;
-      clearTimeout(timer);
-      resolveHook({ exitCode: code ?? 0, stdout, stderr });
+      cleanup();
+      resolveHook({
+        exitCode: code ?? 0,
+        stdout,
+        stderr,
+        aborted: false,
+        timedOut: false,
+      });
     });
     try {
       child.stdin.write(JSON.stringify(payload));
@@ -315,27 +375,67 @@ function runShellHook(command, payload, cwd, timeoutMs = 10000) {
 }
 
 export class HookRunner {
-  constructor(workspaceRoot, { dataRoot = null } = {}) {
+  constructor(
+    workspaceRoot,
+    { dataRoot = null, store = null, trustManager = null, eventRouter = null } = {},
+  ) {
     this.workspaceRoot = resolve(workspaceRoot);
     this.dataRoot = dataRoot ? resolve(dataRoot) : null;
+    this.trustManager = trustManager ?? new HookTrustManager({ store, eventRouter });
+  }
+
+  #getCandidateHookFiles() {
+    const raw = [
+      ...(this.dataRoot ? [join(this.dataRoot, 'hooks.json')] : []),
+      join(this.workspaceRoot, '.agent-us', 'hooks.json'),
+    ];
+    const seen = new Set();
+    const out = [];
+    for (const p of raw) {
+      const norm = normalizeHookConfigPath(p);
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      out.push(p);
+    }
+    return out;
   }
 
   #getHandlers(eventName) {
-    const sources = [
-      ...(this.dataRoot ? [loadHooksFile(join(this.dataRoot, 'hooks.json'))] : []),
-      loadHooksFile(join(this.workspaceRoot, '.agent-us', 'hooks.json')),
-    ];
     const handlers = [];
-    for (const src of sources) {
+    const skippedUntrusted = [];
+    for (const filePath of this.#getCandidateHookFiles()) {
+      if (!existsSync(filePath)) continue;
+      let rawBuffer;
+      try {
+        rawBuffer = readFileSync(filePath);
+      } catch {
+        continue;
+      }
+      // Enforce explicit SHA-256 content-bound trust boundary for ALL hook configs & ALL hook kinds
+      const trust = this.trustManager.verifyFile(filePath, { rawBuffer });
+      if (!trust.trusted) {
+        skippedUntrusted.push({
+          filePath,
+          configPath: trust.configPath,
+          contentDigest: trust.contentDigest,
+          reason: trust.reason,
+        });
+        continue;
+      }
+      const src = parseHooksBuffer(rawBuffer);
       const list = src?.[eventName];
       if (!Array.isArray(list)) continue;
       for (const item of list) {
         if (item && typeof item.command === 'string' && item.command.trim()) {
-          handlers.push(item);
+          handlers.push({
+            ...item,
+            __sourcePath: trust.configPath,
+            __contentDigest: trust.contentDigest,
+          });
         }
       }
     }
-    return handlers;
+    return { handlers, skippedUntrusted };
   }
 
   #resolveHookKind(eventName, item) {
@@ -344,8 +444,12 @@ export class HookRunner {
     return eventName === 'PreToolUse' ? 'security' : 'observation';
   }
 
-  async run(eventName, payload = {}) {
-    const handlers = this.#getHandlers(eventName);
+  async run(
+    eventName,
+    payload = {},
+    { signal = undefined, permissionMode = null, maxTimeoutMs = 15000 } = {},
+  ) {
+    const { handlers, skippedUntrusted } = this.#getHandlers(eventName);
     if (!handlers.length) {
       return {
         blocked: false,
@@ -355,6 +459,7 @@ export class HookRunner {
         transformApplied: false,
         additionalContexts: [],
         warnings: [],
+        skippedUntrusted,
       };
     }
     const toolName = String(payload.tool ?? '');
@@ -364,6 +469,12 @@ export class HookRunner {
     let transformApplied = false;
 
     for (const h of handlers) {
+      if (signal?.aborted) {
+        if (eventName === 'PreToolUse') {
+          signal.throwIfAborted?.();
+        }
+        break;
+      }
       if (h.matcher) {
         try {
           if (!new RegExp(String(h.matcher)).test(toolName)) continue;
@@ -377,10 +488,28 @@ export class HookRunner {
         : payload;
       const res = await runShellHook(
         h.command,
-        { event: eventName, hookKind: kind, workspaceRoot: this.workspaceRoot, ...currentPayload },
+        {
+          event: eventName,
+          hookKind: kind,
+          workspaceRoot: this.workspaceRoot,
+          ...(permissionMode ? { permissionMode } : {}),
+          ...currentPayload,
+        },
         this.workspaceRoot,
-        Number(h.timeoutMs ?? 10000),
+        {
+          timeoutMs: Number(h.timeoutMs ?? 10000),
+          maxTimeoutMs,
+          signal,
+        },
       );
+
+      if (res.aborted) {
+        if (eventName === 'PreToolUse') {
+          signal?.throwIfAborted?.();
+        }
+        warnings.push(`Hook (${eventName}) 已取消`);
+        break;
+      }
 
       let parsed = null;
       const trimmedOut = res.stdout.trim();
@@ -411,6 +540,7 @@ export class HookRunner {
             transformApplied: false,
             additionalContexts,
             warnings,
+            skippedUntrusted,
           };
         }
         if (typeof parsed?.additionalContext === 'string' && parsed.additionalContext.trim()) {
@@ -434,6 +564,7 @@ export class HookRunner {
             transformApplied: false,
             additionalContexts,
             warnings,
+            skippedUntrusted,
           };
         }
         if (parsed?.updatedInput !== undefined) {
@@ -451,6 +582,7 @@ export class HookRunner {
               transformApplied: false,
               additionalContexts,
               warnings,
+              skippedUntrusted,
             };
           }
           updatedInput = parsed.updatedInput;
@@ -462,7 +594,8 @@ export class HookRunner {
         continue;
       }
 
-      // Observation hook: cannot block, cannot mutate inputs, cannot grant authorization
+      // Observation hook: cannot block, cannot mutate inputs, cannot grant authorization,
+      // and receives ZERO extra execution privileges (same trust, env sanitization, signal, timeout).
       if (res.exitCode !== 0) {
         warnings.push(
           `观察型 Hook (${eventName}) 返回非零退出码 ${res.exitCode}: ${(res.stderr || trimmedOut).slice(0, 200)}`,
@@ -483,6 +616,7 @@ export class HookRunner {
       transformApplied,
       additionalContexts,
       warnings,
+      skippedUntrusted,
     };
   }
 }

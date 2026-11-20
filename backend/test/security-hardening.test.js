@@ -11,6 +11,7 @@ import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { UnknownOutcomeReconciler } from '../src/durable/reconciliation.js';
 import { EventRouter } from '../src/kernel/events.js';
 import { HookRunner } from '../src/agent-context.js';
+import { HookTrustManager } from '../src/tools/hook-trust.js';
 import { ToolDispatcher, computeArgsDigest } from '../src/tools/dispatcher.js';
 import { ToolPermissionPolicy } from '../src/tools/policy.js';
 import { GitWorktreeIsolator, ISOLATION_MODES } from '../src/tools/sandbox.js';
@@ -196,9 +197,12 @@ test('P8.A2 Hooks separate security, transform (with post-transform validation),
   });
 
   try {
+    const trustManager = new HookTrustManager({ store, eventRouter: router });
+    const hooksFile = join(workDir, '.agent-us', 'hooks.json');
+
     // 1. Security PreToolUse failing with exit code 1 MUST block (Fail-Closed!)
     writeFileSync(
-      join(workDir, '.agent-us', 'hooks.json'),
+      hooksFile,
       JSON.stringify({
         PreToolUse: [
           { matcher: 'custom_write', kind: 'security', command: 'node -e "process.exit(1)"' },
@@ -206,12 +210,13 @@ test('P8.A2 Hooks separate security, transform (with post-transform validation),
       }),
       'utf8',
     );
+    trustManager.approveFile(hooksFile, { workspaceRoot: workDir, approvedBy: 'test' });
     const secBlocked = await dispatcher.dispatchBatch({
       sessionId: 's-hk',
       turnId: 't-hk',
       toolCalls: [{ id: 'hk-1', name: 'custom_write', arguments: '{"count":2}' }],
       tools: [writeTool],
-      hooks: new HookRunner(workDir),
+      hooks: new HookRunner(workDir, { store, trustManager }),
     });
     assert.equal(secBlocked[0].isError, true);
     assert.equal(secBlocked[0].receipt.errorCode, 'SECURITY_HOOK_BLOCKED');
@@ -219,7 +224,7 @@ test('P8.A2 Hooks separate security, transform (with post-transform validation),
 
     // 2. Transform hook modifying args to invalid schema triggers post-transform Zod rejection
     writeFileSync(
-      join(workDir, '.agent-us', 'hooks.json'),
+      hooksFile,
       JSON.stringify({
         PreToolUse: [
           {
@@ -231,12 +236,13 @@ test('P8.A2 Hooks separate security, transform (with post-transform validation),
       }),
       'utf8',
     );
+    trustManager.approveFile(hooksFile, { workspaceRoot: workDir, approvedBy: 'test' });
     const invalidXform = await dispatcher.dispatchBatch({
       sessionId: 's-hk',
       turnId: 't-hk',
       toolCalls: [{ id: 'hk-2', name: 'custom_write', arguments: '{"count":2}' }],
       tools: [writeTool],
-      hooks: new HookRunner(workDir),
+      hooks: new HookRunner(workDir, { store, trustManager }),
     });
     assert.equal(invalidXform[0].isError, true);
     assert.equal(invalidXform[0].receipt.errorCode, 'HOOK_TRANSFORM_INVALID_ARGS');
@@ -244,7 +250,7 @@ test('P8.A2 Hooks separate security, transform (with post-transform validation),
 
     // 3. Observation hook failing NEVER blocks and NEVER alters args
     writeFileSync(
-      join(workDir, '.agent-us', 'hooks.json'),
+      hooksFile,
       JSON.stringify({
         PreToolUse: [
           { matcher: 'custom_write', kind: 'observation', command: 'node -e "process.exit(1)"' },
@@ -252,12 +258,13 @@ test('P8.A2 Hooks separate security, transform (with post-transform validation),
       }),
       'utf8',
     );
+    trustManager.approveFile(hooksFile, { workspaceRoot: workDir, approvedBy: 'test' });
     const obsPass = await dispatcher.dispatchBatch({
       sessionId: 's-hk',
       turnId: 't-hk',
       toolCalls: [{ id: 'hk-3', name: 'custom_write', arguments: '{"count":3}' }],
       tools: [writeTool],
-      hooks: new HookRunner(workDir),
+      hooks: new HookRunner(workDir, { store, trustManager }),
     });
     assert.equal(obsPass[0].isError, false);
     assert.equal(executedCount, 3);

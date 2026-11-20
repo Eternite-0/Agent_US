@@ -99,6 +99,8 @@ export class ToolDispatcher {
     parentGuard = null,
     verifierEvents = [],
     permissionMode = null,
+    allowTools = undefined,
+    denyTools = undefined,
     getApprovedPrefixes = () => [],
     requestApproval = null,
     tainted = false,
@@ -134,6 +136,8 @@ export class ToolDispatcher {
           parentGuard,
           verifierEvents,
           permissionMode,
+          allowTools,
+          denyTools,
           getApprovedPrefixes,
           requestApproval,
           tainted,
@@ -155,6 +159,8 @@ export class ToolDispatcher {
     parentGuard,
     verifierEvents,
     permissionMode,
+    allowTools,
+    denyTools,
     getApprovedPrefixes,
     requestApproval,
     tainted,
@@ -200,6 +206,29 @@ export class ToolDispatcher {
     });
 
     if (!toolImpl) {
+      const deniedByAllowlist =
+        (Array.isArray(allowTools) && !allowTools.includes(tc.name)) ||
+        (Array.isArray(denyTools) && denyTools.includes(tc.name));
+      if (deniedByAllowlist) {
+        const receipt = this.#recordPreEffectRejection({
+          sessionId,
+          turnId,
+          callId: tc.id,
+          toolName: tc.name,
+          meta: { riskLevel: 'medium', effectClass: 'irreversible_side_effect', replayable: false, outward: false },
+          args: parsedArgs ?? {},
+          errorCode: 'POLICY_DENIED',
+          startedAt: tStart,
+        });
+        return {
+          tc,
+          parsedArgs,
+          output: `安全策略拦截：工具「${tc.name}」不在允许的 allowlist 中`,
+          isError: true,
+          durationMs: Date.now() - tStart,
+          receipt,
+        };
+      }
       return {
         tc,
         parsedArgs,
@@ -280,16 +309,24 @@ export class ToolDispatcher {
     }
 
     // 2. PreToolUse Hook (Security / Transform hooks MUST fail-closed on exception or non-zero exit)
+    const effectivePermMode = permissionMode ?? this.policy.permissionMode;
     let preHook = { blocked: false, updatedInput: null, transformApplied: false, additionalContexts: [] };
     if (hooks) {
       try {
-        preHook = await hooks.run('PreToolUse', {
-          sessionId,
-          turnId,
-          tool: tc.name,
-          arguments: parsedArgs,
-        });
+        preHook = await hooks.run(
+          'PreToolUse',
+          {
+            sessionId,
+            turnId,
+            tool: tc.name,
+            arguments: parsedArgs,
+          },
+          { signal, permissionMode: effectivePermMode },
+        );
       } catch (hookErr) {
+        if (signal?.aborted || hookErr?.name === 'AbortError' || hookErr?.category === 'cancellation') {
+          throw hookErr;
+        }
         const receipt = this.#recordPreEffectRejection({
           sessionId,
           turnId,
@@ -378,7 +415,9 @@ export class ToolDispatcher {
     const policyVerdict = this.policy.evaluate(toolImpl, effectiveArgs, {
       approvedPrefixes: getApprovedPrefixes(),
       tainted,
-      permissionMode: permissionMode ?? this.policy.permissionMode,
+      permissionMode: effectivePermMode,
+      allowTools,
+      denyTools,
     });
 
     if (policyVerdict.decision === 'deny') {
@@ -591,7 +630,8 @@ export class ToolDispatcher {
       output = `执行失败：${String(err?.message ?? err)}`;
     }
 
-    const exitMatch = /^exitCode:\s*(-?\d+)/m.exec(output);
+    const unwrappedHead = output.replace(/^<untrusted\b[^>]*>/, '');
+    const exitMatch = /^exitCode:\s*(-?\d+)/m.exec(unwrappedHead);
     const parsedExit = exitMatch ? Number(exitMatch[1]) : null;
     if (parsedExit !== null && parsedExit !== 0) {
       isError = true;
@@ -639,16 +679,20 @@ export class ToolDispatcher {
       });
     }
 
-    if (hooks) {
+    if (hooks && !signal?.aborted) {
       const postHook = await hooks
-        .run('PostToolUse', {
-          sessionId,
-          turnId,
-          tool: tc.name,
-          arguments: effectiveArgs,
-          isError,
-          output: output.slice(0, 4000),
-        })
+        .run(
+          'PostToolUse',
+          {
+            sessionId,
+            turnId,
+            tool: tc.name,
+            arguments: effectiveArgs,
+            isError,
+            output: output.slice(0, 4000),
+          },
+          { signal, permissionMode: effectivePermMode },
+        )
         .catch(() => ({ additionalContexts: [], warnings: [] }));
       if (postHook.additionalContexts?.length) {
         output += `\n[PostToolUse Hook]\n${postHook.additionalContexts.join('\n')}`;

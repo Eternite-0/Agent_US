@@ -64,8 +64,8 @@ export const RUN_TRANSITIONS = Object.freeze({
   planning: new Set(['running', 'reconciling', 'aggregating', 'failed', 'cancelled']),
   running: new Set(['reconciling', 'aggregating', 'verifying', 'completed', 'failed', 'cancelled']),
   reconciling: new Set(['running', 'aggregating', 'failed', 'cancelled']),
-  aggregating: new Set(['verifying', 'completed', 'failed', 'cancelled']),
-  verifying: new Set(['completed', 'failed', 'cancelled']),
+  aggregating: new Set(['verifying', 'reconciling', 'completed', 'failed', 'cancelled']),
+  verifying: new Set(['reconciling', 'completed', 'failed', 'cancelled']),
   completed: new Set([]),
   failed: new Set(['running']), // only explicit resume/replan
   cancelled: new Set([]),

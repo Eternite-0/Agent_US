@@ -20,6 +20,7 @@ import {
   discoverProjectInstructions,
   HookRunner,
 } from '../src/agent-context.js';
+import { HookTrustManager } from '../src/tools/hook-trust.js';
 import { resolveSafePath } from '../src/workspace-tools.js';
 
 class ScriptedAdapter extends LlmAdapter {
@@ -144,8 +145,9 @@ test('DirectAgent Wave 1-3: Prompt Cache stability, AGENTS.md, /rewind, approval
 
   // Configure a deterministic PreToolUse hook blocking any write to forbidden.txt
   mkdirSync(join(workDir, '.agent-us'), { recursive: true });
+  const hooksFile = join(workDir, '.agent-us', 'hooks.json');
   writeFileSync(
-    join(workDir, '.agent-us', 'hooks.json'),
+    hooksFile,
     JSON.stringify({
       PreToolUse: [
         {
@@ -156,7 +158,9 @@ test('DirectAgent Wave 1-3: Prompt Cache stability, AGENTS.md, /rewind, approval
     }),
     'utf8',
   );
-  const hookCheck = await new HookRunner(workDir).run('PreToolUse', {
+  const hookTrust = new HookTrustManager();
+  hookTrust.approveFile(hooksFile, { workspaceRoot: workDir, approvedBy: 'test' });
+  const hookCheck = await new HookRunner(workDir, { trustManager: hookTrust }).run('PreToolUse', {
     tool: 'write_file',
     arguments: { path: 'forbidden.txt', content: 'x' },
   });

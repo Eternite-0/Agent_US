@@ -16,6 +16,7 @@ import {
 } from '../../patch-and-diagnostics.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
 import { resolveConfinedPath } from '../sandbox.js';
+import { isHookConfigPath } from '../hook-trust.js';
 
 const SKIP_DIRS = new Set([
   '.git',
@@ -93,12 +94,23 @@ function isProbablyBinary(buf) {
 
 export function createFsTools({
   workspaceRoot,
+  dataRoot = null,
   readFileState,
   wrapResult,
   guardFallback,
   onBeforeMutate,
   onFileChanged,
+  onHookConfigMutated = null,
 }) {
+  const notifyIfHookConfig = (rel, full, toolName, action = 'write') => {
+    if (!isHookConfigPath(rel, { workspaceRoot, dataRoot })) return '';
+    try {
+      onHookConfigMutated?.({ path: full, rel, action, toolName });
+    } catch {
+      // never fail file write due to revocation notification
+    }
+    return `\n[Hook Trust] 检测到写入 Hook 配置文件 (${rel})：未信任草稿不会自动激活或执行，需人工显式审批对应 SHA-256 摘要后方可生效。`;
+  };
   const checkStaleFile = (rel, full) => {
     const tracked = readFileState.get(rel);
     if (!tracked || !existsSync(full)) return;
@@ -202,8 +214,9 @@ export function createFsTools({
           before: Buffer.from(before, 'utf8').toString('base64'),
           after: Buffer.from(applied.after, 'utf8').toString('base64'),
         });
+        const hookNotice = notifyIfHookConfig(rel, full, 'edit_file', 'edit');
         const diag = runQuickDiagnostics(full, rel);
-        return `已成功编辑 ${rel}（匹配级别: ${applied.tier}，替换 ${applied.replacedCount} 处）。${diag.summary}`;
+        return `已成功编辑 ${rel}（匹配级别: ${applied.tier}，替换 ${applied.replacedCount} 处）。${diag.summary}${hookNotice}`;
       },
     }),
 
@@ -238,8 +251,9 @@ export function createFsTools({
           before: before !== null ? Buffer.from(before, 'utf8').toString('base64') : null,
           after: Buffer.from(content, 'utf8').toString('base64'),
         });
+        const hookNotice = notifyIfHookConfig(rel, full, 'write_file', existed ? 'overwrite' : 'create');
         const diag = runQuickDiagnostics(full, rel);
-        return `${existed ? '已覆写' : '已创建'} ${rel} (${Buffer.byteLength(content, 'utf8')} bytes)。${diag.summary}`;
+        return `${existed ? '已覆写' : '已创建'} ${rel} (${Buffer.byteLength(content, 'utf8')} bytes)。${diag.summary}${hookNotice}`;
       },
     }),
 
@@ -266,7 +280,10 @@ export function createFsTools({
           onFileChanged,
         });
         const diagNotes = [];
+        const hookNotices = [];
         for (const t of touched) {
+          const hn = notifyIfHookConfig(t.path, t.full, 'apply_patch', t.action);
+          if (hn) hookNotices.push(hn);
           if (t.action !== 'deleted' && existsSync(t.full)) {
             trackFileHash(t.path, readFileSync(t.full, 'utf8'));
             const d = runQuickDiagnostics(t.full, t.path);
@@ -274,7 +291,7 @@ export function createFsTools({
           }
         }
         const summary = touched.map((t) => `${t.action}: ${t.path}`).join('\n');
-        return `原子补丁已成功应用 (${touched.length} 个文件):\n${summary}${diagNotes.join('')}`;
+        return `原子补丁已成功应用 (${touched.length} 个文件):\n${summary}${diagNotes.join('')}${hookNotices.join('')}`;
       },
     }),
 

@@ -112,4 +112,44 @@ export function registerRuntimeRoutes(app, { store, directAgent, controlPlane })
     }
     return { items: [] };
   });
+
+  app.get('/v1/hooks/trust', async (req) => {
+    const q = req.query ?? {};
+    return {
+      workspaceConfig: directAgent?.inspectHookConfig?.(q.filePath ? String(q.filePath) : null) ?? null,
+      items:
+        directAgent?.listHookTrust?.({
+          workspaceRoot: q.workspaceRoot ? String(q.workspaceRoot) : null,
+          status: q.status ? String(q.status) : null,
+        }) ?? [],
+    };
+  });
+
+  app.post('/v1/hooks/approve', async (req, reply) => {
+    if (!directAgent?.approveHookConfig) {
+      return reply.code(503).send({
+        error: { code: 'HOOK_TRUST_UNAVAILABLE', message: 'Hook trust manager unavailable', status: 503 },
+      });
+    }
+    const body = req.body ?? {};
+    return directAgent.approveHookConfig(body.filePath ? String(body.filePath) : null, {
+      workspaceRoot: body.workspaceRoot ? String(body.workspaceRoot) : undefined,
+      expectedDigest: body.expectedDigest ? String(body.expectedDigest) : null,
+      approvedBy: body.approvedBy ? String(body.approvedBy) : 'user',
+      note: body.note ? String(body.note) : '',
+    });
+  });
+
+  app.post('/v1/hooks/revoke', async (req, reply) => {
+    if (!directAgent?.revokeHookConfig) {
+      return reply.code(503).send({
+        error: { code: 'HOOK_TRUST_UNAVAILABLE', message: 'Hook trust manager unavailable', status: 503 },
+      });
+    }
+    const body = req.body ?? {};
+    return directAgent.revokeHookConfig(body.filePath ? String(body.filePath) : null, {
+      contentDigest: body.contentDigest ? String(body.contentDigest) : null,
+      reason: body.reason ? String(body.reason) : 'revoked',
+    });
+  });
 }

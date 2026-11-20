@@ -66,6 +66,7 @@ export function needsApproval(
 
 export function createWorkspaceTools({
   workspaceRoot,
+  dataRoot = null,
   store,
   sessionId = null,
   permissionMode = 'auto-safe',
@@ -78,6 +79,7 @@ export function createWorkspaceTools({
   requestApproval = null,
   onBeforeMutate = () => {},
   onFileChanged = () => {},
+  onHookConfigMutated = null,
   onToolOutput = () => {},
   onPlanUpdated = () => {},
   runSubagent = null,
@@ -141,11 +143,13 @@ export function createWorkspaceTools({
   registry.registerMany([
     ...createFsTools({
       workspaceRoot,
+      dataRoot,
       readFileState,
       wrapResult,
       guardFallback,
       onBeforeMutate,
       onFileChanged,
+      onHookConfigMutated,
     }),
     ...createShellTools({
       workspaceRoot,

@@ -32,12 +32,25 @@ export function buildSwarmSummary(nodes = []) {
     .join('\n\n');
 }
 
+export function parseToolAllowJson(str) {
+  if (str === null || str === undefined || str === '') return null;
+  try {
+    const parsed = JSON.parse(str);
+    if (parsed === null) return null;
+    if (Array.isArray(parsed)) return parsed.map(String);
+    return [];
+  } catch {
+    // Fail-closed: never widen malformed allowlist to unrestricted null
+    return [];
+  }
+}
+
 export function hydrateSwarmNode(n) {
   return {
     ...n,
     allowIsolationFallback: Boolean(n.allowIsolationFallback),
     dependencies: parseJsonSafe(n.dependenciesJson, []),
-    toolAllow: parseJsonSafe(n.toolAllowJson, null),
+    toolAllow: parseToolAllowJson(n.toolAllowJson),
     budget: parseJsonSafe(n.budgetJson, {}),
     artifactUris: parseJsonSafe(n.artifactUrisJson, []),
   };

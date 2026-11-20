@@ -1,6 +1,11 @@
 import { id as uuid } from '../store.js';
 import { RuntimeError } from '../kernel/errors.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
+import {
+  classifyFailureKind,
+  resolveSwarmOutcome,
+  safeIsolateSideEffect,
+} from '../kernel/verdict.js';
 import { SWARM_JOB_KINDS, enqueueSwarmJob } from './jobs.js';
 import {
   SWARM_NODE_STATES,
@@ -18,6 +23,7 @@ import {
   inspectNodeReconciliation,
   parkNodeAndRunForReconciliation,
   parseJsonSafe,
+  parseToolAllowJson,
   recoverInterruptedSwarmRuns,
 } from './recovery-helpers.js';
 
@@ -333,20 +339,27 @@ export class AdaptiveSwarmOrchestrator {
         });
       }
     }
+    let transitionedToCancelled = false;
     if (!isTerminalRunState(run.status)) {
-      transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.CANCELLED, {
-        patch: { currentPhase: 'cancelled' },
-      });
+      const prevRow = this.store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(runId);
+      if (prevRow && !isTerminalRunState(prevRow.status)) {
+        transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.CANCELLED, {
+          patch: { currentPhase: 'cancelled' },
+        });
+        transitionedToCancelled = true;
+      }
     }
 
     const finalRun = this.getRun(runId);
-    this.eventRouter?.emitPersisted({
-      sessionId: run.sessionId,
-      turnId: run.rootTurnId,
-      type: RUNTIME_EVENTS.SWARM_RUN_COMPLETED,
-      data: { runId, status: SWARM_RUN_STATES.CANCELLED, usage: finalRun.usage },
-      audit: true,
-    });
+    if (transitionedToCancelled) {
+      this.eventRouter?.emitPersisted({
+        sessionId: run.sessionId,
+        turnId: run.rootTurnId,
+        type: RUNTIME_EVENTS.SWARM_RUN_COMPLETED,
+        data: { runId, status: SWARM_RUN_STATES.CANCELLED, usage: finalRun.usage },
+        audit: true,
+      });
+    }
     this.#notifyWaiters(finalRun);
     return finalRun;
   }
@@ -640,10 +653,11 @@ export class AdaptiveSwarmOrchestrator {
         run.budget?.maxTotalSteps > 0
           ? Math.max(1, Number(run.budget.maxTotalSteps) - Number(run.usage?.steps ?? 0))
           : undefined;
-      const fallbackWorkspace =
-        run.workspaceRoot ||
-        this.store.db.prepare('SELECT workspaceRoot FROM direct_sessions WHERE id=?').get(run.sessionId)
-          ?.workspaceRoot;
+      const parentSessRow = this.store.db
+        .prepare('SELECT workspaceRoot, toolAllowJson FROM direct_sessions WHERE id=?')
+        .get(run.sessionId);
+      const fallbackWorkspace = run.workspaceRoot || parentSessRow?.workspaceRoot;
+      const parentAllowTools = parseToolAllowJson(parentSessRow?.toolAllowJson);
 
       const childRes = await this.childManager.spawn({
         parentSessionId: run.sessionId,
@@ -654,6 +668,7 @@ export class AdaptiveSwarmOrchestrator {
         provider: node.provider || 'pool',
         permissionMode: node.permissionMode || run.permissionMode || 'auto-safe',
         parentPermissionMode: run.permissionMode || 'auto-safe',
+        parentAllowTools,
         allowedTools: node.toolAllow,
         budget: {
           ...(node.budget ?? {}),
@@ -711,14 +726,28 @@ export class AdaptiveSwarmOrchestrator {
         },
       });
 
-      this.modelFeedback?.record?.({
-        model: node.model,
-        provider: node.provider || 'pool',
-        taskType: node.taskType || 'general',
-        success: true,
-        latencyMs: Date.now() - startedAt,
-        inputTokens: childRes.usage?.inputTokens ?? 0,
-        outputTokens: childRes.usage?.outputTokens ?? 0,
+      safeIsolateSideEffect(() => {
+        const receiptStats =
+          childRes.childSessionId && childRes.childTurnId && this.store?.db?.isOpen
+            ? this.store.db
+                .prepare(
+                  "SELECT COUNT(*) AS total, SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS ok FROM tool_receipts WHERE sessionId=? AND turnId=?",
+                )
+                .get(childRes.childSessionId, childRes.childTurnId)
+            : null;
+        this.modelFeedback?.record?.({
+          model: node.model,
+          provider: node.provider || 'pool',
+          taskType: node.taskType || 'general',
+          success: true,
+          toolTotal: Number(receiptStats?.total ?? 0),
+          toolSuccess: Number(receiptStats?.ok ?? 0),
+          verifiedPass: childRes.verifiedPass ?? null,
+          latencyMs: Date.now() - startedAt,
+          inputTokens: childRes.usage?.inputTokens ?? 0,
+          outputTokens: childRes.usage?.outputTokens ?? 0,
+          recovered: Boolean(job.reclaimedFromCrash || job.attempts > 1),
+        });
       });
 
       enqueueSwarmJob(
@@ -784,13 +813,36 @@ export class AdaptiveSwarmOrchestrator {
       }
 
       const errorCode = String(err?.code || 'NODE_FAILED');
-      const errorMessage = String(err?.message ?? err);
-      this.modelFeedback?.record?.({
-        model: freshNode.model,
-        provider: freshNode.provider || 'pool',
-        taskType: freshNode.taskType || 'general',
-        success: false,
-        latencyMs: Date.now() - startedAt,
+      const errorMessage = String(err?.detail?.message ?? err?.message ?? err);
+      safeIsolateSideEffect(() => {
+        const receiptStats =
+          freshNode.childSessionId && freshNode.childTurnId && this.store?.db?.isOpen
+            ? this.store.db
+                .prepare(
+                  "SELECT COUNT(*) AS total, SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS ok, SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed FROM tool_receipts WHERE sessionId=? AND turnId=?",
+                )
+                .get(freshNode.childSessionId, freshNode.childTurnId)
+            : null;
+        const isVerificationFailure = errorCode === 'VERIFICATION_FAILED';
+        const failureKind = classifyFailureKind(err, {
+          isVerificationFailure,
+          hasToolFailure: Number(receiptStats?.failed ?? 0) > 0,
+        });
+        this.modelFeedback?.record?.({
+          model: freshNode.model,
+          provider: freshNode.provider || 'pool',
+          taskType: freshNode.taskType || 'general',
+          success: false,
+          toolTotal: Number(receiptStats?.total ?? 0),
+          toolSuccess: Number(receiptStats?.ok ?? 0),
+          verifiedPass: isVerificationFailure || err?.detail?.verdict?.accepted === false ? false : null,
+          failureKind,
+          timedOut: failureKind === 'timeout',
+          latencyMs: Date.now() - startedAt,
+          inputTokens: err?.detail?.usage?.inputTokens ?? 0,
+          outputTokens: err?.detail?.usage?.outputTokens ?? 0,
+          recovered: Boolean(job.reclaimedFromCrash || job.attempts > 1),
+        });
       });
 
       const replanOut = this.replanner
@@ -863,36 +915,78 @@ export class AdaptiveSwarmOrchestrator {
     if (!run || isTerminalRunState(run.status)) return;
 
     const replacedKeys = this.#getReplacedNodeKeys(runId);
-    const anyFailed = run.nodes.some(
-      (n) => n.status === SWARM_NODE_STATES.FAILED && !replacedKeys.has(n.nodeKey),
-    );
     const summary = buildSwarmSummary(run.nodes);
+    const childSessionIds = run.nodes.map((n) => n.childSessionId).filter(Boolean);
+    const allSessionIds = [...new Set([run.sessionId, ...childSessionIds].filter(Boolean))];
+    const childTurnIds = run.nodes.map((n) => n.childTurnId).filter(Boolean);
+    const allTurnIds = [...new Set([run.rootTurnId, ...childTurnIds].filter(Boolean))];
+
     const verdict = this.evidenceVerifier
       ? this.evidenceVerifier.verify({
           text: summary,
           sessionId: run.sessionId,
           turnId: run.rootTurnId,
+          sessionIds: allSessionIds,
+          turnIds: allTurnIds.length ? allTurnIds : null,
           workspaceRoot: run.workspaceRoot,
         })
       : { verdict: 'pass', accepted: true, reasons: [] };
 
-    const finalStatus = anyFailed ? SWARM_RUN_STATES.FAILED : SWARM_RUN_STATES.COMPLETED;
-    transitionSwarmRun(this.store, runId, finalStatus, {
-      patch: {
-        currentPhase: finalStatus,
-        verdictJson: JSON.stringify(verdict),
-        errorCode: anyFailed ? 'SWARM_NODE_FAILED' : null,
-      },
+    const outcome = resolveSwarmOutcome({
+      nodes: run.nodes,
+      replacedKeys,
+      verdict,
+      hasPendingReconciliation: verdict?.verdict === 'block_reconciliation',
     });
 
+    if (outcome.status === SWARM_RUN_STATES.RECONCILING) {
+      transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.RECONCILING, {
+        patch: {
+          currentPhase: 'reconciling',
+          verdictJson: JSON.stringify(outcome.verdict),
+          errorCode: outcome.errorCode,
+          errorMessage: outcome.errorMessage,
+        },
+      });
+      return;
+    }
+
+    const finalStatus =
+      outcome.status === SWARM_RUN_STATES.COMPLETED
+        ? SWARM_RUN_STATES.COMPLETED
+        : SWARM_RUN_STATES.FAILED;
+
+    let didTransition = false;
+    const prevRow = this.store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(runId);
+    if (prevRow && !isTerminalRunState(prevRow.status)) {
+      transitionSwarmRun(this.store, runId, finalStatus, {
+        patch: {
+          currentPhase: finalStatus,
+          verdictJson: JSON.stringify(outcome.verdict),
+          errorCode: outcome.errorCode,
+          errorMessage: outcome.errorMessage,
+        },
+      });
+      didTransition = true;
+    }
+
     const settled = this.getRun(runId);
-    this.eventRouter?.emitPersisted({
-      sessionId: run.sessionId,
-      turnId: run.rootTurnId,
-      type: RUNTIME_EVENTS.SWARM_RUN_COMPLETED,
-      data: { runId, status: finalStatus, usage: settled.usage, verdict },
-      audit: true,
-    });
+    if (didTransition) {
+      this.eventRouter?.emitPersisted({
+        sessionId: run.sessionId,
+        turnId: run.rootTurnId,
+        type: RUNTIME_EVENTS.SWARM_RUN_COMPLETED,
+        data: {
+          runId,
+          status: finalStatus,
+          usage: settled.usage,
+          verdict: outcome.verdict,
+          ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
+          ...(outcome.errorMessage ? { errorMessage: outcome.errorMessage } : {}),
+        },
+        audit: true,
+      });
+    }
     this.#notifyWaiters(settled);
   }
 
@@ -904,7 +998,7 @@ export class AdaptiveSwarmOrchestrator {
       selection: this.router.select({
         taskType: n.taskType,
         objective: n.objective,
-        requiredTools: n.toolAllow ?? [],
+        requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
         budget: n.budget ?? budget,
       }),
     }));
@@ -929,7 +1023,9 @@ export class AdaptiveSwarmOrchestrator {
         spec.objective,
         spec.acceptance,
         JSON.stringify(spec.dependencies),
-        spec.toolAllow ? JSON.stringify(spec.toolAllow) : JSON.stringify(selection.profile.toolAllow),
+        Array.isArray(spec.toolAllow)
+          ? JSON.stringify(spec.toolAllow)
+          : JSON.stringify(selection.profile.toolAllow),
         parentPermissionMode,
         spec.taskType || 'research',
         spec.isolationMode || 'shared_readonly',

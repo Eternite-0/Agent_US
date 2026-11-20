@@ -1,8 +1,8 @@
 import { Fault, id as uuid } from '../store.js';
 import { excerpt } from '../context.js';
-import { CancellationError } from '../kernel/errors.js';
+import { CancellationError, RecoveryError, RuntimeError } from '../kernel/errors.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
-import { intersectPolicies } from '../tools/policy.js';
+import { filterToolsByPolicy, intersectAllowlists, intersectPolicies } from '../tools/policy.js';
 import { ISOLATION_MODES } from '../tools/sandbox.js';
 import { WORKSPACE_TOOL_META } from '../workspace-tools.js';
 
@@ -152,11 +152,11 @@ export class ChildAgentManager {
     const denySet = new Set(policy.denyTools ?? []);
     if (isChild) denySet.add('spawn_subagent');
 
-    let filtered = allTools.filter((t) => !denySet.has(t.name));
-    if (Array.isArray(policy.allowTools) && policy.allowTools.length) {
-      const allowSet = new Set(policy.allowTools);
-      filtered = filtered.filter((t) => allowSet.has(t.name));
-    }
+    // Preserve explicit allowlist semantics: null=unrestricted, []=allow NO tools, non-empty=only listed
+    let filtered = filterToolsByPolicy(allTools, {
+      denyTools: [...denySet],
+      allowTools: policy.allowTools,
+    });
     if (policy.permissionMode === 'read-only' && !isolatedWorktree) {
       filtered = filtered.filter(
         (t) => Boolean(t.meta?.readOnly ?? WORKSPACE_TOOL_META[t.name]?.readOnly),
@@ -429,6 +429,8 @@ export class ChildAgentManager {
         model: resolvedModel,
         provider,
         permissionMode: effectivePolicy.permissionMode,
+        allowTools: effectivePolicy.allowTools,
+        denyTools: [...new Set([...(effectivePolicy.denyTools ?? []), 'spawn_subagent'])],
         messages: assembled.messages,
         tools,
         budget: {
@@ -475,26 +477,58 @@ export class ChildAgentManager {
         },
       });
 
+      if (!state.paused && result.status === 'reconciling') {
+        throw new RecoveryError('RECONCILIATION_REQUIRED', {
+          message: result.errorMessage || 'Child turn requires reconciliation before completion',
+          detail: {
+            verdict: result.verdict,
+            usage: result.usage,
+            steps: result.steps,
+          },
+        });
+      }
+
+      if (!state.paused && result.status === 'failed') {
+        throw new RuntimeError(result.errorCode || 'VERIFICATION_FAILED', {
+          message: result.errorMessage || 'Child turn failed verification',
+          detail: {
+            verdict: result.verdict,
+            stopReason: result.stopReason,
+            usage: result.usage,
+            steps: result.steps,
+            verifiedPass: result.verifiedPass,
+            failureKind: result.failureKind,
+          },
+        });
+      }
+
       const nextState = state.paused ? 'paused' : 'completed';
       const finAt = Date.now();
-      this.store.tx(() => {
-        this.store.db
-          .prepare('UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=?')
-          .run(nextState, finAt, childSessionId);
-        this.store.db
+      const verdictJson = result.verdict ? JSON.stringify(result.verdict) : null;
+      const evidenceCount = Number(result.verdict?.evidenceCount ?? 0);
+      const committed = this.store.tx(() => {
+        const turnRes = this.store.db
           .prepare(
             `UPDATE direct_turns
-             SET state=?, inputTokens=?, outputTokens=?, step=?, finishedAt=?
-             WHERE id=?`,
+             SET state=?, phase=?, inputTokens=?, outputTokens=?, step=?, verdictJson=?, evidenceCount=?, finishedAt=?
+             WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
           )
           .run(
+            nextState,
             nextState,
             result.usage?.inputTokens ?? 0,
             result.usage?.outputTokens ?? 0,
             result.steps ?? 0,
+            verdictJson,
+            evidenceCount,
             finAt,
             turnId,
           );
+        if ((turnRes.changes ?? 0) === 0) return false;
+        this.store.db
+          .prepare("UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state!='cancelled'")
+          .run(nextState, finAt, childSessionId);
+        return true;
       });
 
       const payload = {
@@ -504,31 +538,37 @@ export class ChildAgentManager {
         role: profile?.name || 'worker',
         summary: excerpt(result.text || '', 500),
         text: result.text || '',
+        verdict: result.verdict ?? null,
         resumeMode,
       };
-      this.#persistNotification({
-        parentSessionId,
-        childSessionId,
-        runId,
-        nodeKey,
-        status: nextState,
-        payload,
-      });
-      this.eventRouter?.emitPersisted({
-        sessionId: parentSessionId,
-        turnId: parentTurnId,
-        type: RUNTIME_EVENTS.SUBAGENT_COMPLETED,
-        data: payload,
-        audit: false,
-      });
+      if (committed) {
+        this.#persistNotification({
+          parentSessionId,
+          childSessionId,
+          runId,
+          nodeKey,
+          status: nextState,
+          payload,
+        });
+        this.eventRouter?.emitPersisted({
+          sessionId: parentSessionId,
+          turnId: parentTurnId,
+          type: RUNTIME_EVENTS.SUBAGENT_COMPLETED,
+          data: payload,
+          audit: false,
+        });
+      }
 
       return {
         childSessionId,
         childTurnId: turnId,
         subagentId: subId,
+        status: nextState,
         text: result.text || '',
         usage: result.usage,
         steps: result.steps,
+        verdict: result.verdict ?? null,
+        verifiedPass: result.verifiedPass ?? null,
         diffSummary: wt ? await wt.diffSummary() : '',
       };
     } catch (err) {
@@ -539,15 +579,38 @@ export class ChildAgentManager {
           : combinedSignal.aborted || err?.category === 'cancellation'
             ? 'cancelled'
             : 'failed';
+      let committed = false;
       if (this.store?.db?.isOpen) {
         const errAt = Date.now();
-        this.store.tx(() => {
+        const errVerdictJson = err?.detail?.verdict ? JSON.stringify(err.detail.verdict) : null;
+        committed = this.store.tx(() => {
+          const turnRes = this.store.db
+            .prepare(
+              `UPDATE direct_turns
+               SET state=?, phase=?, error=?,
+                   inputTokens=COALESCE(?, inputTokens),
+                   outputTokens=COALESCE(?, outputTokens),
+                   step=COALESCE(?, step),
+                   verdictJson=COALESCE(?, verdictJson),
+                   finishedAt=?
+               WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
+            )
+            .run(
+              nextState,
+              nextState,
+              String(err?.detail?.message ?? err?.message ?? err).slice(0, 500),
+              err?.detail?.usage?.inputTokens ?? null,
+              err?.detail?.usage?.outputTokens ?? null,
+              err?.detail?.steps ?? null,
+              errVerdictJson,
+              nextState === 'reconciling' || nextState === 'paused' ? null : errAt,
+              turnId,
+            );
+          if ((turnRes.changes ?? 0) === 0) return false;
           this.store.db
-            .prepare('UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=?')
+            .prepare("UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state!='cancelled'")
             .run(nextState, errAt, childSessionId);
-          this.store.db
-            .prepare("UPDATE direct_turns SET state=?, error=?, finishedAt=? WHERE id=? AND state NOT IN ('completed','cancelled')")
-            .run(nextState, String(err?.message ?? err).slice(0, 500), errAt, turnId);
+          return true;
         });
       }
       const failPayload = {
@@ -555,24 +618,27 @@ export class ChildAgentManager {
         childSessionId,
         turnId,
         errorCode: err?.code || 'CHILD_FAILED',
-        error: String(err?.message ?? err),
+        error: String(err?.detail?.message ?? err?.message ?? err),
+        verdict: err?.detail?.verdict ?? null,
         paused: state.paused,
       };
-      this.#persistNotification({
-        parentSessionId,
-        childSessionId,
-        runId,
-        nodeKey,
-        status: nextState,
-        payload: failPayload,
-      });
-      this.eventRouter?.emitPersisted({
-        sessionId: parentSessionId,
-        turnId: parentTurnId,
-        type: RUNTIME_EVENTS.SUBAGENT_FAILED,
-        data: failPayload,
-        audit: false,
-      });
+      if (committed) {
+        this.#persistNotification({
+          parentSessionId,
+          childSessionId,
+          runId,
+          nodeKey,
+          status: nextState,
+          payload: failPayload,
+        });
+        this.eventRouter?.emitPersisted({
+          sessionId: parentSessionId,
+          turnId: parentTurnId,
+          type: RUNTIME_EVENTS.SUBAGENT_FAILED,
+          data: failPayload,
+          audit: false,
+        });
+      }
       throw err;
     } finally {
       this.activeChildren.delete(childSessionId);
@@ -611,17 +677,26 @@ export class ChildAgentManager {
     const requestedMode =
       isolationMode ||
       (isolatedWorktree ? ISOLATION_MODES.WORKTREE : ISOLATION_MODES.SHARED_READONLY);
+    const existingChild = existingChildSessionId
+      ? this.sessionRepo.getSession(existingChildSessionId)
+      : null;
+    const effectiveParentAllow = intersectAllowlists(parentSess?.toolAllow, parentAllowTools);
+    const effectiveChildAllow = intersectAllowlists(allowedTools, existingChild?.toolAllow);
     const effectivePolicy = intersectPolicies(
       {
         permissionMode: parentPermissionMode || parentSess?.permissionMode || 'auto-safe',
-        allowTools: parentAllowTools,
-        denyTools: parentDenyTools,
+        allowTools: effectiveParentAllow,
+        denyTools: [...new Set([...(parentSess?.toolDeny ?? []), ...(parentDenyTools ?? [])])],
       },
-      { permissionMode, allowTools: allowedTools },
+      {
+        permissionMode,
+        allowTools: effectiveChildAllow,
+        denyTools: existingChild?.toolDeny ?? [],
+      },
     );
     const resolvedModel = model || parentSess?.model || this.getDefaultModel();
-    const child = existingChildSessionId
-      ? this.sessionRepo.getSession(existingChildSessionId)
+    const child = existingChild
+      ? existingChild
       : this.sessionRepo.createSession({
           title: `子任务: ${String(objective).slice(0, 60)}`,
           model: resolvedModel,
@@ -635,6 +710,8 @@ export class ChildAgentManager {
           rootSessionId: parentSess?.rootSessionId || parentSessionId,
           agentProfile: profile?.id || 'subagent',
           budget,
+          toolAllow: effectivePolicy.allowTools,
+          toolDeny: effectivePolicy.denyTools,
         });
 
     return this.#runChildTurn({
@@ -671,6 +748,7 @@ export class ChildAgentManager {
     permissionMode = 'auto-safe',
     parentPermissionMode = null,
     allowedTools = null,
+    parentAllowTools = null,
     budget = {},
     workspaceRoot = null,
     isolatedWorktree = false,
@@ -687,8 +765,13 @@ export class ChildAgentManager {
     }
     const parentSess = this.sessionRepo.getSession(parentSessionId);
     const parentNonce = this.sessionRepo.ensureSessionNonce(parentSessionId);
+    const effectiveParentAllow = intersectAllowlists(parentSess?.toolAllow, parentAllowTools);
     const effectivePolicy = intersectPolicies(
-      { permissionMode: parentPermissionMode || parentSess.permissionMode || 'auto-safe', denyTools: ['spawn_subagent'] },
+      {
+        permissionMode: parentPermissionMode || parentSess.permissionMode || 'auto-safe',
+        allowTools: effectiveParentAllow,
+        denyTools: [...new Set([...(parentSess?.toolDeny ?? []), 'spawn_subagent'])],
+      },
       { permissionMode, allowTools: allowedTools },
     );
     const resolvedModel = model || parentSess.model || this.getDefaultModel();
@@ -702,6 +785,8 @@ export class ChildAgentManager {
       rootSessionId: parentSess.rootSessionId || parentSessionId,
       agentProfile: `fork:${profile?.id || 'worker'}`,
       budget,
+      toolAllow: effectivePolicy.allowTools,
+      toolDeny: effectivePolicy.denyTools,
     });
 
     const parentMsgs = this.store.db
@@ -768,8 +853,16 @@ export class ChildAgentManager {
     const parentSess = child.parentSessionId ? this.sessionRepo.getSession(child.parentSessionId) : null;
     this.#assertAncestorsActive(child.parentSessionId);
     const effectivePolicy = intersectPolicies(
-      { permissionMode: parentSess?.permissionMode || child.permissionMode || 'auto-safe', denyTools: ['spawn_subagent'] },
-      { permissionMode: child.permissionMode || 'auto-safe' },
+      {
+        permissionMode: parentSess?.permissionMode || child.permissionMode || 'auto-safe',
+        allowTools: parentSess?.toolAllow ?? null,
+        denyTools: [...new Set([...(parentSess?.toolDeny ?? []), 'spawn_subagent'])],
+      },
+      {
+        permissionMode: child.permissionMode || 'auto-safe',
+        allowTools: child.toolAllow,
+        denyTools: child.toolDeny ?? [],
+      },
     );
     return this.#runChildTurn({
       parentSessionId: child.parentSessionId || childSessionId,
