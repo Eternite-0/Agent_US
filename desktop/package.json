@@ -1,19 +1,84 @@
 {
   "name": "@agent-us/desktop",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "author": "Agent_US",
-  "description": "Codex-fidelity Electron desktop shell for Agent_US",
+  "description": "Agent_US Full-Stack Desktop Workbench (Frontend + Backend + Reverse-Proxy Gateway)",
   "main": "main.mjs",
   "type": "module",
   "scripts": {
     "dev": "electron .",
     "start": "electron . --prod",
-    "pack": "npm --prefix ../frontend run build && node pack-win.mjs",
+    "pack": "npm --prefix ../frontend run build && node pack-win.mjs --unpacked",
     "build": "npm --prefix ../frontend run build && node pack-win.mjs"
   },
   "devDependencies": {
     "electron": "^35.2.0",
     "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "io.github.eternite0.agentus",
+    "productName": "Agent_US",
+    "copyright": "Copyright © 2026 Agent_US",
+    "compression": "normal",
+    "asar": true,
+    "afterPack": "./after-pack.cjs",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.mjs",
+      "preload.cjs",
+      "extension-hub.mjs",
+      "catalog-seed.json",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "release/.stage/frontend-dist",
+        "to": "frontend-dist",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "release/.stage/backend/src",
+        "to": "backend/src",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "release/.stage/backend/package.json",
+        "to": "backend/package.json"
+      }
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "signAndEditExecutable": true,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Agent_US",
+      "uninstallDisplayName": "Agent_US",
+      "artifactName": "Agent_US-${version}-win-x64-setup.exe"
+    },
+    "portable": {
+      "artifactName": "Agent_US-${version}-win-x64-portable.exe"
+    }
   }
 }

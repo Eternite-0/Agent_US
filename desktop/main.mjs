@@ -2,7 +2,14 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createServer, request as httpRequest } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer as createNetServer } from 'node:net';
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,16 +22,25 @@ const forceProd = process.argv.includes('--prod') || isPackaged;
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
   '.json': 'application/json; charset=utf-8',
+  '.woff': 'font/woff',
   '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
   '.ico': 'image/x-icon',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
 let mainWindow = null;
 let backendProc = null;
+let backendLogStream = null;
 let localServer = null;
 
 function getPaths() {
@@ -53,15 +69,46 @@ function getOrCreateToken(dataDir) {
     return process.env.BACKEND_TOKEN;
   }
   const tokenFile = join(dataDir, '.dev-token');
-  if (!isPackaged && existsSync(tokenFile)) {
+  if (existsSync(tokenFile)) {
     const existing = readFileSync(tokenFile, 'utf8').trim();
     if (existing.length >= 24) return existing;
   }
   const fresh = randomBytes(32).toString('hex');
-  if (!isPackaged) {
-    writeFileSync(tokenFile, fresh, 'utf8');
+  try {
+    writeFileSync(tokenFile, fresh, { encoding: 'utf8', mode: 0o600 });
+  } catch {
+    // ignore read-only environments
   }
   return fresh;
+}
+
+function isPortAvailable(port) {
+  return new Promise((resolveFree) => {
+    const probe = createNetServer();
+    probe.unref();
+    probe.once('error', () => resolveFree(false));
+    probe.listen(port, '127.0.0.1', () => {
+      probe.close(() => resolveFree(true));
+    });
+  });
+}
+
+async function pickBackendPort(preferredPort) {
+  if (await isPortAvailable(preferredPort)) return preferredPort;
+  const fallbackPort = preferredPort + 10000;
+  if (fallbackPort <= 65535 && (await isPortAvailable(fallbackPort))) {
+    return fallbackPort;
+  }
+  return new Promise((resolvePort, rejectPort) => {
+    const probe = createNetServer();
+    probe.unref();
+    probe.once('error', rejectPort);
+    probe.listen(0, '127.0.0.1', () => {
+      const addr = probe.address();
+      const chosen = typeof addr === 'object' && addr ? addr.port : fallbackPort;
+      probe.close(() => resolvePort(chosen));
+    });
+  });
 }
 
 function checkHealth(port) {
@@ -122,8 +169,8 @@ async function ensureBackend(backendDir, backendDataDir, token) {
     }
   }
 
-  // If preferredPort is already bound by another process, fall back to 18787
-  const port = (await checkHealth(preferredPort)) ? preferredPort + 10000 : preferredPort;
+  // If preferredPort is occupied by another process, pick a free port cleanly
+  const port = await pickBackendPort(preferredPort);
 
   // Load optional local config.json & .provider-env.json from backendDataDir (or dev backend/var)
   const extraEnv = {};
@@ -159,7 +206,25 @@ async function ensureBackend(backendDir, backendDataDir, token) {
   });
   backendProc = child;
 
-  for (let i = 0; i < 40; i++) {
+  // Always drain child stdout/stderr to prevent pipe-buffer deadlock on Windows
+  try {
+    backendLogStream = createWriteStream(join(backendDataDir, 'backend.log'), {
+      flags: 'w',
+    });
+    child.stdout?.pipe(backendLogStream, { end: false });
+    child.stderr?.pipe(backendLogStream, { end: false });
+  } catch {
+    child.stdout?.resume();
+    child.stderr?.resume();
+  }
+
+  let exitedEarly = false;
+  child.once('exit', () => {
+    exitedEarly = true;
+  });
+
+  for (let i = 0; i < 60; i++) {
+    if (exitedEarly) break;
     if (await checkHealth(port)) {
       return { port, token, spawned: true };
     }
@@ -197,9 +262,13 @@ function startLocalUiServer(distDir, backendPort, token, backendDataDir) {
           },
           (uRes) => {
             res.writeHead(uRes.statusCode || 502, uRes.headers);
+            res.flushHeaders?.();
             uRes.pipe(res);
           },
         );
+        res.on('close', () => {
+          if (!res.writableEnded) upstream.destroy();
+        });
         upstream.on('error', () => {
           if (!res.headersSent) {
             res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -267,13 +336,17 @@ async function createMainWindow() {
     targetUrl = started.url;
   }
 
+  const iconCandidate = isPackaged
+    ? join(process.resourcesPath, 'icon.png')
+    : join(__dirname, 'assets', 'icon.png');
   mainWindow = new BrowserWindow({
     width: 1360,
     height: 860,
     minWidth: 960,
     minHeight: 620,
     frame: false,
-    title: 'Codex',
+    title: 'Agent_US',
+    ...(existsSync(iconCandidate) ? { icon: iconCandidate } : {}),
     backgroundColor: '#111111',
     show: false,
     webPreferences: {
@@ -350,14 +423,34 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('window-all-closed', () => {
+function cleanupRuntime() {
   if (localServer) {
     localServer.close();
     localServer = null;
   }
   if (backendProc && !backendProc.killed) {
-    backendProc.kill();
+    try {
+      backendProc.kill();
+    } catch {
+      // ignore already exited
+    }
     backendProc = null;
   }
+  if (backendLogStream) {
+    try {
+      backendLogStream.end();
+    } catch {
+      // ignore
+    }
+    backendLogStream = null;
+  }
+}
+
+app.on('before-quit', () => {
+  cleanupRuntime();
+});
+
+app.on('window-all-closed', () => {
+  cleanupRuntime();
   if (process.platform !== 'darwin') app.quit();
 });
