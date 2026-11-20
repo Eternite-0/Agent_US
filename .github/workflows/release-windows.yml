@@ -1,0 +1,110 @@
+name: Build & Release Windows Desktop (.exe)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name (e.g. v2.0.0)'
+        required: false
+        default: 'v2.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies (backend / frontend / desktop)
+        run: |
+          npm --prefix backend ci
+          npm --prefix frontend ci
+          npm --prefix desktop ci
+
+      - name: Verify backend & frontend checks
+        run: |
+          npm --prefix backend run check
+          Push-Location backend
+          node --test test/gateway-proxy.test.js test/web-login.test.js
+          Pop-Location
+          npm --prefix frontend exec -- tsc --noEmit
+          node --check desktop/main.mjs
+          node --check desktop/pack-win.mjs
+          node --check desktop/after-pack.cjs
+
+      - name: Build frontend & package Windows .exe (NSIS + Portable)
+        run: |
+          npm --prefix desktop run build
+
+      - name: Audit packaged artifacts & compute SHA-256
+        id: artifacts
+        run: |
+          $releaseDir = "desktop/release"
+          $setup = Get-ChildItem $releaseDir -Filter "*-setup.exe" | Select-Object -First 1
+          $portable = Get-ChildItem $releaseDir -Filter "*-portable.exe" | Select-Object -First 1
+          if (-not $setup -or -not $portable) {
+            throw "Missing built Windows .exe artifacts in $releaseDir"
+          }
+          $sums = @()
+          foreach ($f in @($setup, $portable)) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+            $mb = [math]::Round($f.Length / 1MB, 2)
+            $sums += "$h  $($f.Name) ($mb MB)"
+            Write-Host "Built: $($f.Name) [$mb MB] SHA256=$h"
+          }
+          $sums | Set-Content -Path "$releaseDir/SHA256SUMS.txt" -Encoding UTF8
+
+          $tag = if ("${{ github.ref_type }}" -eq "tag") {
+            "${{ github.ref_name }}"
+          } elseif ("${{ github.event.inputs.tag }}") {
+            "${{ github.event.inputs.tag }}"
+          } else {
+            "v2.0.0"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "setup_path=$($setup.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "portable_path=$($portable.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sums_path=$PWD/$releaseDir/SHA256SUMS.txt" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish GitHub Release & upload Windows .exe assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.artifacts.outputs.tag }}"
+          $setupPath = "${{ steps.artifacts.outputs.setup_path }}"
+          $portablePath = "${{ steps.artifacts.outputs.portable_path }}"
+          $sumsPath = "${{ steps.artifacts.outputs.sums_path }}"
+
+          $exists = $false
+          try {
+            gh release view $tag --repo "${{ github.repository }}" *> $null
+            if ($LASTEXITCODE -eq 0) { $exists = $true }
+          } catch { $exists = $false }
+
+          if (-not $exists) {
+            gh release create $tag `
+              --repo "${{ github.repository }}" `
+              --target "${{ github.sha }}" `
+              --title "Agent_US $tag (Windows Full-Stack Desktop)" `
+              --notes "Automated Windows x64 full-stack build (Frontend + Backend + Reverse-Proxy Gateway bundled)."
+          }
+
+          gh release upload $tag `
+            $setupPath `
+            $portablePath `
+            $sumsPath `
+            --repo "${{ github.repository }}" `
+            --clobber
