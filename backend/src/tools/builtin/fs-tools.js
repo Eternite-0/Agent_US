@@ -1,0 +1,382 @@
+import { z } from 'zod';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, relative, resolve } from 'node:path';
+import { sha256Hex } from '../../integrity.js';
+import {
+  applyCodexPatch,
+  applyFuzzyEdit,
+  runQuickDiagnostics,
+} from '../../patch-and-diagnostics.js';
+import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
+import { resolveConfinedPath } from '../sandbox.js';
+
+const SKIP_DIRS = new Set([
+  '.git',
+  'node_modules',
+  'dist',
+  'build',
+  'target',
+  '.next',
+  '.nuxt',
+  '.cache',
+  '__pycache__',
+  '.venv',
+  'upstream',
+]);
+
+function globToRegex(pattern) {
+  const norm = String(pattern || '*').replace(/\\/g, '/');
+  let re = '^';
+  for (let i = 0; i < norm.length; i++) {
+    const ch = norm[i];
+    if (ch === '*') {
+      if (norm[i + 1] === '*') {
+        if (norm[i + 2] === '/') {
+          re += '(?:.*/)?';
+          i += 2;
+        } else {
+          re += '.*';
+          i += 1;
+        }
+      } else {
+        re += '[^/]*';
+      }
+    } else if (ch === '?') {
+      re += '[^/]';
+    } else if ('^$+?.()|[]{}'.includes(ch)) {
+      re += '\\' + ch;
+    } else {
+      re += ch;
+    }
+  }
+  re += '$';
+  return new RegExp(re, 'i');
+}
+
+function walkFiles(dir, root, out, maxFiles = 5000) {
+  if (out.length >= maxFiles) return;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of entries) {
+    if (out.length >= maxFiles) break;
+    if (SKIP_DIRS.has(ent.name)) continue;
+    const full = resolve(dir, ent.name);
+    if (ent.isDirectory()) {
+      walkFiles(full, root, out, maxFiles);
+    } else if (ent.isFile()) {
+      out.push({
+        full,
+        rel: relative(root, full).replace(/\\/g, '/'),
+      });
+    }
+  }
+}
+
+function isProbablyBinary(buf) {
+  const sample = buf.subarray(0, Math.min(buf.length, 4096));
+  for (let i = 0; i < sample.length; i++) {
+    if (sample[i] === 0) return true;
+  }
+  return false;
+}
+
+export function createFsTools({
+  workspaceRoot,
+  readFileState,
+  wrapResult,
+  guardFallback,
+  onBeforeMutate,
+  onFileChanged,
+}) {
+  const checkStaleFile = (rel, full) => {
+    const tracked = readFileState.get(rel);
+    if (!tracked || !existsSync(full)) return;
+    try {
+      const curHash = sha256Hex(readFileSync(full, 'utf8'));
+      if (curHash !== tracked.sha256) {
+        throw new Error(
+          `防脏写拦截：${rel} 在你上次 read_file 之后已被外部修改，请先重新 read_file 获取最新内容再编辑。`,
+        );
+      }
+    } catch (err) {
+      if (String(err?.message).startsWith('防脏写拦截')) throw err;
+    }
+  };
+
+  const trackFileHash = (rel, content) => {
+    readFileState.set(rel, {
+      sha256: sha256Hex(content),
+      at: Date.now(),
+    });
+  };
+
+  return [
+    defineTool({
+      name: 'read_file',
+      description:
+        '读取工作区内的文本文件内容（带行号）。支持通过 startLine / endLine 分段阅读大文件。',
+      effectClass: EFFECT_CLASSES.READ_ONLY,
+      riskLevel: RISK_LEVELS.LOW,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        path: z.string().min(1).describe('相对工作区路径（或工作区内绝对路径）'),
+        startLine: z.number().int().min(1).optional().describe('起始行号（从 1 开始，可选）'),
+        endLine: z.number().int().min(1).optional().describe('结束行号（含，可选，单次最多 400 行）'),
+      }),
+      async execute(args, ctx) {
+        await guardFallback('read_file', args, ctx);
+        const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+        if (!existsSync(full)) return `文件不存在: ${rel}`;
+        const st = statSync(full);
+        if (st.isDirectory()) {
+          const items = readdirSync(full).slice(0, 100);
+          return `路径是目录 (${rel})，包含 ${items.length} 项:\n${items.join('\n')}`;
+        }
+        const buf = readFileSync(full);
+        if (isProbablyBinary(buf)) {
+          return `二进制文件 (${rel}, ${buf.length} bytes)，跳过文本展示。`;
+        }
+        const text = buf.toString('utf8');
+        trackFileHash(rel, text);
+        const lines = text.replace(/\r\n/g, '\n').split('\n');
+        const total = lines.length;
+        const start = Math.max(1, Number(args.startLine ?? 1));
+        const end = Math.min(total, args.endLine ? Number(args.endLine) : start + 399);
+        const slice = lines
+          .slice(start - 1, end)
+          .map((line, i) => `${start + i}: ${line}`)
+          .join('\n');
+        return wrapResult('read_file', `File: ${rel} (lines ${start}-${end} of ${total})\n${slice}`);
+      },
+    }),
+
+    defineTool({
+      name: 'edit_file',
+      description:
+        '对工作区已有文件做精准局部替换（内置 Codex 4 级容错匹配与自动语法诊断）。',
+      effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
+      riskLevel: RISK_LEVELS.MEDIUM,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        path: z.string().min(1).describe('目标文件路径'),
+        target: z.string().min(1).describe('要被替换的原始文本块'),
+        replacement: z.string().describe('替换后的新文本块'),
+        replaceAll: z.boolean().optional().describe('是否替换全部匹配项（默认 false）'),
+      }),
+      async execute(args, ctx) {
+        const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+        if (!existsSync(full)) throw new Error(`文件不存在: ${rel}`);
+        const target = String(args.target ?? '');
+        const replacement = String(args.replacement ?? '');
+        if (!target) throw new Error('target 不能为空');
+
+        checkStaleFile(rel, full);
+        await guardFallback('edit_file', { path: rel, target, replacement }, ctx);
+
+        const before = readFileSync(full, 'utf8');
+        const applied = applyFuzzyEdit(before, target, replacement, {
+          replaceAll: Boolean(args.replaceAll),
+        });
+        if (!applied.ok) {
+          throw new Error(`编辑 ${rel} 失败：${applied.error}`);
+        }
+
+        onBeforeMutate(rel, full);
+        writeFileSync(full, applied.after, 'utf8');
+        trackFileHash(rel, applied.after);
+        onFileChanged({
+          path: rel,
+          before: Buffer.from(before, 'utf8').toString('base64'),
+          after: Buffer.from(applied.after, 'utf8').toString('base64'),
+        });
+        const diag = runQuickDiagnostics(full, rel);
+        return `已成功编辑 ${rel}（匹配级别: ${applied.tier}，替换 ${applied.replacedCount} 处）。${diag.summary}`;
+      },
+    }),
+
+    defineTool({
+      name: 'write_file',
+      description: '新建文件或完整覆写工作区内指定文件，自动创建缺失父目录并执行快速语法诊断。',
+      effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
+      riskLevel: RISK_LEVELS.MEDIUM,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        path: z.string().min(1).describe('目标文件路径'),
+        content: z.string().describe('文件完整内容'),
+      }),
+      async execute(args, ctx) {
+        const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+        const content = String(args.content ?? '');
+        if (existsSync(full)) checkStaleFile(rel, full);
+        await guardFallback(
+          'write_file',
+          { path: rel, bytes: Buffer.byteLength(content, 'utf8') },
+          ctx,
+        );
+        const existed = existsSync(full);
+        const before = existed ? readFileSync(full, 'utf8') : null;
+        onBeforeMutate(rel, full);
+        mkdirSync(dirname(full), { recursive: true });
+        writeFileSync(full, content, 'utf8');
+        trackFileHash(rel, content);
+        onFileChanged({
+          path: rel,
+          before: before !== null ? Buffer.from(before, 'utf8').toString('base64') : null,
+          after: Buffer.from(content, 'utf8').toString('base64'),
+        });
+        const diag = runQuickDiagnostics(full, rel);
+        return `${existed ? '已覆写' : '已创建'} ${rel} (${Buffer.byteLength(content, 'utf8')} bytes)。${diag.summary}`;
+      },
+    }),
+
+    defineTool({
+      name: 'apply_patch',
+      description:
+        'Codex 风格多文件原子补丁工具：在一次调用中原子完成多处编辑、新建、移动与删除。格式：`*** Begin Patch` / `*** Update File: <path>` / `*** Add File: <path>` / `*** Delete File: <path>` / `@@ <context>` / `+`/`-`/` ` 行 / `*** End Patch`。',
+      effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
+      riskLevel: RISK_LEVELS.MEDIUM,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        patch: z.string().min(1).describe('完整 Codex 补丁文本'),
+      }),
+      async execute(args, ctx) {
+        const patch = String(args.patch ?? '');
+        if (!patch.trim()) throw new Error('patch 不能为空');
+        await guardFallback('apply_patch', { preview: patch.slice(0, 400) }, ctx);
+        const touched = applyCodexPatch(patch, {
+          workspaceRoot,
+          resolveSafePath: resolveConfinedPath,
+          checkStale: checkStaleFile,
+          onBeforeMutate,
+          onFileChanged,
+        });
+        const diagNotes = [];
+        for (const t of touched) {
+          if (t.action !== 'deleted' && existsSync(t.full)) {
+            trackFileHash(t.path, readFileSync(t.full, 'utf8'));
+            const d = runQuickDiagnostics(t.full, t.path);
+            if (!d.ok) diagNotes.push(d.summary);
+          }
+        }
+        const summary = touched.map((t) => `${t.action}: ${t.path}`).join('\n');
+        return `原子补丁已成功应用 (${touched.length} 个文件):\n${summary}${diagNotes.join('')}`;
+      },
+    }),
+
+    defineTool({
+      name: 'glob',
+      description: '按通配符模式快速查找工作区内的文件（自动忽略 node_modules 与 .git）。',
+      effectClass: EFFECT_CLASSES.READ_ONLY,
+      riskLevel: RISK_LEVELS.LOW,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        pattern: z.string().min(1).describe('如 **/*.ts 或 src/**/*.js'),
+        path: z.string().optional().describe('限定子目录（可选）'),
+        maxResults: z.number().int().min(1).max(300).optional().describe('最大返回条数（默认 100）'),
+      }),
+      async execute(args, ctx) {
+        await guardFallback('glob', args, ctx);
+        const base = args.path
+          ? resolveConfinedPath(workspaceRoot, args.path).full
+          : resolve(workspaceRoot);
+        if (!existsSync(base)) return `目录不存在: ${args.path}`;
+        const files = [];
+        walkFiles(base, resolve(workspaceRoot), files, 8000);
+        const rx = globToRegex(args.pattern);
+        const limit = Math.min(300, Math.max(1, Number(args.maxResults ?? 100)));
+        const matched = files
+          .filter((f) => rx.test(f.rel) || rx.test(f.rel.split('/').at(-1) ?? ''))
+          .slice(0, limit)
+          .map((f) => f.rel);
+        if (!matched.length) return `未找到匹配「${args.pattern}」的文件。`;
+        return wrapResult('glob', `找到 ${matched.length} 个匹配文件:\n${matched.join('\n')}`);
+      },
+    }),
+
+    defineTool({
+      name: 'grep',
+      description: '在工作区代码文件中搜索文本或正则表达式，返回精确的文件名、行号和内容。',
+      effectClass: EFFECT_CLASSES.READ_ONLY,
+      riskLevel: RISK_LEVELS.LOW,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        query: z.string().min(1).describe('搜索关键词或正则表达式'),
+        path: z.string().optional().describe('限定搜索的子目录或单文件（可选）'),
+        isRegex: z.boolean().optional().describe('是否按正则解析（默认 false）'),
+        glob: z.string().optional().describe('限定文件名通配符如 *.ts（可选）'),
+        maxResults: z.number().int().min(1).max(200).optional().describe('最多返回匹配行（默认 80）'),
+      }),
+      async execute(args, ctx) {
+        await guardFallback('grep', args, ctx);
+        const query = String(args.query ?? '');
+        if (!query) throw new Error('query 不能为空');
+        const base = args.path
+          ? resolveConfinedPath(workspaceRoot, args.path).full
+          : resolve(workspaceRoot);
+        if (!existsSync(base)) return `路径不存在: ${args.path}`;
+        const rx = args.isRegex
+          ? new RegExp(query, 'i')
+          : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        const fileFilter = args.glob ? globToRegex(args.glob) : null;
+        const limit = Math.min(200, Math.max(1, Number(args.maxResults ?? 80)));
+
+        const files = [];
+        const st = statSync(base);
+        if (st.isFile()) {
+          files.push({
+            full: base,
+            rel: relative(resolve(workspaceRoot), base).replace(/\\/g, '/'),
+          });
+        } else {
+          walkFiles(base, resolve(workspaceRoot), files, 6000);
+        }
+
+        const hits = [];
+        for (const f of files) {
+          if (hits.length >= limit) break;
+          if (
+            fileFilter &&
+            !fileFilter.test(f.rel) &&
+            !fileFilter.test(f.rel.split('/').at(-1) ?? '')
+          ) {
+            continue;
+          }
+          try {
+            const fst = statSync(f.full);
+            if (fst.size > 1024 * 1024) continue;
+            const buf = readFileSync(f.full);
+            if (isProbablyBinary(buf)) continue;
+            const lines = buf.toString('utf8').replace(/\r\n/g, '\n').split('\n');
+            for (let i = 0; i < lines.length; i++) {
+              if (rx.test(lines[i])) {
+                hits.push(`${f.rel}:${i + 1}: ${lines[i].trim().slice(0, 220)}`);
+                if (hits.length >= limit) break;
+              }
+            }
+          } catch {
+            // skip unreadable
+          }
+        }
+        if (!hits.length) return `未搜索到匹配「${query}」的内容。`;
+        return wrapResult('grep', hits.join('\n'));
+      },
+    }),
+  ];
+}

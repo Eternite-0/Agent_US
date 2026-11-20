@@ -35,7 +35,7 @@ export class Store {
   constructor(path) {
     this.db = new DatabaseSync(path);
     const userVersion = this.db.prepare('PRAGMA user_version').get().user_version;
-    if (userVersion > 4) {
+    if (userVersion > 5) {
       this.db.close();
       throw new Fault('UNSUPPORTED_DATABASE_SCHEMA');
     }
@@ -73,7 +73,25 @@ export class Store {
       CREATE TABLE IF NOT EXISTS nexus_usage(id INTEGER PRIMARY KEY AUTOINCREMENT, sessionId TEXT, planId TEXT, provider TEXT, model TEXT, accountId TEXT, day TEXT NOT NULL, inputTokens INTEGER NOT NULL DEFAULT 0, outputTokens INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, costUsd REAL NOT NULL DEFAULT 0, durationMs INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS nexus_usage_day ON nexus_usage(day, sessionId);
       CREATE TABLE IF NOT EXISTS turn_snapshots(id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES direct_sessions(id) ON DELETE CASCADE, turnId TEXT NOT NULL, path TEXT NOT NULL, existed INTEGER NOT NULL, beforeSha256 TEXT, afterSha256 TEXT, createdAt INTEGER NOT NULL, UNIQUE(turnId, path));
-      CREATE INDEX IF NOT EXISTS turn_snapshots_session ON turn_snapshots(sessionId, createdAt);`);
+      CREATE INDEX IF NOT EXISTS turn_snapshots_session ON turn_snapshots(sessionId, createdAt);
+      CREATE TABLE IF NOT EXISTS runtime_checkpoints(id TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT NOT NULL, step INTEGER NOT NULL, phase TEXT NOT NULL, stateJson TEXT NOT NULL, ledgerSeq INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS runtime_checkpoints_session ON runtime_checkpoints(sessionId, createdAt);
+      CREATE INDEX IF NOT EXISTS runtime_checkpoints_turn ON runtime_checkpoints(turnId, step);
+      CREATE TABLE IF NOT EXISTS runtime_jobs(id TEXT PRIMARY KEY, kind TEXT NOT NULL, sessionId TEXT, turnId TEXT, taskId TEXT, parentJobId TEXT, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', fence TEXT, workerId TEXT, leaseExpiresAt INTEGER, attempts INTEGER NOT NULL DEFAULT 0, maxAttempts INTEGER NOT NULL DEFAULT 3, idempotencyKey TEXT, errorCode TEXT, errorMessage TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS runtime_jobs_status ON runtime_jobs(status, leaseExpiresAt);
+      CREATE UNIQUE INDEX IF NOT EXISTS runtime_jobs_idem ON runtime_jobs(idempotencyKey) WHERE idempotencyKey IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS tool_receipts(id TEXT PRIMARY KEY, sessionId TEXT, turnId TEXT, taskId TEXT, callId TEXT NOT NULL, toolName TEXT NOT NULL, riskLevel TEXT NOT NULL, effectClass TEXT NOT NULL, replayable INTEGER NOT NULL, outward INTEGER NOT NULL, argsDigest TEXT NOT NULL, approvalId TEXT, permitEffectId TEXT, status TEXT NOT NULL, outputDigest TEXT, exitCode INTEGER, durationMs INTEGER NOT NULL DEFAULT 0, errorCode TEXT, reconciliationOutcome TEXT, reconciliationNote TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS tool_receipts_turn ON tool_receipts(sessionId, turnId);
+      CREATE INDEX IF NOT EXISTS tool_receipts_status ON tool_receipts(status);
+      CREATE TABLE IF NOT EXISTS swarm_runs(id TEXT PRIMARY KEY, sessionId TEXT NOT NULL, rootTurnId TEXT, goal TEXT NOT NULL, status TEXT NOT NULL, strategyJson TEXT NOT NULL, budgetJson TEXT NOT NULL, usageJson TEXT NOT NULL DEFAULT '{}', verdictJson TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS swarm_runs_session ON swarm_runs(sessionId, createdAt);
+      CREATE TABLE IF NOT EXISTS swarm_nodes(id TEXT PRIMARY KEY, runId TEXT NOT NULL REFERENCES swarm_runs(id) ON DELETE CASCADE, nodeKey TEXT NOT NULL, parentNodeId TEXT, agentProfileId TEXT NOT NULL, childSessionId TEXT, model TEXT, provider TEXT, objective TEXT NOT NULL, acceptance TEXT NOT NULL, dependenciesJson TEXT NOT NULL DEFAULT '[]', toolAllowJson TEXT, permissionMode TEXT NOT NULL DEFAULT 'auto-safe', worktreePath TEXT, status TEXT NOT NULL DEFAULT 'pending', priority INTEGER NOT NULL DEFAULT 0, budgetJson TEXT NOT NULL DEFAULT '{}', resultText TEXT, artifactUrisJson TEXT NOT NULL DEFAULT '[]', errorCode TEXT, errorMessage TEXT, attempts INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, UNIQUE(runId, nodeKey));
+      CREATE INDEX IF NOT EXISTS swarm_nodes_run ON swarm_nodes(runId, status);
+      CREATE TABLE IF NOT EXISTS agent_messages(id TEXT PRIMARY KEY, runId TEXT, fromAgentId TEXT NOT NULL, toAgentId TEXT NOT NULL, kind TEXT NOT NULL, payloadJson TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', createdAt INTEGER NOT NULL, deliveredAt INTEGER);
+      CREATE INDEX IF NOT EXISTS agent_messages_recipient ON agent_messages(toAgentId, status, createdAt);
+      CREATE TABLE IF NOT EXISTS context_compactions(id TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT, stage TEXT NOT NULL, coveredThroughSeq INTEGER NOT NULL, summaryText TEXT NOT NULL, taskStateJson TEXT NOT NULL, preservedConstraintsJson TEXT NOT NULL, tokenBefore INTEGER NOT NULL, tokenAfter INTEGER NOT NULL, createdAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS context_compactions_session ON context_compactions(sessionId, createdAt);
+      CREATE TABLE IF NOT EXISTS scheduled_tasks(id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL, scheduleKind TEXT NOT NULL, scheduleExpr TEXT NOT NULL, workspaceRoot TEXT, model TEXT, permissionMode TEXT NOT NULL DEFAULT 'auto-safe', enabled INTEGER NOT NULL DEFAULT 1, lastRunAt INTEGER, nextRunAt INTEGER, lastSessionId TEXT, lastStatus TEXT, runHistoryJson TEXT NOT NULL DEFAULT '[]', createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);`);
     this.#migrateSchema();
   }
   #migrateSchema() {
@@ -132,6 +150,78 @@ export class Store {
           "ALTER TABLE direct_sessions ADD COLUMN approvedPrefixes TEXT NOT NULL DEFAULT '[]'",
         );
       }
+      if (!sessCols.has('parentSessionId')) {
+        this.db.exec('ALTER TABLE direct_sessions ADD COLUMN parentSessionId TEXT');
+      }
+      if (!sessCols.has('rootSessionId')) {
+        this.db.exec('ALTER TABLE direct_sessions ADD COLUMN rootSessionId TEXT');
+      }
+      if (!sessCols.has('agentProfile')) {
+        this.db.exec(
+          "ALTER TABLE direct_sessions ADD COLUMN agentProfile TEXT NOT NULL DEFAULT 'default'",
+        );
+      }
+      if (!sessCols.has('budgetJson')) {
+        this.db.exec('ALTER TABLE direct_sessions ADD COLUMN budgetJson TEXT');
+      }
+      if (!sessCols.has('activeCompactionId')) {
+        this.db.exec('ALTER TABLE direct_sessions ADD COLUMN activeCompactionId TEXT');
+      }
+      const turnCols = new Set(
+        this.db
+          .prepare('PRAGMA table_info(direct_turns)')
+          .all()
+          .map((c) => c.name),
+      );
+      if (!turnCols.has('jobId')) {
+        this.db.exec('ALTER TABLE direct_turns ADD COLUMN jobId TEXT');
+      }
+      if (!turnCols.has('phase')) {
+        this.db.exec(
+          "ALTER TABLE direct_turns ADD COLUMN phase TEXT NOT NULL DEFAULT 'init'",
+        );
+      }
+      if (!turnCols.has('step')) {
+        this.db.exec(
+          'ALTER TABLE direct_turns ADD COLUMN step INTEGER NOT NULL DEFAULT 0',
+        );
+      }
+      if (!turnCols.has('agentProfile')) {
+        this.db.exec(
+          "ALTER TABLE direct_turns ADD COLUMN agentProfile TEXT NOT NULL DEFAULT 'default'",
+        );
+      }
+      if (!turnCols.has('verdictJson')) {
+        this.db.exec('ALTER TABLE direct_turns ADD COLUMN verdictJson TEXT');
+      }
+      if (!turnCols.has('evidenceCount')) {
+        this.db.exec(
+          'ALTER TABLE direct_turns ADD COLUMN evidenceCount INTEGER NOT NULL DEFAULT 0',
+        );
+      }
+      const apprCols = new Set(
+        this.db
+          .prepare('PRAGMA table_info(direct_approvals)')
+          .all()
+          .map((c) => c.name),
+      );
+      if (!apprCols.has('kind')) {
+        this.db.exec(
+          "ALTER TABLE direct_approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'tool'",
+        );
+      }
+      if (!apprCols.has('receiptId')) {
+        this.db.exec('ALTER TABLE direct_approvals ADD COLUMN receiptId TEXT');
+      }
+      if (!apprCols.has('riskLevel')) {
+        this.db.exec('ALTER TABLE direct_approvals ADD COLUMN riskLevel TEXT');
+      }
+      if (!apprCols.has('effectClass')) {
+        this.db.exec('ALTER TABLE direct_approvals ADD COLUMN effectClass TEXT');
+      }
+      if (!apprCols.has('outcome')) {
+        this.db.exec('ALTER TABLE direct_approvals ADD COLUMN outcome TEXT');
+      }
       try {
         this.db.exec(`
           CREATE VIRTUAL TABLE IF NOT EXISTS direct_messages_fts USING fts5(
@@ -155,7 +245,7 @@ export class Store {
       } catch {
         this.ftsEnabled = false;
       }
-      this.db.exec('PRAGMA user_version=4');
+      this.db.exec('PRAGMA user_version=5');
     });
   }
   searchDirectHistory(

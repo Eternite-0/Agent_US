@@ -7,6 +7,7 @@ import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { bundle } from './bundle.js';
 import { Fault } from './store.js';
 import { buildRepairNote, decideRepair } from './verifier.js';
+import { classifyError } from './kernel/errors.js';
 
 // A fresh Cordis scope exposes exactly this attempt's tools and adapter.
 export async function runSession({
@@ -48,6 +49,8 @@ export async function runSession({
           if (chunk.type === 'usage') onUsage?.(chunk.usage);
           yield chunk;
         }
+      } catch (err) {
+        throw err instanceof Fault ? err : classifyError(err);
       } finally {
         onTelemetry?.({
           step: calls,

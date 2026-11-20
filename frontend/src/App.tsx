@@ -299,7 +299,7 @@ export const App: React.FC = () => {
         const health = await client.health();
         setBackendHealthy(health.ok ?? health.status === "ok");
         if (health.workspaceRoot) setWorkspaceRoot(health.workspaceRoot);
-        const [projList, taskList, apprList, modelList, pHealth, memList, usgList, evList, currentGitStatus] =
+        const [projList, taskList, apprList, modelList, pHealth, memList, usgList, evList, currentGitStatus, schedList] =
           await Promise.all([
             client.listProjects(),
             client.listTasks(),
@@ -310,6 +310,7 @@ export const App: React.FC = () => {
             client.listUsage(),
             client.listEvents({ after: 0 }).catch(() => [] as EventEnvelope[]),
             client.getGitStatus?.().catch(() => null) ?? Promise.resolve(null),
+            client.listSchedules?.().catch(() => null) ?? Promise.resolve(null),
           ]);
 
         setProjects(projList);
@@ -320,6 +321,29 @@ export const App: React.FC = () => {
         setGitStatus(currentGitStatus);
         setMemory(memList);
         setUsage(usgList);
+        if (schedList) {
+          setScheduledTasks(
+            schedList.map((s) => ({
+              id: s.id,
+              title: s.name,
+              prompt: s.prompt,
+              projectId: null,
+              frequency:
+                s.scheduleKind === 'hourly' ||
+                s.scheduleKind === 'daily' ||
+                s.scheduleKind === 'weekly' ||
+                s.scheduleKind === 'cron'
+                  ? s.scheduleKind
+                  : 'cron',
+              time: /^\d{1,2}:\d{2}$/.test(s.scheduleExpr) ? s.scheduleExpr : '09:00',
+              weekday: '一',
+              cronExpr: s.scheduleExpr,
+              paused: !s.enabled,
+              lastRunTaskIds: (s.runHistory ?? []).map((h) => h.sessionId).filter(Boolean),
+              createdAt: s.createdAt ?? Date.now(),
+            })),
+          );
+        }
         if (evList.length) {
           setRecentEvents((prev) => {
             const bySeq = new Map<number, EventEnvelope>();
@@ -689,7 +713,7 @@ export const App: React.FC = () => {
           });
           return;
         }
-        if (sid && (ev.type === 'tool/result' || ev.type === 'turn/completed' || ev.type === 'turn/failed' || ev.type === 'turn/cancelled')) {
+        if (sid && (ev.type === 'tool/result' || ev.type === 'turn/completed' || ev.type === 'turn/failed' || ev.type === 'turn/cancelled' || ev.type === 'turn/parked')) {
           setLiveToolOutputs((prev) => {
             if (!prev[sid]) return prev;
             const next = { ...prev };
@@ -697,7 +721,7 @@ export const App: React.FC = () => {
             return next;
           });
         }
-        if (sid && (ev.type === 'turn/completed' || ev.type === 'turn/failed' || ev.type === 'turn/cancelled' || ev.type === 'assistant/message')) {
+        if (sid && (ev.type === 'turn/completed' || ev.type === 'turn/failed' || ev.type === 'turn/cancelled' || ev.type === 'turn/parked' || ev.type === 'assistant/message')) {
           setLiveStreams((prev) => {
             if (!prev[sid]) return prev;
             const next = { ...prev };
@@ -705,11 +729,22 @@ export const App: React.FC = () => {
             return next;
           });
         }
+        if (ev.type === 'reconciliation/required') {
+          pushToast('检测到待人工核对的外部操作 (outcome_unknown)', 'warning');
+        } else if (ev.type === 'session/recovered') {
+          pushToast('已从检查点恢复中断会话', 'success');
+        }
+        // Track structural runtime/swarm/verifier events in recentEvents & refresh bundles cleanly
         setRecentEvents((prev) => {
-          if (prev.some((x) => x.seq === ev.seq)) return prev;
+          if (ev.seq > 0 && prev.some((x) => x.seq === ev.seq && x.type === ev.type)) return prev;
           return [...prev.slice(-119), ev];
         });
-        scheduleRefresh();
+        if (
+          ev.type !== 'turn/phase_changed' ||
+          activeChainRef.current.includes(sid)
+        ) {
+          scheduleRefresh();
+        }
       },
       (state) => setSseState(state),
     );
@@ -718,48 +753,7 @@ export const App: React.FC = () => {
       if (throttleTimer !== null) window.clearTimeout(throttleTimer);
       unsubscribe();
     };
-  }, [client, refreshWorkspace, refreshActiveBundles]);
-
-  // Auto-approve based on selected 3-mode PermissionMode:
-  // - 'full-access': auto-approves all pending tool gates
-  // - 'auto-safe': auto-approves low-risk read_file / workspace write_file, holds shell/git/mcp for manual confirmation
-  // - 'approval': holds every approval for explicit manual confirmation
-  const autoApprovedIds = useRef(new Set<string>());
-  useEffect(() => {
-    if (permissionMode === 'approval') return;
-    const isAutoSafeEligible = (a: Approval) => {
-      if (permissionMode === 'full-access') return true;
-      if (a.tool === 'read_file') return true;
-      if (a.tool === 'write_file') {
-        const p = String(a.action?.path ?? '');
-        return Boolean(p) && !p.startsWith('/') && !p.includes('..');
-      }
-      return false;
-    };
-    const pending = approvals.filter(
-      (a) => a.status === 'pending' && isAutoSafeEligible(a) && !autoApprovedIds.current.has(a.id),
-    );
-    for (const a of pending) {
-      autoApprovedIds.current.add(a.id);
-      void client
-        .decideApproval(a.id, a.version, 'approve')
-        .then(() => {
-          pushToast(
-            permissionMode === 'full-access'
-              ? `完全访问权限已自动批准 ${a.tool}`
-              : `帮我批准已放行安全操作 ${a.tool}`,
-            'success',
-          );
-          void refreshWorkspace(false);
-          if (activeChainRef.current.length) {
-            void refreshActiveBundles(activeChainRef.current, true);
-          }
-        })
-        .catch(() => {
-          autoApprovedIds.current.delete(a.id);
-        });
-    }
-  }, [approvals, permissionMode, client, pushToast, refreshWorkspace, refreshActiveBundles]);
+  }, [client, refreshWorkspace, refreshActiveBundles, pushToast]);
 
   // Domain Actions
   const handleSelectProject = useCallback((projectId: string | null) => {
@@ -916,18 +910,31 @@ export const App: React.FC = () => {
     approval: Approval,
     decision: 'approve' | 'deny',
     scope?: 'once' | 'session',
+    outcome?: 'happened' | 'not_applied' | 'abort',
   ) => {
     setDecidingApprovalId(approval.id);
     try {
-      await client.decideApproval(approval.id, approval.version, decision, scope);
-      pushToast(
-        decision === 'approve'
-          ? scope === 'session'
-            ? `已本会话自动放行 ${approval.tool}`
-            : `已批准 ${approval.tool}`
-          : `已拒绝 ${approval.tool}`,
-        decision === 'approve' ? 'success' : 'warning',
-      );
+      if (approval.kind === 'reconciliation' && outcome && client.resolveReconciliation) {
+        await client.resolveReconciliation(approval.id, outcome);
+        pushToast(
+          outcome === 'happened'
+            ? `已确认 ${approval.tool} 已执行，继续恢复任务`
+            : outcome === 'not_applied'
+              ? `已确认 ${approval.tool} 未产生副作用`
+              : `已中止 ${approval.tool} 相关任务`,
+          outcome === 'abort' ? 'warning' : 'success',
+        );
+      } else {
+        await client.decideApproval(approval.id, approval.version, decision, scope);
+        pushToast(
+          decision === 'approve'
+            ? scope === 'session'
+              ? `已本会话自动放行 ${approval.tool}`
+              : `已批准 ${approval.tool}`
+            : `已拒绝 ${approval.tool}`,
+          decision === 'approve' ? 'success' : 'warning',
+        );
+      }
       await refreshWorkspace(false);
       if (activeChainRef.current.length) {
         await refreshActiveBundles(activeChainRef.current, true);
@@ -1397,6 +1404,38 @@ export const App: React.FC = () => {
                 projects={projects}
                 selectedProjectId={selectedProject?.id ?? null}
                 onCreateScheduled={(item) => {
+                  if (client.createSchedule) {
+                    const expr =
+                      item.frequency === 'daily'
+                        ? item.time
+                        : item.frequency === 'weekly'
+                          ? `${item.weekday} ${item.time}`
+                          : item.frequency === 'hourly'
+                            ? '0 * * * *'
+                            : item.cronExpr;
+                    void client
+                      .createSchedule({
+                        name: item.title,
+                        prompt: item.prompt,
+                        scheduleKind: item.frequency,
+                        scheduleExpr: expr,
+                        workspaceRoot: workspaceRoot || undefined,
+                        model: selectedModel || undefined,
+                        permissionMode,
+                        enabled: !item.paused,
+                      })
+                      .then((saved) => {
+                        setScheduledTasks((prev) => [
+                          { ...item, id: saved.id, lastRunTaskIds: [], createdAt: saved.createdAt ?? Date.now() },
+                          ...prev,
+                        ]);
+                        pushToast(`已保存定时任务「${item.title}」`, 'success');
+                      })
+                      .catch((e) => {
+                        pushToast(`创建定时任务失败：${e instanceof Error ? e.message : '请求失败'}`, 'danger');
+                      });
+                    return;
+                  }
                   const created: ScheduledTaskItem = {
                     ...item,
                     id: `sched-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1407,6 +1446,15 @@ export const App: React.FC = () => {
                   pushToast(`已创建定时任务「${created.title}」`, 'success');
                 }}
                 onUpdateScheduled={(id, patch) => {
+                  if (client.updateSchedule) {
+                    void client
+                      .updateSchedule(id, {
+                        ...(patch.title !== undefined ? { name: patch.title } : {}),
+                        ...(patch.prompt !== undefined ? { prompt: patch.prompt } : {}),
+                        ...(patch.paused !== undefined ? { enabled: !patch.paused } : {}),
+                      })
+                      .catch(() => {});
+                  }
                   setScheduledTasks((prev) =>
                     prev.map((s) => (s.id === id ? { ...s, ...patch } : s)),
                   );
@@ -1415,10 +1463,20 @@ export const App: React.FC = () => {
                   }
                 }}
                 onDeleteScheduled={(id) => {
+                  if (client.deleteSchedule) {
+                    void client.deleteSchedule(id).catch(() => {});
+                  }
                   setScheduledTasks((prev) => prev.filter((s) => s.id !== id));
                   pushToast('已删除定时任务');
                 }}
                 onRunScheduledNow={async (item) => {
+                  if (client.runScheduleNow) {
+                    const out = await client.runScheduleNow(item.id);
+                    await refreshWorkspace(false);
+                    pushToast(`已触发定时任务「${item.title}」`, 'success');
+                    navigate({ kind: 'thread', taskId: out.session.id });
+                    return;
+                  }
                   let projectId = item.projectId ?? selectedProject?.id ?? null;
                   if (!projectId) {
                     const created = await client.createProject('Agent_US Workspace');
@@ -1427,14 +1485,14 @@ export const App: React.FC = () => {
                     setSelectedProjectId(created.id);
                   }
                   const task = await client.submitTask({
-        effort,
+                    effort,
                     projectId,
                     input: item.prompt,
                     idempotencyKey: randomIdempotencyKey(),
-        ...(selectedModel ? { model: selectedModel } : {}),
-        permissionMode,
-        ...(workspaceRoot ? { workspaceRoot } : {}),
-                   });
+                    ...(selectedModel ? { model: selectedModel } : {}),
+                    permissionMode,
+                    ...(workspaceRoot ? { workspaceRoot } : {}),
+                  });
                   setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
                   setScheduledTasks((prev) =>
                     prev.map((s) =>

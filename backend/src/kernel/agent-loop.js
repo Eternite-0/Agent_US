@@ -1,0 +1,590 @@
+import { sha256Hex } from '../integrity.js';
+import { excerpt } from '../context.js';
+import { verifyTurn, buildRepairNote } from '../verifier.js';
+import { BudgetError, classifyError } from './errors.js';
+import { RUNTIME_EVENTS } from './events.js';
+import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
+
+/**
+ * Default DecisionEngine handles premature-stop detection, verification gate,
+ * repair loop policy, and thrashing circuit-breaker checks.
+ */
+export class DecisionEngine {
+  constructor({ judgment = null, verifier = null, maxRepairRounds = 1 } = {}) {
+    this.judgment = judgment;
+    this.verifier = verifier ?? verifyTurn;
+    this.maxRepairRounds = maxRepairRounds;
+  }
+
+  async shouldContinueOnIdle({
+    input,
+    stepText,
+    steps,
+    maxSteps,
+    stopContinuedOnce,
+    repairedOnce,
+    repairRound,
+    verifierEvents,
+    node,
+    execution,
+    sessionId = null,
+    turnId = null,
+    workspaceRoot = null,
+    signal,
+  }) {
+    if (
+      this.judgment &&
+      typeof this.judgment.detectPrematureStop === 'function' &&
+      !stopContinuedOnce &&
+      stepText &&
+      steps < maxSteps
+    ) {
+      const check = await this.judgment
+        .detectPrematureStop({
+          requestText: input,
+          replyText: stepText,
+          hasTools: false,
+          alreadyContinued: stopContinuedOnce,
+          signal,
+        })
+        .catch(() => null);
+      if (check?.shouldContinue && check.note) {
+        return {
+          action: 'continue_stop',
+          note: check.note,
+          meta: { prob: check.prob, cached: !!check.cached },
+        };
+      }
+    }
+
+    if (
+      this.verifier &&
+      !repairedOnce &&
+      repairRound < this.maxRepairRounds &&
+      verifierEvents.length > 0 &&
+      stepText &&
+      steps < maxSteps
+    ) {
+      const verdict = await Promise.resolve(
+        this.verifier({
+          events: verifierEvents,
+          text: stepText,
+          node,
+          execution,
+          sessionId,
+          turnId,
+          workspaceRoot,
+        }),
+      );
+      if (verdict && verdict.verdict === 'block_reconciliation') {
+        return { action: 'complete', verdict };
+      }
+      if (verdict && verdict.verdict !== 'pass') {
+        return {
+          action: 'repair',
+          verdict,
+          note: buildRepairNote(verdict),
+        };
+      }
+      return { action: 'complete', verdict };
+    }
+
+    return { action: 'complete', verdict: null };
+  }
+}
+
+/**
+ * TurnManager tracks per-turn usage, steering drain, thrashing detection, and checkpoint persistence.
+ */
+export class TurnManager {
+  constructor({
+    store = null,
+    eventRouter,
+    checkpointStore = null,
+    sessionId,
+    turnId,
+  }) {
+    this.store = store;
+    this.eventRouter = eventRouter;
+    this.checkpointStore = checkpointStore;
+    this.sessionId = sessionId;
+    this.turnId = turnId;
+    this.totalIn = 0;
+    this.totalOut = 0;
+    this.totalCacheRead = 0;
+    this.totalCacheWrite = 0;
+    this.recentCallSigs = [];
+    this.thrashWarned = false;
+  }
+
+  addUsage(usage) {
+    this.totalIn += Number(usage?.inputTokens ?? 0);
+    this.totalOut += Number(usage?.outputTokens ?? 0);
+    this.totalCacheRead += Number(usage?.cacheReadTokens ?? 0);
+    this.totalCacheWrite += Number(usage?.cacheWriteTokens ?? 0);
+  }
+
+  recordToolSignature(tc, isError) {
+    const sig = sha256Hex(`${tc.name}::${tc.arguments}::${isError}`);
+    this.recentCallSigs.push(sig);
+    if (this.recentCallSigs.length > 6) this.recentCallSigs.shift();
+    return this.recentCallSigs.filter((s) => s === sig).length >= 3;
+  }
+
+  saveCheckpoint({ step, phase, state }) {
+    if (!this.checkpointStore || !this.sessionId || !this.turnId) return null;
+    return this.checkpointStore.save({
+      sessionId: this.sessionId,
+      turnId: this.turnId,
+      step,
+      phase,
+      state,
+    });
+  }
+}
+
+/**
+ * Unified Phase-Driven AgentLoop (Layer 3 Kernel).
+ * Executes all Agent Profiles (default direct session, subagents, swarm nodes, legacy profiles)
+ * through a single deterministic loop with state-machine enforcement, steering, budget checks,
+ * context compaction, tool batching, verification, and checkpoints.
+ */
+export class AgentLoop {
+  constructor({
+    store = null,
+    eventRouter,
+    inferenceEngine,
+    decisionEngine = null,
+    checkpointStore = null,
+  }) {
+    this.store = store;
+    this.eventRouter = eventRouter;
+    this.inferenceEngine = inferenceEngine;
+    this.decisionEngine = decisionEngine ?? new DecisionEngine();
+    this.checkpointStore = checkpointStore;
+  }
+
+  async run({
+    sessionId,
+    turnId,
+    profile,
+    input,
+    model,
+    provider = 'pool',
+    effort = null,
+    messages,
+    tools = [],
+    toolDispatcher,
+    contextManager,
+    drainSteering = () => [],
+    drainMailbox = null,
+    hooks = null,
+    permissionMode = null,
+    getApprovedPrefixes = () => [],
+    requestApproval = null,
+    onAssistantMessage = null,
+    onToolResult = null,
+    leaseGuard = null,
+    budget = {},
+    initialStep = 0,
+    signal,
+    workspaceRoot = null,
+    node = null,
+    execution = null,
+  }) {
+    const sm = new TurnStateMachine({
+      store: this.store,
+      eventRouter: this.eventRouter,
+      sessionId,
+      turnId,
+      initialPhase: TURN_PHASES.INIT,
+      initialStep,
+    });
+    const tm = new TurnManager({
+      store: this.store,
+      eventRouter: this.eventRouter,
+      checkpointStore: this.checkpointStore,
+      sessionId,
+      turnId,
+    });
+
+    const maxSteps = Math.min(60, Math.max(1, Number(budget.maxSteps ?? profile?.defaultMaxSteps ?? 24)));
+    const deadlineAt = budget.maxDurationMs ? Date.now() + Number(budget.maxDurationMs) : null;
+    const maxTotalTokens = budget.maxTokens ? Number(budget.maxTokens) : null;
+    const verifierEvents = [];
+    const argStrikes = new Map();
+
+    let steps = Number(initialStep || 0);
+    let stopContinuedOnce = false;
+    let repairedOnce = false;
+    let repairRound = 0;
+    let finalAssistantText = '';
+    let finalVerdict = null;
+    let stopReason = 'completed';
+
+    try {
+      tm.saveCheckpoint({
+        step: steps,
+        phase: sm.phase,
+        state: { model, maxSteps, messageCount: messages.length },
+      });
+
+      while (steps < maxSteps) {
+        signal?.throwIfAborted?.();
+        leaseGuard?.();
+        if (deadlineAt && Date.now() > deadlineAt) {
+          throw new BudgetError('TASK_DEADLINE', { message: '任务执行超出时间预算' });
+        }
+        if (maxTotalTokens && tm.totalIn + tm.totalOut >= maxTotalTokens) {
+          throw new BudgetError('TOKEN_BUDGET', { message: '任务执行超出 Token 预算' });
+        }
+
+        steps++;
+        sm.transition(TURN_PHASES.CHECKPOINT, { step: steps, persist: profile?.persistTurn !== false });
+
+        // Drain mid-turn steering input and inter-agent mailbox messages at step boundary
+        const steers = drainSteering() ?? [];
+        for (const steerText of steers) {
+          messages.push({
+            role: 'user',
+            content: [{ type: 'text', text: `[用户实时纠偏指令]\n${steerText}` }],
+          });
+        }
+        if (typeof drainMailbox === 'function') {
+          const mailItems = (await drainMailbox()) ?? [];
+          for (const mail of mailItems) {
+            messages.push({
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: `[来自子代理 ${mail.fromAgentId} 的消息 (${mail.kind})]\n${
+                    typeof mail.payload === 'string' ? mail.payload : JSON.stringify(mail.payload)
+                  }`,
+                },
+              ],
+            });
+          }
+        }
+
+        // Context compaction check (fixes P0 bug where string stage > 0 never fired)
+        let requestOptions = {
+          provider,
+          model,
+          sessionKey: sessionId,
+          effort,
+          messages,
+          tools,
+          maxTokens: budget.maxOutputTokens ?? 4096,
+          signal,
+        };
+        if (contextManager) {
+          sm.transition(TURN_PHASES.COMPACTING, { step: steps, persist: profile?.persistTurn !== false });
+          const compacted = await contextManager.prepareRequest(requestOptions, { step: steps });
+          requestOptions = compacted.options;
+          if (compacted.stage && compacted.stage !== 'none') {
+            this.eventRouter.emitPersisted({
+              sessionId,
+              turnId,
+              type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
+              data: {
+                stage: compacted.stage,
+                step: steps,
+                tokens: compacted.tokens ?? null,
+              },
+              audit: false,
+            });
+          }
+        }
+
+        // Model inference phase
+        sm.transition(TURN_PHASES.INFERENCE, { step: steps, persist: profile?.persistTurn !== false });
+        const stepResult = await this.inferenceEngine.streamStep({
+          ...requestOptions,
+          onTextDelta: (_delta, full) => {
+            if (profile?.streamDeltas !== false) {
+              this.eventRouter.emitEphemeral({
+                sessionId,
+                turnId,
+                type: RUNTIME_EVENTS.ASSISTANT_DELTA,
+                data: { turnId, sessionId, delta: _delta, text: full },
+              });
+            }
+          },
+          onReasoningDelta: (_delta, full) => {
+            if (profile?.streamDeltas !== false) {
+              this.eventRouter.emitEphemeral({
+                sessionId,
+                turnId,
+                type: RUNTIME_EVENTS.REASONING_DELTA,
+                data: { turnId, sessionId, delta: _delta, text: full },
+              });
+            }
+          },
+        });
+        tm.addUsage(stepResult.usage);
+        leaseGuard?.();
+
+        if (
+          stepResult.text ||
+          stepResult.reasoning ||
+          stepResult.toolCalls.length > 0
+        ) {
+          const assistantMsg = {
+            role: 'assistant',
+            content: [
+              ...(stepResult.text ? [{ type: 'text', text: stepResult.text }] : []),
+              ...stepResult.toolCalls,
+            ],
+          };
+          messages.push(assistantMsg);
+          verifierEvents.push({
+            type: 'assistant/message',
+            data: { message: assistantMsg },
+          });
+          if (stepResult.text) {
+            finalAssistantText = stepResult.text;
+          }
+          await onAssistantMessage?.({
+            text: stepResult.text,
+            reasoning: stepResult.reasoning,
+            toolCalls: stepResult.toolCalls,
+            step: steps,
+          });
+          if (stepResult.text && profile?.emitAssistantMessage !== false) {
+            this.eventRouter.emitPersisted({
+              sessionId,
+              turnId,
+              type: RUNTIME_EVENTS.ASSISTANT_MESSAGE,
+              data: {
+                turnId,
+                sessionId,
+                text: stepResult.text,
+                reasoning: stepResult.reasoning || undefined,
+                hasToolCalls: stepResult.toolCalls.length > 0,
+              },
+              audit: false,
+            });
+          }
+        }
+
+        // Idle completion / verification check when model emitted no tool calls
+        if (!stepResult.toolCalls.length) {
+          if (drainSteering && (steers?.length === 0)) {
+            const lateSteers = drainSteering();
+            if (lateSteers?.length) {
+              for (const s of lateSteers) {
+                messages.push({
+                  role: 'user',
+                  content: [{ type: 'text', text: `[用户实时纠偏指令]\n${s}` }],
+                });
+              }
+              continue;
+            }
+          }
+
+          verifierEvents.push({
+            type: 'turn/end',
+            data: { reason: { kind: stepResult.finishReason || 'completed' } },
+          });
+
+          sm.transition(TURN_PHASES.VERIFYING, { step: steps, persist: profile?.persistTurn !== false });
+          const decision = await this.decisionEngine.shouldContinueOnIdle({
+            input,
+            stepText: stepResult.text,
+            steps,
+            maxSteps,
+            stopContinuedOnce,
+            repairedOnce,
+            repairRound,
+            verifierEvents,
+            node,
+            execution,
+            sessionId,
+            turnId,
+            workspaceRoot,
+            signal,
+          });
+
+          if (decision.action === 'continue_stop') {
+            stopContinuedOnce = true;
+            messages.push({ role: 'user', content: [{ type: 'text', text: decision.note }] });
+            continue;
+          }
+          if (decision.action === 'repair') {
+            repairedOnce = true;
+            repairRound++;
+            finalVerdict = decision.verdict;
+            this.eventRouter.emitPersisted({
+              sessionId,
+              turnId,
+              type: RUNTIME_EVENTS.VERIFIER_REPAIR,
+              data: {
+                verdict: decision.verdict.verdict,
+                reasons: decision.verdict.reasons,
+              },
+            });
+            messages.push({ role: 'user', content: [{ type: 'text', text: decision.note }] });
+            continue;
+          }
+          if (decision.verdict) {
+            finalVerdict = decision.verdict;
+          }
+          break;
+        }
+
+        // Tools dispatch phase
+        sm.transition(TURN_PHASES.TOOLS, { step: steps, persist: profile?.persistTurn !== false });
+        const executedBatch = await toolDispatcher.dispatchBatch({
+          sessionId,
+          turnId,
+          toolCalls: stepResult.toolCalls,
+          tools,
+          hooks,
+          argStrikes,
+          signal,
+          leaseGuard,
+          verifierEvents,
+          permissionMode,
+          getApprovedPrefixes,
+          requestApproval,
+          tainted: Boolean(execution?.tainted),
+        });
+
+        let detectedThrashing = false;
+        for (const item of executedBatch) {
+          const { tc, output, isError, durationMs, receipt } = item;
+          await onToolResult?.({
+            tc,
+            output,
+            isError,
+            durationMs,
+            receipt,
+            step: steps,
+          });
+          messages.push({
+            role: 'tool',
+            toolCallId: tc.id,
+            content: [{ type: 'text', text: output }],
+          });
+          verifierEvents.push({
+            type: 'tool/result',
+            data: {
+              name: tc.name,
+              isError,
+              content: output,
+              receipt,
+            },
+          });
+          if (profile?.emitToolEvents !== false) {
+            this.eventRouter.emitPersisted({
+              sessionId,
+              turnId,
+              type: RUNTIME_EVENTS.TOOL_RESULT,
+              data: {
+                turnId,
+                sessionId,
+                callId: tc.id,
+                name: tc.name,
+                isError,
+                durationMs,
+                output: excerpt(output, 4000),
+                ...(receipt?.id ? { receiptId: receipt.id } : {}),
+              },
+              audit: false,
+            });
+          }
+          if (tm.recordToolSignature(tc, isError)) {
+            detectedThrashing = true;
+          }
+        }
+
+        tm.saveCheckpoint({
+          step: steps,
+          phase: sm.phase,
+          state: {
+            model,
+            steps,
+            totalIn: tm.totalIn,
+            totalOut: tm.totalOut,
+            lastToolCallIds: executedBatch.map((b) => b.tc.id),
+          },
+        });
+
+        if (detectedThrashing) {
+          if (!tm.thrashWarned) {
+            tm.thrashWarned = true;
+            this.eventRouter.emitPersisted({
+              sessionId,
+              turnId,
+              type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
+              data: { step: steps },
+              audit: false,
+            });
+            messages.push({
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: '[系统防死循环提示] 检测到你连续多次执行相同的失败/重复工具调用。请停止重复相同参数，换一种思路排查，或直接向用户如实汇报当前进展与阻塞点。',
+                },
+              ],
+            });
+          } else {
+            stopReason = 'thrashing_circuit_break';
+            break;
+          }
+        }
+      }
+
+      if (steps >= maxSteps && !finalAssistantText) {
+        stopReason = 'max_steps';
+      }
+
+      sm.transition(TURN_PHASES.COMPLETED, {
+        step: steps,
+        reason: stopReason,
+        persist: profile?.persistTurn !== false,
+      });
+
+      return {
+        status: 'completed',
+        stopReason,
+        text: finalAssistantText,
+        steps,
+        usage: {
+          inputTokens: tm.totalIn,
+          outputTokens: tm.totalOut,
+          cacheReadTokens: tm.totalCacheRead,
+          cacheWriteTokens: tm.totalCacheWrite,
+        },
+        verdict: finalVerdict,
+        verifierEvents,
+        phaseHistory: sm.history,
+      };
+    } catch (err) {
+      const classified = classifyError(err);
+      const isCancelled = Boolean(signal?.aborted || classified.category === 'cancellation');
+      const targetPhase =
+        classified.code === 'APPROVAL_PARKED'
+          ? TURN_PHASES.PARKED
+          : classified.code === 'RECONCILIATION_REQUIRED'
+            ? TURN_PHASES.RECONCILING
+            : isCancelled
+              ? TURN_PHASES.CANCELLED
+              : TURN_PHASES.FAILED;
+      try {
+        if (!sm.isTerminal()) {
+          sm.transition(targetPhase, {
+            step: steps,
+            reason: classified.code,
+            persist: profile?.persistTurn !== false,
+          });
+        }
+      } catch {
+        // already terminal
+      }
+      throw classified;
+    }
+  }
+}

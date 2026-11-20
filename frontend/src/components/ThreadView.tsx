@@ -31,7 +31,9 @@ import {
 import { ActivityBlock, ApprovalGateCard } from './ActivityBlock';
 import { AgentCompanionCard } from './AgentCompanionCard';
 import { Composer } from './Composer';
+import { EvidenceBadge } from './EvidenceBadge';
 import { FileChangeCard } from './FileChangeCard';
+import { ReconciliationCard } from './ReconciliationCard';
 import {
   IconArrowDown,
   IconBookmark,
@@ -153,7 +155,12 @@ interface ThreadViewProps {
   onSlashCommand: (cmd: string) => void;
   onSubmitFollowup: (text: string, files: Record<string, string>) => Promise<void>;
   onControlTask: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'retry') => Promise<void>;
-  onDecideApproval: (approval: Approval, decision: 'approve' | 'deny', scope?: 'once' | 'session') => Promise<void>;
+  onDecideApproval: (
+    approval: Approval,
+    decision: 'approve' | 'deny',
+    scope?: 'once' | 'session',
+    outcome?: 'happened' | 'not_applied' | 'abort',
+  ) => Promise<void>;
   onOpenInspector: (tab: InspectorTab, filePath?: string, targetTaskId?: string) => void;
   onOpenSubagent: (workerId: string | null, targetTaskId?: string) => void;
   onToggleInspector: () => void;
@@ -1373,12 +1380,27 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       .filter((a) => a.status === 'pending')
                       .map((appr) => (
                         <div key={appr.id} data-anchor-key={apprKey}>
-                          <ApprovalGateCard
-                            approval={appr}
-                            worker={undefined}
-                            busy={decidingApprovalId === appr.id}
-                            onDecide={(a, d, scope) => void onDecideApproval(a, d, scope)}
-                          />
+                          {appr.kind === 'reconciliation' ? (
+                            <ReconciliationCard
+                              approval={appr}
+                              busy={decidingApprovalId === appr.id}
+                              onResolve={(a, outcome) =>
+                                void onDecideApproval(
+                                  a,
+                                  outcome === 'abort' ? 'deny' : 'approve',
+                                  'once',
+                                  outcome,
+                                )
+                              }
+                            />
+                          ) : (
+                            <ApprovalGateCard
+                              approval={appr}
+                              worker={undefined}
+                              busy={decidingApprovalId === appr.id}
+                              onDecide={(a, d, scope) => void onDecideApproval(a, d, scope)}
+                            />
+                          )}
                         </div>
                       ))}
 
@@ -1396,8 +1418,12 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       </div>
                     )}
 
-                    {!isLive && (onRewindSession || onCompactSession) && (
+                    {!isLive && (onRewindSession || onCompactSession || task.verdict || (task.evidenceCount ?? 0) > 0) && (
                       <div className="a2a-direct-actions">
+                        <EvidenceBadge
+                          verdict={task.verdict}
+                          evidenceCount={task.evidenceCount}
+                        />
                         {onRewindSession && (
                           <button
                             type="button"
@@ -1652,12 +1678,27 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                           className={flashedKey === apprKey ? 'codex-turn-flash' : undefined}
                           data-anchor-key={apprKey}
                         >
-                          <ApprovalGateCard
-                            approval={appr}
-                            worker={apprWorker}
-                            busy={decidingApprovalId === appr.id}
-                            onDecide={(a, d, scope) => void onDecideApproval(a, d, scope)}
-                          />
+                          {appr.kind === 'reconciliation' ? (
+                            <ReconciliationCard
+                              approval={appr}
+                              busy={decidingApprovalId === appr.id}
+                              onResolve={(a, outcome) =>
+                                void onDecideApproval(
+                                  a,
+                                  outcome === 'abort' ? 'deny' : 'approve',
+                                  'once',
+                                  outcome,
+                                )
+                              }
+                            />
+                          ) : (
+                            <ApprovalGateCard
+                              approval={appr}
+                              worker={apprWorker}
+                              busy={decidingApprovalId === appr.id}
+                              onDecide={(a, d, scope) => void onDecideApproval(a, d, scope)}
+                            />
+                          )}
                         </div>
                       );
                     })}

@@ -95,6 +95,130 @@ export interface Artifact extends Entity {
   published: boolean;
   assignmentId: string;
 }
+
+// ---- P7 Unified Control-Plane & Autonomous Runtime DTOs (/v1/*) ----
+
+export interface RuntimeSession {
+  id: string;
+  title: string;
+  workspaceRoot: string;
+  model: string;
+  mode: string;
+  permissionMode: string;
+  state: string;
+  parentSessionId?: string | null;
+  rootSessionId?: string | null;
+  agentProfile?: string;
+  activeCompactionId?: string | null;
+  plan?: { explanation?: string; steps: Array<{ id: string; title: string; status: string }> } | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface RuntimeTurn {
+  id: string;
+  sessionId: string;
+  input: string;
+  model: string;
+  state: string;
+  phase?: string;
+  step?: number;
+  error?: string | null;
+  verdict?: { verdict?: string; accepted?: boolean; reasons?: string[]; evidenceCount?: number } | null;
+  evidenceCount?: number;
+  inputTokens: number;
+  outputTokens: number;
+  durationMs: number;
+  createdAt: number;
+  finishedAt?: number | null;
+}
+
+export interface ToolReceipt {
+  id: string;
+  sessionId: string;
+  turnId: string;
+  callId: string;
+  toolName: string;
+  riskLevel: string;
+  effectClass: string;
+  replayable: number;
+  outward: number;
+  status: string;
+  exitCode?: number | null;
+  durationMs: number;
+  reconciliationOutcome?: string | null;
+  createdAt: number;
+}
+
+export interface ReconciliationItem {
+  id: string;
+  sessionId: string;
+  turnId?: string | null;
+  callId?: string | null;
+  tool: string;
+  kind: string;
+  receiptId?: string | null;
+  status: string;
+  outcome?: string | null;
+  arguments: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface SwarmNode {
+  id: string;
+  runId: string;
+  nodeKey: string;
+  agentProfileId: string;
+  childSessionId?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  objective: string;
+  dependencies: string[];
+  status: string;
+  priority: number;
+  resultText?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}
+
+export interface SwarmRun {
+  id: string;
+  sessionId: string;
+  goal: string;
+  status: string;
+  usage: Record<string, unknown>;
+  nodes: SwarmNode[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  scheduleKind: string;
+  scheduleExpr: string;
+  workspaceRoot?: string | null;
+  model?: string | null;
+  permissionMode: string;
+  enabled: boolean;
+  lastRunAt?: number | null;
+  nextRunAt?: number | null;
+  lastSessionId?: string | null;
+  runHistory: Array<{ sessionId: string; turnId: string; at: number; trigger: string }>;
+}
+
+export interface RuntimeOverview {
+  ok: boolean;
+  activeTurns: number;
+  pendingApprovals: number;
+  pendingReconciliations: number;
+  unknownReceipts: number;
+  activeSwarmRuns: number;
+  enabledSchedules: number;
+  modelCount?: number;
+}
+
 export function connect(base: string, token: string) {
   async function request<T>(path: string, body?: unknown): Promise<T> {
     const res = await fetch(new URL(`/api/v1/${path}`, base), {
@@ -149,5 +273,55 @@ export function connect(base: string, token: string) {
       request<EventEnvelope[]>(
         'events?' + new URLSearchParams({ taskId, after: String(after) }),
       ),
+  };
+}
+
+export function connectRuntime(base: string, token: string) {
+  async function req<T>(
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    const res = await fetch(new URL(`/v1/${path}`, base), {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw Error(
+        `${data.error?.code ?? res.status} (${data.error?.requestId ?? 'unknown'})`,
+      );
+    }
+    return res.json() as Promise<T>;
+  }
+  return {
+    overview: () => req<RuntimeOverview>('GET', 'runtime/overview'),
+    sessions: () => req<{ items: RuntimeSession[] }>('GET', 'sessions'),
+    createSession: (body: { title?: string; model?: string; workspaceRoot?: string; permissionMode?: string }) =>
+      req<RuntimeSession>('POST', 'sessions', body),
+    startTurn: (sessionId: string, body: { input: string; model?: string; permissionMode?: string; maxSteps?: number }) =>
+      req<{ turn: RuntimeTurn; session: RuntimeSession }>('POST', `sessions/${encodeURIComponent(sessionId)}/turns`, body),
+    receipts: (sessionId: string) =>
+      req<{ items: ToolReceipt[] }>('GET', `sessions/${encodeURIComponent(sessionId)}/receipts`),
+    reconciliations: (status = 'pending') =>
+      req<{ items: ReconciliationItem[] }>('GET', `reconciliations?status=${encodeURIComponent(status)}`),
+    resolveReconciliation: (id: string, outcome: 'happened' | 'not_applied' | 'abort', note = '') =>
+      req<ReconciliationItem>('POST', `reconciliations/${encodeURIComponent(id)}/resolve`, { outcome, note }),
+    swarmCapabilities: () =>
+      req<{ models: unknown[]; archetypes: unknown[] }>('GET', 'swarm/capabilities'),
+    swarmRuns: (sessionId?: string) =>
+      req<{ items: SwarmRun[] }>('GET', sessionId ? `swarm/runs?sessionId=${encodeURIComponent(sessionId)}` : 'swarm/runs'),
+    startSwarm: (body: { goal: string; sessionId?: string; maxConcurrency?: number; nodes?: unknown[] }) =>
+      req<SwarmRun>('POST', 'swarm/runs', body),
+    schedules: () => req<{ items: ScheduledTask[] }>('GET', 'schedules'),
+    createSchedule: (body: { name?: string; prompt: string; scheduleKind?: string; scheduleExpr?: string }) =>
+      req<ScheduledTask>('POST', 'schedules', body),
+    runSchedule: (id: string) =>
+      req<{ schedule: ScheduledTask; session: RuntimeSession; turn: RuntimeTurn }>('POST', `schedules/${encodeURIComponent(id)}/run`),
+    auditIntegrity: () => req<IntegrityReport>('GET', 'audit/integrity'),
   };
 }

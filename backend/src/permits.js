@@ -117,3 +117,8 @@ export class ExecutePermitRegistry {
     this.#byEffect.clear();
   }
 }
+
+export async function dispatchWithPermit(permit, expected, permits, fn) {
+  permits.consume(permit, expected);
+  return await fn();
+}

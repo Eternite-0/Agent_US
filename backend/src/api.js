@@ -11,7 +11,14 @@ export function api(
   store,
   token,
   providers = { models: [], list: () => [] },
-  { snapshotPin = null, pool = null, directAgent = null, checkin = null, webLogin = null } = {},
+  {
+    snapshotPin = null,
+    pool = null,
+    directAgent = null,
+    checkin = null,
+    webLogin = null,
+    controlPlane = null,
+  } = {},
 ) {
   if (!token || token.length < 24)
     throw Error('BACKEND_TOKEN requires at least 24 characters');
@@ -174,6 +181,6 @@ export function api(
     };
   });
   publicRoutes(app, store, providers);
-  v1Routes(app, { store, providers, pool, directAgent, checkin, webLogin });
+  v1Routes(app, { store, providers, pool, directAgent, checkin, webLogin, controlPlane });
   return app;
 }

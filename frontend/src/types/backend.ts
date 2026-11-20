@@ -83,11 +83,16 @@ export interface TaskPlan {
 export interface TaskVerdict {
   accepted: boolean;
   reason: string;
+  verdict?: string;
+  reasons?: string[];
+  evidenceCount?: number;
 }
 
 export interface Task extends Entity {
   input: string;
   status: TaskStatus;
+  phase?: string;
+  evidenceCount?: number;
   previousStatus?: TaskStatus;
   createdAt?: number;
   budget?: Budget;
@@ -157,6 +162,11 @@ export interface Approval extends Entity {
   jobId?: string;
   fence?: string;
   callId?: string;
+  kind?: 'tool' | 'reconciliation';
+  receiptId?: string;
+  riskLevel?: string;
+  effectClass?: string;
+  outcome?: string;
   policy?: number;
   status: 'pending' | 'approve' | 'deny' | 'revoked' | 'consumed' | 'expired';
   action: Record<string, unknown>;
@@ -654,4 +664,78 @@ export interface ConnectionSettings {
   mode: 'live' | 'demo';
   baseUrl: string;
   token: string;
+}
+
+export interface ToolReceiptRecord {
+  id: string;
+  sessionId: string;
+  turnId: string;
+  callId: string;
+  toolName: string;
+  riskLevel: string;
+  effectClass: string;
+  replayable: number;
+  outward: number;
+  status: 'executing' | 'finished' | 'failed' | 'outcome_unknown';
+  exitCode?: number | null;
+  durationMs: number;
+  reconciliationOutcome?: string | null;
+  createdAt: number;
+}
+
+export interface SwarmNodeRecord {
+  id: string;
+  runId: string;
+  nodeKey: string;
+  agentProfileId: string;
+  childSessionId?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  objective: string;
+  acceptance: string;
+  dependencies: string[];
+  status: string;
+  priority: number;
+  resultText?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}
+
+export interface SwarmRunRecord {
+  id: string;
+  sessionId: string;
+  goal: string;
+  status: string;
+  usage: Record<string, unknown>;
+  nodes: SwarmNodeRecord[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface BackendScheduleRecord {
+  id: string;
+  name: string;
+  prompt: string;
+  scheduleKind: string;
+  scheduleExpr: string;
+  workspaceRoot?: string | null;
+  model?: string | null;
+  permissionMode: string;
+  enabled: boolean;
+  lastRunAt?: number | null;
+  nextRunAt?: number | null;
+  lastSessionId?: string | null;
+  runHistory: Array<{ sessionId: string; turnId: string; at: number; trigger: string }>;
+  createdAt: number;
+}
+
+export interface RuntimeOverviewRecord {
+  ok: boolean;
+  activeTurns: number;
+  pendingApprovals: number;
+  pendingReconciliations: number;
+  unknownReceipts: number;
+  activeSwarmRuns: number;
+  enabledSchedules: number;
+  modelCount?: number;
 }

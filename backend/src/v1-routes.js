@@ -2,6 +2,11 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Fault, id as uuid } from './store.js';
 import { decide as decideLegacyApproval } from './tools.js';
+import { AuditLedgerService } from './governance/audit.js';
+import { ScheduledTaskRunner } from './governance/scheduler.js';
+import { registerRuntimeRoutes } from './routes/runtime-routes.js';
+import { registerSwarmRoutes } from './routes/swarm-routes.js';
+import { registerScheduleRoutes } from './routes/schedule-routes.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -64,7 +69,16 @@ function writeSseFrame(res, ev) {
 
 export function v1Routes(
   app,
-  { store, providers, pool, directAgent, checkin, webLogin = null, startedAt = Date.now() },
+  {
+    store,
+    providers,
+    pool,
+    directAgent,
+    checkin,
+    webLogin = null,
+    controlPlane = null,
+    startedAt = Date.now(),
+  },
 ) {
   if (!pool || !directAgent) return;
 
@@ -763,5 +777,18 @@ export function v1Routes(
     return { items: rows, summary: totals };
   });
 
-  app.get('/v1/plans', async () => ({ items: [] }));
+  const effectiveControlPlane = controlPlane ?? {
+    auditService: new AuditLedgerService(store),
+    scheduler: new ScheduledTaskRunner({ store, directAgent }),
+    getOverview: null,
+  };
+  registerRuntimeRoutes(app, {
+    store,
+    directAgent,
+    controlPlane: controlPlane ?? effectiveControlPlane,
+  });
+  registerSwarmRoutes(app, { store, directAgent });
+  registerScheduleRoutes(app, {
+    scheduler: effectiveControlPlane.scheduler,
+  });
 }

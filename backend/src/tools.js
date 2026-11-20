@@ -3,7 +3,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { Fault, id } from './store.js';
 import { docker } from './docker.js';
-import { ExecutePermitRegistry, RejectedBeforeEffectError } from './permits.js';
+import {
+  ExecutePermitRegistry,
+  RejectedBeforeEffectError,
+  dispatchWithPermit,
+} from './permits.js';
 
 const path = z
   .string()
@@ -185,10 +189,7 @@ export function checkHardBlockedCommand(argv) {
 
 const hash = (v) => createHash('sha256').update(v).digest('hex');
 
-export async function dispatchWithPermit(permit, expected, permits, fn) {
-  permits.consume(permit, expected);
-  return await fn();
-}
+export { dispatchWithPermit };
 
 export async function sandbox(
   argv,

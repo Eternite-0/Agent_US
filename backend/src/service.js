@@ -16,6 +16,7 @@ import { mintNonce, wrapUntrusted } from './envelope.js';
 import { JudgmentService } from './judgment.js';
 import { RefinementService } from './refinement.js';
 import { createDefaultSeams } from './seams.js';
+import { ControlPlane } from './governance/control-plane.js';
 
 const ROLES = ['Researcher', 'Planner', 'Coder', 'Reviewer', 'Tester'];
 
@@ -51,7 +52,7 @@ export async function service({
 }) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const store = new Store(join(root, 'engine.sqlite'));
-  let ctx, providers, pool, directAgent, checkin, engine, app;
+  let ctx, providers, pool, directAgent, controlPlane, checkin, engine, app;
   try {
     ctx = await bundle(store, '', {
       seams: seams === undefined ? createDefaultSeams(store) : seams,
@@ -88,12 +89,14 @@ export async function service({
         pinnedAt: Date.now(),
       };
     };
+    controlPlane = new ControlPlane({ store, pool, directAgent });
     app = api(ctx.taskEngine, token, providers, {
       snapshotPin,
       pool,
       directAgent,
       checkin,
       webLogin,
+      controlPlane,
     });
     const refinement = new RefinementService(store, {
       enabled: configuration.refinement?.enabled ?? false,
@@ -138,6 +141,7 @@ export async function service({
     });
     await providers.start();
     checkin.start();
+    controlPlane.scheduler.start();
     engine.start();
     return {
       app,
@@ -147,12 +151,14 @@ export async function service({
       providers,
       pool,
       directAgent,
+      controlPlane,
       checkin,
       judgment,
       refinement,
       seams: ctx.seams,
       async close() {
         checkin.stop();
+        controlPlane.close();
         directAgent.close();
         await app.close();
         await engine.stop();
@@ -163,6 +169,7 @@ export async function service({
     };
   } catch (e) {
     checkin?.stop();
+    controlPlane?.close();
     directAgent?.close();
     await app?.close();
     await engine?.stop();

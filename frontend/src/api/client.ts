@@ -3,6 +3,7 @@ import type {
   Approval,
   Artifact,
   Assignment,
+  BackendScheduleRecord,
   CheckinBridgeConfig,
   CheckinCenterResponse,
   CheckinRecordRow,
@@ -28,15 +29,19 @@ import type {
   ProviderDirectory,
   ProviderPresetCatalog,
   ProvidersHealth,
+  RuntimeOverviewRecord,
   SessionHistoryItem,
   SessionRecord,
   Submission,
+  SwarmRunRecord,
   Task,
   TaskBundle,
   TaskPlan,
+  ToolReceiptRecord,
   UsageItem,
   Worker,
 } from '../types/backend';
+import { createRuntimeClient } from './runtimeClient';
 import { normalizeLegacyWorkerRole, resolveWorkerIdFromPayload } from '../utils/worker';
 
 export class ApiError extends Error {
@@ -109,6 +114,41 @@ export interface AgentBackendClient {
     decision: 'approve' | 'deny',
     scope?: 'once' | 'session',
   ): Promise<Approval>;
+  resolveReconciliation?: (
+    id: string,
+    outcome: 'happened' | 'not_applied' | 'abort',
+    note?: string,
+  ) => Promise<Record<string, unknown>>;
+  getRuntimeOverview?: () => Promise<RuntimeOverviewRecord>;
+  getSessionReceipts?: (sessionId: string) => Promise<ToolReceiptRecord[]>;
+  listSwarmRuns?: (params?: { sessionId?: string; limit?: number }) => Promise<SwarmRunRecord[]>;
+  listSchedules?: () => Promise<BackendScheduleRecord[]>;
+  createSchedule?: (input: {
+    name: string;
+    prompt: string;
+    scheduleKind: string;
+    scheduleExpr: string;
+    workspaceRoot?: string;
+    model?: string;
+    permissionMode?: string;
+    enabled?: boolean;
+  }) => Promise<BackendScheduleRecord>;
+  updateSchedule?: (
+    id: string,
+    patch: Partial<{
+      name: string;
+      prompt: string;
+      scheduleKind: string;
+      scheduleExpr: string;
+      enabled: boolean;
+    }>,
+  ) => Promise<BackendScheduleRecord>;
+  deleteSchedule?: (id: string) => Promise<{ id: string; deleted: boolean }>;
+  runScheduleNow?: (id: string) => Promise<{
+    schedule: BackendScheduleRecord;
+    session: { id: string };
+    turn: { id: string };
+  }>;
   listModels(): Promise<ModelSpec[]>;
   listProviders(): Promise<ProviderDirectory>;
   providersHealth(): Promise<ProvidersHealth>;
@@ -432,6 +472,11 @@ function mapApproval(value: Record<string, unknown>): Approval {
     assignmentId: '',
     jobId: typeof value.turnId === 'string' ? value.turnId : undefined,
     callId: typeof value.callId === 'string' ? value.callId : undefined,
+    kind: value.kind === 'reconciliation' ? 'reconciliation' : 'tool',
+    receiptId: typeof value.receiptId === 'string' ? value.receiptId : undefined,
+    riskLevel: typeof value.riskLevel === 'string' ? value.riskLevel : undefined,
+    effectClass: typeof value.effectClass === 'string' ? value.effectClass : undefined,
+    outcome: typeof value.outcome === 'string' ? value.outcome : undefined,
     status: status as Approval['status'],
     action: (
       value.arguments && typeof value.arguments === 'object' ? value.arguments : {}
@@ -449,6 +494,7 @@ export class LiveBackendClient implements AgentBackendClient {
   private token: string;
   private defaultModel = '';
   private workspaceRoot = '';
+  private readonly rt = createRuntimeClient((m, p, o) => this.req(m, p, o));
 
   constructor(settings: ConnectionSettings) {
     this.baseUrl = settings.baseUrl.trim().replace(/\/v1\/?$/, '');
@@ -567,6 +613,24 @@ export class LiveBackendClient implements AgentBackendClient {
             : state === 'completed'
               ? 'completed'
               : 'completed';
+    const rawVerdict =
+      turn?.verdict && typeof turn.verdict === 'object'
+        ? (turn.verdict as Record<string, unknown>)
+        : null;
+    const verdict =
+      rawVerdict !== null
+        ? {
+            accepted: Boolean(rawVerdict.accepted),
+            reason: Array.isArray(rawVerdict.reasons) && rawVerdict.reasons.length
+              ? rawVerdict.reasons.map(String).join('；')
+              : String(rawVerdict.reason ?? (rawVerdict.accepted ? '已通过验证' : '验证未通过')),
+            verdict: typeof rawVerdict.verdict === 'string' ? rawVerdict.verdict : undefined,
+            reasons: Array.isArray(rawVerdict.reasons) ? rawVerdict.reasons.map(String) : undefined,
+            evidenceCount: Number(turn?.evidenceCount ?? rawVerdict.evidenceCount ?? 0),
+          }
+        : typeof turn?.error === 'string' && turn.error
+          ? { accepted: false, reason: turn.error }
+          : undefined;
     const input = String(session.title ?? turn?.input ?? '新对话');
     return {
       id: String(session.id),
@@ -575,6 +639,8 @@ export class LiveBackendClient implements AgentBackendClient {
       taskId: null,
       input,
       status,
+      phase: typeof turn?.phase === 'string' ? turn.phase : undefined,
+      evidenceCount: Number(turn?.evidenceCount ?? verdict?.evidenceCount ?? 0),
       createdAt: Number(session.createdAt ?? Date.now()),
       files: {},
       code: typeof turn?.id === 'string' ? turn.id : undefined,
@@ -584,9 +650,7 @@ export class LiveBackendClient implements AgentBackendClient {
         session.plan && typeof session.plan === 'object'
           ? (session.plan as Task['livePlan'])
           : null,
-      ...(typeof turn?.error === 'string' && turn.error
-        ? { verdict: { accepted: false, reason: turn.error } }
-        : {}),
+      ...(verdict ? { verdict } : {}),
     };
   }
 
@@ -759,6 +823,64 @@ export class LiveBackendClient implements AgentBackendClient {
       { body: { decision: decision === 'approve' ? 'allow' : 'deny', scope } },
     );
     return mapApproval(value);
+  }
+
+  resolveReconciliation(
+    id: string,
+    outcome: 'happened' | 'not_applied' | 'abort',
+    note = '',
+  ) {
+    return this.rt.resolveReconciliation(id, outcome, note);
+  }
+
+  getRuntimeOverview() {
+    return this.rt.getOverview();
+  }
+
+  getSessionReceipts(sessionId: string) {
+    return this.rt.getSessionReceipts(sessionId);
+  }
+
+  listSwarmRuns(params?: { sessionId?: string; limit?: number }) {
+    return this.rt.listSwarmRuns(params);
+  }
+
+  listSchedules() {
+    return this.rt.listSchedules();
+  }
+
+  createSchedule(input: {
+    name: string;
+    prompt: string;
+    scheduleKind: string;
+    scheduleExpr: string;
+    workspaceRoot?: string;
+    model?: string;
+    permissionMode?: string;
+    enabled?: boolean;
+  }) {
+    return this.rt.createSchedule(input);
+  }
+
+  updateSchedule(
+    id: string,
+    patch: Partial<{
+      name: string;
+      prompt: string;
+      scheduleKind: string;
+      scheduleExpr: string;
+      enabled: boolean;
+    }>,
+  ) {
+    return this.rt.updateSchedule(id, patch);
+  }
+
+  deleteSchedule(id: string) {
+    return this.rt.deleteSchedule(id);
+  }
+
+  runScheduleNow(id: string) {
+    return this.rt.runScheduleNow(id);
   }
 
   async listModels(): Promise<ModelSpec[]> {
@@ -1229,7 +1351,7 @@ export class LiveBackendClient implements AgentBackendClient {
   }
 
   async loadTaskBundle(taskId: string): Promise<TaskBundle> {
-    const [task, messages, rawEvents, approvals, usage] = await Promise.all([
+    const [task, messages, rawEvents, approvals, usage, receipts, swarmRuns] = await Promise.all([
       this.getTask(taskId),
       this.req<{ items?: Array<Record<string, unknown>> }>(
         'GET',
@@ -1239,6 +1361,8 @@ export class LiveBackendClient implements AgentBackendClient {
       this.listEvents({ taskId, after: 0 }),
       this.listApprovals({ taskId }),
       this.listUsage({ sessionId: taskId }),
+      this.rt.getSessionReceipts(taskId).catch(() => [] as ToolReceiptRecord[]),
+      this.rt.listSwarmRuns({ sessionId: taskId, limit: 10 }).catch(() => [] as SwarmRunRecord[]),
     ]);
 
     const events = [...rawEvents].sort((a, b) => {
@@ -1294,6 +1418,37 @@ export class LiveBackendClient implements AgentBackendClient {
       });
     }
 
+    // Reconcile durable tool_receipts into Evidence[] (authoritative status/exitCode/outcome_unknown)
+    const evByCallId = new Map(evidence.map((e) => [e.id, e]));
+    for (const r of receipts) {
+      const existing = evByCallId.get(r.callId);
+      const rStatus: Evidence['status'] =
+        r.status === 'outcome_unknown'
+          ? 'outcome_unknown'
+          : r.status === 'failed'
+            ? 'failed'
+            : r.status === 'executing'
+              ? 'executing'
+              : 'finished';
+      if (existing) {
+        existing.status = rStatus;
+        if (typeof r.exitCode === 'number') existing.exitCode = r.exitCode;
+      } else {
+        evidence.push({
+          id: r.callId || r.id,
+          version: 1,
+          projectId: 'workspace',
+          taskId,
+          status: rStatus,
+          tool: r.toolName,
+          workerId: taskId,
+          assignmentId: 'direct',
+          digest: r.id,
+          exitCode: r.exitCode ?? undefined,
+        });
+      }
+    }
+
     const session: SessionRecord = {
       id: taskId,
       version: 1,
@@ -1335,11 +1490,64 @@ export class LiveBackendClient implements AgentBackendClient {
       };
     });
 
-    // Preserve worker extraction compatibility if DAG events exist
+    // Hydrate adaptive Swarm workers & DAG assignments + legacy worker fallback
     const workers: Worker[] = [];
     const assignments: Assignment[] = [];
     const hydratedPlan: TaskPlan | undefined = task.plan;
     const seenWorker = new Set<string>();
+    for (const run of swarmRuns) {
+      for (const n of run.nodes ?? []) {
+        const wStatus: Worker['status'] =
+          n.status === 'running'
+            ? 'running'
+            : n.status === 'failed'
+              ? 'failed'
+              : n.status === 'cancelled'
+                ? 'interrupted'
+                : 'done';
+        const wid = n.childSessionId || `${run.id}:${n.nodeKey}`;
+        assignments.push({
+          id: n.id,
+          version: 1,
+          projectId: 'workspace',
+          taskId,
+          key: n.nodeKey,
+          role: normalizeLegacyWorkerRole(n.agentProfileId),
+          workerName: n.nodeKey,
+          workerRole: n.agentProfileId,
+          objective: n.objective,
+          acceptance: n.acceptance,
+          dependencies: n.dependencies ?? [],
+          status:
+            n.status === 'running'
+              ? 'running'
+              : n.status === 'failed' || n.status === 'cancelled'
+                ? 'failed'
+                : n.status === 'completed'
+                  ? 'done'
+                  : 'waiting',
+          workerId: wid,
+        });
+        if (!seenWorker.has(wid)) {
+          seenWorker.add(wid);
+          workers.push({
+            id: wid,
+            version: 1,
+            projectId: 'workspace',
+            taskId,
+            jobId: run.id,
+            model: n.model || task.model || this.defaultModel,
+            provider: n.provider || 'pool',
+            assignmentId: n.id,
+            role: normalizeLegacyWorkerRole(n.agentProfileId),
+            workerName: n.nodeKey,
+            workerRole: n.agentProfileId,
+            status: wStatus,
+            attempt: 1,
+          });
+        }
+      }
+    }
     for (const ev of events) {
       const resolvedKey = resolveWorkerIdFromPayload(ev.payload ?? {});
       if (resolvedKey && !seenWorker.has(resolvedKey) && ev.payload?.workerRole !== 'router') {
