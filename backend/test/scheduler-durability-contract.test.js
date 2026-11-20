@@ -456,18 +456,35 @@ test('Part 1.7: scheduled_tasks.lastStatus updates monotonically so a late older
   pool.setDefaultModel('mock-sched');
 
   let invocation = 0;
+  let r1EnteredResolve;
+  let releaseR1;
+  const r1Entered = new Promise((r) => {
+    r1EnteredResolve = r;
+  });
+  const r1Gate = new Promise((r) => {
+    releaseR1 = r;
+  });
+  let s1EnteredResolve;
+  let releaseS1;
+  const s1Entered = new Promise((r) => {
+    s1EnteredResolve = r;
+  });
+  const s1Gate = new Promise((r) => {
+    releaseS1 = r;
+  });
+
   const direct = new DirectAgentRuntime(store, pool, {
     defaultWorkspace: dir,
     dataRoot: dir,
     adapter: new TrackingAdapter(async () => {
       const idx = ++invocation;
       if (idx === 1) {
-        // Older run finishes LATE and FAILS
-        await delay(260);
+        // Older run finishes LATE (deterministically gated until newer run settles) and FAILS
+        r1EnteredResolve();
+        await r1Gate;
         throw new Error('older-run-late-failure');
       }
       // Newer run finishes FAST and SUCCEEDS
-      await delay(30);
       return 'NEWER_OK';
     }),
   });
@@ -485,14 +502,18 @@ test('Part 1.7: scheduled_tasks.lastStatus updates monotonically so a late older
     });
 
     const r1 = await scheduler.runNow(sched.id, { trigger: 'manual-1' });
-    await delay(20);
+    await r1Entered;
     const r2 = await scheduler.runNow(sched.id, { trigger: 'manual-2' });
 
-    // Wait for BOTH r2 (completed) and r1 (failed) to settle
+    // Wait for newer run r2 to complete FIRST, then unleash older run r1 to fail late
+    await pollUntil(() => {
+      const row2 = store.db.prepare('SELECT status FROM scheduled_task_runs WHERE id=?').get(r2.run.id);
+      return row2?.status === 'completed';
+    });
+    releaseR1();
     await pollUntil(() => {
       const row1 = store.db.prepare('SELECT status FROM scheduled_task_runs WHERE id=?').get(r1.run.id);
-      const row2 = store.db.prepare('SELECT status FROM scheduled_task_runs WHERE id=?').get(r2.run.id);
-      return row1?.status === 'failed' && row2?.status === 'completed';
+      return row1?.status === 'failed';
     });
 
     const finalTask = scheduler.get(sched.id);
@@ -507,10 +528,10 @@ test('Part 1.7: scheduled_tasks.lastStatus updates monotonically so a late older
     direct.adapter.handler = async () => {
       const idx = ++invocation;
       if (idx === 1) {
-        await delay(260);
+        s1EnteredResolve();
+        await s1Gate;
         return 'OLDER_LATE_SUCCESS';
       }
-      await delay(30);
       throw new Error('newer-run-fast-failure');
     };
     const sched2 = scheduler.create({
@@ -522,12 +543,16 @@ test('Part 1.7: scheduled_tasks.lastStatus updates monotonically so a late older
       concurrencyPolicy: 'allow',
     });
     const s1 = await scheduler.runNow(sched2.id, { trigger: 'manual-sym-1' });
-    await delay(20);
+    await s1Entered;
     const s2 = await scheduler.runNow(sched2.id, { trigger: 'manual-sym-2' });
     await pollUntil(() => {
-      const row1 = store.db.prepare('SELECT status FROM scheduled_task_runs WHERE id=?').get(s1.run.id);
       const row2 = store.db.prepare('SELECT status FROM scheduled_task_runs WHERE id=?').get(s2.run.id);
-      return row1?.status === 'completed' && row2?.status === 'failed';
+      return row2?.status === 'failed';
+    });
+    releaseS1();
+    await pollUntil(() => {
+      const row1 = store.db.prepare('SELECT status FROM scheduled_task_runs WHERE id=?').get(s1.run.id);
+      return row1?.status === 'completed';
     });
     assert.equal(
       scheduler.get(sched2.id).lastStatus,
@@ -535,6 +560,8 @@ test('Part 1.7: scheduled_tasks.lastStatus updates monotonically so a late older
       'older run late completion must NOT overwrite newer run failed status',
     );
   } finally {
+    releaseR1?.();
+    releaseS1?.();
     scheduler.stop();
     await direct.close();
     store.close();

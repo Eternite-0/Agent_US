@@ -222,10 +222,13 @@ export interface SwarmArtifactVerifyResult {
 }
 
 export interface SwarmArtifactApplyResult {
-  applied: boolean;
+  ok: boolean;
+  status: string;
   artifactId: string;
-  appliedFiles?: string[];
-  conflicts?: Array<{ path: string; reason: string }>;
+  uri?: string;
+  applied: Array<{ path: string; changeType: string; previousPath?: string; sha256?: string }>;
+  skipped: Array<{ path: string; reason: string }>;
+  conflicts: Array<{ path: string; reason: string; changeType?: string }>;
 }
 
 export interface SwarmRun {

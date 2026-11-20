@@ -748,7 +748,7 @@ export class TaskTreeBudgetLedger {
       for (const job of treeJobs) {
         if (!classifyJobOwnership(this.store, job, { now }).liveOwner) continue;
         if (!res.nodeId && !res.nodeKey) return true;
-        const payload = parseJsonSafe(job.payloadJson, {});
+        const payload = parseJsonSafe(job.payload, {});
         if (
           (res.nodeId && payload.nodeId === res.nodeId) ||
           (res.nodeKey && payload.nodeKey === res.nodeKey)
