@@ -17,7 +17,9 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    shell: pwsh
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout repository
