@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { Fault } from './store.js';
+import { manageMemory } from './refinement.js';
 const live = ['running', 'reviewing', 'planning'];
 export function control(db, key, action, version) {
   return db.tx(() => {
@@ -45,13 +46,23 @@ export function control(db, key, action, version) {
       db.update('sessions', s, { status: 'interrupted' });
     for (const a of db
       .list('approvals', { taskId: key, limit: 2000 })
-      .filter((a) => ['pending', 'approve'].includes(a.status)))
+      .filter((a) => ['pending', 'approve'].includes(a.status))) {
+      if (status === 'paused' && (a.parked || a.kind === 'reconciliation'))
+        continue;
       db.update('approvals', a, { status: 'revoked' });
+    }
     db.db
       .prepare(
         "UPDATE jobs SET status=?, fence=NULL,attempts=MAX(0,attempts-1) WHERE taskId=? AND status='active'",
       )
       .run(status === 'paused' ? 'pending' : 'cancelled', key);
+    if (status === 'cancelled') {
+      db.db
+        .prepare(
+          "UPDATE jobs SET status='cancelled', fence=NULL WHERE taskId=? AND status IN ('pending','parked','reconciling')",
+        )
+        .run(key);
+    }
     return db.update('tasks', t, { status, previousStatus: t.status });
   });
 }
@@ -71,6 +82,14 @@ export function publicRoutes(app, db, providers) {
     routerReady: providers.models.length > 0,
     providers: providers.list(),
   }));
+  app.get(base + '/integrity', async (req) => {
+    const q = z
+      .strictObject({
+        full: z.enum(['true', 'false']).optional(),
+      })
+      .parse(req.query);
+    return db.verifyIntegrity({ full: q.full === 'true' });
+  });
   app.get(base + '/models', async () => providers.models);
   app.get(base + '/providers', async () => providers.list());
   app.get(base + '/router/:id', async (req) => {
@@ -91,6 +110,14 @@ export function publicRoutes(app, db, providers) {
         z.strictObject({ version: z.number().int().positive() }).parse(req.body)
           .version,
       ),
+    );
+  for (const action of ['renew', 'withdraw', 'pin'])
+    app.post(base + `/memory/:id/${action}`, async (req) =>
+      manageMemory(db, uuid.parse(req.params.id), action, {
+        version: z
+          .strictObject({ version: z.number().int().positive() })
+          .parse(req.body).version,
+      }),
     );
   app.get(base + '/sessions/:id/history', async (req) => {
     const key = uuid.parse(req.params.id);

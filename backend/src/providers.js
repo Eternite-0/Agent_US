@@ -40,6 +40,28 @@ export const Config = z
     mcp: z
       .record(label, z.array(z.string().max(1024)).min(1).max(32))
       .default({}),
+    sideModel: z
+      .strictObject({
+        kind: z.enum(['sys1', 'openai']),
+        endpoint: safeEndpoint,
+        keyRef: z.string().regex(/^[A-Z][A-Z0-9_]{2,100}$/),
+        model: z.string().min(1),
+      })
+      .optional(),
+    judgment: z
+      .strictObject({
+        stopCheck: z.boolean().default(false),
+        autoReview: z.boolean().default(false),
+        routeTriage: z.boolean().default(false),
+        maxAutoReviews: z.number().int().min(0).max(50).default(20),
+      })
+      .optional(),
+    refinement: z
+      .strictObject({
+        enabled: z.boolean().default(false),
+        cooldownMs: z.number().int().min(0).max(3_600_000).default(120_000),
+      })
+      .optional(),
   })
   .superRefine((v, c) => {
     const ids = new Set(v.providers.map((p) => p.id));
@@ -76,6 +98,19 @@ export class Providers {
       this.routes.set(p.id, { id: p.id, key, endpoint: p.endpoint });
     }
     this.models = config.models.filter((m) => this.routes.has(m.provider));
+    this.sideModel = null;
+    if (config.sideModel) {
+      const sideKey =
+        secrets[config.sideModel.keyRef] ?? process.env[config.sideModel.keyRef];
+      if (sideKey) {
+        this.sideModel = {
+          kind: config.sideModel.kind,
+          endpoint: config.sideModel.endpoint,
+          model: config.sideModel.model,
+          key: sideKey,
+        };
+      }
+    }
     if (config.magpie)
       this.sidecar = new Magpie(
         this.enabled.map((p) => ({
@@ -147,12 +182,16 @@ export class Providers {
     this.models.splice(0, this.models.length, ...rated);
   }
   async start() {
+    if (!this.enabled.length && !this.sidecar) return;
     await this.refresh();
     this.timer = setInterval(() => this.refresh().catch(() => {}), 60000);
     this.timer.unref();
   }
   async stop() {
-    clearInterval(this.timer);
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
     await this.refreshing;
     await this.sidecar?.stop();
   }

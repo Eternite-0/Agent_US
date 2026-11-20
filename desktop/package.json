@@ -1,0 +1,19 @@
+{
+  "name": "@agent-us/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "author": "Agent_US",
+  "description": "Codex-fidelity Electron desktop shell for Agent_US",
+  "main": "main.mjs",
+  "type": "module",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron . --prod",
+    "pack": "npm --prefix ../frontend run build && node pack-win.mjs",
+    "build": "npm --prefix ../frontend run build && node pack-win.mjs"
+  },
+  "devDependencies": {
+    "electron": "^35.2.0",
+    "electron-builder": "^26.0.12"
+  }
+}

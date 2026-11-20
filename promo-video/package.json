@@ -1,0 +1,28 @@
+{
+  "name": "agent-us-promo-video",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remotion project demonstration video for Agent_US",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "build": "remotion render src/index.ts AgentUSPromo out/agent-us-demo.mp4 --codec=h264",
+    "still": "remotion still src/index.ts AgentUSPromo out/preview-frame.png --frame=1650",
+    "build:defense": "remotion render src/index.ts AgentUSDefense out/agent-us-defense.mp4 --codec=h264 --crf=16",
+    "build:defense-v2": "remotion render src/index.ts AgentUSDefenseV2 out/agent-us-defense-v2.mp4 --codec=h264 --crf=16",
+    "build:defense-v3": "remotion render src/index.ts AgentUSDefenseV3 out/agent-us-defense-v3.mp4 --codec=h264 --crf=16",
+    "stills": "node scripts/stills.mjs",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.286",
+    "@remotion/renderer": "4.0.286",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.286"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "typescript": "5.8.2"
+  }
+}

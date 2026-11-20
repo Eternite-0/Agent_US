@@ -22,12 +22,14 @@ export interface Budget {
   maxDurationSeconds?: number;
   maxCostUSD?: number;
 }
+export type ApprovalMode = 'manual' | 'workspace-write' | 'auto-review';
 export interface Submission {
   projectId: string;
   input: string;
   idempotencyKey: string;
   files?: Record<string, string>;
   budget?: Budget;
+  approvalMode?: ApprovalMode;
 }
 export interface PlanNode {
   key: string;
@@ -40,22 +42,44 @@ export interface PlanNode {
 export interface Task extends Entity {
   input: string;
   status: Status;
+  approvalMode?: ApprovalMode;
   plan?: {
     type: string;
     complexity: 'simple' | 'medium' | 'complex';
     risk: 'low' | 'medium' | 'high';
     nodes: PlanNode[];
   };
-  verdict?: { accepted: boolean; reason: string };
+  verdict?: { accepted: boolean; reason: string; failedNodes?: string[] };
 }
 export interface Approval extends Entity {
   workerId: string;
   assignmentId: string;
+  kind?: 'reconciliation';
+  parked?: boolean;
+  checkpoint?: 'outward';
   status: 'pending' | 'approve' | 'deny' | 'revoked' | 'consumed' | 'expired';
   action: Record<string, unknown>;
   tool: string;
   digest: string;
   expires: number;
+}
+export interface IntegrityReport {
+  ok: boolean;
+  algorithm: string;
+  lastSeq: number;
+  legacyThroughSeq: number;
+  verifiedThroughSeq: number;
+  headDigest: string | null;
+  checkedRows: number;
+  hashedRows: number;
+}
+export interface MemoryEntry extends Entity {
+  summary: string;
+  refinementId?: string;
+  title?: string;
+  lesson?: string;
+  status?: 'active' | 'expired' | 'withdrawn' | 'pinned';
+  expiresAt?: number | null;
 }
 export interface EventEnvelope {
   seq: number;
@@ -96,11 +120,29 @@ export function connect(base: string, token: string) {
     task: (id: string) => request<Task>('tasks/' + encodeURIComponent(id)),
     approvals: (taskId: string) =>
       request<Approval[]>('approvals?' + new URLSearchParams({ taskId })),
-    decide: (approval: Approval, decision: 'approve' | 'deny') =>
+    decide: (
+      approval: Approval,
+      decision: 'approve' | 'deny',
+      extra?: { outcome?: 'succeeded' | 'not_applied' | 'abort'; reason?: string },
+    ) =>
       request<Approval>(
         `approvals/${encodeURIComponent(approval.id)}/decision`,
-        { version: approval.version, decision },
+        { version: approval.version, decision, ...extra },
       ),
+    integrity: (full = false) =>
+      request<IntegrityReport>(`integrity?full=${full ? 'true' : 'false'}`),
+    renewMemory: (entry: MemoryEntry) =>
+      request<MemoryEntry>(`memory/${encodeURIComponent(entry.id)}/renew`, {
+        version: entry.version,
+      }),
+    withdrawMemory: (entry: MemoryEntry) =>
+      request<MemoryEntry>(`memory/${encodeURIComponent(entry.id)}/withdraw`, {
+        version: entry.version,
+      }),
+    pinMemory: (entry: MemoryEntry) =>
+      request<MemoryEntry>(`memory/${encodeURIComponent(entry.id)}/pin`, {
+        version: entry.version,
+      }),
     artifacts: (taskId: string) =>
       request<Artifact[]>('artifacts?' + new URLSearchParams({ taskId })),
     events: (taskId: string, after = 0) =>

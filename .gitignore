@@ -1,0 +1,13 @@
+/upstream/
+node_modules/
+/frontend/dist/
+/backend/var/
+/desktop/release/
+/promo-video/out/
+*.log
+.env
+.env.*
+!.env.example
+.pool-key
+.dev-token
+/t.obj

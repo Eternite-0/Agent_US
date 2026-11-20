@@ -1,0 +1,1256 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import type { InspectorTab, Task, TaskBundle, Worker } from '../types/backend';
+import { aggregateFileChanges, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
+import { fmtClock, fmtRelative, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
+import {
+  eventMatchesWorker,
+  getWorkerActivityLabel,
+  getWorkerDisplayName as resolveWorkerName,
+  getWorkerDisplayRole,
+} from '../utils/worker';
+import { ActivityBlock } from './ActivityBlock';
+import { AgentAvatar } from './AgentAvatar';
+import {
+  IconAgent,
+  IconArrowBack,
+  IconBranch,
+  IconCheck,
+  IconChevronDown,
+  IconChevronRight,
+  IconClose,
+  IconColumns,
+  IconCopy,
+  IconDiffBox,
+  IconDownload,
+  IconFileDoc,
+  IconFolder,
+  IconHistory,
+  IconPlus,
+  IconRightPanelToggle,
+  IconSearch,
+} from './Icons';
+import { ImageLightbox, isImagePath, toImageDataUrl, type PreviewImageItem } from './ImageLightbox';
+import { Markdown } from './Markdown';
+
+interface InspectorDrawerProps {
+  open: boolean;
+  width: number;
+  tab: InspectorTab;
+  selectedFile: string | null;
+  selectedSubagentId: string | null;
+  projectName?: string;
+  bundle: TaskBundle | null;
+  onResize: (width: number) => void;
+  onChangeTab: (tab: InspectorTab) => void;
+  onSelectFile: (path: string) => void;
+  onSelectSubagent: (workerId: string | null) => void;
+  onFetchVersion?: (taskId: string, version: number) => Promise<Task | null>;
+  onClose: () => void;
+  onToast: (msg: string) => void;
+}
+
+type OpenPaneTab =
+  | { id: 'subagents'; kind: 'subagents'; label: string }
+  | { id: 'events'; kind: 'events'; label: string }
+  | { id: `file:${string}`; kind: 'file'; path: string; label: string };
+
+interface TreeDirNode {
+  kind: 'dir';
+  name: string;
+  fullPath: string;
+  children: TreeNode[];
+}
+
+interface TreeFileNode {
+  kind: 'file';
+  name: string;
+  path: string;
+  diff: ComputedFileDiff;
+}
+
+type TreeNode = TreeDirNode | TreeFileNode;
+
+function buildFileTree(diffs: ComputedFileDiff[]): TreeNode[] {
+  const root: TreeDirNode = { kind: 'dir', name: '', fullPath: '', children: [] };
+
+  for (const diff of diffs) {
+    const parts = diff.path.replace(/\\/g, '/').split('/').filter(Boolean);
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const isLast = i === parts.length - 1;
+      if (isLast) {
+        cur.children.push({ kind: 'file', name: part, path: diff.path, diff });
+      } else {
+        const nextPath = cur.fullPath ? `${cur.fullPath}/${part}` : part;
+        let sub = cur.children.find(
+          (c): c is TreeDirNode => c.kind === 'dir' && c.name === part,
+        );
+        if (!sub) {
+          sub = { kind: 'dir', name: part, fullPath: nextPath, children: [] };
+          cur.children.push(sub);
+        }
+        cur = sub;
+      }
+    }
+  }
+
+  const sortNodes = (nodes: TreeNode[]): TreeNode[] =>
+    nodes
+      .sort((a, b) => {
+        if (a.kind !== b.kind) return a.kind === 'dir' ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      })
+      .map((n) => (n.kind === 'dir' ? { ...n, children: sortNodes(n.children) } : n));
+
+  return sortNodes(root.children);
+}
+
+/** Lightweight safe React tokenizer for code preview (no dangerouslySetInnerHTML!) */
+function highlightCodeLine(line: string): React.ReactNode {
+  if (!line) return ' ';
+  const trimmed = line.trimStart();
+  if (trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('*') || trimmed.startsWith('/*')) {
+    return <span className="tok-com">{line}</span>;
+  }
+  const regex =
+    /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:import|export|from|const|let|var|function|return|async|await|if|else|for|while|switch|case|break|continue|try|catch|finally|throw|new|class|extends|interface|type|default|true|false|null|undefined|def|class|self|None|True|False)\b|\b\d+(?:\.\d+)?\b)/g;
+  const parts: React.ReactNode[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let k = 0;
+  while ((m = regex.exec(line)) !== null) {
+    if (m.index > last) parts.push(line.slice(last, m.index));
+    const tok = m[0];
+    if (tok.startsWith('"') || tok.startsWith("'") || tok.startsWith('`')) {
+      parts.push(<span key={k++} className="tok-str">{tok}</span>);
+    } else if (/^\d/.test(tok)) {
+      parts.push(<span key={k++} className="tok-num">{tok}</span>);
+    } else {
+      parts.push(<span key={k++} className="tok-kw">{tok}</span>);
+    }
+    last = regex.lastIndex;
+  }
+  if (last < line.length) parts.push(line.slice(last));
+  return parts;
+}
+
+export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
+  open,
+  width,
+  tab,
+  selectedFile,
+  selectedSubagentId,
+  projectName = 'Agent_US',
+  bundle,
+  onResize,
+  onChangeTab,
+  onSelectFile,
+  onSelectSubagent,
+  onFetchVersion,
+  onClose,
+  onToast,
+}) => {
+  const [resizing, setResizing] = useState(false);
+  const [openTabs, setOpenTabs] = useState<OpenPaneTab[]>([
+    { id: 'subagents', kind: 'subagents', label: '子智能体' },
+  ]);
+  const [activeTabId, setActiveTabId] = useState<string>('subagents');
+  const [plusMenuOpen, setPlusMenuOpen] = useState(false);
+
+  // File IDE tab states
+  const [showChanges, setShowChanges] = useState(false);
+  const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
+  const [treeFilter, setTreeFilter] = useState('');
+  const [collapsedDirs, setCollapsedDirs] = useState<Record<string, boolean>>({});
+  const [copiedFile, setCopiedFile] = useState(false);
+  const [showAllSubagents, setShowAllSubagents] = useState(false);
+  const [lightbox, setLightbox] = useState<{ images: PreviewImageItem[]; index: number } | null>(null);
+
+  // Version snapshot state
+  const [loadedVersion, setLoadedVersion] = useState<Task | null>(null);
+  const [loadingVersion, setLoadingVersion] = useState(false);
+
+  const plusMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!plusMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (plusMenuRef.current && !plusMenuRef.current.contains(e.target as Node)) {
+        setPlusMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [plusMenuOpen]);
+
+  const diffs = useMemo(() => {
+    if (!bundle) return [];
+    const changes = bundle.evidence.flatMap((e) => e.changes ?? []);
+    const artFiles: Record<string, string> = {};
+    for (const a of bundle.artifacts) {
+      if (a.published) Object.assign(artFiles, a.files ?? {});
+    }
+    const baseDiffs = aggregateFileChanges(changes, artFiles, bundle.task.files);
+    // Also expose user-attached task files so clicking any attachment opens cleanly in the IDE pane
+    const existing = new Set(baseDiffs.map((d) => d.path));
+    const extras: ComputedFileDiff[] = [];
+    for (const [k, v] of Object.entries(bundle.task.files ?? {})) {
+      if (existing.has(k)) continue;
+      const txt = decodeBase64Utf8(v);
+      extras.push({
+        path: k,
+        added: 0,
+        deleted: 0,
+        isNew: false,
+        isDeleted: false,
+        beforeText: txt,
+        afterText: txt,
+        lines: txt
+          .replace(/\r\n/g, '\n')
+          .split('\n')
+          .map((line, i) => ({ kind: 'context', oldLine: i + 1, newLine: i + 1, text: line })),
+      });
+    }
+    return [...baseDiffs, ...extras];
+  }, [bundle]);
+
+  const ensureTab = (next: OpenPaneTab) => {
+    setOpenTabs((prev) => (prev.some((t) => t.id === next.id) ? prev : [...prev, next]));
+    setActiveTabId(next.id);
+  };
+
+  // Sync external tab/file/subagent triggers cleanly into our multi-tab bar
+  useEffect(() => {
+    if (!open) return;
+    if (tab === 'subagents') {
+      ensureTab({ id: 'subagents', kind: 'subagents', label: '子智能体' });
+    } else if (tab === 'events') {
+      ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
+    } else if (tab === 'diff' || tab === 'artifacts') {
+      const targetPath = selectedFile || diffs[0]?.path;
+      const targetDiff = diffs.find((d) => d.path === targetPath) ?? diffs[0];
+      if (tab === 'diff' && targetDiff && (targetDiff.added > 0 || targetDiff.deleted > 0)) {
+        setShowChanges(true);
+      } else if (tab === 'artifacts') {
+        setShowChanges(false);
+      }
+      if (targetPath) {
+        const base = targetPath.replace(/\\/g, '/').split('/').pop() || targetPath;
+        ensureTab({ id: `file:${targetPath}`, kind: 'file', path: targetPath, label: base });
+      } else {
+        ensureTab({ id: 'file:__all__', kind: 'file', path: '__all__', label: '变更' });
+      }
+    }
+  }, [open, tab, selectedFile, diffs.length]);
+
+  const activePaneTab = openTabs.find((t) => t.id === activeTabId) ?? openTabs[0] ?? null;
+
+  const activeFileDiff = useMemo(() => {
+    if (activePaneTab?.kind === 'file' && activePaneTab.path !== '__all__') {
+      return diffs.find((d) => d.path === activePaneTab.path) ?? diffs[0] ?? null;
+    }
+    return diffs.find((d) => d.path === selectedFile) ?? diffs[0] ?? null;
+  }, [activePaneTab, diffs, selectedFile]);
+
+  const filteredDiffs = useMemo(() => {
+    const q = treeFilter.trim().toLowerCase();
+    if (!q) return diffs;
+    return diffs.filter((d) => d.path.toLowerCase().includes(q));
+  }, [diffs, treeFilter]);
+
+  const fileTree = useMemo(() => buildFileTree(filteredDiffs), [filteredDiffs]);
+
+  const addedLineNumbers = useMemo(() => {
+    const s = new Set<number>();
+    if (!activeFileDiff) return s;
+    for (const ln of activeFileDiff.lines) {
+      if (ln.kind === 'add' && ln.newLine !== null) s.add(ln.newLine);
+    }
+    return s;
+  }, [activeFileDiff]);
+
+  const splitRows = useMemo(() => {
+    if (!activeFileDiff) return [];
+    const pairs: Array<{
+      left: { ln: number | null; kind: 'context' | 'del' | 'empty'; text: string };
+      right: { ln: number | null; kind: 'context' | 'add' | 'empty'; text: string };
+    }> = [];
+    const lines = activeFileDiff.lines;
+    let i = 0;
+    while (i < lines.length) {
+      if (lines[i].kind === 'context') {
+        pairs.push({
+          left: { ln: lines[i].oldLine, kind: 'context', text: lines[i].text },
+          right: { ln: lines[i].newLine, kind: 'context', text: lines[i].text },
+        });
+        i++;
+      } else {
+        const dels: typeof lines = [];
+        const adds: typeof lines = [];
+        while (i < lines.length && lines[i].kind !== 'context') {
+          if (lines[i].kind === 'del') dels.push(lines[i]);
+          else adds.push(lines[i]);
+          i++;
+        }
+        const maxLen = Math.max(dels.length, adds.length);
+        for (let j = 0; j < maxLen; j++) {
+          pairs.push({
+            left: dels[j]
+              ? { ln: dels[j].oldLine, kind: 'del', text: dels[j].text }
+              : { ln: null, kind: 'empty', text: '' },
+            right: adds[j]
+              ? { ln: adds[j].newLine, kind: 'add', text: adds[j].text }
+              : { ln: null, kind: 'empty', text: '' },
+          });
+        }
+      }
+    }
+    return pairs;
+  }, [activeFileDiff]);
+
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = width;
+    setResizing(true);
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.max(380, Math.min(980, startW - (ev.clientX - startX)));
+      onResize(next);
+    };
+    const onUp = () => {
+      setResizing(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const closeTab = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const remaining = openTabs.filter((t) => t.id !== id);
+    if (remaining.length === 0) {
+      onClose();
+      return;
+    }
+    setOpenTabs(remaining);
+    if (activeTabId === id) {
+      const next = remaining[remaining.length - 1];
+      setActiveTabId(next.id);
+      if (next.kind === 'subagents') onChangeTab('subagents');
+      else if (next.kind === 'events') onChangeTab('events');
+      else if (next.kind === 'file') {
+        onChangeTab('diff');
+        if (next.path !== '__all__') onSelectFile(next.path);
+      }
+    }
+  };
+
+  const openFileInPane = (path: string) => {
+    const base = path.replace(/\\/g, '/').split('/').pop() || path;
+    onSelectFile(path);
+    onChangeTab('diff');
+    ensureTab({ id: `file:${path}`, kind: 'file', path, label: base });
+  };
+
+  const copyActiveFile = async () => {
+    if (!activeFileDiff) return;
+    try {
+      await navigator.clipboard.writeText(activeFileDiff.afterText);
+      setCopiedFile(true);
+      onToast(`已复制 ${activeFileDiff.path}`);
+      window.setTimeout(() => setCopiedFile(false), 1200);
+    } catch {
+      // ignore
+    }
+  };
+
+  const downloadTextFile = (filename: string, text: string) => {
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename.split('/').pop() || 'file.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+    onToast(`已下载 ${filename}`);
+  };
+
+  const handleLoadVersion = async (v: number) => {
+    if (!bundle || !onFetchVersion) return;
+    setLoadingVersion(true);
+    try {
+      const res = await onFetchVersion(bundle.task.id, v);
+      setLoadedVersion(res);
+    } finally {
+      setLoadingVersion(false);
+    }
+  };
+
+  const renderTreeNodes = (nodes: TreeNode[], depth = 0): React.ReactNode =>
+    nodes.map((node) => {
+      if (node.kind === 'dir') {
+        const collapsed = Boolean(collapsedDirs[node.fullPath]);
+        return (
+          <div key={node.fullPath}>
+            <button
+              type="button"
+              className="codex-tree-node"
+              style={{ paddingLeft: 8 + depth * 12 }}
+              onClick={() =>
+                setCollapsedDirs((prev) => ({ ...prev, [node.fullPath]: !prev[node.fullPath] }))
+              }
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+                {collapsed ? <IconChevronRight size={12} /> : <IconChevronDown size={12} />}
+                <IconFolder size={13} style={{ color: 'var(--text-tertiary)', flex: 'none' }} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {node.name}
+                </span>
+              </span>
+            </button>
+            {!collapsed && renderTreeNodes(node.children, depth + 1)}
+          </div>
+        );
+      }
+
+      const isCreated = !node.diff.beforeText.trim();
+      const isSelected = activeFileDiff?.path === node.path;
+      return (
+        <button
+          key={node.path}
+          type="button"
+          className="codex-tree-node"
+          data-active={isSelected ? 'true' : undefined}
+          style={{ paddingLeft: 18 + depth * 12 }}
+          title={node.path}
+          onClick={() => openFileInPane(node.path)}
+        >
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+            <IconFileDoc size={13} style={{ color: 'var(--text-tertiary)', flex: 'none' }} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {node.name}
+            </span>
+          </span>
+          <span className="codex-tree-badge" data-kind={isCreated ? 'add' : 'mod'}>
+            {isCreated ? '+' : 'M'}
+          </span>
+        </button>
+      );
+    });
+
+  // Subagent helper
+  const assignmentById = useMemo(
+    () => new Map((bundle?.assignments ?? []).map((a) => [a.id, a])),
+    [bundle?.assignments],
+  );
+  const getWorkerDisplayName = (w: Worker) => {
+    const asgn = w.assignmentId ? assignmentById.get(w.assignmentId) : undefined;
+    return resolveWorkerName(w, { assignment: asgn });
+  };
+
+  const dedupedWorkers = useMemo(() => {
+    const all = bundle?.workers ?? [];
+    const sub = all.filter((w) => w.assignmentId !== null);
+    const pool = sub.length > 0 ? sub : all;
+    const byAsgn = new Map<string, Worker>();
+    for (const w of pool) {
+      const k = w.assignmentId || w.id;
+      const prev = byAsgn.get(k);
+      if (!prev || (w.attempt ?? 1) >= (prev.attempt ?? 1)) byAsgn.set(k, w);
+    }
+    return [...byAsgn.values()];
+  }, [bundle?.workers]);
+
+  const activeWorkers = dedupedWorkers.filter((w) => w.status === 'running');
+  const doneWorkers = dedupedWorkers.filter((w) => w.status !== 'running');
+  const focusedSubagent = selectedSubagentId
+    ? (bundle?.workers ?? []).find((w) => w.id === selectedSubagentId) ?? null
+    : null;
+
+  return (
+    <aside
+      className="codex-drawer"
+      data-open={open ? 'true' : undefined}
+      data-resizing={resizing ? 'true' : undefined}
+      style={{ width: open ? width : 0 }}
+      aria-label="右侧工作区面板"
+    >
+      {open && <div className="codex-drawer-resizer" onMouseDown={startResize} title="拖拽调整右侧工作区宽度" />}
+
+      <div className="codex-drawer-inner" style={{ width }}>
+        {/* Multi-Tab Bar (1:1 with User Screenshots 3, 4, 5!) */}
+        <div className="codex-split-tabbar">
+          <div className="codex-split-tabs" role="tablist">
+            {openTabs.map((t) => {
+              const active = activePaneTab?.id === t.id;
+              return (
+                <div
+                  key={t.id}
+                  role="tab"
+                  aria-selected={active}
+                  tabIndex={0}
+                  className="codex-split-tab"
+                  data-active={active ? 'true' : undefined}
+                  onClick={() => {
+                    setActiveTabId(t.id);
+                    if (t.kind === 'subagents') onChangeTab('subagents');
+                    else if (t.kind === 'events') onChangeTab('events');
+                    else if (t.kind === 'file') {
+                      onChangeTab('diff');
+                      if (t.path !== '__all__') onSelectFile(t.path);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setActiveTabId(t.id);
+                    }
+                  }}
+                >
+                  {t.kind === 'subagents' ? (
+                    <IconAgent size={13} style={{ flex: 'none' }} />
+                  ) : t.kind === 'events' ? (
+                    <IconHistory size={13} style={{ flex: 'none' }} />
+                  ) : (
+                    <IconFileDoc size={13} style={{ flex: 'none' }} />
+                  )}
+                  <span className="codex-split-tab-label">{t.label}</span>
+                  <button
+                    type="button"
+                    className="codex-split-tab-close"
+                    aria-label={`关闭 ${t.label}`}
+                    onClick={(e) => closeTab(t.id, e)}
+                  >
+                    <IconClose size={11} />
+                  </button>
+                </div>
+              );
+            })}
+
+            <div style={{ position: 'relative', flex: 'none' }} ref={plusMenuRef}>
+              <button
+                type="button"
+                className="codex-icon-btn"
+                style={{ width: 26, height: 26 }}
+                title="打开面板标签页"
+                onClick={() => setPlusMenuOpen((v) => !v)}
+              >
+                <IconPlus size={14} />
+              </button>
+              {plusMenuOpen && (
+                <div className="codex-popover" data-side="bottom" style={{ left: 0, width: 176 }}>
+                  <button
+                    type="button"
+                    className="codex-popover-item"
+                    onClick={() => {
+                      setPlusMenuOpen(false);
+                      onChangeTab('subagents');
+                      ensureTab({ id: 'subagents', kind: 'subagents', label: '子智能体' });
+                    }}
+                  >
+                    <span>子智能体</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="codex-popover-item"
+                    onClick={() => {
+                      setPlusMenuOpen(false);
+                      const firstPath = diffs[0]?.path;
+                      if (firstPath) openFileInPane(firstPath);
+                      else {
+                        onChangeTab('diff');
+                        ensureTab({ id: 'file:__all__', kind: 'file', path: '__all__', label: '变更' });
+                      }
+                    }}
+                  >
+                    <span>文件与变更 Diff</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="codex-popover-item"
+                    onClick={() => {
+                      setPlusMenuOpen(false);
+                      onChangeTab('events');
+                      ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
+                    }}
+                  >
+                    <span>SSE 事件与版本</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flex: 'none' }}>
+            <button
+              type="button"
+              className="codex-icon-btn"
+              style={{ width: 26, height: 26 }}
+              title={width > 700 ? '还原分屏宽度' : '加宽分屏视图'}
+              onClick={() => onResize(width > 700 ? 580 : 860)}
+            >
+              <IconColumns size={14} />
+            </button>
+            <button
+              type="button"
+              className="codex-icon-btn"
+              style={{ width: 26, height: 26 }}
+              aria-label="关闭右侧面板"
+              title="关闭右侧面板"
+              onClick={onClose}
+            >
+              <IconRightPanelToggle size={15} />
+            </button>
+          </div>
+        </div>
+
+        {/* Empty state if no active task */}
+        {!bundle ? (
+          <div
+            style={{
+              flex: 1,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 24,
+              color: 'var(--text-tertiary)',
+              fontSize: 13,
+              textAlign: 'center',
+            }}
+          >
+            打开任意会话或提交任务后，可在此查看子智能体过程、文件变更、DAG 与实时事件。
+          </div>
+        ) : activePaneTab?.kind === 'subagents' ? (
+          /* ================================================================
+           * TAB A: 子智能体 (List View <-> Drill-down Detail View — Screenshots 3 & 4!)
+           * ============================================================== */
+          focusedSubagent ? (
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              <div className="codex-subagent-detail-head">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                  <button
+                    type="button"
+                    className="codex-icon-btn"
+                    style={{ width: 26, height: 26 }}
+                    aria-label="返回子智能体列表"
+                    onClick={() => onSelectSubagent(null)}
+                  >
+                    <IconArrowBack size={15} />
+                  </button>
+                  <AgentAvatar
+                    seed={`${focusedSubagent.id}-${focusedSubagent.role}`}
+                    size={16}
+                  />
+                  <span
+                    style={{
+                      fontSize: 13.5,
+                      fontWeight: 500,
+                      color: 'var(--text-default)',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {getWorkerDisplayName(focusedSubagent)}
+                  </span>
+                </div>
+                <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flex: 'none' }}>
+                  {[focusedSubagent.model, getWorkerDisplayRole(focusedSubagent)].filter(Boolean).join(' · ')}
+                </span>
+              </div>
+
+              <div className="codex-subagent-panel">
+                {(() => {
+                  const wEvidence = bundle.evidence.filter((e) => e.workerId === focusedSubagent.id);
+                  const wApprovals = bundle.approvals.filter((a) => a.workerId === focusedSubagent.id);
+                  const wSessions = bundle.sessions.filter((s) => s.workerId === focusedSubagent.id);
+                  const wEvents = bundle.events.filter((ev) => eventMatchesWorker(ev, focusedSubagent.id, bundle.workers));
+                  const wArtifacts = bundle.artifacts.filter(
+                    (a) => a.workerId === focusedSubagent.id && a.text?.trim(),
+                  );
+                  const wMessages = wSessions.flatMap((s) =>
+                    (bundle.histories[s.id] ?? [])
+                      .filter((h) => h.type === 'assistant/message' && h.text?.trim())
+                      .map((h) => ({ id: `${s.id}-${h.cursor}`, text: h.text! })),
+                  );
+                  const finalBlocks = wArtifacts.length
+                    ? wArtifacts.map((a) => ({ id: a.id, text: a.text! }))
+                    : wMessages.slice(-1);
+                  const wRunning = focusedSubagent.status === 'running';
+
+                  const wArtifactFiles: Record<string, string> = {};
+                  for (const a of bundle.artifacts) {
+                    if (a.published) Object.assign(wArtifactFiles, a.files ?? {});
+                  }
+
+                  return (
+                    <>
+                      <ActivityBlock
+                        assignments={bundle.assignments}
+                        workers={[focusedSubagent]}
+                        sessions={wSessions}
+                        histories={bundle.histories}
+                        evidence={wEvidence}
+                        approvals={wApprovals}
+                        taskFiles={bundle.task.files}
+                        artifactFiles={wArtifactFiles}
+                        events={wEvents}
+                        durationMs={wRunning ? undefined : 1000 * 60 * 1 + 42000}
+                        isLive={wRunning}
+                        liveText={getWorkerActivityLabel(focusedSubagent) || `正在运行 ${getWorkerDisplayName(focusedSubagent)}…`}
+                        finalProseTexts={finalBlocks.map((b) => b.text)}
+                        defaultOpen
+                        subagentMode
+                        onInspectFile={openFileInPane}
+                        onOpenImage={(imgs, idx) => setLightbox({ images: imgs, index: idx })}
+                        onCopy={onToast}
+                      />
+
+                      {finalBlocks.map((blk) => (
+                        <div key={blk.id} className="codex-assistant-turn" style={{ fontSize: 14.5 }}>
+                          <Markdown
+                            text={blk.text}
+                            onOpenFile={openFileInPane}
+                            onCopy={onToast}
+                          />
+                        </div>
+                      ))}
+
+                      {!wEvidence.length && !finalBlocks.length && (
+                        <div style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>
+                          该子智能体当前暂无工具执行或输出记录（状态：{fmtStatusLabel(focusedSubagent.status)}）。
+                        </div>
+                      )}
+
+                      {finalBlocks.length > 0 && (
+                        <div>
+                          <button
+                            type="button"
+                            className="codex-icon-btn"
+                            style={{ width: 26, height: 26 }}
+                            title="复制子智能体输出"
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(
+                                  finalBlocks.map((b) => b.text).join('\n\n'),
+                                );
+                                onToast('已复制子智能体输出');
+                              } catch {
+                                // ignore
+                              }
+                            }}
+                          >
+                            <IconCopy size={14} />
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+          ) : (
+            <div className="codex-subagent-panel">
+              {/* 已开启 · N */}
+              <div>
+                <div className="codex-subagent-section-head tabular-nums">
+                  已开启 · {activeWorkers.length}
+                </div>
+                {activeWorkers.length === 0 ? (
+                  <div style={{ padding: '4px 10px', fontSize: 13, color: 'var(--text-tertiary)' }}>
+                    没有已开启的子代理
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    {activeWorkers.map((w) => (
+                      <button
+                        key={w.id}
+                        type="button"
+                        className="codex-subagent-list-row"
+                        onClick={() => onSelectSubagent(w.id)}
+                      >
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                          <AgentAvatar seed={`${w.id}-${w.role}`} size={16} />
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {getWorkerDisplayName(w)}
+                          </span>
+                          <span className="codex-status-dot" data-tone="pulse" />
+                        </span>
+                        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flex: 'none' }}>
+                          运行中
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* 完成 · M */}
+              <div>
+                <div className="codex-subagent-section-head tabular-nums">
+                  完成 · {doneWorkers.length}
+                </div>
+                {doneWorkers.length === 0 ? (
+                  <div style={{ padding: '4px 10px', fontSize: 13, color: 'var(--text-tertiary)' }}>
+                    暂无已完成的子代理
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    {(showAllSubagents ? doneWorkers : doneWorkers.slice(0, 10)).map((w) => (
+                      <button
+                        key={w.id}
+                        type="button"
+                        className="codex-subagent-list-row"
+                        onClick={() => onSelectSubagent(w.id)}
+                      >
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                          <AgentAvatar seed={`${w.id}-${w.role}`} size={16} />
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {getWorkerDisplayName(w)}
+                          </span>
+                        </span>
+                        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flex: 'none' }}>
+                          {bundle.task.createdAt ? fmtRelative(bundle.task.createdAt) : w.model}
+                        </span>
+                      </button>
+                    ))}
+                    {!showAllSubagents && doneWorkers.length > 10 && (
+                      <button
+                        type="button"
+                        className="codex-sidebar-more-btn"
+                        style={{ paddingLeft: 10, marginTop: 4 }}
+                        onClick={() => setShowAllSubagents(true)}
+                      >
+                        再显示 {doneWorkers.length - 10} 个
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )
+        ) : activePaneTab?.kind === 'file' ? (
+          /* ================================================================
+           * TAB B: IDE File Code + Diff + Right Changed Files Tree (Screenshot 5!)
+           * ============================================================== */
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            {/* Breadcrumb & 显示更改 Toolbar */}
+            <div className="codex-ide-toolbar">
+              <div className="codex-ide-breadcrumb" title={activeFileDiff?.path}>
+                <span>{projectName}</span>
+                {activeFileDiff?.path
+                  .replace(/\\/g, '/')
+                  .split('/')
+                  .filter(Boolean)
+                  .map((seg, idx, arr) => (
+                    <React.Fragment key={`${seg}-${idx}`}>
+                      <IconChevronRight size={11} style={{ flex: 'none', opacity: 0.6 }} />
+                      <span
+                        style={{
+                          color: idx === arr.length - 1 ? 'var(--text-default)' : 'var(--text-tertiary)',
+                          fontWeight: idx === arr.length - 1 ? 500 : 400,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }}
+                      >
+                        {seg}
+                      </span>
+                    </React.Fragment>
+                  ))}
+              </div>
+
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flex: 'none' }}>
+                {activeFileDiff && (
+                  <>
+                    {showChanges && (
+                      <span className="codex-ide-branch-pill" title="当前对比基准">
+                        <IconBranch size={12} />
+                        <span>分支</span>
+                        <span style={{ opacity: 0.45 }}>|</span>
+                        <span style={{ color: 'var(--text-default)' }}>main</span>
+                        {(activeFileDiff.added > 0 || activeFileDiff.deleted > 0) && (
+                          <span className="codex-diff-counts tabular-nums" style={{ fontSize: 11, marginLeft: 2 }}>
+                            <span className="codex-git-add">+{activeFileDiff.added}</span>
+                            <span className="codex-git-del">-{activeFileDiff.deleted}</span>
+                          </span>
+                        )}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="codex-toolbar-btn"
+                      data-variant={showChanges ? 'primary' : 'outline'}
+                      style={{ height: 26, fontSize: 12 }}
+                      onClick={() => setShowChanges((v) => !v)}
+                    >
+                      <IconDiffBox size={13} />
+                      <span>{showChanges ? '查看源码' : '显示更改'}</span>
+                    </button>
+                    {showChanges && (
+                      <button
+                        type="button"
+                        className="codex-toolbar-btn"
+                        data-variant="outline"
+                        style={{ height: 26, fontSize: 12 }}
+                        onClick={() => setDiffMode((m) => (m === 'unified' ? 'split' : 'unified'))}
+                      >
+                        <IconColumns size={12} />
+                        <span>{diffMode === 'unified' ? '双栏' : '单栏'}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="codex-icon-btn"
+                      style={{ width: 26, height: 26 }}
+                      title="复制文件内容"
+                      onClick={() => void copyActiveFile()}
+                    >
+                      {copiedFile ? <IconCheck size={13} /> : <IconCopy size={13} />}
+                    </button>
+                    <button
+                      type="button"
+                      className="codex-icon-btn"
+                      style={{ width: 26, height: 26 }}
+                      title="下载文件"
+                      onClick={() => downloadTextFile(activeFileDiff.path, activeFileDiff.afterText)}
+                    >
+                      <IconDownload size={13} />
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Split Body: Left Code/Diff Viewer + Right Changed Files Tree */}
+            <div className="codex-ide-body">
+              <div className="codex-ide-editor">
+                {!activeFileDiff ? (
+                  <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>
+                    当前任务暂无文件变更或产物。
+                  </div>
+                ) : isImagePath(activeFileDiff.path) ? (
+                  (() => {
+                    const raw =
+                      bundle.artifacts.find((a) => a.files?.[activeFileDiff.path])?.files?.[
+                        activeFileDiff.path
+                      ] ?? bundle.task.files?.[activeFileDiff.path];
+                    const imgSrc = toImageDataUrl(activeFileDiff.path, raw);
+                    return (
+                      <div
+                        style={{
+                          padding: 24,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          minHeight: 240,
+                          gap: 10,
+                          fontFamily: 'var(--font-sans)',
+                        }}
+                      >
+                        {imgSrc ? (
+                          <img
+                            src={imgSrc}
+                            alt={activeFileDiff.path}
+                            style={{
+                              maxWidth: '100%',
+                              maxHeight: 520,
+                              borderRadius: 10,
+                              border: '1px solid var(--border-default)',
+                              boxShadow: 'var(--shadow-sm)',
+                            }}
+                          />
+                        ) : (
+                          <span style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>
+                            无法预览此图像文件
+                          </span>
+                        )}
+                        <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                          {activeFileDiff.path}
+                        </span>
+                      </div>
+                    );
+                  })()
+                ) : !showChanges ? (
+                  /* Syntax-Highlighted Line-Numbered Code View (Screenshot 5 default!) */
+                  <div>
+                    {activeFileDiff.afterText.replace(/\r\n/g, '\n').split('\n').map((line, i) => {
+                      const ln = i + 1;
+                      return (
+                        <div
+                          key={ln}
+                          className="codex-code-line"
+                          data-change={addedLineNumbers.has(ln) ? 'add' : undefined}
+                        >
+                          <span className="codex-code-ln">{ln}</span>
+                          <span className="codex-code-src">{highlightCodeLine(line)}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : diffMode === 'unified' ? (
+                  <div className="codex-diff-table">
+                    {activeFileDiff.lines.map((line, idx) => (
+                      <div key={idx} className="codex-diff-line" data-kind={line.kind}>
+                        <span className="codex-diff-ln">{line.oldLine ?? ''}</span>
+                        <span className="codex-diff-ln">{line.newLine ?? ''}</span>
+                        <span className="codex-diff-sign">
+                          {line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ' '}
+                        </span>
+                        <span className="codex-diff-code">{line.text}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="codex-diff-split">
+                    {splitRows.map((row, idx) => (
+                      <React.Fragment key={idx}>
+                        <div className="codex-diff-split-cell" data-kind={row.left.kind}>
+                          <span className="codex-diff-ln">{row.left.ln ?? ''}</span>
+                          <span className="codex-diff-sign">
+                            {row.left.kind === 'del' ? '-' : ' '}
+                          </span>
+                          <span>{row.left.text}</span>
+                        </div>
+                        <div className="codex-diff-split-cell" data-kind={row.right.kind}>
+                          <span className="codex-diff-ln">{row.right.ln ?? ''}</span>
+                          <span className="codex-diff-sign">
+                            {row.right.kind === 'add' ? '+' : ' '}
+                          </span>
+                          <span>{row.right.text}</span>
+                        </div>
+                      </React.Fragment>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Right Collapsible Changed Files Tree (Exact Screenshot 5!) */}
+              {diffs.length > 0 && (
+                <div className="codex-ide-tree">
+                  <div className="codex-ide-tree-search">
+                    <IconSearch size={12} style={{ flex: 'none' }} />
+                    <input
+                      value={treeFilter}
+                      onChange={(e) => setTreeFilter(e.target.value)}
+                      placeholder="筛选文件…"
+                    />
+                  </div>
+                  <div
+                    style={{
+                      padding: '4px 10px',
+                      fontSize: 11.5,
+                      fontWeight: 500,
+                      color: 'var(--text-tertiary)',
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                    }}
+                  >
+                    <span>已更改的文件</span>
+                    <span className="tabular-nums">{filteredDiffs.length}</span>
+                  </div>
+                  <div className="codex-ide-tree-list">{renderTreeNodes(fileTree)}</div>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          /* ================================================================
+           * TAB C: Live SSE Events + Task Version Snapshots
+           * ============================================================== */
+          <div className="codex-drawer-body">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 500,
+                    color: 'var(--text-tertiary)',
+                    marginBottom: 8,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                  }}
+                >
+                  <IconHistory size={14} />
+                  <span>任务版本历史（当前 v{bundle.task.version}）</span>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {Array.from({ length: Math.min(bundle.task.version, 12) }, (_, i) => i + 1).map((v) => (
+                    <button
+                      key={v}
+                      type="button"
+                      className="codex-toolbar-btn tabular-nums"
+                      data-variant={loadedVersion?.version === v ? 'primary' : 'outline'}
+                      disabled={loadingVersion}
+                      onClick={() => void handleLoadVersion(v)}
+                    >
+                      v{v}
+                    </button>
+                  ))}
+                </div>
+                {loadedVersion && (
+                  <div
+                    style={{
+                      marginTop: 8,
+                      padding: 10,
+                      borderRadius: 'var(--radius-md)',
+                      border: '1px solid var(--border-default)',
+                      background: 'var(--bg-surface-secondary)',
+                      fontSize: 12,
+                    }}
+                  >
+                    <div style={{ fontWeight: 500, marginBottom: 4 }}>
+                      快照 v{loadedVersion.version} · 状态：{fmtStatusLabel(loadedVersion.status)}
+                    </div>
+                    <pre
+                      style={{
+                        margin: 0,
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 11.5,
+                        color: 'var(--text-secondary)',
+                        whiteSpace: 'pre-wrap',
+                        maxHeight: 160,
+                        overflow: 'auto',
+                      }}
+                    >
+                      {JSON.stringify(
+                        {
+                          status: loadedVersion.status,
+                          version: loadedVersion.version,
+                          planNodes: loadedVersion.plan?.nodes.length ?? 0,
+                          verdict: loadedVersion.verdict ?? null,
+                        },
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </div>
+                )}
+              </div>
+
+              {/* Token Usage Breakdown */}
+              {bundle.usage.length > 0 && (
+                <div
+                  style={{
+                    padding: 10,
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    background: 'var(--bg-surface-secondary)',
+                    fontSize: 12,
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                  }}
+                >
+                  <span style={{ color: 'var(--text-secondary)' }}>累计用量</span>
+                  <span className="tabular-nums" style={{ fontWeight: 500 }}>
+                    {fmtTokens(bundle.usage.reduce((s, u) => s + u.inputTokens + u.outputTokens, 0))} tokens ·{' '}
+                    {fmtUSD(bundle.usage.reduce((s, u) => s + u.estimatedUSD, 0))}
+                  </span>
+                </div>
+              )}
+
+              {/* Live SSE Events Log */}
+              <div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 500,
+                    color: 'var(--text-tertiary)',
+                    marginBottom: 8,
+                  }}
+                >
+                  实时 SSE 事件流 ({bundle.events.length})
+                </div>
+                {bundle.events.length === 0 ? (
+                  <div style={{ fontSize: 12.5, color: 'var(--text-tertiary)' }}>
+                    当前任务暂无事件记录。
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {[...bundle.events].reverse().map((ev) => (
+                      <div
+                        key={ev.seq}
+                        style={{
+                          padding: '7px 10px',
+                          borderRadius: 'var(--radius-md)',
+                          border: '1px solid var(--border-subtle)',
+                          background: 'var(--bg-surface)',
+                          fontSize: 12,
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 500 }}>
+                            #{ev.seq} {ev.type}
+                          </span>
+                          <span className="tabular-nums" style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>
+                            {fmtClock(ev.timestamp)}
+                          </span>
+                        </div>
+                        {Object.keys(ev.payload ?? {}).length > 0 && (
+                          <div
+                            style={{
+                              marginTop: 4,
+                              fontFamily: 'var(--font-mono)',
+                              fontSize: 11,
+                              color: 'var(--text-secondary)',
+                              wordBreak: 'break-all',
+                            }}
+                          >
+                            {JSON.stringify(ev.payload)}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Artifacts summary */}
+              {bundle.artifacts.some((a) => Object.keys(a.files ?? {}).length > 0) && (
+                <div>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 500,
+                      color: 'var(--text-tertiary)',
+                      marginBottom: 6,
+                    }}
+                  >
+                    已发布产物文件
+                  </div>
+                  {bundle.artifacts.map((art) =>
+                    Object.entries(art.files ?? {}).map(([path, b64]) => (
+                      <button
+                        key={`${art.id}-${path}`}
+                        type="button"
+                        className="codex-agent-source-row"
+                        onClick={() => openFileInPane(path)}
+                      >
+                        <IconFileDoc size={13} />
+                        <span className="codex-agent-source-name">{path}</span>
+                        <span className="tabular-nums" style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                          {decodeBase64Utf8(b64).length} B
+                        </span>
+                      </button>
+                    )),
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <ImageLightbox
+        images={lightbox?.images ?? []}
+        index={lightbox?.index ?? null}
+        onChangeIndex={(next) =>
+          setLightbox((cur) => (next === null || !cur ? null : { ...cur, index: next }))
+        }
+      />
+    </aside>
+  );
+};

@@ -1,4 +1,5 @@
 import { publicRoutes } from './routes.js';
+import { v1Routes } from './v1-routes.js';
 import { decide, filemap } from './tools.js';
 import Fastify from 'fastify';
 import { z, ZodError } from 'zod';
@@ -6,19 +7,34 @@ import { timingSafeEqual, createHash } from 'node:crypto';
 import { Fault } from './store.js';
 export const uuid = z.uuid();
 const digest = (s) => createHash('sha256').update(s).digest();
-export function api(store, token, providers = { models: [], list: () => [] }) {
+export function api(
+  store,
+  token,
+  providers = { models: [], list: () => [] },
+  { snapshotPin = null, pool = null, directAgent = null, checkin = null, webLogin = null } = {},
+) {
   if (!token || token.length < 24)
     throw Error('BACKEND_TOKEN requires at least 24 characters');
   const app = Fastify({ bodyLimit: 512 * 1024, logger: false });
   app.addHook('onRequest', async (req) => {
-    if (req.url === '/health') return;
+    const pathname = req.url.split('?')[0];
     if (
-      !timingSafeEqual(
-        digest(req.headers.authorization ?? ''),
-        digest(`Bearer ${token}`),
-      )
+      pathname === '/health' ||
+      pathname === '/v1/health' ||
+      pathname === '/v1/auth/oauth/callback'
     )
-      throw new Fault('UNAUTHORIZED', 401);
+      return;
+    const authHeader = String(req.headers.authorization ?? '');
+    const xApiKey = String(req.headers['x-api-key'] ?? '');
+    const bearerOk = timingSafeEqual(
+      digest(authHeader),
+      digest(`Bearer ${token}`),
+    );
+    const apiKeyOk =
+      Boolean(xApiKey) &&
+      pathname.startsWith('/v1/') &&
+      timingSafeEqual(digest(xApiKey), digest(token));
+    if (!bearerOk && !apiKeyOk) throw new Fault('UNAUTHORIZED', 401);
   });
   app.setErrorHandler((e, req, rep) => {
     const status =
@@ -27,6 +43,10 @@ export function api(store, token, providers = { models: [], list: () => [] }) {
         : e instanceof ZodError
           ? 400
           : (e.statusCode ?? 500);
+    const message =
+      e instanceof Fault && e.detail && typeof e.detail.message === 'string'
+        ? e.detail.message
+        : undefined;
     rep.code(status).send({
       error: {
         code:
@@ -35,6 +55,7 @@ export function api(store, token, providers = { models: [], list: () => [] }) {
             : status < 500
               ? 'INVALID_REQUEST'
               : 'INTERNAL_ERROR',
+        ...(message ? { message } : {}),
         requestId: req.id,
       },
     });
@@ -50,31 +71,34 @@ export function api(store, token, providers = { models: [], list: () => [] }) {
         .parse(req.body),
     ),
   );
-  app.post('/api/v1/tasks', async (req) =>
-    store.submit(
-      z
-        .strictObject({
-          projectId: uuid,
-          input: z.string().trim().min(1).max(16000),
-          idempotencyKey: z.string().min(1).max(128),
-          files: filemap
-            .refine(
-              (f) =>
-                Object.keys(f).length <= 64 &&
-                JSON.stringify(f).length <= 345000,
-            )
-            .optional(),
-          budget: z
-            .strictObject({
-              maxSteps: z.number().int().min(1).max(32).optional(),
-              maxDurationSeconds: z.number().int().min(10).max(7200).optional(),
-              maxCostUSD: z.number().positive().max(100).optional(),
-            })
-            .optional(),
-        })
-        .parse(req.body),
-    ),
-  );
+  app.post('/api/v1/tasks', async (req) => {
+    const body = z
+      .strictObject({
+        projectId: uuid,
+        input: z.string().trim().min(1).max(16000),
+        idempotencyKey: z.string().min(1).max(128),
+        files: filemap
+          .refine(
+            (f) =>
+              Object.keys(f).length <= 64 &&
+              JSON.stringify(f).length <= 345000,
+          )
+          .optional(),
+        budget: z
+          .strictObject({
+            maxSteps: z.number().int().min(1).max(32).optional(),
+            maxDurationSeconds: z.number().int().min(10).max(7200).optional(),
+            maxCostUSD: z.number().positive().max(100).optional(),
+          })
+          .optional(),
+        approvalMode: z
+          .enum(['manual', 'workspace-write', 'auto-review'])
+          .optional(),
+      })
+      .parse(req.body);
+    const pin = snapshotPin ? await snapshotPin(body) : undefined;
+    return store.submit({ ...body, ...(pin ? { pin } : {}) });
+  });
   for (const kind of [
     'projects',
     'tasks',
@@ -112,6 +136,8 @@ export function api(store, token, providers = { models: [], list: () => [] }) {
         .strictObject({
           version: z.number().int().positive(),
           decision: z.enum(['approve', 'deny']),
+          outcome: z.enum(['succeeded', 'not_applied', 'abort']).optional(),
+          reason: z.string().max(500).optional(),
         })
         .parse(req.body),
     ),
@@ -148,5 +174,6 @@ export function api(store, token, providers = { models: [], list: () => [] }) {
     };
   });
   publicRoutes(app, store, providers);
+  v1Routes(app, { store, providers, pool, directAgent, checkin, webLogin });
   return app;
 }

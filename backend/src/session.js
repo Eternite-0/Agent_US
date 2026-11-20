@@ -1,7 +1,12 @@
-import { compact, excerpt } from './context.js';
+import {
+  compactTwoStage,
+  excerpt,
+  measureRequestComposition,
+} from './context.js';
 import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { bundle } from './bundle.js';
 import { Fault } from './store.js';
+import { buildRepairNote, decideRepair } from './verifier.js';
 
 // A fresh Cordis scope exposes exactly this attempt's tools and adapter.
 export async function runSession({
@@ -17,6 +22,11 @@ export async function runSession({
   signal,
   maxSteps = 8,
   onUsage,
+  onTelemetry,
+  summarize = null,
+  verify = null,
+  repairPolicy = decideRepair,
+  stopCheck = null,
 }) {
   const ctx = await bundle(store, persona);
   let agent;
@@ -27,11 +37,24 @@ export async function runSession({
     }
     async *stream(options) {
       if (++calls > maxSteps) throw new Fault('STEP_BUDGET');
-      for await (const chunk of adapter.stream(
-        compact(options, Math.min(200000, model.context - 4096)),
-      )) {
-        if (chunk.type === 'usage') onUsage?.(chunk.usage);
-        yield chunk;
+      const started = Date.now();
+      const compacted = await compactTwoStage(options, {
+        contextWindow: Math.min(200000, model.context),
+        summarize,
+      });
+      const composition = measureRequestComposition(compacted.options);
+      try {
+        for await (const chunk of adapter.stream(compacted.options)) {
+          if (chunk.type === 'usage') onUsage?.(chunk.usage);
+          yield chunk;
+        }
+      } finally {
+        onTelemetry?.({
+          step: calls,
+          compactionStage: compacted.stage,
+          composition,
+          modelDurationMs: Date.now() - started,
+        });
       }
     }
   }
@@ -99,13 +122,96 @@ export async function runSession({
     );
     await agent.whenIdle();
     signal.throwIfAborted();
-    const events = agent.session.snapshotEvents();
-    const end = events.findLast((e) => e.type === 'turn/end');
-    const last = events.findLast((e) => e.type === 'assistant/message');
-    const text = last?.data.message.content
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('');
+
+    const extractOutcome = () => {
+      const events = agent.session.snapshotEvents();
+      const end = events.findLast((e) => e.type === 'turn/end');
+      const lastIdx = events.findLastIndex((e) => e.type === 'assistant/message');
+      const last = lastIdx >= 0 ? events[lastIdx] : undefined;
+      const text = last?.data.message.content
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('');
+      const hasToolsInLastReply =
+        lastIdx >= 0 &&
+        events.slice(lastIdx + 1).some((e) => e.type === 'tool/call');
+      return { events, end, last, text, hasToolsInLastReply };
+    };
+
+    let outcome = extractOutcome();
+    let continuedOnce = false;
+    let repairRound = 0;
+
+    // 1. Optional System-1 premature-stop check (max 1 continuation per session).
+    if (
+      stopCheck &&
+      !continuedOnce &&
+      outcome.text &&
+      outcome.end?.data.reason.kind === 'completed' &&
+      !outcome.last?.data.interrupted &&
+      !outcome.hasToolsInLastReply &&
+      calls < maxSteps
+    ) {
+      const check = await stopCheck({
+        requestText: input,
+        replyText: outcome.text,
+        hasTools: outcome.hasToolsInLastReply,
+        alreadyContinued: continuedOnce,
+      });
+      if (check?.shouldContinue && check.note) {
+        continuedOnce = true;
+        store.event('judgment.stop_continued', task.projectId, task.id, {
+          sessionId: session.id,
+          prob: check.prob,
+          cached: !!check.cached,
+        });
+        agent.followup(
+          createUserMessage({
+            content: [{ type: 'text', text: check.note }],
+            source: { kind: 'user' },
+          }),
+        );
+        await agent.whenIdle();
+        signal.throwIfAborted();
+        outcome = extractOutcome();
+      }
+    }
+
+    // 2. Deterministic T0 completion verifier + bounded 1-round warm repair.
+    if (
+      verify &&
+      outcome.text &&
+      outcome.end?.data.reason.kind === 'completed' &&
+      !outcome.last?.data.interrupted
+    ) {
+      const verdict = verify({ events: outcome.events, text: outcome.text });
+      if (verdict && verdict.verdict !== 'pass') {
+        store.event('verifier.signal', task.projectId, task.id, {
+          sessionId: session.id,
+          verdict: verdict.verdict,
+          reasons: verdict.reasons,
+        });
+        const decision = repairPolicy({ round: ++repairRound, verdict });
+        if (decision === 'repair' && calls < maxSteps) {
+          store.event('verifier.repair', task.projectId, task.id, {
+            sessionId: session.id,
+            round: repairRound,
+            reasons: verdict.reasons,
+          });
+          agent.followup(
+            createUserMessage({
+              content: [{ type: 'text', text: buildRepairNote(verdict) }],
+              source: { kind: 'user' },
+            }),
+          );
+          await agent.whenIdle();
+          signal.throwIfAborted();
+          outcome = extractOutcome();
+        }
+      }
+    }
+
+    const { events, end, last, text } = outcome;
     if (
       !text ||
       end?.data.reason.kind !== 'completed' ||

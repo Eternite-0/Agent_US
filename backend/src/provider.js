@@ -100,6 +100,11 @@ export class ChatAdapter extends LlmAdapter {
           usage: {
             inputTokens: frame.usage.prompt_tokens,
             outputTokens: frame.usage.completion_tokens,
+            cacheReadTokens:
+              frame.usage.prompt_tokens_details?.cached_tokens ??
+              frame.usage.cache_read_input_tokens ??
+              0,
+            cacheWriteTokens: frame.usage.cache_creation_input_tokens ?? 0,
           },
         };
       const choice = frame.choices?.[0];
