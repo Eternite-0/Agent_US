@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { Fault, id as uuid } from './store.js';
 import { excerpt } from './context.js';
@@ -12,6 +13,12 @@ import { DurableJobQueue } from './durable/job-queue.js';
 import { CheckpointStore } from './durable/checkpoint.js';
 import { UnknownOutcomeReconciler } from './durable/reconciliation.js';
 import { RecoveryWorker } from './durable/recovery.js';
+import {
+  assertLeaseInTx,
+  checkLeaseHeld,
+  isLeaseLostError,
+  markWorkerStopped,
+} from './durable/lease-guard.js';
 import {
   discoverMemoryAndSkills,
   discoverProjectInstructions,
@@ -45,6 +52,7 @@ import { InterAgentMailbox } from './swarm/mailbox.js';
 import { ChildAgentManager } from './swarm/child-lifecycle.js';
 import { DynamicReplanner } from './swarm/replan.js';
 import { AdaptiveSwarmOrchestrator } from './swarm/orchestrator.js';
+import { SwarmArtifactManager } from './swarm/artifacts.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -83,6 +91,10 @@ export class DirectAgentRuntime {
       adapter = null,
       judgment = null,
       staticMcp = {},
+      workerId = null,
+      leaseMs = 15000,
+      enableHeartbeat = true,
+      artifactStoreDir = null,
     } = {},
   ) {
     this.store = store;
@@ -93,7 +105,7 @@ export class DirectAgentRuntime {
     this.dataRoot = dataRoot ? resolve(dataRoot) : null;
     this.closed = false;
 
-    this.jobQueue = new DurableJobQueue(this.store);
+    this.jobQueue = new DurableJobQueue(this.store, { defaultLeaseMs: leaseMs });
     this.checkpointStore = new CheckpointStore(this.store);
     this.kernel = new AgentRuntimeKernel({
       store: this.store,
@@ -153,6 +165,9 @@ export class DirectAgentRuntime {
       checkpointStore: this.checkpointStore,
       reconciler: this.reconciler,
       eventRouter: this.eventRouter,
+      workerId,
+      leaseMs,
+      enableHeartbeat,
       handlers: {
         direct_turn: (job, ctx) => this.#executeTurnJob(job, ctx),
       },
@@ -200,6 +215,17 @@ export class DirectAgentRuntime {
 
     // Layer 6: Adaptive Swarm Orchestrator & Dynamic Capability Routing
     this.worktreeIsolator = new GitWorktreeIsolator(this.store);
+    this.artifactStoreDir = artifactStoreDir
+      ? resolve(artifactStoreDir)
+      : this.dataRoot
+        ? join(this.dataRoot, 'swarm-artifacts')
+        : this.store?.dbPath && this.store.dbPath !== ':memory:'
+          ? join(dirname(resolve(this.store.dbPath)), 'swarm-artifacts')
+          : join(tmpdir(), 'agent-us-swarm-artifacts');
+    this.artifactManager = new SwarmArtifactManager({
+      store: this.store,
+      storageRoot: this.artifactStoreDir,
+    });
     this.modelCapabilities = new ModelCapabilityRegistry(this.pool);
     this.agentCapabilities = new AgentCapabilityRegistry();
     this.modelFeedback = new ModelFeedbackTracker(this.store);
@@ -221,6 +247,7 @@ export class DirectAgentRuntime {
       contextAssembler: this.contextAssembler,
       eventRouter: this.eventRouter,
       worktreeIsolator: this.worktreeIsolator,
+      artifactManager: this.artifactManager,
       jobQueue: this.jobQueue,
       getDefaultModel: () => this.pool.getDefaultModel(),
       getWorkspaceTools: ({ workspaceRoot, sessionId, permissionMode, nonce, signal }) =>
@@ -253,6 +280,7 @@ export class DirectAgentRuntime {
       planner: this.swarmPlanner,
       router: this.adaptiveRouter,
       childManager: this.childManager,
+      artifactManager: this.artifactManager,
       mailbox: this.mailbox,
       evidenceVerifier: this.evidenceVerifier,
       modelFeedback: this.modelFeedback,
@@ -277,6 +305,7 @@ export class DirectAgentRuntime {
         clearInterval(this.recoveryWorker.timer);
         this.recoveryWorker.timer = null;
       }
+      markWorkerStopped(this.store, this.recoveryWorker.workerId);
       this.swarmOrchestrator.closeAll();
       this.kernel.close();
       this.processManager.closeAll();
@@ -289,7 +318,10 @@ export class DirectAgentRuntime {
     this.shutdownCoordinator.registerStage(
       'worktrees',
       async () => {
-        if (this.store?.db?.isOpen) await this.worktreeIsolator.cleanupAll();
+        if (this._orphanCleanupPromise) {
+          await this._orphanCleanupPromise.catch(() => {});
+        }
+        if (this.store?.db?.isOpen) await this.worktreeIsolator.cleanupAll({ preserveDirty: true });
       },
       { order: 30, timeoutMs: 4000 },
     );
@@ -301,7 +333,12 @@ export class DirectAgentRuntime {
     this.swarmOrchestrator.registerOnWorker(this.recoveryWorker);
     this.recoveryWorker.registerStartupHook(() => this.swarmOrchestrator.recoverInterruptedRuns());
     this.recoveryWorker.registerStartupHook(() => {
-      void this.worktreeIsolator.cleanupOrphans();
+      this._orphanCleanupPromise = this.worktreeIsolator.cleanupOrphans().catch(() => ({
+        cleaned: 0,
+        preserved: 0,
+        skippedLive: 0,
+        paths: [],
+      }));
     });
     this.reconciler.onResolved((res) => this.swarmOrchestrator.handleReconciliationResolved(res));
 
@@ -615,6 +652,21 @@ export class DirectAgentRuntime {
     const session = this.store.db.prepare('SELECT * FROM direct_sessions WHERE id=?').get(sessionId);
     if (!session || session.state === 'cancelled') return;
 
+    // Atomically bind this worker's fence & attempt onto direct_turns before running
+    try {
+      this.store.tx(() => {
+        assertLeaseInTx(leaseGuard, { sessionId, turnId, bindingOwnership: true });
+        this.store.db
+          .prepare(
+            "UPDATE direct_turns SET activeFence=?, activeAttempt=? WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
+          )
+          .run(job.fence ?? null, Number(job.attempts || 1), turnId);
+      });
+    } catch (err) {
+      if (isLeaseLostError(err)) return;
+      throw err;
+    }
+
     try {
       await this.#runTurnLoop({
         sessionId,
@@ -633,7 +685,7 @@ export class DirectAgentRuntime {
         signal: combinedSignal,
       });
     } catch (err) {
-      if (this.closed || !this.store.db?.isOpen) return;
+      if (this.closed || !this.store.db?.isOpen || isLeaseLostError(err)) return;
       throw err;
     }
   }
@@ -960,6 +1012,7 @@ export class DirectAgentRuntime {
         },
         onAssistantMessage: ({ text, reasoning, toolCalls }) => {
           this.store.tx(() => {
+            assertLeaseInTx(leaseGuard, { sessionId, turnId });
             this.store.db
               .prepare(
                 `INSERT INTO direct_messages(
@@ -978,6 +1031,7 @@ export class DirectAgentRuntime {
         },
         onToolResult: ({ tc, output, isError, durationMs }) => {
           this.store.tx(() => {
+            assertLeaseInTx(leaseGuard, { sessionId, turnId });
             this.store.db
               .prepare(
                 `INSERT INTO direct_messages(
@@ -1015,7 +1069,6 @@ export class DirectAgentRuntime {
       const totalTokens = totalIn + totalOut;
 
       if (this.closed || !this.store.db?.isOpen) return;
-      leaseGuard?.();
 
       const receiptStats = this.store.db
         .prepare(
@@ -1029,11 +1082,12 @@ export class DirectAgentRuntime {
           turnId,
         });
         const parked = this.store.tx(() => {
+          assertLeaseInTx(leaseGuard, { sessionId, turnId });
           const res = this.store.db
             .prepare(
               `UPDATE direct_turns
                SET state='reconciling', phase='reconciling', inputTokens=?, outputTokens=?, durationMs=?,
-                   verdictJson=?, evidenceCount=?
+                   verdictJson=?, evidenceCount=?, activeFence=NULL
                WHERE id=? AND state IN ('running','reconciling','parked')`,
             )
             .run(
@@ -1047,7 +1101,7 @@ export class DirectAgentRuntime {
           if ((res.changes ?? 0) === 0) return false;
           this.store.db
             .prepare(
-              "UPDATE direct_sessions SET state='reconciling', updatedAt=? WHERE id=? AND state!='cancelled'",
+              "UPDATE direct_sessions SET state='reconciling', updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
             )
             .run(finishedAt, sessionId);
           return true;
@@ -1082,11 +1136,12 @@ export class DirectAgentRuntime {
         );
         const errorCode = String(loopResult.errorCode || 'VERIFICATION_FAILED');
         const committed = this.store.tx(() => {
+          assertLeaseInTx(leaseGuard, { sessionId, turnId });
           const res = this.store.db
             .prepare(
               `UPDATE direct_turns
                SET state='failed', phase='failed', error=?, inputTokens=?, outputTokens=?, durationMs=?,
-                   verdictJson=?, evidenceCount=?, finishedAt=?
+                   verdictJson=?, evidenceCount=?, finishedAt=?, activeFence=NULL
                WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
             )
             .run(
@@ -1102,7 +1157,7 @@ export class DirectAgentRuntime {
           if ((res.changes ?? 0) === 0) return false;
           this.store.db
             .prepare(
-              "UPDATE direct_sessions SET state='failed', updatedAt=? WHERE id=? AND state!='cancelled'",
+              "UPDATE direct_sessions SET state='failed', updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
             )
             .run(finishedAt, sessionId);
           if (totalTokens > 0) {
@@ -1177,12 +1232,14 @@ export class DirectAgentRuntime {
       }
 
       // 3. Verified completion (or explicit plain-text no-tool completion)
+      // Fix D5 / D7: Enforce fence & terminal state protection atomically INSIDE the SQLite commit!
       const committed = this.store.tx(() => {
+        assertLeaseInTx(leaseGuard, { sessionId, turnId });
         const res = this.store.db
           .prepare(
             `UPDATE direct_turns
              SET state='completed', phase='completed', inputTokens=?, outputTokens=?, durationMs=?,
-                 verdictJson=?, evidenceCount=?, finishedAt=?
+                 verdictJson=?, evidenceCount=?, finishedAt=?, activeFence=NULL
              WHERE id=? AND state IN ('running','reconciling','parked')`,
           )
           .run(
@@ -1197,7 +1254,7 @@ export class DirectAgentRuntime {
         if ((res.changes ?? 0) === 0) return false;
         this.store.db
           .prepare(
-            "UPDATE direct_sessions SET state='completed', updatedAt=? WHERE id=? AND state!='cancelled'",
+            "UPDATE direct_sessions SET state='completed', updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
           )
           .run(finishedAt, sessionId);
         this.store.db
@@ -1276,10 +1333,12 @@ export class DirectAgentRuntime {
     } catch (err) {
       if (this.closed || !this.store.db?.isOpen) return;
       const classified = classifyError(err);
-      if (classified.code === 'LEASE_LOST') return;
+      // Fix D6 / D7: Stale worker whose lease was lost MUST exit cleanly without overwriting active/completed turns!
+      if (isLeaseLostError(classified)) return;
       if (classified.code === 'RECONCILIATION_REQUIRED' || classified.code === 'APPROVAL_PARKED') {
         throw classified;
       }
+      if (!checkLeaseHeld(leaseGuard, { sessionId, turnId })) return;
       const durationMs = Date.now() - started;
       const finishedAt = Date.now();
       const isCancelled = signal.aborted || classified.category === 'cancellation';
@@ -1297,29 +1356,36 @@ export class DirectAgentRuntime {
         throw classified;
       }
 
-      const committed = this.store.tx(() => {
-        const res = this.store.db
-          .prepare(
-            "UPDATE direct_turns SET state=?, phase=?, error=?, inputTokens=?, outputTokens=?, durationMs=?, finishedAt=? WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
-          )
-          .run(
-            nextState,
-            nextState,
-            isCancelled ? null : message.slice(0, 1000),
-            totalIn,
-            totalOut,
-            durationMs,
-            finishedAt,
-            turnId,
-          );
-        if ((res.changes ?? 0) === 0) return false;
-        this.store.db
-          .prepare(
-            "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state!='cancelled'",
-          )
-          .run(nextState, finishedAt, sessionId);
-        return true;
-      });
+      let committed = false;
+      try {
+        committed = this.store.tx(() => {
+          assertLeaseInTx(leaseGuard, { sessionId, turnId });
+          const res = this.store.db
+            .prepare(
+              "UPDATE direct_turns SET state=?, phase=?, error=?, inputTokens=?, outputTokens=?, durationMs=?, finishedAt=?, activeFence=NULL WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
+            )
+            .run(
+              nextState,
+              nextState,
+              isCancelled ? null : message.slice(0, 1000),
+              totalIn,
+              totalOut,
+              durationMs,
+              finishedAt,
+              turnId,
+            );
+          if ((res.changes ?? 0) === 0) return false;
+          this.store.db
+            .prepare(
+              "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
+            )
+            .run(nextState, finishedAt, sessionId);
+          return true;
+        });
+      } catch (txErr) {
+        if (isLeaseLostError(txErr)) return;
+        throw txErr;
+      }
 
       if (committed) {
         if (!isCancelled) {

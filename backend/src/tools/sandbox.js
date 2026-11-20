@@ -5,6 +5,11 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { id as uuid } from '../store.js';
 import { sandbox as dockerSandbox } from '../tools.js';
+import {
+  assertLeaseInTx,
+  checkLeaseHeld,
+  isWorktreeOwnerLive,
+} from '../durable/lease-guard.js';
 
 export const ISOLATION_MODES = Object.freeze({
   WORKTREE: 'worktree',
@@ -234,7 +239,8 @@ export class DockerSandboxAdapter {
 }
 
 /**
- * Manages temporary isolated Git Worktrees for parallel write agents.
+ * Manages temporary isolated Git Worktrees for parallel write agents with
+ * fence/attempt ownership binding, dirty-write preservation, and rehydration.
  */
 export class GitWorktreeIsolator {
   constructor(store = null) {
@@ -242,14 +248,221 @@ export class GitWorktreeIsolator {
     this.active = new Map(); // leaseId -> entry
   }
 
+  async #gitStatusExcludingHandoff(wtPath) {
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['status', '--porcelain', '--', '.', ':(exclude).agent-us-handoff'],
+        {
+          cwd: wtPath,
+          windowsHide: true,
+          timeout: 5000,
+        },
+      );
+      return stdout.trim();
+    } catch {
+      try {
+        const { stdout } = await execFileAsync('git', ['status', '--porcelain'], {
+          cwd: wtPath,
+          windowsHide: true,
+          timeout: 5000,
+        });
+        return stdout
+          .split(/\r?\n/)
+          .filter((line) => line.trim() && !line.includes('.agent-us-handoff'))
+          .join('\n')
+          .trim();
+      } catch {
+        return '';
+      }
+    }
+  }
+
+  #buildHandle({
+    leaseId,
+    worktreePath,
+    workspaceRoot,
+    runId = null,
+    baseCommit = null,
+    baseRef = null,
+    jobId = null,
+    fence = null,
+    attempt = 1,
+    rehydrated = false,
+  }) {
+    const entry = {
+      leaseId,
+      path: worktreePath,
+      workspaceRoot,
+      runId,
+      baseCommit,
+      baseRef,
+      jobId,
+      fence,
+      attempt,
+      rehydrated,
+      released: false,
+      diffSummary: () => this.#gitStatusExcludingHandoff(worktreePath),
+      isDirty: async () => Boolean(await this.#gitStatusExcludingHandoff(worktreePath)),
+      release: async ({
+        archivedArtifactId = null,
+        forceDiscard = false,
+        preserveDirty = Boolean(runId),
+        leaseGuard = null,
+      } = {}) => {
+        if (entry.released) return { cleaned: false, reason: 'already_released' };
+        entry.released = true;
+        this.active.delete(leaseId);
+
+        let dbRow = null;
+        if (this.store?.db?.isOpen) {
+          try {
+            dbRow = this.store.db.prepare('SELECT * FROM worktree_leases WHERE id=?').get(leaseId);
+          } catch {
+            dbRow = null;
+          }
+        }
+
+        // Fix C10 / D5: Never touch disk if a newer attempt/fence now owns this worktree lease
+        if (dbRow) {
+          if (dbRow.fence && entry.fence && dbRow.fence !== entry.fence) {
+            return { cleaned: false, preserved: true, reason: 'fence_mismatch' };
+          }
+          if (
+            dbRow.attempt !== null &&
+            dbRow.attempt !== undefined &&
+            entry.attempt !== null &&
+            entry.attempt !== undefined &&
+            Number(dbRow.attempt) !== Number(entry.attempt)
+          ) {
+            return { cleaned: false, preserved: true, reason: 'attempt_mismatch' };
+          }
+          if (dbRow.jobId && entry.jobId && dbRow.jobId !== entry.jobId) {
+            return { cleaned: false, preserved: true, reason: 'job_mismatch' };
+          }
+          if (dbRow.status === 'cleaned' || dbRow.status === 'orphan_cleaned') {
+            return { cleaned: false, reason: 'already_cleaned' };
+          }
+        }
+
+        if (leaseGuard && !forceDiscard && !checkLeaseHeld(leaseGuard, { allowTerminalTurn: true })) {
+          return { cleaned: false, preserved: true, reason: 'lease_lost' };
+        }
+
+        const isArchived = Boolean(
+          archivedArtifactId || dbRow?.artifactId || dbRow?.cleanupState === 'archived',
+        );
+
+        // Fix C8: Only delete worktrees that are archived, explicitly discarded, or clean/empty
+        if (!isArchived && !forceDiscard && preserveDirty && existsSync(worktreePath)) {
+          const dirty = await entry.isDirty();
+          if (dirty) {
+            if (this.store?.db?.isOpen) {
+              try {
+                const now = Date.now();
+                this.store.tx(() => {
+                  this.store.db
+                    .prepare(
+                      `UPDATE worktree_leases
+                       SET status='preserved', cleanupState='preserved', dirtyWrites=1, updatedAt=?
+                       WHERE id=? AND (? IS NULL OR fence IS NULL OR fence=?)`,
+                    )
+                    .run(now, leaseId, entry.fence, entry.fence);
+                });
+              } catch {
+                // ignore if store closing concurrently
+              }
+            }
+            return { cleaned: false, preserved: true, reason: 'unarchived_dirty_preserved' };
+          }
+        }
+
+        // Re-verify ownership right before deleting directory
+        if (this.store?.db?.isOpen) {
+          let canDelete = true;
+          try {
+            canDelete = this.store.tx(() => {
+              const latest = this.store.db
+                .prepare('SELECT status, fence, attempt, jobId FROM worktree_leases WHERE id=?')
+                .get(leaseId);
+              if (!latest) return true;
+              if (latest.fence && entry.fence && latest.fence !== entry.fence) return false;
+              if (
+                latest.attempt !== null &&
+                latest.attempt !== undefined &&
+                entry.attempt !== null &&
+                entry.attempt !== undefined &&
+                Number(latest.attempt) !== Number(entry.attempt)
+              ) {
+                return false;
+              }
+              if (latest.jobId && entry.jobId && latest.jobId !== entry.jobId) return false;
+              if (leaseGuard && !forceDiscard) {
+                if (!checkLeaseHeld(leaseGuard, { allowTerminalTurn: true })) return false;
+              }
+              return true;
+            });
+          } catch {
+            canDelete = false;
+          }
+          if (!canDelete) {
+            return { cleaned: false, preserved: true, reason: 'ownership_changed_before_delete' };
+          }
+        }
+
+        await execFileAsync('git', ['worktree', 'remove', '--force', worktreePath], {
+          cwd: workspaceRoot,
+          windowsHide: true,
+          timeout: 8000,
+        }).catch(() => {});
+        rmSync(worktreePath, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
+
+        if (this.store?.db?.isOpen) {
+          try {
+            const now = Date.now();
+            const cleanupState = isArchived
+              ? 'archived'
+              : forceDiscard
+                ? 'discarded'
+                : 'clean_empty';
+            this.store.tx(() => {
+              this.store.db
+                .prepare(
+                  `UPDATE worktree_leases
+                   SET status='cleaned',
+                       cleanupState=?,
+                       artifactId=COALESCE(?, artifactId),
+                       cleanedAt=?,
+                       updatedAt=?
+                   WHERE id=? AND (? IS NULL OR fence IS NULL OR fence=?)`,
+                )
+                .run(cleanupState, archivedArtifactId, now, now, leaseId, entry.fence, entry.fence);
+            });
+          } catch {
+            // ignore if store closing concurrently
+          }
+        }
+        return { cleaned: true, preserved: false, reason: isArchived ? 'archived' : 'cleaned' };
+      },
+    };
+    this.active.set(leaseId, entry);
+    return entry;
+  }
+
   async acquire(
     workspaceRoot,
     {
       prefix = 'agent-us-wt-',
       ownerId = `owner-${process.pid}`,
+      workerId = null,
       sessionId = null,
       runId = null,
       nodeKey = null,
+      jobId = null,
+      fence = null,
+      attempt = 1,
+      rehydrateExisting = false,
+      leaseGuard = null,
     } = {},
   ) {
     // Support legacy positional string arg: acquire(workspaceRoot, 'custom-prefix-')
@@ -257,6 +470,64 @@ export class GitWorktreeIsolator {
       prefix = arguments[1];
     }
     const wsRoot = resolve(workspaceRoot);
+    const effectiveFence = fence ?? leaseGuard?.fence ?? null;
+    const effectiveJobId = jobId ?? leaseGuard?.jobId ?? null;
+    const effectiveWorkerId = workerId ?? leaseGuard?.workerId ?? null;
+    const effectiveAttempt = Number(attempt ?? leaseGuard?.attempt ?? 1);
+
+    // Fix C9 / C10: Rehydrate a preserved/non-live worktree for the same (runId, nodeKey) if requested
+    if (rehydrateExisting && runId && nodeKey && this.store?.db?.isOpen) {
+      const candidate = this.store.db
+        .prepare(
+          `SELECT * FROM worktree_leases
+           WHERE runId=? AND nodeKey=? AND status IN ('preserved', 'active')
+           ORDER BY COALESCE(updatedAt, createdAt) DESC, createdAt DESC
+           LIMIT 1`,
+        )
+        .get(runId, nodeKey);
+
+      if (
+        candidate &&
+        candidate.worktreePath &&
+        existsSync(candidate.worktreePath) &&
+        !isWorktreeOwnerLive(this.store, candidate)
+      ) {
+        const now = Date.now();
+        this.store.tx(() => {
+          assertLeaseInTx(leaseGuard, { runId });
+          this.store.db
+            .prepare(
+              `UPDATE worktree_leases
+               SET ownerId=?, workerId=?, sessionId=?, jobId=?, fence=?, attempt=?,
+                   status='active', cleanupState='active', updatedAt=?
+               WHERE id=?`,
+            )
+            .run(
+              ownerId,
+              effectiveWorkerId,
+              sessionId,
+              effectiveJobId,
+              effectiveFence,
+              effectiveAttempt,
+              now,
+              candidate.id,
+            );
+        });
+        return this.#buildHandle({
+          leaseId: candidate.id,
+          worktreePath: candidate.worktreePath,
+          workspaceRoot: wsRoot,
+          runId,
+          baseCommit: candidate.baseCommit || null,
+          baseRef: candidate.baseRef || null,
+          jobId: effectiveJobId,
+          fence: effectiveFence,
+          attempt: effectiveAttempt,
+          rehydrated: true,
+        });
+      }
+    }
+
     const leaseId = uuid();
     const tmpDir = join(tmpdir(), `${prefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(tmpDir, { recursive: true });
@@ -266,73 +537,150 @@ export class GitWorktreeIsolator {
         windowsHide: true,
         timeout: 10000,
       });
+      let baseCommit = null;
+      let baseRef = null;
+      try {
+        baseCommit = (
+          await execFileAsync('git', ['rev-parse', 'HEAD'], {
+            cwd: tmpDir,
+            windowsHide: true,
+            timeout: 5000,
+          })
+        ).stdout.trim();
+        baseRef = (
+          await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+            cwd: wsRoot,
+            windowsHide: true,
+            timeout: 5000,
+          })
+        ).stdout.trim();
+      } catch {
+        // best-effort metadata
+      }
       if (this.store?.db?.isOpen) {
+        const now = Date.now();
         this.store.tx(() => {
+          assertLeaseInTx(leaseGuard, { runId });
           this.store.db
             .prepare(
               `INSERT INTO worktree_leases(
-                id, ownerId, sessionId, runId, nodeKey, workspaceRoot, worktreePath, status, createdAt
-              ) VALUES(?,?,?,?,?,?,?,'active',?)`,
+                id, ownerId, sessionId, runId, nodeKey, workspaceRoot, worktreePath, status,
+                jobId, fence, attempt, workerId, baseCommit, baseRef, cleanupState, dirtyWrites,
+                createdAt, updatedAt
+              ) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?,?,?,'active',0,?,?)`,
             )
-            .run(leaseId, ownerId, sessionId, runId, nodeKey, wsRoot, tmpDir, Date.now());
+            .run(
+              leaseId,
+              ownerId,
+              sessionId,
+              runId,
+              nodeKey,
+              wsRoot,
+              tmpDir,
+              effectiveJobId,
+              effectiveFence,
+              effectiveAttempt,
+              effectiveWorkerId,
+              baseCommit,
+              baseRef,
+              now,
+              now,
+            );
         });
       }
-      const entry = {
+      return this.#buildHandle({
         leaseId,
-        path: tmpDir,
+        worktreePath: tmpDir,
         workspaceRoot: wsRoot,
-        released: false,
-        async diffSummary() {
-          try {
-            const { stdout } = await execFileAsync('git', ['status', '--porcelain'], {
-              cwd: tmpDir,
-              windowsHide: true,
-              timeout: 5000,
-            });
-            return stdout.trim();
-          } catch {
-            return '';
-          }
-        },
-        release: async () => {
-          if (entry.released) return;
-          entry.released = true;
-          this.active.delete(leaseId);
-          await execFileAsync('git', ['worktree', 'remove', '--force', tmpDir], {
-            cwd: wsRoot,
-            windowsHide: true,
-            timeout: 8000,
-          }).catch(() => {});
-          rmSync(tmpDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
-          if (this.store?.db?.isOpen) {
-            try {
-              this.store.tx(() => {
-                this.store.db
-                  .prepare("UPDATE worktree_leases SET status='cleaned', cleanedAt=? WHERE id=?")
-                  .run(Date.now(), leaseId);
-              });
-            } catch {
-              // ignore if store closing concurrently
-            }
-          }
-        },
-      };
-      this.active.set(leaseId, entry);
-      return entry;
+        runId,
+        baseCommit,
+        baseRef,
+        jobId: effectiveJobId,
+        fence: effectiveFence,
+        attempt: effectiveAttempt,
+        rehydrated: false,
+      });
     } catch (err) {
+      await execFileAsync('git', ['worktree', 'remove', '--force', tmpDir], {
+        cwd: wsRoot,
+        windowsHide: true,
+        timeout: 5000,
+      }).catch(() => {});
       rmSync(tmpDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
       throw err;
     }
   }
 
-  async cleanupOrphans({ activeOwnerIds = new Set() } = {}) {
-    if (!this.store?.db?.isOpen) return { cleaned: 0, paths: [] };
+  async cleanupOrphans({ activeOwnerIds = new Set(), forceDiscard = false } = {}) {
+    if (!this.store?.db?.isOpen) return { cleaned: 0, preserved: 0, skippedLive: 0, paths: [] };
     const rows = this.store.db
-      .prepare("SELECT * FROM worktree_leases WHERE status='active' ORDER BY createdAt ASC")
+      .prepare("SELECT * FROM worktree_leases WHERE status IN ('active','preserved') ORDER BY createdAt ASC")
       .all();
     const cleanedPaths = [];
+    let preservedCount = 0;
+    let skippedLive = 0;
+
     for (const r of rows) {
-      if (this.active.has(r.id) || activeOwnerIds.has(r.ownerId)) continue;
+      if (
+        this.active.has(r.id) ||
+        activeOwnerIds.has(r.ownerId) ||
+        (r.workerId && activeOwnerIds.has(r.workerId))
+      ) {
+        skippedLive++;
+        continue;
+      }
+
+      // Fix D2 / D3 / C10: Never delete a worktree owned by a live worker/job lease!
+      if (isWorktreeOwnerLive(this.store, r)) {
+        skippedLive++;
+        continue;
+      }
+
+      // Fix C8 / C9: Preserve unarchived dirty worktrees unless owning run/session was cancelled or forceDiscard
+      let ownerCancelled = false;
+      let nodeRecoverable = false;
+      if (r.runId) {
+        const runRow = this.store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(r.runId);
+        if (runRow?.status === 'cancelled') ownerCancelled = true;
+        if (r.nodeKey) {
+          const nodeRow = this.store.db
+            .prepare('SELECT status FROM swarm_nodes WHERE runId=? AND nodeKey=?')
+            .get(r.runId, r.nodeKey);
+          if (nodeRow && !['completed', 'failed', 'cancelled'].includes(nodeRow.status)) {
+            nodeRecoverable = true;
+          }
+          if (nodeRow?.status === 'cancelled') ownerCancelled = true;
+        }
+      } else if (r.sessionId) {
+        const sessRow = this.store.db
+          .prepare('SELECT state FROM direct_sessions WHERE id=?')
+          .get(r.sessionId);
+        if (sessRow?.state === 'cancelled') ownerCancelled = true;
+      }
+
+      if (!forceDiscard && !ownerCancelled && !r.artifactId && existsSync(r.worktreePath)) {
+        const dirty = Boolean(await this.#gitStatusExcludingHandoff(r.worktreePath));
+        if (!this.store?.db?.isOpen) break;
+        if (dirty || nodeRecoverable) {
+          if (dirty) {
+            const now = Date.now();
+            try {
+              this.store.tx(() => {
+                this.store.db
+                  .prepare(
+                    "UPDATE worktree_leases SET status='preserved', cleanupState='preserved', dirtyWrites=1, updatedAt=? WHERE id=? AND status='active'",
+                  )
+                  .run(now, r.id);
+              });
+            } catch {
+              // ignore if store closing concurrently
+            }
+          }
+          preservedCount++;
+          continue;
+        }
+      }
+
       if (existsSync(r.workspaceRoot)) {
         await execFileAsync('git', ['worktree', 'remove', '--force', r.worktreePath], {
           cwd: r.workspaceRoot,
@@ -350,17 +698,27 @@ export class GitWorktreeIsolator {
       } catch {
         // ignore if already gone
       }
-      this.store.tx(() => {
-        this.store.db
-          .prepare("UPDATE worktree_leases SET status='orphan_cleaned', cleanedAt=? WHERE id=?")
-          .run(Date.now(), r.id);
-      });
+      if (!this.store?.db?.isOpen) break;
+      const now = Date.now();
+      try {
+        this.store.tx(() => {
+          this.store.db
+            .prepare(
+              "UPDATE worktree_leases SET status='orphan_cleaned', cleanupState='orphan_cleaned', cleanedAt=?, updatedAt=? WHERE id=?",
+            )
+            .run(now, now, r.id);
+        });
+      } catch {
+        // ignore if store closing concurrently
+      }
       cleanedPaths.push(r.worktreePath);
     }
-    return { cleaned: cleanedPaths.length, paths: cleanedPaths };
+    return { cleaned: cleanedPaths.length, preserved: preservedCount, skippedLive, paths: cleanedPaths };
   }
 
-  async cleanupAll() {
-    await Promise.allSettled([...this.active.values()].map((e) => e.release()));
+  async cleanupAll({ preserveDirty = true } = {}) {
+    await Promise.allSettled(
+      [...this.active.values()].map((e) => e.release({ preserveDirty })),
+    );
   }
 }

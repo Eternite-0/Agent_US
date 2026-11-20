@@ -6,6 +6,11 @@ import {
   resolveSwarmOutcome,
   safeIsolateSideEffect,
 } from '../kernel/verdict.js';
+import {
+  assertLeaseInTx,
+  checkLeaseHeld,
+  isLeaseLostError,
+} from '../durable/lease-guard.js';
 import { SWARM_JOB_KINDS, enqueueSwarmJob } from './jobs.js';
 import {
   SWARM_NODE_STATES,
@@ -42,6 +47,7 @@ export class AdaptiveSwarmOrchestrator {
     planner,
     router,
     childManager,
+    artifactManager = null,
     mailbox,
     evidenceVerifier = null,
     modelFeedback = null,
@@ -55,6 +61,7 @@ export class AdaptiveSwarmOrchestrator {
     this.planner = planner;
     this.router = router;
     this.childManager = childManager;
+    this.artifactManager = artifactManager;
     this.mailbox = mailbox;
     this.evidenceVerifier = evidenceVerifier;
     this.modelFeedback = modelFeedback;
@@ -96,20 +103,20 @@ export class AdaptiveSwarmOrchestrator {
     recoveryWorker.registerHandler(SWARM_JOB_KINDS.PLAN, (job, ctx) =>
       this.#handlePlan(job, ctx),
     );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE, (job) =>
-      this.#handleDependencyResolve(job),
+    recoveryWorker.registerHandler(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE, (job, ctx) =>
+      this.#handleDependencyResolve(job, ctx),
     );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.DISPATCH, (job) =>
-      this.#handleDispatch(job),
+    recoveryWorker.registerHandler(SWARM_JOB_KINDS.DISPATCH, (job, ctx) =>
+      this.#handleDispatch(job, ctx),
     );
     recoveryWorker.registerHandler(SWARM_JOB_KINDS.NODE_EXECUTE, (job, ctx) =>
       this.#handleNodeExecute(job, ctx),
     );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.AGGREGATE, (job) =>
-      this.#handleAggregate(job),
+    recoveryWorker.registerHandler(SWARM_JOB_KINDS.AGGREGATE, (job, ctx) =>
+      this.#handleAggregate(job, ctx),
     );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.VERIFY, (job) =>
-      this.#handleVerify(job),
+    recoveryWorker.registerHandler(SWARM_JOB_KINDS.VERIFY, (job, ctx) =>
+      this.#handleVerify(job, ctx),
     );
   }
 
@@ -369,6 +376,7 @@ export class AdaptiveSwarmOrchestrator {
       store: this.store,
       jobQueue: this.jobQueue,
       reconciler: this.reconciler,
+      artifactManager: this.artifactManager,
       eventRouter: this.eventRouter,
       getRun: (id) => this.getRun(id),
       cancelRun: (id) => this.cancelRun(id),
@@ -450,8 +458,9 @@ export class AdaptiveSwarmOrchestrator {
     );
   }
 
-  #handleDependencyResolve(job) {
+  #handleDependencyResolve(job, { leaseGuard } = {}) {
     const { runId } = job.payload;
+    assertLeaseInTx(leaseGuard, { runId });
     let run = this.getRun(runId);
     if (!run || isTerminalRunState(run.status)) return;
 
@@ -588,8 +597,9 @@ export class AdaptiveSwarmOrchestrator {
     );
   }
 
-  #handleDispatch(job) {
+  #handleDispatch(job, { leaseGuard } = {}) {
     const { runId, nodeKeys } = job.payload;
+    assertLeaseInTx(leaseGuard, { runId });
     const run = this.getRun(runId);
     if (!run || isTerminalRunState(run.status)) return;
 
@@ -613,9 +623,9 @@ export class AdaptiveSwarmOrchestrator {
     }
   }
 
-  async #handleNodeExecute(job, { signal, leaseGuard }) {
-    leaseGuard?.();
+  async #handleNodeExecute(job, { signal, leaseGuard, workerId = null }) {
     const { runId, nodeId, nodeKey } = job.payload;
+    assertLeaseInTx(leaseGuard, { runId });
     const run = this.getRun(runId);
     const node = run?.nodes.find((n) => n.id === nodeId || n.nodeKey === nodeKey);
     if (!run || !node || isTerminalRunState(run.status) || isTerminalNodeState(node.status)) {
@@ -623,12 +633,57 @@ export class AdaptiveSwarmOrchestrator {
     }
     if (!['ready', 'queued', 'interrupted', 'running'].includes(node.status)) return;
 
+    // Atomically bind this attempt/fence as the authoritative owner of `swarm_nodes` (even when reclaiming a running node!)
+    const nextAttempt = Number(node.attempts ?? 0) + 1;
     if (node.status !== SWARM_NODE_STATES.RUNNING) {
       transitionSwarmNode(this.store, this.eventRouter, node.id, SWARM_NODE_STATES.RUNNING, {
         sessionId: run.sessionId,
         rootTurnId: run.rootTurnId,
-        patch: { attempts: Number(node.attempts ?? 0) + 1, jobId: job.id },
+        leaseGuard,
+        bindingOwnership: true,
+        patch: {
+          attempts: nextAttempt,
+          jobId: job.id,
+          activeJobId: job.id,
+          activeFence: job.fence ?? null,
+          activeAttempt: nextAttempt,
+        },
       });
+    } else {
+      this.store.tx(() => {
+        assertLeaseInTx(leaseGuard, { runId, nodeId: node.id, bindingOwnership: true });
+        this.store.db
+          .prepare(
+            `UPDATE swarm_nodes
+             SET attempts=?, jobId=?, activeJobId=?, activeFence=?, activeAttempt=?, updatedAt=?
+             WHERE id=? AND status='running'`,
+          )
+          .run(nextAttempt, job.id, job.id, job.fence ?? null, nextAttempt, Date.now(), node.id);
+      });
+    }
+
+    const nodeGuard =
+      leaseGuard?.withContext?.({
+        runId,
+        nodeId: node.id,
+      }) ?? leaseGuard;
+
+    // Fix C9 / D8: Before resuming a node that already has prior child execution history,
+    // verify no unresolved unknown side effects or lost unarchived worktree writes exist.
+    if (node.childTurnId || node.childSessionId) {
+      const preRec = inspectNodeReconciliation(
+        this.store,
+        this.reconciler,
+        this.eventRouter,
+        node,
+        node.childSessionId,
+        node.childTurnId,
+        { artifactManager: this.artifactManager },
+      );
+      if (preRec.needsReconciliation) {
+        parkNodeAndRunForReconciliation(this.store, this.eventRouter, run, node, preRec.approvalId);
+        return;
+      }
     }
 
     const ctrl = this.#getRunController(runId);
@@ -643,6 +698,19 @@ export class AdaptiveSwarmOrchestrator {
           return dn?.resultText ? `[前置节点 ${d} 输出]\n${dn.resultText}` : '';
         })
         .filter(Boolean);
+
+      // Fix C6: Collect real verified predecessor artifacts directly from durable registry (never regex-parsed from text)
+      const predecessorArtifacts = [];
+      if (this.artifactManager && node.dependencies.length) {
+        for (const depKey of node.dependencies) {
+          const dn = byKey.get(depKey);
+          const art = dn?.latestArtifactId
+            ? this.artifactManager.getArtifact(dn.latestArtifactId)
+            : this.artifactManager.getLatestNodeArtifact(runId, depKey);
+          if (art) predecessorArtifacts.push(art);
+        }
+      }
+
       const inboxMsgs = this.mailbox
         .drainInbox(node.nodeKey, { runId })
         .map((m) => `[协同消息来自 ${m.fromAgentId}]: ${JSON.stringify(m.payload)}`);
@@ -678,15 +746,19 @@ export class AdaptiveSwarmOrchestrator {
         isolationMode: node.isolationMode,
         allowIsolationFallback: Boolean(node.allowIsolationFallback),
         runId: run.id,
+        nodeId: node.id,
         nodeKey: node.nodeKey,
+        attempt: nextAttempt,
+        workerId,
+        predecessorArtifacts,
         existingChildSessionId: node.childSessionId || null,
         resumeTurnId: node.childTurnId || null,
         initialStep: cp?.step ?? 0,
-        leaseGuard,
+        leaseGuard: nodeGuard,
         signal: combinedSignal,
       });
 
-      leaseGuard?.();
+      assertLeaseInTx(nodeGuard, { runId, nodeId: node.id });
       const recCheck = inspectNodeReconciliation(
         this.store,
         this.reconciler,
@@ -694,14 +766,43 @@ export class AdaptiveSwarmOrchestrator {
         node,
         childRes.childSessionId,
         childRes.childTurnId,
+        { artifactManager: this.artifactManager },
       );
       if (recCheck.needsReconciliation) {
         parkNodeAndRunForReconciliation(this.store, this.eventRouter, run, node, recCheck.approvalId);
         return;
       }
 
-      const uris = extractArtifactUris(childRes.text);
-      this.store.tx(() => {
+      // Fix C5: Isolated worktree nodes MUST have a registered durable artifact before completing
+      if (node.isolationMode === 'worktree' && this.artifactManager && !childRes.artifact?.id) {
+        throw new RuntimeError('ARTIFACT_PERSIST_REQUIRED', {
+          message: `Isolated worktree node ${node.nodeKey} completed without registered durable artifact`,
+          detail: { runId, nodeKey: node.nodeKey },
+        });
+      }
+
+      const uris = [
+        ...new Set([
+          ...(childRes.artifact?.uri ? [childRes.artifact.uri] : []),
+          ...extractArtifactUris(childRes.text),
+        ]),
+      ];
+
+      // Fix D5 / D7: Single atomic SQLite commit enforcing fence/attempt ownership for BOTH usage settlement & node completion!
+      const committedNode = this.store.tx(() => {
+        assertLeaseInTx(nodeGuard, { runId, nodeId: node.id });
+        const curNode = this.store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(node.id);
+        if (!curNode || curNode.status !== SWARM_NODE_STATES.RUNNING) {
+          throw new RuntimeError('LEASE_LOST', {
+            message: `Node ${node.id} no longer running (status=${curNode?.status})`,
+          });
+        }
+        if (curNode.activeFence && job.fence && curNode.activeFence !== job.fence) {
+          throw new RuntimeError('LEASE_LOST', {
+            message: `Node ${node.id} fence superseded before commit`,
+          });
+        }
+        const now = Date.now();
         const curRun = this.store.db.prepare('SELECT usageJson FROM swarm_runs WHERE id=?').get(runId);
         const curUsage = parseJsonSafe(curRun?.usageJson, {});
         const nextUsage = {
@@ -712,18 +813,41 @@ export class AdaptiveSwarmOrchestrator {
         };
         this.store.db
           .prepare('UPDATE swarm_runs SET usageJson=?, updatedAt=? WHERE id=?')
-          .run(JSON.stringify(nextUsage), Date.now(), runId);
+          .run(JSON.stringify(nextUsage), now, runId);
+        this.store.db
+          .prepare(
+            `UPDATE swarm_nodes
+             SET status=?, childSessionId=?, childTurnId=?, resultText=?,
+                 artifactUrisJson=?, latestArtifactId=COALESCE(?, latestArtifactId),
+                 activeFence=NULL, updatedAt=?
+             WHERE id=? AND status='running'`,
+          )
+          .run(
+            SWARM_NODE_STATES.COMPLETED,
+            childRes.childSessionId,
+            childRes.childTurnId,
+            childRes.text,
+            JSON.stringify(uris),
+            childRes.artifact?.id ?? null,
+            now,
+            node.id,
+          );
+        return this.store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(node.id);
       });
 
-      transitionSwarmNode(this.store, this.eventRouter, node.id, SWARM_NODE_STATES.COMPLETED, {
+      this.eventRouter?.emitPersisted({
         sessionId: run.sessionId,
-        rootTurnId: run.rootTurnId,
-        patch: {
-          childSessionId: childRes.childSessionId,
-          childTurnId: childRes.childTurnId,
-          resultText: childRes.text,
-          artifactUrisJson: JSON.stringify(uris),
+        turnId: run.rootTurnId,
+        type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
+        data: {
+          runId: committedNode.runId,
+          nodeId: committedNode.id,
+          nodeKey: committedNode.nodeKey,
+          status: committedNode.status,
+          childSessionId: committedNode.childSessionId || undefined,
+          artifactUris: uris,
         },
+        audit: false,
       });
 
       safeIsolateSideEffect(() => {
@@ -762,8 +886,13 @@ export class AdaptiveSwarmOrchestrator {
         { idempotencyKey: `swarm:resolve:${runId}:${node.nodeKey}:done:${uuid().slice(0, 8)}` },
       );
     } catch (err) {
-      if (err?.code === 'LEASE_LOST') return;
-      if (!this.store?.db?.isOpen) return;
+      if (signal?.reason === 'shutdown' || ctrl.signal.reason === 'shutdown') {
+        return;
+      }
+      // Fix D6/D7: A stale worker encountering LEASE_LOST (or whose lease was already lost) MUST exit cleanly!
+      if (isLeaseLostError(err) || !this.store?.db?.isOpen || !checkLeaseHeld(nodeGuard, { runId, nodeId: node.id })) {
+        return;
+      }
 
       const freshRun = this.getRun(runId);
       const freshNode = freshRun?.nodes.find((n) => n.id === node.id);
@@ -778,6 +907,7 @@ export class AdaptiveSwarmOrchestrator {
         freshNode,
         freshNode.childSessionId,
         freshNode.childTurnId,
+        { artifactManager: this.artifactManager },
       );
       if (recCheck.needsReconciliation || err?.code === 'RECONCILIATION_REQUIRED') {
         parkNodeAndRunForReconciliation(
@@ -792,22 +922,32 @@ export class AdaptiveSwarmOrchestrator {
 
       if (err?.code === 'PARENT_CANCELLED' || err?.category === 'cancellation' || combinedSignal.aborted) {
         if (!ctrl.signal.aborted) {
-          transitionSwarmNode(this.store, this.eventRouter, freshNode.id, SWARM_NODE_STATES.CANCELLED, {
-            sessionId: freshRun.sessionId,
-            rootTurnId: freshRun.rootTurnId,
-            patch: { errorCode: err?.code || 'NODE_CANCELLED', errorMessage: String(err?.message ?? err) },
-          });
-          enqueueSwarmJob(
-            this.jobQueue,
-            SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
-            {
-              runId,
+          try {
+            transitionSwarmNode(this.store, this.eventRouter, freshNode.id, SWARM_NODE_STATES.CANCELLED, {
               sessionId: freshRun.sessionId,
-              planVersion: freshRun.planVersion || 1,
-              epoch: Date.now(),
-            },
-            { idempotencyKey: `swarm:resolve:${runId}:${freshNode.nodeKey}:cancel:${uuid().slice(0, 8)}` },
-          );
+              rootTurnId: freshRun.rootTurnId,
+              leaseGuard: nodeGuard,
+              patch: {
+                activeFence: null,
+                errorCode: err?.code || 'NODE_CANCELLED',
+                errorMessage: String(err?.message ?? err),
+              },
+            });
+            enqueueSwarmJob(
+              this.jobQueue,
+              SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
+              {
+                runId,
+                sessionId: freshRun.sessionId,
+                planVersion: freshRun.planVersion || 1,
+                epoch: Date.now(),
+              },
+              { idempotencyKey: `swarm:resolve:${runId}:${freshNode.nodeKey}:cancel:${uuid().slice(0, 8)}` },
+            );
+          } catch (txErr) {
+            if (isLeaseLostError(txErr)) return;
+            throw txErr;
+          }
         }
         return;
       }
@@ -857,6 +997,8 @@ export class AdaptiveSwarmOrchestrator {
             .catch(() => ({ replanned: false }))
         : { replanned: false };
 
+      if (!checkLeaseHeld(leaseGuard, { runId })) return;
+
       if (replanOut?.replanned) {
         enqueueSwarmJob(
           this.jobQueue,
@@ -872,11 +1014,17 @@ export class AdaptiveSwarmOrchestrator {
         return;
       }
 
-      transitionSwarmNode(this.store, this.eventRouter, freshNode.id, SWARM_NODE_STATES.FAILED, {
-        sessionId: freshRun.sessionId,
-        rootTurnId: freshRun.rootTurnId,
-        patch: { errorCode, errorMessage },
-      });
+      try {
+        transitionSwarmNode(this.store, this.eventRouter, freshNode.id, SWARM_NODE_STATES.FAILED, {
+          sessionId: freshRun.sessionId,
+          rootTurnId: freshRun.rootTurnId,
+          leaseGuard: nodeGuard,
+          patch: { activeFence: null, errorCode, errorMessage },
+        });
+      } catch (txErr) {
+        if (isLeaseLostError(txErr)) return;
+        throw txErr;
+      }
       enqueueSwarmJob(
         this.jobQueue,
         SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
@@ -891,11 +1039,13 @@ export class AdaptiveSwarmOrchestrator {
     }
   }
 
-  #handleAggregate(job) {
+  #handleAggregate(job, { leaseGuard } = {}) {
     const { runId } = job.payload;
+    assertLeaseInTx(leaseGuard, { runId });
     const run = this.getRun(runId);
     if (!run || isTerminalRunState(run.status)) return;
     transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.VERIFYING, {
+      leaseGuard,
       patch: { currentPhase: 'verifying' },
     });
     enqueueSwarmJob(
@@ -909,8 +1059,9 @@ export class AdaptiveSwarmOrchestrator {
     );
   }
 
-  #handleVerify(job) {
+  #handleVerify(job, { leaseGuard } = {}) {
     const { runId } = job.payload;
+    assertLeaseInTx(leaseGuard, { runId });
     const run = this.getRun(runId);
     if (!run || isTerminalRunState(run.status)) return;
 
@@ -941,6 +1092,7 @@ export class AdaptiveSwarmOrchestrator {
 
     if (outcome.status === SWARM_RUN_STATES.RECONCILING) {
       transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.RECONCILING, {
+        leaseGuard,
         patch: {
           currentPhase: 'reconciling',
           verdictJson: JSON.stringify(outcome.verdict),
@@ -960,6 +1112,7 @@ export class AdaptiveSwarmOrchestrator {
     const prevRow = this.store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(runId);
     if (prevRow && !isTerminalRunState(prevRow.status)) {
       transitionSwarmRun(this.store, runId, finalStatus, {
+        leaseGuard,
         patch: {
           currentPhase: finalStatus,
           verdictJson: JSON.stringify(outcome.verdict),
@@ -1013,6 +1166,11 @@ export class AdaptiveSwarmOrchestrator {
       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`,
     );
     for (const { spec, selection } of routedSpecs) {
+      // Never widen an explicit empty allowlist (`[]`) by injecting `read_swarm_artifact`.
+      const defaultToolAllow =
+        Array.isArray(selection.profile.toolAllow) && selection.profile.toolAllow.length > 0
+          ? [...new Set([...selection.profile.toolAllow, 'read_swarm_artifact'])]
+          : selection.profile.toolAllow;
       ins.run(
         uuid(),
         runId,
@@ -1023,9 +1181,9 @@ export class AdaptiveSwarmOrchestrator {
         spec.objective,
         spec.acceptance,
         JSON.stringify(spec.dependencies),
-        Array.isArray(spec.toolAllow)
+        spec.toolAllow !== null && spec.toolAllow !== undefined
           ? JSON.stringify(spec.toolAllow)
-          : JSON.stringify(selection.profile.toolAllow),
+          : JSON.stringify(defaultToolAllow),
         parentPermissionMode,
         spec.taskType || 'research',
         spec.isolationMode || 'shared_readonly',

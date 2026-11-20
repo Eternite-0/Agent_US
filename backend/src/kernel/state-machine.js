@@ -1,5 +1,6 @@
 import { RuntimeError } from './errors.js';
 import { RUNTIME_EVENTS } from './events.js';
+import { assertLeaseInTx } from '../durable/lease-guard.js';
 
 export const TURN_PHASES = Object.freeze({
   INIT: 'init',
@@ -117,6 +118,7 @@ export class TurnStateMachine {
     turnId,
     initialPhase = TURN_PHASES.INIT,
     initialStep = 0,
+    leaseGuard = null,
   }) {
     this.store = store;
     this.eventRouter = eventRouter;
@@ -124,6 +126,7 @@ export class TurnStateMachine {
     this.turnId = turnId;
     this.phase = initialPhase;
     this.step = initialStep;
+    this.leaseGuard = leaseGuard;
     this.history = [{ phase: initialPhase, step: initialStep, at: Date.now() }];
   }
 
@@ -144,17 +147,20 @@ export class TurnStateMachine {
       });
     }
     const prevPhase = this.phase;
-    this.phase = nextPhase;
-    this.step = step;
-    this.history.push({ phase: nextPhase, step, reason, at: Date.now() });
-
     if (persist && this.store?.db && this.turnId) {
       this.store.tx(() => {
+        assertLeaseInTx(this.leaseGuard, { sessionId: this.sessionId, turnId: this.turnId });
         this.store.db
-          .prepare('UPDATE direct_turns SET phase=?, step=? WHERE id=?')
+          .prepare(
+            "UPDATE direct_turns SET phase=?, step=? WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
+          )
           .run(nextPhase, step, this.turnId);
       });
     }
+
+    this.phase = nextPhase;
+    this.step = step;
+    this.history.push({ phase: nextPhase, step, reason, at: Date.now() });
 
     if (this.eventRouter && this.sessionId) {
       this.eventRouter.emitPersisted({

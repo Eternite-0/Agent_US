@@ -1,10 +1,19 @@
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import { classifyError } from '../kernel/errors.js';
+import {
+  classifyJobOwnership,
+  createLeaseGuard,
+  createWorkerId,
+  heartbeatWorker,
+  isLeaseLostError,
+  markWorkerStopped,
+  registerWorker,
+} from './lease-guard.js';
 
 /**
  * Event-driven, zero-idle-polling Durable RecoveryWorker.
  * Claims leased jobs from `DurableJobQueue`, renews leases with fence checks,
- * and reconciles/resumes interrupted turns on startup.
+ * distinguishes live joining workers from dead/expired owners, and safely recovers interrupted turns.
  */
 export class RecoveryWorker {
   constructor({
@@ -14,9 +23,10 @@ export class RecoveryWorker {
     reconciler,
     eventRouter,
     handlers = {},
-    workerId = `worker-${process.pid}`,
+    workerId = null,
     slots = 10,
     leaseMs = 15000,
+    enableHeartbeat = true,
   }) {
     this.store = store;
     this.jobQueue = jobQueue;
@@ -24,9 +34,10 @@ export class RecoveryWorker {
     this.reconciler = reconciler;
     this.eventRouter = eventRouter;
     this.handlers = handlers;
-    this.workerId = workerId;
+    this.workerId = workerId || createWorkerId('worker');
     this.slots = Math.max(1, Number(slots || 10));
-    this.leaseMs = Math.max(2000, Number(leaseMs || 15000));
+    this.leaseMs = Math.max(1000, Number(leaseMs || 15000));
+    this.enableHeartbeat = enableHeartbeat !== false;
     this.active = new Map(); // fence -> { abort, done, jobId }
     this.startupHooks = [];
     this.started = false;
@@ -44,8 +55,8 @@ export class RecoveryWorker {
   }
 
   /**
-   * Scans SQLite on startup for interrupted turns/jobs after a crash, verifies JCS ledger,
-   * routes unknown non-replayable executions to human reconciliation, and re-enqueues safe turns.
+   * Scans SQLite on startup for interrupted turns/jobs whose lease has expired or whose owner is dead.
+   * Never steals or modifies jobs owned by a live worker with a valid lease.
    */
   recoverOnStartup() {
     if (typeof this.store.verifyIntegrity === 'function') {
@@ -60,6 +71,7 @@ export class RecoveryWorker {
       recoveredTurns: [],
       reconciliationRequired: [],
       skippedTerminal: 0,
+      skippedLiveOwners: 0,
     };
 
     for (const turn of interruptedTurns) {
@@ -76,6 +88,24 @@ export class RecoveryWorker {
         continue;
       }
 
+      const existingJob = turn.jobId
+        ? this.jobQueue.get(turn.jobId)
+        : this.store.db
+            .prepare('SELECT * FROM runtime_jobs WHERE turnId=? ORDER BY createdAt DESC LIMIT 1')
+            .get(turn.id);
+
+      // Fix D1-D4: Distinguish live owner with valid lease vs expired/dead owner BEFORE inspecting receipts!
+      if (existingJob && existingJob.status === 'active') {
+        const ownership = classifyJobOwnership(this.store, existingJob, { markDeadInDb: true });
+        if (ownership.liveOwner) {
+          report.skippedLiveOwners++;
+          continue;
+        }
+        if (!ownership.reclaimable) {
+          continue;
+        }
+      }
+
       const recCheck = this.reconciler.inspectInterruptedTurn(turn.id, {
         sessionId: turn.sessionId,
       });
@@ -88,12 +118,6 @@ export class RecoveryWorker {
         });
         continue;
       }
-
-      const existingJob = turn.jobId
-        ? this.jobQueue.get(turn.jobId)
-        : this.store.db
-            .prepare("SELECT * FROM runtime_jobs WHERE turnId=? ORDER BY createdAt DESC LIMIT 1")
-            .get(turn.id);
 
       const cp = this.checkpointStore.loadLatest(turn.id);
 
@@ -128,16 +152,21 @@ export class RecoveryWorker {
             .run(job.id, turn.id);
         });
       } else if (existingJob.status === 'active') {
-        // Reclaim expired or orphaned active job from dead process immediately on boot
-        this.store.tx(() => {
-          this.store.db
+        // Reclaim expired or dead-owner active job atomically matching its dead fence
+        const reclaimed = this.store.tx(() => {
+          const res = this.store.db
             .prepare(
-              "UPDATE runtime_jobs SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE id=? AND status='active'",
+              `UPDATE runtime_jobs
+               SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=?
+               WHERE id=? AND status='active' AND (? IS NULL OR fence=?)`,
             )
-            .run(Date.now(), existingJob.id);
+            .run(Date.now(), existingJob.id, existingJob.fence ?? null, existingJob.fence ?? null);
+          return (res.changes ?? 0) > 0;
         });
+        if (!reclaimed) continue;
       } else if (existingJob.status === 'pending') {
-        // Already queued for execution
+        // Already pending & queued — idempotent no-op (do not re-emit duplicate SESSION_RECOVERED)
+        continue;
       } else {
         continue;
       }
@@ -168,12 +197,13 @@ export class RecoveryWorker {
     if (this.started) return { recoveredTurns: [], reconciliationRequired: [] };
     this.started = true;
     this.stopping = false;
+    registerWorker(this.store, { workerId: this.workerId });
     if (!this.unsubWake && typeof this.store.onJobWake === 'function') {
       this.unsubWake = this.store.onJobWake(() => this.wake());
     }
     const report = recover
       ? this.recoverOnStartup()
-      : { recoveredTurns: [], reconciliationRequired: [], skippedTerminal: 0 };
+      : { recoveredTurns: [], reconciliationRequired: [], skippedTerminal: 0, skippedLiveOwners: 0 };
     if (recover && this.startupHooks.length) {
       report.hooks = [];
       for (const hook of this.startupHooks) {
@@ -204,9 +234,10 @@ export class RecoveryWorker {
       this.timer = null;
     }
     for (const entry of this.active.values()) {
-      entry.abort.abort();
+      entry.abort.abort('shutdown');
     }
     await Promise.allSettled([...this.active.values()].map((a) => a.done));
+    markWorkerStopped(this.store, this.workerId);
   }
 
   #isDbOpen() {
@@ -293,36 +324,53 @@ export class RecoveryWorker {
       return;
     }
 
-    const heartbeatMs = Math.max(400, Math.floor(this.leaseMs / 4));
-    const heartbeat = setInterval(() => {
-      if (abort.signal.aborted) return;
-      try {
-        const ok = this.jobQueue.renewLease(job.id, job.fence, this.leaseMs);
-        if (!ok) abort.abort();
-      } catch {
-        abort.abort();
-      }
-    }, heartbeatMs);
-    heartbeat.unref?.();
+    let heartbeat = null;
+    if (this.enableHeartbeat) {
+      const heartbeatMs = Math.max(400, Math.floor(this.leaseMs / 4));
+      heartbeat = setInterval(() => {
+        if (abort.signal.aborted) return;
+        try {
+          const ok = this.jobQueue.renewLease(job.id, job.fence, this.leaseMs);
+          if (ok) {
+            heartbeatWorker(this.store, this.workerId);
+          } else {
+            abort.abort();
+          }
+        } catch {
+          abort.abort();
+        }
+      }, heartbeatMs);
+      heartbeat.unref?.();
+    }
 
-    const leaseGuard = () => this.jobQueue.assertFence(job.id, job.fence);
+    const leaseGuard = createLeaseGuard({
+      store: this.store,
+      jobId: job.id,
+      fence: job.fence,
+      workerId: this.workerId,
+      attempt: job.attempts,
+      sessionId: job.sessionId || null,
+      turnId: job.turnId && !String(job.turnId).startsWith('swarm:') ? job.turnId : null,
+      runId: job.taskId || null,
+    });
 
     try {
       await handler(job, {
         signal: abort.signal,
         leaseGuard,
+        workerId: this.workerId,
         checkpoint: this.checkpointStore.loadLatest(job.turnId),
       });
       if (this.stopping || !this.#isDbOpen()) return;
       try {
         this.jobQueue.complete(job.id, job.fence);
       } catch {
-        // handler may have parked/completed/cancelled the job
+        // handler may have parked/completed/cancelled the job or lost lease
       }
     } catch (err) {
       if (this.stopping || !this.#isDbOpen()) return;
       const classified = classifyError(err);
-      if (classified.code === 'LEASE_LOST') {
+      if (isLeaseLostError(classified) || !leaseGuard.isHeld()) {
         return;
       }
       if (classified.code === 'APPROVAL_PARKED') {
@@ -354,7 +402,7 @@ export class RecoveryWorker {
         // ignore if already fenced/terminal
       }
     } finally {
-      clearInterval(heartbeat);
+      if (heartbeat) clearInterval(heartbeat);
     }
   }
 }

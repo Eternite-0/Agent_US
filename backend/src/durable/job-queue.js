@@ -1,5 +1,10 @@
 import { id as uuid } from '../store.js';
 import { RecoveryError } from '../kernel/errors.js';
+import {
+  assertJobOwnershipInTx,
+  classifyJobOwnership,
+  heartbeatWorker,
+} from './lease-guard.js';
 
 /**
  * SQLite-backed Durable Job Queue with lease expiration, fencing tokens,
@@ -103,21 +108,25 @@ export class DurableJobQueue {
           : '';
       const kindParams = Array.isArray(kinds) && kinds.length ? kinds : [];
 
-      for (;;) {
-        const row = db
-          .prepare(
-            `SELECT * FROM runtime_jobs
-             WHERE (status='pending' OR (status='active' AND leaseExpiresAt IS NOT NULL AND leaseExpiresAt<?))
-             ${kindClause}
-             ORDER BY createdAt ASC, rowid ASC
-             LIMIT 1`,
-          )
-          .get(now, ...kindParams);
+      const candidates = db
+        .prepare(
+          `SELECT * FROM runtime_jobs
+           WHERE status IN ('pending', 'active')
+           ${kindClause}
+           ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END ASC, createdAt ASC, rowid ASC`,
+        )
+        .all(...kindParams);
 
-        if (!row) return null;
+      for (const row of candidates) {
+        if (row.status === 'active') {
+          const ownership = classifyJobOwnership(this.store, row, { now, markDeadInDb: true });
+          if (!ownership.reclaimable) {
+            continue;
+          }
+        }
 
-        // Guard: never resurrect cancelled/terminal turns or cancelled sessions
-        if (row.turnId) {
+        // Guard: never resurrect cancelled/terminal turns, sessions, swarm runs, or swarm nodes
+        if (row.turnId && !String(row.turnId).startsWith('swarm:')) {
           const turn = db
             .prepare('SELECT state FROM direct_turns WHERE id=?')
             .get(row.turnId);
@@ -137,6 +146,38 @@ export class DurableJobQueue {
             db.prepare(
               "UPDATE runtime_jobs SET status='cancelled', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE id=?",
             ).run(now, row.id);
+            continue;
+          }
+        }
+        if (row.taskId) {
+          const run = db
+            .prepare('SELECT status FROM swarm_runs WHERE id=?')
+            .get(row.taskId);
+          if (run && ['completed', 'failed', 'cancelled'].includes(run.status)) {
+            const finalStatus = run.status === 'completed' ? 'done' : run.status;
+            db.prepare(
+              'UPDATE runtime_jobs SET status=?, fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE id=?',
+            ).run(finalStatus, now, row.id);
+            continue;
+          }
+        }
+
+        let payload = {};
+        try {
+          payload = JSON.parse(row.payload || '{}');
+        } catch {
+          payload = {};
+        }
+
+        if (row.kind === 'swarm_node_execute' && payload.nodeId) {
+          const node = db
+            .prepare('SELECT status FROM swarm_nodes WHERE id=?')
+            .get(payload.nodeId);
+          if (node && ['completed', 'cancelled'].includes(node.status)) {
+            const finalStatus = node.status === 'completed' ? 'done' : 'cancelled';
+            db.prepare(
+              'UPDATE runtime_jobs SET status=?, fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE id=?',
+            ).run(finalStatus, now, row.id);
             continue;
           }
         }
@@ -164,47 +205,33 @@ export class DurableJobQueue {
           leaseExpiresAt: expires,
           attempts: row.attempts + 1,
           reclaimedFromCrash: row.status === 'active',
-          payload: JSON.parse(row.payload || '{}'),
+          payload,
         };
       }
+      return null;
     });
   }
 
   renewLease(jobId, fence, leaseMs = this.defaultLeaseMs) {
     const now = Date.now();
     const expires = now + Math.max(1000, Number(leaseMs || this.defaultLeaseMs));
-    const res = this.store.tx(() =>
-      this.store.db
+    const res = this.store.tx(() => {
+      const r = this.store.db
         .prepare(
           "UPDATE runtime_jobs SET leaseExpiresAt=?, updatedAt=? WHERE id=? AND fence=? AND status='active'",
         )
-        .run(expires, now, jobId, fence),
-    );
+        .run(expires, now, jobId, fence);
+      if ((r.changes ?? 0) > 0) {
+        const row = this.store.db.prepare('SELECT workerId FROM runtime_jobs WHERE id=?').get(jobId);
+        if (row?.workerId) heartbeatWorker(this.store, row.workerId);
+      }
+      return r;
+    });
     return (res.changes ?? 0) > 0;
   }
 
-  assertFence(jobId, fence) {
-    const row = this.store.db
-      .prepare('SELECT status, fence, leaseExpiresAt, turnId FROM runtime_jobs WHERE id=?')
-      .get(jobId);
-    if (!row || row.status !== 'active' || row.fence !== fence || (row.leaseExpiresAt && row.leaseExpiresAt < Date.now())) {
-      throw new RecoveryError('LEASE_LOST', {
-        message: `Lease lost for job ${jobId}`,
-        detail: { jobId, status: row?.status ?? 'missing' },
-      });
-    }
-    if (row.turnId) {
-      const turn = this.store.db
-        .prepare('SELECT state FROM direct_turns WHERE id=?')
-        .get(row.turnId);
-      if (turn && ['cancelled', 'completed', 'failed'].includes(turn.state)) {
-        throw new RecoveryError('LEASE_LOST', {
-          message: `Turn ${row.turnId} already reached terminal state ${turn.state}`,
-          detail: { jobId, turnState: turn.state },
-        });
-      }
-    }
-    return true;
+  assertFence(jobId, fence, opts = {}) {
+    return assertJobOwnershipInTx(this.store, { jobId, fence, ...opts });
   }
 
   complete(jobId, fence) {

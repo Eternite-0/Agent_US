@@ -1,5 +1,6 @@
 import { RuntimeError } from '../kernel/errors.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
+import { assertLeaseInTx } from '../durable/lease-guard.js';
 
 export const SWARM_NODE_STATES = Object.freeze({
   PENDING: 'pending',
@@ -89,6 +90,8 @@ export function transitionSwarmNode(
     rootTurnId = null,
     patch = {},
     allowReplanReset = false,
+    leaseGuard = null,
+    bindingOwnership = false,
   } = {},
 ) {
   const updated = store.tx(() => {
@@ -96,6 +99,7 @@ export function transitionSwarmNode(
     if (!row) {
       throw new RuntimeError('SWARM_NODE_NOT_FOUND', { detail: { nodeId } });
     }
+    assertLeaseInTx(leaseGuard, { runId: row.runId, nodeId: row.id, bindingOwnership });
     const from = row.status;
     if (from === toStatus) return row;
 
@@ -120,6 +124,11 @@ export function transitionSwarmNode(
       'childSessionId',
       'childTurnId',
       'jobId',
+      'activeJobId',
+      'activeFence',
+      'activeAttempt',
+      'latestArtifactId',
+      'worktreeLeaseId',
       'reconcileApprovalId',
       'model',
       'provider',
@@ -175,13 +184,14 @@ export function transitionSwarmRun(
   store,
   runId,
   toStatus,
-  { patch = {}, allowResume = false } = {},
+  { patch = {}, allowResume = false, leaseGuard = null } = {},
 ) {
   return store.tx(() => {
     const row = store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);
     if (!row) {
       throw new RuntimeError('SWARM_RUN_NOT_FOUND', { detail: { runId } });
     }
+    assertLeaseInTx(leaseGuard, { runId: row.id });
     const from = row.status;
     if (from === toStatus) return row;
     if (from === 'failed' && !allowResume) {

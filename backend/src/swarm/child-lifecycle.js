@@ -2,9 +2,15 @@ import { Fault, id as uuid } from '../store.js';
 import { excerpt } from '../context.js';
 import { CancellationError, RecoveryError, RuntimeError } from '../kernel/errors.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
+import {
+  assertLeaseInTx,
+  checkLeaseHeld,
+  isLeaseLostError,
+} from '../durable/lease-guard.js';
 import { filterToolsByPolicy, intersectAllowlists, intersectPolicies } from '../tools/policy.js';
 import { ISOLATION_MODES } from '../tools/sandbox.js';
 import { WORKSPACE_TOOL_META } from '../workspace-tools.js';
+import { createSwarmArtifactTools } from './artifacts.js';
 
 const MAX_FORK_DEPTH = 2;
 
@@ -32,6 +38,7 @@ export class ChildAgentManager {
     contextAssembler,
     eventRouter,
     worktreeIsolator,
+    artifactManager = null,
     jobQueue = null,
     getWorkspaceTools,
     getDefaultModel,
@@ -42,10 +49,12 @@ export class ChildAgentManager {
     this.contextAssembler = contextAssembler;
     this.eventRouter = eventRouter;
     this.worktreeIsolator = worktreeIsolator;
+    this.artifactManager = artifactManager;
     this.jobQueue = jobQueue;
     this.getWorkspaceTools = getWorkspaceTools;
     this.getDefaultModel = getDefaultModel;
-    this.activeChildren = new Map(); // childSessionId -> { controller, parentSessionId, paused, model }
+    this.activeChildren = new Map(); // childSessionId -> { controller, parentSessionId, paused, shuttingDown, model }
+    this.shuttingDown = false;
   }
 
   #computeDepth(sessionId) {
@@ -141,14 +150,18 @@ export class ChildAgentManager {
     signal,
     isolatedWorktree,
     isChild = true,
+    extraTools = [],
   }) {
-    const allTools = this.getWorkspaceTools({
-      workspaceRoot,
-      sessionId,
-      permissionMode: policy.permissionMode,
-      nonce,
-      signal,
-    });
+    const allTools = [
+      ...this.getWorkspaceTools({
+        workspaceRoot,
+        sessionId,
+        permissionMode: policy.permissionMode,
+        nonce,
+        signal,
+      }),
+      ...extraTools,
+    ];
     const denySet = new Set(policy.denyTools ?? []);
     if (isChild) denySet.add('spawn_subagent');
 
@@ -165,34 +178,72 @@ export class ChildAgentManager {
     return filtered;
   }
 
-  #persistNotification({ parentSessionId, childSessionId, runId = null, nodeKey = null, status, payload }) {
+  #persistNotificationInTx({
+    parentSessionId,
+    childSessionId,
+    runId = null,
+    nodeKey = null,
+    status,
+    payload,
+    jobId = null,
+    fence = null,
+    attempt = 0,
+  }) {
     if (!parentSessionId || !this.store?.db?.isOpen) return null;
     const notifId = uuid();
     const now = Date.now();
     const idem = `notify:${childSessionId}:${status}:${payload?.turnId || ''}`;
-    this.store.tx(() => {
-      this.store.db
-        .prepare(
-          `INSERT OR IGNORE INTO child_notifications(
-            id, idempotencyKey, parentSessionId, childSessionId, runId, nodeKey,
-            status, payloadJson, delivered, createdAt
-          ) VALUES(?,?,?,?,?,?,?,?,0,?)`,
-        )
-        .run(
-          notifId,
-          idem,
-          parentSessionId,
-          childSessionId,
-          runId,
-          nodeKey,
-          status,
-          JSON.stringify(payload ?? {}),
-          now,
-        );
-    });
+    this.store.db
+      .prepare(
+        `INSERT OR IGNORE INTO child_notifications(
+          id, idempotencyKey, parentSessionId, childSessionId, runId, nodeKey,
+          status, payloadJson, delivered, jobId, fence, attempt, createdAt
+        ) VALUES(?,?,?,?,?,?,?,?,0,?,?,?,?)`,
+      )
+      .run(
+        notifId,
+        idem,
+        parentSessionId,
+        childSessionId,
+        runId,
+        nodeKey,
+        status,
+        JSON.stringify(payload ?? {}),
+        jobId,
+        fence,
+        Number(attempt || 0),
+        now,
+      );
     return this.store.db
       .prepare('SELECT * FROM child_notifications WHERE idempotencyKey=?')
       .get(idem);
+  }
+
+  #persistNotification({
+    parentSessionId,
+    childSessionId,
+    runId = null,
+    nodeKey = null,
+    status,
+    payload,
+    leaseGuard = null,
+    attempt = 0,
+  }) {
+    if (!parentSessionId || !this.store?.db?.isOpen) return null;
+    return this.store.tx(() => {
+      assertLeaseInTx(leaseGuard);
+      return this.#persistNotificationInTx({
+        parentSessionId,
+        childSessionId,
+        runId,
+        nodeKey,
+        status,
+        payload,
+        jobId: leaseGuard?.jobId ?? null,
+        fence: leaseGuard?.fence ?? null,
+        attempt,
+      });
+    });
   }
 
   collectNotifications(parentSessionId, { unreadOnly = true } = {}) {
@@ -233,7 +284,11 @@ export class ChildAgentManager {
     isolationMode = null,
     allowIsolationFallback = false,
     runId = null,
+    nodeId = null,
     nodeKey = null,
+    attempt = 1,
+    workerId = null,
+    predecessorArtifacts = [],
     budget = {},
     leaseGuard = null,
     initialStep = 0,
@@ -254,6 +309,7 @@ export class ChildAgentManager {
       controller,
       parentSessionId,
       paused: false,
+      shuttingDown: false,
       model,
       runId,
       nodeKey,
@@ -264,10 +320,22 @@ export class ChildAgentManager {
       isolationMode ||
       (isolatedWorktree ? ISOLATION_MODES.WORKTREE : ISOLATION_MODES.SHARED_READONLY);
 
+    const baseLeaseGuard =
+      leaseGuard?.withContext?.({
+        sessionId: childSessionId,
+        runId,
+        nodeId,
+      }) ?? leaseGuard;
+
     let wt = null;
     let effectiveRoot = workspaceRoot;
     let effectivePolicy = { ...policy };
     let isIsolated = false;
+    let materializedHandoffs = [];
+    let archivedArtifact = null;
+    let leaseLost = false;
+    let explicitCancel = false;
+    let shuttingDownTurn = false;
 
     if (requestedMode === ISOLATION_MODES.WORKTREE) {
       if (!this.worktreeIsolator) {
@@ -284,13 +352,23 @@ export class ChildAgentManager {
         try {
           wt = await this.worktreeIsolator.acquire(workspaceRoot, {
             ownerId: childSessionId,
+            workerId: workerId ?? leaseGuard?.workerId ?? null,
             sessionId: childSessionId,
             runId,
             nodeKey,
+            jobId: leaseGuard?.jobId ?? null,
+            fence: leaseGuard?.fence ?? null,
+            attempt,
+            rehydrateExisting: Boolean(runId && nodeKey),
+            leaseGuard: baseLeaseGuard,
           });
           effectiveRoot = wt.path;
           isIsolated = true;
         } catch (wtErr) {
+          if (isLeaseLostError(wtErr)) {
+            this.activeChildren.delete(childSessionId);
+            throw wtErr;
+          }
           if (!allowIsolationFallback) {
             throw new Fault('WORKTREE_ISOLATION_FAILED', 500, {
               message: `Worktree isolation failed (fail-closed, no implicit fallback): ${String(wtErr?.message ?? wtErr)}`,
@@ -307,6 +385,13 @@ export class ChildAgentManager {
     }
 
     const turnId = resumeTurnId || `${parentTurnId || 'root'}:${subId}:${Date.now().toString(36)}`;
+    const turnLeaseGuard =
+      baseLeaseGuard?.withContext?.({
+        sessionId: childSessionId,
+        turnId,
+        runId,
+        nodeId,
+      }) ?? baseLeaseGuard;
     const maxSteps = Math.min(20, Math.max(1, Number(effectiveBudget.maxSteps ?? profile?.defaultMaxSteps ?? 8)));
     const resolvedModel = model || this.getDefaultModel();
 
@@ -323,55 +408,116 @@ export class ChildAgentManager {
         objective,
         isolationMode: requestedMode,
         isolatedWorktree: isIsolated,
+        rehydratedWorktree: Boolean(wt?.rehydrated),
       },
       audit: false,
     });
 
     try {
+      // Fix C6: Materialize predecessor artifacts into isolated handoff dir & build structured context
+      let artifactContext = '';
+      if (predecessorArtifacts.length && this.artifactManager) {
+        if (isIsolated && wt) {
+          materializedHandoffs = this.artifactManager.materializeToHandoffDir(
+            predecessorArtifacts,
+            wt.path,
+          );
+          artifactContext = this.artifactManager.formatPredecessorArtifactsContext(
+            materializedHandoffs,
+            { isolatedWorktree: true },
+          );
+        } else {
+          const descriptors = predecessorArtifacts.map((a) => ({
+            artifactId: a.id || a.artifactId,
+            uri: a.uri,
+            nodeKey: a.nodeKey,
+            attempt: a.attempt,
+            baseCommit: a.baseCommit,
+            bundleSha256: a.bundleSha256,
+            files: a.files ?? [],
+          }));
+          artifactContext = this.artifactManager.formatPredecessorArtifactsContext(descriptors, {
+            isolatedWorktree: false,
+          });
+        }
+      }
+      const effectiveObjective = artifactContext
+        ? `${artifactContext}\n\n${objective}`
+        : objective;
+
       const now = Date.now();
       this.store.tx(() => {
+        assertLeaseInTx(baseLeaseGuard, { runId, nodeId, bindingOwnership: true });
         this.store.db
-          .prepare("UPDATE direct_sessions SET state='running', permissionMode=?, updatedAt=? WHERE id=?")
+          .prepare(
+            "UPDATE direct_sessions SET state='running', permissionMode=?, updatedAt=? WHERE id=? AND state!='cancelled'",
+          )
           .run(effectivePolicy.permissionMode, now, childSessionId);
         if (!resumeTurnId) {
           this.store.db
             .prepare(
               `INSERT OR IGNORE INTO direct_turns(
-                id, sessionId, input, model, state, phase, step, agentProfile, createdAt
-              ) VALUES(?,?,?,?,'running','init',?,?,?)`,
+                id, sessionId, input, model, state, phase, step, agentProfile,
+                activeFence, activeAttempt, createdAt
+              ) VALUES(?,?,?,?,'running','init',?,?,?,?,?)`,
             )
             .run(
               turnId,
               childSessionId,
-              String(objective || '').slice(0, 2000),
+              String(effectiveObjective || '').slice(0, 2000),
               resolvedModel,
               initialStep,
               profile?.id || 'subagent',
+              turnLeaseGuard?.fence ?? null,
+              Number(attempt || 1),
               now,
             );
-          if (objective) {
+          if (effectiveObjective) {
             this.store.db
               .prepare(
                 'INSERT INTO direct_messages(sessionId, turnId, role, content, createdAt) VALUES(?,?,?,?,?)',
               )
-              .run(childSessionId, turnId, 'user', objective, now);
+              .run(childSessionId, turnId, 'user', effectiveObjective, now);
           }
         } else {
           this.store.db
-            .prepare("UPDATE direct_turns SET state='running', phase='checkpoint' WHERE id=?")
-            .run(turnId);
+            .prepare(
+              `UPDATE direct_turns
+               SET state='running', phase='checkpoint', activeFence=?, activeAttempt=?
+               WHERE id=? AND state NOT IN ('completed','cancelled')`,
+            )
+            .run(turnLeaseGuard?.fence ?? null, Number(attempt || 1), turnId);
         }
         if (runId && nodeKey) {
           this.store.db
             .prepare(
-              'UPDATE swarm_nodes SET childSessionId=?, childTurnId=?, updatedAt=? WHERE runId=? AND nodeKey=?',
+              `UPDATE swarm_nodes
+               SET childSessionId=?, childTurnId=?, worktreeLeaseId=COALESCE(?, worktreeLeaseId),
+                   worktreePath=COALESCE(?, worktreePath), updatedAt=?
+               WHERE runId=? AND nodeKey=? AND status NOT IN ('completed','failed','cancelled')`,
             )
-            .run(childSessionId, turnId, now, runId, nodeKey);
+            .run(
+              childSessionId,
+              turnId,
+              wt?.leaseId ?? null,
+              wt?.path ?? null,
+              now,
+              runId,
+              nodeKey,
+            );
         }
       });
 
       const session = this.sessionRepo.getSession(childSessionId);
       const nonce = this.sessionRepo.ensureSessionNonce(childSessionId);
+      const extraTools =
+        runId && this.artifactManager
+          ? createSwarmArtifactTools({
+              artifactManager: this.artifactManager,
+              runId,
+              predecessorArtifacts: isIsolated ? materializedHandoffs : predecessorArtifacts,
+            })
+          : [];
       const tools = this.#resolveTools({
         workspaceRoot: effectiveRoot,
         sessionId: childSessionId,
@@ -379,6 +525,7 @@ export class ChildAgentManager {
         nonce,
         signal: combinedSignal,
         isolatedWorktree: isIsolated,
+        extraTools,
       });
 
       const assembled = this.contextAssembler.assemble({
@@ -415,7 +562,7 @@ export class ChildAgentManager {
         parentEpochId: parentTurnId,
         externalSignal: combinedSignal,
         workspaceRoot: effectiveRoot,
-        leaseGuard,
+        leaseGuard: turnLeaseGuard,
         parentGuard: () => this.#assertAncestorsActive(childSessionId),
         initialStep,
         profile: {
@@ -425,7 +572,7 @@ export class ChildAgentManager {
           emitAssistantMessage: false,
           emitToolEvents: false,
         },
-        input: objective,
+        input: effectiveObjective,
         model: resolvedModel,
         provider,
         permissionMode: effectivePolicy.permissionMode,
@@ -440,6 +587,7 @@ export class ChildAgentManager {
         },
         onAssistantMessage: ({ text, reasoning, toolCalls }) => {
           this.store.tx(() => {
+            assertLeaseInTx(turnLeaseGuard);
             this.store.db
               .prepare(
                 `INSERT INTO direct_messages(
@@ -458,6 +606,7 @@ export class ChildAgentManager {
         },
         onToolResult: ({ tc, output, isError, durationMs }) => {
           this.store.tx(() => {
+            assertLeaseInTx(turnLeaseGuard);
             this.store.db
               .prepare(
                 `INSERT INTO direct_messages(
@@ -502,15 +651,53 @@ export class ChildAgentManager {
         });
       }
 
+      // Fix C1/C5/C10: Persist & register isolated worktree artifacts BEFORE marking completed!
+      const diffSummary = wt ? await wt.diffSummary() : '';
+      if (isIsolated && wt && !state.paused && this.artifactManager && runId && nodeKey) {
+        archivedArtifact = await this.artifactManager.archiveWorktree({
+          runId,
+          nodeId: nodeId || nodeKey,
+          nodeKey,
+          childSessionId,
+          childTurnId: turnId,
+          jobId: turnLeaseGuard?.jobId ?? null,
+          attempt,
+          ownerId: childSessionId,
+          fence: turnLeaseGuard?.fence ?? null,
+          workspaceRoot,
+          worktreePath: wt.path,
+          worktreeLeaseId: wt.leaseId,
+          baseCommit: wt.baseCommit,
+          baseRef: wt.baseRef,
+          leaseGuard: turnLeaseGuard,
+        });
+      }
+
       const nextState = state.paused ? 'paused' : 'completed';
       const finAt = Date.now();
       const verdictJson = result.verdict ? JSON.stringify(result.verdict) : null;
       const evidenceCount = Number(result.verdict?.evidenceCount ?? 0);
+      const payload = {
+        subagentId: subId,
+        childSessionId,
+        turnId,
+        role: profile?.name || 'worker',
+        summary: excerpt(result.text || '', 500),
+        text: result.text || '',
+        verdict: result.verdict ?? null,
+        resumeMode,
+        ...(archivedArtifact
+          ? { artifactId: archivedArtifact.id, artifactUri: archivedArtifact.uri }
+          : {}),
+      };
+
+      // Fix D5/D7: Enforce fence/attempt ownership & terminal protection atomically inside DB commit
       const committed = this.store.tx(() => {
+        assertLeaseInTx(turnLeaseGuard);
         const turnRes = this.store.db
           .prepare(
             `UPDATE direct_turns
-             SET state=?, phase=?, inputTokens=?, outputTokens=?, step=?, verdictJson=?, evidenceCount=?, finishedAt=?
+             SET state=?, phase=?, inputTokens=?, outputTokens=?, step=?, verdictJson=?, evidenceCount=?, finishedAt=?, activeFence=NULL
              WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
           )
           .run(
@@ -526,30 +713,25 @@ export class ChildAgentManager {
           );
         if ((turnRes.changes ?? 0) === 0) return false;
         this.store.db
-          .prepare("UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state!='cancelled'")
+          .prepare(
+            "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
+          )
           .run(nextState, finAt, childSessionId);
-        return true;
-      });
-
-      const payload = {
-        subagentId: subId,
-        childSessionId,
-        turnId,
-        role: profile?.name || 'worker',
-        summary: excerpt(result.text || '', 500),
-        text: result.text || '',
-        verdict: result.verdict ?? null,
-        resumeMode,
-      };
-      if (committed) {
-        this.#persistNotification({
+        this.#persistNotificationInTx({
           parentSessionId,
           childSessionId,
           runId,
           nodeKey,
           status: nextState,
           payload,
+          jobId: turnLeaseGuard?.jobId ?? null,
+          fence: turnLeaseGuard?.fence ?? null,
+          attempt,
         });
+        return true;
+      });
+
+      if (committed) {
         this.eventRouter?.emitPersisted({
           sessionId: parentSessionId,
           turnId: parentTurnId,
@@ -569,9 +751,34 @@ export class ChildAgentManager {
         steps: result.steps,
         verdict: result.verdict ?? null,
         verifiedPass: result.verifiedPass ?? null,
-        diffSummary: wt ? await wt.diffSummary() : '',
+        diffSummary,
+        artifact: archivedArtifact,
       };
     } catch (err) {
+      // Graceful runtime shutdown is an interruption, NOT user cancellation or failure — preserve state & dirty worktree!
+      const isShutdown = Boolean(
+        state.shuttingDown ||
+          this.shuttingDown ||
+          combinedSignal.reason === 'shutdown' ||
+          externalSignal?.reason === 'shutdown' ||
+          controller.signal.reason === 'shutdown',
+      );
+      if (isShutdown) {
+        shuttingDownTurn = true;
+        throw err;
+      }
+
+      // Fix D6: On LEASE_LOST (or if lease was already lost), exit cleanly without corrupting new owner!
+      if (isLeaseLostError(err) || !checkLeaseHeld(turnLeaseGuard)) {
+        leaseLost = true;
+        throw isLeaseLostError(err)
+          ? err
+          : new RecoveryError('LEASE_LOST', {
+              message: `Lease lost during child turn ${turnId}`,
+              cause: err,
+            });
+      }
+
       const nextState = state.paused
         ? 'paused'
         : err?.code === 'RECONCILIATION_REQUIRED'
@@ -579,40 +786,8 @@ export class ChildAgentManager {
           : combinedSignal.aborted || err?.category === 'cancellation'
             ? 'cancelled'
             : 'failed';
-      let committed = false;
-      if (this.store?.db?.isOpen) {
-        const errAt = Date.now();
-        const errVerdictJson = err?.detail?.verdict ? JSON.stringify(err.detail.verdict) : null;
-        committed = this.store.tx(() => {
-          const turnRes = this.store.db
-            .prepare(
-              `UPDATE direct_turns
-               SET state=?, phase=?, error=?,
-                   inputTokens=COALESCE(?, inputTokens),
-                   outputTokens=COALESCE(?, outputTokens),
-                   step=COALESCE(?, step),
-                   verdictJson=COALESCE(?, verdictJson),
-                   finishedAt=?
-               WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
-            )
-            .run(
-              nextState,
-              nextState,
-              String(err?.detail?.message ?? err?.message ?? err).slice(0, 500),
-              err?.detail?.usage?.inputTokens ?? null,
-              err?.detail?.usage?.outputTokens ?? null,
-              err?.detail?.steps ?? null,
-              errVerdictJson,
-              nextState === 'reconciling' || nextState === 'paused' ? null : errAt,
-              turnId,
-            );
-          if ((turnRes.changes ?? 0) === 0) return false;
-          this.store.db
-            .prepare("UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state!='cancelled'")
-            .run(nextState, errAt, childSessionId);
-          return true;
-        });
-      }
+      explicitCancel = nextState === 'cancelled';
+
       const failPayload = {
         subagentId: subId,
         childSessionId,
@@ -622,15 +797,64 @@ export class ChildAgentManager {
         verdict: err?.detail?.verdict ?? null,
         paused: state.paused,
       };
+
+      let committed = false;
+      if (this.store?.db?.isOpen) {
+        const errAt = Date.now();
+        const errVerdictJson = err?.detail?.verdict ? JSON.stringify(err.detail.verdict) : null;
+        try {
+          committed = this.store.tx(() => {
+            assertLeaseInTx(turnLeaseGuard);
+            const turnRes = this.store.db
+              .prepare(
+                `UPDATE direct_turns
+                 SET state=?, phase=?, error=?,
+                     inputTokens=COALESCE(?, inputTokens),
+                     outputTokens=COALESCE(?, outputTokens),
+                     step=COALESCE(?, step),
+                     verdictJson=COALESCE(?, verdictJson),
+                     finishedAt=?, activeFence=NULL
+                 WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
+              )
+              .run(
+                nextState,
+                nextState,
+                String(err?.detail?.message ?? err?.message ?? err).slice(0, 500),
+                err?.detail?.usage?.inputTokens ?? null,
+                err?.detail?.usage?.outputTokens ?? null,
+                err?.detail?.steps ?? null,
+                errVerdictJson,
+                nextState === 'reconciling' || nextState === 'paused' ? null : errAt,
+                turnId,
+              );
+            if ((turnRes.changes ?? 0) === 0) return false;
+            this.store.db
+              .prepare(
+                "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state NOT IN ('completed','cancelled')",
+              )
+              .run(nextState, errAt, childSessionId);
+            this.#persistNotificationInTx({
+              parentSessionId,
+              childSessionId,
+              runId,
+              nodeKey,
+              status: nextState,
+              payload: failPayload,
+              jobId: turnLeaseGuard?.jobId ?? null,
+              fence: turnLeaseGuard?.fence ?? null,
+              attempt,
+            });
+            return true;
+          });
+        } catch (txErr) {
+          if (isLeaseLostError(txErr)) {
+            leaseLost = true;
+            throw txErr;
+          }
+          throw txErr;
+        }
+      }
       if (committed) {
-        this.#persistNotification({
-          parentSessionId,
-          childSessionId,
-          runId,
-          nodeKey,
-          status: nextState,
-          payload: failPayload,
-        });
         this.eventRouter?.emitPersisted({
           sessionId: parentSessionId,
           turnId: parentTurnId,
@@ -642,7 +866,19 @@ export class ChildAgentManager {
       throw err;
     } finally {
       this.activeChildren.delete(childSessionId);
-      if (wt) await wt.release();
+      if (wt) {
+        if (leaseLost) {
+          // Stale worker MUST NOT touch disk when lease was lost; detach handle only
+          this.worktreeIsolator?.active?.delete?.(wt.leaseId);
+        } else {
+          await wt.release({
+            archivedArtifactId: archivedArtifact?.id ?? null,
+            forceDiscard: explicitCancel,
+            preserveDirty: true,
+            leaseGuard: explicitCancel || shuttingDownTurn ? null : baseLeaseGuard,
+          });
+        }
+      }
     }
   }
 
@@ -664,7 +900,11 @@ export class ChildAgentManager {
     isolationMode = null,
     allowIsolationFallback = false,
     runId = null,
+    nodeId = null,
     nodeKey = null,
+    attempt = 1,
+    workerId = null,
+    predecessorArtifacts = [],
     existingChildSessionId = null,
     resumeTurnId = null,
     initialStep = 0,
@@ -728,7 +968,11 @@ export class ChildAgentManager {
       isolationMode: requestedMode,
       allowIsolationFallback,
       runId,
+      nodeId,
       nodeKey,
+      attempt,
+      workerId,
+      predecessorArtifacts,
       budget,
       leaseGuard,
       initialStep,
@@ -931,8 +1175,10 @@ export class ChildAgentManager {
   }
 
   shutdown() {
+    this.shuttingDown = true;
     for (const active of this.activeChildren.values()) {
       active.paused = false;
+      active.shuttingDown = true;
       active.controller.abort('shutdown');
     }
   }

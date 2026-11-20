@@ -33,6 +33,7 @@ export class Store {
   #wakeListeners = new Set();
   #wakePending = false;
   constructor(path) {
+    this.dbPath = path;
     this.db = new DatabaseSync(path);
     const userVersion = this.db.prepare('PRAGMA user_version').get().user_version;
     if (userVersion > 7) {
@@ -275,6 +276,76 @@ export class Store {
         ['concurrencyPolicy', "TEXT NOT NULL DEFAULT 'skip'"],
         ['misfirePolicy', "TEXT NOT NULL DEFAULT 'fire_once'"],
         ['maxConcurrency', 'INTEGER NOT NULL DEFAULT 1'],
+      ]);
+      // --- 2.1.1 Group 2: Artifacts & Leases ---
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS runtime_workers(
+          workerId TEXT PRIMARY KEY,
+          pid INTEGER NOT NULL,
+          hostname TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          startedAt INTEGER NOT NULL,
+          heartbeatAt INTEGER NOT NULL,
+          stoppedAt INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS runtime_workers_status ON runtime_workers(status, heartbeatAt);
+        CREATE TABLE IF NOT EXISTS swarm_artifacts(
+          id TEXT PRIMARY KEY,
+          uri TEXT NOT NULL UNIQUE,
+          runId TEXT NOT NULL,
+          nodeId TEXT NOT NULL,
+          nodeKey TEXT NOT NULL,
+          childSessionId TEXT,
+          childTurnId TEXT,
+          jobId TEXT,
+          attempt INTEGER NOT NULL DEFAULT 1,
+          ownerId TEXT NOT NULL,
+          fence TEXT,
+          workspaceRoot TEXT NOT NULL,
+          worktreePath TEXT,
+          baseCommit TEXT,
+          baseRef TEXT,
+          storagePath TEXT NOT NULL,
+          bundleSha256 TEXT NOT NULL,
+          manifestJson TEXT NOT NULL,
+          fileCount INTEGER NOT NULL DEFAULT 0,
+          totalBytes INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'archived',
+          appliedAt INTEGER,
+          applyResultJson TEXT,
+          createdAt INTEGER NOT NULL,
+          updatedAt INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS swarm_artifacts_run ON swarm_artifacts(runId, nodeKey, attempt);
+        CREATE INDEX IF NOT EXISTS swarm_artifacts_node ON swarm_artifacts(nodeId, attempt);
+      `);
+      ensureColumns('worktree_leases', [
+        ['jobId', 'TEXT'],
+        ['fence', 'TEXT'],
+        ['attempt', 'INTEGER NOT NULL DEFAULT 1'],
+        ['workerId', 'TEXT'],
+        ['baseCommit', 'TEXT'],
+        ['baseRef', 'TEXT'],
+        ['artifactId', 'TEXT'],
+        ['cleanupState', "TEXT NOT NULL DEFAULT 'active'"],
+        ['dirtyWrites', 'INTEGER NOT NULL DEFAULT 0'],
+        ['updatedAt', 'INTEGER'],
+      ]);
+      ensureColumns('swarm_nodes', [
+        ['activeJobId', 'TEXT'],
+        ['activeFence', 'TEXT'],
+        ['activeAttempt', 'INTEGER NOT NULL DEFAULT 0'],
+        ['latestArtifactId', 'TEXT'],
+        ['worktreeLeaseId', 'TEXT'],
+      ]);
+      ensureColumns('direct_turns', [
+        ['activeFence', 'TEXT'],
+        ['activeAttempt', 'INTEGER NOT NULL DEFAULT 0'],
+      ]);
+      ensureColumns('child_notifications', [
+        ['jobId', 'TEXT'],
+        ['fence', 'TEXT'],
+        ['attempt', 'INTEGER NOT NULL DEFAULT 0'],
       ]);
       try {
         this.db.exec(`

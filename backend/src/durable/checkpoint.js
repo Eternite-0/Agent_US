@@ -1,4 +1,5 @@
 import { id as uuid } from '../store.js';
+import { assertLeaseInTx } from './lease-guard.js';
 
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
@@ -18,11 +19,12 @@ export class CheckpointStore {
     this.store = store;
   }
 
-  save({ sessionId, turnId, step = 0, phase, state = {}, ledgerSeq = 0 }) {
+  save({ sessionId, turnId, step = 0, phase, state = {}, ledgerSeq = 0, leaseGuard = null }) {
     if (!this.store?.db || !sessionId || !turnId) return null;
     const id = uuid();
     const now = Date.now();
     this.store.tx(() => {
+      assertLeaseInTx(leaseGuard, { sessionId, turnId });
       this.store.db
         .prepare(
           `INSERT INTO runtime_checkpoints(

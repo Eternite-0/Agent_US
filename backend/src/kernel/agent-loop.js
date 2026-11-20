@@ -1,10 +1,11 @@
 import { sha256Hex } from '../integrity.js';
 import { excerpt } from '../context.js';
 import { verifyTurn, buildRepairNote } from '../verifier.js';
-import { BudgetError, classifyError } from './errors.js';
+import { BudgetError, RecoveryError, classifyError } from './errors.js';
 import { RUNTIME_EVENTS } from './events.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
 import { resolveTurnOutcome } from './verdict.js';
+import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
 
 /**
  * Default DecisionEngine handles premature-stop detection, verification gate,
@@ -100,12 +101,14 @@ export class TurnManager {
     checkpointStore = null,
     sessionId,
     turnId,
+    leaseGuard = null,
   }) {
     this.store = store;
     this.eventRouter = eventRouter;
     this.checkpointStore = checkpointStore;
     this.sessionId = sessionId;
     this.turnId = turnId;
+    this.leaseGuard = leaseGuard;
     this.totalIn = 0;
     this.totalOut = 0;
     this.totalCacheRead = 0;
@@ -136,6 +139,7 @@ export class TurnManager {
       step,
       phase,
       state,
+      leaseGuard: this.leaseGuard,
     });
   }
 }
@@ -199,6 +203,7 @@ export class AgentLoop {
       turnId,
       initialPhase: TURN_PHASES.INIT,
       initialStep,
+      leaseGuard,
     });
     const tm = new TurnManager({
       store: this.store,
@@ -206,6 +211,7 @@ export class AgentLoop {
       checkpointStore: this.checkpointStore,
       sessionId,
       turnId,
+      leaseGuard,
     });
 
     const maxSteps = Math.min(60, Math.max(1, Number(budget.maxSteps ?? profile?.defaultMaxSteps ?? 24)));
@@ -325,6 +331,7 @@ export class AgentLoop {
           },
         });
         tm.addUsage(stepResult.usage);
+        signal?.throwIfAborted?.();
         leaseGuard?.();
 
         if (
@@ -634,6 +641,15 @@ export class AgentLoop {
       };
     } catch (err) {
       const classified = classifyError(err);
+      // Fix D6: On LEASE_LOST (or if lease was already lost before error), exit cleanly without corrupting turn phase
+      if (isLeaseLostError(classified) || !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
+        throw isLeaseLostError(classified)
+          ? classified
+          : new RecoveryError('LEASE_LOST', {
+              message: `Lease lost during turn ${turnId}`,
+              cause: err,
+            });
+      }
       const isCancelled = Boolean(signal?.aborted || classified.category === 'cancellation');
       const targetPhase =
         classified.code === 'APPROVAL_PARKED'
@@ -652,7 +668,7 @@ export class AgentLoop {
           });
         }
       } catch {
-        // already terminal
+        // already terminal or lease lost
       }
       throw classified;
     }

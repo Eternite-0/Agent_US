@@ -146,24 +146,31 @@ export class UnknownOutcomeReconciler {
   }
 
   /**
-   * Inspects executing tool receipts for an interrupted turn.
+   * Inspects executing AND already-outcome_unknown tool receipts for an interrupted turn.
    * Replayable tools are marked `interrupted_replayable`; non-replayable side effects
    * transition to `outcome_unknown` and create a durable reconciliation request.
    */
   inspectInterruptedTurn(turnId, { sessionId = null } = {}) {
-    const executing = this.store.db
-      .prepare("SELECT * FROM tool_receipts WHERE turnId=? AND status='executing' ORDER BY createdAt ASC")
+    const rows = this.store.db
+      .prepare(
+        "SELECT * FROM tool_receipts WHERE turnId=? AND status IN ('executing','outcome_unknown') ORDER BY createdAt ASC",
+      )
       .all(turnId);
-    if (!executing.length) {
+    if (!rows.length) {
       return { needsReconciliation: false, unknownReceipts: [] };
     }
 
     const now = Date.now();
     const unknown = [];
     let approvalId = null;
+    let newlyCreatedApproval = false;
 
     this.store.tx(() => {
-      for (const r of executing) {
+      for (const r of rows) {
+        if (r.status === 'outcome_unknown') {
+          unknown.push(r);
+          continue;
+        }
         if (r.replayable) {
           this.store.db
             .prepare(
@@ -192,6 +199,7 @@ export class UnknownOutcomeReconciler {
           approvalId = existingPending.id;
         } else {
           approvalId = uuid();
+          newlyCreatedApproval = true;
           this.store.db
             .prepare(
               `INSERT INTO direct_approvals(
@@ -212,7 +220,7 @@ export class UnknownOutcomeReconciler {
                 toolName: first.toolName,
                 effectClass: first.effectClass,
                 reason:
-                  '不可重放工具在进程崩溃时正在执行，系统无法确认外部副作用是否已完成，请核对后选择继续或中止。',
+                  '不可重放工具在进程崩溃或中断时处于未知结果状态，系统无法确认外部副作用是否已完成，请核对后选择继续或中止。',
               }),
               first.id,
               first.riskLevel,
@@ -238,7 +246,7 @@ export class UnknownOutcomeReconciler {
       }
     });
 
-    if (unknown.length > 0 && this.eventRouter) {
+    if (unknown.length > 0 && newlyCreatedApproval && this.eventRouter) {
       const first = unknown[0];
       const sid = sessionId || first.sessionId;
       this.eventRouter.emitPersisted({

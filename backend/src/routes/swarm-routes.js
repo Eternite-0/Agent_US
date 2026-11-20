@@ -103,6 +103,91 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
     items: directAgent?.mailbox?.listForRun(req.params.id) ?? [],
   }));
 
+  // ---- Isolated Worktree Artifacts: List, Read, Verify, and Guarded Apply-to-Parent ----
+
+  app.get('/v1/swarm/runs/:id/artifacts', async (req) => {
+    const q = req.query ?? {};
+    return {
+      items:
+        directAgent?.artifactManager?.listArtifacts({
+          runId: req.params.id,
+          nodeKey: q.nodeKey ? String(q.nodeKey) : null,
+          limit: Number(q.limit ?? 200),
+        }) ?? [],
+    };
+  });
+
+  app.get('/v1/swarm/runs/:id/artifacts/:artifactId', async (req, reply) => {
+    const mgr = directAgent?.artifactManager;
+    if (!mgr) {
+      return reply.code(503).send({
+        error: { code: 'ARTIFACT_MANAGER_UNAVAILABLE', message: 'Artifact manager not ready', status: 503 },
+      });
+    }
+    const art = mgr.getArtifact(req.params.artifactId);
+    if (!art || art.runId !== req.params.id) {
+      return reply.code(404).send({
+        error: { code: 'ARTIFACT_NOT_FOUND', message: 'Swarm artifact not found', status: 404 },
+      });
+    }
+    const filePath = req.query?.path ? String(req.query.path) : null;
+    if (filePath) {
+      const fileRes = mgr.readArtifactFile(art.id, filePath);
+      return {
+        artifactId: art.id,
+        uri: art.uri,
+        entry: fileRes.entry,
+        deleted: fileRes.deleted,
+        text: fileRes.text,
+        base64: fileRes.base64,
+        verified: fileRes.verified,
+      };
+    }
+    return art;
+  });
+
+  app.post('/v1/swarm/runs/:id/artifacts/:artifactId/verify', async (req, reply) => {
+    const mgr = directAgent?.artifactManager;
+    if (!mgr) {
+      return reply.code(503).send({
+        error: { code: 'ARTIFACT_MANAGER_UNAVAILABLE', message: 'Artifact manager not ready', status: 503 },
+      });
+    }
+    const art = mgr.getArtifact(req.params.artifactId);
+    if (!art || art.runId !== req.params.id) {
+      return reply.code(404).send({
+        error: { code: 'ARTIFACT_NOT_FOUND', message: 'Swarm artifact not found', status: 404 },
+      });
+    }
+    return mgr.verifyArtifact(art.id);
+  });
+
+  app.post('/v1/swarm/runs/:id/artifacts/:artifactId/apply', async (req, reply) => {
+    const mgr = directAgent?.artifactManager;
+    if (!mgr) {
+      return reply.code(503).send({
+        error: { code: 'ARTIFACT_MANAGER_UNAVAILABLE', message: 'Artifact manager not ready', status: 503 },
+      });
+    }
+    const art = mgr.getArtifact(req.params.artifactId);
+    if (!art || art.runId !== req.params.id) {
+      return reply.code(404).send({
+        error: { code: 'ARTIFACT_NOT_FOUND', message: 'Swarm artifact not found', status: 404 },
+      });
+    }
+    const body = req.body ?? {};
+    const result = mgr.applyToParent(art.id, {
+      workspaceRoot: body.workspaceRoot ? String(body.workspaceRoot) : null,
+      permissionMode: body.permissionMode ? String(body.permissionMode) : null,
+      approved: Boolean(body.approved),
+      dryRun: Boolean(body.dryRun),
+    });
+    if (result.status === 'conflict') {
+      return reply.code(409).send(result);
+    }
+    return reply.code(200).send(result);
+  });
+
   // Replaces legacy empty stub with unified Swarm + Session active plans view
   app.get('/v1/plans', async (req) => {
     const q = req.query ?? {};
