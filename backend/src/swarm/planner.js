@@ -99,6 +99,8 @@ export class DynamicTaskPlanner {
       toolCategories: Array.isArray(n.toolCategories) ? n.toolCategories : [],
       toolAllow: Array.isArray(n.toolAllow) ? n.toolAllow : null,
       isolatedWorktree: Boolean(n.isolatedWorktree),
+      isolationMode: n.isolationMode ? String(n.isolationMode) : null,
+      allowIsolationFallback: Boolean(n.allowIsolationFallback),
       priority: Number(n.priority ?? 0),
     }));
   }
@@ -177,6 +179,7 @@ export class DynamicTaskPlanner {
             acceptance: '完成代码编写并保持最小职责边界',
             dependencies: ['analyze'],
             isolatedWorktree: true,
+            allowIsolationFallback: true,
             priority: 10,
           },
           {

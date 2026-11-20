@@ -59,6 +59,13 @@ export function registerRuntimeRoutes(app, { store, directAgent, controlPlane })
     items: directAgent?.sessionRepo?.listChildSessions(req.params.id) ?? [],
   }));
 
+  app.get('/v1/sessions/:id/notifications', async (req) => ({
+    items:
+      directAgent?.childManager?.collectNotifications?.(req.params.id, {
+        unreadOnly: req.query?.unreadOnly === 'true',
+      }) ?? [],
+  }));
+
   app.get('/v1/reconciliations', async (req) => {
     const q = req.query ?? {};
     const status = q.status ? String(q.status) : 'pending';

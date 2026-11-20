@@ -60,7 +60,9 @@ export class ControlPlane {
         .get()?.n ?? 0;
     const activeSwarmRuns =
       this.store.db
-        .prepare("SELECT COUNT(*) AS n FROM swarm_runs WHERE status='running'")
+        .prepare(
+          "SELECT COUNT(*) AS n FROM swarm_runs WHERE status IN ('pending','planning','running','reconciling','aggregating','verifying')",
+        )
         .get()?.n ?? 0;
     const enabledSchedules =
       this.store.db

@@ -1,7 +1,11 @@
 import type {
   BackendScheduleRecord,
+  ChildNotificationRecord,
   RuntimeOverviewRecord,
+  ScheduleRunRecord,
+  SwarmReplanRecord,
   SwarmRunRecord,
+  SwarmSubmitResponse,
   ToolReceiptRecord,
 } from '../types/backend';
 
@@ -42,6 +46,48 @@ export function createRuntimeClient(req: ReqFn) {
       return data.items ?? [];
     },
 
+    submitSwarmRun(input: {
+      goal: string;
+      sessionId?: string;
+      workspaceRoot?: string;
+      permissionMode?: string;
+      maxConcurrency?: number;
+      budget?: Record<string, unknown>;
+      nodes?: unknown[];
+      maxReplans?: number;
+      wait?: boolean;
+    }): Promise<SwarmSubmitResponse> {
+      return req('POST', '/v1/swarm/runs', { body: input });
+    },
+
+    getSwarmRun(id: string): Promise<SwarmRunRecord> {
+      return req('GET', `/v1/swarm/runs/${encodeURIComponent(id)}`);
+    },
+
+    resumeSwarmRun(id: string): Promise<SwarmRunRecord> {
+      return req('POST', `/v1/swarm/runs/${encodeURIComponent(id)}/resume`);
+    },
+
+    async listSwarmReplans(id: string): Promise<SwarmReplanRecord[]> {
+      const data = await req<{ items?: SwarmReplanRecord[] }>(
+        'GET',
+        `/v1/swarm/runs/${encodeURIComponent(id)}/replans`,
+      );
+      return data.items ?? [];
+    },
+
+    async listSessionNotifications(
+      sessionId: string,
+      unreadOnly = false,
+    ): Promise<ChildNotificationRecord[]> {
+      const data = await req<{ items?: ChildNotificationRecord[] }>(
+        'GET',
+        `/v1/sessions/${encodeURIComponent(sessionId)}/notifications`,
+        { query: unreadOnly ? { unreadOnly: 'true' } : undefined },
+      );
+      return data.items ?? [];
+    },
+
     async listSchedules(): Promise<BackendScheduleRecord[]> {
       const data = await req<{ items?: BackendScheduleRecord[] }>('GET', '/v1/schedules');
       return data.items ?? [];
@@ -52,6 +98,10 @@ export function createRuntimeClient(req: ReqFn) {
       prompt: string;
       scheduleKind: string;
       scheduleExpr: string;
+      timezone?: string;
+      concurrencyPolicy?: string;
+      misfirePolicy?: string;
+      maxConcurrency?: number;
       workspaceRoot?: string;
       model?: string;
       permissionMode?: string;
@@ -67,6 +117,10 @@ export function createRuntimeClient(req: ReqFn) {
         prompt: string;
         scheduleKind: string;
         scheduleExpr: string;
+        timezone: string;
+        concurrencyPolicy: string;
+        misfirePolicy: string;
+        maxConcurrency: number;
         enabled: boolean;
       }>,
     ): Promise<BackendScheduleRecord> {
@@ -83,6 +137,22 @@ export function createRuntimeClient(req: ReqFn) {
       turn: { id: string };
     }> {
       return req('POST', `/v1/schedules/${encodeURIComponent(id)}/run`);
+    },
+
+    async listScheduleRuns(id: string, limit = 50): Promise<ScheduleRunRecord[]> {
+      const data = await req<{ items?: ScheduleRunRecord[] }>(
+        'GET',
+        `/v1/schedules/${encodeURIComponent(id)}/runs`,
+        { query: { limit } },
+      );
+      return data.items ?? [];
+    },
+
+    cancelScheduleRun(id: string, runId: string): Promise<ScheduleRunRecord> {
+      return req(
+        'POST',
+        `/v1/schedules/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/cancel`,
+      );
     },
   };
 }

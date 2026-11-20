@@ -45,7 +45,7 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
           permissionMode: body.permissionMode ?? 'auto-safe',
         });
 
-    const result = await directAgent.swarmOrchestrator.startRun({
+    const opts = {
       sessionId: session.id,
       goal,
       workspaceRoot: body.workspaceRoot || session.workspaceRoot || directAgent.getWorkspaceRoot(),
@@ -53,8 +53,16 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
       maxConcurrency: Number(body.maxConcurrency ?? 3),
       budget: body.budget ?? {},
       nodes: Array.isArray(body.nodes) ? body.nodes : null,
-    });
-    return reply.code(201).send(result);
+      maxReplans: body.maxReplans !== undefined ? Number(body.maxReplans) : 2,
+    };
+
+    if (body.wait === true || req.query?.wait === 'true') {
+      const result = await directAgent.swarmOrchestrator.startRun(opts);
+      return reply.code(201).send(result);
+    }
+
+    const submitted = directAgent.swarmOrchestrator.submitRun(opts);
+    return reply.code(202).send(submitted);
   });
 
   app.get('/v1/swarm/runs/:id', async (req, reply) => {
@@ -66,6 +74,20 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
     }
     return run;
   });
+
+  app.post('/v1/swarm/runs/:id/resume', async (req, reply) => {
+    const run = directAgent?.swarmOrchestrator?.resumeRun(req.params.id);
+    if (!run) {
+      return reply.code(404).send({
+        error: { code: 'SWARM_RUN_NOT_FOUND', message: 'Swarm run not found', status: 404 },
+      });
+    }
+    return run;
+  });
+
+  app.get('/v1/swarm/runs/:id/replans', async (req) => ({
+    items: directAgent?.swarmOrchestrator?.listReplans(req.params.id) ?? [],
+  }));
 
   app.post('/v1/swarm/runs/:id/cancel', async (req, reply) => {
     const run = directAgent?.swarmOrchestrator?.cancelRun(req.params.id);

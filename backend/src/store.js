@@ -35,7 +35,7 @@ export class Store {
   constructor(path) {
     this.db = new DatabaseSync(path);
     const userVersion = this.db.prepare('PRAGMA user_version').get().user_version;
-    if (userVersion > 5) {
+    if (userVersion > 6) {
       this.db.close();
       throw new Fault('UNSUPPORTED_DATABASE_SCHEMA');
     }
@@ -91,7 +91,17 @@ export class Store {
       CREATE INDEX IF NOT EXISTS agent_messages_recipient ON agent_messages(toAgentId, status, createdAt);
       CREATE TABLE IF NOT EXISTS context_compactions(id TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT, stage TEXT NOT NULL, coveredThroughSeq INTEGER NOT NULL, summaryText TEXT NOT NULL, taskStateJson TEXT NOT NULL, preservedConstraintsJson TEXT NOT NULL, tokenBefore INTEGER NOT NULL, tokenAfter INTEGER NOT NULL, createdAt INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS context_compactions_session ON context_compactions(sessionId, createdAt);
-      CREATE TABLE IF NOT EXISTS scheduled_tasks(id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL, scheduleKind TEXT NOT NULL, scheduleExpr TEXT NOT NULL, workspaceRoot TEXT, model TEXT, permissionMode TEXT NOT NULL DEFAULT 'auto-safe', enabled INTEGER NOT NULL DEFAULT 1, lastRunAt INTEGER, nextRunAt INTEGER, lastSessionId TEXT, lastStatus TEXT, runHistoryJson TEXT NOT NULL DEFAULT '[]', createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS scheduled_tasks(id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL, scheduleKind TEXT NOT NULL, scheduleExpr TEXT NOT NULL, workspaceRoot TEXT, model TEXT, permissionMode TEXT NOT NULL DEFAULT 'auto-safe', enabled INTEGER NOT NULL DEFAULT 1, lastRunAt INTEGER, nextRunAt INTEGER, lastSessionId TEXT, lastStatus TEXT, runHistoryJson TEXT NOT NULL DEFAULT '[]', createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS worktree_leases(id TEXT PRIMARY KEY, ownerId TEXT NOT NULL, sessionId TEXT, runId TEXT, nodeKey TEXT, workspaceRoot TEXT NOT NULL, worktreePath TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', createdAt INTEGER NOT NULL, cleanedAt INTEGER);
+      CREATE INDEX IF NOT EXISTS worktree_leases_status ON worktree_leases(status, createdAt);
+      CREATE TABLE IF NOT EXISTS swarm_replans(id TEXT PRIMARY KEY, runId TEXT NOT NULL REFERENCES swarm_runs(id) ON DELETE CASCADE, version INTEGER NOT NULL, failedNodeKey TEXT, strategy TEXT NOT NULL, reason TEXT, diffJson TEXT NOT NULL, createdAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS swarm_replans_run ON swarm_replans(runId, version);
+      CREATE TABLE IF NOT EXISTS child_notifications(id TEXT PRIMARY KEY, idempotencyKey TEXT NOT NULL UNIQUE, parentSessionId TEXT NOT NULL, childSessionId TEXT NOT NULL, runId TEXT, nodeKey TEXT, status TEXT NOT NULL, payloadJson TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, deliveredAt INTEGER);
+      CREATE INDEX IF NOT EXISTS child_notifications_parent ON child_notifications(parentSessionId, delivered, createdAt);
+      CREATE TABLE IF NOT EXISTS model_feedback(id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, provider TEXT NOT NULL, taskType TEXT NOT NULL, success INTEGER NOT NULL, toolTotal INTEGER NOT NULL DEFAULT 0, toolSuccess INTEGER NOT NULL DEFAULT 0, verifiedPass INTEGER NOT NULL DEFAULT 1, latencyMs INTEGER NOT NULL DEFAULT 0, timedOut INTEGER NOT NULL DEFAULT 0, inputTokens INTEGER NOT NULL DEFAULT 0, outputTokens INTEGER NOT NULL DEFAULT 0, contextWindow INTEGER NOT NULL DEFAULT 128000, recovered INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS model_feedback_model ON model_feedback(model, createdAt);
+      CREATE TABLE IF NOT EXISTS scheduled_task_runs(id TEXT PRIMARY KEY, scheduleId TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE, scheduledFor INTEGER NOT NULL, idempotencyKey TEXT NOT NULL UNIQUE, jobId TEXT, sessionId TEXT, turnId TEXT, status TEXT NOT NULL DEFAULT 'queued', error TEXT, startedAt INTEGER, finishedAt INTEGER, createdAt INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS scheduled_task_runs_sched ON scheduled_task_runs(scheduleId, createdAt);`);
     this.#migrateSchema();
   }
   #migrateSchema() {
@@ -222,6 +232,50 @@ export class Store {
       if (!apprCols.has('outcome')) {
         this.db.exec('ALTER TABLE direct_approvals ADD COLUMN outcome TEXT');
       }
+      if (!apprCols.has('argsDigest')) {
+        this.db.exec('ALTER TABLE direct_approvals ADD COLUMN argsDigest TEXT');
+      }
+      const ensureColumns = (table, colDefs) => {
+        const existing = new Set(
+          this.db
+            .prepare(`PRAGMA table_info(${table})`)
+            .all()
+            .map((c) => c.name),
+        );
+        for (const [col, def] of colDefs) {
+          if (!existing.has(col)) {
+            this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+          }
+        }
+      };
+      ensureColumns('tool_receipts', [
+        ['approvedArgsDigest', 'TEXT'],
+        ['hookDigest', 'TEXT'],
+      ]);
+      ensureColumns('swarm_runs', [
+        ['workspaceRoot', 'TEXT'],
+        ['permissionMode', "TEXT NOT NULL DEFAULT 'auto-safe'"],
+        ['planVersion', 'INTEGER NOT NULL DEFAULT 1'],
+        ['currentPhase', "TEXT NOT NULL DEFAULT 'init'"],
+        ['replanCount', 'INTEGER NOT NULL DEFAULT 0'],
+        ['errorCode', 'TEXT'],
+        ['errorMessage', 'TEXT'],
+      ]);
+      ensureColumns('swarm_nodes', [
+        ['taskType', "TEXT NOT NULL DEFAULT 'research'"],
+        ['isolationMode', "TEXT NOT NULL DEFAULT 'shared_readonly'"],
+        ['allowIsolationFallback', 'INTEGER NOT NULL DEFAULT 0'],
+        ['childTurnId', 'TEXT'],
+        ['jobId', 'TEXT'],
+        ['reconcileApprovalId', 'TEXT'],
+        ['planVersion', 'INTEGER NOT NULL DEFAULT 1'],
+      ]);
+      ensureColumns('scheduled_tasks', [
+        ['timezone', "TEXT NOT NULL DEFAULT 'UTC'"],
+        ['concurrencyPolicy', "TEXT NOT NULL DEFAULT 'skip'"],
+        ['misfirePolicy', "TEXT NOT NULL DEFAULT 'fire_once'"],
+        ['maxConcurrency', 'INTEGER NOT NULL DEFAULT 1'],
+      ]);
       try {
         this.db.exec(`
           CREATE VIRTUAL TABLE IF NOT EXISTS direct_messages_fts USING fts5(
@@ -245,7 +299,7 @@ export class Store {
       } catch {
         this.ftsEnabled = false;
       }
-      this.db.exec('PRAGMA user_version=5');
+      this.db.exec('PRAGMA user_version=6');
     });
   }
   searchDirectHistory(

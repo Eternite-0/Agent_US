@@ -26,6 +26,8 @@ import { GitWorktreeIsolator, HostSandboxAdapter } from './tools/sandbox.js';
 import { McpLifecycleManager } from './tools/mcp-lifecycle.js';
 import { DirectSessionRepo } from './runtime/session-repo.js';
 import { DirectApprovalManager } from './runtime/approval-manager.js';
+import { ShutdownCoordinator } from './runtime/shutdown.js';
+import { ModelFeedbackTracker } from './swarm/feedback.js';
 import { TokenBudgetManager } from './context/budget.js';
 import { ProjectMemoryService } from './context/memory.js';
 import { MultiStageCompactor } from './context/compaction.js';
@@ -38,6 +40,7 @@ import { AdaptiveModelRouter } from './swarm/router.js';
 import { DynamicTaskPlanner } from './swarm/planner.js';
 import { InterAgentMailbox } from './swarm/mailbox.js';
 import { ChildAgentManager } from './swarm/child-lifecycle.js';
+import { DynamicReplanner } from './swarm/replan.js';
 import { AdaptiveSwarmOrchestrator } from './swarm/orchestrator.js';
 
 const execFileAsync = promisify(execFile);
@@ -189,13 +192,15 @@ export class DirectAgentRuntime {
     });
 
     // Layer 6: Adaptive Swarm Orchestrator & Dynamic Capability Routing
-    this.worktreeIsolator = new GitWorktreeIsolator();
+    this.worktreeIsolator = new GitWorktreeIsolator(this.store);
     this.modelCapabilities = new ModelCapabilityRegistry(this.pool);
     this.agentCapabilities = new AgentCapabilityRegistry();
+    this.modelFeedback = new ModelFeedbackTracker(this.store);
     this.adaptiveRouter = new AdaptiveModelRouter({
       modelRegistry: this.modelCapabilities,
       agentRegistry: this.agentCapabilities,
       pool: this.pool,
+      feedbackTracker: this.modelFeedback,
     });
     this.mailbox = new InterAgentMailbox({ store: this.store, eventRouter: this.eventRouter });
     this.swarmPlanner = new DynamicTaskPlanner({
@@ -209,6 +214,7 @@ export class DirectAgentRuntime {
       contextAssembler: this.contextAssembler,
       eventRouter: this.eventRouter,
       worktreeIsolator: this.worktreeIsolator,
+      jobQueue: this.jobQueue,
       getDefaultModel: () => this.pool.getDefaultModel(),
       getWorkspaceTools: ({ workspaceRoot, sessionId, permissionMode, nonce, signal }) =>
         createWorkspaceTools({
@@ -222,14 +228,72 @@ export class DirectAgentRuntime {
           signal,
         }),
     });
+    this.swarmReplanner = new DynamicReplanner({
+      store: this.store,
+      planner: this.swarmPlanner,
+      router: this.adaptiveRouter,
+      eventRouter: this.eventRouter,
+    });
     this.swarmOrchestrator = new AdaptiveSwarmOrchestrator({
       store: this.store,
+      jobQueue: this.jobQueue,
+      checkpointStore: this.checkpointStore,
+      reconciler: this.reconciler,
       eventRouter: this.eventRouter,
       planner: this.swarmPlanner,
       router: this.adaptiveRouter,
       childManager: this.childManager,
       mailbox: this.mailbox,
+      evidenceVerifier: this.evidenceVerifier,
+      modelFeedback: this.modelFeedback,
+      replanner: this.swarmReplanner,
     });
+
+    this.shutdownCoordinator = new ShutdownCoordinator();
+    this.shutdownCoordinator.registerSyncHook(() => {
+      this.closed = true;
+      for (const active of this.activeTurns.values()) {
+        active.controller.abort();
+      }
+      this.activeTurns.clear();
+      this.activeSessionTurn.clear();
+      this.recoveryWorker.stopping = true;
+      this.recoveryWorker.started = false;
+      if (this.recoveryWorker.unsubWake) {
+        this.recoveryWorker.unsubWake();
+        this.recoveryWorker.unsubWake = null;
+      }
+      if (this.recoveryWorker.timer) {
+        clearInterval(this.recoveryWorker.timer);
+        this.recoveryWorker.timer = null;
+      }
+      this.swarmOrchestrator.closeAll();
+      this.kernel.close();
+      this.processManager.closeAll();
+    });
+    this.shutdownCoordinator.registerStage(
+      'recovery_worker',
+      () => this.recoveryWorker.stop(),
+      { order: 20, timeoutMs: 4000 },
+    );
+    this.shutdownCoordinator.registerStage(
+      'worktrees',
+      async () => {
+        if (this.store?.db?.isOpen) await this.worktreeIsolator.cleanupAll();
+      },
+      { order: 30, timeoutMs: 4000 },
+    );
+    this.shutdownCoordinator.registerStage('mcp', () => this.mcpManager.close(), {
+      order: 40,
+      timeoutMs: 3000,
+    });
+
+    this.swarmOrchestrator.registerOnWorker(this.recoveryWorker);
+    this.recoveryWorker.registerStartupHook(() => this.swarmOrchestrator.recoverInterruptedRuns());
+    this.recoveryWorker.registerStartupHook(() => {
+      void this.worktreeIsolator.cleanupOrphans();
+    });
+    this.reconciler.onResolved((res) => this.swarmOrchestrator.handleReconciliationResolved(res));
 
     this.lastRecoveryReport = this.recoveryWorker.start({ recover: true });
   }
@@ -239,18 +303,7 @@ export class DirectAgentRuntime {
   }
 
   close() {
-    this.closed = true;
-    for (const active of this.activeTurns.values()) {
-      active.controller.abort();
-    }
-    this.activeTurns.clear();
-    this.activeSessionTurn.clear();
-    this.swarmOrchestrator.closeAll();
-    void this.worktreeIsolator.cleanupAll();
-    void this.recoveryWorker.stop();
-    this.kernel.close();
-    this.processManager.closeAll();
-    this.mcpManager.close();
+    return this.shutdownCoordinator.shutdown();
   }
 
   getWorkspaceRoot() {
@@ -564,6 +617,7 @@ export class DirectAgentRuntime {
     }
     const row = this.store.db.prepare('SELECT * FROM direct_turns WHERE id=?').get(turnId);
     if (!row) throw new Fault('TURN_NOT_FOUND', 404);
+    this.childManager?.cancelDescendants?.(row.sessionId);
     if (['running', 'reconciling', 'parked'].includes(row.state)) {
       const now = Date.now();
       this.store.tx(() => {
@@ -730,13 +784,16 @@ export class DirectAgentRuntime {
         sandbox: this.sandbox,
         mcpTools,
         signal,
-        requestApproval: ({ tool, arguments: args, callId }) =>
+        requestApproval: ({ tool, arguments: args, callId, riskLevel, effectClass, argsDigest }) =>
           this.approvalManager.requestApproval({
             sessionId,
             turnId,
             callId,
             tool,
             args,
+            riskLevel,
+            effectClass,
+            argsDigest,
             signal,
           }),
         onBeforeMutate: (rel, full) =>
@@ -820,13 +877,16 @@ export class DirectAgentRuntime {
         hooks,
         permissionMode,
         getApprovedPrefixes: () => this.getSession(sessionId).approvedPrefixes ?? [],
-        requestApproval: ({ tool, arguments: args, callId }) =>
+        requestApproval: ({ tool, arguments: args, callId, riskLevel, effectClass, argsDigest }) =>
           this.approvalManager.requestApproval({
             sessionId,
             turnId,
             callId,
             tool,
             args,
+            riskLevel,
+            effectClass,
+            argsDigest,
             signal,
           }),
         initialStep,
@@ -962,6 +1022,26 @@ export class DirectAgentRuntime {
         evidenceCount: Number(evidenceCount || 0),
       });
 
+      const receiptStats = this.store.db
+        .prepare(
+          "SELECT COUNT(*) AS total, SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS ok FROM tool_receipts WHERE sessionId=? AND turnId=?",
+        )
+        .get(sessionId, turnId);
+      this.modelFeedback.record({
+        model: effectiveModel,
+        provider: 'pool',
+        taskType: mode || 'direct',
+        success: true,
+        toolTotal: Number(receiptStats?.total ?? 0),
+        toolSuccess: Number(receiptStats?.ok ?? 0),
+        verifiedPass: finalVerdict ? Boolean(finalVerdict.accepted) : true,
+        latencyMs: durationMs,
+        inputTokens: totalIn,
+        outputTokens: totalOut,
+        contextWindow,
+        recovered: Boolean(isRecovery),
+      });
+
       this.#emitPersisted(sessionId, turnId, 'turn/completed', {
         turnId,
         sessionId,
@@ -1018,6 +1098,19 @@ export class DirectAgentRuntime {
       });
 
       if (!isCancelled) {
+        this.modelFeedback.record({
+          model: effectiveModel,
+          provider: 'pool',
+          taskType: mode || 'direct',
+          success: false,
+          verifiedPass: false,
+          latencyMs: durationMs,
+          timedOut: classified.code === 'TIMEOUT' || /timeout/i.test(message),
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+          contextWindow,
+          recovered: Boolean(isRecovery),
+        });
         this.#emitPersisted(sessionId, turnId, 'turn/failed', {
           turnId,
           sessionId,

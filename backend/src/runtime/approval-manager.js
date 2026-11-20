@@ -112,7 +112,12 @@ export class DirectApprovalManager {
     const waiter = this.pendingApprovals.get(approvalId);
     if (waiter) {
       this.pendingApprovals.delete(approvalId);
-      waiter.resolve(normalized === 'allowed');
+      waiter.resolve({
+        allowed: normalized === 'allowed',
+        approvalId: row.id,
+        argsDigest: row.argsDigest ?? waiter.argsDigest ?? null,
+        reason: reason || (normalized === 'allowed' ? 'approved' : 'denied'),
+      });
     }
 
     const updated = {
@@ -153,6 +158,7 @@ export class DirectApprovalManager {
     args,
     riskLevel = null,
     effectClass = null,
+    argsDigest = null,
     signal,
   }) {
     const approvalId = uuid();
@@ -162,8 +168,8 @@ export class DirectApprovalManager {
       this.store.db
         .prepare(
           `INSERT INTO direct_approvals(
-            id, sessionId, turnId, callId, tool, arguments, status, kind, riskLevel, effectClass, expiresAt, createdAt
-          ) VALUES(?,?,?,?,?,?,'pending','tool',?,?,?,?)`,
+            id, sessionId, turnId, callId, tool, arguments, status, kind, riskLevel, effectClass, argsDigest, expiresAt, createdAt
+          ) VALUES(?,?,?,?,?,?,'pending','tool',?,?,?,?,?)`,
         )
         .run(
           approvalId,
@@ -174,6 +180,7 @@ export class DirectApprovalManager {
           JSON.stringify(args ?? {}),
           riskLevel,
           effectClass,
+          argsDigest,
           expiresAt,
           now,
         );
@@ -188,6 +195,7 @@ export class DirectApprovalManager {
         tool,
         riskLevel,
         effectClass,
+        argsDigest,
         arguments: args ?? {},
         expiresAt,
       },
@@ -224,14 +232,20 @@ export class DirectApprovalManager {
               .run(Date.now(), approvalId);
           });
         }
-        resolveDecision(false);
+        resolveDecision({
+          allowed: false,
+          approvalId,
+          argsDigest,
+          reason: 'timeout',
+        });
       }, 10 * 60 * 1000);
       timer.unref?.();
 
       this.pendingApprovals.set(approvalId, {
-        resolve: (allowed) => {
+        argsDigest,
+        resolve: (result) => {
           cleanup();
-          resolveDecision(allowed);
+          resolveDecision(result);
         },
         reject: (err) => {
           cleanup();

@@ -151,7 +151,7 @@ test('P8 Full-Chain E2E: real HTTP/SSE -> tools -> receipts -> swarm -> compacti
     assert.equal(receipts.json.items.length, 1);
     assert.equal(receipts.json.items[0].toolName, 'write_file');
 
-    // Swarm DAG run + GET /v1/plans
+    // Swarm DAG run (Async 202 submission + polling + GET /v1/plans)
     const swarmRes = await apiJson('POST', '/v1/swarm/runs', {
       sessionId: sid,
       goal: 'E2E 群体协同验证',
@@ -161,8 +161,13 @@ test('P8 Full-Chain E2E: real HTTP/SSE -> tools -> receipts -> swarm -> compacti
         { nodeKey: 'audit', taskType: 'review', objective: '审计产物', dependencies: ['scan'] },
       ],
     });
-    assert.equal(swarmRes.status, 201);
-    assert.equal(swarmRes.json.status, 'completed');
+    assert.equal(swarmRes.status, 202);
+    const runId = swarmRes.json.runId;
+    const completedRun = await pollUntil(async () => {
+      const r = await apiJson('GET', `/v1/swarm/runs/${runId}`);
+      return r.json.status === 'completed' ? r.json : null;
+    });
+    assert.equal(completedRun.status, 'completed');
 
     const plansRes = await apiJson('GET', '/v1/plans');
     assert.equal(plansRes.status, 200);

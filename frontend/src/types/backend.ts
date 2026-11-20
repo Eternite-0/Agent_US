@@ -706,10 +706,61 @@ export interface SwarmRunRecord {
   sessionId: string;
   goal: string;
   status: string;
+  planVersion?: number;
+  currentPhase?: string;
+  replanCount?: number;
+  errorCode?: string | null;
+  errorMessage?: string | null;
   usage: Record<string, unknown>;
   nodes: SwarmNodeRecord[];
   createdAt: number;
   updatedAt: number;
+}
+
+export interface SwarmSubmitResponse {
+  runId: string;
+  sessionId: string;
+  status: string;
+  run: SwarmRunRecord;
+}
+
+export interface SwarmReplanRecord {
+  id: string;
+  runId: string;
+  version: number;
+  failedNodeKey?: string | null;
+  strategy: string;
+  reason?: string | null;
+  diff: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface ChildNotificationRecord {
+  id: string;
+  idempotencyKey: string;
+  parentSessionId: string;
+  childSessionId: string;
+  runId?: string | null;
+  nodeKey?: string | null;
+  status: string;
+  payload: Record<string, unknown>;
+  delivered: number;
+  createdAt: number;
+}
+
+export interface ScheduleRunRecord {
+  id: string;
+  scheduleId: string;
+  scheduledFor: number;
+  idempotencyKey: string;
+  jobId?: string | null;
+  sessionId?: string | null;
+  turnId?: string | null;
+  status: string;
+  error?: string | null;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  createdAt: number;
 }
 
 export interface BackendScheduleRecord {
@@ -718,6 +769,10 @@ export interface BackendScheduleRecord {
   prompt: string;
   scheduleKind: string;
   scheduleExpr: string;
+  timezone?: string;
+  concurrencyPolicy?: string;
+  misfirePolicy?: string;
+  maxConcurrency?: number;
   workspaceRoot?: string | null;
   model?: string | null;
   permissionMode: string;

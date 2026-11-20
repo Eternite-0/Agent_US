@@ -18,4 +18,12 @@ export function registerScheduleRoutes(app, { scheduler }) {
   app.delete('/v1/schedules/:id', async (req) => scheduler.delete(req.params.id));
 
   app.post('/v1/schedules/:id/run', async (req) => scheduler.runNow(req.params.id));
+
+  app.get('/v1/schedules/:id/runs', async (req) => ({
+    items: scheduler.listRuns(req.params.id, { limit: Number(req.query?.limit ?? 50) }),
+  }));
+
+  app.post('/v1/schedules/:id/runs/:runId/cancel', async (req) =>
+    scheduler.cancelRun(req.params.id, req.params.runId),
+  );
 }

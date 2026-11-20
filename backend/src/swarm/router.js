@@ -2,13 +2,14 @@ import { CAPABILITY_DIMENSIONS } from './capabilities.js';
 
 /**
  * Layer 6 AdaptiveModelRouter selects the best (model, provider, profile) tuple
- * for a task/node based on 8-dimensional model capabilities, task features, budget, and health.
+ * by blending static 8-dimensional priors with confidence-weighted empirical feedback.
  */
 export class AdaptiveModelRouter {
-  constructor({ modelRegistry, agentRegistry, pool = null }) {
+  constructor({ modelRegistry, agentRegistry, pool = null, feedbackTracker = null }) {
     this.modelRegistry = modelRegistry;
     this.agentRegistry = agentRegistry;
     this.pool = pool;
+    this.feedbackTracker = feedbackTracker;
   }
 
   select({
@@ -39,6 +40,16 @@ export class AdaptiveModelRouter {
         profile,
         score: 0,
         rationale: defaultModel ? 'fallback to default model' : 'no model configured',
+        explanation: {
+          priorScore: 0,
+          empiricalScore: null,
+          confidence: 0,
+          sampleCount: 0,
+          metrics: null,
+          penalty: 0,
+          finalScore: 0,
+          candidates: [],
+        },
       };
     }
 
@@ -47,9 +58,10 @@ export class AdaptiveModelRouter {
     if (requiresVision) weights.multimodal = 2.0;
     if (minContext >= 120000) weights.contextCapacity = 1.2;
 
+    const evaluated = [];
     let best = null;
+
     for (const c of candidates) {
-      // Hard compatibility constraints get steep penalty if alternatives exist
       let penalty = 0;
       if (!c.healthy) penalty += 3.0;
       if (requiresVision && !c.capabilities.multimodal) penalty += 5.0;
@@ -66,21 +78,51 @@ export class AdaptiveModelRouter {
         rawScore += (c.capabilities[dim] ?? 0.5) * w;
         totalWeight += w;
       }
-      let score = totalWeight > 0 ? rawScore / totalWeight : 0.5;
-      if (preferredModel && c.model === preferredModel) score += 0.25;
-      score -= penalty;
+      const priorScore = Number((totalWeight > 0 ? rawScore / totalWeight : 0.5).toFixed(4));
+      const fb = this.feedbackTracker?.getStats?.(c.model, { taskType }) ?? null;
+      const conf = fb?.sampleCount > 0 ? fb.confidence : 0;
+      const emp = fb?.empiricalScore ?? null;
+      const blended = emp !== null ? (1 - conf) * priorScore + conf * emp : priorScore;
+      let finalScore = blended;
+      if (preferredModel && c.model === preferredModel) finalScore += 0.25;
+      finalScore = Number((finalScore - penalty).toFixed(4));
 
-      if (!best || score > best.score) {
-        best = {
-          model: c.model,
-          provider: c.provider,
-          profile,
-          score: Number(score.toFixed(4)),
-          rationale: `archetype=${profile.archetype}, healthy=${c.healthy}, costWeight=${c.costWeight}`,
-        };
+      const candidateInfo = {
+        model: c.model,
+        provider: c.provider,
+        healthy: c.healthy,
+        costWeight: c.costWeight,
+        priorScore,
+        empiricalScore: emp,
+        confidence: conf,
+        sampleCount: fb?.sampleCount ?? 0,
+        metrics: fb?.metrics ?? null,
+        penalty: Number(penalty.toFixed(4)),
+        finalScore,
+      };
+      evaluated.push(candidateInfo);
+
+      if (!best || candidateInfo.finalScore > best.finalScore) {
+        best = candidateInfo;
       }
     }
 
-    return best;
+    return {
+      model: best.model,
+      provider: best.provider,
+      profile,
+      score: best.finalScore,
+      rationale: `archetype=${profile.archetype}, healthy=${best.healthy}, costWeight=${best.costWeight}, confidence=${best.confidence}`,
+      explanation: {
+        priorScore: best.priorScore,
+        empiricalScore: best.empiricalScore,
+        confidence: best.confidence,
+        sampleCount: best.sampleCount,
+        metrics: best.metrics,
+        penalty: best.penalty,
+        finalScore: best.finalScore,
+        candidates: evaluated,
+      },
+    };
   }
 }

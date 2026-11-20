@@ -7,6 +7,7 @@ import type {
   CheckinBridgeConfig,
   CheckinCenterResponse,
   CheckinRecordRow,
+  ChildNotificationRecord,
   ConnectionSettings,
   EventEnvelope,
   Evidence,
@@ -30,10 +31,13 @@ import type {
   ProviderPresetCatalog,
   ProvidersHealth,
   RuntimeOverviewRecord,
+  ScheduleRunRecord,
   SessionHistoryItem,
   SessionRecord,
   Submission,
+  SwarmReplanRecord,
   SwarmRunRecord,
+  SwarmSubmitResponse,
   Task,
   TaskBundle,
   TaskPlan,
@@ -122,12 +126,31 @@ export interface AgentBackendClient {
   getRuntimeOverview?: () => Promise<RuntimeOverviewRecord>;
   getSessionReceipts?: (sessionId: string) => Promise<ToolReceiptRecord[]>;
   listSwarmRuns?: (params?: { sessionId?: string; limit?: number }) => Promise<SwarmRunRecord[]>;
+  submitSwarmRun?: (input: {
+    goal: string;
+    sessionId?: string;
+    workspaceRoot?: string;
+    permissionMode?: string;
+    maxConcurrency?: number;
+    budget?: Record<string, unknown>;
+    nodes?: unknown[];
+    maxReplans?: number;
+    wait?: boolean;
+  }) => Promise<SwarmSubmitResponse>;
+  getSwarmRun?: (id: string) => Promise<SwarmRunRecord>;
+  resumeSwarmRun?: (id: string) => Promise<SwarmRunRecord>;
+  listSwarmReplans?: (id: string) => Promise<SwarmReplanRecord[]>;
+  listSessionNotifications?: (sessionId: string, unreadOnly?: boolean) => Promise<ChildNotificationRecord[]>;
   listSchedules?: () => Promise<BackendScheduleRecord[]>;
   createSchedule?: (input: {
     name: string;
     prompt: string;
     scheduleKind: string;
     scheduleExpr: string;
+    timezone?: string;
+    concurrencyPolicy?: string;
+    misfirePolicy?: string;
+    maxConcurrency?: number;
     workspaceRoot?: string;
     model?: string;
     permissionMode?: string;
@@ -140,6 +163,10 @@ export interface AgentBackendClient {
       prompt: string;
       scheduleKind: string;
       scheduleExpr: string;
+      timezone: string;
+      concurrencyPolicy: string;
+      misfirePolicy: string;
+      maxConcurrency: number;
       enabled: boolean;
     }>,
   ) => Promise<BackendScheduleRecord>;
@@ -149,6 +176,8 @@ export interface AgentBackendClient {
     session: { id: string };
     turn: { id: string };
   }>;
+  listScheduleRuns?: (id: string, limit?: number) => Promise<ScheduleRunRecord[]>;
+  cancelScheduleRun?: (id: string, runId: string) => Promise<ScheduleRunRecord>;
   listModels(): Promise<ModelSpec[]>;
   listProviders(): Promise<ProviderDirectory>;
   providersHealth(): Promise<ProvidersHealth>;
@@ -845,6 +874,26 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.rt.listSwarmRuns(params);
   }
 
+  submitSwarmRun(input: Parameters<typeof this.rt.submitSwarmRun>[0]) {
+    return this.rt.submitSwarmRun(input);
+  }
+
+  getSwarmRun(id: string) {
+    return this.rt.getSwarmRun(id);
+  }
+
+  resumeSwarmRun(id: string) {
+    return this.rt.resumeSwarmRun(id);
+  }
+
+  listSwarmReplans(id: string) {
+    return this.rt.listSwarmReplans(id);
+  }
+
+  listSessionNotifications(sessionId: string, unreadOnly = false) {
+    return this.rt.listSessionNotifications(sessionId, unreadOnly);
+  }
+
   listSchedules() {
     return this.rt.listSchedules();
   }
@@ -854,6 +903,10 @@ export class LiveBackendClient implements AgentBackendClient {
     prompt: string;
     scheduleKind: string;
     scheduleExpr: string;
+    timezone?: string;
+    concurrencyPolicy?: string;
+    misfirePolicy?: string;
+    maxConcurrency?: number;
     workspaceRoot?: string;
     model?: string;
     permissionMode?: string;
@@ -869,6 +922,10 @@ export class LiveBackendClient implements AgentBackendClient {
       prompt: string;
       scheduleKind: string;
       scheduleExpr: string;
+      timezone: string;
+      concurrencyPolicy: string;
+      misfirePolicy: string;
+      maxConcurrency: number;
       enabled: boolean;
     }>,
   ) {
@@ -881,6 +938,14 @@ export class LiveBackendClient implements AgentBackendClient {
 
   runScheduleNow(id: string) {
     return this.rt.runScheduleNow(id);
+  }
+
+  listScheduleRuns(id: string, limit = 50) {
+    return this.rt.listScheduleRuns(id, limit);
+  }
+
+  cancelScheduleRun(id: string, runId: string) {
+    return this.rt.cancelScheduleRun(id, runId);
   }
 
   async listModels(): Promise<ModelSpec[]> {

@@ -15,7 +15,7 @@ export class RecoveryWorker {
     eventRouter,
     handlers = {},
     workerId = `worker-${process.pid}`,
-    slots = 4,
+    slots = 10,
     leaseMs = 15000,
   }) {
     this.store = store;
@@ -25,9 +25,10 @@ export class RecoveryWorker {
     this.eventRouter = eventRouter;
     this.handlers = handlers;
     this.workerId = workerId;
-    this.slots = Math.max(1, Number(slots || 4));
+    this.slots = Math.max(1, Number(slots || 10));
     this.leaseMs = Math.max(2000, Number(leaseMs || 15000));
     this.active = new Map(); // fence -> { abort, done, jobId }
+    this.startupHooks = [];
     this.started = false;
     this.stopping = false;
     this.timer = null;
@@ -36,6 +37,10 @@ export class RecoveryWorker {
 
   registerHandler(kind, fn) {
     this.handlers[kind] = fn;
+  }
+
+  registerStartupHook(fn) {
+    if (typeof fn === 'function') this.startupHooks.push(fn);
   }
 
   /**
@@ -58,6 +63,19 @@ export class RecoveryWorker {
     };
 
     for (const turn of interruptedTurns) {
+      const ownedBySwarm =
+        this.store.db
+          .prepare('SELECT id FROM swarm_nodes WHERE childTurnId=? LIMIT 1')
+          .get(turn.id) ||
+        this.store.db
+          .prepare(
+            "SELECT id FROM swarm_nodes WHERE childSessionId=? AND status IN ('queued','running','interrupted','reconciling') LIMIT 1",
+          )
+          .get(turn.sessionId);
+      if (ownedBySwarm) {
+        continue;
+      }
+
       const recCheck = this.reconciler.inspectInterruptedTurn(turn.id, {
         sessionId: turn.sessionId,
       });
@@ -156,6 +174,20 @@ export class RecoveryWorker {
     const report = recover
       ? this.recoverOnStartup()
       : { recoveredTurns: [], reconciliationRequired: [], skippedTerminal: 0 };
+    if (recover && this.startupHooks.length) {
+      report.hooks = [];
+      for (const hook of this.startupHooks) {
+        try {
+          const out = hook();
+          report.hooks.push(out);
+          if (out && typeof out === 'object' && 'recoveredRuns' in out) {
+            report.swarm = out;
+          }
+        } catch {
+          // isolate hook startup failure
+        }
+      }
+    }
     this.wake();
     return report;
   }

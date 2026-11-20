@@ -75,7 +75,7 @@ export function createWorkspaceTools({
   processManager = null,
   sandbox = null,
   mcpTools = [],
-  requestApproval = async () => true,
+  requestApproval = null,
   onBeforeMutate = () => {},
   onFileChanged = () => {},
   onToolOutput = () => {},
@@ -103,17 +103,26 @@ export function createWorkspaceTools({
         approvedPrefixes: getApprovedPrefixes(),
       })
     ) {
+      if (typeof requestApproval !== 'function') {
+        throw new Error(`安全拒绝：工具 ${toolName} 需要人工审批，但审批服务不可用`);
+      }
       const prefix =
         toolName === 'bash' || toolName === 'start_process'
           ? canonicalizeCommandPrefix(args?.command)
           : null;
-      const allowed = await requestApproval({
+      const decision = await requestApproval({
         tool: toolName,
         arguments: { ...args, ...(prefix ? { commandPrefix: prefix } : {}) },
         callId: ctx?.callId,
       });
+      const allowed =
+        typeof decision === 'object' && decision !== null
+          ? decision.allowed === true
+          : decision === true;
       if (!allowed) throw new Error(`用户拒绝了 ${toolName} 操作`);
-      approvalId = `approved-${ctx?.callId || ++seq}`;
+      approvalId =
+        (typeof decision === 'object' && decision?.approvalId) ||
+        `approved-${ctx?.callId || ++seq}`;
     }
     const effectId = `${toolName}-${ctx?.callId || 'local'}-${++seq}`;
     const binding = {

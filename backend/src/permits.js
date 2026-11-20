@@ -30,7 +30,7 @@ export class ExecutePermitRegistry {
   #byEffect = new Map();
   #open = true;
 
-  issue({ owner, effectId, approvalId, evidenceId, callId, attempt = 1 }) {
+  issue({ owner, effectId, approvalId, evidenceId, callId, argsDigest = null, attempt = 1 }) {
     if (!this.#open) refused('permit registry is closed');
     if (!owner || typeof owner !== 'object') refused('permit owner is invalid');
     if (!effectId || typeof effectId !== 'string')
@@ -59,6 +59,7 @@ export class ExecutePermitRegistry {
       approvalId: approvalId ?? null,
       evidenceId,
       callId: callId ?? null,
+      argsDigest: argsDigest ?? null,
       attempt,
     });
     this.#live.set(permit, binding);
@@ -89,6 +90,7 @@ export class ExecutePermitRegistry {
       binding.evidenceId !== expected.evidenceId ||
       binding.approvalId !== (expected.approvalId ?? null) ||
       binding.callId !== (expected.callId ?? null) ||
+      binding.argsDigest !== (expected.argsDigest ?? null) ||
       binding.attempt !== (expected.attempt ?? 1)
     ) {
       refused('permit is unknown, stale, or bound to another dispatch');

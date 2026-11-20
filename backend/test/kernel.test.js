@@ -145,9 +145,29 @@ test('P1 Kernel: Unified AgentLoop runs multiple profiles, emits compaction & or
   const tools = [
     {
       name: 'echo_tool',
+      meta: {
+        readOnly: true,
+        effectClass: 'read_only',
+        riskLevel: 'low',
+        replayable: true,
+        outward: false,
+      },
       isConcurrencySafe: () => true,
       async execute(args) {
         return `echo:${args.msg}`;
+      },
+    },
+    {
+      name: 'danger_tool',
+      meta: {
+        readOnly: false,
+        effectClass: 'irreversible_side_effect',
+        riskLevel: 'high',
+        replayable: false,
+        outward: false,
+      },
+      async execute() {
+        throw new Error('SHOULD_NEVER_EXECUTE_WITHOUT_APPROVAL');
       },
     },
   ];
@@ -196,6 +216,17 @@ test('P1 Kernel: Unified AgentLoop runs multiple profiles, emits compaction & or
     });
     assert.equal(res2.status, 'completed');
     assert.equal(res2.text, 'Done: hello-kernel');
+
+    // Verify Kernel default ToolDispatcher fails closed when non-readonly tool lacks approval callback
+    const failClosedOut = await kernel.toolDispatcher.dispatchBatch({
+      sessionId: 'sess-kernel-2',
+      turnId: 'turn-k2',
+      toolCalls: [{ id: 'tc-danger', name: 'danger_tool', arguments: '{}' }],
+      tools,
+      permissionMode: 'approval',
+    });
+    assert.equal(failClosedOut[0].isError, true);
+    assert.match(failClosedOut[0].output, /Fail-Closed/);
   } finally {
     kernel.close();
     cleanup();

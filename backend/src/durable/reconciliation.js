@@ -19,6 +19,11 @@ export class UnknownOutcomeReconciler {
   constructor(store, eventRouter) {
     this.store = store;
     this.eventRouter = eventRouter;
+    this.resolvedListeners = [];
+  }
+
+  onResolved(fn) {
+    if (typeof fn === 'function') this.resolvedListeners.push(fn);
   }
 
   recordReceiptStart({
@@ -35,6 +40,8 @@ export class UnknownOutcomeReconciler {
     args = {},
     approvalId = null,
     permitEffectId = null,
+    approvedArgsDigest = null,
+    hookDigest = null,
   }) {
     const now = Date.now();
     const argsDigest = sha256Hex(JSON.stringify(args ?? {}));
@@ -43,9 +50,9 @@ export class UnknownOutcomeReconciler {
         .prepare(
           `INSERT INTO tool_receipts(
             id, sessionId, turnId, taskId, callId, toolName, riskLevel, effectClass,
-            replayable, outward, argsDigest, approvalId, permitEffectId, status,
-            durationMs, createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'executing',0,?,?)`,
+            replayable, outward, argsDigest, approvalId, permitEffectId, approvedArgsDigest, hookDigest,
+            status, durationMs, createdAt, updatedAt
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'executing',0,?,?)`,
         )
         .run(
           id,
@@ -61,6 +68,8 @@ export class UnknownOutcomeReconciler {
           argsDigest,
           approvalId,
           permitEffectId,
+          approvedArgsDigest,
+          hookDigest,
           now,
           now,
         );
@@ -447,6 +456,13 @@ export class UnknownOutcomeReconciler {
         data: result,
         audit: true,
       });
+    }
+    for (const listener of this.resolvedListeners) {
+      try {
+        listener(result);
+      } catch {
+        // isolate hook failure
+      }
     }
     if (normalizedOutcome !== 'abort') {
       this.store.notifyJobWake();

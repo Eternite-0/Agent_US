@@ -186,10 +186,61 @@ export interface SwarmRun {
   sessionId: string;
   goal: string;
   status: string;
+  planVersion?: number;
+  currentPhase?: string;
+  replanCount?: number;
+  errorCode?: string | null;
+  errorMessage?: string | null;
   usage: Record<string, unknown>;
   nodes: SwarmNode[];
   createdAt: number;
   updatedAt: number;
+}
+
+export interface SwarmSubmitResponse {
+  runId: string;
+  sessionId: string;
+  status: string;
+  run: SwarmRun;
+}
+
+export interface SwarmReplan {
+  id: string;
+  runId: string;
+  version: number;
+  failedNodeKey?: string | null;
+  strategy: string;
+  reason?: string | null;
+  diff: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface ChildNotification {
+  id: string;
+  idempotencyKey: string;
+  parentSessionId: string;
+  childSessionId: string;
+  runId?: string | null;
+  nodeKey?: string | null;
+  status: string;
+  payload: Record<string, unknown>;
+  delivered: number;
+  createdAt: number;
+}
+
+export interface ScheduledTaskRun {
+  id: string;
+  scheduleId: string;
+  scheduledFor: number;
+  idempotencyKey: string;
+  jobId?: string | null;
+  sessionId?: string | null;
+  turnId?: string | null;
+  status: string;
+  error?: string | null;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  createdAt: number;
 }
 
 export interface ScheduledTask {
@@ -198,6 +249,10 @@ export interface ScheduledTask {
   prompt: string;
   scheduleKind: string;
   scheduleExpr: string;
+  timezone?: string;
+  concurrencyPolicy?: string;
+  misfirePolicy?: string;
+  maxConcurrency?: number;
   workspaceRoot?: string | null;
   model?: string | null;
   permissionMode: string;
@@ -315,13 +370,38 @@ export function connectRuntime(base: string, token: string) {
       req<{ models: unknown[]; archetypes: unknown[] }>('GET', 'swarm/capabilities'),
     swarmRuns: (sessionId?: string) =>
       req<{ items: SwarmRun[] }>('GET', sessionId ? `swarm/runs?sessionId=${encodeURIComponent(sessionId)}` : 'swarm/runs'),
-    startSwarm: (body: { goal: string; sessionId?: string; maxConcurrency?: number; nodes?: unknown[] }) =>
-      req<SwarmRun>('POST', 'swarm/runs', body),
+    startSwarm: (body: { goal: string; sessionId?: string; maxConcurrency?: number; nodes?: unknown[]; wait?: boolean }) =>
+      req<SwarmRun | SwarmSubmitResponse>('POST', 'swarm/runs', body),
+    submitSwarmRun: (body: { goal: string; sessionId?: string; maxConcurrency?: number; nodes?: unknown[]; maxReplans?: number }) =>
+      req<SwarmSubmitResponse>('POST', 'swarm/runs', body),
+    getSwarmRun: (id: string) =>
+      req<SwarmRun>('GET', `swarm/runs/${encodeURIComponent(id)}`),
+    resumeSwarmRun: (id: string) =>
+      req<SwarmRun>('POST', `swarm/runs/${encodeURIComponent(id)}/resume`),
+    listSwarmReplans: (id: string) =>
+      req<{ items: SwarmReplan[] }>('GET', `swarm/runs/${encodeURIComponent(id)}/replans`),
+    listSessionNotifications: (sessionId: string, unreadOnly = false) =>
+      req<{ items: ChildNotification[] }>(
+        'GET',
+        `sessions/${encodeURIComponent(sessionId)}/notifications${unreadOnly ? '?unreadOnly=true' : ''}`,
+      ),
     schedules: () => req<{ items: ScheduledTask[] }>('GET', 'schedules'),
-    createSchedule: (body: { name?: string; prompt: string; scheduleKind?: string; scheduleExpr?: string }) =>
-      req<ScheduledTask>('POST', 'schedules', body),
+    createSchedule: (body: {
+      name?: string;
+      prompt: string;
+      scheduleKind?: string;
+      scheduleExpr?: string;
+      timezone?: string;
+      concurrencyPolicy?: string;
+      misfirePolicy?: string;
+      maxConcurrency?: number;
+    }) => req<ScheduledTask>('POST', 'schedules', body),
     runSchedule: (id: string) =>
       req<{ schedule: ScheduledTask; session: RuntimeSession; turn: RuntimeTurn }>('POST', `schedules/${encodeURIComponent(id)}/run`),
+    listScheduleRuns: (id: string, limit = 50) =>
+      req<{ items: ScheduledTaskRun[] }>('GET', `schedules/${encodeURIComponent(id)}/runs?limit=${limit}`),
+    cancelScheduleRun: (id: string, runId: string) =>
+      req<ScheduledTaskRun>('POST', `schedules/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/cancel`),
     auditIntegrity: () => req<IntegrityReport>('GET', 'audit/integrity'),
   };
 }

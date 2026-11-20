@@ -3,7 +3,14 @@ import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
+import { id as uuid } from '../store.js';
 import { sandbox as dockerSandbox } from '../tools.js';
+
+export const ISOLATION_MODES = Object.freeze({
+  WORKTREE: 'worktree',
+  SHARED_READONLY: 'shared_readonly',
+  SHARED_WORKSPACE: 'shared_workspace',
+});
 
 const execFileAsync = promisify(execFile);
 
@@ -230,22 +237,50 @@ export class DockerSandboxAdapter {
  * Manages temporary isolated Git Worktrees for parallel write agents.
  */
 export class GitWorktreeIsolator {
-  constructor() {
-    this.active = new Set();
+  constructor(store = null) {
+    this.store = store;
+    this.active = new Map(); // leaseId -> entry
   }
 
-  async acquire(workspaceRoot, prefix = 'agent-us-wt-') {
+  async acquire(
+    workspaceRoot,
+    {
+      prefix = 'agent-us-wt-',
+      ownerId = `owner-${process.pid}`,
+      sessionId = null,
+      runId = null,
+      nodeKey = null,
+    } = {},
+  ) {
+    // Support legacy positional string arg: acquire(workspaceRoot, 'custom-prefix-')
+    if (typeof arguments[1] === 'string') {
+      prefix = arguments[1];
+    }
+    const wsRoot = resolve(workspaceRoot);
+    const leaseId = uuid();
     const tmpDir = join(tmpdir(), `${prefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(tmpDir, { recursive: true });
     try {
       await execFileAsync('git', ['worktree', 'add', '--detach', tmpDir, 'HEAD'], {
-        cwd: workspaceRoot,
+        cwd: wsRoot,
         windowsHide: true,
         timeout: 10000,
       });
+      if (this.store?.db?.isOpen) {
+        this.store.tx(() => {
+          this.store.db
+            .prepare(
+              `INSERT INTO worktree_leases(
+                id, ownerId, sessionId, runId, nodeKey, workspaceRoot, worktreePath, status, createdAt
+              ) VALUES(?,?,?,?,?,?,?,'active',?)`,
+            )
+            .run(leaseId, ownerId, sessionId, runId, nodeKey, wsRoot, tmpDir, Date.now());
+        });
+      }
       const entry = {
+        leaseId,
         path: tmpDir,
-        workspaceRoot,
+        workspaceRoot: wsRoot,
         released: false,
         async diffSummary() {
           try {
@@ -262,24 +297,70 @@ export class GitWorktreeIsolator {
         release: async () => {
           if (entry.released) return;
           entry.released = true;
-          this.active.delete(entry);
+          this.active.delete(leaseId);
           await execFileAsync('git', ['worktree', 'remove', '--force', tmpDir], {
-            cwd: workspaceRoot,
+            cwd: wsRoot,
             windowsHide: true,
             timeout: 8000,
           }).catch(() => {});
-          rmSync(tmpDir, { recursive: true, force: true });
+          rmSync(tmpDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
+          if (this.store?.db?.isOpen) {
+            try {
+              this.store.tx(() => {
+                this.store.db
+                  .prepare("UPDATE worktree_leases SET status='cleaned', cleanedAt=? WHERE id=?")
+                  .run(Date.now(), leaseId);
+              });
+            } catch {
+              // ignore if store closing concurrently
+            }
+          }
         },
       };
-      this.active.add(entry);
+      this.active.set(leaseId, entry);
       return entry;
     } catch (err) {
-      rmSync(tmpDir, { recursive: true, force: true });
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
       throw err;
     }
   }
 
+  async cleanupOrphans({ activeOwnerIds = new Set() } = {}) {
+    if (!this.store?.db?.isOpen) return { cleaned: 0, paths: [] };
+    const rows = this.store.db
+      .prepare("SELECT * FROM worktree_leases WHERE status='active' ORDER BY createdAt ASC")
+      .all();
+    const cleanedPaths = [];
+    for (const r of rows) {
+      if (this.active.has(r.id) || activeOwnerIds.has(r.ownerId)) continue;
+      if (existsSync(r.workspaceRoot)) {
+        await execFileAsync('git', ['worktree', 'remove', '--force', r.worktreePath], {
+          cwd: r.workspaceRoot,
+          windowsHide: true,
+          timeout: 8000,
+        }).catch(() => {});
+        await execFileAsync('git', ['worktree', 'prune'], {
+          cwd: r.workspaceRoot,
+          windowsHide: true,
+          timeout: 5000,
+        }).catch(() => {});
+      }
+      try {
+        rmSync(r.worktreePath, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
+      } catch {
+        // ignore if already gone
+      }
+      this.store.tx(() => {
+        this.store.db
+          .prepare("UPDATE worktree_leases SET status='orphan_cleaned', cleanedAt=? WHERE id=?")
+          .run(Date.now(), r.id);
+      });
+      cleanedPaths.push(r.worktreePath);
+    }
+    return { cleaned: cleanedPaths.length, paths: cleanedPaths };
+  }
+
   async cleanupAll() {
-    await Promise.allSettled([...this.active].map((e) => e.release()));
+    await Promise.allSettled([...this.active.values()].map((e) => e.release()));
   }
 }

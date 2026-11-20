@@ -338,14 +338,30 @@ export class HookRunner {
     return handlers;
   }
 
+  #resolveHookKind(eventName, item) {
+    const raw = String(item?.kind ?? '').toLowerCase();
+    if (raw === 'security' || raw === 'transform' || raw === 'observation') return raw;
+    return eventName === 'PreToolUse' ? 'security' : 'observation';
+  }
+
   async run(eventName, payload = {}) {
     const handlers = this.#getHandlers(eventName);
     if (!handlers.length) {
-      return { blocked: false, reason: null, updatedInput: null, additionalContexts: [] };
+      return {
+        blocked: false,
+        reason: null,
+        hookKind: null,
+        updatedInput: null,
+        transformApplied: false,
+        additionalContexts: [],
+        warnings: [],
+      };
     }
     const toolName = String(payload.tool ?? '');
     const additionalContexts = [];
+    const warnings = [];
     let updatedInput = null;
+    let transformApplied = false;
 
     for (const h of handlers) {
       if (h.matcher) {
@@ -355,12 +371,17 @@ export class HookRunner {
           if (String(h.matcher) !== toolName) continue;
         }
       }
+      const kind = this.#resolveHookKind(eventName, h);
+      const currentPayload = updatedInput
+        ? { ...payload, arguments: updatedInput }
+        : payload;
       const res = await runShellHook(
         h.command,
-        { event: eventName, workspaceRoot: this.workspaceRoot, ...payload },
+        { event: eventName, hookKind: kind, workspaceRoot: this.workspaceRoot, ...currentPayload },
         this.workspaceRoot,
         Number(h.timeoutMs ?? 10000),
       );
+
       let parsed = null;
       const trimmedOut = res.stdout.trim();
       if (trimmedOut.startsWith('{') && trimmedOut.endsWith('}')) {
@@ -370,20 +391,82 @@ export class HookRunner {
           parsed = null;
         }
       }
-      if (res.exitCode === 2 || parsed?.decision === 'block') {
-        return {
-          blocked: true,
-          reason:
-            parsed?.reason ||
-            res.stderr.trim() ||
-            trimmedOut ||
-            `被生命周期 Hook (${eventName}) 拦截`,
-          updatedInput: null,
-          additionalContexts,
-        };
+
+      if (kind === 'security') {
+        if (
+          res.exitCode !== 0 ||
+          parsed?.decision === 'block' ||
+          parsed?.decision === 'deny'
+        ) {
+          return {
+            blocked: true,
+            failClosed: true,
+            hookKind: 'security',
+            reason:
+              parsed?.reason ||
+              res.stderr.trim() ||
+              trimmedOut ||
+              `安全 Hook (${eventName}) 失败或拦截 (exit=${res.exitCode})`,
+            updatedInput: null,
+            transformApplied: false,
+            additionalContexts,
+            warnings,
+          };
+        }
+        if (typeof parsed?.additionalContext === 'string' && parsed.additionalContext.trim()) {
+          additionalContexts.push(parsed.additionalContext.trim().slice(0, 4096));
+        }
+        continue;
       }
-      if (parsed?.updatedInput && typeof parsed.updatedInput === 'object') {
-        updatedInput = parsed.updatedInput;
+
+      if (kind === 'transform') {
+        if (res.exitCode !== 0 || parsed?.decision === 'block' || parsed?.decision === 'deny') {
+          return {
+            blocked: true,
+            failClosed: true,
+            hookKind: 'transform',
+            reason:
+              parsed?.reason ||
+              res.stderr.trim() ||
+              trimmedOut ||
+              `参数变换 Hook (${eventName}) 失败 (exit=${res.exitCode})`,
+            updatedInput: null,
+            transformApplied: false,
+            additionalContexts,
+            warnings,
+          };
+        }
+        if (parsed?.updatedInput !== undefined) {
+          if (
+            !parsed.updatedInput ||
+            typeof parsed.updatedInput !== 'object' ||
+            Array.isArray(parsed.updatedInput)
+          ) {
+            return {
+              blocked: true,
+              failClosed: true,
+              hookKind: 'transform',
+              reason: `参数变换 Hook 返回非对象 updatedInput`,
+              updatedInput: null,
+              transformApplied: false,
+              additionalContexts,
+              warnings,
+            };
+          }
+          updatedInput = parsed.updatedInput;
+          transformApplied = true;
+        }
+        if (typeof parsed?.additionalContext === 'string' && parsed.additionalContext.trim()) {
+          additionalContexts.push(parsed.additionalContext.trim().slice(0, 4096));
+        }
+        continue;
+      }
+
+      // Observation hook: cannot block, cannot mutate inputs, cannot grant authorization
+      if (res.exitCode !== 0) {
+        warnings.push(
+          `观察型 Hook (${eventName}) 返回非零退出码 ${res.exitCode}: ${(res.stderr || trimmedOut).slice(0, 200)}`,
+        );
       }
       if (typeof parsed?.additionalContext === 'string' && parsed.additionalContext.trim()) {
         additionalContexts.push(parsed.additionalContext.trim().slice(0, 4096));
@@ -392,6 +475,14 @@ export class HookRunner {
       }
     }
 
-    return { blocked: false, reason: null, updatedInput, additionalContexts };
+    return {
+      blocked: false,
+      reason: null,
+      hookKind: null,
+      updatedInput,
+      transformApplied,
+      additionalContexts,
+      warnings,
+    };
   }
 }

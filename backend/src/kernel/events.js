@@ -33,6 +33,7 @@ export const RUNTIME_EVENTS = Object.freeze({
   SUBAGENT_FAILED: 'subagent/failed',
   SWARM_RUN_STARTED: 'swarm/run_started',
   SWARM_NODE_UPDATED: 'swarm/node_updated',
+  SWARM_REPLANNED: 'swarm/replanned',
   SWARM_MESSAGE: 'swarm/message',
   SWARM_RUN_COMPLETED: 'swarm/run_completed',
 });

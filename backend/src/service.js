@@ -17,6 +17,7 @@ import { JudgmentService } from './judgment.js';
 import { RefinementService } from './refinement.js';
 import { createDefaultSeams } from './seams.js';
 import { ControlPlane } from './governance/control-plane.js';
+import { ShutdownCoordinator } from './runtime/shutdown.js';
 
 const ROLES = ['Researcher', 'Planner', 'Coder', 'Reviewer', 'Tester'];
 
@@ -143,6 +144,32 @@ export async function service({
     checkin.start();
     controlPlane.scheduler.start();
     engine.start();
+
+    const shutdownCoordinator = new ShutdownCoordinator();
+    shutdownCoordinator.registerStage('http', () => app?.close(), { order: 10, timeoutMs: 4000 });
+    shutdownCoordinator.registerStage(
+      'checkin_scheduler',
+      () => {
+        checkin?.stop();
+        controlPlane?.close();
+      },
+      { order: 20, timeoutMs: 3000 },
+    );
+    shutdownCoordinator.registerStage('direct_agent', () => directAgent?.close(), {
+      order: 30,
+      timeoutMs: 5000,
+    });
+    shutdownCoordinator.registerStage('engine', () => engine?.stop(), { order: 40, timeoutMs: 5000 });
+    shutdownCoordinator.registerStage('providers', () => providers?.stop(), { order: 50, timeoutMs: 3000 });
+    shutdownCoordinator.registerStage('fiber', () => ctx?.fiber.dispose(), { order: 60, timeoutMs: 3000 });
+    shutdownCoordinator.registerStage(
+      'store',
+      () => {
+        if (store?.db?.isOpen) store.close();
+      },
+      { order: 90, timeoutMs: 3000 },
+    );
+
     return {
       app,
       store,
@@ -156,15 +183,9 @@ export async function service({
       judgment,
       refinement,
       seams: ctx.seams,
-      async close() {
-        checkin.stop();
-        controlPlane.close();
-        directAgent.close();
-        await app.close();
-        await engine.stop();
-        await providers.stop();
-        await ctx.fiber.dispose();
-        store.close();
+      shutdownCoordinator,
+      close() {
+        return shutdownCoordinator.shutdown();
       },
     };
   } catch (e) {
