@@ -840,7 +840,7 @@ test('Fix C10: stale attempt/fence cannot overwrite newer attempt artifact or de
       taskId: 'run-f',
       payload: { runId: 'run-f', nodeId: 'node-f', nodeKey: 'n1', sessionId: 'sess-f', planVersion: 1, attemptSeq: 1 },
     });
-    const claimA = direct.jobQueue.claim({ workerId: 'worker-A', kinds: ['swarm_node_execute'], leaseMs: 1000 });
+    const claimA = direct.jobQueue.claim({ workerId: 'worker-A', kinds: ['swarm_node_execute'], leaseMs: 60000 });
     const wtA = await direct.worktreeIsolator.acquire(workDir, {
       ownerId: 'child-a',
       workerId: 'worker-A',
@@ -856,7 +856,8 @@ test('Fix C10: stale attempt/fence cannot overwrite newer attempt artifact or de
     store.tx(() => {
       store.db.prepare('UPDATE runtime_jobs SET leaseExpiresAt=? WHERE id=?').run(Date.now() - 2000, job.id);
     });
-    const claimB = direct.jobQueue.claim({ workerId: 'worker-B', kinds: ['swarm_node_execute'], leaseMs: 10000 });
+    const claimB = direct.jobQueue.claim({ workerId: 'worker-B', kinds: ['swarm_node_execute'], leaseMs: 60000 });
+    assert.ok(claimB, 'Worker B must reclaim the explicitly expired lease');
     const wtB = await direct.worktreeIsolator.acquire(workDir, {
       ownerId: 'child-b',
       workerId: 'worker-B',
