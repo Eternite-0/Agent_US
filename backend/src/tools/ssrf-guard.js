@@ -160,31 +160,43 @@ export async function validateExternalUrl(rawUrl, { lookupImpl = dns.promises.lo
     });
   }
 
-  let resolved;
-  try {
-    resolved = await lookupImpl(parsed.hostname, { all: true });
-  } catch (err) {
-    throw new PolicyError('DNS_RESOLUTION_FAILED', {
-      message: `域名解析失败 (${parsed.hostname}): ${err?.message ?? err}`,
-    });
-  }
-  const rawAddrs = Array.isArray(resolved) ? resolved : [resolved];
+  const cleanHost = parsed.hostname.replace(/^\[|\]$/g, '');
+  const literalIpFamily = net.isIP(cleanHost);
   const validatedAddrs = [];
-  for (const entry of rawAddrs) {
-    const address = String(typeof entry === 'string' ? entry : entry?.address ?? '').trim();
-    if (!address || isPrivateIpAddress(address)) {
-      throw new PolicyError('SSRF_DNS_BLOCKED', {
-        message: `安全拦截：域名 ${parsed.hostname} 解析到内网或保留 IP`,
+
+  if (literalIpFamily === 4 || literalIpFamily === 6) {
+    if (isPrivateIpAddress(cleanHost)) {
+      throw new PolicyError('SSRF_BLOCKED', {
+        message: `安全拦截：不允许访问本机或内网地址 (${parsed.hostname})`,
       });
     }
-    const family =
-      Number(entry?.family) || (net.isIPv6(address) ? 6 : net.isIPv4(address) ? 4 : 0);
-    if (family !== 4 && family !== 6) {
-      throw new PolicyError('SSRF_DNS_BLOCKED', {
-        message: `安全拦截：域名 ${parsed.hostname} 返回无效 IP 地址`,
+    validatedAddrs.push({ address: cleanHost, family: literalIpFamily });
+  } else {
+    let resolved;
+    try {
+      resolved = await lookupImpl(cleanHost, { all: true });
+    } catch (err) {
+      throw new PolicyError('DNS_RESOLUTION_FAILED', {
+        message: `域名解析失败 (${parsed.hostname}): ${err?.message ?? err}`,
       });
     }
-    validatedAddrs.push({ address, family });
+    const rawAddrs = Array.isArray(resolved) ? resolved : [resolved];
+    for (const entry of rawAddrs) {
+      const address = String(typeof entry === 'string' ? entry : entry?.address ?? '').trim();
+      if (!address || isPrivateIpAddress(address)) {
+        throw new PolicyError('SSRF_DNS_BLOCKED', {
+          message: `安全拦截：域名 ${parsed.hostname} 解析到内网或保留 IP`,
+        });
+      }
+      const family =
+        Number(entry?.family) || (net.isIPv6(address) ? 6 : net.isIPv4(address) ? 4 : 0);
+      if (family !== 4 && family !== 6) {
+        throw new PolicyError('SSRF_DNS_BLOCKED', {
+          message: `安全拦截：域名 ${parsed.hostname} 返回无效 IP 地址`,
+        });
+      }
+      validatedAddrs.push({ address, family });
+    }
   }
   if (!validatedAddrs.length) {
     throw new PolicyError('SSRF_DNS_BLOCKED', {

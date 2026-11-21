@@ -929,12 +929,14 @@ export class GitWorktreeIsolator {
     } catch (err) {
       if (cloneSourceCandidate && this.store?.db?.isOpen) {
         try {
+          const restoreStatus = cloneSourceCandidate.status || 'active';
+          const restoreCleanupState = cloneSourceCandidate.cleanupState ?? restoreStatus;
           this.store.tx(() => {
             this.store.db
               .prepare(
-                "UPDATE worktree_leases SET status='preserved', cleanupState='preserved', updatedAt=? WHERE id=? AND status='superseded'",
+                "UPDATE worktree_leases SET status=?, cleanupState=?, updatedAt=? WHERE id=? AND status='superseded'",
               )
-              .run(Date.now(), cloneSourceCandidate.id);
+              .run(restoreStatus, restoreCleanupState, Date.now(), cloneSourceCandidate.id);
           });
         } catch {
           // ignore restore failure

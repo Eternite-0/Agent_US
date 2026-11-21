@@ -430,6 +430,39 @@ test('Scenario #8: Pre-execution approval revocation, policy tightening, nested 
       (err) => err.code === 'POLICY_DENIED',
     );
     assert.equal(existsSync(join(workDir, 'should-not-write.txt')), false);
+
+    // 8g. decideApproval on an expired approval commits status='expired' (no tx rollback) and resolves pending waiter
+    let expiredAprId = null;
+    const expiredWaiter = approvalManager.requestApproval({
+      sessionId: 'sess-s8',
+      turnId: 'turn-s8-exp',
+      callId: 'tc-s8-exp',
+      tool: 'deploy_service',
+      args: { config: { target: 'expired' } },
+      argsDigest: computeArgsDigest('deploy_service', { config: { target: 'expired' } }),
+      timeoutMs: 60000,
+    });
+    const expRowPending = store.db
+      .prepare("SELECT id FROM direct_approvals WHERE turnId='turn-s8-exp'")
+      .get();
+    expiredAprId = expRowPending.id;
+    store.tx(() => {
+      store.db
+        .prepare('UPDATE direct_approvals SET expiresAt=? WHERE id=?')
+        .run(Date.now() - 5000, expiredAprId);
+    });
+    assert.throws(
+      () => approvalManager.decideApproval(expiredAprId, { decision: 'allow' }),
+      (err) => err.code === 'APPROVAL_EXPIRED' && err.status === 409,
+    );
+    const expRowAfter = store.db
+      .prepare('SELECT status, resolvedAt FROM direct_approvals WHERE id=?')
+      .get(expiredAprId);
+    assert.equal(expRowAfter.status, 'expired', 'expired status must be committed, not rolled back to pending');
+    assert.ok(Number(expRowAfter.resolvedAt) > 0);
+    const expiredWaiterResult = await withTimeout(expiredWaiter, 3000, 'expired waiter resolution');
+    assert.equal(expiredWaiterResult.allowed, false);
+    assert.equal(expiredWaiterResult.expired, true);
   } finally {
     store.close();
     rmDirSafe(dir);
@@ -882,6 +915,32 @@ test('Scenario #16: Cross-OS path case sensitivity, dangling/intra-workspace sym
       (err) => err.code === 'SSRF_DNS_BLOCKED',
     );
 
+    // Bracketed public IPv6 & public IPv4 literals bypass DNS lookup and pin directly
+    let literalLookupCalls = 0;
+    const publicIpv6Parsed = await validateExternalUrl(
+      'https://[2606:2800:220:1:248:1893:25c8:1946]/resource',
+      {
+        lookupImpl: async () => {
+          literalLookupCalls++;
+          throw new Error('DNS should not be called for IP literals');
+        },
+      },
+    );
+    assert.equal(literalLookupCalls, 0);
+    assert.deepEqual(publicIpv6Parsed._resolvedAddresses, [
+      { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 },
+    ]);
+    const publicIpv4Parsed = await validateExternalUrl('https://93.184.216.34/resource', {
+      lookupImpl: async () => {
+        literalLookupCalls++;
+        throw new Error('DNS should not be called for IP literals');
+      },
+    });
+    assert.equal(literalLookupCalls, 0);
+    assert.deepEqual(publicIpv4Parsed._resolvedAddresses, [
+      { address: '93.184.216.34', family: 4 },
+    ]);
+
     assert.equal(
       intersectPolicies({ permissionMode: 'unknown-typo' }, { permissionMode: 'full-access' })
         .permissionMode,
@@ -944,7 +1003,40 @@ test('Scenario #16: Cross-OS path case sensitivity, dangling/intra-workspace sym
     });
     writeFileSync(join(wtA.path, 'dirty.txt'), 'from-worker-A\n', 'utf8');
 
-    // Worker B reclaims the expired lease while worker A's PID is STILL alive!
+    // Simulate a clone failure (invalid baseCommit) -> must restore status='active' (NOT 'preserved')
+    // so the subsequent retry STILL clones instead of rehydrating in-place into the live PID's dir!
+    const origBaseCommit = store.db
+      .prepare('SELECT baseCommit FROM worktree_leases WHERE id=?')
+      .get(wtA.leaseId).baseCommit;
+    store.tx(() => {
+      store.db
+        .prepare("UPDATE worktree_leases SET baseCommit='deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' WHERE id=?")
+        .run(wtA.leaseId);
+    });
+    await assert.rejects(() =>
+      isolator.acquire(gitDir, {
+        ownerId: 'owner-B-fail',
+        workerId: 'w-B',
+        runId: 'run-p010',
+        nodeKey: 'node-1',
+        jobId: 'j-B',
+        fence: 'f2',
+        attempt: 2,
+        rehydrateExisting: true,
+      }),
+    );
+    const afterFailedClone = store.db
+      .prepare('SELECT status, cleanupState FROM worktree_leases WHERE id=?')
+      .get(wtA.leaseId);
+    assert.equal(afterFailedClone.status, 'active', 'failed clone must restore prior active status, not preserved');
+    assert.equal(afterFailedClone.cleanupState, 'active');
+    store.tx(() => {
+      store.db
+        .prepare('UPDATE worktree_leases SET baseCommit=? WHERE id=?')
+        .run(origBaseCommit, wtA.leaseId);
+    });
+
+    // Worker B retries reclaiming the expired lease while worker A's PID is STILL alive -> MUST still clone!
     const wtB = await isolator.acquire(gitDir, {
       ownerId: 'owner-B',
       workerId: 'w-B',

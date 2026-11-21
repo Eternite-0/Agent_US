@@ -97,7 +97,7 @@ export class DirectApprovalManager {
     const now = Date.now();
     const args = parseJsonSafe(row.arguments, {});
 
-    const updatedRow = this.store.tx(() => {
+    const txOutcome = this.store.tx(() => {
       const fresh = this.store.db
         .prepare('SELECT * FROM direct_approvals WHERE id=?')
         .get(approvalId);
@@ -114,9 +114,10 @@ export class DirectApprovalManager {
             "UPDATE direct_approvals SET status='expired', resolvedAt=COALESCE(resolvedAt, ?) WHERE id=? AND status='pending'",
           )
           .run(now, approvalId);
-        throw new Fault('APPROVAL_EXPIRED', 409, {
-          message: `Approval ${approvalId} has expired`,
-        });
+        const expiredRow = this.store.db
+          .prepare('SELECT * FROM direct_approvals WHERE id=?')
+          .get(approvalId);
+        return { expired: true, row: expiredRow };
       }
 
       const res = this.store.db
@@ -152,12 +153,47 @@ export class DirectApprovalManager {
         }
       }
 
-      return this.store.db
-        .prepare('SELECT * FROM direct_approvals WHERE id=?')
-        .get(approvalId);
+      return {
+        expired: false,
+        row: this.store.db
+          .prepare('SELECT * FROM direct_approvals WHERE id=?')
+          .get(approvalId),
+      };
     });
 
-    if (!updatedRow) return null;
+    if (!txOutcome || !txOutcome.row) return null;
+
+    if (txOutcome.expired) {
+      const expiredRow = txOutcome.row;
+      const waiter = this.pendingApprovals.get(approvalId);
+      if (waiter) {
+        this.pendingApprovals.delete(approvalId);
+        waiter.resolve({
+          allowed: false,
+          expired: true,
+          approvalId: expiredRow.id,
+          argsDigest: expiredRow.argsDigest ?? waiter.argsDigest ?? null,
+          reason: 'Approval has expired',
+        });
+      }
+      this.#safeEmit({
+        sessionId: expiredRow.sessionId,
+        turnId: expiredRow.turnId,
+        type: RUNTIME_EVENTS.APPROVAL_RESOLVED,
+        data: {
+          approvalId: expiredRow.id,
+          status: 'expired',
+          expired: true,
+          tool: expiredRow.tool,
+        },
+        audit: true,
+      });
+      throw new Fault('APPROVAL_EXPIRED', 409, {
+        message: `Approval ${approvalId} has expired`,
+      });
+    }
+
+    const updatedRow = txOutcome.row;
 
     const waiter = this.pendingApprovals.get(approvalId);
     if (waiter) {
