@@ -63,6 +63,29 @@ export function getZonedParts(ms, timeZone = 'UTC') {
   };
 }
 
+/**
+ * Returns true if `ms` falls in the second (repeated) fold of a DST fall-back
+ * transition in `timeZone` (i.e. an earlier instant 30 or 60 minutes prior
+ * mapped to the exact same local wall-clock year/month/day/hour/minute).
+ */
+export function isSecondDstFold(ms, timeZone = 'UTC') {
+  const tz = validateTimezone(timeZone);
+  const cur = getZonedParts(ms, tz);
+  for (const delta of [1_800_000, 3_600_000]) {
+    const prev = getZonedParts(ms - delta, tz);
+    if (
+      prev.year === cur.year &&
+      prev.month === cur.month &&
+      prev.day === cur.day &&
+      prev.hour === cur.hour &&
+      prev.minute === cur.minute
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function parseCronField(fieldExpr, min, max, { normalizeDow = false } = {}) {
   const raw = String(fieldExpr ?? '').trim();
   if (!raw) {
@@ -253,28 +276,43 @@ export function validateScheduleConfig({
       message: `Cron expression must have 5 fields, got ${fields.length}: "${expr}"`,
     });
   }
+  const hours = parseCronField(fields[1], 0, 23);
   const parsed = {
     minutes: parseCronField(fields[0], 0, 59),
-    hours: parseCronField(fields[1], 0, 23),
+    hours,
     dom: parseCronField(fields[2], 1, 31),
     months: parseCronField(fields[3], 1, 12),
     dow: parseCronField(fields[4], 0, 7, { normalizeDow: true }),
+    hoursWildcard: fields[1] === '*' || hours.size >= 24,
     domWildcard: fields[2] === '*',
     dowWildcard: fields[4] === '*',
   };
   return { kind, expr, tz, cron: parsed, maxConc };
 }
 
-function matchDateParts(parts, cron) {
+function matchDay(parts, cron) {
   if (!cron.months.has(parts.month)) return false;
   const domMatch = cron.dom.has(parts.day);
   const dowMatch = cron.dow.has(parts.weekday);
   // Standard POSIX cron day matching semantics when either DOM or DOW is restricted
-  const dayOk =
-    cron.domWildcard || cron.dowWildcard ? domMatch && dowMatch : domMatch || dowMatch;
-  if (!dayOk) return false;
+  return cron.domWildcard || cron.dowWildcard ? domMatch && dowMatch : domMatch || dowMatch;
+}
+
+function matchDateParts(parts, cron) {
+  if (!matchDay(parts, cron)) return false;
   return cron.hours.has(parts.hour) && cron.minutes.has(parts.minute);
 }
+
+/**
+ * Advances an interval anchor in O(1) strictly past `afterMs` while preserving cadence phase.
+ */
+export function advanceIntervalPast(anchorMs, intervalMs, afterMs) {
+  if (anchorMs > afterMs) return anchorMs;
+  const steps = Math.floor((afterMs - anchorMs) / intervalMs) + 1;
+  return anchorMs + steps * intervalMs;
+}
+
+const MAX_SCAN_DAYS = 1830;
 
 /**
  * Computes the next firing epoch in milliseconds strictly > `fromMs` using `timezone`.
@@ -291,9 +329,8 @@ export function computeNextRunAt(
     return fromMs + cfg.intervalMs;
   }
 
-  const fromParts = getZonedParts(fromMs, cfg.tz);
-  let cursor = fromMs - (fromMs % 60_000) + 60_000;
-  const maxCursor = fromMs + 366 * 86_400_000;
+  let cursor = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
+  const maxCursor = fromMs + MAX_SCAN_DAYS * 86_400_000;
 
   while (cursor <= maxCursor) {
     const p = getZonedParts(cursor, cfg.tz);
@@ -304,13 +341,7 @@ export function computeNextRunAt(
     }
     if (cfg.kind === 'daily') {
       if (p.hour === cfg.hour && p.minute === cfg.minute) {
-        const sameDayAlreadyMatched =
-          fromParts.year === p.year &&
-          fromParts.month === p.month &&
-          fromParts.day === p.day &&
-          fromParts.hour === cfg.hour &&
-          fromParts.minute === cfg.minute;
-        if (!sameDayAlreadyMatched) return cursor;
+        if (!isSecondDstFold(cursor, cfg.tz)) return cursor;
       }
       if (p.hour !== cfg.hour) {
         cursor += (60 - p.minute) * 60_000;
@@ -321,16 +352,14 @@ export function computeNextRunAt(
     }
     if (cfg.kind === 'weekly') {
       if (p.weekday === cfg.dow && p.hour === cfg.hour && p.minute === cfg.minute) {
-        const sameDayAlreadyMatched =
-          fromParts.year === p.year &&
-          fromParts.month === p.month &&
-          fromParts.day === p.day &&
-          fromParts.weekday === cfg.dow &&
-          fromParts.hour === cfg.hour &&
-          fromParts.minute === cfg.minute;
-        if (!sameDayAlreadyMatched) return cursor;
+        if (!isSecondDstFold(cursor, cfg.tz)) return cursor;
       }
-      if (p.weekday !== cfg.dow || p.hour !== cfg.hour) {
+      if (p.weekday !== cfg.dow) {
+        cursor +=
+          p.hour < 20
+            ? (21 - p.hour) * 3_600_000 - p.minute * 60_000
+            : (60 - p.minute) * 60_000;
+      } else if (p.hour !== cfg.hour) {
         cursor += (60 - p.minute) * 60_000;
       } else {
         cursor += 60_000;
@@ -338,16 +367,27 @@ export function computeNextRunAt(
       continue;
     }
 
-    // 5-field cron with smart hour skip when hours don't match
-    if (!cfg.cron.months.has(p.month) || !cfg.cron.hours.has(p.hour)) {
+    // 5-field cron with DST-safe day/hour skip
+    if (!matchDay(p, cfg.cron)) {
+      cursor +=
+        p.hour < 20
+          ? (21 - p.hour) * 3_600_000 - p.minute * 60_000
+          : (60 - p.minute) * 60_000;
+      continue;
+    }
+    if (!cfg.cron.hours.has(p.hour)) {
       cursor += (60 - p.minute) * 60_000;
       continue;
     }
-    if (matchDateParts(p, cfg.cron)) return cursor;
+    if (matchDateParts(p, cfg.cron)) {
+      if (cfg.cron.hoursWildcard || !isSecondDstFold(cursor, cfg.tz)) {
+        return cursor;
+      }
+    }
     cursor += 60_000;
   }
 
   throw new Fault('INVALID_SCHEDULE_CONFIG', 400, {
-    message: `No valid trigger found within 366 days for "${scheduleExpr}" (${timezone})`,
+    message: `No valid trigger found within ${MAX_SCAN_DAYS} days for "${scheduleExpr}" (${timezone})`,
   });
 }

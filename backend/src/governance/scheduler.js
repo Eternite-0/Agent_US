@@ -1,5 +1,6 @@
 import { Fault, id as uuid } from '../store.js';
-import { computeNextRunAt, validateScheduleConfig } from './cron.js';
+import { classifyJobOwnership } from '../durable/lease-guard.js';
+import { advanceIntervalPast, computeNextRunAt, validateScheduleConfig } from './cron.js';
 
 export { computeNextRunAt };
 
@@ -160,7 +161,8 @@ function ensureScheduledJobTx(store, runRow, { desiredStatus = 'pending', now = 
       return job;
     }
     if (job.status === 'active') {
-      if (job.leaseExpiresAt && job.leaseExpiresAt < now) store.notifyJobWake();
+      const ownership = classifyJobOwnership(store, job, { now, markDeadInDb: true });
+      if (ownership.reclaimable) store.notifyJobWake();
       return job;
     }
     if (job.status === 'parked') {
@@ -394,16 +396,76 @@ export function convergeScheduledRunForTurn(
  * Preserves zero-idle-polling: `timer === null` whenever no enabled tasks exist.
  */
 export class ScheduledTaskRunner {
-  constructor({ store, directAgent }) {
+  constructor({ store, directAgent, nowFn = null }) {
     this.store = store;
     this.directAgent = directAgent;
+    this.nowFn = typeof nowFn === 'function' ? nowFn : null;
     this.running = false;
     this.timer = null;
     this.unsubs = new Set();
+    this.turnWatchers = new Map(); // turnId -> { scheduleId, runId, unsub }
 
     this.directAgent?.recoveryWorker?.registerHandler('scheduled_task', (job, ctx) =>
       this.#executeScheduledJob(job, ctx),
     );
+  }
+
+  #now() {
+    return this.nowFn ? Number(this.nowFn()) : Date.now();
+  }
+
+  #unwatchTurn(turnId) {
+    const entry = this.turnWatchers.get(turnId);
+    if (!entry) return;
+    this.turnWatchers.delete(turnId);
+    this.unsubs.delete(entry.unsub);
+    try {
+      entry.unsub();
+    } catch {
+      // ignore listener cleanup
+    }
+  }
+
+  #unwatchSchedule(scheduleId) {
+    for (const [turnId, entry] of [...this.turnWatchers.entries()]) {
+      if (entry.scheduleId === scheduleId) {
+        this.#unwatchTurn(turnId);
+      }
+    }
+  }
+
+  #unwatchRun(runId) {
+    for (const [turnId, entry] of [...this.turnWatchers.entries()]) {
+      if (entry.runId === runId) {
+        this.#unwatchTurn(turnId);
+      }
+    }
+  }
+
+  #pruneSettledWatchers() {
+    if (!this.turnWatchers.size || !this.store?.db?.isOpen) return 0;
+    let pruned = 0;
+    for (const [turnId] of [...this.turnWatchers.entries()]) {
+      const turn = this.store.db
+        .prepare('SELECT state, error, finishedAt FROM direct_turns WHERE id=?')
+        .get(turnId);
+      if (!turn) {
+        this.#unwatchTurn(turnId);
+        pruned++;
+        continue;
+      }
+      const terminal = mapTurnStateToRunStatus(turn.state);
+      if (terminal) {
+        this.#unwatchTurn(turnId);
+        convergeScheduledRunForTurn(this.store, turnId, {
+          status: terminal,
+          error: turn.error ?? null,
+          finishedAt: turn.finishedAt ?? Date.now(),
+        });
+        pruned++;
+      }
+    }
+    return pruned;
   }
 
   #hydrate(row) {
@@ -425,9 +487,12 @@ export class ScheduledTaskRunner {
   start() {
     if (this.running) return;
     this.running = true;
-    this.reconcileRuns();
-    this.#recoverMisfires();
-    this.#rearmTimer();
+    try {
+      this.reconcileRuns();
+      this.recoverMisfires();
+    } finally {
+      this.#rearmTimer();
+    }
   }
 
   stop() {
@@ -435,6 +500,9 @@ export class ScheduledTaskRunner {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+    for (const turnId of [...this.turnWatchers.keys()]) {
+      this.#unwatchTurn(turnId);
     }
     for (const unsub of this.unsubs) {
       try {
@@ -502,8 +570,9 @@ export class ScheduledTaskRunner {
 
     const id = customId || uuid();
     const now = Date.now();
+    const scheduleNow = this.#now();
     const nextRunAt = enabled
-      ? computeNextRunAt(cfg.kind, cfg.expr, now, { timezone: cfg.tz })
+      ? computeNextRunAt(cfg.kind, cfg.expr, scheduleNow, { timezone: cfg.tz })
       : null;
 
     return this.#insertTask({
@@ -561,6 +630,7 @@ export class ScheduledTaskRunner {
   update(id, patch = {}) {
     const cur = this.get(id);
     const now = Date.now();
+    const scheduleNow = this.#now();
     const enabled = patch.enabled !== undefined ? Boolean(patch.enabled) : cur.enabled;
     const scheduleKind = patch.scheduleKind ?? cur.scheduleKind;
     const scheduleExpr = patch.scheduleExpr ?? cur.scheduleExpr;
@@ -585,8 +655,13 @@ export class ScheduledTaskRunner {
     });
 
     const nextRunAt = enabled
-      ? patch.nextRunAt ?? computeNextRunAt(cfg.kind, cfg.expr, now, { timezone: cfg.tz })
+      ? patch.nextRunAt ?? computeNextRunAt(cfg.kind, cfg.expr, scheduleNow, { timezone: cfg.tz })
       : null;
+
+    const capacityExpanded =
+      enabled &&
+      (cfg.maxConc > cur.maxConcurrency ||
+        (cur.concurrencyPolicy === 'queue' && String(concurrencyPolicy) === 'allow'));
 
     this.store.tx(() => {
       this.store.db
@@ -614,6 +689,9 @@ export class ScheduledTaskRunner {
           now,
           id,
         );
+      if (capacityExpanded) {
+        advanceQueuedRunsForScheduleTx(this.store, id, now);
+      }
     });
     this.#rearmTimer();
     return this.get(id);
@@ -621,6 +699,22 @@ export class ScheduledTaskRunner {
 
   delete(id) {
     this.get(id);
+    const activeTurnIds = this.store.db
+      .prepare(
+        "SELECT DISTINCT turnId FROM scheduled_task_runs WHERE scheduleId=? AND status IN ('queued','running') AND turnId IS NOT NULL",
+      )
+      .all(id)
+      .map((r) => r.turnId);
+
+    for (const turnId of activeTurnIds) {
+      try {
+        this.directAgent?.cancelTurn?.(turnId);
+      } catch {
+        // turn may already be terminal or missing
+      }
+    }
+
+    this.#unwatchSchedule(id);
     this.store.tx(() => {
       const now = Date.now();
       this.store.db
@@ -628,6 +722,18 @@ export class ScheduledTaskRunner {
           "UPDATE runtime_jobs SET status='cancelled', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE kind='scheduled_task' AND taskId=? AND status IN ('pending','active','parked','reconciling')",
         )
         .run(now, id);
+      for (const turnId of activeTurnIds) {
+        this.store.db
+          .prepare(
+            "UPDATE runtime_jobs SET status='cancelled', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE turnId=? AND status IN ('pending','active','parked','reconciling')",
+          )
+          .run(now, turnId);
+        this.store.db
+          .prepare(
+            "UPDATE direct_turns SET state='cancelled', phase='cancelled', finishedAt=COALESCE(finishedAt, ?) WHERE id=? AND state IN ('running','reconciling','parked')",
+          )
+          .run(now, turnId);
+      }
       this.store.db.prepare('DELETE FROM scheduled_tasks WHERE id=?').run(id);
     });
     this.#rearmTimer();
@@ -639,6 +745,7 @@ export class ScheduledTaskRunner {
       .prepare('SELECT * FROM scheduled_task_runs WHERE id=? AND scheduleId=?')
       .get(runId, scheduleId);
     if (!row) throw new Fault('SCHEDULE_RUN_NOT_FOUND', 404);
+    this.#unwatchRun(runId);
     if (row.turnId) {
       try {
         this.directAgent?.cancelTurn?.(row.turnId);
@@ -886,12 +993,15 @@ export class ScheduledTaskRunner {
 
         if (job.status === 'parked') {
           schedulesToAdvance.add(run.scheduleId);
-        } else if (
-          job.status === 'pending' ||
-          (job.status === 'active' && job.leaseExpiresAt && job.leaseExpiresAt < now)
-        ) {
+        } else if (job.status === 'pending') {
           this.store.notifyJobWake();
           stats.woken++;
+        } else if (job.status === 'active') {
+          const ownership = classifyJobOwnership(this.store, job, { now, markDeadInDb: true });
+          if (ownership.reclaimable) {
+            this.store.notifyJobWake();
+            stats.woken++;
+          }
         }
       }
 
@@ -900,6 +1010,7 @@ export class ScheduledTaskRunner {
       }
     });
 
+    this.#pruneSettledWatchers();
     for (const w of runsToWatch) {
       this.#watchTurnSettlement(w.scheduleId, w.runId, w.sessionId, w.turnId);
     }
@@ -907,67 +1018,154 @@ export class ScheduledTaskRunner {
     return stats;
   }
 
-  async runNow(id, { trigger = 'manual', scheduledFor = null } = {}) {
+  async runNow(id, { trigger = 'manual', scheduledFor = null, existingRunId = null } = {}) {
     const sched = this.get(id);
     const now = Date.now();
-    const runId = uuid();
+    const isManual = trigger === 'manual' || String(trigger).startsWith('manual');
     const slotTs = scheduledFor ?? now;
-    const idem =
-      scheduledFor !== null
-        ? `sched:${id}:${scheduledFor}`
-        : `sched:${id}:manual:${runId}`;
 
-    const nextRunAt = sched.enabled
-      ? computeNextRunAt(sched.scheduleKind, sched.scheduleExpr, now, { timezone: sched.timezone })
-      : null;
+    const launched = this.store.tx(() => {
+      const db = this.store.db;
+      if (existingRunId) {
+        const existingRow = db
+          .prepare('SELECT * FROM scheduled_task_runs WHERE id=? AND scheduleId=?')
+          .get(existingRunId, id);
+        if (!existingRow || TERMINAL_RUN_STATUSES.has(existingRow.status)) {
+          return { noop: true, runId: existingRunId, sess: null, turn: null };
+        }
+        const seq = ensureRunSeqTx(db, existingRow);
+        const existingTurn = findCorrelatedTurnTx(db, existingRow);
+        if (existingTurn) {
+          const terminal = mapTurnStateToRunStatus(existingTurn.state);
+          const nextStatus = terminal ?? 'running';
+          db.prepare(
+            `UPDATE scheduled_task_runs
+             SET sessionId=COALESCE(sessionId, ?), turnId=COALESCE(turnId, ?),
+                 status=?, error=?, startedAt=COALESCE(startedAt, ?),
+                 finishedAt=COALESCE(finishedAt, ?), updatedAt=?
+             WHERE id=? AND status='queued'`,
+          ).run(
+            existingTurn.sessionId,
+            existingTurn.id,
+            nextStatus,
+            terminal ? (existingTurn.error ? String(existingTurn.error) : null) : null,
+            existingTurn.createdAt ?? now,
+            terminal ? (existingTurn.finishedAt ?? now) : null,
+            now,
+            existingRow.id,
+          );
+          updateTaskStatusMonotonicTx(db, id, {
+            runId: existingRow.id,
+            runSeq: seq,
+            status: nextStatus,
+            lastRunAt: existingTurn.createdAt ?? now,
+            lastSessionId: existingTurn.sessionId,
+            historyEntry: {
+              runId: existingRow.id,
+              sessionId: existingTurn.sessionId,
+              turnId: existingTurn.id,
+              at: existingTurn.createdAt ?? now,
+              trigger: existingRow.trigger || trigger,
+            },
+            now: terminal ? (existingTurn.finishedAt ?? now) : now,
+          });
+          let sess = null;
+          try {
+            sess = this.directAgent?.getSession?.(existingTurn.sessionId) ?? null;
+          } catch {
+            sess = null;
+          }
+          return { noop: Boolean(terminal), runId: existingRow.id, sess, turn: existingTurn };
+        }
 
-    const { sess, turn } = this.store.tx(() => {
-      const runSeq = nextRunSeqTx(this.store.db, id);
-      const launched = this.#launchSessionAndTurn(sched, { clientTurnId: idem });
-      this.store.db
-        .prepare(
-          `INSERT INTO scheduled_task_runs(
-            id, scheduleId, scheduledFor, idempotencyKey, sessionId, turnId,
-            status, runSeq, trigger, startedAt, createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,'running',?,?,?,?,?)`,
-        )
-        .run(
-          runId,
-          id,
-          slotTs,
-          idem,
-          launched.sess.id,
-          launched.turn.id,
-          runSeq,
-          trigger,
-          now,
-          now,
-          now,
-        );
+        const started = this.#launchSessionAndTurn(sched, {
+          clientTurnId: existingRow.idempotencyKey,
+          existingSessionId: existingRow.sessionId || null,
+        });
+        db.prepare(
+          `UPDATE scheduled_task_runs
+           SET sessionId=?, turnId=?, status='running', startedAt=COALESCE(startedAt, ?), updatedAt=?
+           WHERE id=? AND status='queued'`,
+        ).run(started.sess.id, started.turn.id, now, now, existingRow.id);
 
-      updateTaskStatusMonotonicTx(this.store.db, id, {
+        updateTaskStatusMonotonicTx(db, id, {
+          runId: existingRow.id,
+          runSeq: seq,
+          status: 'running',
+          lastRunAt: now,
+          lastSessionId: started.sess.id,
+          historyEntry: {
+            runId: existingRow.id,
+            sessionId: started.sess.id,
+            turnId: started.turn.id,
+            at: now,
+            trigger: existingRow.trigger || trigger,
+          },
+          now,
+        });
+        return { noop: false, runId: existingRow.id, sess: started.sess, turn: started.turn };
+      }
+
+      const runId = uuid();
+      const idem =
+        scheduledFor !== null
+          ? `sched:${id}:${scheduledFor}`
+          : `sched:${id}:manual:${runId}`;
+      const runSeq = nextRunSeqTx(db, id);
+      const started = this.#launchSessionAndTurn(sched, { clientTurnId: idem });
+      db.prepare(
+        `INSERT INTO scheduled_task_runs(
+          id, scheduleId, scheduledFor, idempotencyKey, sessionId, turnId,
+          status, runSeq, trigger, startedAt, createdAt, updatedAt
+        ) VALUES(?,?,?,?,?,?,'running',?,?,?,?,?)`,
+      ).run(
+        runId,
+        id,
+        slotTs,
+        idem,
+        started.sess.id,
+        started.turn.id,
+        runSeq,
+        trigger,
+        now,
+        now,
+        now,
+      );
+
+      // Preserve periodic nextRunAt cadence on manual runNow()
+      const nextRunAt = isManual
+        ? undefined
+        : sched.enabled
+          ? computeNextRunAt(sched.scheduleKind, sched.scheduleExpr, this.#now(), {
+              timezone: sched.timezone,
+            })
+          : null;
+
+      updateTaskStatusMonotonicTx(db, id, {
         runId,
         runSeq,
         status: 'running',
         lastRunAt: now,
-        lastSessionId: launched.sess.id,
+        lastSessionId: started.sess.id,
         nextRunAt,
         historyEntry: {
           runId,
-          sessionId: launched.sess.id,
-          turnId: launched.turn.id,
+          sessionId: started.sess.id,
+          turnId: started.turn.id,
           at: now,
           trigger,
         },
         now,
       });
-      return launched;
+      return { noop: false, runId, sess: started.sess, turn: started.turn };
     });
 
-    this.#watchTurnSettlement(id, runId, sess.id, turn.id);
+    if (!launched.noop && launched.sess && launched.turn) {
+      this.#watchTurnSettlement(id, launched.runId, launched.sess.id, launched.turn.id);
+    }
     this.#rearmTimer();
-    const run = this.store.db.prepare('SELECT * FROM scheduled_task_runs WHERE id=?').get(runId);
-    return { schedule: this.get(id), run, session: sess, turn };
+    const run = this.store.db.prepare('SELECT * FROM scheduled_task_runs WHERE id=?').get(launched.runId);
+    return { schedule: this.get(id), run, session: launched.sess, turn: launched.turn };
   }
 
   enqueueScheduledRun(sched, scheduledFor, { trigger = 'schedule' } = {}) {
@@ -975,7 +1173,7 @@ export class ScheduledTaskRunner {
     const idem = `sched:${sched.id}:${scheduledFor}`;
     const jobQueue = this.directAgent?.jobQueue;
     let watchAfterCommit = null;
-    let fallbackRunNow = false;
+    let fallbackRunId = null;
 
     const run = this.store.tx(() => {
       const db = this.store.db;
@@ -1053,6 +1251,8 @@ export class ScheduledTaskRunner {
                 ? 'parked'
                 : 'pending';
             ensureScheduledJobTx(this.store, existing, { desiredStatus, now });
+          } else {
+            fallbackRunId = existing.id;
           }
           return db.prepare('SELECT * FROM scheduled_task_runs WHERE id=?').get(existing.id);
         }
@@ -1099,7 +1299,7 @@ export class ScheduledTaskRunner {
             : 'pending';
         ensureScheduledJobTx(this.store, inserted, { desiredStatus, now });
       } else {
-        fallbackRunNow = true;
+        fallbackRunId = runId;
       }
       return db.prepare('SELECT * FROM scheduled_task_runs WHERE id=?').get(runId);
     });
@@ -1112,8 +1312,13 @@ export class ScheduledTaskRunner {
         watchAfterCommit.turnId,
       );
     }
-    if (fallbackRunNow) {
-      void this.runNow(sched.id, { trigger, scheduledFor });
+    if (fallbackRunId) {
+      void this.runNow(sched.id, {
+        trigger,
+        scheduledFor,
+        existingRunId: fallbackRunId,
+      }).catch(() => {});
+      return this.store.db.prepare('SELECT * FROM scheduled_task_runs WHERE id=?').get(fallbackRunId) ?? run;
     }
     return run;
   }
@@ -1201,6 +1406,22 @@ export class ScheduledTaskRunner {
       }
 
       if (runRow.status !== 'queued') {
+        return { action: 'noop' };
+      }
+
+      const isManual = String(runRow.trigger || trigger || '').startsWith('manual');
+      if (!hydrated.enabled && !isManual) {
+        db.prepare(
+          `UPDATE scheduled_task_runs
+           SET status='cancelled', error='schedule_disabled', finishedAt=COALESCE(finishedAt, ?), updatedAt=?
+           WHERE id=? AND status='queued'`,
+        ).run(now, now, scheduleRunId);
+        updateTaskStatusMonotonicTx(db, scheduleId, {
+          runId: scheduleRunId,
+          runSeq: seq,
+          status: 'cancelled',
+          now,
+        });
         return { action: 'noop' };
       }
 
@@ -1324,11 +1545,14 @@ export class ScheduledTaskRunner {
   }
 
   #watchTurnSettlement(scheduleId, scheduleRunId, sessionId, turnId) {
-    if (!this.directAgent?.subscribe) return;
+    if (!this.directAgent?.subscribe || !turnId) return;
+    if (this.turnWatchers.has(turnId)) return;
 
     // Fast durable DB check in case the turn already converged before subscribing
     if (this.store?.db?.isOpen) {
-      const turn = this.store.db.prepare('SELECT state, error, finishedAt FROM direct_turns WHERE id=?').get(turnId);
+      const turn = this.store.db
+        .prepare('SELECT state, error, finishedAt FROM direct_turns WHERE id=?')
+        .get(turnId);
       const terminal = turn ? mapTurnStateToRunStatus(turn.state) : null;
       if (terminal) {
         convergeScheduledRunForTurn(this.store, turnId, {
@@ -1343,8 +1567,7 @@ export class ScheduledTaskRunner {
     const unsub = this.directAgent.subscribe(sessionId, (ev) => {
       if (ev.turnId !== turnId) return;
       if (!['turn/completed', 'turn/failed', 'turn/cancelled'].includes(ev.type)) return;
-      unsub();
-      this.unsubs.delete(unsub);
+      this.#unwatchTurn(turnId);
       if (!this.store?.db?.isOpen) return;
       const status =
         ev.type === 'turn/completed'
@@ -1359,51 +1582,171 @@ export class ScheduledTaskRunner {
       });
     });
     this.unsubs.add(unsub);
+    this.turnWatchers.set(turnId, { scheduleId, runId: scheduleRunId, unsub });
+    if (this.running) this.#rearmTimer();
   }
 
-  #recoverMisfires() {
-    if (!this.store?.db?.isOpen) return;
-    const now = Date.now();
-    const due = this.store.db
-      .prepare('SELECT * FROM scheduled_tasks WHERE enabled=1 AND nextRunAt IS NOT NULL AND nextRunAt<=?')
-      .all(now)
-      .map((r) => this.#hydrate(r));
+  #planDueSchedule(sched, expectedNextRunAt, now, { mode = 'tick' } = {}) {
+    const cfg = validateScheduleConfig({
+      scheduleKind: sched.scheduleKind,
+      scheduleExpr: sched.scheduleExpr,
+      timezone: sched.timezone,
+      concurrencyPolicy: sched.concurrencyPolicy,
+      misfirePolicy: sched.misfirePolicy,
+      maxConcurrency: sched.maxConcurrency,
+    });
 
-    for (const sched of due) {
-      this.store.tx(() => {
-        let cursor = sched.nextRunAt;
-        if (sched.misfirePolicy === 'skip') {
-          while (cursor <= now) {
-            cursor = computeNextRunAt(sched.scheduleKind, sched.scheduleExpr, cursor, {
-              timezone: sched.timezone,
-            });
-          }
-        } else if (sched.misfirePolicy === 'catch_up') {
-          let count = 0;
-          while (cursor <= now && count < 5) {
-            this.enqueueScheduledRun(sched, cursor, { trigger: 'misfire_catch_up' });
-            cursor = computeNextRunAt(sched.scheduleKind, sched.scheduleExpr, cursor, {
-              timezone: sched.timezone,
-            });
-            count++;
-          }
-          while (cursor <= now) {
-            cursor = computeNextRunAt(sched.scheduleKind, sched.scheduleExpr, cursor, {
-              timezone: sched.timezone,
-            });
-          }
-        } else {
-          this.enqueueScheduledRun(sched, cursor, { trigger: 'misfire_fire_once' });
-          while (cursor <= now) {
-            cursor = computeNextRunAt(sched.scheduleKind, sched.scheduleExpr, cursor, {
-              timezone: sched.timezone,
-            });
-          }
+    const advancePastNow = (cursor) => {
+      if (cursor > now) return cursor;
+      if (cfg.kind === 'interval') {
+        return advanceIntervalPast(cursor, cfg.intervalMs, now);
+      }
+      const next = computeNextRunAt(cfg.kind, cfg.expr, cursor, { timezone: cfg.tz });
+      if (next > now) return next;
+      return computeNextRunAt(cfg.kind, cfg.expr, now, { timezone: cfg.tz });
+    };
+
+    const slotsToEnqueue = [];
+    let cursor = expectedNextRunAt;
+
+    if (mode === 'misfire') {
+      if (sched.misfirePolicy === 'skip') {
+        cursor = advancePastNow(cursor);
+      } else if (sched.misfirePolicy === 'catch_up') {
+        let count = 0;
+        while (cursor <= now && count < 5) {
+          slotsToEnqueue.push({ slot: cursor, trigger: 'misfire_catch_up' });
+          cursor = computeNextRunAt(cfg.kind, cfg.expr, cursor, { timezone: cfg.tz });
+          count++;
         }
-        this.store.db
-          .prepare('UPDATE scheduled_tasks SET nextRunAt=?, updatedAt=? WHERE id=?')
-          .run(cursor, now, sched.id);
+        cursor = advancePastNow(cursor);
+      } else {
+        slotsToEnqueue.push({ slot: cursor, trigger: 'misfire_fire_once' });
+        cursor = advancePastNow(cursor);
+      }
+      return { slotsToEnqueue, nextRunAt: cursor };
+    }
+
+    // Live tick: advance from fresh.nextRunAt (not Math.max(now, nextRunAt)) so
+    // DST fall-back lag or process sleep never double-fires ambiguous wall times.
+    if (sched.misfirePolicy === 'catch_up') {
+      let count = 0;
+      while (cursor <= now && count < 5) {
+        slotsToEnqueue.push({
+          slot: cursor,
+          trigger: count === 0 ? 'schedule' : 'misfire_catch_up',
+        });
+        cursor = computeNextRunAt(cfg.kind, cfg.expr, cursor, { timezone: cfg.tz });
+        count++;
+      }
+      cursor = advancePastNow(cursor);
+    } else {
+      slotsToEnqueue.push({ slot: cursor, trigger: 'schedule' });
+      cursor = advancePastNow(cursor);
+    }
+    return { slotsToEnqueue, nextRunAt: cursor };
+  }
+
+  #processDueSchedule(scheduleId, expectedNextRunAt, now, { mode = 'tick' } = {}) {
+    try {
+      let processed = false;
+      this.store.tx(() => {
+        const db = this.store.db;
+        const freshRow = db.prepare('SELECT * FROM scheduled_tasks WHERE id=?').get(scheduleId);
+        if (
+          !freshRow ||
+          !freshRow.enabled ||
+          freshRow.nextRunAt === null ||
+          freshRow.nextRunAt === undefined ||
+          freshRow.nextRunAt > now ||
+          freshRow.nextRunAt !== expectedNextRunAt
+        ) {
+          return;
+        }
+        const sched = this.#hydrate(freshRow);
+        const { slotsToEnqueue, nextRunAt } = this.#planDueSchedule(
+          sched,
+          freshRow.nextRunAt,
+          now,
+          { mode },
+        );
+
+        const wallNow = Date.now();
+        const cas = db
+          .prepare(
+            'UPDATE scheduled_tasks SET nextRunAt=?, updatedAt=? WHERE id=? AND enabled=1 AND nextRunAt=?',
+          )
+          .run(nextRunAt, wallNow, sched.id, expectedNextRunAt);
+        if ((cas.changes ?? 0) !== 1) {
+          return;
+        }
+        processed = true;
+        for (const item of slotsToEnqueue) {
+          this.enqueueScheduledRun(sched, item.slot, { trigger: item.trigger });
+        }
       });
+      return processed;
+    } catch (err) {
+      // Isolate corrupt/legacy schedule config so one bad row never blocks boot or other schedules
+      if (err?.code === 'INVALID_SCHEDULE_CONFIG' && this.store?.db?.isOpen) {
+        try {
+          this.store.tx(() => {
+            this.store.db
+              .prepare(
+                "UPDATE scheduled_tasks SET enabled=0, nextRunAt=NULL, lastStatus='failed', updatedAt=? WHERE id=? AND nextRunAt=?",
+              )
+              .run(Date.now(), scheduleId, expectedNextRunAt);
+          });
+        } catch {
+          // best-effort quarantine
+        }
+      }
+      return false;
+    }
+  }
+
+  recoverMisfires({ now = this.#now() } = {}) {
+    if (!this.store?.db?.isOpen) return 0;
+    const due = this.store.db
+      .prepare(
+        'SELECT id, nextRunAt FROM scheduled_tasks WHERE enabled=1 AND nextRunAt IS NOT NULL AND nextRunAt<=?',
+      )
+      .all(now);
+
+    let handled = 0;
+    for (const row of due) {
+      if (this.#processDueSchedule(row.id, row.nextRunAt, now, { mode: 'misfire' })) {
+        handled++;
+      }
+    }
+    return handled;
+  }
+
+  #hasReconcilableWork() {
+    if (!this.store?.db?.isOpen) return false;
+    const db = this.store.db;
+    const needsRunReconcile = db
+      .prepare(
+        `SELECT 1 FROM scheduled_task_runs r
+         LEFT JOIN direct_turns t ON t.id = r.turnId
+         WHERE r.status = 'queued'
+            OR (r.status = 'running' AND (r.turnId IS NULL OR t.id IS NULL OR t.state IN ('completed','failed','cancelled')))
+         LIMIT 1`,
+      )
+      .get();
+    return Boolean(needsRunReconcile);
+  }
+
+  #onTimerWake() {
+    if (!this.running || !this.store?.db?.isOpen) return;
+    try {
+      this.#pruneSettledWatchers();
+      if (this.#hasReconcilableWork()) {
+        this.reconcileRuns();
+      }
+      this.tickDue({ rearm: false });
+    } finally {
+      this.#rearmTimer();
     }
   }
 
@@ -1418,40 +1761,53 @@ export class ScheduledTaskRunner {
         'SELECT id, nextRunAt FROM scheduled_tasks WHERE enabled=1 AND nextRunAt IS NOT NULL ORDER BY nextRunAt ASC LIMIT 1',
       )
       .get();
-    if (!next) return; // Zero-idle-polling invariant
+    const hasActiveRunsOrJobs = Boolean(
+      this.turnWatchers.size > 0 ||
+        this.store.db
+          .prepare("SELECT 1 FROM scheduled_task_runs WHERE status IN ('queued','running') LIMIT 1")
+          .get() ||
+        this.store.db
+          .prepare(
+            "SELECT 1 FROM runtime_jobs WHERE kind='scheduled_task' AND status IN ('pending','active','parked') LIMIT 1",
+          )
+          .get(),
+    );
+    if (!next && !hasActiveRunsOrJobs) return; // Zero-idle-polling invariant
 
-    const delayMs = Math.min(2147483647, Math.max(25, next.nextRunAt - Date.now()));
+    const now = this.#now();
+    let delayMs;
+    if (next) {
+      const untilNext = Math.max(25, next.nextRunAt - now);
+      const syncCapMs = hasActiveRunsOrJobs ? 500 : 30_000;
+      delayMs = Math.min(2147483647, untilNext, syncCapMs);
+    } else {
+      delayMs = 500;
+    }
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.#tickDue();
+      this.#onTimerWake();
     }, delayMs);
     this.timer.unref?.();
   }
 
-  #tickDue() {
-    if (!this.running || !this.store?.db?.isOpen) return;
-    const now = Date.now();
-    const due = this.store.db
-      .prepare(
-        'SELECT * FROM scheduled_tasks WHERE enabled=1 AND nextRunAt IS NOT NULL AND nextRunAt<=?',
-      )
-      .all(now)
-      .map((r) => this.#hydrate(r));
+  tickDue({ now = this.#now(), rearm = true } = {}) {
+    if (!this.running || !this.store?.db?.isOpen) return 0;
+    let handled = 0;
+    try {
+      const due = this.store.db
+        .prepare(
+          'SELECT id, nextRunAt FROM scheduled_tasks WHERE enabled=1 AND nextRunAt IS NOT NULL AND nextRunAt<=?',
+        )
+        .all(now);
 
-    for (const sched of due) {
-      this.store.tx(() => {
-        this.enqueueScheduledRun(sched, sched.nextRunAt, { trigger: 'schedule' });
-        const nextRunAt = computeNextRunAt(
-          sched.scheduleKind,
-          sched.scheduleExpr,
-          Math.max(now, sched.nextRunAt),
-          { timezone: sched.timezone },
-        );
-        this.store.db
-          .prepare('UPDATE scheduled_tasks SET nextRunAt=?, updatedAt=? WHERE id=?')
-          .run(nextRunAt, now, sched.id);
-      });
+      for (const row of due) {
+        if (this.#processDueSchedule(row.id, row.nextRunAt, now, { mode: 'tick' })) {
+          handled++;
+        }
+      }
+    } finally {
+      if (rearm) this.#rearmTimer();
     }
-    this.#rearmTimer();
+    return handled;
   }
 }
