@@ -122,13 +122,18 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const mergedCatalog = useMemo<ProviderPresetCatalog>(() => {
-    const items = presets?.items && Object.keys(presets.items).length > 0
-      ? presets.items
-      : BUILTIN_PROVIDER_PRESETS.items;
-    const categories = presets?.categories && presets.categories.length > 0
-      ? presets.categories
-      : BUILTIN_PROVIDER_PRESETS.categories ?? [];
-    return { categories, items };
+    const remoteItems = presets?.items ?? {};
+    const remoteCategories = presets?.categories ?? [];
+    const categoriesById = new Map(
+      [...(BUILTIN_PROVIDER_PRESETS.categories ?? []), ...remoteCategories].map((category) => [category.id, category]),
+    );
+    return {
+      categories: [...categoriesById.values()],
+      items: {
+        ...BUILTIN_PROVIDER_PRESETS.items,
+        ...remoteItems,
+      },
+    };
   }, [presets]);
 
   const allPresets = useMemo<ProviderPreset[]>(

@@ -1,4 +1,4 @@
-import type { ProviderPresetCatalog, ProviderPresetField } from '../types/backend';
+import type { ProviderPreset, ProviderPresetCatalog, ProviderPresetField } from '../types/backend';
 
 const OPENAI_FIELDS: ProviderPresetField[] = [
   { name: 'apiKey', label: 'API Key / 令牌', type: 'string', secret: true, required: true },
@@ -10,6 +10,384 @@ const GATEWAY_FIELDS: ProviderPresetField[] = [
   { name: 'endpoint', label: '反代 / 网关地址', type: 'string', secret: false, required: true },
 ];
 
+/**
+ * Provider Enhancement / MagPie channels are intentionally represented as
+ * generic gateway presets here. This frontend can collect and route their
+ * accounts without pretending to implement provider-specific OAuth flows.
+ */
+const thirdPartyGateway = (
+  id: string,
+  name: string,
+  ownedBy: string,
+  icon: string,
+  color: string,
+  description: string,
+): ProviderPreset => ({
+  id,
+  name,
+  category: 'custom',
+  kind: 'gateway',
+  protocol: 'openai',
+  ownedBy,
+  icon,
+  color,
+  description,
+  defaultEndpoint: '',
+  supportsBalance: false,
+  supportsCheckin: false,
+  fields: GATEWAY_FIELDS,
+  accountCount: 0,
+});
+
+/** Channels exposed by Agent2API Provider Enhancement, plus MagPie community channels. */
+const THIRD_PARTY_GATEWAY_PRESETS: Record<string, ProviderPreset> = {
+  'workbuddy-intl': thirdPartyGateway(
+    'workbuddy-intl',
+    'WorkBuddy 国际版',
+    '腾讯 WorkBuddy',
+    'WB',
+    '#3777f0',
+    'Agent2API Provider Enhancement 渠道；请填写 WorkBuddy 国际版所用的 OpenAI 兼容网关地址与凭据。',
+  ),
+  raccoon: thirdPartyGateway(
+    'raccoon',
+    'Raccoon / 小浣熊',
+    '商汤',
+    'RC',
+    '#2563eb',
+    'Agent2API Provider Enhancement 渠道；通过兼容网关接入 Raccoon / 小浣熊。',
+  ),
+  catpaw: thirdPartyGateway(
+    'catpaw',
+    'CatPaw',
+    '美团',
+    'CP',
+    '#f97316',
+    'Agent2API Provider Enhancement 渠道；通过兼容网关接入 CatPaw。',
+  ),
+  autoclaw: thirdPartyGateway(
+    'autoclaw',
+    'AutoClaw 国内版',
+    '智谱',
+    'AC',
+    '#4f46e5',
+    'Agent2API Provider Enhancement 渠道；请填写 AutoClaw 国内版的兼容网关地址与凭据。',
+  ),
+  'autoclaw-intl': thirdPartyGateway(
+    'autoclaw-intl',
+    'AutoClaw 国际版',
+    '智谱',
+    'AC',
+    '#4f46e5',
+    'Agent2API Provider Enhancement 渠道；请填写 AutoClaw 国际版的兼容网关地址与凭据。',
+  ),
+  qoder: thirdPartyGateway(
+    'qoder',
+    'Qoder 国内版',
+    '阿里巴巴',
+    'QD',
+    '#7c3aed',
+    'Agent2API Provider Enhancement 渠道；请填写 Qoder 国内版的兼容网关地址与凭据。',
+  ),
+  'qoder-intl': thirdPartyGateway(
+    'qoder-intl',
+    'Qoder 国际版',
+    '阿里巴巴',
+    'QD',
+    '#7c3aed',
+    'Agent2API Provider Enhancement 渠道；请填写 Qoder 国际版的兼容网关地址与凭据。',
+  ),
+  qwenwork: thirdPartyGateway(
+    'qwenwork',
+    'QwenWork 国内版 / 千问办公',
+    '阿里巴巴',
+    'QW',
+    '#6d28d9',
+    'Agent2API Provider Enhancement 渠道；请填写 QwenWork 国内版的兼容网关地址与凭据。',
+  ),
+  'qwenwork-intl': thirdPartyGateway(
+    'qwenwork-intl',
+    'QwenWork 国际版 / 千问办公',
+    '阿里巴巴',
+    'QW',
+    '#6d28d9',
+    'Agent2API Provider Enhancement 渠道；请填写 QwenWork 国际版的兼容网关地址与凭据。',
+  ),
+  'cline-free': thirdPartyGateway(
+    'cline-free',
+    'Cline 免费池',
+    'Cline',
+    'CL',
+    '#0f172a',
+    'Agent2API Provider Enhancement 渠道；Cline 免费池兼容网关。',
+  ),
+  'cline-pass': thirdPartyGateway(
+    'cline-pass',
+    'Cline 订阅池',
+    'Cline',
+    'CL',
+    '#0f172a',
+    'Agent2API Provider Enhancement 渠道；Cline 订阅池兼容网关。',
+  ),
+  accio: thirdPartyGateway(
+    'accio',
+    'Accio 国际版',
+    '阿里巴巴',
+    'AC',
+    '#0ea5e9',
+    'Agent2API Provider Enhancement 渠道；请填写 Accio 国际版的兼容网关地址与凭据。',
+  ),
+  'accio-cn': thirdPartyGateway(
+    'accio-cn',
+    'Accio 国内版',
+    '阿里巴巴',
+    'AC',
+    '#0ea5e9',
+    'Agent2API Provider Enhancement 渠道；请填写 Accio 国内版的兼容网关地址与凭据。',
+  ),
+  zcode: thirdPartyGateway(
+    'zcode',
+    'ZCode 国内版',
+    '智谱',
+    'ZC',
+    '#2563eb',
+    'Agent2API Provider Enhancement 渠道；请填写 ZCode 国内版的兼容网关地址与凭据。',
+  ),
+  'zcode-intl': thirdPartyGateway(
+    'zcode-intl',
+    'ZCode 国际版',
+    '智谱',
+    'ZC',
+    '#2563eb',
+    'Agent2API Provider Enhancement 渠道；请填写 ZCode 国际版的兼容网关地址与凭据。',
+  ),
+  loomy: thirdPartyGateway(
+    'loomy',
+    'Loomy',
+    '科大讯飞',
+    'LO',
+    '#0891b2',
+    'Agent2API Provider Enhancement 渠道；请填写 Loomy 的兼容网关地址与凭据。',
+  ),
+  kuku: thirdPartyGateway(
+    'kuku',
+    'KukuAI',
+    '百度文库',
+    'KU',
+    '#7c3aed',
+    'Agent2API Provider Enhancement 渠道；请填写 KukuAI 的兼容网关地址与凭据。',
+  ),
+  monkeycode: thirdPartyGateway(
+    'monkeycode',
+    'MonkeyCode 国内版',
+    '长亭科技',
+    'MC',
+    '#ea580c',
+    'Agent2API Provider Enhancement 渠道；请填写 MonkeyCode 国内版的兼容网关地址与凭据。',
+  ),
+  'monkeycode-intl': thirdPartyGateway(
+    'monkeycode-intl',
+    'MonkeyCode 国际版',
+    '长亭科技',
+    'MC',
+    '#ea580c',
+    'Agent2API Provider Enhancement 渠道；请填写 MonkeyCode 国际版的兼容网关地址与凭据。',
+  ),
+  commandcode: thirdPartyGateway(
+    'commandcode',
+    'Command Code',
+    'Command Code',
+    'CC',
+    '#334155',
+    'Agent2API Provider Enhancement 渠道；请填写 Command Code 的兼容网关地址与凭据。',
+  ),
+  antigravity: thirdPartyGateway(
+    'antigravity',
+    'Antigravity',
+    'Google',
+    'AG',
+    '#4285f4',
+    'Agent2API Provider Enhancement / MagPie 渠道；请填写 Antigravity 的兼容网关地址与凭据。',
+  ),
+  officeace: thirdPartyGateway(
+    'officeace',
+    'OfficeAce / 果办',
+    'Huawei Cloud',
+    'OA',
+    '#ef4444',
+    'Agent2API Provider Enhancement / MagPie 渠道；请填写 OfficeAce 的兼容网关地址与凭据。',
+  ),
+  orcaterm: thirdPartyGateway(
+    'orcaterm',
+    'OrcaTerm',
+    '腾讯云',
+    'OT',
+    '#0f766e',
+    'Agent2API Provider Enhancement 渠道；请填写 OrcaTerm 的兼容网关地址与凭据。',
+  ),
+  modelscope: thirdPartyGateway(
+    'modelscope',
+    'ModelScope / 魔搭 国内版',
+    'ModelScope',
+    'MS',
+    '#2563eb',
+    'Agent2API Provider Enhancement 渠道；请填写 ModelScope 国内版的兼容网关地址与凭据。',
+  ),
+  'modelscope-intl': thirdPartyGateway(
+    'modelscope-intl',
+    'ModelScope 国际版',
+    'ModelScope',
+    'MS',
+    '#2563eb',
+    'Agent2API Provider Enhancement 渠道；请填写 ModelScope 国际版的兼容网关地址与凭据。',
+  ),
+  atomcode: thirdPartyGateway(
+    'atomcode',
+    'AtomCode',
+    'AtomGit / GitCode',
+    'AT',
+    '#111827',
+    'Agent2API Provider Enhancement / MagPie 渠道；请填写 AtomCode 的兼容网关地址与凭据。',
+  ),
+  lobsterai: thirdPartyGateway(
+    'lobsterai',
+    'LobsterAI / 有道龙虾',
+    '网易有道',
+    'LA',
+    '#e11d48',
+    'Agent2API Provider Enhancement / MagPie 渠道；请填写 LobsterAI 的兼容网关地址与凭据。',
+  ),
+  doubaowork: thirdPartyGateway(
+    'doubaowork',
+    'Doubao Work / 豆包 Work',
+    '字节跳动',
+    'DW',
+    '#2563eb',
+    'Agent2API Provider Enhancement / MagPie 渠道；请填写 Doubao Work 的兼容网关地址与凭据。',
+  ),
+  kiro: thirdPartyGateway(
+    'kiro',
+    'Kiro',
+    'AWS',
+    'KI',
+    '#f97316',
+    'Agent2API Provider Enhancement / MagPie 渠道；请填写 Kiro 的兼容网关地址与凭据。',
+  ),
+  astudio: thirdPartyGateway(
+    'astudio',
+    'AStudio',
+    '科大讯飞',
+    'AS',
+    '#0891b2',
+    'Agent2API Provider Enhancement / MagPie 渠道；请填写 AStudio 的兼容网关地址与凭据。',
+  ),
+
+  // MagPie community providers that do not have a native Agent2Providers entry here.
+  'kimi-code': thirdPartyGateway(
+    'kimi-code',
+    'Kimi Code',
+    'Moonshot',
+    'KC',
+    '#0f172a',
+    'MagPie 社区渠道；请填写 Kimi Code 订阅兼容网关地址与凭据。',
+  ),
+  'minimax-code': thirdPartyGateway(
+    'minimax-code',
+    'MiniMax Code',
+    'MiniMax',
+    'MC',
+    '#db2777',
+    'MagPie 社区渠道；请填写 MiniMax Code 订阅兼容网关地址与凭据。',
+  ),
+  'qwen-code': thirdPartyGateway(
+    'qwen-code',
+    'Qwen Code',
+    'Alibaba',
+    'QC',
+    '#6d28d9',
+    'MagPie 社区渠道；请填写 Qwen Code 兼容网关地址与凭据。',
+  ),
+  grok: thirdPartyGateway(
+    'grok',
+    'Grok / SuperGrok',
+    'xAI',
+    'GK',
+    '#18181b',
+    'MagPie 社区渠道；请填写 Grok 订阅兼容网关地址与凭据。',
+  ),
+  opencode: thirdPartyGateway(
+    'opencode',
+    'OpenCode',
+    'OpenCode',
+    'OC',
+    '#334155',
+    'MagPie 社区渠道；请填写 OpenCode 兼容网关地址与凭据。',
+  ),  cursor: thirdPartyGateway(
+    'cursor',
+    'Cursor',
+    'Anysphere',
+    'CU',
+    '#111827',
+    'MagPie 社区渠道；请填写 Cursor 兼容网关地址与凭据。',
+  ),
+  devin: thirdPartyGateway(
+    'devin',
+    'Devin',
+    'Cognition',
+    'DV',
+    '#0f172a',
+    'MagPie 社区渠道；请填写 Devin 兼容网关地址与凭据。',
+  ),
+  factory: thirdPartyGateway(
+    'factory',
+    'Factory',
+    'Factory',
+    'FA',
+    '#475569',
+    'MagPie 社区渠道；请填写 Factory 兼容网关地址与凭据。',
+  ),
+  'kimi-work': thirdPartyGateway(
+    'kimi-work',
+    'Kimi Work',
+    'Moonshot',
+    'KW',
+    '#0f172a',
+    'MagPie 社区渠道；请填写 Kimi Work 兼容网关地址与凭据。',
+  ),
+  opendesign: thirdPartyGateway(
+    'opendesign',
+    'OpenDesign',
+    'OpenDesign',
+    'OD',
+    '#7c3aed',
+    'MagPie 社区渠道；请填写 OpenDesign 兼容网关地址与凭据。',
+  ),
+  nous: thirdPartyGateway(
+    'nous',
+    'Nous Portal',
+    'Nous',
+    'NO',
+    '#0f172a',
+    'MagPie 社区渠道；请填写 Nous Portal 兼容网关地址与凭据。',
+  ),
+  tabbit: thirdPartyGateway(
+    'tabbit',
+    'Tabbit',
+    'Tabbit',
+    'TB',
+    '#0ea5e9',
+    'MagPie 社区渠道；请填写 Tabbit 兼容网关地址与凭据。',
+  ),
+  zed: thirdPartyGateway(
+    'zed',
+    'Zed',
+    'Zed',
+    'ZD',
+    '#111827',
+    'MagPie 社区渠道；请填写 Zed 兼容网关地址与凭据。',
+  ),
+};
+
 export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
   categories: [
     { id: 'all', label: '全部' },
@@ -18,6 +396,7 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
     { id: 'custom', label: '本地 / 反代网关' },
   ],
   items: {
+    ...THIRD_PARTY_GATEWAY_PRESETS,
     // ---- Native Web Login / Subscription & Local CLI Direct Providers ----
     'github-copilot': {
       id: 'github-copilot',
@@ -422,6 +801,55 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
       accountCount: 0,
     },
 
+    // ---- Coding tool provider gateways ----
+    workbuddy: {
+      id: 'workbuddy',
+      name: 'WorkBuddy',
+      category: 'custom',
+      kind: 'gateway',
+      protocol: 'openai',
+      ownedBy: '腾讯 WorkBuddy',
+      icon: 'WB',
+      color: '#3777f0',
+      description: 'WorkBuddy 兼容网关；请填写你使用的 OpenAI 兼容服务地址与凭据',
+      defaultEndpoint: '',
+      supportsBalance: false,
+      supportsCheckin: false,
+      fields: GATEWAY_FIELDS,
+      accountCount: 0,
+    },
+    codearts: {
+      id: 'codearts',
+      name: 'CodeArts',
+      category: 'custom',
+      kind: 'gateway',
+      protocol: 'openai',
+      ownedBy: 'Huawei CodeArts',
+      icon: 'CA',
+      color: '#cf2630',
+      description: 'CodeArts 兼容网关；请填写你使用的 OpenAI 兼容服务地址与凭据',
+      defaultEndpoint: '',
+      supportsBalance: false,
+      supportsCheckin: false,
+      fields: GATEWAY_FIELDS,
+      accountCount: 0,
+    },
+    trae: {
+      id: 'trae',
+      name: 'Trae',
+      category: 'custom',
+      kind: 'gateway',
+      protocol: 'openai',
+      ownedBy: 'ByteDance Trae',
+      icon: 'TR',
+      color: '#5b6cff',
+      description: 'Trae 兼容网关；请填写你使用的 OpenAI 兼容服务地址与凭据',
+      defaultEndpoint: '',
+      supportsBalance: false,
+      supportsCheckin: false,
+      fields: GATEWAY_FIELDS,
+      accountCount: 0,
+    },
     // ---- Local Runtimes & Reverse-Proxy Upstreams ----
     ollama: {
       id: 'ollama',
@@ -543,3 +971,26 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
     },
   },
 };
+/** Keep frontend presets available when the backend catalog is older or partial. */
+export function mergeProviderPresetCatalog(
+  catalog: ProviderPresetCatalog | null | undefined,
+): ProviderPresetCatalog {
+  const remoteItems = catalog?.items ?? {};
+  const remoteCategories = catalog?.categories ?? [];
+  const categoriesById = new Map(
+    [...(BUILTIN_PROVIDER_PRESETS.categories ?? []), ...remoteCategories].map((category) => [category.id, category]),
+  );
+
+  const items: Record<string, ProviderPreset> = { ...remoteItems };
+  for (const [id, builtin] of Object.entries(BUILTIN_PROVIDER_PRESETS.items)) {
+    const remote = remoteItems[id];
+    items[id] = remote
+      ? { ...remote, ...builtin, accountCount: remote.accountCount ?? builtin.accountCount }
+      : builtin;
+  }
+
+  return {
+    categories: [...categoriesById.values()],
+    items,
+  };
+}

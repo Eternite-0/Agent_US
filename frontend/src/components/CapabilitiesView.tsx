@@ -890,40 +890,53 @@ interface LocalPluginLogoSpec {
   circular?: boolean;
 }
 
-/** Authentic local brand logos served from public/plugin-logos/ (zero external network dependency) */
+const normalizePluginKey = (value: string | undefined): string =>
+  (value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, '-');
+
+const pluginLogoAssets = import.meta.glob('../assets/plugins/*', {
+  eager: true,
+  import: 'default',
+  query: '?url',
+}) as Record<string, string>;
+
+/** Authentic local brand logos bundled with the frontend (zero external network dependency). */
 const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
   slack: { light: '/plugin-logos/slack.png', fit: 'contain', bgLight: '#1c1c20', bgDark: '#1c1c20' },
   gmail: { light: '/plugin-logos/gmail.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#1c1c20' },
   remotion: {
     light: '/plugin-logos/remotion.png',
     dark: '/plugin-logos/remotion-dark.png',
-    fit: 'cover',
+    fit: 'contain',
     fitDark: 'contain',
     bgLight: '#ffffff',
     bgDark: '#141417',
   },
-  hyperframes: { light: '/plugin-logos/hyperframes.png', fit: 'cover', bgLight: '#ffffff', bgDark: '#ffffff' },
-  figma: { light: '/plugin-logos/figma.png', fit: 'cover', bgLight: '#1e1e22', bgDark: '#1e1e22' },
-  canva: { light: '/plugin-logos/canva.png', fit: 'cover', bgLight: '#00c4cc', bgDark: '#00c4cc' },
+  hyperframes: { light: '/plugin-logos/hyperframes.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#ffffff' },
+  figma: { light: '/plugin-logos/figma.png', fit: 'contain', bgLight: '#1e1e22', bgDark: '#1e1e22' },
+  canva: { light: '/plugin-logos/canva.png', fit: 'contain', bgLight: '#00c4cc', bgDark: '#00c4cc' },
   'product-design': {
     light: '/plugin-logos/product-design.png',
-    fit: 'cover',
+    fit: 'contain',
     bgLight: '#a855f7',
     bgDark: '#a855f7',
   },
-  higgsfield: { light: '/plugin-logos/higgsfield.png', fit: 'cover', bgLight: '#d1fe17', bgDark: '#d1fe17' },
+  higgsfield: { light: '/plugin-logos/higgsfield.png', fit: 'contain', bgLight: '#d1fe17', bgDark: '#d1fe17' },
   adobe: { light: '/plugin-logos/adobe.svg', fit: 'contain', pad: 6, bgLight: '#ffffff', bgDark: '#1c1c20' },
-  fal: { light: '/plugin-logos/fal.png', fit: 'cover', bgLight: '#ffffff', bgDark: '#1c1c20' },
+  fal: { light: '/plugin-logos/fal.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#1c1c20' },
   heygen: { light: '/plugin-logos/heygen.png', fit: 'contain', pad: 5, bgLight: '#ffffff', bgDark: '#1c1c20' },
-  krea: { light: '/plugin-logos/krea.png', fit: 'cover', bgLight: '#ffffff', bgDark: '#ffffff' },
-  pixverse: { light: '/plugin-logos/pixverse.png', fit: 'cover', bgLight: '#110216', bgDark: '#110216' },
-  'kling-ai': { light: '/plugin-logos/kling-ai.png', fit: 'cover', bgLight: '#000000', bgDark: '#000000' },
-  imagineart: { light: '/plugin-logos/imagineart.png', fit: 'cover', bgLight: '#3f2168', bgDark: '#3f2168' },
-  picsart: { light: '/plugin-logos/picsart.png', fit: 'cover', bgLight: '#c026d3', bgDark: '#c026d3' },
-  morphix: { light: '/plugin-logos/morphix.png', fit: 'cover', bgLight: '#0f172a', bgDark: '#0f172a' },
-  riverside: { light: '/plugin-logos/riverside.png', fit: 'cover', bgLight: '#090a0c', bgDark: '#090a0c' },
-  descript: { light: '/plugin-logos/descript.png', fit: 'cover', bgLight: '#651a39', bgDark: '#651a39' },
-  gamma: { light: '/plugin-logos/gamma.png', fit: 'cover', bgLight: '#122448', bgDark: '#122448' },
+  krea: { light: '/plugin-logos/krea.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#ffffff' },
+  pixverse: { light: '/plugin-logos/pixverse.png', fit: 'contain', bgLight: '#110216', bgDark: '#110216' },
+  'kling-ai': { light: '/plugin-logos/kling-ai.png', fit: 'contain', bgLight: '#000000', bgDark: '#000000' },
+  imagineart: { light: '/plugin-logos/imagineart.png', fit: 'contain', bgLight: '#3f2168', bgDark: '#3f2168' },
+  picsart: { light: '/plugin-logos/picsart.png', fit: 'contain', bgLight: '#c026d3', bgDark: '#c026d3' },
+  morphix: { light: '/plugin-logos/morphix.png', fit: 'contain', bgLight: '#0f172a', bgDark: '#0f172a' },
+  riverside: { light: '/plugin-logos/riverside.png', fit: 'contain', bgLight: '#090a0c', bgDark: '#090a0c' },
+  descript: { light: '/plugin-logos/descript.png', fit: 'contain', bgLight: '#651a39', bgDark: '#651a39' },
+  gamma: { light: '/plugin-logos/gamma.png', fit: 'contain', bgLight: '#122448', bgDark: '#122448' },
   mixpanel: {
     light: '/plugin-logos/mixpanel.png',
     fit: 'contain',
@@ -931,7 +944,7 @@ const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
     bgDark: 'transparent',
     circular: true,
   },
-  posthog: { light: '/plugin-logos/posthog.png', fit: 'cover', bgLight: '#ffffff', bgDark: '#ffffff' },
+  posthog: { light: '/plugin-logos/posthog.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#ffffff' },
   'game-studio': {
     light: '/plugin-logos/game-studio.png',
     fit: 'contain',
@@ -953,13 +966,13 @@ const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
     bgLight: '#ffffff',
     bgDark: '#161618',
   },
-  sentry: { light: '/plugin-logos/sentry.png', fit: 'cover', bgLight: '#362d59', bgDark: '#362d59' },
-  'build-ios': { light: '/plugin-logos/build-ios.png', fit: 'cover', bgLight: '#27272a', bgDark: '#27272a' },
-  'build-macos': { light: '/plugin-logos/build-macos.png', fit: 'cover', bgLight: '#27272a', bgDark: '#27272a' },
+  sentry: { light: '/plugin-logos/sentry.png', fit: 'contain', bgLight: '#362d59', bgDark: '#362d59' },
+  'build-ios': { light: '/plugin-logos/build-ios.png', fit: 'contain', bgLight: '#27272a', bgDark: '#27272a' },
+  'build-macos': { light: '/plugin-logos/build-macos.png', fit: 'contain', bgLight: '#27272a', bgDark: '#27272a' },
   github: {
     light: '/plugin-logos/github.png',
     dark: '/plugin-logos/github-dark.png',
-    fit: 'cover',
+    fit: 'contain',
     fitDark: 'contain',
     bgLight: '#ffffff',
     bgDark: '#18181b',
@@ -986,13 +999,13 @@ const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
     bgLight: '#f0f9ff',
     bgDark: '#0f1d30',
   },
-  consensus: { light: '/plugin-logos/consensus.png', fit: 'cover', bgLight: '#ffffff', bgDark: '#ffffff' },
-  stripe: { light: '/plugin-logos/stripe.png', fit: 'cover', bgLight: '#635bff', bgDark: '#635bff' },
-  linear: { light: '/plugin-logos/linear.png', fit: 'cover', bgLight: '#18181c', bgDark: '#18181c' },
+  consensus: { light: '/plugin-logos/consensus.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#ffffff' },
+  stripe: { light: '/plugin-logos/stripe.png', fit: 'contain', bgLight: '#635bff', bgDark: '#635bff' },
+  linear: { light: '/plugin-logos/linear.png', fit: 'contain', bgLight: '#18181c', bgDark: '#18181c' },
   notion: {
     light: '/plugin-logos/notion.png',
     dark: '/plugin-logos/notion-dark.png',
-    fit: 'cover',
+    fit: 'contain',
     bgLight: '#ffffff',
     bgDark: '#1c1c1e',
   },
@@ -1006,11 +1019,11 @@ const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
   dropbox: {
     light: '/plugin-logos/dropbox.png',
     dark: '/plugin-logos/dropbox-dark.png',
-    fit: 'cover',
+    fit: 'contain',
     bgLight: '#0061ff',
     bgDark: '#0061ff',
   },
-  granola: { light: '/plugin-logos/granola.png', fit: 'cover', bgLight: '#84cc16', bgDark: '#84cc16' },
+  granola: { light: '/plugin-logos/granola.png', fit: 'contain', bgLight: '#84cc16', bgDark: '#84cc16' },
   monday: { light: '/plugin-logos/monday.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#1c1c20' },
   'google-drive': {
     light: '/plugin-logos/google-drive.png',
@@ -1018,7 +1031,7 @@ const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
     bgLight: '#ffffff',
     bgDark: '#1c1c20',
   },
-  boltz: { light: '/plugin-logos/boltz.png', fit: 'cover', bgLight: '#d1fae5', bgDark: '#d1fae5' },
+  boltz: { light: '/plugin-logos/boltz.png', fit: 'contain', bgLight: '#d1fae5', bgDark: '#d1fae5' },
   'codex-security': {
     light: '/plugin-logos/codex-security.png',
     fit: 'contain',
@@ -1037,16 +1050,42 @@ const PLUGIN_LOGO_ALIASES: Record<string, string> = {
   'life-sciences-ngs-analysis': 'life-science-ngs',
   'ngs-analysis': 'life-science-ngs',
   'boltz-api-cli': 'boltz',
+  'hyperframes-by-heygen': 'hyperframes',
+  'figma-skill': 'figma',
+  'figma-design': 'figma',
+  'google-drive-mcp': 'google-drive',
+  atlassian: 'atlassian-rovo',
+  'monday-mcp': 'monday',
+  'code-review-pro': 'codex-security',
+  'security-hygiene-audit': 'codex-security',
+  'ui-pixel-polish': 'product-design',
 };
 
 function resolvePluginLogoSpec(plugin: MarketplacePlugin): LocalPluginLogoSpec | null {
-  const idKey = plugin.id.toLowerCase();
+  const idKey = normalizePluginKey(plugin.id);
   if (PLUGIN_LOGO_SPECS[idKey]) return PLUGIN_LOGO_SPECS[idKey];
   if (PLUGIN_LOGO_ALIASES[idKey]) return PLUGIN_LOGO_SPECS[PLUGIN_LOGO_ALIASES[idKey]];
-  const slugKey = (plugin.slug || '').toLowerCase();
+  const slugKey = normalizePluginKey(plugin.slug);
   if (slugKey && PLUGIN_LOGO_SPECS[slugKey]) return PLUGIN_LOGO_SPECS[slugKey];
   if (slugKey && PLUGIN_LOGO_ALIASES[slugKey]) return PLUGIN_LOGO_SPECS[PLUGIN_LOGO_ALIASES[slugKey]];
   return null;
+}
+
+function resolvePluginLogoUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  const trimmed = url.trim();
+  if (!trimmed) return undefined;
+  const bundledPath = trimmed.match(/^\/?plugin-logos\/(.+)$/i);
+  if (bundledPath) {
+    return pluginLogoAssets[`../assets/plugins/${bundledPath[1]}`];
+  }
+  if (trimmed.startsWith('//')) return `${window.location.protocol}${trimmed}`;
+  if (/^(data:|blob:|https?:|\/)/i.test(trimmed)) return trimmed;
+  const normalized = trimmed.replace(/^\.\//, '').replace(/^public\//, '');
+  if (normalized.toLowerCase().startsWith('plugin-logos/')) {
+    return pluginLogoAssets[`../assets/plugins/${normalized.slice('plugin-logos/'.length)}`];
+  }
+  return trimmed;
 }
 
 function getPluginTileStyle(
@@ -1084,19 +1123,33 @@ const PluginTileGraphic: React.FC<{
   theme: 'light' | 'dark';
   size?: number;
 }> = ({ plugin, theme, size = 19 }) => {
-  const [imgFailed, setImgFailed] = useState(false);
+  const [failedLogoUrls, setFailedLogoUrls] = useState<string[]>([]);
   const spec = resolvePluginLogoSpec(plugin);
-  const src =
-    theme === 'dark'
-      ? plugin.logoUrlDark || spec?.dark || plugin.logoUrl || spec?.light
-      : plugin.logoUrl || spec?.light || plugin.logoUrlDark || spec?.dark;
+  const logoCandidates = useMemo(() => {
+    const candidates =
+      theme === 'dark'
+        ? [
+            resolvePluginLogoUrl(plugin.logoUrlDark),
+            resolvePluginLogoUrl(spec?.dark),
+            resolvePluginLogoUrl(plugin.logoUrl),
+            resolvePluginLogoUrl(spec?.light),
+          ]
+        : [
+            resolvePluginLogoUrl(plugin.logoUrl),
+            resolvePluginLogoUrl(spec?.light),
+            resolvePluginLogoUrl(plugin.logoUrlDark),
+            resolvePluginLogoUrl(spec?.dark),
+          ];
+    return [...new Set(candidates.filter((candidate): candidate is string => Boolean(candidate)))];
+  }, [plugin.logoUrl, plugin.logoUrlDark, spec, theme]);
+  const src = logoCandidates.find((candidate) => !failedLogoUrls.includes(candidate));
 
   useEffect(() => {
-    setImgFailed(false);
-  }, [src]);
+    setFailedLogoUrls([]);
+  }, [logoCandidates]);
 
-  if (src && !imgFailed) {
-    const fit = theme === 'dark' ? spec?.fitDark || spec?.fit || 'cover' : spec?.fit || 'cover';
+  if (src) {
+    const fit = theme === 'dark' ? spec?.fitDark || spec?.fit || 'contain' : spec?.fit || 'contain';
     const basePad = spec?.pad ?? 0;
     const scaledPad = basePad > 0 ? Math.max(1, Math.round(basePad * (size / 19))) : 0;
     return (
@@ -1112,10 +1165,12 @@ const PluginTileGraphic: React.FC<{
           padding: scaledPad > 0 ? scaledPad : undefined,
           boxSizing: 'border-box',
           borderRadius: 'inherit',
+          maxWidth: '100%',
+          maxHeight: '100%',
           display: 'block',
           filter: spec?.darkInvert && theme === 'dark' ? 'invert(0.92)' : undefined,
         }}
-        onError={() => setImgFailed(true)}
+        onError={() => setFailedLogoUrls((failed) => [...failed, src])}
       />
     );
   }

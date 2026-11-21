@@ -49,7 +49,7 @@ import type {
   UsageItem,
 } from './types/backend';
 import { randomIdempotencyKey } from './utils/format';
-import { BUILTIN_PROVIDER_PRESETS } from './data/providerPresets';
+import { BUILTIN_PROVIDER_PRESETS, mergeProviderPresetCatalog } from './data/providerPresets';
 
 function parseHash(): AppView {
   const hash = window.location.hash.replace(/^#/, '');
@@ -415,7 +415,7 @@ export const App: React.FC = () => {
         client.providerPresets(),
         client.listAccounts(),
       ]);
-      setProviderPresets(presetCatalog);
+      setProviderPresets(mergeProviderPresetCatalog(presetCatalog));
       setProviderAccounts(accountList);
     } catch (error) {
       if (connection.mode === 'live') {
