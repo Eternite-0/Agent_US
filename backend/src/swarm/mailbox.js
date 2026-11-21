@@ -1,6 +1,8 @@
 import { id as uuid } from '../store.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import { assertLeaseInTx } from '../durable/lease-guard.js';
+import { CommunicationBus } from '../communication/bus.js';
+import { StoreCommunicationAdapter } from '../communication/store-adapter.js';
 
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
@@ -16,13 +18,20 @@ function parseJsonSafe(str, fallback) {
  * Enables structured asynchronous peer & parent-child handoffs inside a Swarm run.
  */
 export class InterAgentMailbox {
-  constructor({ store, eventRouter = null }) {
+  constructor({ store, eventRouter = null, communication = null }) {
     this.store = store;
     this.eventRouter = eventRouter;
+    this.bus = communication ?? new CommunicationBus({ adapter: new StoreCommunicationAdapter({ store }) });
   }
 
   #dbOpen() {
     return Boolean(this.store?.db?.isOpen);
+  }
+
+  setCommunicationBus(bus) {
+    if (!bus || typeof bus.send !== 'function' || typeof bus.receive !== 'function') throw new TypeError('CommunicationBus is required');
+    this.bus = bus;
+    return this.bus;
   }
 
   send({
@@ -32,7 +41,31 @@ export class InterAgentMailbox {
     toAgentId,
     kind = 'note',
     payload,
+    conversationId = null,
+    idempotencyKey = null,
+    artifactManifest = undefined,
+    maxAttempts = undefined,
+    createdAt = undefined,
+    expiresAt = undefined,
   }) {
+    if (conversationId) {
+      // Unified messages intentionally remain out of the legacy agent_messages table.
+      // Preserve the synchronous return shape for legacy callers while returning the
+      // CommunicationBus promise for the durable envelope path.
+      return this.bus.send({
+        conversationId: String(conversationId),
+        runId,
+        fromAgentId: String(fromAgentId),
+        toAgentId: String(toAgentId),
+        kind,
+        idempotencyKey: idempotencyKey ?? uuid(),
+        payload,
+        artifactManifest,
+        ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+        ...(createdAt !== undefined ? { createdAt } : {}),
+        ...(expiresAt !== undefined ? { expiresAt } : {}),
+      });
+    }
     const msgId = uuid();
     const now = Date.now();
     const body = typeof payload === 'string' ? { text: payload } : payload ?? {};
@@ -70,6 +103,34 @@ export class InterAgentMailbox {
       status: 'queued',
       createdAt: now,
     };
+  }
+
+  /**
+   * Claim one durable CommunicationBus message. This is the unified counterpart to
+   * legacy drainInbox(); it returns a deliveryToken that must be supplied to ack/retry.
+   */
+  receive(toAgentId, options = {}) {
+    return this.bus.receive(String(toAgentId), options);
+  }
+
+  claim(toAgentId, options = {}) {
+    return this.receive(toAgentId, options);
+  }
+
+  ack(messageId, agentId, deliveryToken = undefined) {
+    return this.bus.ack(String(messageId), String(agentId), deliveryToken);
+  }
+
+  retry(messageId, agentId, options = {}) {
+    return this.bus.retry(String(messageId), String(agentId), options);
+  }
+
+  sweep() {
+    return this.bus.sweep();
+  }
+
+  getMessage(messageId) {
+    return this.bus.get(String(messageId));
   }
 
   /**
