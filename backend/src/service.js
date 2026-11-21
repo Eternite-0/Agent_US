@@ -96,6 +96,7 @@ export async function service({
     };
     controlPlane = new ControlPlane({ store, pool, directAgent, metrics });
     intelligence = createIntelligenceServices({ store, directAgent, providers });
+    directAgent.attachIntelligenceServices(intelligence);
     app = api(ctx.taskEngine, token, providers, {
       snapshotPin,
       pool,

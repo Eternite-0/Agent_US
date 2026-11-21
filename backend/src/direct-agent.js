@@ -110,6 +110,7 @@ export class DirectAgentRuntime {
     this.adapter = adapter ?? pool.adapter;
     this.judgment = judgment;
     this.metrics = metrics ?? pool?.metrics ?? null;
+    this.intelligence = null;
     this.defaultWorkspace = resolve(defaultWorkspace);
     this.dataRoot = dataRoot ? resolve(dataRoot) : null;
     this.closed = false;
@@ -388,6 +389,40 @@ export class DirectAgentRuntime {
 
   close() {
     return this.shutdownCoordinator.shutdown();
+  }
+
+  /** Attach the existing intelligence services without creating a second runtime loop. */
+  attachIntelligenceServices(intelligence) {
+    if (intelligence !== null && (typeof intelligence !== 'object' || !intelligence)) throw new TypeError('intelligence must be an object or null');
+    this.intelligence = intelligence;
+    if (intelligence?.memory) this.contextAssembler.experienceMemoryService = intelligence.memory;
+    return intelligence;
+  }
+
+  /** Submit a validated planner plan to the existing durable swarm orchestrator. */
+  submitPlannedSwarmRun(options = {}) {
+    if (!this.intelligence?.planner) throw new Fault('INTELLIGENCE_UNAVAILABLE', 503);
+    return this.swarmOrchestrator.submitPlannedRun(options);
+  }
+
+  /** Wait for a turn row to become terminal after cancellation or timeout. */
+  async waitForTurnTerminal(turnId, { timeoutMs = 30_000, signal } = {}) {
+    const id = String(turnId || '');
+    if (!id) throw new Fault('TURN_ID_REQUIRED', 400);
+    const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 30_000);
+    while (true) {
+      if (signal?.aborted) throw Object.assign(new Error('wait aborted'), { name: 'AbortError', code: 'E_WAIT_ABORTED' });
+      const row = this.store.db?.prepare('SELECT * FROM direct_turns WHERE id=?').get(id);
+      if (!row) throw new Fault('TURN_NOT_FOUND', 404);
+      if (['completed', 'failed', 'cancelled'].includes(row.state)) return row;
+      if (Date.now() >= deadline) throw Object.assign(new Error('turn drain timeout'), { code: 'TURN_DRAIN_TIMEOUT' });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 50);
+        timer.unref?.();
+        const onAbort = () => { clearTimeout(timer); reject(Object.assign(new Error('wait aborted'), { name: 'AbortError', code: 'E_WAIT_ABORTED' })); };
+        signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    }
   }
 
   getWorkspaceRoot() {

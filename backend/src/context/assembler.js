@@ -1,5 +1,6 @@
 import { liveContextNotes } from '../context.js';
 import { buildStaticSystemPrompt } from '../agent-context.js';
+import { redactSecrets, sanitize } from '../envelope.js';
 
 /**
  * Layer 5 ContextAssembler.
@@ -7,11 +8,20 @@ import { buildStaticSystemPrompt } from '../agent-context.js';
  * for provider Prompt Cache hits, while pushing volatile workspace/git/plan/memory/hooks
  * strictly as diff-only tail notes via `liveContextNotes`.
  */
+function formatExperienceMemory(result) {
+  return (result?.items ?? []).map((item) => {
+    const source = sanitize(redactSecrets(String(item.source ?? 'unknown'))).slice(0, 80);
+    const content = sanitize(redactSecrets(String(item.content ?? ''))).slice(0, 1200).trim();
+    return content ? `- [source=${source} verified=${item.verified ? 'true' : 'false'}] ${content}` : null;
+  }).filter(Boolean).join('\n');
+}
+
 export class ContextAssembler {
-  constructor({ sessionRepo, compactor, memoryService = null, maxCachedSessions = 200 }) {
+  constructor({ sessionRepo, compactor, memoryService = null, experienceMemoryService = null, maxCachedSessions = 200 }) {
     this.sessionRepo = sessionRepo;
     this.compactor = compactor;
     this.memoryService = memoryService;
+    this.experienceMemoryService = experienceMemoryService;
     this.maxCachedSessions = Math.max(16, Number(maxCachedSessions || 200));
     // Per-session cache of previously emitted live-context note messages per turn boundary
     this.emittedTailHistory = new Map(); // sessionId -> Map<turnId|string, Array<msg>>
@@ -93,6 +103,8 @@ export class ContextAssembler {
     permissionMode = 'auto-safe',
     projectInstructions = null,
     memoryQuery = '',
+    projectId = null,
+    memoryTokenBudget = 1000,
     legacyMemoryText = '',
     skillsText = '',
     planState = null,
@@ -158,14 +170,16 @@ export class ContextAssembler {
     }
 
     // 3. Build current volatile sections and compute diff-only tail notes against messages so far
-    const retrievedMem =
-      this.memoryService?.retrieve({
-        query: memoryQuery,
-        workspaceRoot,
-        sessionId: session.id,
-        limit: 8,
-        maxChars: 3500,
-      })?.text || legacyMemoryText;
+    const experienceMemory = this.experienceMemoryService && projectId
+      ? formatExperienceMemory(this.experienceMemoryService.retrieve({ projectId, query: memoryQuery, limit: 8, tokenBudget: memoryTokenBudget }))
+      : '';
+    const retrievedMem = experienceMemory || this.memoryService?.retrieve({
+      query: memoryQuery,
+      workspaceRoot,
+      sessionId: session.id,
+      limit: 8,
+      maxChars: 3500,
+    })?.text || sanitize(redactSecrets(legacyMemoryText));
 
     const planText = planState?.steps?.length
       ? planState.steps

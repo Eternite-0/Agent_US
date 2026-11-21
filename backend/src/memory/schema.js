@@ -1,4 +1,4 @@
-export const MEMORY_SCHEMA_VERSION = 1;
+export const MEMORY_SCHEMA_VERSION = 2;
 
 export const MEMORY_TYPES = Object.freeze([
   'fact',
@@ -30,6 +30,11 @@ export function ensureMemorySchema(store) {
       content TEXT NOT NULL,
       normalizedContent TEXT NOT NULL,
       contentHash TEXT NOT NULL,
+      memoryClass TEXT,
+      scopeType TEXT,
+      scopeId TEXT,
+      sourceArtifact TEXT,
+      verificationEvidence TEXT,
       tags TEXT NOT NULL DEFAULT '[]',
       confidence REAL NOT NULL DEFAULT 0.5 CHECK(confidence >= 0 AND confidence <= 1),
       verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0, 1)),
@@ -46,12 +51,26 @@ export function ensureMemorySchema(store) {
       lastAccessedAt INTEGER,
       expiresAt INTEGER
     );
+  `);
+  const columns = new Set(db.prepare('PRAGMA table_info(experience_memory)').all().map((row) => row.name));
+  for (const [name, definition] of [
+    ['memoryClass', 'TEXT'],
+    ['scopeType', 'TEXT'],
+    ['scopeId', 'TEXT'],
+    ['sourceArtifact', 'TEXT'],
+    ['verificationEvidence', 'TEXT'],
+  ]) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE experience_memory ADD COLUMN ${name} ${definition}`);
+  }
+  db.exec(`
     CREATE INDEX IF NOT EXISTS experience_memory_project_status
       ON experience_memory(projectId, status, updatedAt DESC);
     CREATE INDEX IF NOT EXISTS experience_memory_project_key
       ON experience_memory(projectId, type, memoryKey, status);
     CREATE INDEX IF NOT EXISTS experience_memory_project_hash
       ON experience_memory(projectId, contentHash, status);
+    CREATE INDEX IF NOT EXISTS experience_memory_scope
+      ON experience_memory(projectId, scopeType, scopeId, status);
   `);
   return db;
 }

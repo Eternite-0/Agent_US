@@ -62,7 +62,7 @@ test('memory supports verified confidence, decay, feedback, invalidation, deleti
   assert.ok(ranked[0].decay > ranked[1].decay);
   assert.equal(memory.retrieve({ query: 'owner', tokenBudget: 100 }).items.length, 1);
   assert.equal(memory.retrieve({ projectId: 'project-a', includeInvalid: true, tokenBudget: 100 }).items.length, 2);
-  const verified = memory.feedback({ id: fresh.id, action: 'verify' });
+  const verified = memory.verifyWithEvidence({ id: fresh.id, evidence: { verifier: 'deterministic-test', passed: true }, sourceArtifact: 'artifact://memory-test' });
   assert.equal(verified.verified, true);
   assert.ok(verified.confidence >= 0.8);
   assert.equal(memory.feedback({ id: old.id, action: 'invalidate' }).status, 'invalid');
@@ -81,5 +81,4 @@ test('memory redacts secrets and rejects invalid candidates without touching per
   assert.throws(() => memory.retrieve({ projectId: '' }), /projectId is required/);
   store.db.close();
 });
-
 

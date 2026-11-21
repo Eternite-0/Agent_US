@@ -96,6 +96,11 @@ function rowToMemory(row) {
     content: row.content,
     normalizedContent: row.normalizedContent,
     contentHash: row.contentHash,
+    memoryClass: row.memoryClass ?? null,
+    scopeType: row.scopeType ?? null,
+    scopeId: row.scopeId ?? null,
+    sourceArtifact: row.sourceArtifact ?? null,
+    verificationEvidence: parseJson(row.verificationEvidence, null),
     tags: parseJson(row.tags, []),
     confidence: Number(row.confidence),
     verified: Boolean(row.verified),
@@ -163,7 +168,7 @@ export class ExperienceMemoryService {
     });
   }
 
-  normalize(candidate, { projectId = this.projectId, source = 'conversation' } = {}) {
+  normalize(candidate, { projectId = this.projectId, source = 'conversation', trustedVerification = false, verificationEvidence = null, sourceArtifact = null } = {}) {
     const project = assertProject(candidate?.projectId ?? projectId);
     const content = cleanText(candidate?.content ?? candidate?.value ?? candidate?.text);
     const key = cleanText(candidate?.key ?? candidate?.memoryKey ?? '', 200).toLowerCase();
@@ -178,9 +183,14 @@ export class ExperienceMemoryService {
       content,
       normalizedContent,
       contentHash: hashText(normalizedContent),
+      memoryClass: candidate?.memoryClass == null ? null : cleanText(candidate.memoryClass, 64),
+      scopeType: candidate?.scopeType == null ? null : cleanText(candidate.scopeType, 64),
+      scopeId: candidate?.scopeId == null ? null : cleanText(candidate.scopeId, 256),
+      sourceArtifact: trustedVerification ? (sourceArtifact ?? candidate?.sourceArtifact ?? null) : null,
+      verificationEvidence: trustedVerification ? sanitizeMetadata(verificationEvidence ?? candidate?.verificationEvidence ?? null) : null,
       tags,
       confidence: Number(candidate?.confidence ?? 0.5),
-      verified: Boolean(candidate?.verified),
+      verified: Boolean(trustedVerification && candidate?.verified && (verificationEvidence ?? candidate?.verificationEvidence)),
       source: cleanText(candidate?.source ?? source, 80) || 'unknown',
       metadata,
       expiresAt: candidate?.expiresAt == null ? null : Number(candidate.expiresAt),
@@ -270,13 +280,16 @@ export class ExperienceMemoryService {
     const id = uuid();
     this.db.prepare(
       `INSERT INTO experience_memory(
-        id, projectId, type, memoryKey, content, normalizedContent, contentHash, tags,
+        id, projectId, type, memoryKey, content, normalizedContent, contentHash,
+        memoryClass, scopeType, scopeId, sourceArtifact, verificationEvidence, tags,
         confidence, verified, status, source, tokenEstimate, metadata, supersedesId,
         invalidReason, createdAt, updatedAt, expiresAt
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id, candidate.projectId, candidate.type, candidate.key, candidate.content, candidate.normalizedContent,
-      candidate.contentHash, JSON.stringify(candidate.tags), Math.max(0, Math.min(1, Number(candidate.confidence))),
+      candidate.contentHash, candidate.memoryClass, candidate.scopeType, candidate.scopeId,
+      candidate.sourceArtifact, candidate.verificationEvidence ? JSON.stringify(candidate.verificationEvidence) : null,
+      JSON.stringify(candidate.tags), Math.max(0, Math.min(1, Number(candidate.confidence))),
       candidate.verified ? 1 : 0, status, candidate.source, estimateTokens(candidate.content), JSON.stringify(candidate.metadata),
       supersedesId, invalidReason, now, now, candidate.expiresAt,
     );
@@ -290,6 +303,27 @@ export class ExperienceMemoryService {
     return this.persist(this.dedupe(normalized, { projectId }), { projectId });
   }
 
+  rememberVerified(input, { projectId = this.projectId, source = 'server-verification', verificationEvidence, sourceArtifact = null } = {}) {
+    const project = assertProject(projectId);
+    if (!verificationEvidence || typeof verificationEvidence !== 'object') throw new TypeError('verificationEvidence is required');
+    const extracted = this.extract(input, { projectId: project, source });
+    const normalized = extracted.map((candidate) => this.normalize({ ...candidate, projectId: project, verified: true }, {
+      projectId: project, source, trustedVerification: true, verificationEvidence, sourceArtifact,
+    })).filter((candidate) => this.validate(candidate).valid);
+    return this.persist(this.dedupe(normalized, { projectId: project }), { projectId: project });
+  }
+
+  verifyWithEvidence({ projectId = this.projectId, id: memoryId, evidence, sourceArtifact = null, now = nowValue(this.clock) } = {}) {
+    const project = assertProject(projectId);
+    if (!evidence || typeof evidence !== 'object') throw new TypeError('verification evidence is required');
+    const row = this.db.prepare('SELECT * FROM experience_memory WHERE id=? AND projectId=?').get(memoryId, project);
+    if (!row) return null;
+    return tx(this.store, () => {
+      this.db.prepare('UPDATE experience_memory SET verified=1, confidence=MAX(confidence, 0.8), verificationEvidence=?, sourceArtifact=?, updatedAt=? WHERE id=? AND projectId=?')
+        .run(JSON.stringify(sanitizeMetadata(evidence)), sourceArtifact ? cleanText(sourceArtifact, 500) : row.sourceArtifact ?? null, now, memoryId, project);
+      return rowToMemory(this.db.prepare('SELECT * FROM experience_memory WHERE id=? AND projectId=?').get(memoryId, project));
+    });
+  }
   retrieve({ projectId = this.projectId, query = '', limit = 10, tokenBudget = 1_000, now = nowValue(this.clock), includeInvalid = false } = {}) {
     const project = assertProject(projectId);
     const budget = Math.max(0, Math.min(MAX_TOKEN_BUDGET, Number(tokenBudget) || 0));
@@ -323,11 +357,10 @@ export class ExperienceMemoryService {
     const project = assertProject(projectId);
     const row = this.db.prepare('SELECT * FROM experience_memory WHERE id=? AND projectId=?').get(memoryId, project);
     if (!row) return null;
-    if (!['helpful', 'unhelpful', 'verify', 'invalidate', 'delete', 'restore'].includes(action)) throw new TypeError('unsupported memory feedback action');
+    if (!['helpful', 'unhelpful', 'invalidate', 'delete', 'restore'].includes(action)) throw new TypeError('unsupported memory feedback action');
     return tx(this.store, () => {
       if (action === 'helpful') this.db.prepare('UPDATE experience_memory SET positiveFeedback=positiveFeedback+1, confidence=MIN(1, confidence+0.05), updatedAt=? WHERE id=?').run(now, memoryId);
       if (action === 'unhelpful') this.db.prepare('UPDATE experience_memory SET negativeFeedback=negativeFeedback+1, confidence=MAX(0, confidence-0.1), updatedAt=? WHERE id=?').run(now, memoryId);
-      if (action === 'verify') this.db.prepare(`UPDATE experience_memory SET verified=1, confidence=MAX(confidence, 0.8), updatedAt=? WHERE id=?`).run(now, memoryId);
       if (action === 'invalidate') this.db.prepare(`UPDATE experience_memory SET status='invalid', invalidReason=?, updatedAt=? WHERE id=?`).run(note ? cleanText(note, 200) : 'feedback', now, memoryId);
       if (action === 'delete') this.db.prepare(`UPDATE experience_memory SET status='deleted', invalidReason=?, updatedAt=? WHERE id=?`).run(note ? cleanText(note, 200) : 'deleted_by_user', now, memoryId);
       if (action === 'restore') this.db.prepare(`UPDATE experience_memory SET status='active', invalidReason=NULL, updatedAt=? WHERE id=?`).run(now, memoryId);
