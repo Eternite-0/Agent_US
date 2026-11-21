@@ -1216,7 +1216,10 @@ export class SwarmArtifactManager {
           } else {
             const parentBuf = readFileSync(target.full);
             const parentSha = sha256Buffer(parentBuf);
-            if (parentSha === entry.sha256) {
+            const modeMatches =
+              process.platform === 'win32' ||
+              (((statSync(target.full).mode & 0o111) !== 0) === (entry.mode === '100755'));
+            if (parentSha === entry.sha256 && modeMatches) {
               skipped.push({ path: entry.path, reason: 'already_applied' });
             } else if (
               entry.baseSha256 &&
