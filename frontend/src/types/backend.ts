@@ -650,6 +650,7 @@ export type AppView =
   | { kind: 'thread'; taskId: string; focusWorkerId?: string }
   | { kind: 'tasks' }
   | { kind: 'capabilities' }
+  | { kind: 'evaluations' }
   | { kind: 'settings'; section: string };
 
 export type CodexMode = 'Codex' | 'Work' | 'Chat';
@@ -837,4 +838,87 @@ export interface RuntimeOverviewRecord {
   activeSwarmRuns: number;
   enabledSchedules: number;
   modelCount?: number;
+}
+
+export type EvaluationRunStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timeout';
+
+export interface EvaluationBenchmark {
+  id: string;
+  title: string;
+  version: string;
+  datasetVersion: string;
+  taskCount: number;
+  categories: string[];
+  description?: string;
+  updatedAt?: number;
+}
+
+export interface EvaluationScore {
+  total: number;
+  passed: number;
+  failed: number;
+  cancelled: number;
+  timedOut: number;
+  attempts: number;
+  passRate: number;
+  meanDurationMs: number;
+  totalDurationMs: number;
+}
+
+export interface EvaluationTaskResult {
+  taskId: string;
+  status: EvaluationRunStatus | 'passed';
+  passed: boolean;
+  attempts: number;
+  durationMs: number;
+  error?: string;
+  judge?: {
+    deterministic?: boolean;
+    reason?: string;
+    score?: number;
+  };
+}
+
+export interface EvaluationRun {
+  id: string;
+  benchmarkId: string;
+  benchmarkVersion: string;
+  datasetVersion: string;
+  status: EvaluationRunStatus;
+  agentVersion?: string;
+  model?: string;
+  createdAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  score?: EvaluationScore;
+  results?: EvaluationTaskResult[];
+  error?: string;
+}
+
+export interface EvaluationStartInput {
+  benchmarkId: string;
+  taskIds?: string[];
+  model?: string;
+  concurrency?: number;
+  timeoutMs?: number;
+  maxAttempts?: number;
+}
+
+export interface EvaluationRegressionSummary {
+  benchmarkId?: string;
+  baselineRunId?: string | null;
+  candidateRunId?: string | null;
+  passed: boolean;
+  regressions: string[];
+  passRateDelta: number;
+  timeoutDelta: number;
+  durationDelta: number;
+  baseline?: EvaluationScore;
+  candidate?: EvaluationScore;
 }

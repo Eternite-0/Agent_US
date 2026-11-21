@@ -10,6 +10,10 @@ import type {
   ChildNotificationRecord,
   ConnectionSettings,
   EventEnvelope,
+  EvaluationBenchmark,
+  EvaluationRegressionSummary,
+  EvaluationRun,
+  EvaluationStartInput,
   Evidence,
   FileChangeDelta,
   GitStatus,
@@ -384,7 +388,16 @@ export interface AgentBackendClient {
     providersCount?: number;
     error?: string;
   }>;
-  // Memory / Usage / Events
+  // Evaluation / Memory / Usage / Events
+  listBenchmarks?: () => Promise<EvaluationBenchmark[]>;
+  listEvaluationRuns?: (params?: { benchmarkId?: string; limit?: number }) => Promise<EvaluationRun[]>;
+  getEvaluationRun?: (id: string) => Promise<EvaluationRun>;
+  startEvaluation?: (input: EvaluationStartInput) => Promise<EvaluationRun>;
+  getEvaluationRegression?: (params: {
+    benchmarkId: string;
+    baselineRunId?: string;
+    candidateRunId?: string;
+  }) => Promise<EvaluationRegressionSummary>;
   listMemory(params?: {
     projectId?: string;
     taskId?: string;
@@ -1373,7 +1386,45 @@ export class LiveBackendClient implements AgentBackendClient {
     }>('POST', '/v1/checkin/bridge/test');
   }
 
-  // ---- Memory & Usage ----
+  // ---- Evaluation / Memory & Usage ----
+
+  async listBenchmarks(): Promise<EvaluationBenchmark[]> {
+    const data = await this.req<{ items?: EvaluationBenchmark[] } | EvaluationBenchmark[]>(
+      'GET',
+      '/v1/benchmarks',
+    );
+    return Array.isArray(data) ? data : (data.items ?? []);
+  }
+
+  async listEvaluationRuns(params?: { benchmarkId?: string; limit?: number }): Promise<EvaluationRun[]> {
+    const data = await this.req<{ items?: EvaluationRun[] } | EvaluationRun[]>(
+      'GET',
+      '/v1/evaluations',
+      { query: params },
+    );
+    return Array.isArray(data) ? data : (data.items ?? []);
+  }
+
+  getEvaluationRun(id: string): Promise<EvaluationRun> {
+    return this.req("GET", `/v1/evaluations/${encodeURIComponent(id)}`);
+  }
+
+  async startEvaluation(input: EvaluationStartInput): Promise<EvaluationRun> {
+    const data = await this.req<EvaluationRun | { run: EvaluationRun }>(
+      'POST',
+      '/v1/evaluations',
+      { body: input },
+    );
+    return 'run' in data ? data.run : data;
+  }
+
+  getEvaluationRegression(params: {
+    benchmarkId: string;
+    baselineRunId?: string;
+    candidateRunId?: string;
+  }): Promise<EvaluationRegressionSummary> {
+    return this.req('GET', '/v1/evaluations/regression', { query: params });
+  }
 
   async listMemory(params?: {
     projectId?: string;

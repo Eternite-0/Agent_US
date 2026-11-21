@@ -676,29 +676,10 @@ export class DirectAgentRuntime {
   }
 
   #recordModelFeedbackSafely(payload) {
-    const res = this.modelFeedback.record(payload);
-    if (
-      res &&
-      this.store?.db?.isOpen &&
-      (payload.isSynthetic || (payload.trafficSource && payload.trafficSource !== 'production'))
-    ) {
-      const latestFb = this.store.db
-        .prepare('SELECT id, trafficSource, isSynthetic FROM model_feedback WHERE model=? ORDER BY id DESC LIMIT 1')
-        .get(payload.model);
-      const wantSource = payload.trafficSource || 'production';
-      const wantSynth = payload.isSynthetic ? 1 : 0;
-      if (
-        latestFb &&
-        (latestFb.trafficSource !== wantSource || Number(latestFb.isSynthetic ?? 0) !== wantSynth)
-      ) {
-        this.store.tx(() => {
-          this.store.db
-            .prepare('UPDATE model_feedback SET trafficSource=?, isSynthetic=? WHERE id=?')
-            .run(wantSource, wantSynth, latestFb.id);
-        });
-      }
-    }
-    return res;
+    // Provenance is written atomically with the feedback row. Do not select the
+    // latest row by model because concurrent production/evaluation writes could
+    // relabel another execution.
+    return this.modelFeedback.record(payload);
   }
 
   // ---- Turn Enqueue & Lifecycle ----

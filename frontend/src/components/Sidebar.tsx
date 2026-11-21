@@ -17,6 +17,7 @@ import {
   IconRailClock,
   IconRailHome,
   IconRailPlugins,
+  IconDagNodes,
   IconSearch,
   IconSettingsGear,
 } from './Icons';
@@ -40,6 +41,7 @@ interface SidebarProps {
   onSelectTask: (taskId: string, focusWorkerId?: string) => void;
   onSelectTasksView: () => void;
   onSelectCapabilities: () => void;
+  onSelectEvaluations: () => void;
   onOpenSettings: (section?: string) => void;
   onOpenSearch: () => void;
   onOpenCreateProject: () => void;
@@ -73,6 +75,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSelectTask,
   onSelectTasksView,
   onSelectCapabilities,
+  onSelectEvaluations,
   onOpenSettings,
   onOpenSearch,
   onOpenCreateProject,
@@ -299,6 +302,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onClick={onSelectCapabilities}
           >
             <IconRailPlugins size={20} />
+          </button>
+          <button
+            type="button"
+            className="codex-rail-btn"
+            data-active={view.kind === 'evaluations' ? 'true' : undefined}
+            aria-label="评测中心"
+            title="Evaluation Center"
+            onClick={onSelectEvaluations}
+          >
+            <IconDagNodes size={20} />
           </button>
         </div>
         <div className="codex-rail-group">

@@ -10,6 +10,7 @@ import {
   type MarketplaceSkill,
 } from './components/CapabilitiesView';
 import { CreateProjectModal } from './components/CreateProjectModal';
+import { EvaluationView } from './components/EvaluationView';
 import { HomeView } from './components/HomeView';
 import { InspectorDrawer } from './components/InspectorDrawer';
 import { SearchPalette } from './components/SearchPalette';
@@ -57,6 +58,7 @@ function parseHash(): AppView {
   if (threadMatch) return { kind: 'thread', taskId: decodeURIComponent(threadMatch[1]) };
   if (hash.startsWith('/tasks')) return { kind: 'tasks' };
   if (hash.startsWith('/capabilities')) return { kind: 'capabilities' };
+  if (hash.startsWith('/evaluations')) return { kind: 'evaluations' };
   const settingsMatch = hash.match(/^\/settings(?:\/([\w-]+))?/);
   if (settingsMatch) return { kind: 'settings', section: settingsMatch[1] || 'general' };
   return { kind: 'home' };
@@ -72,6 +74,8 @@ function viewToHash(v: AppView): string {
       return '#/tasks';
     case 'capabilities':
       return '#/capabilities';
+    case 'evaluations':
+      return '#/evaluations';
     case 'settings':
       return `#/settings/${encodeURIComponent(v.section || 'general')}`;
   }
@@ -1232,7 +1236,7 @@ export const App: React.FC = () => {
           view={view}
           collapsed={sidebarCollapsed}
           hidePanel={
-            view.kind === 'settings' || view.kind === 'tasks' || view.kind === 'capabilities'
+            view.kind === 'settings' || view.kind === 'tasks' || view.kind === 'capabilities' || view.kind === 'evaluations'
           }
           width={sidebarWidth}
           codexMode={codexMode}
@@ -1265,6 +1269,7 @@ export const App: React.FC = () => {
           }}
           onSelectTasksView={() => navigate({ kind: 'tasks' })}
           onSelectCapabilities={() => navigate({ kind: 'capabilities' })}
+          onSelectEvaluations={() => navigate({ kind: 'evaluations' })}
           onOpenSettings={(sec) => navigate({ kind: 'settings', section: sec || 'general' })}
           onOpenSearch={() => setSearchOpen(true)}
           onOpenCreateProject={() => setCreateProjectOpen(true)}
@@ -1278,7 +1283,7 @@ export const App: React.FC = () => {
         <main
           className="codex-main-surface"
           data-frameless={
-            view.kind === 'settings' || view.kind === 'tasks' || view.kind === 'capabilities'
+            view.kind === 'settings' || view.kind === 'tasks' || view.kind === 'capabilities' || view.kind === 'evaluations'
               ? 'true'
               : undefined
           }
@@ -1514,6 +1519,9 @@ export const App: React.FC = () => {
               />
             )}
 
+            {view.kind === 'evaluations' && (
+              <EvaluationView client={client} onToast={pushToast} />
+            )}
             {view.kind === 'capabilities' && (
               <CapabilitiesView
                 theme={resolvedTheme}
