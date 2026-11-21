@@ -151,6 +151,8 @@ export class EvaluationRunner {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (signal?.aborted) return this.#cancelled(task, attempt - 1, 'cancelled');
       let workspaceRoot = null;
+      let runtimeHandle = null;
+      let runtimeDrain = null;
       try {
         workspaceRoot = await createFixtureWorkspace(task);
         const syntheticContext = {
@@ -158,8 +160,6 @@ export class EvaluationRunner {
           source: 'evaluation',
           ...(await this.syntheticContextHook?.({ task, attempt, workspaceRoot, context, signal }) ?? {}),
         };
-         let runtimeHandle = null;
-         let runtimeDrain = null;
          const output = await withTimeout(
            async (runtimeSignal) => {
              const invoked = await invokeRuntime(this.runtimeFactory, {
