@@ -34,10 +34,39 @@ function freezeSnapshot(value) {
  * cannot mistake historical performance for an immutable capability claim.
  */
 export class CapabilityProfileRegistry {
-  constructor({ priorWeight = DEFAULT_CONFIDENCE_PRIOR } = {}) {
+  constructor({ priorWeight = DEFAULT_CONFIDENCE_PRIOR, store = null, kind = 'capability_profiles' } = {}) {
     this.priorWeight = Math.max(1, Number(priorWeight) || DEFAULT_CONFIDENCE_PRIOR);
+    this.store = store;
+    this.kind = String(kind || 'capability_profiles');
     this.declared = new Map();
     this.measured = new Map();
+    this.#loadPersisted();
+  }
+
+  #loadPersisted() {
+    if (!this.store?.list) return;
+    for (const row of this.store.list(this.kind, { limit: 10_000 })) {
+      const body = row?.profile ?? row;
+      if (!body?.id) continue;
+      if (body.declared) this.declared.set(body.id, structuredClone(body.declared));
+      if (body.measured) this.measured.set(body.id, structuredClone(body.measured));
+    }
+  }
+
+  #persist(id) {
+    if (!this.store?.list || !this.store?.add || !this.store?.update) return;
+    const body = {
+      id,
+      profile: {
+        id,
+        declared: this.declared.get(id) ? structuredClone(this.declared.get(id)) : null,
+        measured: this.measured.get(id) ? structuredClone(this.measured.get(id)) : null,
+        updatedAt: Date.now(),
+      },
+    };
+    const existing = this.store.list(this.kind, { limit: 10_000 }).find((row) => (row?.profile?.id ?? row?.id) === id);
+    if (existing) this.store.update(this.kind, existing, body);
+    else this.store.add(this.kind, body, null, null, id);
   }
 
   registerDeclared(spec = {}) {
@@ -56,6 +85,7 @@ export class CapabilityProfileRegistry {
       registeredAt: spec.registeredAt ?? Date.now(),
     };
     this.declared.set(id, profile);
+    this.#persist(id);
     return freezeSnapshot({ ...profile, capabilities: { ...profile.capabilities }, toolAllow: [...profile.toolAllow] });
   }
 
@@ -63,13 +93,25 @@ export class CapabilityProfileRegistry {
     return this.registerDeclared(spec);
   }
 
+  /**
+   * Evidence-backed capability updates are intentionally not accepted through the
+   * generic recordMeasured name. Callers must provide a durable evaluation result.
+   */
   recordMeasured(spec = {}) {
+    throw new TypeError('Measured capabilities require recordMeasuredFromEvaluation()');
+  }
+
+  recordMeasuredFromEvaluation(spec = {}, evidence = {}) {
     const id = String(spec.id ?? spec.agentId ?? spec.model ?? '').trim();
     if (!id) throw new TypeError('Capability measurement requires id');
-    const sampleCount = Math.max(0, Number(spec.sampleCount ?? spec.samples ?? 0));
-    const confidence = clamp(
-      spec.confidence ?? (sampleCount > 0 ? sampleCount / (sampleCount + this.priorWeight) : 0),
-    );
+    const source = evidence && typeof evidence === 'object' ? evidence : {};
+    const evaluationRunId = String(source.evaluationRunId ?? spec.evaluationRunId ?? '').trim();
+    const evidenceRefs = [...new Set((source.evidenceRefs ?? spec.evidenceRefs ?? []).map(String).filter(Boolean))];
+    if (!evaluationRunId || evidenceRefs.length === 0) {
+      throw new TypeError('Capability measurement requires evaluationRunId and evidenceRefs');
+    }
+    const sampleCount = Math.max(1, Number(spec.sampleCount ?? source.sampleCount ?? 1));
+    const confidence = measuredConfidence({ sampleCount, confidence: undefined });
     const capabilities = normalizeVector(spec.capabilities ?? spec.vector ?? {});
     const measurement = {
       id,
@@ -80,10 +122,17 @@ export class CapabilityProfileRegistry {
       capabilities,
       metrics: spec.metrics ? structuredClone(spec.metrics) : {},
       lastMeasuredAt: spec.lastMeasuredAt ?? Date.now(),
-      evidenceRefs: Array.isArray(spec.evidenceRefs) ? [...new Set(spec.evidenceRefs.map(String))] : [],
+      evidenceRefs,
+      evaluation: {
+        evaluationRunId,
+        benchmarkId: source.benchmarkId ?? spec.benchmarkId ?? null,
+        benchmarkVersion: source.benchmarkVersion ?? spec.benchmarkVersion ?? null,
+        datasetVersion: source.datasetVersion ?? spec.datasetVersion ?? null,
+      },
     };
     this.measured.set(id, measurement);
-    return freezeSnapshot({ ...measurement, capabilities: { ...capabilities }, evidenceRefs: [...measurement.evidenceRefs] });
+    this.#persist(id);
+    return freezeSnapshot({ ...measurement, capabilities: { ...capabilities }, evidenceRefs: [...evidenceRefs] });
   }
 
   getDeclared(id) {
@@ -132,7 +181,6 @@ export class CapabilityProfileRegistry {
     return this.list().map((entry) => structuredClone(entry));
   }
 }
-
 export function createCapabilityProfileRegistry(options) {
   return new CapabilityProfileRegistry(options);
 }

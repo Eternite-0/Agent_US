@@ -43,7 +43,7 @@ export class MemoryCommunicationAdapter {
     const sequence = prior.reduce((max, m) => Math.max(max, m.sequence), 0) + 1;
     const message = {
       ...clone(draft), messageId: randomUUID(), sequence, status: 'pending', attempts: 0,
-      nextAttemptAt: draft.createdAt, deliveredAt: null, ackDeadline: null, acknowledgedAt: null, lastError: null,
+      nextAttemptAt: draft.createdAt, deliveredAt: null, ackDeadline: null, deliveryToken: null, acknowledgedAt: null, lastError: null,
     };
     this.#messages.set(message.messageId, message);
     for (const artifact of draft.artifactManifest.artifacts) this.#artifactDigests.set(artifact.uri, artifact.sha256);
@@ -60,27 +60,30 @@ export class MemoryCommunicationAdapter {
       message.attempts++;
       message.deliveredAt = now;
       message.ackDeadline = now + visibilityTimeoutMs;
+      message.deliveryToken = randomUUID();
       return clone(message);
     }
     return null;
   }
 
-  async ack({ messageId, agentId, now }) {
+  async ack({ messageId, agentId, deliveryToken, now }) {
     const message = this.#messages.get(messageId);
     if (!message) return null;
     if (message.toAgentId !== agentId) throw new CommunicationStateError('ACK_RECIPIENT_MISMATCH');
+    if (deliveryToken !== undefined && deliveryToken !== message.deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
     if (message.status === 'acked') return clone(message);
     if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');
-    message.status = 'acked'; message.acknowledgedAt = now; message.ackDeadline = null;
+    message.status = 'acked'; message.acknowledgedAt = now; message.ackDeadline = null; message.deliveryToken = null;
     return clone(message);
   }
 
-  async retry({ messageId, agentId, now, delayMs, error }) {
+  async retry({ messageId, agentId, deliveryToken, now, delayMs, error }) {
     const message = this.#messages.get(messageId);
     if (!message) return null;
     if (message.toAgentId !== agentId) throw new CommunicationStateError('RETRY_RECIPIENT_MISMATCH');
+    if (deliveryToken !== undefined && deliveryToken !== message.deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
     if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');
-    message.lastError = error ?? null; message.ackDeadline = null;
+    message.lastError = error ?? null; message.ackDeadline = null; message.deliveryToken = null;
     if (message.attempts >= message.maxAttempts) message.status = 'dead_letter';
     else { message.status = 'pending'; message.nextAttemptAt = now + delayMs; }
     return clone(message);

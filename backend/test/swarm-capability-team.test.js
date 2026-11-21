@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Store } from '../src/store.js';
 import { CapabilityProfileRegistry } from '../src/swarm/capability-registry.js';
 import { TeamOptimizer } from '../src/swarm/team-optimizer.js';
 import { ResultAggregator } from '../src/swarm/result-aggregator.js';
@@ -13,14 +17,14 @@ test('Swarm capability profiles keep declared and measured evidence distinct', (
     toolAllow: ['read_file', 'edit_file'],
     capabilities: { coding: 0.9, reasoning: 0.7, speed: 0.5 },
   });
-  registry.recordMeasured({
+  registry.recordMeasuredFromEvaluation({
     id: 'agent-impl',
     sampleCount: 10,
     capabilities: { coding: 0.6, reasoning: 0.8, speed: 0.9 },
     empiricalScore: 0.78,
     metrics: { successRate: 0.8, avgLatencyMs: 1200 },
     evidenceRefs: ['receipt:1', 'verdict:1'],
-  });
+  }, { evaluationRunId: 'eval-run-1', benchmarkId: 'smoke', benchmarkVersion: '1', datasetVersion: '1' });
 
   const profile = registry.getEffectiveCapability('agent-impl');
   assert.equal(profile.declared.source, 'declared');
@@ -32,6 +36,26 @@ test('Swarm capability profiles keep declared and measured evidence distinct', (
   assert.ok(profile.effective.coding < 0.9 && profile.effective.coding > 0.6);
   assert.equal(registry.getDeclared('agent-impl').readOnly, false);
   assert.equal(registry.getMeasured('agent-impl').metrics.successRate, 0.8);
+});
+
+test('CapabilityProfileRegistry persists declarations and evaluation-backed measurements', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-us-capability-registry-'));
+  const dbPath = join(dir, 'capabilities.sqlite');
+  let store = new Store(dbPath);
+  try {
+    const first = new CapabilityProfileRegistry({ store });
+    first.registerDeclared({ id: 'persisted-model', capabilities: { coding: 0.8 } });
+    first.recordMeasuredFromEvaluation({ id: 'persisted-model', sampleCount: 4, capabilities: { coding: 0.7 }, empiricalScore: 0.75, evidenceRefs: ['artifact://eval/1'] }, { evaluationRunId: 'eval-1', benchmarkId: 'smoke', benchmarkVersion: '1', datasetVersion: '1' });
+    store.close();
+    store = new Store(dbPath);
+    const reopened = new CapabilityProfileRegistry({ store });
+    assert.equal(reopened.getDeclared('persisted-model').capabilities.coding, 0.8);
+    assert.equal(reopened.getMeasured('persisted-model').evaluation.evaluationRunId, 'eval-1');
+    assert.throws(() => reopened.recordMeasured({ id: 'persisted-model', sampleCount: 1 }), /recordMeasuredFromEvaluation/);
+  } finally {
+    if (store?.db?.isOpen) store.close();
+    await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
+  }
 });
 
 test('TeamOptimizer chooses one agent for simple work and bounds teams by concurrency', () => {

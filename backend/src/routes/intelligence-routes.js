@@ -108,9 +108,9 @@ export function registerIntelligenceRoutes(app, {
     if (!capabilityRegistry) fail('CAPABILITY_REGISTRY_UNAVAILABLE', 503);
     try { return capabilityRegistry.registerDeclared(req.body ?? {}); } catch (error) { throw asRouteError(error); }
   });
-  app.post('/v1/agents/capabilities/measure', async (req) => {
-    if (!capabilityRegistry) fail('CAPABILITY_REGISTRY_UNAVAILABLE', 503);
-    try { return capabilityRegistry.recordMeasured(req.body ?? {}); } catch (error) { throw asRouteError(error); }
+  app.post('/v1/agents/capabilities/measure', async () => {
+    // Measured capability is evidence-backed state. Ordinary HTTP clients cannot write it.
+    fail('CAPABILITY_MEASUREMENT_FORBIDDEN', 403, 'Measured capabilities can only be recorded by the trusted evaluation service');
   });
 
   app.post('/v1/swarm/teams/optimize', async (req) => {
@@ -132,7 +132,7 @@ export function registerIntelligenceRoutes(app, {
   });
   app.post('/v1/communication/messages/:id/ack', async (req) => {
     if (!communication) fail('COMMUNICATION_UNAVAILABLE', 503);
-    try { return await communication.ack(req.params.id, String(req.body?.agentId || '')); } catch (error) { throw asRouteError(error); }
+    try { return await communication.ack(req.params.id, String(req.body?.agentId || ''), req.body?.deliveryToken); } catch (error) { throw asRouteError(error); }
   });
 
   app.get('/v1/memory/experience', async (req) => {
@@ -145,11 +145,19 @@ export function registerIntelligenceRoutes(app, {
   });
   app.post('/v1/memory/experience', async (req) => {
     if (!memory) fail('EXPERIENCE_MEMORY_UNAVAILABLE', 503);
-    try { return memory.remember(req.body?.candidates ?? req.body?.content ?? req.body ?? {}, { projectId: req.body?.projectId, source: req.body?.source ?? 'api' }); } catch (error) { throw asRouteError(error); }
+    try {
+      const body = req.body ?? {};
+      const input = body.candidates ?? body.content ?? body;
+      return memory.remember(input, { projectId: body.projectId, source: 'api' });
+    } catch (error) { throw asRouteError(error); }
   });
   app.post('/v1/memory/experience/:id/feedback', async (req) => {
     if (!memory) fail('EXPERIENCE_MEMORY_UNAVAILABLE', 503);
-    try { return memory.feedback({ id: req.params.id, ...(req.body ?? {}) }); } catch (error) { throw asRouteError(error); }
+    try {
+      const body = req.body ?? {};
+      if (body.action === 'verify') fail('MEMORY_VERIFICATION_FORBIDDEN', 403, 'use trusted server-side verification evidence');
+      return memory.feedback({ id: req.params.id, ...body });
+    } catch (error) { throw asRouteError(error); }
   });
   app.delete('/v1/memory/experience/:id', async (req) => {
     if (!memory) fail('EXPERIENCE_MEMORY_UNAVAILABLE', 503);

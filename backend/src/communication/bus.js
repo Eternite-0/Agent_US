@@ -19,9 +19,9 @@ export class CommunicationBus {
     if (typeof agentId !== 'string' || !agentId) throw new TypeError('agentId is required');
     return this.adapter.claimNext({ agentId, now: this.clock(), visibilityTimeoutMs: options.visibilityTimeoutMs ?? this.options.visibilityTimeoutMs });
   }
-  async ack(messageId, agentId) { return this.adapter.ack({ messageId, agentId, now: this.clock() }); }
-  async retry(messageId, agentId, { delayMs = this.options.retryDelayMs, error = null } = {}) {
-    return this.adapter.retry({ messageId, agentId, now: this.clock(), delayMs: Math.max(0, Math.trunc(Number(delayMs) || 0)), error: error ? String(error) : null });
+  async ack(messageId, agentId, deliveryToken = undefined) { return this.adapter.ack({ messageId, agentId, deliveryToken, now: this.clock() }); }
+  async retry(messageId, agentId, { delayMs = this.options.retryDelayMs, error = null, deliveryToken = undefined } = {}) {
+    return this.adapter.retry({ messageId, agentId, deliveryToken, now: this.clock(), delayMs: Math.max(0, Math.trunc(Number(delayMs) || 0)), error: error ? String(error) : null });
   }
   async cancel(messageId, actorId) { return this.adapter.cancel({ messageId, actorId, now: this.clock() }); }
   async sweep() { return this.adapter.sweep ? this.adapter.sweep({ now: this.clock() }) : { expired: 0, deadLettered: 0 }; }

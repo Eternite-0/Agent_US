@@ -89,45 +89,53 @@ export class StoreCommunicationAdapter {
       const message = {
         ...clone(draft), messageId: randomUUID(), sequence, status: 'pending', attempts: 0,
         nextAttemptAt: draft.createdAt, deliveredAt: null, ackDeadline: null,
-        acknowledgedAt: null, lastError: null,
+        deliveryToken: null, acknowledgedAt: null, lastError: null,
       };
       this.store.add(this.kind, message, null, null, message.messageId);
       return { status: 'created', message: clone(message) };
     });
   }
   async claimNext({ agentId, now, visibilityTimeoutMs }) {
-    const messages = this.#messages();
-    for (const message of messages
-      .filter((item) => item.toAgentId === agentId && ACTIVE.has(item.status) && item.expiresAt > now && (item.status === 'pending' ? item.nextAttemptAt <= now : item.ackDeadline <= now))
-      .sort((a, b) => Number(a.sequence) - Number(b.sequence) || Number(a.createdAt) - Number(b.createdAt) || a.messageId.localeCompare(b.messageId))) {
-      const earlier = messages.some((item) => streamKey(item) === streamKey(message) && Number(item.sequence) < Number(message.sequence) && !TERMINAL.has(item.status));
-      if (earlier) continue;
-      return this.#save(message, {
-        status: 'delivered', attempts: Number(message.attempts || 0) + 1,
-        deliveredAt: now, ackDeadline: now + visibilityTimeoutMs,
-      });
-    }
-    return null;
+    return this.store.tx(() => {
+      const messages = this.#messages();
+      for (const message of messages
+        .filter((item) => item.toAgentId === agentId && ACTIVE.has(item.status) && item.expiresAt > now && (item.status === 'pending' ? item.nextAttemptAt <= now : item.ackDeadline <= now))
+        .sort((a, b) => Number(a.sequence) - Number(b.sequence) || Number(a.createdAt) - Number(b.createdAt) || a.messageId.localeCompare(b.messageId))) {
+        const earlier = messages.some((item) => streamKey(item) === streamKey(message) && Number(item.sequence) < Number(message.sequence) && !TERMINAL.has(item.status));
+        if (earlier) continue;
+        return this.#save(message, {
+          status: 'delivered', attempts: Number(message.attempts || 0) + 1,
+          deliveredAt: now, ackDeadline: now + visibilityTimeoutMs, deliveryToken: randomUUID(),
+        });
+      }
+      return null;
+    });
   }
 
-  async ack({ messageId, agentId, now }) {
-    const message = this.#messages().find((item) => item.messageId === messageId);
-    if (!message) return null;
-    if (message.toAgentId !== agentId) throw new CommunicationStateError('ACK_RECIPIENT_MISMATCH');
-    if (message.status === 'acked') return clone(message);
-    if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');
-    return this.#save(message, { status: 'acked', acknowledgedAt: now, ackDeadline: null });
+  async ack({ messageId, agentId, deliveryToken, now }) {
+    return this.store.tx(() => {
+      const message = this.#messages().find((item) => item.messageId === messageId);
+      if (!message) return null;
+      if (message.toAgentId !== agentId) throw new CommunicationStateError('ACK_RECIPIENT_MISMATCH');
+      if (deliveryToken !== undefined && deliveryToken !== message.deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
+      if (message.status === 'acked') return clone(message);
+      if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');
+      return this.#save(message, { status: 'acked', acknowledgedAt: now, ackDeadline: null, deliveryToken: null });
+    });
   }
 
-  async retry({ messageId, agentId, now, delayMs, error }) {
-    const message = this.#messages().find((item) => item.messageId === messageId);
-    if (!message) return null;
-    if (message.toAgentId !== agentId) throw new CommunicationStateError('RETRY_RECIPIENT_MISMATCH');
-    if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');
-    const exhausted = Number(message.attempts || 0) >= Number(message.maxAttempts || 1);
-    return this.#save(message, exhausted
-      ? { status: 'dead_letter', lastError: error ?? null, ackDeadline: null }
-      : { status: 'pending', lastError: error ?? null, ackDeadline: null, nextAttemptAt: now + delayMs });
+  async retry({ messageId, agentId, deliveryToken, now, delayMs, error }) {
+    return this.store.tx(() => {
+      const message = this.#messages().find((item) => item.messageId === messageId);
+      if (!message) return null;
+      if (message.toAgentId !== agentId) throw new CommunicationStateError('RETRY_RECIPIENT_MISMATCH');
+      if (deliveryToken !== undefined && deliveryToken !== message.deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
+      if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');
+      const exhausted = Number(message.attempts || 0) >= Number(message.maxAttempts || 1);
+      return this.#save(message, exhausted
+        ? { status: 'dead_letter', lastError: error ?? null, ackDeadline: null, deliveryToken: null }
+        : { status: 'pending', lastError: error ?? null, ackDeadline: null, deliveryToken: null, nextAttemptAt: now + delayMs });
+    });
   }
 
   async cancel({ messageId, actorId, now }) {

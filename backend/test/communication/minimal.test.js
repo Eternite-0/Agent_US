@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CommunicationBus, CommunicationValidationError, MemoryCommunicationAdapter } from '../../src/communication/index.js';
+import { CommunicationBus, CommunicationValidationError, MemoryCommunicationAdapter, StoreCommunicationAdapter } from '../../src/communication/index.js';
+import { Store } from '../../src/store.js';
 
 function harness(start = 1_000) {
   let now = start;
@@ -39,18 +40,38 @@ test('receive/ack is at-least-once, retry is bounded, and dead letters after max
   await bus.send({ conversationId: 'c1', fromAgentId: 'a', toAgentId: 'b', idempotencyKey: 'retry-1', payload: {} });
   const first = await bus.receive('b');
   assert.equal(first.attempts, 1);
+  assert.match(first.deliveryToken, /^[0-9a-f-]{36}$/);
+  await assert.rejects(() => bus.ack(first.messageId, 'b', 'stale-worker-token'), (err) => err.code === 'DELIVERY_TOKEN_MISMATCH');
   advance(11);
   const second = await bus.receive('b');
   assert.equal(second.messageId, first.messageId);
   assert.equal(second.attempts, 2);
-  await bus.retry(second.messageId, 'b', { delayMs: 5, error: 'temporary' });
+  await bus.retry(second.messageId, 'b', { deliveryToken: second.deliveryToken, delayMs: 5, error: 'temporary' });
   assert.equal(await bus.receive('b'), null);
   advance(5);
   const third = await bus.receive('b');
   assert.equal(third.attempts, 3);
-  await bus.retry(third.messageId, 'b', { error: 'final' });
+  await bus.retry(third.messageId, 'b', { deliveryToken: third.deliveryToken, error: 'final' });
   assert.equal((await bus.get(third.messageId)).status, 'dead_letter');
   await assert.rejects(() => bus.ack(third.messageId, 'wrong-agent'), (err) => err.code === 'ACK_RECIPIENT_MISMATCH');
+});
+
+test('store communication claims are fenced and atomically exclusive', async () => {
+  const store = new Store(':memory:');
+  const bus = new CommunicationBus({ adapter: new StoreCommunicationAdapter({ store }), clock: () => 2_000, defaultTtlMs: 10_000, visibilityTimeoutMs: 50 });
+  try {
+    const sent = await bus.send({ conversationId: 'store-c1', runId: 'store-r1', fromAgentId: 'a', toAgentId: 'b', idempotencyKey: 'store-1', payload: { task: 'one' } });
+    const claims = await Promise.all([bus.receive('b'), bus.receive('b')]);
+    const delivered = claims.filter(Boolean);
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].messageId, sent.message.messageId);
+    assert.match(delivered[0].deliveryToken, /^[0-9a-f-]{36}$/);
+    await assert.rejects(() => bus.ack(sent.message.messageId, 'b', 'old-worker'), (err) => err.code === 'DELIVERY_TOKEN_MISMATCH');
+    const acked = await bus.ack(delivered[0].messageId, 'b', delivered[0].deliveryToken);
+    assert.equal(acked.status, 'acked');
+  } finally {
+    store.close();
+  }
 });
 
 test('expiry, cancellation, parent-child links, and per-stream order are enforced', async () => {
