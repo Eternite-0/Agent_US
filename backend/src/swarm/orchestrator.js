@@ -873,7 +873,7 @@ export class AdaptiveSwarmOrchestrator {
             reviewerAvailable: picked.some((n) => n.taskType === 'verification'),
           });
           const dispatchCount = team.mode === 'team'
-            ? Math.min(picked.length, team.members?.length ?? 0)
+            ? picked.length
             : Math.min(1, picked.length);
           const queuedKeys = [];
           for (const [index, n] of picked.slice(0, dispatchCount).entries()) {

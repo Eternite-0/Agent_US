@@ -122,7 +122,7 @@ export class TeamOptimizer {
     const teamCost = members.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (reviewer ? this.reviewerCost : 0);
     const budgetAllowsTeam = teamCost <= maxBudget;
-    const mode = teamWanted && members.length > 1 && budgetAllowsTeam && maxC > 1 ? 'team' : 'single';
+    const mode = teamWanted && members.length >= 1 && budgetAllowsTeam && maxC > 1 ? 'team' : 'single';
     const selected = mode === 'team' ? members : [single];
     const estimatedCost = selected.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (mode === 'team' && reviewer && !selected.some((member) => member.id === reviewer.id) ? this.reviewerCost : 0);
