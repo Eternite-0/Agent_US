@@ -1301,7 +1301,7 @@ test('Phase 4 Observability E2E: all 10 KPIs, all 12 trace fields, pool routing 
     ]);
     assert.equal(prodT2.state, 'failed');
 
-    // 3. Synthetic traffic via header x-agent-traffic-source: synthetic + /v1/models/test probe
+    // 3. Client provenance spoofing is ignored; only the server-side probe path is synthetic.
     const synthSessRes = await svc.app.inject({
       method: 'POST',
       url: '/v1/sessions',
@@ -1310,8 +1310,8 @@ test('Phase 4 Observability E2E: all 10 KPIs, all 12 trace fields, pool routing 
     });
     assert.equal(synthSessRes.statusCode, 200);
     const synthSess = synthSessRes.json();
-    assert.equal(synthSess.isSynthetic, true);
-    assert.equal(synthSess.trafficSource, 'synthetic');
+    assert.equal(synthSess.isSynthetic, false, 'client header must not mark a session synthetic');
+    assert.equal(synthSess.trafficSource, 'production');
 
     const synthTurnRes = await svc.app.inject({
       method: 'POST',
@@ -1384,10 +1384,10 @@ test('Phase 4 Observability E2E: all 10 KPIs, all 12 trace fields, pool routing 
 
     // Strict real vs synthetic separation: ONLY the 2 production turns (1 pass, 1 verifier fail -> 0.5)!
     // The synthetic completed turn MUST NOT inflate production success rate!
-    assert.equal(pm.agentTaskSuccessRate.directTurns.total, 2);
-    assert.equal(pm.agentTaskSuccessRate.directTurns.succeeded, 1);
+    assert.equal(pm.agentTaskSuccessRate.directTurns.total, 3);
+    assert.equal(pm.agentTaskSuccessRate.directTurns.succeeded, 2);
     assert.equal(pm.agentTaskSuccessRate.directTurns.failed, 1);
-    assert.equal(pm.agentTaskSuccessRate.rate, 0.5);
+    assert.equal(pm.agentTaskSuccessRate.rate, 0.6667);
     assert.ok(pm.trafficBreakdown.syntheticCount > 0, 'synthetic traffic must be tracked separately');
 
     // Model routing KPI reflects real failover & cooldown rejection (and excludes /v1/models/test probe!)
@@ -1396,7 +1396,7 @@ test('Phase 4 Observability E2E: all 10 KPIs, all 12 trace fields, pool routing 
     assert.ok(pm.modelRoutingSuccessRate.failoverRate > 0, 'failover from primary 429 must be reflected');
     assert.ok(pm.modelRoutingSuccessRate.cooldownRejections >= 1, '429 cooldown rejection must be counted');
 
-    // Including synthetic traffic increases total turns from 2 -> 3 and routing requests by probe+synthetic!
+    // Client-spoofed traffic remains production; the internal model probe is synthetic.
     const allMetricsRes = await svc.app.inject({
       method: 'GET',
       url: '/v1/observability/metrics?windowHours=24&includeSynthetic=true',
@@ -1414,7 +1414,7 @@ test('Phase 4 Observability E2E: all 10 KPIs, all 12 trace fields, pool routing 
     const ov = ovRes.json();
     assert.equal(ov.ok, true);
     assert.ok(ov.metricsSummary);
-    assert.equal(ov.metricsSummary.agentTaskSuccessRate, 0.5);
+    assert.equal(ov.metricsSummary.agentTaskSuccessRate, 0.6667);
 
     // 7. Query GET /v1/observability/traces -> verify ALL 12 canonical correlation fields + _trace on direct_events!
     const traceRes = await svc.app.inject({

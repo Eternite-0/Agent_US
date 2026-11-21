@@ -79,6 +79,7 @@ export class ControlPlane {
         metricsSummary = {
           windowHours: 24,
           agentTaskSuccessRate: m.agentTaskSuccessRate.rate,
+          agentTaskUnverified: m.agentTaskSuccessRate.unverified,
           verificationPassRate: m.verificationPassRate.rate,
           toolFailureRate: m.toolFailureRate.rate,
           recoverySuccessRate: m.recoverySuccessRate.rate,

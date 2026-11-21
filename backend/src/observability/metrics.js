@@ -177,10 +177,13 @@ export class MetricsCollector {
     let dtTotal = 0;
     let dtSuccess = 0;
     let dtCancelled = 0;
+    let dtUnverified = 0;
     let evTotal = 0;
     let evSuccess = 0;
     let ptTotal = 0;
     let ptSuccess = 0;
+    let ptUnverified = 0;
+    let unverifiedTotal = 0;
 
     for (const t of turnRows) {
       if (t.state === 'cancelled') {
@@ -189,29 +192,38 @@ export class MetricsCollector {
       }
       dtTotal++;
       const verdict = parseJsonSafe(t.verdictJson, null);
+      const hasVerdict = verdict !== null;
       const verdictOk =
-        verdict !== null
-          ? verdict.accepted === true && verdict.verdict === 'pass'
-          : true;
+        hasVerdict && verdict.accepted === true && verdict.verdict === 'pass';
       const succeeded = t.state === 'completed' && verdictOk;
+      const unverified = !hasVerdict;
       if (succeeded) dtSuccess++;
+      if (unverified) {
+        dtUnverified++;
+        unverifiedTotal++;
+      }
 
-      const evidenceBacked =
-        verdict?.evidenceRequired === true ||
-        (verdict?.verificationMode && verdict.verificationMode !== 'plain_text_no_tools') ||
-        Number(t.evidenceCount || 0) > 0;
+      // Plain-text completion is a deliberate verifier path, never an inference
+      // from an old row that merely happens to have zero evidence/tool usage.
+      const plainText = verdict?.verificationMode === 'plain_text_no_tools';
+      const evidenceBacked = !plainText &&
+        (verdict?.evidenceRequired === true ||
+          (verdict?.verificationMode && verdict.verificationMode !== 'plain_text_no_tools') ||
+          Number(t.evidenceCount || 0) > 0);
       if (evidenceBacked) {
         evTotal++;
         if (succeeded) evSuccess++;
-      } else {
+      } else if (plainText) {
         ptTotal++;
         if (succeeded) ptSuccess++;
+        if (unverified) ptUnverified++;
       }
     }
 
     let srTotal = 0;
     let srSuccess = 0;
     let srCancelled = 0;
+    let srUnverified = 0;
     const swarmCompletedDurs = [];
     const swarmFailedDurs = [];
     const swarmAllDurs = [];
@@ -223,14 +235,18 @@ export class MetricsCollector {
       }
       srTotal++;
       const verdict = parseJsonSafe(r.verdictJson, null);
+      const hasVerdict = verdict !== null;
       const verdictOk =
-        verdict !== null
-          ? verdict.accepted === true && verdict.verdict === 'pass'
-          : true;
+        hasVerdict && verdict.accepted === true && verdict.verdict === 'pass';
       const succeeded = r.status === 'completed' && verdictOk;
       if (succeeded) srSuccess++;
-      evTotal++;
-      if (succeeded) evSuccess++;
+      if (!hasVerdict) {
+        srUnverified++;
+        unverifiedTotal++;
+      } else {
+        evTotal++;
+        if (succeeded) evSuccess++;
+      }
 
       const endTs = Number(r.finishedAt ?? r.updatedAt ?? r.createdAt);
       const dur = Math.max(0, endTs - Number(r.createdAt ?? endTs));
@@ -246,22 +262,26 @@ export class MetricsCollector {
       succeeded: totalTaskSuccess,
       failed: totalTasks - totalTaskSuccess,
       cancelled: dtCancelled + srCancelled,
+      unverified: unverifiedTotal,
       total: totalTasks,
       evidenceBackedSuccessRate: evTotal > 0 ? round4(evSuccess / evTotal) : null,
       evidenceBackedTotal: evTotal,
       plainTextCompletionRate: ptTotal > 0 ? round4(ptSuccess / ptTotal) : null,
       plainTextTotal: ptTotal,
+      plainTextUnverified: ptUnverified,
       directTurns: {
         total: dtTotal,
         succeeded: dtSuccess,
-        failed: dtTotal - dtSuccess,
+        failed: dtTotal - dtSuccess - dtUnverified,
         cancelled: dtCancelled,
+        unverified: dtUnverified,
       },
       swarmRuns: {
         total: srTotal,
         succeeded: srSuccess,
-        failed: srTotal - srSuccess,
+        failed: srTotal - srSuccess - srUnverified,
         cancelled: srCancelled,
+        unverified: srUnverified,
       },
     };
 
@@ -1366,13 +1386,15 @@ export class MetricsCollector {
         succeeded: 0,
         failed: 0,
         cancelled: 0,
+        unverified: 0,
         total: 0,
         evidenceBackedSuccessRate: null,
         evidenceBackedTotal: 0,
         plainTextCompletionRate: null,
         plainTextTotal: 0,
-        directTurns: { total: 0, succeeded: 0, failed: 0, cancelled: 0 },
-        swarmRuns: { total: 0, succeeded: 0, failed: 0, cancelled: 0 },
+        plainTextUnverified: 0,
+        directTurns: { total: 0, succeeded: 0, failed: 0, cancelled: 0, unverified: 0 },
+        swarmRuns: { total: 0, succeeded: 0, failed: 0, cancelled: 0, unverified: 0 },
       },
       verificationPassRate: { rate: null, passed: 0, failed: 0, total: 0, unverifiedCount: 0 },
       toolFailureRate: {

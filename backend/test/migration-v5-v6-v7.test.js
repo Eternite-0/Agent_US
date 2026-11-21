@@ -676,11 +676,15 @@ test('9. Observability primitives: trace context, redacted NDJSON logger, 10 pro
     // 9A: Trace context propagation & traffic classification
     assert.equal(getLogLevel(), 'silent', 'Default log level under node --test must be silent');
     assert.deepEqual(classifyTrafficSource({ 'x-agent-traffic-source': 'eval' }), {
-      trafficSource: 'eval',
-      isSynthetic: true,
+      trafficSource: 'production',
+      isSynthetic: false,
     });
     assert.deepEqual(classifyTrafficSource({ 'x-agent-synthetic': 'true' }), {
-      trafficSource: 'synthetic',
+      trafficSource: 'production',
+      isSynthetic: false,
+    });
+    assert.deepEqual(classifyTrafficSource({ trafficSource: 'eval' }), {
+      trafficSource: 'eval',
       isSynthetic: true,
     });
     assert.deepEqual(classifyTrafficSource({ trafficSource: 'probe', isSynthetic: false }), {
@@ -779,6 +783,12 @@ test('9. Observability primitives: trace context, redacted NDJSON logger, 10 pro
            VALUES('turn-obs-cancel','sess-obs-1','cancel','gpt-5','cancelled','production',0,?,?)`,
         )
         .run(now - 2400, now - 2300);
+      store.db
+        .prepare(
+          `INSERT INTO direct_turns(id, sessionId, input, model, state, trafficSource, isSynthetic, createdAt, finishedAt)
+           VALUES('turn-obs-unverified','sess-obs-1','legacy no verdict','gpt-5','completed','production',0,?,?)`,
+        )
+        .run(now - 2300, now - 2200);
       // Synthetic failing turns that MUST NOT pollute production metrics
       for (let i = 0; i < 5; i++) {
         store.db
@@ -945,9 +955,12 @@ test('9. Observability primitives: trace context, redacted NDJSON logger, 10 pro
     });
 
     const prod = metrics.getProductionMetrics({ windowHours: 24, includeSynthetic: false });
-    assert.equal(prod.agentTaskSuccessRate.total, 5); // 3 prod turns + 2 prod swarms (cancelled excluded)
-    assert.equal(prod.agentTaskSuccessRate.succeeded, 3); // 2 prod turns + 1 prod swarm
-    assert.equal(prod.agentTaskSuccessRate.rate, 0.6);
+    assert.equal(prod.agentTaskSuccessRate.total, 6); // 4 prod turns + 2 prod swarms (cancelled excluded)
+    assert.equal(prod.agentTaskSuccessRate.succeeded, 3); // 2 verified turns + 1 verified swarm
+    assert.equal(prod.agentTaskSuccessRate.rate, 0.5);
+    assert.equal(prod.agentTaskSuccessRate.unverified, 1);
+    assert.equal(prod.agentTaskSuccessRate.directTurns.unverified, 1);
+    assert.equal(prod.agentTaskSuccessRate.directTurns.failed, 1);
     assert.equal(prod.agentTaskSuccessRate.evidenceBackedTotal, 4);
     assert.equal(prod.agentTaskSuccessRate.evidenceBackedSuccessRate, 0.5);
     assert.equal(prod.agentTaskSuccessRate.plainTextTotal, 1);
@@ -995,7 +1008,7 @@ test('9. Observability primitives: trace context, redacted NDJSON logger, 10 pro
 
     // With includeSynthetic=true, synthetic failures appear
     const withSynth = metrics.getProductionMetrics({ windowHours: 24, includeSynthetic: true });
-    assert.equal(withSynth.agentTaskSuccessRate.total, 11); // +5 synth turns +1 synth swarm
+    assert.equal(withSynth.agentTaskSuccessRate.total, 12); // +5 synth turns +1 synth swarm
     assert.equal(withSynth.modelRoutingSuccessRate.totalRequests, 5); // 3 prod + 2 synthetic probes
 
     // Regression #25-2: Populate >120 older noise rows across direct_events, runtime_checkpoints, runtime_jobs

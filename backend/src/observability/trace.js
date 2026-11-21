@@ -52,20 +52,15 @@ function parseBooleanFlag(val) {
   return null;
 }
 
-function readHeader(headers, name) {
-  if (!headers || typeof headers !== 'object') return undefined;
-  const target = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === target) {
-      return Array.isArray(v) ? v[0] : v;
-    }
-  }
-  return undefined;
-}
-
 /**
- * Normalizes HTTP headers, request/session metadata, or raw source string into
- * `{ trafficSource, isSynthetic }` for strict separation of production vs synthetic traffic.
+ * Normalizes trusted server-side source metadata or a raw source string into
+ * `{ trafficSource, isSynthetic }`.
+ *
+ * HTTP headers are intentionally ignored here.  A caller that is crossing an
+ * HTTP boundary must establish the source at that boundary; accepting source
+ * headers would let an external client move traffic into synthetic/eval
+ * buckets and corrupt production KPIs.  The API boundary performs that
+ * sanitization before routing, while internal probes use `withTraceContext()`.
  */
 export function classifyTrafficSource(headersOrSource, fallback = TRAFFIC_SOURCES.PRODUCTION) {
   const safeFallback = VALID_TRAFFIC_SOURCES.has(String(fallback || '').toLowerCase())
@@ -89,23 +84,11 @@ export function classifyTrafficSource(headersOrSource, fallback = TRAFFIC_SOURCE
   }
 
   if (typeof headersOrSource === 'object') {
-    const headers =
-      headersOrSource.headers && typeof headersOrSource.headers === 'object'
-        ? headersOrSource.headers
-        : headersOrSource;
-
-    const rawSource =
-      headersOrSource.trafficSource ??
-      headersOrSource.source ??
-      readHeader(headers, 'x-agent-traffic-source') ??
-      readHeader(headers, 'x-traffic-source') ??
-      null;
-
-    const rawSynth =
-      headersOrSource.isSynthetic !== undefined
-        ? headersOrSource.isSynthetic
-        : (readHeader(headers, 'x-agent-synthetic') ?? readHeader(headers, 'x-synthetic'));
-
+    // Only explicit server-side fields are trusted.  In particular, do not
+    // inspect `headers` (or any x-* aliases) here: request headers are
+    // attacker-controlled input, not provenance metadata.
+    const rawSource = headersOrSource.trafficSource ?? headersOrSource.source ?? null;
+    const rawSynth = headersOrSource.isSynthetic;
     const explicitSynth = parseBooleanFlag(rawSynth);
     const normSource = rawSource ? String(rawSource).trim().toLowerCase() : '';
     let trafficSource = VALID_TRAFFIC_SOURCES.has(normSource) ? normSource : null;

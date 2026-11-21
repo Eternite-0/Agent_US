@@ -5,7 +5,7 @@ import Fastify from 'fastify';
 import { z, ZodError } from 'zod';
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { Fault } from './store.js';
-import { classifyTrafficSource, withTraceContext } from './observability/trace.js';
+import { TRAFFIC_SOURCES, withTraceContext } from './observability/trace.js';
 import { logEvent } from './observability/logger.js';
 export const uuid = z.uuid();
 const digest = (s) => createHash('sha256').update(s).digest();
@@ -27,15 +27,31 @@ export function api(
     throw Error('BACKEND_TOKEN requires at least 24 characters');
   const app = Fastify({ bodyLimit: 512 * 1024, logger: false });
   app.addHook('onRequest', (req, _reply, done) => {
-    const classified = classifyTrafficSource(req.headers);
+    // HTTP clients cannot assert provenance.  Keep the request trace pinned to
+    // production; internal probe routes establish their own trusted context.
+    // Also remove legacy override fields before v1-routes can inspect them.
+    for (const key of [
+      'x-agent-traffic-source',
+      'x-traffic-source',
+      'x-agent-synthetic',
+      'x-synthetic',
+    ]) {
+      delete req.headers[key];
+    }
     withTraceContext(
       {
         traceId: req.id,
-        trafficSource: classified.trafficSource,
-        isSynthetic: classified.isSynthetic,
+        trafficSource: TRAFFIC_SOURCES.PRODUCTION,
+        isSynthetic: false,
       },
       () => done(),
     );
+  });
+  app.addHook('preHandler', async (req) => {
+    if (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) {
+      delete req.body.trafficSource;
+      delete req.body.isSynthetic;
+    }
   });
   app.addHook('onRequest', async (req) => {
     const pathname = req.url.split('?')[0];
