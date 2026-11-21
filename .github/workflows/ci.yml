@@ -107,7 +107,7 @@ jobs:
             cat "$log_file"
             if [ "$code" -ne 0 ]; then
               failed=1
-              summary="$(grep -E '(^✖|not ok|AssertionError|TypeError|Error:|ℹ fail|ℹ duration_ms)' "$log_file" | tail -8 | tr '\n' ' ' | cut -c1-900)"
+              summary="$(tail -30 "$log_file" | tr '\n' ' ' | cut -c1-1800)"
               echo "::error file=backend/${test_file},title=Backend test file failed::${summary:-exit code ${code}}"
             fi
             rm -f "$log_file"
@@ -147,9 +147,9 @@ jobs:
             Get-Content -LiteralPath $logFile
             if ($code -ne 0) {
               $failed = $true
-              $summary = (Select-String -LiteralPath $logFile -Pattern '(^✖|not ok|AssertionError|TypeError|Error:|ℹ fail|ℹ duration_ms)' | Select-Object -Last 8 | ForEach-Object { $_.Line }) -join ' '
+              $summary = (Get-Content -LiteralPath $logFile | Select-Object -Last 30) -join ' '
               if ([string]::IsNullOrWhiteSpace($summary)) { $summary = "exit code $code" }
-              $summary = $summary.Substring(0, [Math]::Min(900, $summary.Length))
+              $summary = $summary.Substring(0, [Math]::Min(1800, $summary.Length))
               Write-Output "::error file=backend/$testFile,title=Backend test file failed::$summary"
             }
             Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
