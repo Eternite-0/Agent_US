@@ -51,7 +51,7 @@ test('Fault injection durable #10/#11: stale job completion is fenced after take
     store.tx(() => store.db.prepare('UPDATE runtime_jobs SET leaseExpiresAt=? WHERE id=?').run(Date.now() - 1, job.id));
     const second = queue.claim({ workerId: 'new-worker', kinds: ['fault_probe'], leaseMs: 1000 });
     assert.notEqual(second.fence, first.fence);
-    assert.throws(() => queue.complete(first), (err) => err?.code === 'LEASE_LOST');
+    assert.throws(() => queue.complete(first.id, first.fence), (err) => err?.code === 'LEASE_LOST');
     assert.equal(store.db.prepare('SELECT status, workerId FROM runtime_jobs WHERE id=?').get(job.id).status, 'active');
     queue.complete(second);
     assert.equal(store.db.prepare('SELECT status FROM runtime_jobs WHERE id=?').get(job.id).status, 'done');
@@ -70,7 +70,7 @@ test('Fault injection durable #12/#13: budget reservations reconcile determinist
     const row = store.db.prepare('SELECT status FROM budget_reservations WHERE id=?').get(reservation.reservationId);
     assert.equal(row.status, 'reserved');
     const report = ledger.reconcileAfterRestart();
-    assert.ok(report.reconciled >= 1);
+    assert.ok(report.reconciledCount >= 1);
     assert.equal(store.db.prepare('SELECT status FROM budget_reservations WHERE id=?').get(reservation.reservationId).status, 'reconciled');
     const snap = ledger.getSnapshot('tree-fi');
     assert.equal(snap.reservedSteps, 0);
@@ -87,7 +87,7 @@ test('Fault injection durable #14/#15/#17: artifact orphan cleanup preserves unr
     initGit(repo);
     writeFileSync(join(repo, 'result.txt'), 'artifact content\n');
     const manager = new SwarmArtifactManager({ store, storageRoot: storage });
-    const artifact = await manager.captureArtifact({
+    const artifact = await manager.archiveWorktree({
       runId: 'run-fi', nodeId: 'node-fi', nodeKey: 'node-fi', childSessionId: 's-fi', childTurnId: 't-fi',
       ownerId: 'owner-fi', fence: 'f1', workspaceRoot: repo, worktreePath: repo,
     });
