@@ -39,6 +39,7 @@ import {
   parseToolAllowJson,
   recoverInterruptedSwarmRuns,
 } from './recovery-helpers.js';
+import { validatePlan } from '../planning/validator.js';
 
 /**
  * Layer 6 Durable Job-Driven AdaptiveSwarmOrchestrator:
@@ -99,7 +100,11 @@ export class AdaptiveSwarmOrchestrator {
     const nodes = this.store.db
       .prepare('SELECT * FROM swarm_nodes WHERE runId=? ORDER BY priority DESC, createdAt ASC')
       .all(runId);
-    return hydrateSwarmRun(run, nodes);
+    const hydrated = hydrateSwarmRun(run, nodes);
+    const persistedPlan = run.planJson
+      ? parseJsonSafe(run.planJson, null)
+      : hydrated.strategy?.plan ?? null;
+    return { ...hydrated, plan: persistedPlan };
   }
 
   listRuns({ sessionId = null, limit = 50 } = {}) {
@@ -157,12 +162,19 @@ export class AdaptiveSwarmOrchestrator {
     maxReplans = 2,
     trafficSource = 'production',
     isSynthetic = 0,
+    planVersion = 1,
+    plan = null,
   }) {
     const runId = uuid();
     const now = Date.now();
+    const initialPlanVersion = Number.isInteger(Number(planVersion)) && Number(planVersion) > 0
+      ? Number(planVersion)
+      : 1;
+    const persistedPlan = plan ? structuredClone(plan) : null;
     const strategy = {
       maxConcurrency: Math.min(6, Math.max(1, Number(maxConcurrency || 3))),
       maxReplans: Math.max(0, Number(maxReplans ?? 2)),
+      ...(persistedPlan ? { plan: persistedPlan } : {}),
     };
     const usageTotals = { inputTokens: 0, outputTokens: 0, steps: 0, completedNodes: 0 };
     const hasExplicitNodes = Array.isArray(nodes) && nodes.length > 0;
@@ -178,7 +190,7 @@ export class AdaptiveSwarmOrchestrator {
             id, sessionId, rootTurnId, goal, status, strategyJson, budgetJson, usageJson,
             workspaceRoot, permissionMode, planVersion, currentPhase, replanCount,
             trafficSource, isSynthetic, createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,0,?,?,?,?)`,
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)`,
         )
         .run(
           runId,
@@ -191,6 +203,7 @@ export class AdaptiveSwarmOrchestrator {
           JSON.stringify(usageTotals),
           workspaceRoot,
           parentPermissionMode,
+          initialPlanVersion,
           initialStatus,
           String(trafficSource || 'production'),
           isSynthetic ? 1 : 0,
@@ -205,7 +218,7 @@ export class AdaptiveSwarmOrchestrator {
         isSynthetic: isSynthetic ? 1 : 0,
       });
       if (routedSpecs.length) {
-        this.#insertNodes(runId, routedSpecs, parentPermissionMode, 1, now);
+        this.#insertNodes(runId, routedSpecs, parentPermissionMode, initialPlanVersion, now);
       }
     });
 
@@ -230,7 +243,7 @@ export class AdaptiveSwarmOrchestrator {
       enqueueSwarmJob(this.jobQueue, SWARM_JOB_KINDS.DEPENDENCY_RESOLVE, {
         runId,
         sessionId,
-        planVersion: 1,
+        planVersion: initialPlanVersion,
         epoch: 0,
       });
     } else {
@@ -246,6 +259,56 @@ export class AdaptiveSwarmOrchestrator {
     return { runId, sessionId, status: run.status, run };
   }
 
+  /**
+   * Validate an Adaptive Planner plan and submit it through the existing durable
+   * Swarm path. No second execution loop is introduced.
+   */
+  submitPlannedRun({
+    plan,
+    sessionId,
+    rootTurnId = null,
+    workspaceRoot = null,
+    parentPermissionMode = 'auto-safe',
+    maxConcurrency = 3,
+    budget = undefined,
+    maxReplans = 2,
+    trafficSource = 'production',
+    isSynthetic = 0,
+  } = {}) {
+    const validated = validatePlan(plan, { permissionCeiling: parentPermissionMode });
+    const nodes = validated.tasks.map((task) => ({
+      nodeKey: task.taskKey,
+      objective: task.objective,
+      acceptance:
+        typeof task.acceptance === 'string'
+          ? task.acceptance
+          : `${task.acceptance.description} (required evidence: ${task.acceptance.requiredEvidence.join(', ')})`,
+      taskType: task.taskType,
+      dependencies: task.dependencies,
+      toolAllow: task.toolAllow,
+      budget: task.budget,
+      priority: Number.isFinite(Number(task.metadata?.priority)) ? Number(task.metadata.priority) : 0,
+    }));
+    return this.submitRun({
+      sessionId,
+      rootTurnId,
+      goal: validated.goal,
+      workspaceRoot,
+      parentPermissionMode: validated.permissionMode,
+      maxConcurrency,
+      budget: budget ?? validated.budget,
+      nodes,
+      maxReplans,
+      trafficSource,
+      isSynthetic,
+      planVersion: validated.planVersion,
+      plan: validated,
+    });
+  }
+
+  submitPlan(options = {}) {
+    return this.submitPlannedRun(options);
+  }
   waitForRun(runId, { timeoutMs = 120_000, signal = undefined } = {}) {
     const initial = this.getRun(runId);
     if (!initial) {
