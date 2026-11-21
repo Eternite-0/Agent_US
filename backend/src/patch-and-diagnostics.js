@@ -358,14 +358,41 @@ export function applyCodexPatch(
 
 // ---- 3. Codex Command Canonicalization & Approval Prefix Cache ----
 
-const COMPOUND_SHELL_RE = /[;&|><`\n]|\$\(/;
+const COMPOUND_SHELL_RE = /[;&|><`\r\n]|\$\(|@\(|<\(|>\(/;
 const DOUBLE_QUOTE_SUBST_RE = /`|\$\(/;
+
+const DISALLOWED_SESSION_PREFIX_HEADS = new Set([
+  'node',
+  'python',
+  'python3',
+  'py',
+  'ruby',
+  'perl',
+  'php',
+  'lua',
+  'sh',
+  'bash',
+  'zsh',
+  'dash',
+  'ksh',
+  'ash',
+  'fish',
+  'pwsh',
+  'powershell',
+  'cmd',
+  'curl',
+  'wget',
+  'eval',
+  'exec',
+  'env',
+  'sudo',
+  'doas',
+]);
 
 /**
  * Checks whether a shell command contains unquoted compound operators (;, &, |, >, <, newline)
  * or command substitution (`...`, $(...)) outside single quotes.
- * Safe characters like `=>` or `;` inside quoted script arguments (e.g. `node -e "x => x + 1"`)
- * do not falsely trigger compound-operator rejection.
+ * Never allows backslash (`\`) outside quotes to hide shell operators (Windows PowerShell treats `\` literally).
  */
 function hasCompoundShellOperators(cmd) {
   let inSingle = false;
@@ -380,6 +407,8 @@ function hasCompoundShellOperators(cmd) {
     }
     if (inDouble) {
       if (ch === '\\' && i + 1 < cmd.length) {
+        const nextCh = cmd[i + 1];
+        if (nextCh === '`' || nextCh === '$' || nextCh === '\r' || nextCh === '\n') return true;
         i += 1;
         continue;
       }
@@ -401,10 +430,6 @@ function hasCompoundShellOperators(cmd) {
       doubleInner = '';
       continue;
     }
-    if (ch === '\\' && i + 1 < cmd.length) {
-      i += 1;
-      continue;
-    }
     unquoted += ch;
   }
   if (inSingle || inDouble) return true;
@@ -412,28 +437,77 @@ function hasCompoundShellOperators(cmd) {
 }
 
 /**
- * Strips common shell wrappers and produces a canonical command prefix suitable for
- * session-level "Always Allow Prefix" caching (e.g. `npm test`, `git diff`, `pytest`).
- * Returns null for compound/piped/redirected commands so unsafe chains are NEVER generalized!
+ * Safely strips a shell wrapper (`bash -lc "..."`, `sh -c '...'`, `pwsh -Command "..."`) ONLY when
+ * the entire argument after the flag is a single balanced quoted string with no trailing tokens.
  */
-export function canonicalizeCommandPrefix(rawCommand) {
-  let cmd = String(rawCommand ?? '').trim();
-  if (!cmd) return null;
-
-  // Strip explicit wrapper prefixes like `sh -c "..."`, `bash -lc '...'`, `powershell -Command "..."`
-  const wrapper =
+function unwrapSingleQuotedShellWrapper(cmd) {
+  const headMatch =
     /^(?:(?:\/[\w/.-]+\/)?(?:sh|bash|zsh|pwsh|powershell(?:\.exe)?))\s+(?:-[a-zA-Z]+\s+)*(?:-c|-lc|-Command)\s+(['"])([\s\S]+)\1$/i.exec(
       cmd,
     );
-  if (wrapper) cmd = wrapper[2].trim();
+  if (!headMatch) return cmd;
+  const quote = headMatch[1];
+  const inner = headMatch[2];
+  // Ensure the opening quote is ONLY closed at EOF (rejects `sh -c "npm test "; whoami; echo "ok"`)
+  for (let i = 0; i < inner.length; i++) {
+    if (quote === '"' && inner[i] === '\\' && i + 1 < inner.length) {
+      i++;
+      continue;
+    }
+    if (inner[i] === quote) {
+      return null;
+    }
+  }
+  return inner.trim();
+}
+
+/**
+ * Strips common shell wrappers and produces a canonical command prefix suitable for
+ * session-level "Always Allow Prefix" caching (e.g. `npm test`, `git diff`, `pytest`).
+ * Returns null for compound/piped/redirected commands, raw interpreters/shells, and dangerous git flags!
+ */
+export function canonicalizeCommandPrefix(rawCommand) {
+  const original = String(rawCommand ?? '').trim();
+  if (!original) return null;
+
+  // CRITICAL: Check compound/chaining operators BEFORE stripping any shell wrapper
+  if (hasCompoundShellOperators(original)) return null;
+
+  const cmd = unwrapSingleQuotedShellWrapper(original);
+  if (!cmd) return null;
 
   if (hasCompoundShellOperators(cmd)) return null;
   const tokens = cmd.split(/\s+/).filter(Boolean);
   if (!tokens.length) return null;
 
   const head = tokens[0].split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
+  if (DISALLOWED_SESSION_PREFIX_HEADS.has(head)) {
+    return null;
+  }
+
+  // Disallow git global config/exec override flags from session-prefix caching
+  if (head === 'git') {
+    for (const tok of tokens.slice(1)) {
+      const f = tok.split('=')[0];
+      const lf = f.toLowerCase();
+      if (
+        f === '-c' ||
+        f === '-C' ||
+        (!tok.startsWith('--') && (tok.startsWith('-c') || tok.startsWith('-C'))) ||
+        lf === '--config-env' ||
+        lf === '--exec-path' ||
+        lf === '--git-dir' ||
+        lf === '--work-tree' ||
+        lf === '--upload-pack' ||
+        lf === '--receive-pack'
+      ) {
+        return null;
+      }
+    }
+  }
+
   const sub = tokens[1] && !tokens[1].startsWith('-') ? tokens[1].toLowerCase() : null;
-  // Two-token prefix for subcommand CLIs (npm test, git commit, cargo build, python -m ...)
+  // Two-token prefix for subcommand CLIs (npm test, git commit, cargo build, ...)
   const multiWordHeads = new Set([
     'npm',
     'pnpm',
@@ -449,7 +523,9 @@ export function canonicalizeCommandPrefix(rawCommand) {
     'poetry',
     'dotnet',
   ]);
-  if (multiWordHeads.has(head) && sub) {
+  if (multiWordHeads.has(head)) {
+    if (!sub) return null;
+    if (head === 'npx' || (head === 'npm' && sub === 'exec')) return null;
     return `${head} ${sub}`;
   }
   return head;

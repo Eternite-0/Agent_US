@@ -22,7 +22,7 @@ export class BackgroundProcessManager {
     const bin = isWin ? 'powershell.exe' : 'sh';
     const args = isWin
       ? ['-NoProfile', '-NonInteractive', '-Command', command]
-      : ['-lc', command];
+      : ['-c', command];
     const child = spawn(bin, args, {
       cwd,
       windowsHide: true,

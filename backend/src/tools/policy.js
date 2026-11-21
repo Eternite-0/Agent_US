@@ -72,10 +72,14 @@ export function filterToolsByPolicy(tools, { denyTools = [], allowTools = null }
  * Preserves explicit [] allowlist semantics (never widens [] to null).
  */
 export function intersectPolicies(parentPolicy = {}, childPolicy = {}) {
-  const parentMode = parentPolicy.permissionMode ?? 'auto-safe';
-  const childMode = childPolicy.permissionMode ?? parentMode;
-  const pRank = PERMISSION_RANK[parentMode] ?? 2;
-  const cRank = PERMISSION_RANK[childMode] ?? 2;
+  const rawParentMode = parentPolicy.permissionMode ?? 'auto-safe';
+  const rawChildMode = childPolicy.permissionMode ?? rawParentMode;
+  const parentValid = Object.hasOwn(PERMISSION_RANK, rawParentMode);
+  const childValid = Object.hasOwn(PERMISSION_RANK, rawChildMode);
+  const parentMode = parentValid ? rawParentMode : 'read-only';
+  const childMode = childValid ? rawChildMode : 'read-only';
+  const pRank = parentValid ? PERMISSION_RANK[parentMode] : 0;
+  const cRank = childValid ? PERMISSION_RANK[childMode] : 0;
   const effectiveMode = pRank <= cRank ? parentMode : childMode;
 
   const denyTools = [
@@ -126,6 +130,9 @@ export class ToolPermissionPolicy {
   ) {
     const name = toolDef.name;
     const meta = toolDef.meta ?? {};
+    const effectiveMode = Object.hasOwn(PERMISSION_RANK, permissionMode)
+      ? permissionMode
+      : 'read-only';
 
     if (this.alwaysDenyRules.has(name) || (Array.isArray(denyTools) && denyTools.includes(name))) {
       return {
@@ -156,7 +163,7 @@ export class ToolPermissionPolicy {
           rule: analysis.hardBlocked,
         };
       }
-      if (permissionMode === 'read-only' && !analysis.isReadOnly) {
+      if (effectiveMode === 'read-only' && !analysis.isReadOnly) {
         return {
           decision: 'deny',
           reason: 'Read-only policy prohibits non-readonly commands',
@@ -170,7 +177,7 @@ export class ToolPermissionPolicy {
           commandPrefix: analysis.commandPrefix,
         };
       }
-      if (permissionMode === 'full-access') {
+      if (effectiveMode === 'full-access') {
         return {
           decision: 'allow',
           reason: 'full-access mode',
@@ -184,7 +191,7 @@ export class ToolPermissionPolicy {
           commandPrefix: analysis.commandPrefix,
         };
       }
-      if (permissionMode === 'auto-safe' && analysis.isReadOnly) {
+      if (effectiveMode === 'auto-safe' && analysis.isReadOnly) {
         return {
           decision: 'allow',
           reason: 'strict read-only command allowlist',
@@ -199,13 +206,20 @@ export class ToolPermissionPolicy {
     }
 
     if (meta.readOnly) {
+      if (tainted && meta.effectClass === 'external_network') {
+        return {
+          decision: 'ask',
+          reason: 'Tainted context requires human approval for external network fetch',
+          rule: 'tainted_external_network_gate',
+        };
+      }
       if (this.alwaysAskRules.has(name)) {
         return { decision: 'ask', reason: 'alwaysAsk rule' };
       }
       return { decision: 'allow', reason: 'read-only tool' };
     }
 
-    if (permissionMode === 'read-only') {
+    if (effectiveMode === 'read-only') {
       return {
         decision: 'deny',
         reason: `Tool "${name}" is not allowed in read-only mode`,
@@ -217,7 +231,7 @@ export class ToolPermissionPolicy {
       if (this.alwaysAllowRules.has(name) && !tainted) {
         return { decision: 'allow', reason: 'explicit outward allow rule' };
       }
-      if (permissionMode === 'full-access' && this.allowOutwardInFullAccess && !tainted) {
+      if (effectiveMode === 'full-access' && this.allowOutwardInFullAccess && !tainted) {
         return { decision: 'allow', reason: 'full-access outward opt-in' };
       }
       return {
@@ -232,14 +246,14 @@ export class ToolPermissionPolicy {
     if (this.alwaysAskRules.has(name)) {
       return { decision: 'ask', reason: 'alwaysAsk rule' };
     }
-    if (this.alwaysAllowRules.has(name) || permissionMode === 'full-access') {
+    if (this.alwaysAllowRules.has(name) || effectiveMode === 'full-access') {
       return { decision: 'allow', reason: 'policy allow' };
     }
     if (
-      (permissionMode === 'auto-safe' || permissionMode === 'workspace-write') &&
+      (effectiveMode === 'auto-safe' || effectiveMode === 'workspace-write') &&
       meta.effectClass === 'reversible_write'
     ) {
-      return { decision: 'allow', reason: `${permissionMode} reversible write` };
+      return { decision: 'allow', reason: `${effectiveMode} reversible write` };
     }
 
     return { decision: 'ask', reason: 'Approval required' };

@@ -1,13 +1,26 @@
 import { execFile, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+} from 'node:fs';
+import { hostname as osHostname, tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { id as uuid } from '../store.js';
 import { sandbox as dockerSandbox } from '../tools.js';
 import {
   assertLeaseInTx,
   checkLeaseHeld,
+  classifyJobOwnership,
+  getWorkerRecord,
+  isPidAlive,
   isWorktreeOwnerLive,
 } from '../durable/lease-guard.js';
 
@@ -19,11 +32,63 @@ export const ISOLATION_MODES = Object.freeze({
 
 const execFileAsync = promisify(execFile);
 
-const PROTECTED_BASENAMES = new Set([
+export const PROTECTED_BASENAMES = new Set([
   '.pool-key',
   '.dev-token',
   '.provider-env.json',
 ]);
+
+/**
+ * Normalizes a path segment for cross-OS security checks:
+ * - Strips NTFS Alternate Data Streams (e.g. `.dev-token::$DATA`)
+ * - Strips trailing dots/spaces (Windows NTFS treats `.dev-token.` / `.git ` as `.dev-token` / `.git`)
+ * - Lowercases for case-insensitive filesystems (Windows/macOS)
+ */
+export function normalizeProtectedSegment(segment) {
+  const raw = String(segment ?? '');
+  const withoutStream = raw.split(':')[0];
+  return withoutStream.replace(/[. ]+$/, '').toLowerCase();
+}
+
+export function isProtectedPathSegment(segment) {
+  const norm = normalizeProtectedSegment(segment);
+  return norm === '.git' || PROTECTED_BASENAMES.has(norm);
+}
+
+function assertSafeSegments(relPath, input) {
+  const parts = relPath ? relPath.split(/[\\/]/).filter(Boolean) : [];
+  for (const part of parts) {
+    const norm = normalizeProtectedSegment(part);
+    if (norm === '.git') {
+      throw new Error('不允许直接修改或读取 .git 内部对象目录');
+    }
+    if (PROTECTED_BASENAMES.has(norm)) {
+      throw new Error(`受保护的密钥文件不允许访问: ${part}`);
+    }
+  }
+}
+
+function isOutsideRelative(relPath) {
+  if (!relPath) return false;
+  if (isAbsolute(relPath)) return true;
+  if (
+    relPath === '..' ||
+    relPath.startsWith(`..${sep}`) ||
+    relPath.startsWith('../') ||
+    relPath.startsWith('..\\')
+  ) {
+    return true;
+  }
+  return relPath.split(/[\\/]/).includes('..');
+}
+
+function stripWinExtendedPrefix(p) {
+  if (process.platform === 'win32' && typeof p === 'string') {
+    if (p.startsWith('\\\\?\\UNC\\')) return `\\\\${p.slice(8)}`;
+    if (p.startsWith('\\\\?\\')) return p.slice(4);
+  }
+  return p;
+}
 
 const SENSITIVE_ENV_KEY_RE =
   /^(?:BACKEND_TOKEN|BACKEND_VAULT|.*_(?:API_KEY|SECRET|TOKEN|PASSWORD|PRIVATE_KEY)|AWS_.*|OPENAI_.*|ANTHROPIC_.*|DEEPSEEK_.*|GITHUB_TOKEN|NPM_TOKEN|GH_TOKEN)$/i;
@@ -52,8 +117,26 @@ function findNearestExistingAncestor(targetPath) {
   return cur;
 }
 
+function canonicalizeTargetWithAncestors(targetPath) {
+  const abs = resolve(targetPath);
+  try {
+    return realpathSync(abs);
+  } catch {
+    const anc = findNearestExistingAncestor(abs);
+    if (!anc) return abs;
+    try {
+      const realAnc = realpathSync(anc);
+      const suffix = relative(anc, abs);
+      return suffix ? resolve(realAnc, suffix) : realAnc;
+    } catch {
+      return abs;
+    }
+  }
+}
+
 /**
- * Resolves a workspace-confined path and prevents symlink/junction escapes outside workspaceRoot.
+ * Resolves a workspace-confined path and prevents symlink/junction escapes,
+ * dangling-symlink writes, intra-workspace symlink bypasses, and cross-OS case/NTFS bypasses.
  */
 export function resolveConfinedPath(workspaceRoot, rawPath) {
   const root = resolve(workspaceRoot);
@@ -61,29 +144,82 @@ export function resolveConfinedPath(workspaceRoot, rawPath) {
   if (!input) throw new Error('路径不能为空');
   const full = isAbsolute(input) ? resolve(input) : resolve(root, input);
   const rel = relative(root, full);
-  if (rel.startsWith('..') || isAbsolute(rel) || rel.split(sep).includes('..')) {
+  if (isOutsideRelative(rel)) {
     throw new Error(`路径超出当前工作区边界: ${input}`);
   }
-  const parts = rel ? rel.split(/[\\/]/) : [];
-  if (parts.includes('.git')) {
-    throw new Error('不允许直接修改或读取 .git 内部对象目录');
-  }
-  const base = parts.at(-1) ?? '';
-  if (PROTECTED_BASENAMES.has(base)) {
-    throw new Error(`受保护的密钥文件不允许访问: ${base}`);
-  }
+  assertSafeSegments(rel, input);
 
-  // Symlink / junction escape check
+  // Component-by-component lstat + symlink/junction/dangling-symlink confinement walk
   if (existsSync(root)) {
     const realRoot = realpathSync(root);
-    const existing = findNearestExistingAncestor(full);
-    if (existing) {
-      const realExisting = realpathSync(existing);
-      const realRel = relative(realRoot, realExisting);
-      if (realRel.startsWith('..') || isAbsolute(realRel) || realRel.split(sep).includes('..')) {
+    const queue = rel ? rel.split(/[\\/]/).filter(Boolean) : [];
+    let cur = realRoot;
+    let hops = 0;
+
+    while (queue.length > 0) {
+      const seg = queue.shift();
+      assertSafeSegments(seg, input);
+      const next = join(cur, seg);
+
+      let lst = null;
+      try {
+        lst = lstatSync(next);
+      } catch (err) {
+        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+          cur = next;
+          while (queue.length > 0) {
+            const rem = queue.shift();
+            assertSafeSegments(rem, input);
+            cur = join(cur, rem);
+          }
+          break;
+        }
+        throw err;
+      }
+
+      if (lst.isSymbolicLink()) {
+        if (++hops > 16) {
+          throw new Error(`符号链接层级过深: ${input}`);
+        }
+        const rawLink = stripWinExtendedPrefix(readlinkSync(next));
+        const resolvedLink = isAbsolute(rawLink)
+          ? resolve(rawLink)
+          : resolve(dirname(next), rawLink);
+        const linkParent = dirname(resolvedLink);
+        const normalizedLink =
+          linkParent === resolvedLink
+            ? resolvedLink
+            : join(canonicalizeTargetWithAncestors(linkParent), basename(resolvedLink));
+        const linkRel = relative(realRoot, normalizedLink);
+        if (isOutsideRelative(linkRel)) {
+          throw new Error(`符号链接路径逃逸出当前工作区边界: ${input}`);
+        }
+        assertSafeSegments(linkRel, input);
+        const nextParts = linkRel ? linkRel.split(/[\\/]/).filter(Boolean) : [];
+        queue.unshift(...nextParts);
+        cur = realRoot;
+        continue;
+      }
+
+      let realNext = next;
+      try {
+        realNext = realpathSync(next);
+      } catch {
+        realNext = next;
+      }
+      const nextRel = relative(realRoot, realNext);
+      if (isOutsideRelative(nextRel)) {
         throw new Error(`符号链接路径逃逸出当前工作区边界: ${input}`);
       }
+      assertSafeSegments(nextRel, input);
+      cur = realNext;
     }
+
+    const finalRealRel = relative(realRoot, cur);
+    if (isOutsideRelative(finalRealRel)) {
+      throw new Error(`符号链接路径逃逸出当前工作区边界: ${input}`);
+    }
+    assertSafeSegments(finalRealRel, input);
   }
 
   return { full, rel: rel.replace(/\\/g, '/') || '.' };
@@ -144,7 +280,7 @@ export class HostSandboxAdapter {
       const bin = isWin ? 'powershell.exe' : 'sh';
       const args = isWin
         ? ['-NoProfile', '-NonInteractive', '-Command', command]
-        : ['-lc', command];
+        : ['-c', command];
 
       const child = spawn(bin, args, {
         cwd,
@@ -415,38 +551,190 @@ export class GitWorktreeIsolator {
           windowsHide: true,
           timeout: 8000,
         }).catch(() => {});
-        rmSync(worktreePath, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
+        await execFileAsync('git', ['worktree', 'prune'], {
+          cwd: workspaceRoot,
+          windowsHide: true,
+          timeout: 5000,
+        }).catch(() => {});
+        let rmError = null;
+        try {
+          rmSync(worktreePath, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
+        } catch (err) {
+          rmError = err;
+        }
+        const stillExists = existsSync(worktreePath);
 
         if (this.store?.db?.isOpen) {
           try {
             const now = Date.now();
-            const cleanupState = isArchived
-              ? 'archived'
-              : forceDiscard
-                ? 'discarded'
-                : 'clean_empty';
-            this.store.tx(() => {
-              this.store.db
-                .prepare(
-                  `UPDATE worktree_leases
-                   SET status='cleaned',
-                       cleanupState=?,
-                       artifactId=COALESCE(?, artifactId),
-                       cleanedAt=?,
-                       updatedAt=?
-                   WHERE id=? AND (? IS NULL OR fence IS NULL OR fence=?)`,
-                )
-                .run(cleanupState, archivedArtifactId, now, now, leaseId, entry.fence, entry.fence);
-            });
+            if (!stillExists) {
+              const cleanupState = isArchived
+                ? 'archived'
+                : forceDiscard
+                  ? 'discarded'
+                  : 'clean_empty';
+              this.store.tx(() => {
+                this.store.db
+                  .prepare(
+                    `UPDATE worktree_leases
+                     SET status='cleaned',
+                         cleanupState=?,
+                         artifactId=COALESCE(?, artifactId),
+                         cleanedAt=?,
+                         updatedAt=?
+                     WHERE id=? AND (? IS NULL OR fence IS NULL OR fence=?)`,
+                  )
+                  .run(cleanupState, archivedArtifactId, now, now, leaseId, entry.fence, entry.fence);
+              });
+            } else {
+              this.store.tx(() => {
+                this.store.db
+                  .prepare(
+                    `UPDATE worktree_leases
+                     SET status='preserved',
+                         cleanupState='cleanup_pending',
+                         artifactId=COALESCE(?, artifactId),
+                         updatedAt=?
+                     WHERE id=? AND (? IS NULL OR fence IS NULL OR fence=?)`,
+                  )
+                  .run(archivedArtifactId, now, leaseId, entry.fence, entry.fence);
+              });
+            }
           } catch {
             // ignore if store closing concurrently
           }
+        }
+        if (stillExists) {
+          return {
+            cleaned: false,
+            preserved: true,
+            reason: 'rm_failed_pending_cleanup',
+            error: rmError ? String(rmError.message ?? rmError) : null,
+          };
         }
         return { cleaned: true, preserved: false, reason: isArchived ? 'archived' : 'cleaned' };
       },
     };
     this.active.set(leaseId, entry);
     return entry;
+  }
+
+  #isWorkerProcessLive(workerId) {
+    if (!workerId || !this.store?.db?.isOpen) return false;
+    const worker = getWorkerRecord(this.store, workerId);
+    if (!worker) return false;
+    if (worker.status === 'stopped' || worker.status === 'dead') return false;
+    const host = osHostname();
+    if (
+      worker.hostname === host &&
+      Number(worker.pid) !== Number(process.pid) &&
+      !isPidAlive(worker.pid)
+    ) {
+      return false;
+    }
+    return worker.status === 'active';
+  }
+
+  #isPreviousOwnerPotentiallyLive(candidate) {
+    if (!candidate) return false;
+    if (candidate.status === 'preserved') return false;
+    if (candidate.workerId && this.#isWorkerProcessLive(candidate.workerId)) {
+      return true;
+    }
+    if (candidate.jobId) {
+      const job = this.store.db
+        .prepare('SELECT * FROM runtime_jobs WHERE id=?')
+        .get(candidate.jobId);
+      if (job && (!candidate.fence || !job.fence || job.fence === candidate.fence)) {
+        if (job.workerId && this.#isWorkerProcessLive(job.workerId)) {
+          return true;
+        }
+        const ownership = classifyJobOwnership(this.store, job, {
+          hostname: osHostname(),
+          currentPid: process.pid,
+          markDeadInDb: true,
+        });
+        if (ownership.liveOwner) return true;
+      }
+    }
+    return false;
+  }
+
+  async #cloneDirtyFilesIntoWorktree(srcWtPath, dstWtPath) {
+    if (!existsSync(srcWtPath) || !existsSync(dstWtPath)) return;
+    let statusOut = '';
+    try {
+      const res = await execFileAsync(
+        'git',
+        ['status', '--porcelain', '-z', '-uall', '--', '.', ':(exclude).agent-us-handoff'],
+        { cwd: srcWtPath, windowsHide: true, timeout: 8000 },
+      );
+      statusOut = res.stdout;
+    } catch {
+      return;
+    }
+    if (!statusOut) return;
+    const entries = statusOut.split('\0').filter(Boolean);
+    for (let i = 0; i < entries.length; i++) {
+      const rec = entries[i];
+      if (rec.length < 4) continue;
+      const xy = rec.slice(0, 2);
+      const relPath = rec.slice(3);
+      if (!relPath || relPath.startsWith('.agent-us-handoff')) continue;
+      if (xy.includes('R') || xy.includes('C')) {
+        // Rename/copy has an extra NUL-separated original path next
+        const origRel = entries[++i];
+        if (origRel && xy.includes('R')) {
+          try {
+            const dstOrig = resolveConfinedPath(dstWtPath, origRel).full;
+            if (existsSync(dstOrig)) unlinkSync(dstOrig);
+          } catch {
+            // ignore
+          }
+        }
+      }
+      let srcFull;
+      let dstFull;
+      try {
+        srcFull = resolveConfinedPath(srcWtPath, relPath).full;
+        dstFull = resolveConfinedPath(dstWtPath, relPath).full;
+      } catch {
+        continue;
+      }
+      if (xy.includes('D') && !existsSync(srcFull)) {
+        if (existsSync(dstFull)) {
+          try {
+            unlinkSync(dstFull);
+          } catch {
+            // ignore
+          }
+        }
+        continue;
+      }
+      if (existsSync(srcFull)) {
+        try {
+          const st = lstatSync(srcFull);
+          if (st.isFile()) {
+            mkdirSync(dirname(dstFull), { recursive: true });
+            copyFileSync(srcFull, dstFull);
+          } else if (st.isDirectory()) {
+            const copyDir = (fromDir, toDir) => {
+              mkdirSync(toDir, { recursive: true });
+              for (const ent of readdirSync(fromDir, { withFileTypes: true })) {
+                if (ent.name === '.git' || ent.name === '.agent-us-handoff') continue;
+                const s = join(fromDir, ent.name);
+                const d = join(toDir, ent.name);
+                if (ent.isDirectory()) copyDir(s, d);
+                else if (ent.isFile()) copyFileSync(s, d);
+              }
+            };
+            copyDir(srcFull, dstFull);
+          }
+        } catch {
+          // best-effort dirty file clone
+        }
+      }
+    }
   }
 
   async acquire(
@@ -475,32 +763,39 @@ export class GitWorktreeIsolator {
     const effectiveWorkerId = workerId ?? leaseGuard?.workerId ?? null;
     const effectiveAttempt = Number(attempt ?? leaseGuard?.attempt ?? 1);
 
-    // Fix C9 / C10: Rehydrate a preserved/non-live worktree for the same (runId, nodeKey) if requested
+    // Fix C9 / C10 / P0-10: Atomically lookup, verify liveness, and CAS rehydrate inside one store.tx()
+    let cloneSourceCandidate = null;
     if (rehydrateExisting && runId && nodeKey && this.store?.db?.isOpen) {
-      const candidate = this.store.db
-        .prepare(
-          `SELECT * FROM worktree_leases
-           WHERE runId=? AND nodeKey=? AND status IN ('preserved', 'active')
-           ORDER BY COALESCE(updatedAt, createdAt) DESC, createdAt DESC
-           LIMIT 1`,
-        )
-        .get(runId, nodeKey);
+      const rehydratePlan = this.store.tx(() => {
+        const candidate = this.store.db
+          .prepare(
+            `SELECT * FROM worktree_leases
+             WHERE runId=? AND nodeKey=? AND status IN ('preserved', 'active')
+             ORDER BY COALESCE(updatedAt, createdAt) DESC, createdAt DESC
+             LIMIT 1`,
+          )
+          .get(runId, nodeKey);
 
-      if (
-        candidate &&
-        candidate.worktreePath &&
-        existsSync(candidate.worktreePath) &&
-        !isWorktreeOwnerLive(this.store, candidate)
-      ) {
+        if (
+          !candidate ||
+          !candidate.worktreePath ||
+          !existsSync(candidate.worktreePath) ||
+          isWorktreeOwnerLive(this.store, candidate)
+        ) {
+          return { mode: 'new' };
+        }
+
+        assertLeaseInTx(leaseGuard, { runId });
         const now = Date.now();
-        this.store.tx(() => {
-          assertLeaseInTx(leaseGuard, { runId });
-          this.store.db
+        const safeInPlace = !this.#isPreviousOwnerPotentiallyLive(candidate);
+
+        if (safeInPlace) {
+          const res = this.store.db
             .prepare(
               `UPDATE worktree_leases
                SET ownerId=?, workerId=?, sessionId=?, jobId=?, fence=?, attempt=?,
                    status='active', cleanupState='active', updatedAt=?
-               WHERE id=?`,
+               WHERE id=? AND status=? AND COALESCE(fence,'')=?`,
             )
             .run(
               ownerId,
@@ -511,8 +806,32 @@ export class GitWorktreeIsolator {
               effectiveAttempt,
               now,
               candidate.id,
+              candidate.status,
+              candidate.fence ?? '',
             );
-        });
+          if ((res.changes ?? 0) === 1) {
+            return { mode: 'in_place', candidate };
+          }
+          return { mode: 'new' };
+        }
+
+        // Expired lease whose OS process may still be alive: atomically supersede old lease
+        // so we clone dirty files into a fresh directory instead of sharing a live path!
+        const supRes = this.store.db
+          .prepare(
+            `UPDATE worktree_leases
+             SET status='superseded', cleanupState='superseded', updatedAt=?
+             WHERE id=? AND status=? AND COALESCE(fence,'')=?`,
+          )
+          .run(now, candidate.id, candidate.status, candidate.fence ?? '');
+        if ((supRes.changes ?? 0) === 1) {
+          return { mode: 'clone', candidate };
+        }
+        return { mode: 'new' };
+      });
+
+      if (rehydratePlan.mode === 'in_place') {
+        const candidate = rehydratePlan.candidate;
         return this.#buildHandle({
           leaseId: candidate.id,
           worktreePath: candidate.worktreePath,
@@ -526,17 +845,24 @@ export class GitWorktreeIsolator {
           rehydrated: true,
         });
       }
+      if (rehydratePlan.mode === 'clone') {
+        cloneSourceCandidate = rehydratePlan.candidate;
+      }
     }
 
     const leaseId = uuid();
     const tmpDir = join(tmpdir(), `${prefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(tmpDir, { recursive: true });
     try {
-      await execFileAsync('git', ['worktree', 'add', '--detach', tmpDir, 'HEAD'], {
+      const targetRev = cloneSourceCandidate?.baseCommit || 'HEAD';
+      await execFileAsync('git', ['worktree', 'add', '--detach', tmpDir, targetRev], {
         cwd: wsRoot,
         windowsHide: true,
-        timeout: 10000,
+        timeout: 25000,
       });
+      if (cloneSourceCandidate?.worktreePath) {
+        await this.#cloneDirtyFilesIntoWorktree(cloneSourceCandidate.worktreePath, tmpDir);
+      }
       let baseCommit = null;
       let baseRef = null;
       try {
@@ -598,15 +924,32 @@ export class GitWorktreeIsolator {
         jobId: effectiveJobId,
         fence: effectiveFence,
         attempt: effectiveAttempt,
-        rehydrated: false,
+        rehydrated: Boolean(cloneSourceCandidate),
       });
     } catch (err) {
+      if (cloneSourceCandidate && this.store?.db?.isOpen) {
+        try {
+          this.store.tx(() => {
+            this.store.db
+              .prepare(
+                "UPDATE worktree_leases SET status='preserved', cleanupState='preserved', updatedAt=? WHERE id=? AND status='superseded'",
+              )
+              .run(Date.now(), cloneSourceCandidate.id);
+          });
+        } catch {
+          // ignore restore failure
+        }
+      }
       await execFileAsync('git', ['worktree', 'remove', '--force', tmpDir], {
         cwd: wsRoot,
         windowsHide: true,
         timeout: 5000,
       }).catch(() => {});
-      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
+      try {
+        rmSync(tmpDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
+      } catch {
+        // ignore
+      }
       throw err;
     }
   }
@@ -614,7 +957,7 @@ export class GitWorktreeIsolator {
   async cleanupOrphans({ activeOwnerIds = new Set(), forceDiscard = false } = {}) {
     if (!this.store?.db?.isOpen) return { cleaned: 0, preserved: 0, skippedLive: 0, paths: [] };
     const rows = this.store.db
-      .prepare("SELECT * FROM worktree_leases WHERE status IN ('active','preserved') ORDER BY createdAt ASC")
+      .prepare("SELECT * FROM worktree_leases WHERE status IN ('active','preserved','superseded') ORDER BY createdAt ASC")
       .all();
     const cleanedPaths = [];
     let preservedCount = 0;
@@ -635,9 +978,13 @@ export class GitWorktreeIsolator {
         skippedLive++;
         continue;
       }
+      if (r.status === 'superseded' && r.workerId && this.#isWorkerProcessLive(r.workerId)) {
+        skippedLive++;
+        continue;
+      }
 
-      // Fix C8 / C9: Preserve unarchived dirty worktrees unless owning run/session was cancelled or forceDiscard
-      let ownerCancelled = false;
+      // Fix C8 / C9: Preserve unarchived dirty worktrees unless owning run/session was cancelled, superseded, or forceDiscard
+      let ownerCancelled = r.status === 'superseded';
       let nodeRecoverable = false;
       if (r.runId) {
         const runRow = this.store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(r.runId);
@@ -696,9 +1043,13 @@ export class GitWorktreeIsolator {
       try {
         rmSync(r.worktreePath, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
       } catch {
-        // ignore if already gone
+        // ignore if locked; verify existence below before marking orphan_cleaned
       }
       if (!this.store?.db?.isOpen) break;
+      if (existsSync(r.worktreePath)) {
+        preservedCount++;
+        continue;
+      }
       const now = Date.now();
       try {
         this.store.tx(() => {

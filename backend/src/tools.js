@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { posix as posixPath } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { Fault, id } from './store.js';
@@ -105,13 +106,58 @@ const MKFS_DEV_RE = /\bmkfs(?:\.[a-z0-9_-]+)?\b[^\n]*\/dev\//i;
 const DISK_ERASE_RE =
   /\b(?:diskutil\s+(?:eraseDisk|zeroDisk|secureErase)|format\s+c:)\b/i;
 
+const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+function stripSurroundingQuotes(token) {
+  let s = String(token ?? '').trim();
+  while (
+    s.length >= 2 &&
+    ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))
+  ) {
+    s = s.slice(1, -1);
+  }
+  return s;
+}
+
+function isDangerousRmTarget(rawToken) {
+  const t = stripSurroundingQuotes(rawToken).trim();
+  if (!t) return false;
+  if (
+    t === '/' ||
+    t === '/*' ||
+    t === '~' ||
+    t === '~/' ||
+    t === '~/*' ||
+    t === '$HOME' ||
+    t === '${HOME}' ||
+    t === '$HOME/' ||
+    t === '${HOME}/' ||
+    t === '$HOME/*' ||
+    t === '${HOME}/*' ||
+    /^[a-z]:[\\/]*\*?$/i.test(t)
+  ) {
+    return true;
+  }
+  // Normalize POSIX paths like `//`, `/./`, `/etc/..`, `//*`
+  if (t.startsWith('/')) {
+    const clean = t.replace(/\/+\*$/, '');
+    const norm = posixPath.normalize(clean || '/');
+    if (norm === '/' || norm === '/*') return true;
+  }
+  if (/^(?:\$HOME|\$\{HOME\}|~)(?:\/\.?)*\/?\*?$/.test(t)) {
+    return true;
+  }
+  return false;
+}
+
 function checkShellText(cmdText, depth = 0) {
   if (depth > 3) return null;
-  if (FORK_BOMB_RE.test(cmdText)) return 'fork-bomb';
-  if (BLOCK_DEV_REDIRECT_RE.test(cmdText) || DD_BLOCK_DEV_RE.test(cmdText) || MKFS_DEV_RE.test(cmdText))
+  const text = String(cmdText ?? '');
+  if (FORK_BOMB_RE.test(text)) return 'fork-bomb';
+  if (BLOCK_DEV_REDIRECT_RE.test(text) || DD_BLOCK_DEV_RE.test(text) || MKFS_DEV_RE.test(text))
     return 'block-device-write';
-  if (DISK_ERASE_RE.test(cmdText)) return 'disk-erase';
-  const segments = cmdText.split(/&&|\|\||;|\|/);
+  if (DISK_ERASE_RE.test(text)) return 'disk-erase';
+  const segments = text.split(/&&|\|\||;|\||\r?\n/);
   for (const seg of segments) {
     const tokens = seg.trim().split(/\s+/).filter(Boolean);
     if (!tokens.length) continue;
@@ -125,54 +171,81 @@ function checkTokenized(argv, depth = 0) {
   if (depth > 3 || !argv.length) return null;
   let i = 0;
   while (i < argv.length) {
-    const base = argv[i].split('/').pop();
+    const rawTok = stripSurroundingQuotes(argv[i]);
+    if (ENV_ASSIGN_RE.test(rawTok)) {
+      i++;
+      continue;
+    }
+    const base = rawTok.split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
     if (WRAPPERS.has(base)) {
       i++;
-      while (i < argv.length && argv[i].startsWith('-')) i++;
-      if (base === 'timeout' && i < argv.length && /^\d/.test(argv[i])) i++;
+      while (i < argv.length) {
+        const nextTok = stripSurroundingQuotes(argv[i]);
+        if (nextTok === '--') {
+          i++;
+          break;
+        }
+        if (base === 'env' && (nextTok === '-u' || nextTok === '--unset')) {
+          i += 2;
+          continue;
+        }
+        if (nextTok.startsWith('-')) {
+          i++;
+          continue;
+        }
+        if (base === 'env' && ENV_ASSIGN_RE.test(nextTok)) {
+          i++;
+          continue;
+        }
+        if (base === 'timeout' && /^\d/.test(nextTok)) {
+          i++;
+          continue;
+        }
+        break;
+      }
       continue;
     }
     break;
   }
   if (i >= argv.length) return null;
-  const cmd = argv[i].split('/').pop();
+  const cmd = stripSurroundingQuotes(argv[i]).split(/[\\/]/).pop().replace(/\.exe$/i, '');
   const rest = argv.slice(i + 1);
-  if (SHELLS.has(cmd)) {
-    const cIdx = rest.findIndex((a) => a === '-c' || /^-[a-z]*c[a-z]*$/.test(a));
+  if (SHELLS.has(cmd.toLowerCase())) {
+    const cIdx = rest.findIndex((a) => {
+      const s = stripSurroundingQuotes(a);
+      return s === '-c' || /^-[a-z]*c[a-z]*$/.test(s);
+    });
     if (cIdx >= 0 && rest[cIdx + 1]) {
-      return checkShellText(rest[cIdx + 1], depth + 1);
+      return checkShellText(stripSurroundingQuotes(rest[cIdx + 1]), depth + 1);
     }
   }
-  if (cmd === 'rm') {
-    const recursive = rest.some(
+  if (cmd.toLowerCase() === 'rm') {
+    const cleanRest = rest.map(stripSurroundingQuotes);
+    const recursive = cleanRest.some(
       (a) => a === '--recursive' || (a.startsWith('-') && !a.startsWith('--') && /[rR]/.test(a)),
     );
-    const noPreserve = rest.includes('--no-preserve-root');
+    const noPreserve = cleanRest.includes('--no-preserve-root');
     if (noPreserve) return 'rm-root-or-home';
     if (recursive) {
-      const targets = rest.filter((a) => !a.startsWith('-'));
-      if (
-        targets.some((t) =>
-          ['/', '/*', '~', '~/', '$HOME', '${HOME}'].includes(t),
-        )
-      ) {
+      const targets = cleanRest.filter((a) => a !== '--' && !a.startsWith('-'));
+      if (targets.some((t) => isDangerousRmTarget(t))) {
         return 'rm-root-or-home';
       }
     }
   }
-  if (cmd.startsWith('mkfs') && rest.some((a) => a.startsWith('/dev/'))) {
+  if (cmd.toLowerCase().startsWith('mkfs') && rest.some((a) => stripSurroundingQuotes(a).startsWith('/dev/'))) {
     return 'block-device-write';
   }
   if (
-    cmd === 'dd' &&
-    rest.some((a) => /^of=\/dev\/(?:sd|nvme|disk|rdisk|hd|mmcblk)/i.test(a))
+    cmd.toLowerCase() === 'dd' &&
+    rest.some((a) => /^of=\/dev\/(?:sd|nvme|disk|rdisk|hd|mmcblk)/i.test(stripSurroundingQuotes(a)))
   ) {
     return 'block-device-write';
   }
   if (
-    (cmd === 'diskutil' &&
-      rest.some((a) => /^(?:eraseDisk|zeroDisk|secureErase)$/i.test(a))) ||
-    (cmd.toLowerCase() === 'format' && rest.some((a) => /^c:$/i.test(a)))
+    (cmd.toLowerCase() === 'diskutil' &&
+      rest.some((a) => /^(?:eraseDisk|zeroDisk|secureErase)$/i.test(stripSurroundingQuotes(a)))) ||
+    (cmd.toLowerCase() === 'format' && rest.some((a) => /^c:$/i.test(stripSurroundingQuotes(a))))
   ) {
     return 'disk-erase';
   }

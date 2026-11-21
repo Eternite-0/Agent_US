@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { UNTRUSTED_RULE_SECTION } from './envelope.js';
 import { killProcessTree, sanitizeChildEnv } from './tools/sandbox.js';
@@ -405,9 +405,15 @@ export class HookRunner {
     const skippedUntrusted = [];
     for (const filePath of this.#getCandidateHookFiles()) {
       if (!existsSync(filePath)) continue;
+      let readTarget = filePath;
+      try {
+        readTarget = realpathSync(filePath);
+      } catch {
+        readTarget = filePath;
+      }
       let rawBuffer;
       try {
-        rawBuffer = readFileSync(filePath);
+        rawBuffer = readFileSync(readTarget);
       } catch {
         continue;
       }
@@ -429,6 +435,7 @@ export class HookRunner {
         if (item && typeof item.command === 'string' && item.command.trim()) {
           handlers.push({
             ...item,
+            __rawFilePath: filePath,
             __sourcePath: trust.configPath,
             __contentDigest: trust.contentDigest,
           });
@@ -483,6 +490,45 @@ export class HookRunner {
         }
       }
       const kind = this.#resolveHookKind(eventName, h);
+      // Re-verify exact disk bytes & trust DB immediately before spawning EACH handler (closes multi-handler TOCTOU)
+      const liveSourcePath = h.__rawFilePath || h.__sourcePath;
+      if (liveSourcePath && h.__contentDigest) {
+        const liveTrust = this.trustManager.verifyFile(liveSourcePath);
+        if (!liveTrust.trusted || liveTrust.contentDigest !== h.__contentDigest) {
+          const modified = liveTrust.exists && liveTrust.contentDigest !== h.__contentDigest;
+          const reasonCode = !liveTrust.exists
+            ? 'HOOK_CONFIG_DELETED_BEFORE_EXEC'
+            : modified
+              ? 'HOOK_CONFIG_MODIFIED_BEFORE_EXEC'
+              : 'HOOK_TRUST_REVOKED_BEFORE_EXEC';
+          const reasonMsg = !liveTrust.exists
+            ? `Hook 配置文件在执行前被删除 (${h.__sourcePath})`
+            : modified
+              ? `Hook 配置文件在执行前已被修改 (${h.__sourcePath})`
+              : `Hook 配置信任在执行前已被撤销 (${h.__sourcePath})`;
+          skippedUntrusted.push({
+            filePath: liveSourcePath,
+            configPath: liveTrust.configPath,
+            contentDigest: liveTrust.contentDigest,
+            reason: reasonCode,
+          });
+          warnings.push(reasonMsg);
+          if (kind === 'security' || kind === 'transform') {
+            return {
+              blocked: true,
+              failClosed: true,
+              hookKind: kind,
+              reason: `${reasonCode}: ${reasonMsg}`,
+              updatedInput: null,
+              transformApplied: false,
+              additionalContexts,
+              warnings,
+              skippedUntrusted,
+            };
+          }
+          continue;
+        }
+      }
       const currentPayload = updatedInput
         ? { ...payload, arguments: updatedInput }
         : payload;

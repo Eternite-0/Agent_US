@@ -20,6 +20,20 @@ function refused(message) {
   throw new Fault('E_EXECUTE_PERMIT', 403, { message });
 }
 
+const DEFAULT_MAX_RETAINED_EFFECTS = 5000;
+const DEFAULT_MAX_TRACKED_APPROVALS = 10000;
+
+// Module-private unforgeable WeakSet of recently consumed permit objects so workspace
+// tools can verify an authentic ToolDispatcher permit without trusting a spoofable boolean.
+const consumedPermitProofs = new WeakSet();
+
+export function verifyAndClearPermitProof(proof) {
+  if (!proof || typeof proof !== 'object') return false;
+  if (!consumedPermitProofs.has(proof)) return false;
+  consumedPermitProofs.delete(proof);
+  return true;
+}
+
 /**
  * In-process one-shot execution permit registry inspired by Agnes Harness.
  * Permits are frozen, empty opaque objects authenticated via a private WeakMap:
@@ -28,7 +42,45 @@ function refused(message) {
 export class ExecutePermitRegistry {
   #live = new WeakMap();
   #byEffect = new Map();
+  #approvalEffects = new Map(); // approvalId -> effectId (prevents cross-effect approval replay)
   #open = true;
+  #maxRetainedEffects;
+  #maxTrackedApprovals;
+
+  constructor({
+    maxRetainedEffects = DEFAULT_MAX_RETAINED_EFFECTS,
+    maxTrackedApprovals = DEFAULT_MAX_TRACKED_APPROVALS,
+  } = {}) {
+    this.#maxRetainedEffects = Math.max(100, Number(maxRetainedEffects || DEFAULT_MAX_RETAINED_EFFECTS));
+    this.#maxTrackedApprovals = Math.max(100, Number(maxTrackedApprovals || DEFAULT_MAX_TRACKED_APPROVALS));
+  }
+
+  #evictConsumedIfNeeded() {
+    if (this.#byEffect.size > this.#maxRetainedEffects) {
+      for (const [effId, state] of this.#byEffect.entries()) {
+        if (!state.livePermit) {
+          this.#byEffect.delete(effId);
+          if (this.#byEffect.size <= this.#maxRetainedEffects) break;
+        }
+      }
+    }
+    if (this.#approvalEffects.size > this.#maxTrackedApprovals) {
+      const overflow = this.#approvalEffects.size - this.#maxTrackedApprovals;
+      let removed = 0;
+      for (const key of this.#approvalEffects.keys()) {
+        this.#approvalEffects.delete(key);
+        if (++removed >= overflow) break;
+      }
+    }
+  }
+
+  isApprovalUsed(approvalId, effectId = null) {
+    if (!approvalId) return false;
+    const bound = this.#approvalEffects.get(String(approvalId));
+    if (!bound) return false;
+    if (effectId && bound === effectId) return false;
+    return true;
+  }
 
   issue({ owner, effectId, approvalId, evidenceId, callId, argsDigest = null, attempt = 1 }) {
     if (!this.#open) refused('permit registry is closed');
@@ -38,6 +90,14 @@ export class ExecutePermitRegistry {
     if (!evidenceId || typeof evidenceId !== 'string')
       refused('evidence id is invalid');
     if (attempt !== 1 && attempt !== 2) refused('execute attempt is invalid');
+
+    const normApprovalId = approvalId ? String(approvalId) : null;
+    if (normApprovalId) {
+      const boundEffect = this.#approvalEffects.get(normApprovalId);
+      if (boundEffect && boundEffect !== effectId) {
+        refused('approvalId has already been bound or consumed by another dispatch');
+      }
+    }
 
     const prior = this.#byEffect.get(effectId);
     if (prior) {
@@ -56,13 +116,16 @@ export class ExecutePermitRegistry {
     const binding = Object.freeze({
       owner,
       effectId,
-      approvalId: approvalId ?? null,
+      approvalId: normApprovalId,
       evidenceId,
       callId: callId ?? null,
       argsDigest: argsDigest ?? null,
       attempt,
     });
     this.#live.set(permit, binding);
+    if (normApprovalId) {
+      this.#approvalEffects.set(normApprovalId, effectId);
+    }
     if (prior) {
       prior.issuedAttempt = attempt;
       prior.livePermit = permit;
@@ -108,6 +171,8 @@ export class ExecutePermitRegistry {
     this.#live.delete(permit);
     state.livePermit = undefined;
     state.consumedAttempt = binding.attempt;
+    consumedPermitProofs.add(permit);
+    this.#evictConsumedIfNeeded();
     return binding;
   }
 
@@ -117,6 +182,7 @@ export class ExecutePermitRegistry {
       if (state.livePermit) this.#live.delete(state.livePermit);
     }
     this.#byEffect.clear();
+    this.#approvalEffects.clear();
   }
 }
 

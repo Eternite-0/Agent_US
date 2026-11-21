@@ -1,6 +1,44 @@
 import { z } from 'zod';
+import { PolicyError } from '../../kernel/errors.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
 import { safeFetchExternal } from '../ssrf-guard.js';
+
+const MAX_WEB_FETCH_BYTES = 512 * 1024;
+
+async function readResponseTextCapped(res, maxBytes = MAX_WEB_FETCH_BYTES) {
+  if (res?.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let received = 0;
+    let truncated = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const buf = Buffer.from(value);
+        const remaining = maxBytes - received;
+        if (buf.length > remaining) {
+          if (remaining > 0) chunks.push(buf.subarray(0, remaining));
+          received = maxBytes;
+          truncated = true;
+          await reader.cancel().catch(() => {});
+          break;
+        }
+        chunks.push(buf);
+        received += buf.length;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return { text: Buffer.concat(chunks).toString('utf8'), truncated };
+  }
+  const raw = String((await res.text()) ?? '');
+  const buf = Buffer.from(raw, 'utf8');
+  if (buf.length > maxBytes) {
+    return { text: buf.subarray(0, maxBytes).toString('utf8'), truncated: true };
+  }
+  return { text: raw, truncated: false };
+}
 
 function stripHtml(html) {
   return html
@@ -134,14 +172,23 @@ export function createMetaTools({
         url: z.string().min(1).describe('公开 https:// URL'),
       }),
       async execute(args, ctx) {
+        if (ctx?.tainted && !ctx?.approvalId) {
+          throw new PolicyError('WEB_FETCH_TAINTED_BLOCKED', {
+            message: '安全拦截：当前上下文受污染 (tainted)，禁止在未经人工审批的情况下执行外联 web_fetch',
+          });
+        }
         await guardFallback('web_fetch', args, ctx);
         const res = await safeFetchExternal(args.url, {
           signal: ctx?.signal ?? signal,
         });
-        if (!res.ok) return `抓取失败: HTTP ${res.status}`;
-        const raw = await res.text();
+        if (!res.ok) {
+          await res.body?.cancel?.().catch(() => {});
+          return `抓取失败: HTTP ${res.status}`;
+        }
+        const { text: raw, truncated } = await readResponseTextCapped(res, MAX_WEB_FETCH_BYTES);
         const text = /<html|<body|<div/i.test(raw) ? stripHtml(raw) : raw;
-        return wrapResult('web_fetch', text.slice(0, 16000));
+        const suffix = truncated ? '\n[... truncated at 512KB stream limit ...]' : '';
+        return wrapResult('web_fetch', `${text.slice(0, 16000)}${suffix}`);
       },
     }),
   ];

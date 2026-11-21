@@ -86,12 +86,13 @@ test('Codex 4-tier fuzzy edit, atomic apply_patch, command canonicalization, dia
     assert.equal(diag.ok, false);
     assert.ok(diag.summary.includes('自动语法诊断'));
 
-    // 4. Command canonicalization strips wrappers, allows quoted JS arrows, and refuses compound/substitution operators
+    // 4. Command canonicalization strips safe wrappers, refuses raw interpreters/shells, and refuses compound/substitution operators
     assert.equal(canonicalizeCommandPrefix('bash -lc "npm test -- --watch"'), 'npm test');
     assert.equal(
       canonicalizeCommandPrefix('node -e "import(\'./math.mjs\').then(m => console.log(m.add(1,2)))"'),
-      'node',
+      null,
     );
+    assert.equal(canonicalizeCommandPrefix('sh -c "npm test "; whoami; echo "ok"'), null);
     assert.equal(canonicalizeCommandPrefix('npm test && rm -rf build'), null);
     assert.equal(canonicalizeCommandPrefix('node -e "$(whoami)"'), null);
     assert.equal(canonicalizeCommandPrefix('echo hi > out.txt'), null);
@@ -327,6 +328,7 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
   const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-guard-data-'));
   const workDir = mkdtempSync(join(tmpdir(), 'agent-us-guard-work-'));
   writeFileSync(join(workDir, 'doc.txt'), 'original content\n', 'utf8');
+  writeFileSync(join(workDir, 'cfg.ini'), '[demo]\na = 111\nb = 222\n', 'utf8');
 
   const store = new Store(join(dataDir, 'engine.sqlite'));
   const pool = new AccountPool(store, { root: dataDir });
@@ -356,7 +358,7 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
           type: 'tool-call',
           id: 'tc-b1',
           name: 'bash',
-          arguments: JSON.stringify({ command: 'node -e "console.log(111)"' }),
+          arguments: JSON.stringify({ command: 'git config --file cfg.ini --get demo.a' }),
         },
       };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
@@ -385,7 +387,7 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
           }),
         },
       };
-      // Second node -e should auto-pass via cached 'node' session prefix with ZERO new approval!
+      // Second `git config` should auto-pass via cached 'git config' session prefix with ZERO new approval!
       yield {
         type: 'block-end',
         index: 1,
@@ -393,7 +395,7 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
           type: 'tool-call',
           id: 'tc-b2',
           name: 'bash',
-          arguments: JSON.stringify({ command: 'node -e "console.log(222)"' }),
+          arguments: JSON.stringify({ command: 'git config --file cfg.ini --get demo.b' }),
         },
       };
       // Trigger thrashing (3 identical calls to non-existent tool)

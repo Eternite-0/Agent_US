@@ -4,10 +4,31 @@ import { Fault, id as uuid } from '../store.js';
 import { sha256Hex } from '../integrity.js';
 
 const HOOK_BASENAME_RE = /^hooks(?:\.[^.]+)?\.json$/i;
+const MCP_BASENAME_RE = /^mcp(?:\.[^.]+)?\.json$/i;
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
+
+function normalizeLexicalPath(filePath) {
+  const abs = resolve(String(filePath ?? ''));
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+
+function normalizeWorkspaceRootKey(workspaceRoot) {
+  if (!workspaceRoot) return null;
+  const abs = resolve(String(workspaceRoot));
+  let canonical = abs;
+  if (existsSync(abs)) {
+    try {
+      canonical = realpathSync(abs);
+    } catch {
+      canonical = abs;
+    }
+  }
+  return CASE_INSENSITIVE_FS ? canonical.toLowerCase() : canonical;
+}
 
 /**
- * Canonicalizes a hook config path for deterministic trust matching across platforms
- * and prevents symlink/junction path spoofing.
+ * Canonicalizes a hook/MCP config path for deterministic trust matching across platforms
+ * (Windows/macOS case-insensitivity, 8.3 short paths) and prevents symlink/junction spoofing.
  */
 export function normalizeHookConfigPath(filePath) {
   const abs = resolve(String(filePath ?? ''));
@@ -28,7 +49,7 @@ export function normalizeHookConfigPath(filePath) {
       }
     }
   }
-  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+  return CASE_INSENSITIVE_FS ? canonical.toLowerCase() : canonical;
 }
 
 /**
@@ -41,19 +62,15 @@ export function computeHookContentDigest(contentOrBuffer) {
   return sha256Hex(Buffer.from(String(contentOrBuffer ?? ''), 'utf8'));
 }
 
-/**
- * Detects whether a relative or absolute workspace path refers to an executable hook config file
- * (such as `.agent-us/hooks.json`, `.claude/hooks.json`, or `<dataRoot>/hooks.json`).
- */
-export function isHookConfigPath(targetPath, { workspaceRoot = null, dataRoot = null } = {}) {
+function matchesConfigBasename(targetPath, regex, { workspaceRoot = null, dataRoot = null } = {}) {
   const raw = String(targetPath ?? '').trim();
   if (!raw) return false;
   const normRel = raw.replace(/\\/g, '/').replace(/^\.\//, '');
   const parts = normRel.split('/').filter(Boolean);
-  const fileName = parts.at(-1) ?? '';
-  if (!HOOK_BASENAME_RE.test(fileName)) return false;
+  const fileName = (parts.at(-1) ?? '').split(':')[0].replace(/[. ]+$/, '');
+  if (!regex.test(fileName)) return false;
 
-  const lowerParts = parts.map((p) => p.toLowerCase());
+  const lowerParts = parts.map((p) => p.split(':')[0].replace(/[. ]+$/, '').toLowerCase());
   if (lowerParts.includes('.agent-us') || lowerParts.includes('.claude')) {
     return true;
   }
@@ -71,6 +88,26 @@ export function isHookConfigPath(targetPath, { workspaceRoot = null, dataRoot = 
 }
 
 /**
+ * Detects whether a relative or absolute workspace path refers to an executable hook config file
+ * (such as `.agent-us/hooks.json`, `.claude/hooks.json`, or `<dataRoot>/hooks.json`).
+ */
+export function isHookConfigPath(targetPath, opts = {}) {
+  return matchesConfigBasename(targetPath, HOOK_BASENAME_RE, opts);
+}
+
+/**
+ * Detects whether a relative or absolute workspace path refers to an MCP server config file
+ * (such as `.agent-us/mcp.json`, `.claude/mcp.json`, or `<dataRoot>/mcp.json`).
+ */
+export function isMcpConfigPath(targetPath, opts = {}) {
+  return matchesConfigBasename(targetPath, MCP_BASENAME_RE, opts);
+}
+
+export function isExecutableConfigPath(targetPath, opts = {}) {
+  return isHookConfigPath(targetPath, opts) || isMcpConfigPath(targetPath, opts);
+}
+
+/**
  * Manages the explicit SHA-256 content-bound trust boundary for executable hook configs.
  *
  * Security invariants:
@@ -84,6 +121,17 @@ export class HookTrustManager {
     this.store = store;
     this.eventRouter = eventRouter;
     this.memoryApprovals = new Map(); // canonicalPath -> { id, configPath, workspaceRoot, contentDigest, status, approvedBy, note, approvedAt, revokedAt, updatedAt }
+    this.lexicalAliases = new Map(); // lexicalPath -> Set<canonicalPath> (so deleting a symlinked config still revokes its realpath)
+  }
+
+  #rememberAlias(displayPath, configPath) {
+    const lexical = normalizeLexicalPath(displayPath);
+    let set = this.lexicalAliases.get(lexical);
+    if (!set) {
+      set = new Set();
+      this.lexicalAliases.set(lexical, set);
+    }
+    set.add(configPath);
   }
 
   #hasDb() {
@@ -95,7 +143,8 @@ export class HookTrustManager {
   }
 
   /**
-   * Reads a hook config file and verifies whether its exact raw SHA-256 digest is explicitly trusted.
+   * Reads a hook/MCP config file (resolving realpath BEFORE reading bytes) and verifies
+   * whether its exact raw SHA-256 digest is explicitly trusted.
    */
   verifyFile(filePath, { rawBuffer = null } = {}) {
     const displayPath = resolve(String(filePath ?? ''));
@@ -111,15 +160,27 @@ export class HookTrustManager {
       };
     }
 
+    // Resolve realpath BEFORE reading bytes to prevent symlink swap between read and normalize
+    let readTarget = displayPath;
+    if (existsSync(displayPath)) {
+      try {
+        readTarget = realpathSync(displayPath);
+      } catch {
+        readTarget = displayPath;
+      }
+    }
+    const configPath = normalizeHookConfigPath(readTarget);
+    this.#rememberAlias(displayPath, configPath);
+
     let buf = rawBuffer;
     if (buf === null) {
       try {
-        buf = readFileSync(displayPath);
+        buf = readFileSync(readTarget);
       } catch (err) {
         return {
           trusted: false,
           exists: false,
-          configPath: normalizeHookConfigPath(displayPath),
+          configPath,
           displayPath,
           contentDigest: null,
           reason: `HOOK_CONFIG_UNREADABLE:${String(err?.message ?? err)}`,
@@ -128,7 +189,6 @@ export class HookTrustManager {
       }
     }
 
-    const configPath = normalizeHookConfigPath(displayPath);
     const contentDigest = computeHookContentDigest(buf);
 
     let row = null;
@@ -184,7 +244,13 @@ export class HookTrustManager {
         approvalId: null,
       };
     }
-    const buf = readFileSync(displayPath);
+    let readTarget = displayPath;
+    try {
+      readTarget = realpathSync(displayPath);
+    } catch {
+      readTarget = displayPath;
+    }
+    const buf = readFileSync(readTarget);
     let validJson = true;
     try {
       const parsed = JSON.parse(buf.toString('utf8'));
@@ -210,11 +276,18 @@ export class HookTrustManager {
 
   /**
    * Explicitly trusts the exact content currently on disk at `filePath`.
-   * Revokes any previous trusted digests for the same path.
+   * Resolves realpath BEFORE reading bytes, supports strict `requireExpectedDigest`,
+   * and revokes any previous trusted digests for the same path.
    */
   approveFile(
     filePath,
-    { workspaceRoot = null, expectedDigest = null, approvedBy = 'user', note = '' } = {},
+    {
+      workspaceRoot = null,
+      expectedDigest = undefined,
+      requireExpectedDigest = false,
+      approvedBy = 'user',
+      note = '',
+    } = {},
   ) {
     const displayPath = resolve(String(filePath ?? ''));
     if (!existsSync(displayPath)) {
@@ -222,7 +295,15 @@ export class HookTrustManager {
         message: `Hook config not found: ${displayPath}`,
       });
     }
-    const buf = readFileSync(displayPath);
+    // Resolve realpath BEFORE reading bytes to prevent symlink-swap TOCTOU
+    let canonicalTarget = displayPath;
+    try {
+      canonicalTarget = realpathSync(displayPath);
+    } catch {
+      canonicalTarget = displayPath;
+    }
+    const configPath = normalizeHookConfigPath(canonicalTarget);
+    const buf = readFileSync(canonicalTarget);
     let parsed;
     try {
       parsed = JSON.parse(buf.toString('utf8'));
@@ -237,9 +318,14 @@ export class HookTrustManager {
       });
     }
 
-    const configPath = normalizeHookConfigPath(displayPath);
     const contentDigest = computeHookContentDigest(buf);
-    if (expectedDigest && String(expectedDigest).toLowerCase() !== contentDigest) {
+    const hasExpected = expectedDigest !== undefined && expectedDigest !== null;
+    if (requireExpectedDigest && (!hasExpected || String(expectedDigest).trim() === '')) {
+      throw new Fault('HOOK_DIGEST_REQUIRED', 400, {
+        message: 'expectedDigest is required to approve executable hook/MCP config',
+      });
+    }
+    if (hasExpected && String(expectedDigest).trim().toLowerCase() !== contentDigest) {
       throw new Fault('HOOK_DIGEST_MISMATCH', 409, {
         message: 'Hook config digest changed before approval',
         expectedDigest,
@@ -247,6 +333,7 @@ export class HookTrustManager {
       });
     }
 
+    this.#rememberAlias(displayPath, configPath);
     const now = Date.now();
     const recordId = uuid();
     const resolvedWs = workspaceRoot ? resolve(workspaceRoot) : null;
@@ -319,31 +406,43 @@ export class HookTrustManager {
 
   revokeFile(filePath, { contentDigest = null, reason = 'revoked' } = {}) {
     const configPath = normalizeHookConfigPath(filePath);
+    const lexicalPath = normalizeLexicalPath(filePath);
+    const candidatePaths = new Set([configPath, lexicalPath]);
+    const aliases = this.lexicalAliases.get(lexicalPath);
+    if (aliases) {
+      for (const a of aliases) candidatePaths.add(a);
+    }
     const now = Date.now();
     let revokedCount = 0;
 
     if (this.#hasDb()) {
       revokedCount = this.store.tx(() => {
-        const res = contentDigest
-          ? this.store.db
-              .prepare(
-                "UPDATE hook_trust_approvals SET status='revoked', revokedAt=?, updatedAt=? WHERE configPath=? AND contentDigest=? AND status='trusted'",
-              )
-              .run(now, now, configPath, String(contentDigest))
-          : this.store.db
-              .prepare(
-                "UPDATE hook_trust_approvals SET status='revoked', revokedAt=?, updatedAt=? WHERE configPath=? AND status='trusted'",
-              )
-              .run(now, now, configPath);
-        return res.changes ?? 0;
+        let total = 0;
+        for (const p of candidatePaths) {
+          const res = contentDigest
+            ? this.store.db
+                .prepare(
+                  "UPDATE hook_trust_approvals SET status='revoked', revokedAt=?, updatedAt=? WHERE configPath=? AND contentDigest=? AND status='trusted'",
+                )
+                .run(now, now, p, String(contentDigest))
+            : this.store.db
+                .prepare(
+                  "UPDATE hook_trust_approvals SET status='revoked', revokedAt=?, updatedAt=? WHERE configPath=? AND status='trusted'",
+                )
+                .run(now, now, p);
+          total += res.changes ?? 0;
+        }
+        return total;
       });
     } else {
-      const mem = this.memoryApprovals.get(configPath);
-      if (mem && mem.status === 'trusted' && (!contentDigest || mem.contentDigest === contentDigest)) {
-        mem.status = 'revoked';
-        mem.revokedAt = now;
-        mem.updatedAt = now;
-        revokedCount = 1;
+      for (const p of candidatePaths) {
+        const mem = this.memoryApprovals.get(p);
+        if (mem && mem.status === 'trusted' && (!contentDigest || mem.contentDigest === contentDigest)) {
+          mem.status = 'revoked';
+          mem.revokedAt = now;
+          mem.updatedAt = now;
+          revokedCount++;
+        }
       }
     }
 
@@ -363,7 +462,7 @@ export class HookTrustManager {
   }
 
   /**
-   * Invoked whenever a workspace tool creates/edits/deletes a hook config file.
+   * Invoked whenever a workspace tool creates/edits/deletes a hook or MCP config file.
    * Immediately revokes prior trust so modified or replaced drafts cannot activate silently.
    */
   onConfigMutated({ filePath, toolName = 'workspace_write' } = {}) {
@@ -372,28 +471,28 @@ export class HookTrustManager {
   }
 
   listApprovals({ workspaceRoot = null, status = null } = {}) {
+    const wsKey = workspaceRoot ? normalizeWorkspaceRootKey(workspaceRoot) : null;
     if (!this.#hasDb()) {
       let items = [...this.memoryApprovals.values()];
-      if (workspaceRoot) {
-        const ws = resolve(workspaceRoot);
-        items = items.filter((r) => r.workspaceRoot === ws);
+      if (wsKey) {
+        items = items.filter((r) => normalizeWorkspaceRootKey(r.workspaceRoot) === wsKey);
       }
       if (status) items = items.filter((r) => r.status === status);
       return items;
     }
     const where = [];
     const params = [];
-    if (workspaceRoot) {
-      where.push('workspaceRoot=?');
-      params.push(resolve(workspaceRoot));
-    }
     if (status) {
       where.push('status=?');
       params.push(String(status));
     }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    return this.store.db
-      .prepare(`SELECT * FROM hook_trust_approvals ${clause} ORDER BY updatedAt DESC LIMIT 200`)
+    const rows = this.store.db
+      .prepare(`SELECT * FROM hook_trust_approvals ${clause} ORDER BY updatedAt DESC LIMIT 500`)
       .all(...params);
+    if (!wsKey) return rows.slice(0, 200);
+    return rows
+      .filter((r) => r.workspaceRoot && normalizeWorkspaceRootKey(r.workspaceRoot) === wsKey)
+      .slice(0, 200);
   }
 }

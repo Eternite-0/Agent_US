@@ -15,8 +15,11 @@ import {
   runQuickDiagnostics,
 } from '../../patch-and-diagnostics.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
-import { resolveConfinedPath } from '../sandbox.js';
-import { isHookConfigPath } from '../hook-trust.js';
+import { isProtectedPathSegment, resolveConfinedPath } from '../sandbox.js';
+import { isExecutableConfigPath } from '../hook-trust.js';
+
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
+const stateKeyFor = (rel) => (CASE_INSENSITIVE_FS ? String(rel).toLowerCase() : String(rel));
 
 const SKIP_DIRS = new Set([
   '.git',
@@ -71,7 +74,8 @@ function walkFiles(dir, root, out, maxFiles = 5000) {
   }
   for (const ent of entries) {
     if (out.length >= maxFiles) break;
-    if (SKIP_DIRS.has(ent.name)) continue;
+    if (ent.isSymbolicLink()) continue;
+    if (SKIP_DIRS.has(ent.name.toLowerCase()) || isProtectedPathSegment(ent.name)) continue;
     const full = resolve(dir, ent.name);
     if (ent.isDirectory()) {
       walkFiles(full, root, out, maxFiles);
@@ -103,16 +107,16 @@ export function createFsTools({
   onHookConfigMutated = null,
 }) {
   const notifyIfHookConfig = (rel, full, toolName, action = 'write') => {
-    if (!isHookConfigPath(rel, { workspaceRoot, dataRoot })) return '';
+    if (!isExecutableConfigPath(rel, { workspaceRoot, dataRoot })) return '';
     try {
       onHookConfigMutated?.({ path: full, rel, action, toolName });
     } catch {
       // never fail file write due to revocation notification
     }
-    return `\n[Hook Trust] 检测到写入 Hook 配置文件 (${rel})：未信任草稿不会自动激活或执行，需人工显式审批对应 SHA-256 摘要后方可生效。`;
+    return `\n[Hook Trust] 检测到写入可执行配置文件 (${rel})：未信任草稿不会自动激活或执行，需人工显式审批对应 SHA-256 摘要后方可生效。`;
   };
   const checkStaleFile = (rel, full) => {
-    const tracked = readFileState.get(rel);
+    const tracked = readFileState.get(stateKeyFor(rel));
     if (!tracked || !existsSync(full)) return;
     try {
       const curHash = sha256Hex(readFileSync(full, 'utf8'));
@@ -127,7 +131,7 @@ export function createFsTools({
   };
 
   const trackFileHash = (rel, content) => {
-    readFileState.set(rel, {
+    readFileState.set(stateKeyFor(rel), {
       sha256: sha256Hex(content),
       at: Date.now(),
     });
@@ -376,19 +380,20 @@ export function createFsTools({
             continue;
           }
           try {
-            const fst = statSync(f.full);
+            const confined = resolveConfinedPath(workspaceRoot, f.rel);
+            const fst = statSync(confined.full);
             if (fst.size > 1024 * 1024) continue;
-            const buf = readFileSync(f.full);
+            const buf = readFileSync(confined.full);
             if (isProbablyBinary(buf)) continue;
             const lines = buf.toString('utf8').replace(/\r\n/g, '\n').split('\n');
             for (let i = 0; i < lines.length; i++) {
               if (rx.test(lines[i])) {
-                hits.push(`${f.rel}:${i + 1}: ${lines[i].trim().slice(0, 220)}`);
+                hits.push(`${confined.rel}:${i + 1}: ${lines[i].trim().slice(0, 220)}`);
                 if (hits.length >= limit) break;
               }
             }
           } catch {
-            // skip unreadable
+            // skip unreadable or protected/escaped paths
           }
         }
         if (!hits.length) return `未搜索到匹配「${query}」的内容。`;

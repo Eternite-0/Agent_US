@@ -1,9 +1,14 @@
-import { ExecutePermitRegistry, dispatchWithPermit } from './permits.js';
+import {
+  ExecutePermitRegistry,
+  dispatchWithPermit,
+  verifyAndClearPermitProof,
+} from './permits.js';
+import { PolicyError } from './kernel/errors.js';
 import { canonicalizeCommandPrefix } from './patch-and-diagnostics.js';
 import { ToolRegistry } from './tools/registry.js';
 import { ToolPermissionPolicy } from './tools/policy.js';
 import { HostSandboxAdapter, resolveConfinedPath } from './tools/sandbox.js';
-import { ToolResultProcessor } from './tools/dispatcher.js';
+import { ToolResultProcessor, computeArgsDigest } from './tools/dispatcher.js';
 import { createFsTools } from './tools/builtin/fs-tools.js';
 import {
   BackgroundProcessManager,
@@ -96,15 +101,45 @@ export function createWorkspaceTools({
 
   const wrapResult = (name, rawText) => processor.normalize(name, rawText, { wrap: true });
 
-  // Fallback gate & one-shot permit when tool.execute() is called directly outside ToolDispatcher
+  // Fallback gate & one-shot permit when tool.execute() is called directly outside ToolDispatcher.
+  // Never trusts a spoofable boolean flag (`ctx.permitConsumed`); only skips if verified by an
+  // authentic one-shot WeakSet permit proof emitted by ExecutePermitRegistry.consume().
+  const fallbackPolicy = new ToolPermissionPolicy({ permissionMode });
   const guardFallback = async (toolName, args, ctx) => {
-    if (ctx?.permitConsumed) return;
-    let approvalId = null;
-    if (
-      needsApproval(toolName, args, permissionMode, {
+    if (ctx?.permitProof && verifyAndClearPermitProof(ctx.permitProof)) return;
+    (ctx?.signal ?? signal)?.throwIfAborted?.();
+
+    const meta = WORKSPACE_TOOL_META[toolName] ?? {
+      readOnly: false,
+      effectClass: toolName.startsWith('mcp__') ? 'external_network' : 'irreversible_side_effect',
+      outward: toolName.startsWith('mcp__'),
+      requiresCommandCheck: toolName === 'bash' || toolName === 'start_process',
+    };
+    const verdict = fallbackPolicy.evaluate(
+      {
+        name: toolName,
+        meta: {
+          ...meta,
+          requiresCommandCheck: toolName === 'bash' || toolName === 'start_process',
+        },
+      },
+      args ?? {},
+      {
         approvedPrefixes: getApprovedPrefixes(),
-      })
-    ) {
+        tainted: Boolean(ctx?.tainted),
+        permissionMode,
+      },
+    );
+
+    if (verdict.decision === 'deny') {
+      throw new PolicyError('POLICY_DENIED', {
+        message: `安全策略拦截：${verdict.reason}`,
+      });
+    }
+
+    const argsDigest = computeArgsDigest(toolName, args ?? {});
+    let approvalId = null;
+    if (verdict.decision === 'ask') {
       if (typeof requestApproval !== 'function') {
         throw new Error(`安全拒绝：工具 ${toolName} 需要人工审批，但审批服务不可用`);
       }
@@ -116,12 +151,25 @@ export function createWorkspaceTools({
         tool: toolName,
         arguments: { ...args, ...(prefix ? { commandPrefix: prefix } : {}) },
         callId: ctx?.callId,
+        argsDigest,
+        signal: ctx?.signal ?? signal,
       });
+      (ctx?.signal ?? signal)?.throwIfAborted?.();
       const allowed =
         typeof decision === 'object' && decision !== null
           ? decision.allowed === true
           : decision === true;
       if (!allowed) throw new Error(`用户拒绝了 ${toolName} 操作`);
+      if (
+        typeof decision === 'object' &&
+        decision !== null &&
+        decision.argsDigest !== undefined &&
+        decision.argsDigest !== argsDigest
+      ) {
+        throw new PolicyError('APPROVAL_ARGS_MISMATCH', {
+          message: `安全阻断：实际执行参数摘要与审批签发摘要不一致 (${toolName})`,
+        });
+      }
       approvalId =
         (typeof decision === 'object' && decision?.approvalId) ||
         `approved-${ctx?.callId || ++seq}`;
@@ -133,10 +181,12 @@ export function createWorkspaceTools({
       evidenceId: `ev-${effectId}`,
       approvalId,
       callId: ctx?.callId ?? null,
+      argsDigest,
       attempt: 1,
     };
     const permit = permits.issue(binding);
     await dispatchWithPermit(permit, binding, permits, async () => true);
+    verifyAndClearPermitProof(permit);
   };
 
   const registry = new ToolRegistry();

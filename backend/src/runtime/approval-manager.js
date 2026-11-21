@@ -1,4 +1,4 @@
-import { id as uuid } from '../store.js';
+import { Fault, id as uuid } from '../store.js';
 import { canonicalizeCommandPrefix } from '../patch-and-diagnostics.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 
@@ -11,8 +11,36 @@ function parseJsonSafe(str, fallback) {
   }
 }
 
+function hydrateApprovalRow(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    sessionId: r.sessionId,
+    turnId: r.turnId,
+    callId: r.callId,
+    tool: r.tool,
+    kind: r.kind || 'tool',
+    receiptId: r.receiptId || undefined,
+    riskLevel: r.riskLevel || undefined,
+    effectClass: r.effectClass || undefined,
+    outcome: r.outcome || undefined,
+    argsDigest: r.argsDigest || undefined,
+    arguments: parseJsonSafe(r.arguments, {}),
+    status: r.status,
+    scope: r.scope,
+    reason: r.reason,
+    expiresAt: r.expiresAt,
+    createdAt: r.createdAt,
+    resolvedAt: r.resolvedAt,
+    consumedAt: r.consumedAt ?? undefined,
+    revokedAt: r.revokedAt ?? undefined,
+    revokedReason: r.revokedReason ?? undefined,
+  };
+}
+
 /**
  * Manages interactive tool approval requests, Codex session command-prefix caching,
+ * atomic single-use consumption (`consumeApproval`), pre-execution revocation (`revokeApproval`),
  * and reconciliation approval delegation.
  */
 export class DirectApprovalManager {
@@ -21,6 +49,14 @@ export class DirectApprovalManager {
     this.eventRouter = eventRouter;
     this.reconciler = reconciler;
     this.pendingApprovals = new Map();
+  }
+
+  #safeEmit(payload) {
+    try {
+      this.eventRouter?.emitPersisted?.(payload);
+    } catch {
+      // Isolate SSE/event listener failures so committed DB mutations never fail
+    }
   }
 
   listApprovals({ sessionId = null, status = null, limit = 200 } = {}) {
@@ -38,25 +74,7 @@ export class DirectApprovalManager {
     return this.store.db
       .prepare(`SELECT * FROM direct_approvals ${clause} ORDER BY createdAt DESC LIMIT ?`)
       .all(...params, Math.min(500, Math.max(1, Number(limit))))
-      .map((r) => ({
-        id: r.id,
-        sessionId: r.sessionId,
-        turnId: r.turnId,
-        callId: r.callId,
-        tool: r.tool,
-        kind: r.kind || 'tool',
-        receiptId: r.receiptId || undefined,
-        riskLevel: r.riskLevel || undefined,
-        effectClass: r.effectClass || undefined,
-        outcome: r.outcome || undefined,
-        arguments: parseJsonSafe(r.arguments, {}),
-        status: r.status,
-        scope: r.scope,
-        reason: r.reason,
-        expiresAt: r.expiresAt,
-        createdAt: r.createdAt,
-        resolvedAt: r.resolvedAt,
-      }));
+      .map(hydrateApprovalRow);
   }
 
   decideApproval(
@@ -79,23 +97,49 @@ export class DirectApprovalManager {
     const now = Date.now();
     const args = parseJsonSafe(row.arguments, {});
 
-    this.store.tx(() => {
-      this.store.db
+    const updatedRow = this.store.tx(() => {
+      const fresh = this.store.db
+        .prepare('SELECT * FROM direct_approvals WHERE id=?')
+        .get(approvalId);
+      if (!fresh) return null;
+      if (fresh.status !== 'pending') {
+        throw new Fault('APPROVAL_INACTIVE', 409, {
+          message: `Approval ${approvalId} cannot be decided because status is "${fresh.status}"`,
+          status: fresh.status,
+        });
+      }
+      if (fresh.expiresAt && Number(fresh.expiresAt) < now) {
+        this.store.db
+          .prepare(
+            "UPDATE direct_approvals SET status='expired', resolvedAt=COALESCE(resolvedAt, ?) WHERE id=? AND status='pending'",
+          )
+          .run(now, approvalId);
+        throw new Fault('APPROVAL_EXPIRED', 409, {
+          message: `Approval ${approvalId} has expired`,
+        });
+      }
+
+      const res = this.store.db
         .prepare(
-          'UPDATE direct_approvals SET status=?, scope=?, reason=?, resolvedAt=? WHERE id=?',
+          "UPDATE direct_approvals SET status=?, scope=?, reason=?, resolvedAt=? WHERE id=? AND status='pending'",
         )
         .run(normalized, scope, reason || null, now, approvalId);
+      if ((res.changes ?? 0) !== 1) {
+        throw new Fault('APPROVAL_INACTIVE', 409, {
+          message: `Approval ${approvalId} was concurrently modified`,
+        });
+      }
 
       if (
         normalized === 'allowed' &&
         (scope === 'session' || scope === 'session-prefix') &&
-        (row.tool === 'bash' || row.tool === 'start_process')
+        (fresh.tool === 'bash' || fresh.tool === 'start_process')
       ) {
-        const prefix = args.commandPrefix || canonicalizeCommandPrefix(args.command);
+        const prefix = canonicalizeCommandPrefix(args.command);
         if (prefix) {
           const sessRow = this.store.db
             .prepare('SELECT approvedPrefixes FROM direct_sessions WHERE id=?')
-            .get(row.sessionId);
+            .get(fresh.sessionId);
           const cur = parseJsonSafe(sessRow?.approvedPrefixes, []);
           if (!cur.includes(prefix)) {
             cur.push(prefix);
@@ -103,51 +147,196 @@ export class DirectApprovalManager {
               .prepare(
                 'UPDATE direct_sessions SET approvedPrefixes=?, updatedAt=? WHERE id=?',
               )
-              .run(JSON.stringify(cur), now, row.sessionId);
+              .run(JSON.stringify(cur), now, fresh.sessionId);
           }
         }
       }
+
+      return this.store.db
+        .prepare('SELECT * FROM direct_approvals WHERE id=?')
+        .get(approvalId);
     });
+
+    if (!updatedRow) return null;
 
     const waiter = this.pendingApprovals.get(approvalId);
     if (waiter) {
       this.pendingApprovals.delete(approvalId);
       waiter.resolve({
         allowed: normalized === 'allowed',
-        approvalId: row.id,
-        argsDigest: row.argsDigest ?? waiter.argsDigest ?? null,
+        approvalId: updatedRow.id,
+        argsDigest: updatedRow.argsDigest ?? waiter.argsDigest ?? null,
         reason: reason || (normalized === 'allowed' ? 'approved' : 'denied'),
       });
     }
 
-    const updated = {
-      id: row.id,
-      sessionId: row.sessionId,
-      turnId: row.turnId,
-      callId: row.callId,
-      tool: row.tool,
-      kind: row.kind || 'tool',
-      arguments: args,
-      status: normalized,
-      scope,
-      reason: reason || null,
-      expiresAt: row.expiresAt,
-      createdAt: row.createdAt,
-      resolvedAt: now,
-    };
-    this.eventRouter.emitPersisted({
-      sessionId: row.sessionId,
-      turnId: row.turnId,
+    const updated = hydrateApprovalRow(updatedRow);
+    this.#safeEmit({
+      sessionId: updatedRow.sessionId,
+      turnId: updatedRow.turnId,
       type: RUNTIME_EVENTS.APPROVAL_RESOLVED,
       data: {
-        approvalId: row.id,
+        approvalId: updatedRow.id,
         status: normalized,
         scope,
-        tool: row.tool,
+        tool: updatedRow.tool,
       },
       audit: true,
     });
     return updated;
+  }
+
+  /**
+   * Revokes a pending or already-allowed (but not yet consumed) approval before tool execution starts.
+   */
+  revokeApproval(approvalId, { reason = 'revoked' } = {}) {
+    const cleanReason = String(reason || 'revoked').slice(0, 500);
+    const now = Date.now();
+    const outcome = this.store.tx(() => {
+      const existing = this.store.db
+        .prepare('SELECT * FROM direct_approvals WHERE id=?')
+        .get(approvalId);
+      if (!existing) {
+        return { ok: false, changed: false, code: 'APPROVAL_NOT_FOUND', approval: null };
+      }
+      const res = this.store.db
+        .prepare(
+          `UPDATE direct_approvals
+           SET status='revoked', revokedAt=?, revokedReason=?, resolvedAt=COALESCE(resolvedAt, ?)
+           WHERE id=? AND status IN ('pending','allowed')`,
+        )
+        .run(now, cleanReason, now, approvalId);
+      const fresh = this.store.db
+        .prepare('SELECT * FROM direct_approvals WHERE id=?')
+        .get(approvalId);
+      return {
+        ok: true,
+        changed: (res.changes ?? 0) > 0,
+        approval: hydrateApprovalRow(fresh),
+      };
+    });
+
+    const waiter = this.pendingApprovals.get(approvalId);
+    if (waiter) {
+      this.pendingApprovals.delete(approvalId);
+      waiter.resolve({
+        allowed: false,
+        revoked: true,
+        approvalId,
+        argsDigest: outcome.approval?.argsDigest ?? waiter.argsDigest ?? null,
+        reason: cleanReason,
+      });
+    }
+
+    if (outcome.changed && outcome.approval) {
+      this.#safeEmit({
+        sessionId: outcome.approval.sessionId,
+        turnId: outcome.approval.turnId,
+        type: RUNTIME_EVENTS.APPROVAL_RESOLVED,
+        data: {
+          approvalId: outcome.approval.id,
+          status: 'revoked',
+          revoked: true,
+          reason: cleanReason,
+          tool: outcome.approval.tool,
+        },
+        audit: true,
+      });
+    }
+
+    return outcome;
+  }
+
+  /**
+   * Atomically verifies and consumes an allowed approval immediately before tool execution.
+   * Rejects revoked, denied, expired, already-consumed, session/turn-mismatched, or digest-mismatched approvals.
+   */
+  consumeApproval(approvalId, { expectedArgsDigest = null, sessionId = null, turnId = null } = {}) {
+    if (!approvalId) {
+      return { ok: false, code: 'APPROVAL_ID_REQUIRED', reason: 'approvalId is required' };
+    }
+    if (!expectedArgsDigest || typeof expectedArgsDigest !== 'string') {
+      return { ok: false, code: 'ARGS_DIGEST_MISMATCH', reason: 'expectedArgsDigest is required' };
+    }
+    const now = Date.now();
+    return this.store.tx(() => {
+      const row = this.store.db
+        .prepare('SELECT * FROM direct_approvals WHERE id=?')
+        .get(approvalId);
+      if (!row) {
+        return { ok: false, code: 'APPROVAL_NOT_FOUND', reason: `Approval ${approvalId} not found` };
+      }
+      if (sessionId && row.sessionId && row.sessionId !== sessionId) {
+        return {
+          ok: false,
+          code: 'APPROVAL_SCOPE_MISMATCH',
+          reason: 'Approval does not belong to this session',
+        };
+      }
+      if (turnId && row.turnId && row.turnId !== turnId) {
+        return {
+          ok: false,
+          code: 'APPROVAL_SCOPE_MISMATCH',
+          reason: 'Approval does not belong to this turn',
+        };
+      }
+      if (row.status === 'revoked') {
+        return {
+          ok: false,
+          code: 'APPROVAL_REVOKED',
+          reason: row.revokedReason || 'Approval was revoked before execution',
+        };
+      }
+      if (row.status === 'consumed') {
+        return {
+          ok: false,
+          code: 'APPROVAL_ALREADY_CONSUMED',
+          reason: 'Approval has already been consumed',
+        };
+      }
+      if (row.status !== 'allowed') {
+        return {
+          ok: false,
+          code: 'APPROVAL_NOT_ALLOWED',
+          reason: `Approval status is "${row.status}"`,
+        };
+      }
+      if (row.expiresAt && Number(row.expiresAt) < now) {
+        this.store.db
+          .prepare(
+            "UPDATE direct_approvals SET status='expired', resolvedAt=COALESCE(resolvedAt, ?) WHERE id=? AND status='allowed'",
+          )
+          .run(now, approvalId);
+        return {
+          ok: false,
+          code: 'APPROVAL_EXPIRED',
+          reason: 'Approval expired before execution',
+        };
+      }
+      if (!row.argsDigest || row.argsDigest !== expectedArgsDigest) {
+        return {
+          ok: false,
+          code: 'ARGS_DIGEST_MISMATCH',
+          reason: 'Approval argsDigest does not match execution arguments',
+        };
+      }
+      const res = this.store.db
+        .prepare(
+          "UPDATE direct_approvals SET status='consumed', consumedAt=? WHERE id=? AND status='allowed' AND argsDigest=?",
+        )
+        .run(now, approvalId, expectedArgsDigest);
+      if ((res.changes ?? 0) !== 1) {
+        return {
+          ok: false,
+          code: 'APPROVAL_ALREADY_CONSUMED',
+          reason: 'Approval was concurrently consumed or modified',
+        };
+      }
+      const fresh = this.store.db
+        .prepare('SELECT * FROM direct_approvals WHERE id=?')
+        .get(approvalId);
+      return { ok: true, approval: hydrateApprovalRow(fresh) };
+    });
   }
 
   requestApproval({
@@ -185,7 +374,7 @@ export class DirectApprovalManager {
           now,
         );
     });
-    this.eventRouter.emitPersisted({
+    this.#safeEmit({
       sessionId,
       turnId,
       type: RUNTIME_EVENTS.APPROVAL_REQUESTED,

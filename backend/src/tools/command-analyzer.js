@@ -3,9 +3,72 @@ import { canonicalizeCommandPrefix } from '../patch-and-diagnostics.js';
 
 const SHELL_COMPOUND_RE = /[;&|><`\r\n]|\$\(|@\(|<\(|>\(/;
 const DOUBLE_QUOTE_SUBST_RE = /`|\$\(/;
+const READONLY_UNSAFE_RAW_RE = /[;&|><`\r\n$]|\$\(|@\(|<\(|>\(/;
 
 const POWERSHELL_HARD_BLOCK_RE =
   /\b(?:invoke-expression|iex|format-volume|clear-disk|stop-computer|restart-computer|bcdedit|diskpart|cipher\s+\/w)\b|(?:^|\s)-(?:enc|encodedcommand)\b|\bremove-item\b[^\n]*-(?:recurse|r)\b[^\n]*(?:[a-z]:\\|\/|~|\$env:)/i;
+
+const GIT_BRANCH_READONLY_FLAGS = new Set([
+  '-a',
+  '--all',
+  '-r',
+  '--remotes',
+  '-l',
+  '--list',
+  '--show-current',
+  '-v',
+  '-vv',
+  '--verbose',
+  '--no-color',
+  '--color',
+  '--merged',
+  '--no-merged',
+  '--contains',
+  '--no-contains',
+  '--points-at',
+  '--sort',
+  '--format',
+  '--abbrev',
+  '--no-abbrev',
+]);
+
+const GIT_BRANCH_MUTATING_FLAGS = new Set([
+  '-d',
+  '-D',
+  '--delete',
+  '-m',
+  '-M',
+  '--move',
+  '-c',
+  '-C',
+  '--copy',
+  '-f',
+  '--force',
+  '-u',
+  '--set-upstream-to',
+  '--unset-upstream',
+  '--edit-description',
+  '--track',
+  '--no-track',
+  '--create-reflog',
+]);
+
+const GIT_BLOCKED_FLAGS = new Set([
+  '-c',
+  '-C',
+  '--config-env',
+  '--git-dir',
+  '--work-tree',
+  '--exec',
+  '--exec-path',
+  '--upload-pack',
+  '--receive-pack',
+  '--output',
+  '-o',
+  '--no-index',
+  '--ext-diff',
+  '--textconv',
+]);
 
 const READONLY_ALLOWLIST = new Map([
   [
@@ -20,25 +83,11 @@ const READONLY_ALLOWLIST = new Map([
         'rev-parse',
         'describe',
       ]),
-      blockedFlags: new Set([
-        '-c',
-        '--exec',
-        '--upload-pack',
-        '--receive-pack',
-        '--output',
-        '-o',
-      ]),
+      blockedFlags: GIT_BLOCKED_FLAGS,
     },
   ],
-  ['ls', { subcommands: null, blockedFlags: new Set() }],
-  ['dir', { subcommands: null, blockedFlags: new Set() }],
   ['pwd', { subcommands: null, blockedFlags: new Set() }],
   ['echo', { subcommands: null, blockedFlags: new Set() }],
-  ['cat', { subcommands: null, blockedFlags: new Set() }],
-  ['type', { subcommands: null, blockedFlags: new Set() }],
-  ['head', { subcommands: null, blockedFlags: new Set() }],
-  ['tail', { subcommands: null, blockedFlags: new Set() }],
-  ['wc', { subcommands: null, blockedFlags: new Set() }],
   ['which', { subcommands: null, blockedFlags: new Set() }],
   ['where', { subcommands: null, blockedFlags: new Set() }],
   [
@@ -56,13 +105,13 @@ const READONLY_ALLOWLIST = new Map([
       blockedFlags: new Set(),
     },
   ],
-  ['get-childitem', { subcommands: null, blockedFlags: new Set() }],
-  ['get-content', { subcommands: null, blockedFlags: new Set() }],
   ['get-location', { subcommands: null, blockedFlags: new Set() }],
 ]);
 
 /**
  * Quote-aware shell tokenization and operator inspection across POSIX & PowerShell.
+ * Never allows backslash (`\`) to hide shell operators (`;`, `|`, `&`, `>`, `<`, `` ` ``, `$`, newlines)
+ * because PowerShell treats `\` as a literal character rather than an escape!
  */
 export function scanCommandSyntax(command) {
   const cmd = String(command ?? '');
@@ -93,7 +142,12 @@ export function scanCommandSyntax(command) {
     }
     if (inDouble) {
       if (ch === '\\' && i + 1 < cmd.length) {
-        cur += cmd[i + 1];
+        const nextCh = cmd[i + 1];
+        // Never allow backslash to mask command substitution or newlines
+        if (nextCh === '`' || nextCh === '$' || nextCh === '\r' || nextCh === '\n') {
+          hasSubstitution = true;
+        }
+        cur += nextCh;
         i++;
         continue;
       }
@@ -113,11 +167,6 @@ export function scanCommandSyntax(command) {
     }
     if (ch === '"') {
       inDouble = true;
-      continue;
-    }
-    if (ch === '\\' && i + 1 < cmd.length) {
-      cur += cmd[i + 1];
-      i++;
       continue;
     }
     if (/\s/.test(ch)) {
@@ -140,6 +189,48 @@ export function scanCommandSyntax(command) {
     hasSubstitution,
     unbalancedQuotes: inSingle || inDouble,
   };
+}
+
+function isSafeGitReadOnly(rest) {
+  let subIdx = -1;
+  let subcmd = null;
+  for (let i = 0; i < rest.length; i++) {
+    const tok = rest[i];
+    const flag = tok.split('=')[0];
+    const lowerFlag = flag.toLowerCase();
+    if (
+      GIT_BLOCKED_FLAGS.has(flag) ||
+      GIT_BLOCKED_FLAGS.has(lowerFlag) ||
+      (!tok.startsWith('--') && (tok.startsWith('-c') || tok.startsWith('-C') || tok.startsWith('-o')))
+    ) {
+      return false;
+    }
+    if (subIdx === -1 && !tok.startsWith('-')) {
+      subIdx = i;
+      subcmd = tok.toLowerCase();
+    }
+  }
+  const gitRule = READONLY_ALLOWLIST.get('git');
+  if (!subcmd || !gitRule.subcommands.has(subcmd)) return false;
+
+  // For `git branch`, only permit strict read-only listing (no delete/move/copy/create)
+  if (subcmd === 'branch') {
+    const afterBranch = rest.slice(subIdx + 1);
+    for (const tok of afterBranch) {
+      const flag = tok.split('=')[0];
+      if (GIT_BRANCH_MUTATING_FLAGS.has(flag) || GIT_BRANCH_MUTATING_FLAGS.has(flag.toLowerCase())) {
+        return false;
+      }
+      if (!tok.startsWith('-')) {
+        // Positional arg on `git branch <name>` creates a branch!
+        return false;
+      }
+      if (!GIT_BRANCH_READONLY_FLAGS.has(flag) && !GIT_BRANCH_READONLY_FLAGS.has(flag.toLowerCase())) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 /**
@@ -167,7 +258,9 @@ export function analyzeCommand(rawCommand) {
     };
   }
 
-  if (POWERSHELL_HARD_BLOCK_RE.test(command)) {
+  // Strip PowerShell inline backtick obfuscation (e.g. I`nvoke-Expression) before matching
+  const deobfuscatedPs = command.replace(/`(?!\r?\n)/g, '');
+  if (POWERSHELL_HARD_BLOCK_RE.test(command) || POWERSHELL_HARD_BLOCK_RE.test(deobfuscatedPs)) {
     return {
       hardBlocked: 'powershell-destructive-or-eval',
       isReadOnly: false,
@@ -184,24 +277,29 @@ export function analyzeCommand(rawCommand) {
     !syntax.hasCompound &&
     !syntax.hasSubstitution &&
     !syntax.unbalancedQuotes &&
+    !READONLY_UNSAFE_RAW_RE.test(command) &&
     syntax.tokens.length
   ) {
     const head = syntax.tokens[0].split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
     const rule = READONLY_ALLOWLIST.get(head);
     if (rule) {
       const rest = syntax.tokens.slice(1);
-      const hasBlockedFlag = rest.some((t) => {
-        const flag = t.split('=')[0].toLowerCase();
-        return rule.blockedFlags.has(flag);
-      });
-      if (!hasBlockedFlag) {
-        if (rule.allowedExactArgs) {
-          isReadOnly = rest.length === 1 && rule.allowedExactArgs.has(rest[0]);
-        } else if (rule.subcommands) {
-          const firstPositional = rest.find((t) => !t.startsWith('-'))?.toLowerCase();
-          isReadOnly = Boolean(firstPositional && rule.subcommands.has(firstPositional));
-        } else {
-          isReadOnly = true;
+      if (head === 'git') {
+        isReadOnly = isSafeGitReadOnly(rest);
+      } else {
+        const hasBlockedFlag = rest.some((t) => {
+          const flag = t.split('=')[0].toLowerCase();
+          return rule.blockedFlags.has(flag);
+        });
+        if (!hasBlockedFlag) {
+          if (rule.allowedExactArgs) {
+            isReadOnly = rest.length === 1 && rule.allowedExactArgs.has(rest[0]);
+          } else if (rule.subcommands) {
+            const firstPositional = rest.find((t) => !t.startsWith('-'))?.toLowerCase();
+            isReadOnly = Boolean(firstPositional && rule.subcommands.has(firstPositional));
+          } else {
+            isReadOnly = true;
+          }
         }
       }
     }

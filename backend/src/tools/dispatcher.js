@@ -4,10 +4,21 @@ import { wrapUntrusted, redactSecrets } from '../envelope.js';
 import { canonicalJson, sha256Hex } from '../integrity.js';
 import { scheduleToolBatch } from '../patch-and-diagnostics.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
+import { withTraceContext } from '../observability/trace.js';
 import { ToolPermissionPolicy } from './policy.js';
 
 export function computeArgsDigest(toolName, args) {
   return sha256Hex(canonicalJson({ tool: String(toolName || ''), args: args ?? {} }));
+}
+
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== 'object') return value;
+  if (seen.has(value) || Object.isFrozen(value)) return value;
+  seen.add(value);
+  for (const key of Object.keys(value)) {
+    deepFreeze(value[key], seen);
+  }
+  return Object.freeze(value);
 }
 
 /**
@@ -40,18 +51,32 @@ export class ToolResultProcessor {
  * cryptographic argsDigest + approvalId + ExecutePermit binding, and consistent tool_receipts.
  */
 export class ToolDispatcher {
+  #effectSeq = 0;
+
   constructor({
     store = null,
     eventRouter = null,
     reconciler = null,
     policy = null,
     permits = null,
+    approvalManager = null,
+    getLivePolicy = null,
   } = {}) {
     this.store = store;
     this.eventRouter = eventRouter;
     this.reconciler = reconciler;
     this.policy = policy ?? new ToolPermissionPolicy({ permissionMode: 'approval' });
     this.permits = permits ?? new ExecutePermitRegistry();
+    this.approvalManager = approvalManager ?? null;
+    this.getLivePolicy = typeof getLivePolicy === 'function' ? getLivePolicy : null;
+  }
+
+  #safeEmit(payload) {
+    try {
+      this.eventRouter?.emitPersisted?.(payload);
+    } catch {
+      // Isolate SSE listener errors so tool dispatch & DB commits are never aborted
+    }
   }
 
   #recordPreEffectRejection({
@@ -65,6 +90,7 @@ export class ToolDispatcher {
     hookDigest = null,
     errorCode,
     startedAt,
+    leaseGuard = null,
   }) {
     if (!this.reconciler || !sessionId || !turnId) return null;
     const rej = this.reconciler.recordReceiptStart({
@@ -79,11 +105,13 @@ export class ToolDispatcher {
       args,
       approvedArgsDigest,
       hookDigest,
+      leaseGuard,
     });
     return this.reconciler.recordReceiptFinish(rej.id, {
       status: 'rejected_before_effect',
       errorCode,
       durationMs: Date.now() - startedAt,
+      leaseGuard,
     });
   }
 
@@ -103,6 +131,8 @@ export class ToolDispatcher {
     denyTools = undefined,
     getApprovedPrefixes = () => [],
     requestApproval = null,
+    approvalManager = null,
+    getLivePolicy = null,
     tainted = false,
     emitCallEvent = true,
   }) {
@@ -140,6 +170,8 @@ export class ToolDispatcher {
           denyTools,
           getApprovedPrefixes,
           requestApproval,
+          approvalManager,
+          getLivePolicy,
           tainted,
           emitCallEvent,
         }),
@@ -163,6 +195,8 @@ export class ToolDispatcher {
     denyTools,
     getApprovedPrefixes,
     requestApproval,
+    approvalManager,
+    getLivePolicy,
     tainted,
     emitCallEvent,
   }) {
@@ -170,6 +204,21 @@ export class ToolDispatcher {
     signal?.throwIfAborted?.();
     leaseGuard?.();
     parentGuard?.();
+
+    const effApprovalManager = approvalManager ?? this.approvalManager;
+    const effGetLivePolicy =
+      typeof getLivePolicy === 'function' ? getLivePolicy : this.getLivePolicy;
+    const readLivePolicy = () => {
+      const live =
+        typeof effGetLivePolicy === 'function'
+          ? effGetLivePolicy({ sessionId, turnId, toolName: tc.name })
+          : null;
+      return {
+        permissionMode: live?.permissionMode ?? permissionMode ?? this.policy.permissionMode,
+        allowTools: live && 'allowTools' in live ? live.allowTools : allowTools,
+        denyTools: live && 'denyTools' in live ? live.denyTools : denyTools,
+      };
+    };
 
     const toolImpl = toolMap.get(tc.name);
     let parsedArgs = null;
@@ -186,7 +235,7 @@ export class ToolDispatcher {
     }
 
     if (emitCallEvent && this.eventRouter && sessionId) {
-      this.eventRouter.emitPersisted({
+      this.#safeEmit({
         sessionId,
         turnId,
         type: RUNTIME_EVENTS.TOOL_CALL,
@@ -206,9 +255,10 @@ export class ToolDispatcher {
     });
 
     if (!toolImpl) {
+      const liveInit = readLivePolicy();
       const deniedByAllowlist =
-        (Array.isArray(allowTools) && !allowTools.includes(tc.name)) ||
-        (Array.isArray(denyTools) && denyTools.includes(tc.name));
+        (Array.isArray(liveInit.allowTools) && !liveInit.allowTools.includes(tc.name)) ||
+        (Array.isArray(liveInit.denyTools) && liveInit.denyTools.includes(tc.name));
       if (deniedByAllowlist) {
         const receipt = this.#recordPreEffectRejection({
           sessionId,
@@ -219,6 +269,7 @@ export class ToolDispatcher {
           args: parsedArgs ?? {},
           errorCode: 'POLICY_DENIED',
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -259,6 +310,7 @@ export class ToolDispatcher {
         args: { raw: tc.arguments },
         errorCode: 'INVALID_ARGUMENTS_JSON',
         startedAt: tStart,
+        leaseGuard,
       });
       return {
         tc,
@@ -292,6 +344,7 @@ export class ToolDispatcher {
           args: parsedArgs,
           errorCode: 'INVALID_ARGUMENTS',
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -309,7 +362,8 @@ export class ToolDispatcher {
     }
 
     // 2. PreToolUse Hook (Security / Transform hooks MUST fail-closed on exception or non-zero exit)
-    const effectivePermMode = permissionMode ?? this.policy.permissionMode;
+    const prePolicy = readLivePolicy();
+    const effectivePermMode = prePolicy.permissionMode;
     let preHook = { blocked: false, updatedInput: null, transformApplied: false, additionalContexts: [] };
     if (hooks) {
       try {
@@ -336,6 +390,7 @@ export class ToolDispatcher {
           args: parsedArgs,
           errorCode: 'SECURITY_HOOK_ERROR',
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -358,6 +413,7 @@ export class ToolDispatcher {
         args: parsedArgs,
         errorCode: 'SECURITY_HOOK_BLOCKED',
         startedAt: tStart,
+        leaseGuard,
       });
       return {
         tc,
@@ -370,9 +426,6 @@ export class ToolDispatcher {
     }
 
     let effectiveArgs = preHook.transformApplied && preHook.updatedInput ? preHook.updatedInput : parsedArgs;
-    const hookDigest = preHook.transformApplied
-      ? computeArgsDigest(tc.name, effectiveArgs)
-      : null;
 
     // Re-validate schema after Transform hook modifies inputs
     if (preHook.transformApplied && typeof toolImpl.validate === 'function') {
@@ -389,9 +442,10 @@ export class ToolDispatcher {
           toolName: tc.name,
           meta,
           args: effectiveArgs,
-          hookDigest,
+          hookDigest: computeArgsDigest(tc.name, effectiveArgs),
           errorCode: 'HOOK_TRANSFORM_INVALID_ARGS',
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -405,6 +459,11 @@ export class ToolDispatcher {
       effectiveArgs = recheck.data;
     }
 
+    // Compute hookDigest AFTER Zod recheck.data so digest matches final normalized execution args
+    const hookDigest = preHook.transformApplied
+      ? computeArgsDigest(tc.name, effectiveArgs)
+      : null;
+
     // 3. Re-check cancellation & compute canonical digest after final arg transforms
     signal?.throwIfAborted?.();
     leaseGuard?.();
@@ -412,12 +471,13 @@ export class ToolDispatcher {
     const finalArgsDigest = computeArgsDigest(tc.name, effectiveArgs);
 
     // 4. Policy Evaluation + Fail-Closed Human Approval Gate
+    const curPolicy = readLivePolicy();
     const policyVerdict = this.policy.evaluate(toolImpl, effectiveArgs, {
       approvedPrefixes: getApprovedPrefixes(),
       tainted,
-      permissionMode: effectivePermMode,
-      allowTools,
-      denyTools,
+      permissionMode: curPolicy.permissionMode,
+      allowTools: curPolicy.allowTools,
+      denyTools: curPolicy.denyTools,
     });
 
     if (policyVerdict.decision === 'deny') {
@@ -431,6 +491,7 @@ export class ToolDispatcher {
         hookDigest,
         errorCode: 'POLICY_DENIED',
         startedAt: tStart,
+        leaseGuard,
       });
       return {
         tc,
@@ -456,6 +517,7 @@ export class ToolDispatcher {
           hookDigest,
           errorCode: 'APPROVAL_SERVICE_UNAVAILABLE',
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -493,6 +555,7 @@ export class ToolDispatcher {
           hookDigest,
           errorCode: 'APPROVAL_ERROR',
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -514,9 +577,11 @@ export class ToolDispatcher {
           : decisionRes === true;
       if (!allowed) {
         const reasonTag =
-          typeof decisionRes === 'object' && decisionRes?.reason === 'timeout'
-            ? 'APPROVAL_TIMEOUT'
-            : 'APPROVAL_DENIED';
+          typeof decisionRes === 'object' && decisionRes?.revoked
+            ? 'APPROVAL_REVOKED'
+            : typeof decisionRes === 'object' && decisionRes?.reason === 'timeout'
+              ? 'APPROVAL_TIMEOUT'
+              : 'APPROVAL_DENIED';
         const receipt = this.#recordPreEffectRejection({
           sessionId,
           turnId,
@@ -527,6 +592,7 @@ export class ToolDispatcher {
           hookDigest,
           errorCode: reasonTag,
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -534,17 +600,25 @@ export class ToolDispatcher {
           output:
             reasonTag === 'APPROVAL_TIMEOUT'
               ? `审批超时，拒绝执行 ${tc.name} 操作`
-              : `用户拒绝了 ${tc.name} 操作`,
+              : reasonTag === 'APPROVAL_REVOKED'
+                ? `审批已被撤销，拒绝执行 ${tc.name} 操作`
+                : `用户拒绝了 ${tc.name} 操作`,
           isError: true,
           durationMs: Date.now() - tStart,
           receipt,
         };
       }
 
+      // 4a. Strict non-null argsDigest verification (prevents null-bypass & nested arg mutation TOCTOU)
       const returnedDigest =
-        typeof decisionRes === 'object' && decisionRes?.argsDigest ? decisionRes.argsDigest : null;
+        typeof decisionRes === 'object' &&
+        decisionRes !== null &&
+        typeof decisionRes.argsDigest === 'string' &&
+        decisionRes.argsDigest.trim().length > 0
+          ? decisionRes.argsDigest.trim()
+          : null;
       const postDigest = computeArgsDigest(tc.name, effectiveArgs);
-      if ((returnedDigest && returnedDigest !== finalArgsDigest) || postDigest !== finalArgsDigest) {
+      if (!returnedDigest || returnedDigest !== finalArgsDigest || postDigest !== finalArgsDigest) {
         const receipt = this.#recordPreEffectRejection({
           sessionId,
           turnId,
@@ -556,6 +630,7 @@ export class ToolDispatcher {
           hookDigest,
           errorCode: 'APPROVAL_ARGS_MISMATCH',
           startedAt: tStart,
+          leaseGuard,
         });
         return {
           tc,
@@ -567,18 +642,108 @@ export class ToolDispatcher {
         };
       }
 
+      // 4b. Re-read live policy & re-evaluate policy after approval wait (catches mid-wait tightening!)
+      const postPolicy = readLivePolicy();
+      const postVerdict = this.policy.evaluate(toolImpl, effectiveArgs, {
+        approvedPrefixes: getApprovedPrefixes(),
+        tainted,
+        permissionMode: postPolicy.permissionMode,
+        allowTools: postPolicy.allowTools,
+        denyTools: postPolicy.denyTools,
+      });
+      if (postVerdict.decision === 'deny') {
+        const receipt = this.#recordPreEffectRejection({
+          sessionId,
+          turnId,
+          callId: tc.id,
+          toolName: tc.name,
+          meta,
+          args: effectiveArgs,
+          approvedArgsDigest: returnedDigest,
+          hookDigest,
+          errorCode: 'POLICY_TIGHTENED_DENIED',
+          startedAt: tStart,
+          leaseGuard,
+        });
+        return {
+          tc,
+          parsedArgs: effectiveArgs,
+          output: `安全阻断：审批后策略已收紧，拒绝执行 ${tc.name} (${postVerdict.reason})`,
+          isError: true,
+          durationMs: Date.now() - tStart,
+          receipt,
+        };
+      }
+
       approvalId =
         (typeof decisionRes === 'object' && decisionRes?.approvalId) ||
         `approved-${tc.id}`;
       approvedArgsDigest = finalArgsDigest;
+
+      // 4c. Atomic DB single-use approval consumption (blocks revoked/expired/replayed approvals)
+      if (effApprovalManager && typeof effApprovalManager.consumeApproval === 'function') {
+        const consumed = effApprovalManager.consumeApproval(approvalId, {
+          expectedArgsDigest: finalArgsDigest,
+          sessionId,
+          turnId,
+        });
+        if (!consumed?.ok) {
+          const receipt = this.#recordPreEffectRejection({
+            sessionId,
+            turnId,
+            callId: tc.id,
+            toolName: tc.name,
+            meta,
+            args: effectiveArgs,
+            approvedArgsDigest: returnedDigest,
+            hookDigest,
+            errorCode: consumed?.code || 'APPROVAL_REVOKED',
+            startedAt: tStart,
+            leaseGuard,
+          });
+          return {
+            tc,
+            parsedArgs: effectiveArgs,
+            output: `安全阻断：审批无效、已消费或已被撤销 (${consumed?.code || 'APPROVAL_REVOKED'}: ${consumed?.reason || ''})`,
+            isError: true,
+            durationMs: Date.now() - tStart,
+            receipt,
+          };
+        }
+      } else if (this.permits.isApprovalUsed?.(approvalId)) {
+        const receipt = this.#recordPreEffectRejection({
+          sessionId,
+          turnId,
+          callId: tc.id,
+          toolName: tc.name,
+          meta,
+          args: effectiveArgs,
+          approvedArgsDigest: returnedDigest,
+          hookDigest,
+          errorCode: 'APPROVAL_ALREADY_CONSUMED',
+          startedAt: tStart,
+          leaseGuard,
+        });
+        return {
+          tc,
+          parsedArgs: effectiveArgs,
+          output: `安全阻断：审批凭证 ${approvalId} 已被消费，禁止重放执行 ${tc.name}`,
+          isError: true,
+          durationMs: Date.now() - tStart,
+          receipt,
+        };
+      }
     }
+
+    // Freeze effectiveArgs deeply so nothing can mutate parameters between verification and execute()
+    deepFreeze(effectiveArgs);
 
     // Final abort/fence/parent check immediately before issuing permit & persisting executing receipt
     signal?.throwIfAborted?.();
     leaseGuard?.();
     parentGuard?.();
 
-    const effectId = `${turnId || 'turn'}:${tc.name}:${tc.id}:${Date.now()}`;
+    const effectId = `${turnId || 'turn'}:${tc.name}:${tc.id}:${Date.now()}:${++this.#effectSeq}`;
     let receipt = null;
     if (this.reconciler && sessionId && turnId) {
       receipt = this.reconciler.recordReceiptStart({
@@ -595,6 +760,7 @@ export class ToolDispatcher {
         permitEffectId: effectId,
         approvedArgsDigest,
         hookDigest,
+        leaseGuard,
       });
     }
 
@@ -614,14 +780,18 @@ export class ToolDispatcher {
     let execErr = null;
     try {
       output = String(
-        (await dispatchWithPermit(permit, binding, this.permits, () =>
-          toolImpl.execute(effectiveArgs, {
-            callId: tc.id,
-            signal,
-            sessionId,
-            turnId,
-            permitConsumed: true,
-          }),
+        (await withTraceContext({ toolCallId: tc.id, sessionId, turnId }, () =>
+          dispatchWithPermit(permit, binding, this.permits, () =>
+            toolImpl.execute(effectiveArgs, {
+              callId: tc.id,
+              signal,
+              sessionId,
+              turnId,
+              tainted,
+              approvalId,
+              permitProof: permit,
+            }),
+          ),
         )) ?? '',
       );
     } catch (err) {
@@ -659,8 +829,9 @@ export class ToolDispatcher {
                 ? 'NON_ZERO_EXIT'
                 : 'TOOL_EXECUTION_ERROR'
               : null,
+        leaseGuard,
       });
-      this.eventRouter?.emitPersisted({
+      this.#safeEmit({
         sessionId,
         turnId,
         type: RUNTIME_EVENTS.TOOL_RECEIPT,
@@ -691,7 +862,7 @@ export class ToolDispatcher {
             isError,
             output: output.slice(0, 4000),
           },
-          { signal, permissionMode: effectivePermMode },
+          { signal, permissionMode: readLivePolicy().permissionMode },
         )
         .catch(() => ({ additionalContexts: [], warnings: [] }));
       if (postHook.additionalContexts?.length) {
