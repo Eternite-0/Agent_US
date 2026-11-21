@@ -1581,15 +1581,22 @@ export class AdaptiveSwarmOrchestrator {
       const activeNodes = run.nodes.filter((n) => !replacedKeys.has(n.nodeKey));
       const summary = buildSwarmSummary(activeNodes);
       const childSessionIds = activeNodes.map((n) => n.childSessionId).filter(Boolean);
-      const allSessionIds = [...new Set([run.sessionId, ...childSessionIds].filter(Boolean))];
       const childTurnIds = activeNodes.map((n) => n.childTurnId).filter(Boolean);
-      const allTurnIds = [...new Set([run.rootTurnId, ...childTurnIds].filter(Boolean))];
+      const rootTurn = run.rootTurnId
+        ? this.store.db.prepare('SELECT state FROM direct_turns WHERE id=?').get(run.rootTurnId)
+        : null;
+      const rootTurnActive = rootTurn && ['running', 'reconciling', 'parked'].includes(rootTurn.state);
+      const allSessionIds = [...new Set([...(rootTurnActive ? [] : [run.sessionId]), ...childSessionIds].filter(Boolean))];
+      const rootTurnIds = rootTurn && !['running', 'reconciling', 'parked'].includes(rootTurn.state)
+        ? [run.rootTurnId]
+        : [];
+      const allTurnIds = [...new Set([...rootTurnIds, ...childTurnIds].filter(Boolean))];
 
       const verdict = this.evidenceVerifier
         ? this.evidenceVerifier.verify({
             text: summary,
-            sessionId: run.sessionId,
-            turnId: run.rootTurnId,
+            sessionId: rootTurnActive ? null : run.sessionId,
+            turnId: rootTurnActive ? null : run.rootTurnId,
             sessionIds: allSessionIds,
             turnIds: allTurnIds.length ? allTurnIds : null,
             workspaceRoot: run.workspaceRoot,
