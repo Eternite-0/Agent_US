@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -209,11 +210,11 @@ test('Self-contained WebLoginService: GitHub Copilot Device Flow, OpenRouter PKC
     else process.env.GITHUB_DEVICE_CODE_URL = prevDeviceUrl;
     if (prevTokenUrl === undefined) delete process.env.GITHUB_ACCESS_TOKEN_URL;
     else process.env.GITHUB_ACCESS_TOKEN_URL = prevTokenUrl;
-    direct.close();
+    await direct.close();
     await app.close();
     store.close();
     await mockGh.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(fakeHome);
   }
 });

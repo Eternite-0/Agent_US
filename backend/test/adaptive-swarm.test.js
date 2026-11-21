@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -90,7 +91,7 @@ test('P5 ModelCapabilityRegistry and AdaptiveModelRouter match models to coding,
     assert.equal(fastChoice.model, 'gemini-2.5-flash');
   } finally {
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
   }
 });
 
@@ -138,7 +139,7 @@ test('P5 DynamicTaskPlanner rejects cycles and supports live addNode, reprioriti
     assert.equal(cancelled.status, 'cancelled');
   } finally {
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
   }
 });
 
@@ -219,10 +220,10 @@ test('P5 ChildAgentManager supports cache-safe fork, recursive fork guard, permi
     assert.equal(direct.getSession(fork1.childSessionId).state, 'cancelled');
     assert.equal(direct.getSession(fork2.childSessionId).state, 'cancelled');
   } finally {
-    direct.close();
+    await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -334,9 +335,9 @@ test('P5 AdaptiveSwarmOrchestrator executes diamond DAG concurrently with mailbo
     assert.equal(done.state, 'completed');
     assert.equal(toolTriggeredSwarm, true);
   } finally {
-    direct.close();
+    await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });

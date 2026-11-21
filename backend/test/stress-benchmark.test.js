@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store, id as uuid } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -237,14 +238,10 @@ test('P8 Stress Benchmark: 20 concurrent sessions, 50 tool dispatches, 4-worker 
     };
     console.log('[P8 BENCHMARK]', JSON.stringify(summary));
   } finally {
-    direct.close();
+    await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 });
-    try {
-      rmSync(workDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 });
-    } catch {
-      // ignore transient Windows temp cleanup
-    }
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 

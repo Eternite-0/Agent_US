@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 
@@ -138,6 +139,6 @@ test('AccountPool encrypts credentials, syncs models, maps aliases, and fails ov
     await upstream1.close();
     await upstream2.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

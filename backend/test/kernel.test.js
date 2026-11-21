@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AgentRuntimeKernel } from '../src/kernel/runtime.js';
 import {
@@ -27,7 +28,7 @@ function createTempStore() {
     store,
     cleanup() {
       store.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmDirSafe(dir);
     },
   };
 }

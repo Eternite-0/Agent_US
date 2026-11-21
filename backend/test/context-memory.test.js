@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -124,10 +125,10 @@ test('P4 ContextAssembler preserves KV Prompt Cache prefix across turns and appe
     const lastUser = call2Msgs.findLast((m) => m.role === 'user');
     assert.ok(lastUser.content.some((b) => b.type === 'image'));
   } finally {
-    direct.close();
+    await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -252,10 +253,10 @@ test('P4 MultiStageCompactor performs non-destructive compaction retaining TaskS
     const compactions = direct.compactor.listCompactions(s.id);
     assert.ok(compactions.some((c) => c.stage === 'auto-summary'));
   } finally {
-    direct.close();
+    await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -337,7 +338,7 @@ test('P4 ProjectMemoryService redacts secrets, filters withdrawn lessons, and ra
     assert.equal(tracker.check(3350).action, 'stop');
   } finally {
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });

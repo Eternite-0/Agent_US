@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe, withTimeout } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -134,7 +135,11 @@ test('Fix D1-D4/D9: Runtime A active with valid lease (Direct & Swarm) is NOT ta
     });
 
     // Wait deterministically until Runtime A holds active leases for BOTH Direct turn and Swarm isolated worktree node
-    await Promise.all([directEntered.promise, swarmEntered.promise]);
+    await withTimeout(
+      Promise.all([directEntered.promise, swarmEntered.promise]),
+      20000,
+      'Runtime A active leases barrier',
+    );
 
     const wtRowBefore = storeA.db
       .prepare("SELECT * FROM worktree_leases WHERE runId=? AND status='active'")
@@ -202,7 +207,7 @@ test('Fix D1-D4/D9: Runtime A active with valid lease (Direct & Swarm) is NOT ta
     await runtimeA.close();
     storeB.close();
     storeA.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -351,7 +356,11 @@ test('Fix D3/D5/D6/D7/C10: expired Runtime A is taken over by Runtime B; A late 
     const directSess = runtimeA.createSession({ workspaceRoot: workDir, title: 'Direct Takeover' });
     const directOut = runtimeA.startTurn(directSess.id, { input: 'TAKEOVER_DIRECT_TURN' });
 
-    await Promise.all([aSwarmEntered.promise, aErrEntered.promise, aDirectEntered.promise]);
+    await withTimeout(
+      Promise.all([aSwarmEntered.promise, aErrEntered.promise, aDirectEntered.promise]),
+      20000,
+      'Runtime A takeover entry barrier',
+    );
 
     // Expire all 3 leases held by Runtime A in SQLite
     storeA.tx(() => {
@@ -369,14 +378,18 @@ test('Fix D3/D5/D6/D7/C10: expired Runtime A is taken over by Runtime B; A late 
     });
 
     // Wait until B is actively running BOTH swarm nodes and has finished the direct turn
-    await Promise.all([
-      bSwarmEntered.promise,
-      bErrEntered.promise,
-      waitUntil(() => {
-        const t = storeB.db.prepare('SELECT state FROM direct_turns WHERE id=?').get(directOut.turn.id);
-        return t?.state === 'completed' ? t : null;
-      }),
-    ]);
+    await withTimeout(
+      Promise.all([
+        bSwarmEntered.promise,
+        bErrEntered.promise,
+        waitUntil(() => {
+          const t = storeB.db.prepare('SELECT state FROM direct_turns WHERE id=?').get(directOut.turn.id);
+          return t?.state === 'completed' ? t : null;
+        }),
+      ]),
+      20000,
+      'Runtime B takeover reclaim barrier',
+    );
 
     const bWorktree = storeB.db
       .prepare("SELECT * FROM worktree_leases WHERE runId=? AND status='active' ORDER BY createdAt DESC LIMIT 1")
@@ -452,7 +465,7 @@ test('Fix D3/D5/D6/D7/C10: expired Runtime A is taken over by Runtime B; A late 
     await runtimeA.close();
     storeB.close();
     storeA.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -506,7 +519,11 @@ test('Fix D7: user-cancelled Direct turn and Swarm run stay cancelled across lat
       nodes: [{ nodeKey: 'n1', taskType: 'research', objective: 'CANCEL_ME_SWARM', dependencies: [] }],
     });
 
-    await Promise.all([enteredDirect.promise, enteredSwarm.promise]);
+    await withTimeout(
+      Promise.all([enteredDirect.promise, enteredSwarm.promise]),
+      20000,
+      'cancel barrier entry',
+    );
 
     runtime.cancelTurn(tOut.turn.id);
     runtime.swarmOrchestrator.cancelRun(swOut.runId);
@@ -543,7 +560,7 @@ test('Fix D7: user-cancelled Direct turn and Swarm run stay cancelled across lat
     releaseSwarm.resolve();
     await runtime.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -612,7 +629,7 @@ test('Fix D8: unresolved outcome_unknown non-replayable side effect enters recon
   } finally {
     await runtime.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -735,6 +752,6 @@ test('Fix D8/D9: live worker executing non-replayable receipt is NOT falsely fla
     await runtimeA.close();
     storeB.close();
     storeA.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

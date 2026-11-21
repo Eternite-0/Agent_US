@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { rmDirSafe, withTimeout } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -17,12 +18,22 @@ import { EventRouter } from '../src/kernel/events.js';
 
 function listenMockOpenAi(handler) {
   return new Promise((resolve) => {
-    const server = http.createServer(handler);
+    const cleanups = new Set();
+    const server = http.createServer((req, res) => handler(req, res, cleanups));
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
       resolve({
         baseUrl: `http://127.0.0.1:${port}/v1`,
-        close: () => new Promise((r) => server.close(r)),
+        close: () => {
+          for (const fn of cleanups) {
+            try {
+              fn();
+            } catch {}
+          }
+          cleanups.clear();
+          server.closeAllConnections?.();
+          return new Promise((r) => server.close(r));
+        },
       });
     });
   });
@@ -98,11 +109,11 @@ test('P2 Durable: Concurrent worker fencing rejects stale lease and protects ter
     );
   } finally {
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
-test('P2 Durable: Cancelled turn is never resurrected across restart or job claim', () => {
+test('P2 Durable: Cancelled turn is never resurrected across restart or job claim', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-us-p2-cancel-'));
   const dbPath = join(dir, 'engine.sqlite');
   let store = new Store(dbPath);
@@ -126,7 +137,7 @@ test('P2 Durable: Cancelled turn is never resurrected across restart or job clai
     });
 
     // Reboot DirectAgentRuntime on same SQLite DB
-    direct.close();
+    await direct.close();
     store.close();
     store = new Store(dbPath);
     const pool2 = new AccountPool(store, { root: dir });
@@ -140,9 +151,9 @@ test('P2 Durable: Cancelled turn is never resurrected across restart or job clai
     const turnRow = store.db.prepare("SELECT state FROM direct_turns WHERE id='t-cancel'").get();
     assert.equal(turnRow.state, 'cancelled');
   } finally {
-    direct.close();
+    await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -232,7 +243,7 @@ test('P2 Durable: Non-replayable executing receipt parks in unknown_outcome reco
     });
 
     // Reboot runtime -> triggers recoverOnStartup()
-    direct.close();
+    await direct.close();
     store.close();
     store = new Store(dbPath);
     const pool2 = new AccountPool(store, { root: dir });
@@ -297,9 +308,9 @@ test('P2 Durable: Non-replayable executing receipt parks in unknown_outcome reco
     const integrity = store.verifyIntegrity({ full: true });
     assert.equal(integrity.ok, true);
   } finally {
-    direct.close();
+    await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -315,7 +326,7 @@ test('P2 Durable: Hard-killed subprocess recovers interrupted turn from SQLite c
   });
 
   // Upstream mock server stays alive in parent test process across child SIGKILL & reboot!
-  const upstream = await listenMockOpenAi(async (req, res) => {
+  const upstream = await listenMockOpenAi(async (req, res, cleanups) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
@@ -367,7 +378,17 @@ test('P2 Durable: Hard-killed subprocess recovers interrupted turn from SQLite c
       if (llmCallCount === 2) {
         step1ReachedResolve();
         // Keep connection open so worker #1 stalls mid-flight before SIGKILL
-        await new Promise((r) => setTimeout(r, 15000));
+        await new Promise((r) => {
+          const done = () => {
+            clearTimeout(timer);
+            cleanups.delete(done);
+            r();
+          };
+          const timer = setTimeout(done, 15000);
+          timer.unref?.();
+          cleanups.add(done);
+          req.once('close', done);
+        });
         return;
       }
 
@@ -422,7 +443,7 @@ test('P2 Durable: Hard-killed subprocess recovers interrupted turn from SQLite c
   const startOut = initDirect.startTurn(sess.id, { input: 'read note.txt and confirm' });
   const turnId = startOut.turn.id;
   // Close immediately before worker runs so child process #1 owns execution cleanly
-  initDirect.close();
+  await initDirect.close();
   initStore.close();
 
   const childScript = `
@@ -451,7 +472,7 @@ test('P2 Durable: Hard-killed subprocess recovers interrupted turn from SQLite c
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    await step1Reached;
+    await withTimeout(step1Reached, 20000, 'durable-runtime step1Reached barrier');
     // Ensure checkpoint after step 1 is flushed before killing child1
     await new Promise((r) => setTimeout(r, 150));
 
@@ -491,10 +512,30 @@ test('P2 Durable: Hard-killed subprocess recovers interrupted turn from SQLite c
     await waitUntil(() => direct2.recoveryWorker.timer === null && direct2.recoveryWorker.active.size === 0);
     assert.equal(store2.verifyIntegrity({ full: true }).ok, true);
   } finally {
-    if (child1) child1.kill('SIGKILL');
-    direct2?.close();
+    if (child1 && child1.exitCode === null && child1.signalCode === null) {
+      try {
+        child1.kill('SIGKILL');
+      } catch {}
+      await new Promise((r) => {
+        const onExit = () => {
+          clearTimeout(timer);
+          r();
+        };
+        const timer = setTimeout(() => {
+          child1.off('exit', onExit);
+          r();
+        }, 2000);
+        timer.unref?.();
+        child1.once('exit', onExit);
+        if (child1.exitCode !== null || child1.signalCode !== null) {
+          child1.off('exit', onExit);
+          onExit();
+        }
+      });
+    }
+    await direct2?.close();
     store2?.close();
     await upstream.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

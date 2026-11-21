@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -164,7 +165,7 @@ test('P8.A1 ToolDispatcher enforces strict Fail-Closed approval gating, permit s
     assert.equal(badExit[0].receipt.errorCode, 'NON_ZERO_EXIT');
   } finally {
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -270,8 +271,8 @@ test('P8.A2 Hooks separate security, transform (with post-transform validation),
     assert.equal(executedCount, 3);
   } finally {
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -393,8 +394,8 @@ test('P8.A3 Kernel removes insecure dispatcher; Worktree isolation fails closed 
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
-    rmSync(nonGitDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
-    rmSync(gitDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
+    rmDirSafe(dataDir);
+    rmDirSafe(nonGitDir);
+    rmDirSafe(gitDir);
   }
 });

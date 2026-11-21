@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -113,8 +114,8 @@ test('P6 EvidenceVerifier blocks fabricated pass claims, unresolved reconciliati
     assert.ok(missingRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
   } finally {
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -242,10 +243,10 @@ test('P6 DirectAgentRuntime persists verdictJson and evidenceCount and HTTP cont
     assert.equal(controlPlane.scheduler.timer, null, 'Deleting last enabled schedule must clear timer');
   } finally {
     controlPlane.close();
-    direct.close();
+    await direct.close();
     await app.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });

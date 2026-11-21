@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { rmDirSafe } from './fixtures.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { DatabaseSync } from 'node:sqlite';
@@ -118,8 +119,8 @@ test('Fix B1-B3: fail -> repair -> still fail MUST fail across DB, REST, and SSE
     await direct.close();
     await app.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -192,8 +193,8 @@ test('Fix B3: fail -> repair -> pass re-verifies after repair and completes clea
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -260,8 +261,8 @@ test('Fix B5-B6: block_reconciliation parks turn in reconciling state (never com
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -381,8 +382,8 @@ test('Fix B4 & B7: Final step still runs verification (pass completes, fail fail
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -471,8 +472,8 @@ test('Fix B8 & B12: Plain-text chat succeeds without tools and feedback never fa
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -541,8 +542,8 @@ test('Fix B10-B11: Pre-model-resolution error, non-retryable error, and modelFee
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -701,8 +702,8 @@ test('Fix B6, B9, B13: Child verification fail, Swarm verify fail, Swarm budget 
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -790,7 +791,7 @@ test('Fix B4 & Schema v6->v7: Resumed execution still runs final verification an
   } finally {
     await direct.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });

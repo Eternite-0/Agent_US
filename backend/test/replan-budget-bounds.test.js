@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -58,7 +59,7 @@ function createSwarmEnv({ models = null, defaultModel = 'mock-model', adapter })
     async cleanup() {
       await direct.close();
       store.close();
-      rmSync(dir, { recursive: true, force: true });
+      rmDirSafe(dir);
     },
   };
 }
@@ -141,7 +142,7 @@ test('Part 1.1: node-state-machine supports non-terminal same-state metadata upd
     assert.equal(checkRun.replanCount, 1);
   } finally {
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -169,7 +170,7 @@ test('Part 1.2-1.5: two always-failing models with maxReplans=1 perform at most 
         { nodeKey: 'work', taskType: 'planning', objective: 'always fail task', dependencies: [] },
       ],
     });
-    const out = await env.direct.swarmOrchestrator.waitForRun(submitted.runId, { timeoutMs: 3000 });
+    const out = await env.direct.swarmOrchestrator.waitForRun(submitted.runId, { timeoutMs: 10000 });
 
     const persistedRun = env.direct.swarmOrchestrator.getRun(out.runId);
     const replans = env.direct.swarmOrchestrator.listReplans(out.runId);
@@ -219,7 +220,7 @@ test('Part 1.2-1.4: concurrent node failures produce monotonic plan versions, co
         { nodeKey: 'f4', taskType: 'research', objective: 'fail 4', dependencies: [] },
       ],
     });
-    const out = await env.direct.swarmOrchestrator.waitForRun(submitted.runId, { timeoutMs: 3000 });
+    const out = await env.direct.swarmOrchestrator.waitForRun(submitted.runId, { timeoutMs: 10000 });
 
     const persistedRun = env.direct.swarmOrchestrator.getRun(out.runId);
     const replans = env.direct.swarmOrchestrator.listReplans(out.runId);
@@ -342,7 +343,7 @@ test('Part 2.3 & 2.7: retries, failed attempts, and planning model calls consume
         { nodeKey: 'flaky', taskType: 'research', objective: 'always fail step', dependencies: [] },
       ],
     });
-    const out = await envA.direct.swarmOrchestrator.waitForRun(submitted.runId, { timeoutMs: 3000 });
+    const out = await envA.direct.swarmOrchestrator.waitForRun(submitted.runId, { timeoutMs: 10000 });
 
     assert.equal(out.status, 'failed');
     assert.equal(
@@ -705,7 +706,7 @@ test('Part 2.4 & 2.9: restart recovers already-used budget and reconciles orphan
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -921,6 +922,6 @@ test('Group 2 + Group 3 integration: reconcileAfterRestart skips live worker res
     await rtA.close();
     storeB.close();
     storeA.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

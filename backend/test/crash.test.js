@@ -8,11 +8,11 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { model } from './fixtures.js';
+import { model, rmDirSafe } from './fixtures.js';
 
 test(
   'CLI process killed during planning recovers the same task from disk',
-  { timeout: 65000 },
+  { timeout: 55000 },
   async (t) => {
     const root = await mkdtemp(join(tmpdir(), 'agent-restart-'));
     const file = join(root, 'config.json');
@@ -66,9 +66,34 @@ test(
     });
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
-    t.after(() => {
+    const spawned = [];
+    const terminateChild = async ({ child, exit, lines }) => {
+      try {
+        lines?.close();
+      } catch {}
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill('SIGKILL');
+        } catch {}
+        let timer;
+        await Promise.race([
+          exit.catch(() => {}),
+          new Promise((r) => {
+            timer = setTimeout(r, 3000);
+            timer.unref?.();
+          }),
+        ]).finally(() => {
+          clearTimeout(timer);
+        });
+      }
+    };
+    t.after(async () => {
+      for (const proc of spawned) {
+        await terminateChild(proc);
+      }
       server.closeAllConnections();
-      server.close();
+      await new Promise((r) => server.close(r));
+      rmDirSafe(root);
     });
     await writeFile(
       file,
@@ -97,18 +122,16 @@ test(
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       const exit = once(child, 'exit');
-      t.after(async () => {
-        if (child.exitCode === null && child.signalCode === null) child.kill();
-        await exit;
-      });
       const lines = createInterface({ input: child.stdout });
+      const proc = { child, exit, lines };
+      spawned.push(proc);
       const [base] = await Promise.race([
         once(lines, 'line'),
         exit.then(() => {
           throw Error('server failed startup');
         }),
       ]);
-      return { base, child, exit };
+      return { base, child, exit, lines };
     }
     const api = async (base, path, body) => {
       const res = await fetch(base + '/api/v1/' + path, {
@@ -122,28 +145,34 @@ test(
       assert.equal(res.status, 200);
       return res.json();
     };
-    const a = await launch();
-    const p = await api(a.base, 'projects', { name: 'restart' });
-    const task = await api(a.base, 'tasks', {
-      projectId: p.id,
-      input: 'answer',
-      idempotencyKey: 'recover',
-    });
-    await firstRequest;
-    a.child.kill('SIGKILL');
-    await a.exit;
-    hang = false;
-    const b = await launch();
-    let status;
-    for (let i = 0; i < 160; i++) {
-      status = (await api(b.base, 'tasks/' + task.id)).status;
-      if (['failed', 'completed'].includes(status)) break;
-      await delay(200);
+    try {
+      const a = await launch();
+      const p = await api(a.base, 'projects', { name: 'restart' });
+      const task = await api(a.base, 'tasks', {
+        projectId: p.id,
+        input: 'answer',
+        idempotencyKey: 'recover',
+      });
+      await firstRequest;
+      a.child.kill('SIGKILL');
+      await a.exit;
+      hang = false;
+      const b = await launch();
+      let status;
+      for (let i = 0; i < 160; i++) {
+        status = (await api(b.base, 'tasks/' + task.id)).status;
+        if (['failed', 'completed'].includes(status)) break;
+        await delay(200);
+      }
+      assert.equal(status, 'completed');
+      const workers = await api(b.base, 'workers?taskId=' + task.id);
+      assert.ok(workers.some((w) => w.status === 'interrupted'));
+      assert.ok(workers.some((w) => w.attempt === 2 && w.role === 'Planner'));
+      assert.equal((await api(b.base, 'artifacts?taskId=' + task.id)).length, 1);
+    } finally {
+      for (const proc of spawned) {
+        await terminateChild(proc);
+      }
     }
-    assert.equal(status, 'completed');
-    const workers = await api(b.base, 'workers?taskId=' + task.id);
-    assert.ok(workers.some((w) => w.status === 'interrupted'));
-    assert.ok(workers.some((w) => w.attempt === 2 && w.role === 'Planner'));
-    assert.equal((await api(b.base, 'artifacts?taskId=' + task.id)).length, 1);
   },
 );

@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { createWorkspaceTools } from '../src/workspace-tools.js';
 import {
@@ -130,8 +131,8 @@ test('P3 Sandbox & Policy: Env sanitization, symlink escape guard, capability ma
       );
     }
   } finally {
-    rmSync(root, { recursive: true, force: true });
-    rmSync(outside, { recursive: true, force: true });
+    rmDirSafe(root);
+    rmDirSafe(outside);
   }
 });
 
@@ -228,7 +229,7 @@ test('P3 ToolDispatcher: Zod 2-strike auto-recovery, outward MCP human gate, per
     assert.ok(receipts.some((r) => r.toolName === 'read_blob' && r.status === 'finished'));
   } finally {
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });

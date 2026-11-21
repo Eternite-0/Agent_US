@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -308,7 +309,7 @@ test('Acceptance Scenario 1: Real isolated worktree artifact delivery, review ve
   } finally {
     await runtime?.close?.();
     store?.close?.();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -543,7 +544,7 @@ setTimeout(() => { clearInterval(keep); process.exit(1); }, 30000);
     killIfAlive(child);
     await runtime?.close?.();
     store?.close?.();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -746,7 +747,7 @@ setTimeout(() => { clearInterval(keep); process.exit(1); }, 25000);
     killIfAlive(child);
     await runtime?.close?.();
     store?.close?.();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 }
 
@@ -922,6 +923,6 @@ test('Acceptance Scenario 4: Queued scheduler mid-run restart convergence, perma
     scheduler?.stop?.();
     await runtime?.close?.();
     store?.close?.();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

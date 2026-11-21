@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -160,7 +161,7 @@ test('Phase C.2: durable ScheduledTaskRunner enforces misfirePolicy, idempotency
     await direct.close();
     await app.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -205,7 +206,7 @@ test('Phase C.3: ShutdownCoordinator orders stages, isolates timeouts, and is id
     assert.equal(c1.ok, true);
     assert.equal(svc.store.db.isOpen, false);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -280,6 +281,6 @@ test('Phase C.4: ModelFeedbackTracker + AdaptiveModelRouter shift empirical sele
     assert.equal(warm.explanation.candidates.length, 2);
   } finally {
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

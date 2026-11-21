@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { Engine } from '../src/engine.js';
@@ -282,12 +283,12 @@ test('Single-process gateway reverse-proxies OpenAI <-> Anthropic (streaming & J
   } finally {
     if (prevCopilotUrl === undefined) delete process.env.GITHUB_COPILOT_TOKEN_URL;
     else process.env.GITHUB_COPILOT_TOKEN_URL = prevCopilotUrl;
-    direct.close();
+    await direct.close();
     await app.close();
     store.close();
     await anthUpstream.close();
     await oaiUpstream.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -325,6 +326,6 @@ test('Zero idle polling: Engine, Providers, and CheckinService arm zero backgrou
     await engine.stop();
     await providers.stop();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

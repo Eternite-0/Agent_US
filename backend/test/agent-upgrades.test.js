@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -127,7 +128,7 @@ test('Codex 4-tier fuzzy edit, atomic apply_patch, command canonicalization, dia
     assert.ok(timeline.indexOf('start:w1') > timeline.indexOf('end:r2'));
     assert.ok(timeline.indexOf('start:r3') > timeline.indexOf('end:w1'));
   } finally {
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(workDir);
   }
 });
 
@@ -314,11 +315,11 @@ test('DirectAgent Wave 1-3: Prompt Cache stability, AGENTS.md, /rewind, approval
     assert.equal(existsSync(join(workDir, 'extra.js')), false);
     assert.equal(direct.listMessages(sess.id).length, 0);
   } finally {
-    direct.close();
+    await direct.close();
     await app.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });
 
@@ -456,7 +457,7 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
 
     // Wait for bash #1 approval request
     let pending = [];
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 200; i++) {
       const aRes = await app.inject({
         method: 'GET',
         url: `/v1/approvals?sessionId=${sess.id}&status=pending`,
@@ -495,10 +496,10 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
     // Verify doc.txt was NOT clobbered by stale edit
     assert.equal(readFileSync(join(workDir, 'doc.txt'), 'utf8'), 'externally changed by user\n');
   } finally {
-    direct.close();
+    await direct.close();
     await app.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });

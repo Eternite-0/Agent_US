@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store, id as uuid } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -47,11 +49,7 @@ function makeSimpleAdapter(delayMs = 20) {
 }
 
 function cleanupDir(dir) {
-  try {
-    rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
-  } catch {
-    // ignore transient Windows handle cleanup
-  }
+  rmDirSafe(dir);
 }
 
 test('Part 1.1 & 1.2: atomic occurrence+job creation and queued/jobId=null repair on retry and startup recovery', async () => {
@@ -1000,7 +998,7 @@ test('Part 3.1-3.6: actual frontend schedule payload builder & SDK match real ba
   const payloadPath = resolve(import.meta.dirname, '../../frontend/src/utils/schedulePayload.ts');
   let mod;
   try {
-    mod = await import(`file://${payloadPath.replace(/\\/g, '/')}`);
+    mod = await import(pathToFileURL(payloadPath).href);
   } catch (err) {
     assert.fail(
       `Expected frontend payload builder module at frontend/src/utils/schedulePayload.ts to exist and export buildCreateSchedulePayload/buildUpdateSchedulePayload/hydrateScheduleItem/getDefaultTimezone: ${err.message}`,

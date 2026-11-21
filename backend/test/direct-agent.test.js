@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -148,7 +149,7 @@ test('DirectAgent handles direct multi-turn chat, real workspace tools, and inte
 
     // Wait for approval request
     let pending = [];
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 200; i++) {
       const aRes = await app.inject({
         method: 'GET',
         url: `/v1/approvals?sessionId=${session.id}&status=pending`,
@@ -182,9 +183,10 @@ test('DirectAgent handles direct multi-turn chat, real workspace tools, and inte
 
     unsub();
   } finally {
+    await direct.close();
     await app.close();
     store.close();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
   }
 });

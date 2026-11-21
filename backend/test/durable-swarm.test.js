@@ -7,12 +7,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { rmDirSafe } from './fixtures.js';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
@@ -91,7 +91,7 @@ test('Durable Swarm: multi-worker contention & expired lease fencing protect job
     assert.equal(done.status, 'done');
   } finally {
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -285,7 +285,7 @@ setTimeout(() => { clearInterval(keep); process.exit(1); }, 25000);
       child.kill('SIGKILL');
       await new Promise((res) => child.once('exit', res));
     }
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -370,7 +370,7 @@ test('Durable Swarm: parallel isolated git worktrees write disjoint files withou
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -414,7 +414,7 @@ test('Durable Swarm: parent cancellation propagates PARENT_CANCELLED and stops d
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -522,7 +522,7 @@ test('Durable Swarm: unknown_outcome parks in reconciling and resumes cleanly on
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -622,7 +622,7 @@ test('Durable Swarm: DynamicReplanner handles switch_model & split_subgraph and 
     } finally {
       await d2.close();
       s2.close();
-      rmSync(store2Dir, { recursive: true, force: true });
+      rmDirSafe(store2Dir);
     }
 
     // Notifications persist across DirectAgentRuntime reboot
@@ -640,6 +640,6 @@ test('Durable Swarm: DynamicReplanner handles switch_model & split_subgraph and 
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });

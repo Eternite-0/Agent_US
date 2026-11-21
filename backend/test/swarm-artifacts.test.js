@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { rmDirSafe, withTimeout } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
@@ -195,7 +196,7 @@ test('Fix C1/C2/C4/C8: two isolated worktree nodes persist verifiable artifacts 
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -337,7 +338,7 @@ test('Fix C6: successor nodes read real predecessor artifact files (both worktre
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -429,7 +430,7 @@ test('Fix C3/C7: artifacts capture tracked edit, untracked add, deletion, rename
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -507,7 +508,7 @@ test('Fix C5/C8: artifact persistence failure prevents node/turn completed statu
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -580,7 +581,7 @@ test('Fix C8/C9: interrupt after write rehydrates preserved worktree on recovery
       ],
     });
 
-    await reachedAfterWrite;
+    await withTimeout(reachedAfterWrite, 20000, 'swarm-artifacts reachedAfterWrite barrier');
     await direct.close();
     releaseHang?.();
     store.close();
@@ -692,7 +693,7 @@ test('Fix C8/C9: interrupt after write rehydrates preserved worktree on recovery
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -797,7 +798,7 @@ test('Fix C7: guarded apply-to-parent honors permission policy and detects confl
     await app.close();
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
 
@@ -898,6 +899,6 @@ test('Fix C10: stale attempt/fence cannot overwrite newer attempt artifact or de
   } finally {
     await direct.close();
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmDirSafe(dir);
   }
 });
