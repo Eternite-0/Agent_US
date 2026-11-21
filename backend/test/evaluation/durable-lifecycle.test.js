@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, rm } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { access, mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import { EvaluationRunner } from '../../src/evaluation/runner.js';
 import { EvaluationService } from '../../src/evaluation/service.js';
@@ -111,6 +115,162 @@ test('evaluation service persists the durable task lifecycle for a completed run
     evaluation_judgements: 1,
     evaluation_budgets: 1,
   });
+});
+
+test('evaluation worker recovers a crashed run in a new Node process without reusing an attempt', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-us-eval-crash-'));
+  const dbPath = join(root, 'engine.sqlite');
+  const store = new Store(dbPath);
+  const task = BENCHMARK_DATASET[0];
+  const service = new EvaluationService({
+    store,
+    runtimeFactory: async ({ task: current }) => ({ output: current.expected.output }),
+    jobQueue: { enqueue: () => ({ id: 'persisted-evaluation-job' }) },
+    timeoutMs: 1_000,
+  });
+  const created = service.start({ taskIds: [task.id], maxAttempts: 2, concurrency: 1 });
+  const durableTaskId = `${created.id}:${task.id}`;
+  const now = Date.now();
+  const runRow = store.get('evaluation_runs', created.id);
+  store.update('evaluation_runs', runRow, { status: 'running', startedAt: now, options: { model: null, concurrency: 1, timeoutMs: 1_000, maxAttempts: 2 } });
+  store.db.prepare("UPDATE evaluation_tasks SET status='running', attempts=1, startedAt=?, updatedAt=? WHERE id=?")
+    .run(now, now, durableTaskId);
+  store.db.prepare(`INSERT INTO evaluation_attempts
+    (id,evaluationTaskId,attempt,status,workspaceRoot,startedAt)
+    VALUES(?,?,1,'running',NULL,?)`).run(`${durableTaskId}:attempt:1`, durableTaskId, now);
+  store.db.prepare(`INSERT OR REPLACE INTO evaluation_checkpoints
+    (id,evaluationTaskId,attempt,phase,stateJson,createdAt)
+    VALUES(?,?,?,?,?,?)`).run(`${durableTaskId}:checkpoint:1`, durableTaskId, 1, 'running', '{}', now);
+  store.close();
+
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import { Store } from ${JSON.stringify(new URL('../../src/store.js', import.meta.url).href)};
+    import { EvaluationService } from ${JSON.stringify(new URL('../../src/evaluation/service.js', import.meta.url).href)};
+    const store = new Store(process.argv[1]);
+    const service = new EvaluationService({ store, runtimeFactory: async ({ task }) => ({ output: task.expected.output }), timeoutMs: 1000 });
+    let handler;
+    service.registerOnWorker({ registerHandler(kind, callback) { if (kind === 'evaluation_run') handler = callback; }, wake() {} });
+    await handler({ taskId: process.argv[2], payload: { runId: process.argv[2] } });
+    await service.close({ timeoutMs: 1000 });
+    store.close();
+  `, dbPath, created.id], { cwd: process.cwd(), encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  try {
+    assert.equal(child.status, 0, 'recovery worker process must exit successfully');
+    const recoveredStore = new Store(dbPath);
+    try {
+      const recovered = recoveredStore.get('evaluation_runs', created.id);
+      assert.equal(recovered.status, 'completed');
+      assert.equal(recovered.results.length, 1);
+      assert.equal(recovered.results[0].status, 'passed');
+      assert.equal(recoveredStore.db.prepare('SELECT MAX(attempt) AS maxAttempt FROM evaluation_attempts WHERE evaluationTaskId=?').get(durableTaskId).maxAttempt, 2);
+    } finally {
+      recoveredStore.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+  }
+});
+
+test('evaluation recovery preserves a passed task and resumes only the interrupted task within its attempt cap', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-us-eval-multi-recovery-'));
+  const dbPath = join(root, 'engine.sqlite');
+  const invocationPath = join(root, 'invocations.log');
+  const store = new Store(dbPath);
+  const [passedTask, interruptedTask] = BENCHMARK_DATASET;
+  const service = new EvaluationService({
+    store,
+    runtimeFactory: async ({ task: current }) => ({ output: current.expected.output }),
+    jobQueue: { enqueue: () => ({ id: 'persisted-evaluation-job' }) },
+    timeoutMs: 1_000,
+  });
+  const created = service.start({ taskIds: [passedTask.id, interruptedTask.id], maxAttempts: 2, concurrency: 1 });
+  const passedDurableId = `${created.id}:${passedTask.id}`;
+  const interruptedDurableId = `${created.id}:${interruptedTask.id}`;
+  const now = Date.now();
+  const passedResult = {
+    taskId: passedTask.id,
+    status: 'passed',
+    passed: true,
+    attempts: 1,
+    durationMs: 7,
+    output: { output: passedTask.expected.output, sessionId: null, turnId: null, artifacts: [], checkpoint: null },
+    judge: { passed: true, deterministic: true, reason: 'seeded_durable_result' },
+  };
+  const runRow = store.get('evaluation_runs', created.id);
+  store.update('evaluation_runs', runRow, {
+    status: 'running',
+    startedAt: now,
+    options: { model: null, concurrency: 1, timeoutMs: 1_000, maxAttempts: 2 },
+    results: [],
+  });
+  store.db.prepare(`UPDATE evaluation_tasks
+    SET status='passed', attempts=1, resultJson=?, finishedAt=?, updatedAt=? WHERE id=?`)
+    .run(JSON.stringify(passedResult), now, now, passedDurableId);
+  store.db.prepare(`INSERT INTO evaluation_attempts
+    (id,evaluationTaskId,attempt,status,workspaceRoot,startedAt,finishedAt,resultJson)
+    VALUES(?,?,1,'passed',NULL,?,?,?)`)
+    .run(`${passedDurableId}:attempt:1`, passedDurableId, now, now, JSON.stringify(passedResult));
+  store.db.prepare(`INSERT OR REPLACE INTO evaluation_checkpoints
+    (id,evaluationTaskId,attempt,phase,stateJson,createdAt)
+    VALUES(?,?,?,?,?,?)`).run(`${passedDurableId}:checkpoint:1`, passedDurableId, 1, 'passed', '{}', now);
+  store.db.prepare(`UPDATE evaluation_tasks
+    SET status='running', attempts=1, startedAt=?, updatedAt=? WHERE id=?`)
+    .run(now, now, interruptedDurableId);
+  store.db.prepare(`INSERT INTO evaluation_attempts
+    (id,evaluationTaskId,attempt,status,workspaceRoot,startedAt)
+    VALUES(?,?,1,'running',NULL,?)`)
+    .run(`${interruptedDurableId}:attempt:1`, interruptedDurableId, now);
+  store.db.prepare(`INSERT OR REPLACE INTO evaluation_checkpoints
+    (id,evaluationTaskId,attempt,phase,stateJson,createdAt)
+    VALUES(?,?,?,?,?,?)`).run(`${interruptedDurableId}:checkpoint:1`, interruptedDurableId, 1, 'running', '{}', now);
+  store.close();
+
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import { appendFileSync } from 'node:fs';
+    import { Store } from ${JSON.stringify(new URL('../../src/store.js', import.meta.url).href)};
+    import { EvaluationService } from ${JSON.stringify(new URL('../../src/evaluation/service.js', import.meta.url).href)};
+    const store = new Store(process.argv[1]);
+    const invocationPath = process.argv[3];
+    const service = new EvaluationService({
+      store,
+      runtimeFactory: async ({ task }) => {
+        appendFileSync(invocationPath, task.id + '\\n');
+        return { output: task.expected.output };
+      },
+      timeoutMs: 1000,
+    });
+    let handler;
+    service.registerOnWorker({ registerHandler(kind, callback) { if (kind === 'evaluation_run') handler = callback; }, wake() {} });
+    await handler({ taskId: process.argv[2], payload: { runId: process.argv[2] } });
+    await service.close({ timeoutMs: 1000 });
+    store.close();
+  `, dbPath, created.id, invocationPath], { cwd: process.cwd(), encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  try {
+    assert.equal(child.status, 0, `recovery worker process must exit successfully: ${child.stderr}`);
+    const recoveredStore = new Store(dbPath);
+    try {
+      const recovered = recoveredStore.get('evaluation_runs', created.id);
+      assert.equal(recovered.status, 'completed');
+      assert.equal(recovered.results.length, 2);
+      assert.deepEqual(recovered.results.find((result) => result.taskId === passedTask.id), passedResult);
+      assert.equal(recovered.results.find((result) => result.taskId === interruptedTask.id)?.status, 'passed');
+      assert.equal(recovered.results.find((result) => result.taskId === interruptedTask.id)?.attempts, 2);
+
+      const invocations = readFileSync(invocationPath, 'utf8').trim().split(/\r?\n/).filter(Boolean);
+      assert.deepEqual(invocations, [interruptedTask.id], 'the passed task must not be executed again');
+      assert.equal(recoveredStore.db.prepare('SELECT COUNT(*) AS count FROM evaluation_attempts WHERE evaluationTaskId=?').get(passedDurableId).count, 1);
+      assert.equal(recoveredStore.db.prepare('SELECT COUNT(*) AS count FROM evaluation_attempts WHERE evaluationTaskId=?').get(interruptedDurableId).count, 2);
+      assert.equal(recoveredStore.db.prepare('SELECT MAX(attempt) AS maxAttempt FROM evaluation_attempts WHERE evaluationTaskId=?').get(interruptedDurableId).maxAttempt, 2);
+      assert.equal(recoveredStore.db.prepare('SELECT attempts FROM evaluation_tasks WHERE id=?').get(interruptedDurableId).attempts, 2);
+      assert.ok(recovered.score);
+      assert.equal(recovered.score.total, 2);
+      assert.equal(recovered.score.passed, 2);
+    } finally {
+      recoveredStore.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+  }
 });
 
 test('evaluation cancellation drains the runtime before deleting its temporary workspace', async () => {

@@ -160,9 +160,12 @@ export class EvaluationRunner {
 
   async #runTask(task, { signal, context, opts }) {
     const started = Date.now();
+    const attemptOffset = Math.max(0, Number(task.attemptOffset) || 0);
     const maxAttempts = Math.min(task.maxAttempts ?? opts.maxAttempts, opts.budget.maxAttempts ?? Infinity);
+    const finalAttempt = attemptOffset + maxAttempts;
     let lastError = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let localAttempt = 1; localAttempt <= maxAttempts; localAttempt++) {
+      const attempt = attemptOffset + localAttempt;
       if (signal?.aborted) return this.#cancelled(task, attempt - 1, 'cancelled');
       let workspaceRoot = null;
       let runtimeHandle = null;
@@ -208,7 +211,7 @@ export class EvaluationRunner {
           await this.recorder.record(result);
           return result;
         }
-        if (attempt >= maxAttempts) break;
+        if (localAttempt >= maxAttempts) break;
         await this.lifecycle?.onAttemptEnd?.({
           task,
           attempt,
@@ -227,8 +230,8 @@ export class EvaluationRunner {
          }
       }
     }
-    const result = { taskId: task.id, status: 'failed', passed: false, attempts: maxAttempts, durationMs: Date.now() - started, error: lastError?.message ?? 'evaluation failed' };
-    await this.lifecycle?.onAttemptEnd?.({ task, attempt: maxAttempts, workspaceRoot: null, result });
+    const result = { taskId: task.id, status: 'failed', passed: false, attempts: finalAttempt, durationMs: Date.now() - started, error: lastError?.message ?? 'evaluation failed' };
+    await this.lifecycle?.onAttemptEnd?.({ task, attempt: finalAttempt, workspaceRoot: null, result });
     await this.recorder.record(result);
     return result;
   }

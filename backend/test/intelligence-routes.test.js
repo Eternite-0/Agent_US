@@ -36,7 +36,9 @@ test('2.2 intelligence routes expose benchmark, plan, capability, communication 
 
   const benchmarks = await app.inject({ method: 'GET', url: '/v1/benchmarks' });
   assert.equal(benchmarks.statusCode, 200);
-  assert.equal(benchmarks.json().items[0].taskCount, 30);
+  const benchmarkItems = benchmarks.json().items;
+  assert.equal(benchmarkItems.find((item) => item.id === 'agent-us-deterministic-core')?.taskCount, 30);
+  assert.equal(benchmarkItems.find((item) => item.id === 'agent-us-real-engineering')?.taskCount, 10);
 
   const plan = await app.inject({
     method: 'POST', url: '/v1/plans/validate',

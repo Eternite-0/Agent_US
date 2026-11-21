@@ -27,6 +27,18 @@ function setup(options = {}) {
   return { store, service };
 }
 
+test('evaluation service exposes separate deterministic and real-engineering benchmark versions', () => {
+  const { store, service } = setup();
+  try {
+    const benchmarks = service.listBenchmarks();
+    assert.equal(benchmarks.find((item) => item.id === 'agent-us-deterministic-core')?.taskCount, 30);
+    assert.equal(benchmarks.find((item) => item.id === 'agent-us-real-engineering')?.taskCount, 10);
+    assert.throws(() => service.start({ benchmarkId: 'agent-us-real-engineering', taskIds: ['code-generation-repair-01'] }), /belong to the selected benchmark/);
+  } finally {
+    store.close();
+  }
+});
+
 test('evaluation service falls back to direct execution if durable enqueue is unavailable', async (t) => {
   const jobQueue = { enqueue: () => null };
   const { store, service } = setup({ jobQueue });

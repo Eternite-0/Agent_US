@@ -3,15 +3,20 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { EvaluationRunner } from './runner.js';
 import { EvaluationRecorder } from './recorder.js';
 import { EvaluationRegistry } from './registry.js';
-import { createBenchmarkDataset } from './dataset.js';
+import { createBenchmarkDataset, createRealEngineeringDataset } from './dataset.js';
 import { compareRegression } from './regression.js';
 import { TRAFFIC_SOURCES, withTraceContext } from '../observability/trace.js';
 import { redactSecrets } from '../envelope.js';
+import { scoreResults } from './scoring.js';
 
 export const BENCHMARK_ID = 'agent-us-deterministic-core';
 export const BENCHMARK_VERSION = '1.0.0';
 export const DATASET_VERSION = '1.0.0';
+export const REAL_ENGINEERING_BENCHMARK_ID = 'agent-us-real-engineering';
+export const REAL_ENGINEERING_BENCHMARK_VERSION = '1.0.0';
+export const REAL_ENGINEERING_DATASET_VERSION = '1.0.0';
 const TERMINAL_TURN_STATES = new Set(['completed', 'failed', 'cancelled']);
+const TERMINAL_EVALUATION_STATUSES = new Set(['passed', 'failed', 'cancelled', 'timeout']);
 
 function plainRun(record) {
   return structuredClone(record);
@@ -28,6 +33,25 @@ function safeJson(value, fallback = null) {
   } catch {
     return JSON.stringify(fallback);
   }
+}
+
+function parseJson(value, fallback = null) {
+  if (value === null || value === undefined || value === '') return fallback;
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return parsed && typeof parsed === 'object' ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function positiveAttemptLimit(value, fallback = 1) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function terminalEvaluationStatus(status) {
+  return TERMINAL_EVALUATION_STATUSES.has(String(status));
 }
 
 function durableTaskId(runId, taskId) {
@@ -77,7 +101,10 @@ export class EvaluationService {
     }
     this.store = store;
     this.directAgent = directAgent ?? null;
-    this.registry = new EvaluationRegistry(createBenchmarkDataset());
+    this.registry = new EvaluationRegistry([
+      ...createBenchmarkDataset(),
+      ...createRealEngineeringDataset(),
+    ]);
     this.runtimeFactory = runtimeFactory;
     this.jobQueue = jobQueue;
     this.memory = memory;
@@ -94,12 +121,81 @@ export class EvaluationService {
       const controller = this.#controllers.get(runId) ?? new AbortController();
       this.#controllers.set(runId, controller);
       const durableTasks = this.#listDurableTasks(runId);
-      const completedTaskIds = new Set(durableTasks.filter((task) => task.status === 'passed').map((task) => task.taskId));
-      const tasks = (run.taskIds ?? [])
-        .filter((id) => !completedTaskIds.has(String(id)))
-        .map((id) => this.registry.require(String(id)));
+      const durableByTask = new Map(durableTasks.map((task) => [String(task.taskId), task]));
+      const taskPlans = (run.taskIds ?? []).map((id) => {
+        const taskId = String(id);
+        const durable = durableByTask.get(taskId);
+        const evaluationTaskId = durable?.id ?? durableTaskId(runId, taskId);
+        const attemptRow = this.store.db.prepare(`
+          SELECT MAX(attempt) AS maxAttempt
+          FROM evaluation_attempts
+          WHERE evaluationTaskId=?
+        `).get(evaluationTaskId);
+        const existingAttempts = Math.max(
+          Number(durable?.attempts ?? 0),
+          Number(attemptRow?.maxAttempt ?? 0),
+        );
+        const maxAttempts = positiveAttemptLimit(
+          durable?.maxAttempts,
+          positiveAttemptLimit(run.options?.maxAttempts, 1),
+        );
+        const storedResult = terminalEvaluationStatus(durable?.status)
+          ? parseJson(durable?.resultJson)
+          : null;
+        const task = this.registry.require(taskId);
+
+        // A passed durable task is authoritative. It is deliberately excluded
+        // from the recovery queue, even when the process died before the run
+        // row was updated with its result.
+        if (durable?.status === 'passed') {
+          return { taskId, durable, storedResult, task, runnable: false };
+        }
+
+        // Timeout and cancellation are terminal task outcomes in the runner;
+        // they must not be silently retried by a worker restart. Ordinary
+        // failures may still have remaining attempts.
+        if (durable?.status === 'timeout' || durable?.status === 'cancelled') {
+          return { taskId, durable, storedResult, task, runnable: false };
+        }
+
+        const remainingAttempts = Math.max(0, maxAttempts - existingAttempts);
+        if (remainingAttempts === 0) {
+          return { taskId, durable, storedResult, task, runnable: false, exhausted: true };
+        }
+        return {
+          taskId,
+          durable,
+          storedResult,
+          task: {
+            ...task,
+            // EvaluationRunner treats maxAttempts as the number of attempts
+            // available in this execution. The offset keeps attempt IDs
+            // monotonic while the remaining count enforces the durable cap.
+            maxAttempts: remainingAttempts,
+            attemptOffset: existingAttempts,
+          },
+          runnable: true,
+        };
+      });
+      const tasks = taskPlans.filter((plan) => plan.runnable).map((plan) => plan.task);
+      const recoveredResults = taskPlans
+        .filter((plan) => plan.storedResult)
+        .map((plan) => plan.storedResult);
+      if (recoveredResults.length) {
+        const merged = this.#mergeResults(runId, recoveredResults);
+        this.#update(runId, { results: merged, score: scoreResults(merged) });
+      }
       if (!tasks.length) {
-        this.#update(runId, { status: 'completed', finishedAt: Date.now(), error: null });
+        const latest = this.getRun(runId);
+        const results = this.#mergeResults(runId, latest?.results ?? []);
+        const complete = (run.taskIds ?? []).every((id) => results.some((result) => String(result.taskId) === String(id)));
+        this.#update(runId, {
+          status: complete ? 'completed' : 'failed',
+          finishedAt: Date.now(),
+          score: scoreResults(results),
+          results,
+          error: complete ? null : 'evaluation recovery has no durable result for an exhausted task',
+        });
         return { skipped: true, completed: true };
       }
       const execution = this.execute(runId, tasks, run.options ?? {}, controller);
@@ -111,17 +207,30 @@ export class EvaluationService {
   }
 
   listBenchmarks() {
-    const tasks = this.registry.list();
-    return [{
-      id: BENCHMARK_ID,
-      title: 'Agent_US Deterministic Core Benchmark',
-      version: BENCHMARK_VERSION,
-      datasetVersion: DATASET_VERSION,
+    const benchmarks = [
+      {
+        id: BENCHMARK_ID,
+        title: 'Agent_US Deterministic Core Benchmark',
+        version: BENCHMARK_VERSION,
+        datasetVersion: DATASET_VERSION,
+        tasks: createBenchmarkDataset(),
+        description: 'Local deterministic smoke tasks. No network snapshots are used.',
+      },
+      {
+        id: REAL_ENGINEERING_BENCHMARK_ID,
+        title: 'Agent_US Real Software Engineering Benchmark',
+        version: REAL_ENGINEERING_BENCHMARK_VERSION,
+        datasetVersion: REAL_ENGINEERING_DATASET_VERSION,
+        tasks: createRealEngineeringDataset(),
+        description: 'Isolated multi-file engineering fixtures with real file edits, tests, Git diff evidence, and deterministic independent verification.',
+      },
+    ];
+    return benchmarks.map(({ tasks, ...benchmark }) => ({
+      ...benchmark,
       taskCount: tasks.length,
       categories: [...new Set(tasks.map((task) => task.category))],
-      description: 'Local, deterministic benchmark tasks. No network snapshots are used.',
       tasks: tasks.map(({ id, title, category, difficulty, tags }) => ({ id, title, category, difficulty, tags })),
-    }];
+    }));
   }
 
   listRuns({ benchmarkId = null, limit = 50 } = {}) {
@@ -136,7 +245,8 @@ export class EvaluationService {
   }
 
   start({ benchmarkId = BENCHMARK_ID, taskIds = null, model = null, projectId = null, concurrency = this.maxConcurrency, timeoutMs = this.timeoutMs, maxAttempts = 1 } = {}) {
-    if (benchmarkId !== BENCHMARK_ID) {
+    const benchmark = this.listBenchmarks().find((item) => item.id === benchmarkId);
+    if (!benchmark) {
       const error = new Error('Unknown benchmark');
       error.code = 'E_BENCHMARK_NOT_FOUND';
       error.status = 404;
@@ -154,14 +264,22 @@ export class EvaluationService {
       error.status = 400;
       throw error;
     }
-    const tasks = taskIds ? taskIds.map((id) => this.registry.require(String(id))) : this.registry.list();
+    const benchmarkTaskIds = new Set(benchmark.tasks.map((task) => task.id));
+    const selectedTaskIds = taskIds ?? [...benchmarkTaskIds];
+    if (selectedTaskIds.some((id) => !benchmarkTaskIds.has(String(id)))) {
+      const error = new Error('taskIds must belong to the selected benchmark');
+      error.code = 'E_EVALUATION_TASK_NOT_IN_BENCHMARK';
+      error.status = 400;
+      throw error;
+    }
+    const tasks = selectedTaskIds.map((id) => this.registry.require(String(id)));
     const runId = randomUUID();
     const now = Date.now();
     const run = this.store.add('evaluation_runs', {
       id: runId,
       benchmarkId,
-      benchmarkVersion: BENCHMARK_VERSION,
-      datasetVersion: DATASET_VERSION,
+      benchmarkVersion: benchmark.version,
+      datasetVersion: benchmark.datasetVersion,
       status: 'queued',
       model: model ? String(model).slice(0, 200) : null,
       projectId: String(projectId ?? benchmarkId).slice(0, 500),
@@ -247,26 +365,31 @@ export class EvaluationService {
         }),
       });
       const report = await runner.run({ tasks, signal: controller.signal, context: { model: options.model, runId } });
+      const previousResults = Array.isArray(run.results) ? run.results : [];
+      const mergedByTask = new Map(previousResults.map((result) => [String(result.taskId), result]));
+      for (const result of report.results) mergedByTask.set(String(result.taskId), result);
+      const mergedResults = [...mergedByTask.values()];
+      const mergedReport = { ...report, results: mergedResults, score: scoreResults(mergedResults) };
       const terminalStatus = controller.signal.aborted
         ? 'cancelled'
-        : report.results.some((result) => result.status === 'timeout') && report.results.every((result) => result.status === 'timeout' || result.status === 'cancelled')
+        : report.results.some((result) => result.status === 'timeout') && mergedReport.results.every((result) => result.status === 'timeout' || result.status === 'cancelled')
           ? 'timeout'
           : 'completed';
       this.#update(runId, {
         status: terminalStatus,
         finishedAt: Date.now(),
-        score: report.score,
-        results: report.results,
+        score: mergedReport.score,
+        results: mergedReport.results,
         error: null,
       });
       const finalRun = this.getRun(runId);
-      this.#recordTrustedOutcomes(finalRun, report);
-      if (finalRun.model && finalRun.status === 'completed' && report.score?.total > 0 && report.score.passed === report.score.total) {
+      this.#recordTrustedOutcomes(finalRun, mergedReport);
+      if (finalRun.model && finalRun.status === 'completed' && mergedReport.score?.total > 0 && mergedReport.score.passed === mergedReport.score.total) {
         try {
           const declared = this.capabilityRegistry?.getDeclared?.(finalRun.model);
           this.capabilityRegistry?.recordMeasuredFromEvaluation?.(
-            { id: finalRun.model, capabilities: declared?.capabilities ?? {}, metrics: { passRate: report.score.passRate } },
-            { evaluationRunId: finalRun.id, evidenceRefs: report.results.filter((result) => result.status === 'passed').map((result) => `evaluation:${finalRun.id}:${result.taskId}`), taskIds: report.results.map((result) => result.taskId) },
+            { id: finalRun.model, capabilities: declared?.capabilities ?? {}, metrics: { passRate: mergedReport.score.passRate } },
+            { evaluationRunId: finalRun.id, evidenceRefs: mergedReport.results.filter((result) => result.status === 'passed').map((result) => `evaluation:${finalRun.id}:${result.taskId}`), taskIds: mergedReport.results.map((result) => result.taskId) },
           );
         } catch {
           // Capability updates are advisory and cannot alter the durable evaluation result.
@@ -286,6 +409,24 @@ export class EvaluationService {
   #update(id, patch) {
     const current = this.store.get('evaluation_runs', id);
     return this.store.update('evaluation_runs', current, patch);
+  }
+
+  #mergeResults(runId, incomingResults = []) {
+    const run = this.getRun(runId);
+    const mergedByTask = new Map();
+    for (const result of Array.isArray(run?.results) ? run.results : []) {
+      if (result?.taskId) mergedByTask.set(String(result.taskId), result);
+    }
+    for (const result of Array.isArray(incomingResults) ? incomingResults : []) {
+      if (result?.taskId) mergedByTask.set(String(result.taskId), result);
+    }
+    const order = Array.isArray(run?.taskIds) ? run.taskIds.map(String) : [];
+    return [
+      ...order.filter((taskId) => mergedByTask.has(taskId)).map((taskId) => mergedByTask.get(taskId)),
+      ...[...mergedByTask.entries()]
+        .filter(([taskId]) => !order.includes(taskId))
+        .map(([, result]) => result),
+    ];
   }
 
   #listDurableTasks(runId) {
@@ -329,8 +470,8 @@ export class EvaluationService {
     this.store.tx(() => {
       this.store.db.prepare(`UPDATE evaluation_tasks SET status=?, finishedAt=?, resultJson=?, errorCode=?, errorMessage=?, updatedAt=? WHERE id=?`)
         .run(status, now, safeJson(result), result.error?.code ?? null, safeError(result.error ?? result.errorMessage ?? ''), now, taskId);
-      this.store.db.prepare(`UPDATE evaluation_attempts SET status=?, finishedAt=?, resultJson=?, errorCode=?, errorMessage=? WHERE evaluationTaskId=? AND attempt=?`)
-        .run(status, now, safeJson(result), result.error?.code ?? null, safeError(result.error ?? result.errorMessage ?? ''), taskId, attempt);
+      this.store.db.prepare(`UPDATE evaluation_attempts SET status=?, finishedAt=?, resultJson=?, runtimeSessionId=?, runtimeTurnId=?, errorCode=?, errorMessage=? WHERE evaluationTaskId=? AND attempt=?`)
+        .run(status, now, safeJson(result), output?.sessionId ?? null, output?.turnId ?? null, result.error?.code ?? null, safeError(result.error ?? result.errorMessage ?? ''), taskId, attempt);
       this.store.db.prepare(`INSERT OR REPLACE INTO evaluation_checkpoints(id,evaluationTaskId,attempt,phase,stateJson,createdAt)
         VALUES(?,?,?,?,?,?)`).run(`${taskId}:checkpoint:${attempt}`, taskId, attempt, status, safeJson({ status, workspaceRoot, runtimeDrained: result.metadata?.runtimeDrained ?? null }), now);
       if (judge) this.store.db.prepare(`INSERT INTO evaluation_judgements(id,evaluationTaskId,attempt,judgeType,rubricVersion,passed,confidence,evidenceJson,rationale,createdAt)
