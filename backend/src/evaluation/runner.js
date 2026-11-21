@@ -31,6 +31,18 @@ async function invokeRuntime(runtimeFactory, args) {
   throw new TypeError('runtimeFactory must return a function, a result object, or an object with runTask/run/execute');
 }
 
+function normalizeRuntimeOutput(value) {
+  if (!value || typeof value !== 'object') return { output: value, sessionId: null, turnId: null, artifacts: [], checkpoint: null };
+  return {
+    ...value,
+    output: Object.hasOwn(value, 'output') ? value.output : value,
+    sessionId: value.sessionId ?? null,
+    turnId: value.turnId ?? null,
+    artifacts: Array.isArray(value.artifacts) ? value.artifacts : [],
+    checkpoint: value.checkpoint ?? null,
+  };
+}
+
 async function drainRuntime(runtime, { reason, timeoutMs = 5_000 } = {}) {
   if (!runtime || typeof runtime !== 'object') return { drained: true, error: null };
   const waitForStop = runtime.waitForStop ?? runtime.drain;
@@ -98,6 +110,7 @@ export class EvaluationRunner {
     budget = {},
     retryDelayMs = 0,
     drainTimeoutMs = 5_000,
+    lifecycle = null,
   } = {}) {
     validateRunnerOptions({ concurrency, timeoutMs, maxAttempts, budget });
     this.registry = registry;
@@ -106,6 +119,7 @@ export class EvaluationRunner {
     this.recorder = recorder;
     this.syntheticContextHook = syntheticContextHook;
     this.options = { concurrency, timeoutMs, maxAttempts, budget, retryDelayMs, drainTimeoutMs };
+    this.lifecycle = lifecycle;
   }
 
   async run({ ids = null, tasks = null, signal = undefined, context = {}, ...overrides } = {}) {
@@ -153,8 +167,10 @@ export class EvaluationRunner {
       let workspaceRoot = null;
       let runtimeHandle = null;
       let runtimeDrain = null;
+      let runtimeStarted = false;
       try {
         workspaceRoot = await createFixtureWorkspace(task);
+        await this.lifecycle?.onAttemptStart?.({ task, attempt, workspaceRoot, context });
         const syntheticContext = {
           isSynthetic: true,
           source: 'evaluation',
@@ -166,7 +182,7 @@ export class EvaluationRunner {
                task, attempt, workspaceRoot, signal: runtimeSignal, context, syntheticContext,
              });
              runtimeHandle = invoked.handle;
-             return invoked.output;
+              return normalizeRuntimeOutput(await invoked.output);
            },
           { timeoutMs: task.timeoutMs ?? opts.timeoutMs, signal },
         );
@@ -176,6 +192,7 @@ export class EvaluationRunner {
           attempts: attempt, durationMs: Date.now() - started, output, judge: judgment,
         };
         validateResult(result);
+        await this.lifecycle?.onAttemptEnd?.({ task, attempt, workspaceRoot, result });
         await this.recorder.record(result);
         return result;
       } catch (error) {
@@ -187,10 +204,18 @@ export class EvaluationRunner {
            });
           const status = error?.code === 'E_EVAL_TIMEOUT' || error?.name === 'TimeoutError' ? 'timeout' : 'cancelled';
             const result = { taskId: task.id, status, passed: false, attempts: attempt, durationMs: Date.now() - started, error: error.message, metadata: { runtimeDrained: runtimeDrain.drained, runtimeDrainError: runtimeDrain.error } };
+          await this.lifecycle?.onAttemptEnd?.({ task, attempt, workspaceRoot, result });
           await this.recorder.record(result);
           return result;
         }
         if (attempt >= maxAttempts) break;
+        await this.lifecycle?.onAttemptEnd?.({
+          task,
+          attempt,
+          workspaceRoot,
+          result: { taskId: task.id, status: 'failed', passed: false, attempts: attempt, durationMs: Date.now() - started, error: error?.message ?? 'evaluation attempt failed' },
+        });
+        await this.lifecycle?.onRetry?.({ task, attempt, nextAttempt: attempt + 1, workspaceRoot, error });
         if (opts.retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, opts.retryDelayMs));
        } finally {
          if (runtimeHandle && typeof runtimeHandle === 'object') {
@@ -203,6 +228,7 @@ export class EvaluationRunner {
       }
     }
     const result = { taskId: task.id, status: 'failed', passed: false, attempts: maxAttempts, durationMs: Date.now() - started, error: lastError?.message ?? 'evaluation failed' };
+    await this.lifecycle?.onAttemptEnd?.({ task, attempt: maxAttempts, workspaceRoot: null, result });
     await this.recorder.record(result);
     return result;
   }

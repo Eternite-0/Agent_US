@@ -28,7 +28,18 @@ export function createDeterministicJudge({ fallback = null } = {}) {
     if (passed) {
       return { passed: true, score: 1, deterministic: true, reason: 'exact_match', actual, expected };
     }
-    if (fallback) return fallback({ task, output, context, actual, expected });
+    if (fallback) {
+      const advisory = await fallback({ task, output, context, actual, expected });
+      return {
+        passed: false,
+        score: 0,
+        deterministic: true,
+        reason: 'deterministic_failure',
+        actual,
+        expected,
+        advisory: advisory && typeof advisory === 'object' ? advisory : { result: advisory },
+      };
+    }
     return { passed: false, score: 0, deterministic: true, reason: 'exact_mismatch', actual, expected };
   };
 }

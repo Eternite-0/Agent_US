@@ -1,5 +1,6 @@
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 
 export async function createFixtureWorkspace(task, { prefix = 'agent-us-eval-' } = {}) {
@@ -9,6 +10,13 @@ export async function createFixtureWorkspace(task, { prefix = 'agent-us-eval-' }
     const target = join(workspaceRoot, relativePath);
     await mkdir(join(target, '..'), { recursive: true });
     await writeFile(target, content, 'utf8');
+  }
+  if (task.metadata?.requiresGitDiff) {
+    execFileSync('git', ['init', '-q'], { cwd: workspaceRoot, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'evaluation@agent-us.invalid'], { cwd: workspaceRoot, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 'Agent_US Evaluation'], { cwd: workspaceRoot, stdio: 'ignore' });
+    execFileSync('git', ['add', '-A'], { cwd: workspaceRoot, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-qm', 'evaluation baseline'], { cwd: workspaceRoot, stdio: 'ignore' });
   }
   return workspaceRoot;
 }

@@ -71,6 +71,12 @@ const REQUIRED_V7_TABLES = Object.freeze([
   'budget_ledgers',
   'budget_reservations',
   'runtime_metrics_events',
+  'evaluation_tasks',
+  'evaluation_attempts',
+  'evaluation_checkpoints',
+  'evaluation_artifacts',
+  'evaluation_budgets',
+  'evaluation_judgements',
 ]);
 
 const REQUIRED_V7_INDEXES = Object.freeze([
@@ -349,6 +355,80 @@ export class Store {
         CREATE INDEX IF NOT EXISTS model_feedback_model ON model_feedback(model, createdAt);
         CREATE TABLE IF NOT EXISTS scheduled_task_runs(id TEXT PRIMARY KEY, scheduleId TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE, scheduledFor INTEGER NOT NULL, idempotencyKey TEXT NOT NULL UNIQUE, jobId TEXT, sessionId TEXT, turnId TEXT, status TEXT NOT NULL DEFAULT 'queued', error TEXT, startedAt INTEGER, finishedAt INTEGER, createdAt INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS scheduled_task_runs_sched ON scheduled_task_runs(scheduleId, createdAt);
+        CREATE TABLE IF NOT EXISTS evaluation_tasks(
+          id TEXT PRIMARY KEY,
+          runId TEXT NOT NULL,
+          taskId TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          maxAttempts INTEGER NOT NULL DEFAULT 1,
+          workspaceRoot TEXT,
+          startedAt INTEGER,
+          finishedAt INTEGER,
+          resultJson TEXT,
+          errorCode TEXT,
+          errorMessage TEXT,
+          createdAt INTEGER NOT NULL,
+          updatedAt INTEGER NOT NULL,
+          UNIQUE(runId, taskId)
+        );
+        CREATE INDEX IF NOT EXISTS evaluation_tasks_run_status ON evaluation_tasks(runId, status);
+        CREATE TABLE IF NOT EXISTS evaluation_attempts(
+          id TEXT PRIMARY KEY,
+          evaluationTaskId TEXT NOT NULL REFERENCES evaluation_tasks(id) ON DELETE CASCADE,
+          attempt INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          workspaceRoot TEXT,
+          runtimeSessionId TEXT,
+          runtimeTurnId TEXT,
+          startedAt INTEGER NOT NULL,
+          finishedAt INTEGER,
+          resultJson TEXT,
+          errorCode TEXT,
+          errorMessage TEXT,
+          UNIQUE(evaluationTaskId, attempt)
+        );
+        CREATE TABLE IF NOT EXISTS evaluation_checkpoints(
+          id TEXT PRIMARY KEY,
+          evaluationTaskId TEXT NOT NULL REFERENCES evaluation_tasks(id) ON DELETE CASCADE,
+          attempt INTEGER NOT NULL,
+          phase TEXT NOT NULL,
+          stateJson TEXT NOT NULL,
+          createdAt INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS evaluation_checkpoints_task ON evaluation_checkpoints(evaluationTaskId, createdAt);
+        CREATE TABLE IF NOT EXISTS evaluation_artifacts(
+          id TEXT PRIMARY KEY,
+          evaluationTaskId TEXT NOT NULL REFERENCES evaluation_tasks(id) ON DELETE CASCADE,
+          attempt INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          sha256 TEXT,
+          manifestJson TEXT,
+          contentJson TEXT,
+          createdAt INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS evaluation_artifacts_task ON evaluation_artifacts(evaluationTaskId, createdAt);
+        CREATE TABLE IF NOT EXISTS evaluation_budgets(
+          runId TEXT PRIMARY KEY,
+          maxTasks INTEGER,
+          maxAttempts INTEGER,
+          maxConcurrent INTEGER,
+          maxDurationMs INTEGER,
+          createdAt INTEGER NOT NULL,
+          updatedAt INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS evaluation_judgements(
+          id TEXT PRIMARY KEY,
+          evaluationTaskId TEXT NOT NULL REFERENCES evaluation_tasks(id) ON DELETE CASCADE,
+          attempt INTEGER NOT NULL,
+          judgeType TEXT NOT NULL,
+          rubricVersion TEXT,
+          passed INTEGER,
+          confidence REAL,
+          evidenceJson TEXT NOT NULL,
+          rationale TEXT,
+          createdAt INTEGER NOT NULL
+        );
       `);
       const ensureColumns = (table, colDefs) => {
         const existing = new Set(

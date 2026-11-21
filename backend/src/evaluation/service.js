@@ -21,6 +21,19 @@ function safeError(error) {
   return redactSecrets(String(error?.message ?? error ?? 'evaluation failed')).slice(0, 1000);
 }
 
+function safeJson(value, fallback = null) {
+  try {
+    const text = redactSecrets(JSON.stringify(value ?? null));
+    return text.length > 200_000 ? text.slice(0, 200_000) : text;
+  } catch {
+    return JSON.stringify(fallback);
+  }
+}
+
+function durableTaskId(runId, taskId) {
+  return `${String(runId)}:${String(taskId)}`;
+}
+
 function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
   if (!directAgent) throw new TypeError('Evaluation requires DirectAgentRuntime');
   return ({ task, workspaceRoot, signal, context }) => {
@@ -58,7 +71,7 @@ export class EvaluationService {
   #controllers = new Map();
   #activeExecutions = new Map();
 
-  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, maxConcurrency = 2, timeoutMs = 120_000 } = {}) {
+  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, maxConcurrency = 2, timeoutMs = 120_000, memory = null, capabilityRegistry = null } = {}) {
     if (!store || typeof store.add !== 'function' || typeof store.list !== 'function') {
       throw new TypeError('EvaluationService requires Store');
     }
@@ -67,6 +80,8 @@ export class EvaluationService {
     this.registry = new EvaluationRegistry(createBenchmarkDataset());
     this.runtimeFactory = runtimeFactory;
     this.jobQueue = jobQueue;
+    this.memory = memory;
+    this.capabilityRegistry = capabilityRegistry;
     this.maxConcurrency = Math.min(4, Math.max(1, Number(maxConcurrency) || 2));
     this.timeoutMs = Math.min(600_000, Math.max(1_000, Number(timeoutMs) || 120_000));
   }
@@ -78,7 +93,15 @@ export class EvaluationService {
       if (!run || ['completed', 'failed', 'cancelled', 'timeout'].includes(run.status)) return { skipped: true };
       const controller = this.#controllers.get(runId) ?? new AbortController();
       this.#controllers.set(runId, controller);
-      const tasks = (run.taskIds ?? []).map((id) => this.registry.require(String(id)));
+      const durableTasks = this.#listDurableTasks(runId);
+      const completedTaskIds = new Set(durableTasks.filter((task) => task.status === 'passed').map((task) => task.taskId));
+      const tasks = (run.taskIds ?? [])
+        .filter((id) => !completedTaskIds.has(String(id)))
+        .map((id) => this.registry.require(String(id)));
+      if (!tasks.length) {
+        this.#update(runId, { status: 'completed', finishedAt: Date.now(), error: null });
+        return { skipped: true, completed: true };
+      }
       const execution = this.execute(runId, tasks, run.options ?? {}, controller);
       this.#activeExecutions.set(runId, execution);
       void execution.then(() => {}, () => {}).finally(() => this.#activeExecutions.delete(runId));
@@ -112,7 +135,7 @@ export class EvaluationService {
     return this.store.get('evaluation_runs', String(id));
   }
 
-  start({ benchmarkId = BENCHMARK_ID, taskIds = null, model = null, concurrency = this.maxConcurrency, timeoutMs = this.timeoutMs, maxAttempts = 1 } = {}) {
+  start({ benchmarkId = BENCHMARK_ID, taskIds = null, model = null, projectId = null, concurrency = this.maxConcurrency, timeoutMs = this.timeoutMs, maxAttempts = 1 } = {}) {
     if (benchmarkId !== BENCHMARK_ID) {
       const error = new Error('Unknown benchmark');
       error.code = 'E_BENCHMARK_NOT_FOUND';
@@ -141,6 +164,7 @@ export class EvaluationService {
       datasetVersion: DATASET_VERSION,
       status: 'queued',
       model: model ? String(model).slice(0, 200) : null,
+      projectId: String(projectId ?? benchmarkId).slice(0, 500),
       agentVersion: process.env.AGENT_US_VERSION || 'unknown',
       createdAt: now,
       startedAt: null,
@@ -156,9 +180,15 @@ export class EvaluationService {
     this.#controllers.set(run.id, controller);
     const options = { model, concurrency, timeoutMs, maxAttempts };
     this.#update(run.id, { options });
+    this.#ensureDurableRun(this.getRun(run.id), tasks, options);
     if (this.jobQueue?.enqueue) {
-      const queued = this.jobQueue.enqueue({ kind: 'evaluation_run', taskId: run.id, payload: { runId: run.id }, idempotencyKey: `evaluation:${run.id}`, maxAttempts: 3 });
-      if (!queued) {
+      let queued = null;
+      try {
+        queued = this.jobQueue.enqueue({ kind: 'evaluation_run', taskId: run.id, payload: { runId: run.id }, idempotencyKey: `evaluation:${run.id}`, maxAttempts: 3 });
+      } catch (error) {
+        this.#update(run.id, { status: 'failed', finishedAt: Date.now(), error: safeError(error), errorCode: 'E_EVALUATION_ENQUEUE_FAILED' });
+      }
+      if (!queued && this.getRun(run.id).status === 'queued') {
         const execution = this.execute(run.id, tasks, options, controller);
         this.#activeExecutions.set(run.id, execution);
         void execution.then(() => {}, () => {}).finally(() => this.#activeExecutions.delete(run.id));
@@ -192,6 +222,7 @@ export class EvaluationService {
           this.#update(runId, { results: [...(latest.results ?? []), result] });
         },
       });
+      this.#ensureDurableRun(run, tasks, options);
       const runtimeFactory = this.runtimeFactory ?? createDirectRuntimeAdapter(this.directAgent, { model: options.model });
       const runner = new EvaluationRunner({
         runtimeFactory,
@@ -200,6 +231,14 @@ export class EvaluationService {
         timeoutMs: Math.min(this.timeoutMs, Math.max(1_000, Number(options.timeoutMs) || this.timeoutMs)),
         maxAttempts: Math.min(3, Math.max(1, Number(options.maxAttempts) || 1)),
         budget: { maxConcurrent: this.maxConcurrency, maxTasks: tasks.length },
+        lifecycle: {
+          onAttemptStart: async ({ task, attempt, workspaceRoot }) => {
+            this.#recordAttemptStart(runId, task, attempt, workspaceRoot);
+          },
+          onAttemptEnd: async ({ task, attempt, workspaceRoot, result }) => {
+            this.#recordAttemptEnd(runId, task, attempt, workspaceRoot, result);
+          },
+        },
         syntheticContextHook: async () => ({
           trafficSource: TRAFFIC_SOURCES.EVAL,
           isSynthetic: true,
@@ -220,6 +259,19 @@ export class EvaluationService {
         results: report.results,
         error: null,
       });
+      const finalRun = this.getRun(runId);
+      this.#recordTrustedOutcomes(finalRun, report);
+      if (finalRun.model && finalRun.status === 'completed' && report.score?.total > 0 && report.score.passed === report.score.total) {
+        try {
+          const declared = this.capabilityRegistry?.getDeclared?.(finalRun.model);
+          this.capabilityRegistry?.recordMeasuredFromEvaluation?.(
+            { id: finalRun.model, capabilities: declared?.capabilities ?? {}, metrics: { passRate: report.score.passRate } },
+            { evaluationRunId: finalRun.id, evidenceRefs: report.results.filter((result) => result.status === 'passed').map((result) => `evaluation:${finalRun.id}:${result.taskId}`), taskIds: report.results.map((result) => result.taskId) },
+          );
+        } catch {
+          // Capability updates are advisory and cannot alter the durable evaluation result.
+        }
+      }
     } catch (error) {
       this.#update(runId, {
         status: controller.signal.aborted ? 'cancelled' : 'failed',
@@ -234,6 +286,93 @@ export class EvaluationService {
   #update(id, patch) {
     const current = this.store.get('evaluation_runs', id);
     return this.store.update('evaluation_runs', current, patch);
+  }
+
+  #listDurableTasks(runId) {
+    return this.store.db.prepare('SELECT * FROM evaluation_tasks WHERE runId=? ORDER BY createdAt ASC').all(String(runId));
+  }
+
+  #ensureDurableRun(run, tasks, options) {
+    const now = Date.now();
+    this.store.tx(() => {
+      this.store.db.prepare(`INSERT OR IGNORE INTO evaluation_budgets(runId,maxTasks,maxAttempts,maxConcurrent,maxDurationMs,createdAt,updatedAt)
+        VALUES(?,?,?,?,?,?,?)`).run(run.id, tasks.length, options.maxAttempts, options.concurrency, options.timeoutMs, now, now);
+      for (const task of tasks) {
+        this.store.db.prepare(`INSERT OR IGNORE INTO evaluation_tasks
+          (id,runId,taskId,status,attempts,maxAttempts,createdAt,updatedAt)
+          VALUES(?,?,?,'queued',0,?,?,?)`).run(durableTaskId(run.id, task.id), run.id, task.id, task.maxAttempts ?? options.maxAttempts, now, now);
+      }
+    });
+  }
+
+  #recordAttemptStart(runId, task, attempt, workspaceRoot) {
+    const taskId = durableTaskId(runId, task.id);
+    const now = Date.now();
+    this.store.tx(() => {
+      this.store.db.prepare(`UPDATE evaluation_tasks SET status='running', attempts=?, workspaceRoot=?, startedAt=COALESCE(startedAt,?), updatedAt=? WHERE id=?`)
+        .run(attempt, workspaceRoot, now, now, taskId);
+      this.store.db.prepare(`INSERT OR IGNORE INTO evaluation_attempts
+        (id,evaluationTaskId,attempt,status,workspaceRoot,startedAt)
+        VALUES(?,?,?,'running',?,?)`).run(`${taskId}:attempt:${attempt}`, taskId, attempt, workspaceRoot, now);
+      this.store.db.prepare(`INSERT OR REPLACE INTO evaluation_checkpoints(id,evaluationTaskId,attempt,phase,stateJson,createdAt)
+        VALUES(?,?,?,?,?,?)`).run(`${taskId}:checkpoint:${attempt}`, taskId, attempt, 'started', JSON.stringify({ workspaceRoot }), now);
+    });
+  }
+
+  #recordAttemptEnd(runId, task, attempt, workspaceRoot, result) {
+    const taskId = durableTaskId(runId, task.id);
+    const status = String(result.status);
+    const now = Date.now();
+    const output = result.output ?? null;
+    const judge = result.judge ?? null;
+    const artifacts = Array.isArray(output?.artifacts) ? output.artifacts : [];
+    this.store.tx(() => {
+      this.store.db.prepare(`UPDATE evaluation_tasks SET status=?, finishedAt=?, resultJson=?, errorCode=?, errorMessage=?, updatedAt=? WHERE id=?`)
+        .run(status, now, safeJson(result), result.error?.code ?? null, safeError(result.error ?? result.errorMessage ?? ''), now, taskId);
+      this.store.db.prepare(`UPDATE evaluation_attempts SET status=?, finishedAt=?, resultJson=?, errorCode=?, errorMessage=? WHERE evaluationTaskId=? AND attempt=?`)
+        .run(status, now, safeJson(result), result.error?.code ?? null, safeError(result.error ?? result.errorMessage ?? ''), taskId, attempt);
+      this.store.db.prepare(`INSERT OR REPLACE INTO evaluation_checkpoints(id,evaluationTaskId,attempt,phase,stateJson,createdAt)
+        VALUES(?,?,?,?,?,?)`).run(`${taskId}:checkpoint:${attempt}`, taskId, attempt, status, safeJson({ status, workspaceRoot, runtimeDrained: result.metadata?.runtimeDrained ?? null }), now);
+      if (judge) this.store.db.prepare(`INSERT INTO evaluation_judgements(id,evaluationTaskId,attempt,judgeType,rubricVersion,passed,confidence,evidenceJson,rationale,createdAt)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(`${taskId}:judgement:${attempt}`, taskId, attempt, judge.deterministic ? 'deterministic' : 'model', judge.rubricVersion ?? null, judge.passed == null ? null : (judge.passed ? 1 : 0), judge.confidence ?? null, safeJson(judge.evidence ?? judge), String(judge.reason ?? '').slice(0, 2000), now);
+      for (let index = 0; index < artifacts.length; index += 1) {
+        const artifact = artifacts[index];
+        this.store.db.prepare(`INSERT OR REPLACE INTO evaluation_artifacts(id,evaluationTaskId,attempt,kind,sha256,manifestJson,contentJson,createdAt)
+          VALUES(?,?,?,?,?,?,?,?)`).run(`${taskId}:artifact:${attempt}:${index}`, taskId, attempt, String(artifact.kind ?? 'result'), artifact.sha256 ?? null, safeJson(artifact.manifest ?? null), safeJson(artifact.content ?? null), now);
+      }
+    });
+  }
+
+  #recordTrustedOutcomes(run, report) {
+    if (run.status !== 'completed' || !report?.score || report.score.passed !== report.score.total || !this.memory) return;
+    const verifier = this.memory.createTrustedVerifier?.();
+    for (const result of report.results ?? []) {
+      if (result.status !== 'passed' || !result.judge?.deterministic) continue;
+      let memory;
+      try {
+        memory = this.memory.remember({
+          projectId: run.projectId ?? run.benchmarkId,
+          type: 'lesson',
+          content: `Evaluation task ${result.taskId} passed deterministic verification.`,
+          source: 'evaluation',
+        }, { projectId: run.projectId ?? run.benchmarkId, source: 'evaluation' });
+      } catch {
+        continue;
+      }
+      const item = Array.isArray(memory) ? memory[0] : memory;
+      if (!item || !verifier) continue;
+      try {
+        verifier({
+          projectId: run.projectId ?? run.benchmarkId,
+          id: item.id,
+          sourceTaskId: result.taskId,
+          evaluationRunId: run.id,
+          evidence: { projectId: run.projectId ?? run.benchmarkId, sourceTaskId: result.taskId, evaluationRunId: run.id, score: report.score, evidenceRef: `evaluation:${run.id}:${result.taskId}` },
+        });
+      } catch {
+        // A failed trust grant must not change the evaluation terminal state.
+      }
+    }
   }
 
   async close({ timeoutMs = 30_000 } = {}) {

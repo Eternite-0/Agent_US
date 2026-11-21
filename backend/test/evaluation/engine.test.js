@@ -31,8 +31,10 @@ test('deterministic judge exact matches structured output before fallback', asyn
   assert.equal(judged.passed, true);
   assert.equal(judged.deterministic, true);
   const failed = await judge({ task, output: { output: { wrong: true } } });
-  assert.equal(failed.passed, true);
-  assert.equal(failed.score, 0.1);
+  assert.equal(failed.passed, false);
+  assert.equal(failed.score, 0);
+  assert.equal(failed.reason, 'deterministic_failure');
+  assert.equal(failed.advisory.passed, true);
 });
 
 test('runner injects isolated workspace and synthetic context, records a passing result', async () => {
