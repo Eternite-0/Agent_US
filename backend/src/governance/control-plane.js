@@ -1,15 +1,17 @@
 import { AuditLedgerService } from './audit.js';
 import { ScheduledTaskRunner } from './scheduler.js';
+import { MetricsCollector } from '../observability/metrics.js';
 
 /**
  * Layer 2 ControlPlane unifying Session/Task governance, Model Routing,
  * Reconciliation Approval Center, Audit Ledger, Swarm Orchestration, and Schedules.
  */
 export class ControlPlane {
-  constructor({ store, pool, directAgent }) {
+  constructor({ store, pool, directAgent, metrics = null }) {
     this.store = store;
     this.pool = pool;
     this.directAgent = directAgent;
+    this.metrics = metrics ?? directAgent?.metrics ?? (store ? new MetricsCollector({ store }) : null);
     this.auditService = new AuditLedgerService(store);
     this.scheduler = new ScheduledTaskRunner({ store, directAgent });
   }
@@ -70,6 +72,27 @@ export class ControlPlane {
         .get()?.n ?? 0;
     const models = this.modelCapabilities?.list?.() ?? [];
     const ledgerMeta = this.store.db.prepare('SELECT lastSeq, verifiedThroughSeq FROM ledger_meta WHERE id=1').get();
+    let metricsSummary = null;
+    if (this.metrics) {
+      try {
+        const m = this.metrics.getProductionMetrics({ windowHours: 24, includeSynthetic: false });
+        metricsSummary = {
+          windowHours: 24,
+          agentTaskSuccessRate: m.agentTaskSuccessRate.rate,
+          verificationPassRate: m.verificationPassRate.rate,
+          toolFailureRate: m.toolFailureRate.rate,
+          recoverySuccessRate: m.recoverySuccessRate.rate,
+          actualDuplicateExecutions: m.duplicateExecutionCount.actualDuplicateExecutions,
+          preventedDuplicates: m.duplicateExecutionCount.preventedDuplicates,
+          reconciliationTotal: m.reconciliationCount.total,
+          modelRoutingSuccessRate: m.modelRoutingSuccessRate.overallSuccessRate,
+          productionCount: m.trafficBreakdown.productionCount,
+          syntheticCount: m.trafficBreakdown.syntheticCount,
+        };
+      } catch {
+        metricsSummary = null;
+      }
+    }
 
     return {
       ok: true,
@@ -82,7 +105,18 @@ export class ControlPlane {
       modelCount: models.length,
       ledger: ledgerMeta ?? { lastSeq: 0, verifiedThroughSeq: 0 },
       lastRecovery: this.directAgent?.lastRecoveryReport ?? null,
+      metricsSummary,
     };
+  }
+
+  getProductionMetrics(opts = {}) {
+    if (!this.metrics) return null;
+    return this.metrics.getProductionMetrics(opts);
+  }
+
+  queryTraces(opts = {}) {
+    if (!this.metrics) return [];
+    return this.metrics.queryTraces(opts);
   }
 
   close() {

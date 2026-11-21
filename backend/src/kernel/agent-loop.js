@@ -149,6 +149,21 @@ export class TurnManager {
   }
 }
 
+function isShutdownAbort(signal, err) {
+  const reasons = [
+    signal?.reason,
+    signal?.reason?.message,
+    signal?.reason?.detail?.message,
+    signal?.reason?.detail?.reason,
+    err?.message,
+    err?.detail?.message,
+    err?.detail?.reason,
+    err?.cause?.message,
+    err?.cause?.detail?.message,
+  ];
+  return reasons.some((r) => r === 'shutdown' || r === 'runtime_closed');
+}
+
 /**
  * Unified Phase-Driven AgentLoop (Layer 3 Kernel).
  * Executes all Agent Profiles (default direct session, subagents, swarm nodes, legacy profiles)
@@ -188,12 +203,14 @@ export class AgentLoop {
     permissionMode = null,
     allowTools = undefined,
     denyTools = undefined,
+    getLivePolicy = null,
     getApprovedPrefixes = () => [],
     requestApproval = null,
     onAssistantMessage = null,
     onToolResult = null,
     leaseGuard = null,
     parentGuard = null,
+    deferTerminalPhase = false,
     budget = {},
     budgetLedger = null,
     budgetContext = null,
@@ -211,6 +228,7 @@ export class AgentLoop {
       initialPhase: TURN_PHASES.INIT,
       initialStep,
       leaseGuard,
+      deferTerminalPhase,
     });
     const tm = new TurnManager({
       store: this.store,
@@ -220,6 +238,24 @@ export class AgentLoop {
       turnId,
       leaseGuard,
     });
+
+    if (initialStep > 0 && this.checkpointStore && turnId) {
+      const latestCp = this.checkpointStore.loadLatest(turnId);
+      if (latestCp?.state) {
+        if (Number.isFinite(Number(latestCp.state.totalIn))) {
+          tm.totalIn = Math.max(0, Number(latestCp.state.totalIn));
+        }
+        if (Number.isFinite(Number(latestCp.state.totalOut))) {
+          tm.totalOut = Math.max(0, Number(latestCp.state.totalOut));
+        }
+        if (Number.isFinite(Number(latestCp.state.totalCacheRead))) {
+          tm.totalCacheRead = Math.max(0, Number(latestCp.state.totalCacheRead));
+        }
+        if (Number.isFinite(Number(latestCp.state.totalCacheWrite))) {
+          tm.totalCacheWrite = Math.max(0, Number(latestCp.state.totalCacheWrite));
+        }
+      }
+    }
 
     const explicitMaxSteps = normalizeBudgetLimit(budget.maxSteps);
     const maxSteps =
@@ -244,6 +280,7 @@ export class AgentLoop {
     let stopReason = 'completed';
     let hadToolCalls = false;
     let idleDecisionAction = null;
+    let lastRoute = null;
 
     try {
       if (explicitMaxSteps === 0) {
@@ -328,6 +365,10 @@ export class AgentLoop {
           const compacted = await contextManager.prepareRequest(requestOptions, { step: steps });
           requestOptions = compacted.options;
           if (compacted.stage && compacted.stage !== 'none') {
+            if (Array.isArray(requestOptions?.messages)) {
+              messages = [...requestOptions.messages];
+              requestOptions = { ...requestOptions, messages };
+            }
             this.eventRouter.emitPersisted({
               sessionId,
               turnId,
@@ -450,6 +491,9 @@ export class AgentLoop {
               }
             },
           });
+          if (stepResult.route) {
+            lastRoute = stepResult.route;
+          }
           executedStepsThisTurn++;
           tm.addUsage(stepResult.usage);
           if (activeReservation?.reservationId) {
@@ -463,19 +507,31 @@ export class AgentLoop {
             activeReservation = null;
           }
         } catch (infErr) {
+          if (infErr?.route) {
+            lastRoute = infErr.route;
+          }
           if (infErr?.partialUsage) {
             tm.addUsage(infErr.partialUsage);
           }
           if (activeReservation?.reservationId && checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
             try {
-              budgetLedger.settleReservation(activeReservation.reservationId, {
-                status: 'failed',
-                actualSteps: 1,
-                actualInputTokens: infErr?.partialUsage?.inputTokens ?? 0,
-                actualOutputTokens: infErr?.partialUsage?.outputTokens ?? 0,
-                errorCode: infErr?.code || 'INFERENCE_FAILED',
-                leaseGuard,
-              });
+              if (
+                infErr?.abortedBeforeProvider &&
+                typeof budgetLedger.releaseReservation === 'function'
+              ) {
+                budgetLedger.releaseReservation(activeReservation.reservationId, {
+                  reason: infErr?.code || 'ABORTED_BEFORE_PROVIDER',
+                });
+              } else {
+                budgetLedger.settleReservation(activeReservation.reservationId, {
+                  status: 'failed',
+                  actualSteps: 1,
+                  actualInputTokens: infErr?.partialUsage?.inputTokens ?? 0,
+                  actualOutputTokens: infErr?.partialUsage?.outputTokens ?? 0,
+                  errorCode: infErr?.code || 'INFERENCE_FAILED',
+                  leaseGuard,
+                });
+              }
             } catch (settleErr) {
               if (!isLeaseLostError(settleErr)) throw settleErr;
             }
@@ -531,7 +587,7 @@ export class AgentLoop {
 
         // Idle completion / verification check when model emitted no tool calls
         if (!stepResult.toolCalls.length) {
-          if (drainSteering && (steers?.length === 0)) {
+          if (drainSteering) {
             const lateSteers = drainSteering();
             if (lateSteers?.length) {
               for (const s of lateSteers) {
@@ -625,10 +681,15 @@ export class AgentLoop {
           permissionMode,
           allowTools,
           denyTools,
+          getLivePolicy,
           getApprovedPrefixes,
           requestApproval,
           tainted: Boolean(execution?.tainted),
         });
+
+        signal?.throwIfAborted?.();
+        parentGuard?.();
+        leaseGuard?.();
 
         let detectedThrashing = false;
         for (const item of executedBatch) {
@@ -686,6 +747,8 @@ export class AgentLoop {
             steps,
             totalIn: tm.totalIn,
             totalOut: tm.totalOut,
+            totalCacheRead: tm.totalCacheRead,
+            totalCacheWrite: tm.totalCacheWrite,
             lastToolCallIds: executedBatch.map((b) => b.tc.id),
           },
         });
@@ -785,11 +848,13 @@ export class AgentLoop {
           cacheReadTokens: tm.totalCacheRead,
           cacheWriteTokens: tm.totalCacheWrite,
         },
+        route: lastRoute,
         verdict: outcome.verdict,
         verifiedPass: outcome.verifiedPass,
         failureKind: outcome.failureKind,
         verifierEvents,
         phaseHistory: sm.history,
+        deferredPhaseTransition: sm.deferredTerminalTransition ?? null,
       };
     } catch (err) {
       const classified = classifyError(err);
@@ -800,6 +865,7 @@ export class AgentLoop {
         cacheWriteTokens: tm.totalCacheWrite,
       };
       classified.steps = steps;
+      classified.route = lastRoute;
       // Fix D6: On LEASE_LOST (or if lease was already lost before error), exit cleanly without corrupting turn phase
       if (isLeaseLostError(classified) || !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
         throw isLeaseLostError(classified)
@@ -808,6 +874,10 @@ export class AgentLoop {
               message: `Lease lost during turn ${turnId}`,
               cause: err,
             });
+      }
+      if (isShutdownAbort(signal, err) || isShutdownAbort(signal, classified)) {
+        classified.isShutdown = true;
+        throw classified;
       }
       const isCancelled = Boolean(signal?.aborted || classified.category === 'cancellation');
       const targetPhase =
@@ -829,6 +899,7 @@ export class AgentLoop {
       } catch {
         // already terminal or lease lost
       }
+      classified.deferredPhaseTransition = sm.deferredTerminalTransition ?? null;
       throw classified;
     }
   }

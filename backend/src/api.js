@@ -5,6 +5,8 @@ import Fastify from 'fastify';
 import { z, ZodError } from 'zod';
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { Fault } from './store.js';
+import { classifyTrafficSource, withTraceContext } from './observability/trace.js';
+import { logEvent } from './observability/logger.js';
 export const uuid = z.uuid();
 const digest = (s) => createHash('sha256').update(s).digest();
 export function api(
@@ -18,11 +20,23 @@ export function api(
     checkin = null,
     webLogin = null,
     controlPlane = null,
+    metrics = null,
   } = {},
 ) {
   if (!token || token.length < 24)
     throw Error('BACKEND_TOKEN requires at least 24 characters');
   const app = Fastify({ bodyLimit: 512 * 1024, logger: false });
+  app.addHook('onRequest', (req, _reply, done) => {
+    const classified = classifyTrafficSource(req.headers);
+    withTraceContext(
+      {
+        traceId: req.id,
+        trafficSource: classified.trafficSource,
+        isSynthetic: classified.isSynthetic,
+      },
+      () => done(),
+    );
+  });
   app.addHook('onRequest', async (req) => {
     const pathname = req.url.split('?')[0];
     if (
@@ -50,6 +64,15 @@ export function api(
         : e instanceof ZodError
           ? 400
           : (e.statusCode ?? 500);
+    if (status >= 500) {
+      logEvent('error', 'http.server_error', {
+        method: req.method,
+        url: req.url,
+        status,
+        requestId: req.id,
+        error: e,
+      });
+    }
     const message =
       e instanceof Fault && e.detail && typeof e.detail.message === 'string'
         ? e.detail.message
@@ -181,6 +204,6 @@ export function api(
     };
   });
   publicRoutes(app, store, providers);
-  v1Routes(app, { store, providers, pool, directAgent, checkin, webLogin, controlPlane });
+  v1Routes(app, { store, providers, pool, directAgent, checkin, webLogin, controlPlane, metrics });
   return app;
 }

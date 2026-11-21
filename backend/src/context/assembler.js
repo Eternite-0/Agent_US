@@ -8,12 +8,64 @@ import { buildStaticSystemPrompt } from '../agent-context.js';
  * strictly as diff-only tail notes via `liveContextNotes`.
  */
 export class ContextAssembler {
-  constructor({ sessionRepo, compactor, memoryService = null }) {
+  constructor({ sessionRepo, compactor, memoryService = null, maxCachedSessions = 200 }) {
     this.sessionRepo = sessionRepo;
     this.compactor = compactor;
     this.memoryService = memoryService;
+    this.maxCachedSessions = Math.max(16, Number(maxCachedSessions || 200));
     // Per-session cache of previously emitted live-context note messages per turn boundary
     this.emittedTailHistory = new Map(); // sessionId -> Map<turnId|string, Array<msg>>
+  }
+
+  #getOrCreateTailCache(sessionId) {
+    let tailCache = this.emittedTailHistory.get(sessionId);
+    if (tailCache) {
+      // Refresh LRU ordering
+      this.emittedTailHistory.delete(sessionId);
+      this.emittedTailHistory.set(sessionId, tailCache);
+      return tailCache;
+    }
+    tailCache = new Map();
+    this.emittedTailHistory.set(sessionId, tailCache);
+    while (this.emittedTailHistory.size > this.maxCachedSessions) {
+      const oldestKey = this.emittedTailHistory.keys().next().value;
+      if (oldestKey === undefined || oldestKey === sessionId) break;
+      this.emittedTailHistory.delete(oldestKey);
+    }
+    return tailCache;
+  }
+
+  #persistTailNotes(sessionId, turnId, firstUserMsg, turnNotes) {
+    const store = this.sessionRepo?.store;
+    if (!store?.db?.isOpen || !firstUserMsg?.seq || !Array.isArray(turnNotes) || !turnNotes.length) {
+      return;
+    }
+    try {
+      const row = store.db
+        .prepare('SELECT meta FROM direct_messages WHERE seq=? AND sessionId=? AND turnId=?')
+        .get(firstUserMsg.seq, sessionId, turnId);
+      if (!row) return;
+      let meta = {};
+      if (row.meta) {
+        try {
+          const parsed = JSON.parse(row.meta);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            meta = parsed;
+          }
+        } catch {
+          meta = {};
+        }
+      }
+      if (Array.isArray(meta._liveContextTail)) return;
+      meta._liveContextTail = turnNotes;
+      store.tx(() => {
+        store.db
+          .prepare('UPDATE direct_messages SET meta=? WHERE seq=?')
+          .run(JSON.stringify(meta), firstUserMsg.seq);
+      });
+    } catch {
+      // Best-effort cache persistence; in-memory tailCache remains authoritative for live turn
+    }
   }
 
   clearSession(sessionId) {
@@ -84,19 +136,20 @@ export class ContextAssembler {
     }
 
     // Re-attach previously emitted diff notes at their exact historical turn boundaries
-    // so prefix bytes across Turn 1..k-1 remain byte-identical!
-    const tailCache = this.emittedTailHistory.get(session.id) ?? new Map();
-    if (!this.emittedTailHistory.has(session.id)) {
-      this.emittedTailHistory.set(session.id, tailCache);
-    }
+    // so prefix bytes across Turn 1..k-1 remain byte-identical (including across process restarts)!
+    const tailCache = this.#getOrCreateTailCache(session.id);
 
-    // Group priorHistory by turnId preserving order and injecting cached notes before each turn's first msg
+    // Group priorHistory by turnId preserving order and injecting cached/persisted notes before each turn's first msg
     const seenTurns = new Set();
     for (const m of priorHistory) {
       const tid = m.turnId || '__pre__';
       if (!seenTurns.has(tid)) {
         seenTurns.add(tid);
-        const cachedNotes = tailCache.get(tid);
+        let cachedNotes = tailCache.get(tid);
+        if (!cachedNotes && Array.isArray(m.liveContextTail) && m.liveContextTail.length) {
+          cachedNotes = m.liveContextTail;
+          tailCache.set(tid, cachedNotes);
+        }
         if (cachedNotes?.length) {
           messages.push(...cachedNotes);
         }
@@ -161,7 +214,15 @@ export class ContextAssembler {
 
     const deltas = liveContextNotes(sections, messages);
     const turnNoteKey = turnId || '__current__';
-    let turnNotes = tailCache.get(turnNoteKey);
+    const firstCurrentUser = currentTurnMsgs.find((m) => m.role === 'user') ?? null;
+    let turnNotes =
+      tailCache.get(turnNoteKey) ??
+      (Array.isArray(firstCurrentUser?.liveContextTail) && firstCurrentUser.liveContextTail.length
+        ? firstCurrentUser.liveContextTail
+        : null);
+    if (turnNotes && !tailCache.has(turnNoteKey)) {
+      tailCache.set(turnNoteKey, turnNotes);
+    }
     if (!turnNotes && deltas.length > 0) {
       turnNotes = [
         {
@@ -174,6 +235,9 @@ export class ContextAssembler {
         },
       ];
       tailCache.set(turnNoteKey, turnNotes);
+      if (turnId && firstCurrentUser) {
+        this.#persistTailNotes(session.id, turnId, firstCurrentUser, turnNotes);
+      }
     }
     if (turnNotes?.length) {
       messages.push(...turnNotes);

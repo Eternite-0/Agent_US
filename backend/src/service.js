@@ -18,6 +18,7 @@ import { RefinementService } from './refinement.js';
 import { createDefaultSeams } from './seams.js';
 import { ControlPlane } from './governance/control-plane.js';
 import { ShutdownCoordinator } from './runtime/shutdown.js';
+import { MetricsCollector } from './observability/metrics.js';
 
 const ROLES = ['Researcher', 'Planner', 'Coder', 'Reviewer', 'Tester'];
 
@@ -64,7 +65,8 @@ export async function service({
       uses: configuration.judgment ?? {},
       maxAutoReviews: configuration.judgment?.maxAutoReviews ?? 20,
     });
-    pool = new AccountPool(store, { root, legacyProviders: providers });
+    const metrics = new MetricsCollector({ store });
+    pool = new AccountPool(store, { root, legacyProviders: providers, metrics });
     const defaultWorkspace = workspaceRoot
       ? resolve(workspaceRoot)
       : resolve(dirname(root), '..');
@@ -73,6 +75,7 @@ export async function service({
       dataRoot: root,
       judgment,
       staticMcp: configuration.mcp ?? {},
+      metrics,
     });
     checkin = new CheckinService(store, pool, { root });
     const webLogin = new WebLoginService(store, pool, { root });
@@ -90,7 +93,7 @@ export async function service({
         pinnedAt: Date.now(),
       };
     };
-    controlPlane = new ControlPlane({ store, pool, directAgent });
+    controlPlane = new ControlPlane({ store, pool, directAgent, metrics });
     app = api(ctx.taskEngine, token, providers, {
       snapshotPin,
       pool,
@@ -98,6 +101,7 @@ export async function service({
       checkin,
       webLogin,
       controlPlane,
+      metrics,
     });
     const refinement = new RefinementService(store, {
       enabled: configuration.refinement?.enabled ?? false,
@@ -179,6 +183,7 @@ export async function service({
       pool,
       directAgent,
       controlPlane,
+      metrics,
       checkin,
       judgment,
       refinement,
@@ -191,7 +196,7 @@ export async function service({
   } catch (e) {
     checkin?.stop();
     controlPlane?.close();
-    directAgent?.close();
+    await directAgent?.close();
     await app?.close();
     await engine?.stop();
     await providers?.stop();

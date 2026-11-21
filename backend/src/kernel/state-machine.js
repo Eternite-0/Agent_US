@@ -119,6 +119,7 @@ export class TurnStateMachine {
     initialPhase = TURN_PHASES.INIT,
     initialStep = 0,
     leaseGuard = null,
+    deferTerminalPhase = false,
   }) {
     this.store = store;
     this.eventRouter = eventRouter;
@@ -127,6 +128,8 @@ export class TurnStateMachine {
     this.phase = initialPhase;
     this.step = initialStep;
     this.leaseGuard = leaseGuard;
+    this.deferTerminalPhase = Boolean(deferTerminalPhase);
+    this.deferredTerminalTransition = null;
     this.history = [{ phase: initialPhase, step: initialStep, at: Date.now() }];
   }
 
@@ -134,7 +137,10 @@ export class TurnStateMachine {
     return TERMINAL_PHASES.has(this.phase);
   }
 
-  transition(nextPhase, { step = this.step, reason = null, persist = true } = {}) {
+  transition(
+    nextPhase,
+    { step = this.step, reason = null, persist = true, defer = false } = {},
+  ) {
     if (nextPhase === this.phase && step === this.step) {
       return this.phase;
     }
@@ -147,6 +153,19 @@ export class TurnStateMachine {
       });
     }
     const prevPhase = this.phase;
+    const shouldDefer =
+      Boolean(defer) || (this.deferTerminalPhase && TERMINAL_PHASES.has(nextPhase));
+
+    if (shouldDefer) {
+      this.phase = nextPhase;
+      this.step = step;
+      const rec = { from: prevPhase, to: nextPhase, step, reason, at: Date.now() };
+      this.deferredTerminalTransition = rec;
+      this.history.push({ phase: nextPhase, step, reason, at: rec.at });
+      return this.phase;
+    }
+
+    let persistedEv = null;
     if (persist && this.store?.db && this.turnId) {
       this.store.tx(() => {
         assertLeaseInTx(this.leaseGuard, { sessionId: this.sessionId, turnId: this.turnId });
@@ -155,6 +174,24 @@ export class TurnStateMachine {
             "UPDATE direct_turns SET phase=?, step=? WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
           )
           .run(nextPhase, step, this.turnId);
+        if (
+          this.eventRouter &&
+          this.sessionId &&
+          typeof this.eventRouter.insertPersistedInTx === 'function'
+        ) {
+          persistedEv = this.eventRouter.insertPersistedInTx({
+            sessionId: this.sessionId,
+            turnId: this.turnId,
+            type: RUNTIME_EVENTS.TURN_PHASE_CHANGED,
+            data: {
+              from: prevPhase,
+              to: nextPhase,
+              step,
+              ...(reason ? { reason } : {}),
+            },
+            audit: false,
+          });
+        }
       });
     }
 
@@ -162,7 +199,9 @@ export class TurnStateMachine {
     this.step = step;
     this.history.push({ phase: nextPhase, step, reason, at: Date.now() });
 
-    if (this.eventRouter && this.sessionId) {
+    if (persistedEv) {
+      this.eventRouter.fanoutPersisted(persistedEv);
+    } else if (this.eventRouter && this.sessionId) {
       this.eventRouter.emitPersisted({
         sessionId: this.sessionId,
         turnId: this.turnId,

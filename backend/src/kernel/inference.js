@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { classifyError, InferenceError } from './errors.js';
+import { CancellationError, classifyError, InferenceError } from './errors.js';
 
 /**
  * Unified inference engine wrapping LlmAdapter streaming calls, token accounting,
@@ -28,11 +28,11 @@ export class InferenceEngine {
     let attempt = 0;
     let activeMaxTokens = maxTokens;
     for (;;) {
-      signal?.throwIfAborted?.();
       let text = '';
       let reasoning = '';
       const toolCalls = [];
       let finishReason = 'completed';
+      let route = null;
       let usage = {
         inputTokens: 0,
         outputTokens: 0,
@@ -40,8 +40,11 @@ export class InferenceEngine {
         cacheWriteTokens: 0,
       };
       let emittedAnything = false;
+      let providerInvoked = false;
 
       try {
+        signal?.throwIfAborted?.();
+        providerInvoked = true;
         for await (const chunk of this.adapter.stream({
           provider,
           model,
@@ -53,7 +56,9 @@ export class InferenceEngine {
           signal,
         })) {
           signal?.throwIfAborted?.();
-          if (chunk.type === 'usage' && chunk.usage) {
+          if (chunk.type === 'route' && chunk.route) {
+            route = chunk.route;
+          } else if (chunk.type === 'usage' && chunk.usage) {
             usage.inputTokens += Number(chunk.usage.inputTokens ?? 0);
             usage.outputTokens += Number(chunk.usage.outputTokens ?? 0);
             usage.cacheReadTokens += Number(chunk.usage.cacheReadTokens ?? 0);
@@ -73,7 +78,10 @@ export class InferenceEngine {
             emittedAnything = true;
             toolCalls.push(chunk.block);
           } else if (chunk.type === 'finish' && chunk.reason) {
-            finishReason = String(chunk.reason);
+            finishReason =
+              typeof chunk.reason === 'object' && chunk.reason !== null
+                ? String(chunk.reason.kind || 'completed')
+                : String(chunk.reason);
           }
         }
         return {
@@ -82,11 +90,29 @@ export class InferenceEngine {
           toolCalls,
           finishReason,
           usage,
+          route,
         };
       } catch (err) {
         if (signal?.aborted) {
-          const cancelled = classifyError(err);
+          const reason = signal.reason;
+          const reasonMsg =
+            reason instanceof Error
+              ? (reason.detail?.message ?? reason.message)
+              : typeof reason === 'string' && reason
+                ? reason
+                : String(err?.detail?.message ?? err?.message ?? 'Inference aborted');
+          const base = classifyError(err);
+          const cancelled =
+            base instanceof CancellationError
+              ? base
+              : new CancellationError('STREAM_ABORTED', {
+                  message: reasonMsg,
+                  cause: err,
+                  detail: reason !== undefined ? { reason: reasonMsg } : undefined,
+                });
           cancelled.partialUsage = usage;
+          if (route) cancelled.route = route;
+          cancelled.abortedBeforeProvider = !providerInvoked;
           throw cancelled;
         }
         const classified = classifyError(err);
@@ -102,7 +128,31 @@ export class InferenceEngine {
               activeMaxTokens = nextCap;
             }
           }
-          await delay(this.retryDelayMs * attempt, undefined, { signal });
+          providerInvoked = false;
+          try {
+            await delay(this.retryDelayMs * attempt, undefined, { signal });
+          } catch (delayErr) {
+            const reason = signal?.reason;
+            const reasonMsg =
+              reason instanceof Error
+                ? reason.message
+                : typeof reason === 'string' && reason
+                  ? reason
+                  : String(delayErr?.message ?? 'Aborted during retry backoff');
+            const cancelled = new CancellationError('STREAM_ABORTED', {
+              message: reasonMsg,
+              cause: delayErr,
+              detail: reason !== undefined ? { reason: reasonMsg } : undefined,
+            });
+            cancelled.partialUsage = {
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            };
+            cancelled.abortedBeforeProvider = true;
+            throw cancelled;
+          }
           continue;
         }
         const outErr =
@@ -116,6 +166,8 @@ export class InferenceEngine {
                 })
               : classified;
         outErr.partialUsage = usage;
+        if (route) outErr.route = route;
+        outErr.abortedBeforeProvider = !providerInvoked;
         throw outErr;
       }
     }

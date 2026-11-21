@@ -107,13 +107,17 @@ export class AgentRuntimeKernel {
         : params.profile ?? this.getProfile('default');
 
     const epochId = params.turnId || `turn_${Date.now()}`;
-    const signal =
-      params.signal ??
-      this.cancellation.createEpoch(epochId, {
-        parentId: params.parentEpochId ?? null,
-        externalSignal: params.externalSignal ?? null,
-        timeoutMs: params.budget?.maxDurationMs ?? null,
-      });
+    const externalSignals = [params.signal, params.externalSignal].filter(Boolean);
+    const combinedExternal =
+      externalSignals.length > 1
+        ? AbortSignal.any(externalSignals)
+        : (externalSignals[0] ?? null);
+    const ownsEpoch = !this.cancellation.getSignal(epochId);
+    const signal = this.cancellation.createEpoch(epochId, {
+      parentId: params.parentEpochId ?? null,
+      externalSignal: combinedExternal,
+      timeoutMs: params.budget?.maxDurationMs ?? null,
+    });
 
     try {
       return await this.loop.run({
@@ -123,7 +127,7 @@ export class AgentRuntimeKernel {
         toolDispatcher: params.toolDispatcher ?? this.toolDispatcher,
       });
     } finally {
-      if (!params.signal) {
+      if (ownsEpoch) {
         this.cancellation.dispose(epochId);
       }
     }

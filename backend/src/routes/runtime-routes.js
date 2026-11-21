@@ -1,8 +1,15 @@
-export function registerRuntimeRoutes(app, { store, directAgent, controlPlane }) {
+import { MetricsCollector } from '../observability/metrics.js';
+
+export function registerRuntimeRoutes(
+  app,
+  { store, directAgent, controlPlane, metrics = null },
+) {
   const audit = controlPlane?.auditService;
+  const effectiveMetrics =
+    metrics ?? controlPlane?.metrics ?? directAgent?.metrics ?? (store ? new MetricsCollector({ store }) : null);
 
   app.get('/v1/runtime/overview', async () => {
-    if (controlPlane) return controlPlane.getOverview();
+    if (typeof controlPlane?.getOverview === 'function') return controlPlane.getOverview();
     return {
       ok: true,
       activeTurns: directAgent?.activeTurns?.size ?? 0,
@@ -12,6 +19,43 @@ export function registerRuntimeRoutes(app, { store, directAgent, controlPlane })
       activeSwarmRuns: 0,
       enabledSchedules: 0,
     };
+  });
+
+  app.get('/v1/observability/metrics', async (req) => {
+    const q = req.query ?? {};
+    const windowHours = q.windowHours !== undefined ? Number(q.windowHours) : 24;
+    const includeSynthetic =
+      q.includeSynthetic === true ||
+      q.includeSynthetic === 'true' ||
+      q.includeSynthetic === '1';
+    if (typeof controlPlane?.getProductionMetrics === 'function') {
+      return controlPlane.getProductionMetrics({ windowHours, includeSynthetic });
+    }
+    if (effectiveMetrics) {
+      return effectiveMetrics.getProductionMetrics({ windowHours, includeSynthetic });
+    }
+    return { ok: false, error: 'METRICS_UNAVAILABLE' };
+  });
+
+  app.get('/v1/observability/traces', async (req) => {
+    const q = req.query ?? {};
+    const filter = {
+      runId: q.runId ? String(q.runId) : null,
+      nodeId: q.nodeId ? String(q.nodeId) : null,
+      sessionId: q.sessionId ? String(q.sessionId) : null,
+      turnId: q.turnId ? String(q.turnId) : null,
+      jobId: q.jobId ? String(q.jobId) : null,
+      toolCallId: q.toolCallId ? String(q.toolCallId) : null,
+      artifactId: q.artifactId ? String(q.artifactId) : null,
+      limit: q.limit !== undefined ? Number(q.limit) : 200,
+    };
+    const items =
+      typeof controlPlane?.queryTraces === 'function'
+        ? controlPlane.queryTraces(filter)
+        : effectiveMetrics
+          ? effectiveMetrics.queryTraces(filter)
+          : [];
+    return { items };
   });
 
   app.get('/v1/sessions/:id/receipts', async (req) => {
@@ -132,9 +176,19 @@ export function registerRuntimeRoutes(app, { store, directAgent, controlPlane })
       });
     }
     const body = req.body ?? {};
+    const expectedDigest = String(body.expectedDigest ?? '').trim();
+    if (!expectedDigest) {
+      return reply.code(400).send({
+        error: {
+          code: 'EXPECTED_DIGEST_REQUIRED',
+          message: 'expectedDigest is required when approving workspace hooks via HTTP',
+          status: 400,
+        },
+      });
+    }
     return directAgent.approveHookConfig(body.filePath ? String(body.filePath) : null, {
       workspaceRoot: body.workspaceRoot ? String(body.workspaceRoot) : undefined,
-      expectedDigest: body.expectedDigest ? String(body.expectedDigest) : null,
+      expectedDigest,
       approvedBy: body.approvedBy ? String(body.approvedBy) : 'user',
       note: body.note ? String(body.note) : '',
     });

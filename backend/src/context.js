@@ -331,6 +331,15 @@ export async function compactTwoStage(
       if (typeof summaryText === 'string' && summaryText.trim().length > 0) {
         const prefix = messages.slice(0, start);
         const suffix = messages.slice(cut);
+        const summaryUserMsg = {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '[compacted summary] Earlier conversation history was compacted into the structured summary below.',
+            },
+          ],
+        };
         const summaryMsg = {
           role: 'assistant',
           content: [
@@ -346,7 +355,7 @@ export async function compactTwoStage(
             : [];
         const stage2Opts = {
           ...options,
-          messages: [...prefix, summaryMsg, ...bridge, ...suffix],
+          messages: [...prefix, summaryUserMsg, summaryMsg, ...bridge, ...suffix],
         };
         const afterStage2 = measureRequestComposition(stage2Opts);
         return {
@@ -395,11 +404,29 @@ export function liveContextNotes(sections, existingMessages = []) {
   for (let i = existingMessages.length - 1; i >= 0; i--) {
     const m = existingMessages[i];
     if (m.role !== 'user') continue;
-    const text = m.content?.find((b) => b.type === 'text')?.text;
-    if (typeof text !== 'string') continue;
-    const match = /^\[live context [a-f0-9]{64}\]\n/.exec(text);
-    if (match && !latestSeen.has(match[0])) {
-      latestSeen.set(match[0], text);
+    const textBlocks = (m.content ?? []).filter(
+      (b) => b.type === 'text' && typeof b.text === 'string',
+    );
+    for (let bi = textBlocks.length - 1; bi >= 0; bi--) {
+      const text = textBlocks[bi].text;
+      if (!text.includes(LIVE_CONTEXT_PREFIX)) continue;
+      const headerRe = /^\[live context [a-f0-9]{64}\]\n/gm;
+      const matches = [];
+      let match;
+      while ((match = headerRe.exec(text)) !== null) {
+        matches.push({ prefix: match[0], index: match.index });
+      }
+      for (let k = matches.length - 1; k >= 0; k--) {
+        const startIdx = matches[k].index;
+        const endIdx = k + 1 < matches.length ? matches[k + 1].index : text.length;
+        let blockText = text.slice(startIdx, endIdx);
+        if (k + 1 < matches.length) {
+          blockText = blockText.replace(/\n\n$/, '');
+        }
+        if (!latestSeen.has(matches[k].prefix)) {
+          latestSeen.set(matches[k].prefix, blockText);
+        }
+      }
     }
   }
 

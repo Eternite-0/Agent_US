@@ -51,10 +51,12 @@ export function verifyTurn({ events = [], text = '', node = null, execution = nu
 
   // 2. Output truncated at max tokens
   const lastEnd = events.findLast((e) => e.type === 'turn/end');
-  if (
-    lastEnd?.data?.reason?.kind === 'max-tokens' ||
-    lastEnd?.data?.reason?.kind === 'length'
-  ) {
+  const endReason = lastEnd?.data?.reason;
+  const endReasonKind =
+    typeof endReason === 'object' && endReason !== null
+      ? endReason.kind
+      : endReason;
+  if (endReasonKind === 'max-tokens' || endReasonKind === 'length') {
     reasons.push('output_truncated');
   }
 

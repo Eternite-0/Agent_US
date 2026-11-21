@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import OpenAI from 'openai';
 import { LlmAdapter, attributionHeaders } from '@deepseek-ai/dsh-llm';
 import { Fault, id as uuid } from './store.js';
+import { withTraceContext } from './observability/trace.js';
 import {
   resolveEffectiveRoute,
   openaiRequestToAnthropic,
@@ -860,10 +861,11 @@ function classifyError(err) {
 }
 
 export class AccountPool {
-  constructor(store, { root, legacyProviders = null } = {}) {
+  constructor(store, { root, legacyProviders = null, metrics = null } = {}) {
     this.store = store;
     this.root = root;
     this.legacyProviders = legacyProviders;
+    this.metrics = metrics ?? null;
     this.masterKey = loadOrCreateMasterKey(root);
     this.sessionStickiness = new Map(); // sessionKey -> { accountId, at }
     this.cooldownStrikes = new Map(); // accountId -> consecutive 429 count
@@ -1489,44 +1491,46 @@ export class AccountPool {
   }
 
   async testAccount(accountId) {
-    const row = this.getAccountRaw(accountId);
-    const started = Date.now();
-    try {
-      const discovered = await this.#fetchUpstreamModels(row);
-      const latencyMs = Date.now() - started;
-      const now = Date.now();
-      this.store.tx(() => {
-        this.store.db
-          .prepare(
-            "UPDATE provider_accounts SET status='healthy', lastError=NULL, lastErrorAt=NULL, cooldownUntil=0, lastSuccessAt=?, updatedAt=? WHERE id=?",
-          )
-          .run(now, now, accountId);
-      });
-      this.cooldownStrikes.delete(accountId);
-      return {
-        ...this.getAccount(accountId),
-        ok: true,
-        latencyMs,
-        discoveredCount: discovered.length,
-      };
-    } catch (err) {
-      const latencyMs = Date.now() - started;
-      const now = Date.now();
-      const message = String(err?.message ?? err);
-      this.store.tx(() => {
-        this.store.db
-          .prepare(
-            "UPDATE provider_accounts SET status='unhealthy', lastError=?, lastErrorAt=?, updatedAt=? WHERE id=?",
-          )
-          .run(message.slice(0, 500), now, now, accountId);
-      });
-      return {
-        ...this.getAccount(accountId),
-        ok: false,
-        latencyMs,
-        error: message,
-      };
-    }
+    return withTraceContext({ trafficSource: 'probe', isSynthetic: true, accountId }, async () => {
+      const row = this.getAccountRaw(accountId);
+      const started = Date.now();
+      try {
+        const discovered = await this.#fetchUpstreamModels(row);
+        const latencyMs = Date.now() - started;
+        const now = Date.now();
+        this.store.tx(() => {
+          this.store.db
+            .prepare(
+              "UPDATE provider_accounts SET status='healthy', lastError=NULL, lastErrorAt=NULL, cooldownUntil=0, lastSuccessAt=?, updatedAt=? WHERE id=?",
+            )
+            .run(now, now, accountId);
+        });
+        this.cooldownStrikes.delete(accountId);
+        return {
+          ...this.getAccount(accountId),
+          ok: true,
+          latencyMs,
+          discoveredCount: discovered.length,
+        };
+      } catch (err) {
+        const latencyMs = Date.now() - started;
+        const now = Date.now();
+        const message = String(err?.message ?? err);
+        this.store.tx(() => {
+          this.store.db
+            .prepare(
+              "UPDATE provider_accounts SET status='unhealthy', lastError=?, lastErrorAt=?, updatedAt=? WHERE id=?",
+            )
+            .run(message.slice(0, 500), now, now, accountId);
+        });
+        return {
+          ...this.getAccount(accountId),
+          ok: false,
+          latencyMs,
+          error: message,
+        };
+      }
+    });
   }
 
   async syncAccountModels(accountId) {
@@ -2543,64 +2547,127 @@ export class AccountPool {
   }
 
   async testModel({ model, accountId = null, preset = null }) {
-    const started = Date.now();
-    const routes = this.resolveRoutes(model, { provider: preset }).filter(
-      (r) => !accountId || r.accountId === accountId,
-    );
-    if (!routes.length) {
+    return withTraceContext({ trafficSource: 'probe', isSynthetic: true, model }, async () => {
+      const started = Date.now();
+      const routes = this.resolveRoutes(model, { provider: preset }).filter(
+        (r) => !accountId || r.accountId === accountId,
+      );
+      if (!routes.length) {
+        this.metrics?.record('model_route', {
+          model,
+          provider: preset ?? null,
+          accountId: accountId ?? null,
+          attempt: 0,
+          ok: false,
+          durationMs: Date.now() - started,
+          code: 'NO_AVAILABLE_PROVIDER',
+          trafficSource: 'probe',
+          isSynthetic: true,
+          detail: { exhausted: true, probe: true },
+        });
+        return {
+          ok: false,
+          latencyMs: Date.now() - started,
+          error: `找不到模型「${model}」对应的可用启用账号`,
+        };
+      }
+      let lastError = '';
+      let attempts = 0;
+      for (const r of routes) {
+        attempts++;
+        try {
+          let reply = '';
+          for await (const chunk of this.adapter.streamRoute(r, {
+            model: r.wireModel,
+            messages: [
+              { role: 'user', content: [{ type: 'text', text: 'Reply with OK' }] },
+            ],
+            maxTokens: 16,
+            signal: AbortSignal.timeout(15000),
+          })) {
+            if (chunk.type === 'text-delta') reply += chunk.text;
+          }
+          this.markRouteSuccess(r);
+          this.metrics?.record('model_route', {
+            model,
+            provider: r.preset,
+            accountId: r.accountId,
+            attempt: attempts,
+            ok: true,
+            durationMs: Date.now() - started,
+            trafficSource: 'probe',
+            isSynthetic: true,
+            detail: {
+              wireModel: r.wireModel,
+              attempts,
+              failovers: Math.max(0, attempts - 1),
+              primaryOk: attempts === 1,
+              probe: true,
+            },
+          });
+          return {
+            ok: true,
+            latencyMs: Date.now() - started,
+            reply: reply.trim() || 'OK',
+            accountId: r.accountId,
+            provider: r.preset,
+            wireModel: r.wireModel,
+          };
+        } catch (err) {
+          lastError = String(err?.message ?? err);
+          this.markRouteFailure(r, err);
+        }
+      }
+      this.metrics?.record('model_route', {
+        model,
+        provider: routes[0]?.preset ?? preset ?? null,
+        accountId: routes[0]?.accountId ?? accountId ?? null,
+        attempt: attempts,
+        ok: false,
+        durationMs: Date.now() - started,
+        code: 'PROVIDER_UNAVAILABLE',
+        trafficSource: 'probe',
+        isSynthetic: true,
+        detail: { attempts, failovers: Math.max(0, attempts - 1), exhausted: true, probe: true },
+      });
       return {
         ok: false,
         latencyMs: Date.now() - started,
-        error: `找不到模型「${model}」对应的可用启用账号`,
+        error: lastError || '模型测试失败',
       };
-    }
-    let lastError = '';
-    for (const r of routes) {
-      try {
-        let reply = '';
-        for await (const chunk of this.adapter.streamRoute(r, {
-          model: r.wireModel,
-          messages: [
-            { role: 'user', content: [{ type: 'text', text: 'Reply with OK' }] },
-          ],
-          maxTokens: 16,
-          signal: AbortSignal.timeout(15000),
-        })) {
-          if (chunk.type === 'text-delta') reply += chunk.text;
-        }
-        this.markRouteSuccess(r);
-        return {
-          ok: true,
-          latencyMs: Date.now() - started,
-          reply: reply.trim() || 'OK',
-          accountId: r.accountId,
-          provider: r.preset,
-          wireModel: r.wireModel,
-        };
-      } catch (err) {
-        lastError = String(err?.message ?? err);
-        this.markRouteFailure(r, err);
-      }
-    }
-    return {
-      ok: false,
-      latencyMs: Date.now() - started,
-      error: lastError || '模型测试失败',
-    };
+    });
   }
 
   // OpenAI-compatible reverse-proxy gateway (/v1/chat/completions)
   // Supports both direct OpenAI pass-through AND zero-dependency OpenAI -> Anthropic translation.
   async proxyChatCompletion(body, { signal } = {}) {
+    const started = Date.now();
     const requestedModel = String(body?.model || this.getDefaultModel());
     const routes = this.resolveRoutes(requestedModel);
     if (!routes.length) {
+      this.metrics?.record('model_route', {
+        model: requestedModel,
+        attempt: 0,
+        ok: false,
+        durationMs: Date.now() - started,
+        code: 'NO_AVAILABLE_PROVIDER',
+        detail: { attempts: 0, failovers: 0, exhausted: true, proxy: 'openai' },
+      });
       throw new Fault('NO_AVAILABLE_PROVIDER', 503, {
         message: `没有找到模型「${requestedModel}」对应的可用号池账号`,
       });
     }
     let lastErr;
+    let lastRoute = null;
+    let attempts = 0;
+    let failovers = 0;
+    let cooldownHits = 0;
+    let lastWasRateLimit = false;
     for (const rawRoute of routes) {
+      attempts++;
+      if (attempts > 1) failovers++;
+      if (Number(rawRoute.cooldownUntil || 0) > Date.now()) cooldownHits++;
+      lastRoute = rawRoute;
       this.markRouteStart(rawRoute);
       let released = false;
       const release = () => {
@@ -2634,12 +2701,31 @@ export class AccountPool {
               new Error(`Anthropic Upstream HTTP ${res.status}: ${text.slice(0, 300)}`),
               { status: res.status, headers: res.headers },
             );
+            const info = classifyError(err);
+            lastWasRateLimit = info.isRateLimit;
+            if (info.isRateLimit) cooldownHits++;
             this.markRouteFailure(rawRoute, err);
             lastErr = err;
             release();
             continue;
           }
           this.markRouteSuccess(rawRoute);
+          this.metrics?.record('model_route', {
+            model: requestedModel,
+            provider: rawRoute.preset,
+            accountId: rawRoute.accountId,
+            attempt: attempts,
+            ok: true,
+            durationMs: Date.now() - started,
+            detail: {
+              wireModel: r.wireModel,
+              attempts,
+              failovers,
+              primaryOk: failovers === 0,
+              cooldownSkipped: cooldownHits,
+              proxy: 'openai',
+            },
+          });
           if (body?.stream && res.body) {
             const translatedStream = anthropicSseToOpenaiStream(
               res.body,
@@ -2682,21 +2768,60 @@ export class AccountPool {
             new Error(`Upstream HTTP ${res.status}: ${text.slice(0, 300)}`),
             { status: res.status, headers: res.headers },
           );
+          const info = classifyError(err);
+          lastWasRateLimit = info.isRateLimit;
+          if (info.isRateLimit) cooldownHits++;
           this.markRouteFailure(rawRoute, err);
           lastErr = err;
           release();
           continue;
         }
         this.markRouteSuccess(rawRoute);
+        this.metrics?.record('model_route', {
+          model: requestedModel,
+          provider: rawRoute.preset,
+          accountId: rawRoute.accountId,
+          attempt: attempts,
+          ok: true,
+          durationMs: Date.now() - started,
+          detail: {
+            wireModel: r.wireModel,
+            attempts,
+            failovers,
+            primaryOk: failovers === 0,
+            cooldownSkipped: cooldownHits,
+            proxy: 'openai',
+          },
+        });
         if (!body?.stream) release();
         return { response: res, route: r, release };
       } catch (err) {
         release();
         if (signal?.aborted) throw err;
+        const info = classifyError(err);
+        lastWasRateLimit = info.isRateLimit;
+        if (info.isRateLimit) cooldownHits++;
         this.markRouteFailure(rawRoute, err);
         lastErr = err;
       }
     }
+    this.metrics?.record('model_route', {
+      model: requestedModel,
+      provider: lastRoute?.preset ?? null,
+      accountId: lastRoute?.accountId ?? null,
+      attempt: attempts,
+      ok: false,
+      durationMs: Date.now() - started,
+      code: lastWasRateLimit ? 'RATE_LIMITED' : 'PROVIDER_UNAVAILABLE',
+      detail: {
+        attempts,
+        failovers,
+        exhausted: true,
+        cooldownRejected: lastWasRateLimit,
+        cooldownSkipped: lastWasRateLimit ? Math.max(0, cooldownHits - 1) : cooldownHits,
+        proxy: 'openai',
+      },
+    });
     throw new Fault('PROVIDER_UNAVAILABLE', 503, {
       message: String(lastErr?.message ?? '所有号池账号均不可用'),
     });
@@ -2705,15 +2830,33 @@ export class AccountPool {
   // Anthropic-compatible reverse-proxy gateway (/v1/messages)
   // Supports both direct Anthropic pass-through AND zero-dependency Anthropic -> OpenAI translation.
   async proxyAnthropicMessages(body, { signal } = {}) {
+    const started = Date.now();
     const requestedModel = String(body?.model || this.getDefaultModel());
     const routes = this.resolveRoutes(requestedModel);
     if (!routes.length) {
+      this.metrics?.record('model_route', {
+        model: requestedModel,
+        attempt: 0,
+        ok: false,
+        durationMs: Date.now() - started,
+        code: 'NO_AVAILABLE_PROVIDER',
+        detail: { attempts: 0, failovers: 0, exhausted: true, proxy: 'anthropic' },
+      });
       throw new Fault('NO_AVAILABLE_PROVIDER', 503, {
         message: `没有找到模型「${requestedModel}」对应的可用号池账号`,
       });
     }
     let lastErr;
+    let lastRoute = null;
+    let attempts = 0;
+    let failovers = 0;
+    let cooldownHits = 0;
+    let lastWasRateLimit = false;
     for (const rawRoute of routes) {
+      attempts++;
+      if (attempts > 1) failovers++;
+      if (Number(rawRoute.cooldownUntil || 0) > Date.now()) cooldownHits++;
+      lastRoute = rawRoute;
       this.markRouteStart(rawRoute);
       let released = false;
       const release = () => {
@@ -2746,12 +2889,31 @@ export class AccountPool {
               new Error(`Anthropic Upstream HTTP ${res.status}: ${text.slice(0, 300)}`),
               { status: res.status, headers: res.headers },
             );
+            const info = classifyError(err);
+            lastWasRateLimit = info.isRateLimit;
+            if (info.isRateLimit) cooldownHits++;
             this.markRouteFailure(rawRoute, err);
             lastErr = err;
             release();
             continue;
           }
           this.markRouteSuccess(rawRoute);
+          this.metrics?.record('model_route', {
+            model: requestedModel,
+            provider: rawRoute.preset,
+            accountId: rawRoute.accountId,
+            attempt: attempts,
+            ok: true,
+            durationMs: Date.now() - started,
+            detail: {
+              wireModel: r.wireModel,
+              attempts,
+              failovers,
+              primaryOk: failovers === 0,
+              cooldownSkipped: cooldownHits,
+              proxy: 'anthropic',
+            },
+          });
           if (!body?.stream) release();
           return { response: res, route: r, release };
         }
@@ -2773,12 +2935,31 @@ export class AccountPool {
             new Error(`OpenAI Upstream HTTP ${res.status}: ${text.slice(0, 300)}`),
             { status: res.status, headers: res.headers },
           );
+          const info = classifyError(err);
+          lastWasRateLimit = info.isRateLimit;
+          if (info.isRateLimit) cooldownHits++;
           this.markRouteFailure(rawRoute, err);
           lastErr = err;
           release();
           continue;
         }
         this.markRouteSuccess(rawRoute);
+        this.metrics?.record('model_route', {
+          model: requestedModel,
+          provider: rawRoute.preset,
+          accountId: rawRoute.accountId,
+          attempt: attempts,
+          ok: true,
+          durationMs: Date.now() - started,
+          detail: {
+            wireModel: r.wireModel,
+            attempts,
+            failovers,
+            primaryOk: failovers === 0,
+            cooldownSkipped: cooldownHits,
+            proxy: 'anthropic',
+          },
+        });
         if (body?.stream && res.body) {
           const translatedStream = openaiSseToAnthropicStream(
             res.body,
@@ -2806,10 +2987,30 @@ export class AccountPool {
       } catch (err) {
         release();
         if (signal?.aborted) throw err;
+        const info = classifyError(err);
+        lastWasRateLimit = info.isRateLimit;
+        if (info.isRateLimit) cooldownHits++;
         this.markRouteFailure(rawRoute, err);
         lastErr = err;
       }
     }
+    this.metrics?.record('model_route', {
+      model: requestedModel,
+      provider: lastRoute?.preset ?? null,
+      accountId: lastRoute?.accountId ?? null,
+      attempt: attempts,
+      ok: false,
+      durationMs: Date.now() - started,
+      code: lastWasRateLimit ? 'RATE_LIMITED' : 'PROVIDER_UNAVAILABLE',
+      detail: {
+        attempts,
+        failovers,
+        exhausted: true,
+        cooldownRejected: lastWasRateLimit,
+        cooldownSkipped: lastWasRateLimit ? Math.max(0, cooldownHits - 1) : cooldownHits,
+        proxy: 'anthropic',
+      },
+    });
     throw new Fault('PROVIDER_UNAVAILABLE', 503, {
       message: String(lastErr?.message ?? '所有号池账号均不可用'),
     });
@@ -2823,31 +3024,114 @@ export class PoolLlmAdapter extends LlmAdapter {
   }
 
   async *stream(o) {
+    const started = Date.now();
     const routes = this.pool.resolveRoutes(o.model, {
       provider: o.provider && o.provider !== 'pool' ? o.provider : null,
       sessionKey: o.sessionKey ?? null,
     });
     if (!routes.length) {
+      this.pool.metrics?.record('model_route', {
+        model: o.model,
+        provider: o.provider && o.provider !== 'pool' ? o.provider : null,
+        attempt: 0,
+        ok: false,
+        durationMs: Date.now() - started,
+        code: 'NO_AVAILABLE_PROVIDER',
+        detail: { attempts: 0, failovers: 0, exhausted: true },
+      });
       throw new Fault('PROVIDER_UNAVAILABLE', 503, {
         message: `没有为模型「${o.model}」配置可用的启用账号，请前往「设置 → 账号号池」添加账号并获取模型。`,
       });
     }
     let yielded = false;
     let lastErr = null;
+    let lastRoute = null;
+    let attempts = 0;
+    let failovers = 0;
+    let cooldownHits = 0;
+    let lastWasRateLimit = false;
     for (const r of routes) {
+      attempts++;
+      if (attempts > 1) failovers++;
+      if (Number(r.cooldownUntil || 0) > Date.now()) {
+        cooldownHits++;
+      }
+      lastRoute = r;
+      let routeEmitted = false;
       this.pool.markRouteStart(r);
       try {
         for await (const chunk of this.streamRoute(r, o)) {
+          if (!routeEmitted) {
+            routeEmitted = true;
+            yield {
+              type: 'route',
+              route: {
+                provider: r.preset,
+                accountId: r.accountId,
+                wireModel: r.wireModel,
+                attempts,
+                failovers,
+              },
+            };
+          }
           yielded = true;
           yield chunk;
         }
+        if (!routeEmitted) {
+          routeEmitted = true;
+          yield {
+            type: 'route',
+            route: {
+              provider: r.preset,
+              accountId: r.accountId,
+              wireModel: r.wireModel,
+              attempts,
+              failovers,
+            },
+          };
+        }
         this.pool.markRouteSuccess(r, o.sessionKey ?? null);
+        this.pool.metrics?.record('model_route', {
+          model: o.model,
+          provider: r.preset,
+          accountId: r.accountId,
+          attempt: attempts,
+          ok: true,
+          durationMs: Date.now() - started,
+          detail: {
+            wireModel: r.wireModel,
+            attempts,
+            failovers,
+            primaryOk: failovers === 0,
+            cooldownSkipped: cooldownHits,
+          },
+        });
         return;
       } catch (err) {
         lastErr = err;
         if (o.signal?.aborted) throw err;
+        const errInfo = classifyError(err);
+        lastWasRateLimit = errInfo.isRateLimit;
+        if (errInfo.isRateLimit) {
+          cooldownHits++;
+        }
         this.pool.markRouteFailure(r, err);
         if (yielded) {
+          this.pool.metrics?.record('model_route', {
+            model: o.model,
+            provider: r.preset,
+            accountId: r.accountId,
+            attempt: attempts,
+            ok: false,
+            durationMs: Date.now() - started,
+            code: 'PROVIDER_STREAM_INTERRUPTED',
+            detail: {
+              wireModel: r.wireModel,
+              attempts,
+              failovers,
+              cooldownSkipped: cooldownHits,
+            },
+          });
           throw new Fault('PROVIDER_STREAM_INTERRUPTED', 502, {
             message: String(err?.message ?? err),
           });
@@ -2856,6 +3140,22 @@ export class PoolLlmAdapter extends LlmAdapter {
         this.pool.markRouteEnd(r);
       }
     }
+    this.pool.metrics?.record('model_route', {
+      model: o.model,
+      provider: lastRoute?.preset ?? null,
+      accountId: lastRoute?.accountId ?? null,
+      attempt: attempts,
+      ok: false,
+      durationMs: Date.now() - started,
+      code: lastWasRateLimit ? 'RATE_LIMITED' : 'PROVIDER_UNAVAILABLE',
+      detail: {
+        attempts,
+        failovers,
+        exhausted: true,
+        cooldownRejected: lastWasRateLimit,
+        cooldownSkipped: lastWasRateLimit ? Math.max(0, cooldownHits - 1) : cooldownHits,
+      },
+    });
     throw new Fault('PROVIDER_UNAVAILABLE', 503, {
       message: String(lastErr?.message ?? '号池内所有候选账号请求失败'),
     });

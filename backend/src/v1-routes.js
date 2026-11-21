@@ -1,12 +1,15 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Fault, id as uuid } from './store.js';
+import { redactSecrets, sanitize } from './envelope.js';
 import { decide as decideLegacyApproval } from './tools.js';
 import { AuditLedgerService } from './governance/audit.js';
 import { ScheduledTaskRunner } from './governance/scheduler.js';
 import { registerRuntimeRoutes } from './routes/runtime-routes.js';
 import { registerSwarmRoutes } from './routes/swarm-routes.js';
 import { registerScheduleRoutes } from './routes/schedule-routes.js';
+import { classifyTrafficSource, withTraceContext } from './observability/trace.js';
+import { MetricsCollector } from './observability/metrics.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -61,10 +64,22 @@ async function getGitStatusFor(cwd) {
   }
 }
 
-function writeSseFrame(res, ev) {
+function isSafeGitBranchName(branch) {
+  if (!branch || typeof branch !== 'string') return false;
+  if (branch.startsWith('-') || branch.startsWith('/') || branch.endsWith('/')) return false;
+  if (branch.includes('..') || branch.includes('@{') || branch.endsWith('.lock')) return false;
+  return /^[a-zA-Z0-9._/-]{1,120}$/.test(branch);
+}
+
+function writeSseFrame(res, ev, onError = null) {
   if (res.destroyed || res.writableEnded) return false;
-  const idLine = ev.seq > 0 ? `id: ${ev.seq}\n` : '';
-  return res.write(`${idLine}event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+  try {
+    const idLine = ev.seq > 0 ? `id: ${ev.seq}\n` : '';
+    return res.write(`${idLine}event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+  } catch (err) {
+    onError?.(err);
+    return false;
+  }
 }
 
 export function v1Routes(
@@ -77,6 +92,7 @@ export function v1Routes(
     checkin,
     webLogin = null,
     controlPlane = null,
+    metrics = null,
     startedAt = Date.now(),
   },
 ) {
@@ -127,6 +143,11 @@ export function v1Routes(
 
   app.post('/v1/sessions', async (req) => {
     const body = req.body ?? {};
+    const traffic = classifyTrafficSource({
+      headers: req.headers,
+      trafficSource: body.trafficSource,
+      isSynthetic: body.isSynthetic,
+    });
     return directAgent.createSession({
       id: body.id,
       title: body.title,
@@ -134,6 +155,8 @@ export function v1Routes(
       workspaceRoot: body.workspaceRoot,
       mode: body.mode,
       permissionMode: body.permissionMode,
+      trafficSource: traffic.trafficSource,
+      isSynthetic: traffic.isSynthetic,
     });
   });
 
@@ -160,6 +183,22 @@ export function v1Routes(
 
   app.post('/v1/sessions/:id/turns', async (req) => {
     const body = req.body ?? {};
+    const hasTrafficOverride =
+      body.trafficSource !== undefined ||
+      body.isSynthetic !== undefined ||
+      Boolean(
+        req.headers?.['x-agent-traffic-source'] ||
+          req.headers?.['x-traffic-source'] ||
+          req.headers?.['x-agent-synthetic'] ||
+          req.headers?.['x-synthetic'],
+      );
+    const traffic = hasTrafficOverride
+      ? classifyTrafficSource({
+          headers: req.headers,
+          trafficSource: body.trafficSource,
+          isSynthetic: body.isSynthetic,
+        })
+      : null;
     return directAgent.startTurn(req.params.id, {
       input: body.input,
       clientTurnId: body.clientTurnId,
@@ -168,6 +207,7 @@ export function v1Routes(
       effort: body.effort,
       maxSteps: body.maxSteps,
       files: body.files,
+      ...(traffic ? { trafficSource: traffic.trafficSource, isSynthetic: traffic.isSynthetic } : {}),
     });
   });
 
@@ -237,40 +277,106 @@ export function v1Routes(
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    res.write(': connected\n\n');
 
-    let lastSeq = after;
-    const backlog = directAgent.listEvents(sessionId, { after, limit: 300 });
-    for (const ev of backlog) {
-      if (ev.seq > lastSeq) lastSeq = ev.seq;
-      writeSseFrame(res, ev);
+    let cleanedUp = false;
+    let unsubscribe = null;
+    let heartbeat = null;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+      if (unsubscribe) {
+        try {
+          unsubscribe();
+        } catch {
+          // ignore
+        }
+        unsubscribe = null;
+      }
+      streams.delete(cleanup);
+      try {
+        if (!res.destroyed && !res.writableEnded) res.end();
+      } catch {
+        // ignore closed socket error
+      }
+    };
+    streams.add(cleanup);
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+
+    try {
+      res.write(': connected\n\n');
+    } catch {
+      cleanup();
+      return;
     }
 
-    const unsubscribe = directAgent.subscribe(sessionId, (ev) => {
+    // Subscribe BEFORE paginated backlog replay (buffering live frames until replay finishes)
+    // so zero events are missed between the final cursor page and live delivery.
+    let lastSeq = after;
+    let replaying = true;
+    const pendingLive = [];
+    unsubscribe = directAgent.subscribe(sessionId, (ev) => {
+      if (cleanedUp) return;
+      if (replaying) {
+        pendingLive.push(ev);
+        return;
+      }
       if (ev.ephemeral) {
-        writeSseFrame(res, ev);
+        writeSseFrame(res, ev, cleanup);
         return;
       }
       if (ev.seq > lastSeq) {
         lastSeq = ev.seq;
-        writeSseFrame(res, ev);
+        writeSseFrame(res, ev, cleanup);
       }
     });
 
-    const heartbeat = setInterval(() => {
-      if (!res.destroyed && !res.writableEnded) {
+    const PAGE_SIZE = 300;
+    const MAX_BACKLOG_PAGES = 100;
+    for (let page = 0; page < MAX_BACKLOG_PAGES; page++) {
+      if (cleanedUp || res.destroyed || res.writableEnded) break;
+      const batch = directAgent.listEvents(sessionId, { after: lastSeq, limit: PAGE_SIZE });
+      if (!batch.length) break;
+      for (const ev of batch) {
+        if (cleanedUp || res.destroyed || res.writableEnded) break;
+        if (ev.seq > lastSeq) {
+          lastSeq = ev.seq;
+          writeSseFrame(res, ev, cleanup);
+        }
+      }
+      if (batch.length < PAGE_SIZE) break;
+    }
+
+    replaying = false;
+    for (const ev of pendingLive) {
+      if (cleanedUp || res.destroyed || res.writableEnded) break;
+      if (ev.ephemeral) {
+        writeSseFrame(res, ev, cleanup);
+      } else if (ev.seq > lastSeq) {
+        lastSeq = ev.seq;
+        writeSseFrame(res, ev, cleanup);
+      }
+    }
+    pendingLive.length = 0;
+
+    if (cleanedUp || res.destroyed || res.writableEnded) return;
+
+    heartbeat = setInterval(() => {
+      if (cleanedUp || res.destroyed || res.writableEnded) {
+        cleanup();
+        return;
+      }
+      try {
         res.write(': heartbeat\n\n');
+      } catch {
+        cleanup();
       }
     }, 15000);
-
-    const cleanup = () => {
-      clearInterval(heartbeat);
-      unsubscribe();
-      streams.delete(cleanup);
-      if (!res.destroyed && !res.writableEnded) res.end();
-    };
-    streams.add(cleanup);
-    res.on('close', cleanup);
+    heartbeat.unref?.();
   };
 
   app.get('/v1/sessions/:id/stream', async (req, reply) =>
@@ -374,7 +480,9 @@ export function v1Routes(
   );
 
   app.post('/v1/accounts/:id/test', async (req) =>
-    pool.testAccount(req.params.id),
+    withTraceContext({ trafficSource: 'probe', isSynthetic: true }, () =>
+      pool.testAccount(req.params.id),
+    ),
   );
 
   app.post('/v1/accounts/:id/sync-models', async (req) =>
@@ -491,7 +599,9 @@ export function v1Routes(
   );
 
   app.post('/v1/models/test', async (req) =>
-    pool.testModel(req.body ?? {}),
+    withTraceContext({ trafficSource: 'probe', isSynthetic: true }, () =>
+      pool.testModel(req.body ?? {}),
+    ),
   );
 
   // Local Reverse-Proxy Gateway: OpenAI (/v1/chat/completions) & Anthropic (/v1/messages)
@@ -612,10 +722,12 @@ export function v1Routes(
   app.post('/v1/git/checkout', async (req) => {
     const cwd = directAgent.getWorkspaceRoot();
     const branch = String(req.body?.branch || '').trim();
-    if (!branch || !/^[a-zA-Z0-9._/-]{1,120}$/.test(branch)) {
+    if (!isSafeGitBranchName(branch)) {
       throw new Fault('INVALID_BRANCH_NAME', 400);
     }
-    const args = req.body?.create ? ['checkout', '-b', branch] : ['checkout', branch];
+    const args = req.body?.create
+      ? ['checkout', '-b', branch, '--']
+      : ['checkout', branch, '--'];
     await runGit(cwd, args);
     return getGitStatusFor(cwd);
   });
@@ -623,6 +735,9 @@ export function v1Routes(
   app.post('/v1/git/init', async (req) => {
     const cwd = directAgent.getWorkspaceRoot();
     const initialBranch = String(req.body?.initialBranch || 'main').trim();
+    if (!isSafeGitBranchName(initialBranch)) {
+      throw new Fault('INVALID_BRANCH_NAME', 400);
+    }
     await runGit(cwd, ['init', '-b', initialBranch]);
     return getGitStatusFor(cwd);
   });
@@ -678,8 +793,8 @@ export function v1Routes(
     const scopeId = String(
       q.sessionId || (scopeType === 'workspace' ? directAgent.getWorkspaceRoot() : 'global'),
     );
-    const key = String(body.key || '').trim();
-    const value = String(body.value ?? '');
+    const key = sanitize(String(body.key || '')).trim();
+    const value = sanitize(redactSecrets(String(body.value ?? '')));
     if (!key) throw new Fault('MEMORY_KEY_REQUIRED', 400);
     const now = Date.now();
     store.tx(() => {
@@ -777,15 +892,27 @@ export function v1Routes(
     return { items: rows, summary: totals };
   });
 
+  const fallbackScheduler = controlPlane?.scheduler
+    ? null
+    : new ScheduledTaskRunner({ store, directAgent });
+  if (fallbackScheduler) {
+    app.addHook('preClose', async () => {
+      fallbackScheduler.stop();
+    });
+  }
+  const effectiveMetrics =
+    metrics ?? controlPlane?.metrics ?? directAgent?.metrics ?? new MetricsCollector({ store });
   const effectiveControlPlane = controlPlane ?? {
     auditService: new AuditLedgerService(store),
-    scheduler: new ScheduledTaskRunner({ store, directAgent }),
+    scheduler: fallbackScheduler,
+    metrics: effectiveMetrics,
     getOverview: null,
   };
   registerRuntimeRoutes(app, {
     store,
     directAgent,
     controlPlane: controlPlane ?? effectiveControlPlane,
+    metrics: effectiveMetrics,
   });
   registerSwarmRoutes(app, { store, directAgent });
   registerScheduleRoutes(app, {

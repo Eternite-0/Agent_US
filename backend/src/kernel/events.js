@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { compactTrace } from '../observability/trace.js';
+import { logEvent } from '../observability/logger.js';
 
 export const RUNTIME_EVENTS = Object.freeze({
   TURN_STARTED: 'turn/started',
@@ -60,6 +62,94 @@ export class EventRouter {
     this.memorySeq = 0;
   }
 
+  #buildPayload(data) {
+    const base =
+      data && typeof data === 'object' && !Array.isArray(data) ? { ...data } : {};
+    const trace = compactTrace();
+    if (Object.keys(trace).length > 0 && base._trace === undefined) {
+      base._trace = trace;
+    }
+    return base;
+  }
+
+  #dispatchChannel(channel, ev) {
+    const listeners = this.bus.rawListeners(channel);
+    for (const listener of listeners) {
+      try {
+        listener.call(this.bus, ev);
+      } catch (err) {
+        logEvent('warn', 'event_router.listener_error', {
+          channel,
+          eventType: ev?.type ?? null,
+          seq: ev?.seq ?? null,
+          sessionId: ev?.sessionId ?? null,
+          turnId: ev?.turnId ?? null,
+          error: err,
+        });
+      }
+    }
+  }
+
+  /**
+   * Inserts a persisted `direct_events` row (and optional ledger audit entry) inside an
+   * ALREADY-OPEN SQLite transaction without fanning out to in-memory listeners yet.
+   * Call `fanoutPersisted(record)` ONLY AFTER the enclosing transaction commits.
+   */
+  insertPersistedInTx({
+    sessionId,
+    turnId = null,
+    projectId = null,
+    taskId = null,
+    type,
+    data = {},
+    audit = true,
+    at = Date.now(),
+  }) {
+    const payload = this.#buildPayload(data);
+    let seq;
+    if (this.store?.db) {
+      const res = this.store.db
+        .prepare(
+          'INSERT INTO direct_events(sessionId, turnId, type, data, at) VALUES(?,?,?,?,?)',
+        )
+        .run(sessionId, turnId ?? null, type, JSON.stringify(payload), at);
+      if (audit && typeof this.store.event === 'function') {
+        this.store.event(`runtime.${type.replace(/\//g, '.')}`, projectId, taskId, {
+          sessionId,
+          turnId: turnId ?? null,
+          ...payload,
+        });
+      }
+      seq = Number(res.lastInsertRowid);
+    } else {
+      seq = ++this.memorySeq;
+    }
+
+    return {
+      seq,
+      sessionId,
+      turnId: turnId ?? null,
+      type,
+      data: payload,
+      at,
+    };
+  }
+
+  /**
+   * Fans out a committed event record to in-memory bus listeners with per-listener
+   * error isolation so one broken/throwing listener never aborts turns or starves siblings.
+   */
+  fanoutPersisted(record) {
+    if (!record) return record;
+    this.#dispatchChannel('event', record);
+    if (record.sessionId) this.#dispatchChannel(`session:${record.sessionId}`, record);
+    return record;
+  }
+
+  fanoutEvent(record) {
+    return this.fanoutPersisted(record);
+  }
+
   emitPersisted({
     sessionId,
     turnId = null,
@@ -69,41 +159,20 @@ export class EventRouter {
     data = {},
     audit = true,
   }) {
-    const at = Date.now();
-    const payload = data ?? {};
-    let seq;
-    if (this.store?.db) {
-      const write = () => {
-        const res = this.store.db
-          .prepare(
-            'INSERT INTO direct_events(sessionId, turnId, type, data, at) VALUES(?,?,?,?,?)',
-          )
-          .run(sessionId, turnId ?? null, type, JSON.stringify(payload), at);
-        if (audit && typeof this.store.event === 'function') {
-          this.store.event(`runtime.${type.replace(/\//g, '.')}`, projectId, taskId, {
-            sessionId,
-            turnId: turnId ?? null,
-            ...payload,
-          });
-        }
-        return Number(res.lastInsertRowid);
-      };
-      seq = this.store.tx(write);
-    } else {
-      seq = ++this.memorySeq;
-    }
-
-    const ev = {
-      seq,
+    const opts = {
       sessionId,
-      turnId: turnId ?? null,
+      turnId,
+      projectId,
+      taskId,
       type,
-      data: payload,
-      at,
+      data,
+      audit,
+      at: Date.now(),
     };
-    this.bus.emit('event', ev);
-    if (sessionId) this.bus.emit(`session:${sessionId}`, ev);
-    return ev;
+    const ev = this.store?.db
+      ? this.store.tx(() => this.insertPersistedInTx(opts))
+      : this.insertPersistedInTx(opts);
+    return this.fanoutPersisted(ev);
   }
 
   emitEphemeral({ sessionId, turnId = null, type, data = {} }) {
@@ -114,12 +183,10 @@ export class EventRouter {
       sessionId,
       turnId: turnId ?? null,
       type,
-      data: data ?? {},
+      data: this.#buildPayload(data),
       at: Date.now(),
     };
-    this.bus.emit('event', ev);
-    if (sessionId) this.bus.emit(`session:${sessionId}`, ev);
-    return ev;
+    return this.fanoutPersisted(ev);
   }
 
   subscribe(sessionId, listener) {
