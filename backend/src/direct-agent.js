@@ -1339,6 +1339,8 @@ export class DirectAgentRuntime {
         permissionMode: currentSession.permissionMode || effectivePermissionMode,
         projectInstructions,
         memoryQuery: input,
+        projectId: currentSession.projectId ?? workspaceRoot,
+        memoryTokenBudget: 1000,
         legacyMemoryText: memoryText,
         skillsText,
         planState: currentSession.plan,
