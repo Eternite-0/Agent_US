@@ -384,12 +384,12 @@ export class EvaluationService {
       });
       const finalRun = this.getRun(runId);
       this.#recordTrustedOutcomes(finalRun, mergedReport);
-      if (finalRun.model && finalRun.status === 'completed' && mergedReport.score?.total > 0 && mergedReport.score.passed === mergedReport.score.total) {
+      if (finalRun.model && finalRun.status === 'completed' && mergedReport.score?.total > 0) {
         try {
           const declared = this.capabilityRegistry?.getDeclared?.(finalRun.model);
           this.capabilityRegistry?.recordMeasuredFromEvaluation?.(
             { id: finalRun.model, capabilities: declared?.capabilities ?? {}, metrics: { passRate: mergedReport.score.passRate } },
-            { evaluationRunId: finalRun.id, evidenceRefs: mergedReport.results.filter((result) => result.status === 'passed').map((result) => `evaluation:${finalRun.id}:${result.taskId}`), taskIds: mergedReport.results.map((result) => result.taskId) },
+            { evaluationRunId: finalRun.id, evidenceRefs: mergedReport.results.filter((result) => result?.taskId && ['passed', 'failed'].includes(result.status)).map((result) => `evaluation:${finalRun.id}:${result.taskId}`), taskIds: mergedReport.results.map((result) => result.taskId) },
           );
         } catch {
           // Capability updates are advisory and cannot alter the durable evaluation result.
