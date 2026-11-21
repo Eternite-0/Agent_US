@@ -7,6 +7,8 @@ function makeStore() {
   const db = new DatabaseSync(':memory:');
   return {
     db,
+    evaluationRuns: new Map(),
+    get(kind, id) { return kind === 'evaluation_runs' ? this.evaluationRuns.get(String(id)) ?? null : null; },
     tx(fn) {
       db.exec('BEGIN');
       try {
@@ -62,7 +64,8 @@ test('memory supports verified confidence, decay, feedback, invalidation, deleti
   assert.ok(ranked[0].decay > ranked[1].decay);
   assert.equal(memory.retrieve({ query: 'owner', tokenBudget: 100 }).items.length, 1);
   assert.equal(memory.retrieve({ projectId: 'project-a', includeInvalid: true, tokenBudget: 100 }).items.length, 2);
-  const verified = memory.verifyWithEvidence({ id: fresh.id, evidence: { verifier: 'deterministic-test', passed: true }, sourceArtifact: 'artifact://memory-test' });
+  store.evaluationRuns.set('evaluation-memory-1', { id: 'evaluation-memory-1', projectId: 'project-a', status: 'completed', synthetic: true, score: { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 }, results: [{ taskId: 'memory-task-1', status: 'passed', passed: true }] });
+  const verified = memory.createTrustedVerifier()({ id: fresh.id, sourceTaskId: 'memory-task-1', evaluationRunId: 'evaluation-memory-1', evidence: { verifier: 'deterministic-test', passed: true }, sourceArtifact: 'artifact://memory-test' });
   assert.equal(verified.verified, true);
   assert.ok(verified.confidence >= 0.8);
   assert.equal(memory.feedback({ id: old.id, action: 'invalidate' }).status, 'invalid');

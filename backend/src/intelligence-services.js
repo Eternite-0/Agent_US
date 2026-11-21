@@ -18,7 +18,8 @@ export function createIntelligenceServices({ store, directAgent, providers = nul
     });
   }
   const planner = new AdaptivePlanner({ permissionCeiling: 'full' });
-  const evaluation = new EvaluationService({ store, directAgent, jobQueue: directAgent?.jobQueue ?? null });
+  const memory = new ExperienceMemoryService({ store });
+  const evaluation = new EvaluationService({ store, directAgent, jobQueue: directAgent?.jobQueue ?? null, memory, capabilityRegistry });
   evaluation.registerOnWorker(directAgent?.recoveryWorker);
   return {
     evaluation,
@@ -27,7 +28,7 @@ export function createIntelligenceServices({ store, directAgent, providers = nul
     capabilityRegistry,
     teamOptimizer: new TeamOptimizer({}),
     communication: new CommunicationBus({ adapter: new StoreCommunicationAdapter({ store }) }),
-    memory: new ExperienceMemoryService({ store }),
+    memory,
   };
 }
 

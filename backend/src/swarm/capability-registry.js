@@ -110,7 +110,26 @@ export class CapabilityProfileRegistry {
     if (!evaluationRunId || evidenceRefs.length === 0) {
       throw new TypeError('Capability measurement requires evaluationRunId and evidenceRefs');
     }
-    const sampleCount = Math.max(1, Number(spec.sampleCount ?? source.sampleCount ?? 1));
+    const run = this.store?.get ? (() => { try { return this.store.get('evaluation_runs', evaluationRunId); } catch { return null; } })() : null;
+    const taskIds = [...new Set((source.taskIds ?? spec.taskIds ?? []).map(String).filter(Boolean))];
+    if (this.store && (!run || run.status !== 'completed' || run.synthetic !== true || !run.score)) {
+      throw new TypeError('Capability measurement requires a persisted completed evaluation run');
+    }
+    if (run && source.benchmarkId && source.benchmarkId !== run.benchmarkId) throw new TypeError('Benchmark evidence does not match evaluation run');
+    if (run && source.benchmarkVersion && source.benchmarkVersion !== run.benchmarkVersion) throw new TypeError('Benchmark version does not match evaluation run');
+    if (run && source.datasetVersion && source.datasetVersion !== run.datasetVersion) throw new TypeError('Dataset version does not match evaluation run');
+    const resultEvidence = (run?.results ?? []).filter((result) =>
+      result && (taskIds.length === 0 || taskIds.includes(String(result.taskId))) &&
+      (evidenceRefs.includes(String(result.artifactId ?? '')) || evidenceRefs.includes(String(result.evidenceRef ?? '')) || evidenceRefs.includes(`evaluation:${evaluationRunId}:${result.taskId}`)),
+    );
+    if (this.store && !resultEvidence.length) throw new TypeError('Capability measurement evidence must reference evaluation results from the run');
+    const verifiedResults = this.store
+      ? resultEvidence.filter((result) => result.status === 'passed' && result.passed === true)
+      : [{ taskId: taskIds[0] ?? 'external-evidence', status: 'passed', passed: true }];
+    const failedResults = resultEvidence.filter((result) => result.status === 'failed' || result.status === 'timeout' || result.status === 'cancelled');
+    const sampleCount = verifiedResults.length + failedResults.length;
+    if (sampleCount < 1) throw new TypeError('Capability measurement requires completed judged task evidence');
+    const empirical = verifiedResults.length / sampleCount;
     const confidence = measuredConfidence({ sampleCount, confidence: undefined });
     const capabilities = normalizeVector(spec.capabilities ?? spec.vector ?? {});
     const measurement = {
@@ -118,16 +137,17 @@ export class CapabilityProfileRegistry {
       source: 'measured',
       sampleCount,
       confidence,
-      empiricalScore: spec.empiricalScore == null ? null : clamp(spec.empiricalScore),
+      empiricalScore: run ? Number(empirical.toFixed(4)) : (spec.empiricalScore == null ? Number(empirical.toFixed(4)) : clamp(spec.empiricalScore)),
       capabilities,
-      metrics: spec.metrics ? structuredClone(spec.metrics) : {},
+      metrics: { ...(spec.metrics ? structuredClone(spec.metrics) : {}), passedSamples: verifiedResults.length, failedSamples: failedResults.length },
       lastMeasuredAt: spec.lastMeasuredAt ?? Date.now(),
       evidenceRefs,
       evaluation: {
         evaluationRunId,
-        benchmarkId: source.benchmarkId ?? spec.benchmarkId ?? null,
-        benchmarkVersion: source.benchmarkVersion ?? spec.benchmarkVersion ?? null,
-        datasetVersion: source.datasetVersion ?? spec.datasetVersion ?? null,
+        benchmarkId: run?.benchmarkId ?? source.benchmarkId ?? spec.benchmarkId ?? null,
+        benchmarkVersion: run?.benchmarkVersion ?? source.benchmarkVersion ?? spec.benchmarkVersion ?? null,
+        datasetVersion: run?.datasetVersion ?? source.datasetVersion ?? spec.datasetVersion ?? null,
+        sampleTaskIds: resultEvidence.map((result) => result.taskId),
       },
     };
     this.measured.set(id, measurement);

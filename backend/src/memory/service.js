@@ -139,7 +139,33 @@ function assertProject(projectId) {
   return id;
 }
 
+function assertTrustedEvidence({ projectId, evidence, sourceTaskId = null, evaluationRunId = null } = {}) {
+  const project = assertProject(projectId);
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    throw new TypeError('verification evidence is required');
+  }
+  const taskId = cleanText(sourceTaskId ?? evidence.sourceTaskId ?? evidence.taskId ?? '', 200);
+  const runId = cleanText(evaluationRunId ?? evidence.evaluationRunId ?? '', 200);
+  if (!taskId || !runId) {
+    throw new TypeError('trusted verification requires sourceTaskId and evaluationRunId');
+  }
+  if (evidence.projectId != null && assertProject(evidence.projectId) !== project) {
+    throw new TypeError('verification evidence project does not match memory project');
+  }
+  const score = evidence.score;
+  if (score && typeof score === 'object') {
+    const total = Number(score.total);
+    const passed = Number(score.passed);
+    if (Number(score.failed) > 0 || Number(score.cancelled) > 0 || Number(score.timedOut) > 0 ||
+      (Number.isFinite(total) && Number.isFinite(passed) && passed < total)) {
+      throw new TypeError('only fully passed evaluation evidence may verify memory');
+    }
+  }
+  return { project, sourceTaskId: taskId, evaluationRunId: runId };
+}
+
 export class ExperienceMemoryService {
+  #verificationAuthority = Symbol('trusted-memory-verification');
   constructor({ store, clock = Date.now, halfLifeMs = DEFAULT_HALF_LIFE_MS, projectId = null } = {}) {
     this.store = store;
     this.db = ensureMemorySchema(store);
@@ -304,23 +330,50 @@ export class ExperienceMemoryService {
   }
 
   rememberVerified(input, { projectId = this.projectId, source = 'server-verification', verificationEvidence, sourceArtifact = null } = {}) {
-    const project = assertProject(projectId);
-    if (!verificationEvidence || typeof verificationEvidence !== 'object') throw new TypeError('verificationEvidence is required');
+    const trusted = assertTrustedEvidence({ projectId, evidence: verificationEvidence });
+    const persistedRun = this.store?.get?.('evaluation_runs', trusted.evaluationRunId);
+    if (typeof this.store?.get === 'function' && (!persistedRun || persistedRun.status !== 'completed' || persistedRun.synthetic !== true || persistedRun.projectId !== trusted.project)) {
+      throw new TypeError('trusted verification requires a completed evaluation run in the same project');
+    }
+    const project = trusted.project;
+    const normalizedEvidence = sanitizeMetadata({
+      ...verificationEvidence,
+      projectId: project,
+      sourceTaskId: trusted.sourceTaskId,
+      evaluationRunId: trusted.evaluationRunId,
+    });
     const extracted = this.extract(input, { projectId: project, source });
     const normalized = extracted.map((candidate) => this.normalize({ ...candidate, projectId: project, verified: true }, {
-      projectId: project, source, trustedVerification: true, verificationEvidence, sourceArtifact,
+      projectId: project, source, trustedVerification: true, verificationEvidence: normalizedEvidence, sourceArtifact,
     })).filter((candidate) => this.validate(candidate).valid);
     return this.persist(this.dedupe(normalized, { projectId: project }), { projectId: project });
   }
 
-  verifyWithEvidence({ projectId = this.projectId, id: memoryId, evidence, sourceArtifact = null, now = nowValue(this.clock) } = {}) {
-    const project = assertProject(projectId);
-    if (!evidence || typeof evidence !== 'object') throw new TypeError('verification evidence is required');
+  createTrustedVerifier() {
+    const authority = this.#verificationAuthority;
+    return (input = {}) => this.verifyWithEvidence({ ...input, authority });
+  }
+
+  verifyWithEvidence({ projectId = this.projectId, id: memoryId, evidence, sourceArtifact = null, sourceTaskId = null, evaluationRunId = null, authority = null, now = nowValue(this.clock) } = {}) {
+    if (authority !== this.#verificationAuthority) throw new TypeError('trusted verification context is required');
+    const trusted = assertTrustedEvidence({ projectId, evidence, sourceTaskId, evaluationRunId });
+    const persistedRun = this.store?.get?.('evaluation_runs', trusted.evaluationRunId);
+    if (typeof this.store?.get === 'function' && (!persistedRun || persistedRun.status !== 'completed' || persistedRun.synthetic !== true || persistedRun.projectId !== trusted.project)) {
+      throw new TypeError('trusted verification requires a completed evaluation run in the same project');
+    }
+    const project = trusted.project;
+    const normalizedEvidence = sanitizeMetadata({
+      ...evidence,
+      projectId: project,
+      sourceTaskId: trusted.sourceTaskId,
+      evaluationRunId: trusted.evaluationRunId,
+      verifiedAt: now,
+    });
     const row = this.db.prepare('SELECT * FROM experience_memory WHERE id=? AND projectId=?').get(memoryId, project);
     if (!row) return null;
     return tx(this.store, () => {
       this.db.prepare('UPDATE experience_memory SET verified=1, confidence=MAX(confidence, 0.8), verificationEvidence=?, sourceArtifact=?, updatedAt=? WHERE id=? AND projectId=?')
-        .run(JSON.stringify(sanitizeMetadata(evidence)), sourceArtifact ? cleanText(sourceArtifact, 500) : row.sourceArtifact ?? null, now, memoryId, project);
+        .run(JSON.stringify(normalizedEvidence), sourceArtifact ? cleanText(sourceArtifact, 500) : row.sourceArtifact ?? null, now, memoryId, project);
       return rowToMemory(this.db.prepare('SELECT * FROM experience_memory WHERE id=? AND projectId=?').get(memoryId, project));
     });
   }

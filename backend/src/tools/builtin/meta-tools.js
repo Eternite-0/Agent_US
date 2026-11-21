@@ -298,7 +298,7 @@ export function createMetaTools({
         }),
         async execute(args, ctx) {
           await guardFallback('send_agent_message', args, ctx);
-          const res = await sendAgentMessage(args);
+          const res = await sendAgentMessage({ ...args, operationId: ctx?.callId ?? null });
           return wrapResult('send_agent_message', JSON.stringify(res));
         },
       }),

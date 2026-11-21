@@ -264,6 +264,7 @@ export class DirectAgentRuntime {
       agentRegistry: this.agentCapabilities,
       pool: this.pool,
       feedbackTracker: this.modelFeedback,
+      capabilityRegistry: null,
     });
     this.mailbox = new InterAgentMailbox({ store: this.store, eventRouter: this.eventRouter });
     this.swarmPlanner = new DynamicTaskPlanner({
@@ -324,6 +325,7 @@ export class DirectAgentRuntime {
       evidenceVerifier: this.evidenceVerifier,
       modelFeedback: this.modelFeedback,
       replanner: this.swarmReplanner,
+      teamOptimizer: null,
     });
 
     this.shutdownCoordinator = new ShutdownCoordinator();
@@ -396,6 +398,13 @@ export class DirectAgentRuntime {
     if (intelligence !== null && (typeof intelligence !== 'object' || !intelligence)) throw new TypeError('intelligence must be an object or null');
     this.intelligence = intelligence;
     if (intelligence?.memory) this.contextAssembler.experienceMemoryService = intelligence.memory;
+    if (intelligence?.communication) this.mailbox.setCommunicationBus?.(intelligence.communication);
+    if (intelligence?.capabilityRegistry) {
+      this.adaptiveRouter.capabilityRegistry = intelligence.capabilityRegistry;
+      this.intelligenceCapabilityRegistry = intelligence.capabilityRegistry;
+      this.swarmOrchestrator.capabilityRegistry = intelligence.capabilityRegistry;
+    }
+    if (intelligence?.teamOptimizer) this.swarmOrchestrator.teamOptimizer = intelligence.teamOptimizer;
     return intelligence;
   }
 
@@ -1317,14 +1326,20 @@ export class DirectAgentRuntime {
           });
           return out.summary;
         },
-        sendAgentMessage: ({ toAgentId, kind = 'note', message }) =>
-          this.mailbox.send({
-            sessionId,
-            fromAgentId: turnId,
-            toAgentId,
-            kind,
-            payload: message,
-          }),
+        sendAgentMessage: ({ toAgentId, kind = 'note', message, operationId = null }) => {
+          if (this.intelligence?.communication) {
+            return this.intelligence.communication.send({
+              conversationId: sessionId,
+              runId: turnId,
+              fromAgentId: turnId,
+              toAgentId,
+              kind,
+              idempotencyKey: `${turnId}:${toAgentId}:${kind}:${operationId ?? message?.id ?? message?.sequence ?? '0'}`,
+              payload: message,
+            });
+          }
+          return this.mailbox.send({ sessionId, fromAgentId: turnId, toAgentId, kind, payload: message });
+        },
       });
 
       const currentSession = this.getSession(sessionId);

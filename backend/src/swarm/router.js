@@ -5,11 +5,12 @@ import { CAPABILITY_DIMENSIONS } from './capabilities.js';
  * by blending static 8-dimensional priors with confidence-weighted empirical feedback.
  */
 export class AdaptiveModelRouter {
-  constructor({ modelRegistry, agentRegistry, pool = null, feedbackTracker = null }) {
+  constructor({ modelRegistry, agentRegistry, pool = null, feedbackTracker = null, capabilityRegistry = null }) {
     this.modelRegistry = modelRegistry;
     this.agentRegistry = agentRegistry;
     this.pool = pool;
     this.feedbackTracker = feedbackTracker;
+    this.capabilityRegistry = capabilityRegistry;
   }
 
   select({
@@ -61,7 +62,11 @@ export class AdaptiveModelRouter {
     const evaluated = [];
     let best = null;
 
-    for (const c of candidates) {
+    for (const baseCandidate of candidates) {
+      const persisted = this.capabilityRegistry?.getEffectiveCapability?.(baseCandidate.model) ?? null;
+      const c = persisted?.effective
+        ? { ...baseCandidate, capabilities: { ...baseCandidate.capabilities, ...Object.fromEntries(CAPABILITY_DIMENSIONS.map((dim) => [dim, persisted.effective[dim]])) }, persistedCapability: persisted }
+        : baseCandidate;
       let penalty = 0;
       if (!c.healthy) penalty += 3.0;
       if (requiresVision && !c.capabilities.multimodal) penalty += 5.0;
@@ -93,10 +98,10 @@ export class AdaptiveModelRouter {
         healthy: c.healthy,
         costWeight: c.costWeight,
         priorScore,
-        empiricalScore: emp,
-        confidence: conf,
+        empiricalScore: emp ?? c.persistedCapability?.effective?.empiricalScore ?? null,
+        confidence: Math.max(conf, c.persistedCapability?.effective?.confidence ?? 0),
         sampleCount: fb?.sampleCount ?? 0,
-        metrics: fb?.metrics ?? null,
+        metrics: fb?.metrics ?? c.persistedCapability?.measured?.metrics ?? null,
         penalty: Number(penalty.toFixed(4)),
         finalScore,
       };

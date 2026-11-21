@@ -80,7 +80,7 @@ jobs:
           echo "::group::Core & Non-Env-Gated Backend Regression Suites"
           shopt -s nullglob
           TESTS=()
-          for f in test/*.test.js; do
+          while IFS= read -r -d '' f; do
             base="$(basename "$f")"
             case "$base" in
               security.test.js|providers.test.js|integration.test.js)
@@ -90,7 +90,7 @@ jobs:
                 TESTS+=("$f")
                 ;;
             esac
-          done
+          done < <(find test -type f -name '*.test.js' ! -name 'security.test.js' ! -name 'providers.test.js' ! -name 'integration.test.js' -print0 | sort -z)
           if [ "${#TESTS[@]}" -eq 0 ]; then
             echo "No backend test files discovered" >&2
             exit 1
@@ -128,10 +128,10 @@ jobs:
           Write-Host "::group::Core & Non-Env-Gated Backend Regression Suites"
           $envGated = @('security.test.js', 'providers.test.js', 'integration.test.js')
           $tests = @(
-            Get-ChildItem -Path 'test/*.test.js' |
+            Get-ChildItem -Path 'test' -Recurse -Filter '*.test.js' -File |
               Where-Object { $envGated -notcontains $_.Name } |
-              Sort-Object Name |
-              ForEach-Object { "test/$($_.Name)" }
+              Sort-Object FullName |
+              ForEach-Object { $_.FullName.Substring((Get-Location).Path.Length + 1).Replace([System.IO.Path]::DirectorySeparatorChar, [char]'/') }
           )
           if ($tests.Count -eq 0) {
             Write-Error "No backend test files discovered"

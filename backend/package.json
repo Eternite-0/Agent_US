@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/main.js",
-    "test": "node --test test/*.test.js",
+    "test": "node --test",
     "check": "node scripts/check.js && tsc --noEmit",
     "test:integration": "node --test test/integration.test.js",
     "images": "pwsh -NoProfile -File scripts/build-images.ps1"

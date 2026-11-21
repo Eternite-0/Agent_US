@@ -46,7 +46,8 @@ test('CapabilityProfileRegistry persists declarations and evaluation-backed meas
   try {
     const first = new CapabilityProfileRegistry({ store });
     first.registerDeclared({ id: 'persisted-model', capabilities: { coding: 0.8 } });
-    first.recordMeasuredFromEvaluation({ id: 'persisted-model', sampleCount: 4, capabilities: { coding: 0.7 }, empiricalScore: 0.75, evidenceRefs: ['artifact://eval/1'] }, { evaluationRunId: 'eval-1', benchmarkId: 'smoke', benchmarkVersion: '1', datasetVersion: '1' });
+    store.add('evaluation_runs', { id: 'eval-1', benchmarkId: 'smoke', benchmarkVersion: '1', datasetVersion: '1', status: 'completed', synthetic: true, score: { passRate: 1 }, results: [{ taskId: 'task-1', status: 'passed', passed: true, artifactId: 'artifact://eval/1' }] }, null, null, 'eval-1');
+    first.recordMeasuredFromEvaluation({ id: 'persisted-model', sampleCount: 1, capabilities: { coding: 0.7 }, evidenceRefs: ['artifact://eval/1'] }, { evaluationRunId: 'eval-1', benchmarkId: 'smoke', benchmarkVersion: '1', datasetVersion: '1' });
     store.close();
     store = new Store(dbPath);
     const reopened = new CapabilityProfileRegistry({ store });

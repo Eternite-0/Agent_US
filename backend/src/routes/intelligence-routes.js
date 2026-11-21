@@ -29,6 +29,7 @@ export function registerIntelligenceRoutes(app, {
   teamOptimizer = null,
   communication = null,
   memory = null,
+  directAgent = null,
 } = {}) {
   const effectiveReplanner = replanner ?? new AdaptiveReplanner({ planner });
 
@@ -89,6 +90,25 @@ export function registerIntelligenceRoutes(app, {
   });
   app.post('/v1/plans/validate', async (req) => {
     try { return planner.validate(req.body?.plan ?? req.body ?? {}); } catch (error) { throw asRouteError(error); }
+  });
+  app.post('/v1/plans/execute', async (req, reply) => {
+    if (!directAgent?.submitPlannedSwarmRun) fail('SWARM_UNAVAILABLE', 503);
+    try {
+      const plan = planner.validate(req.body?.plan ?? req.body ?? {});
+      const result = directAgent.submitPlannedSwarmRun({
+        plan,
+        sessionId: req.body?.sessionId ?? null,
+        rootTurnId: req.body?.rootTurnId ?? null,
+        workspaceRoot: req.body?.workspaceRoot ?? null,
+        parentPermissionMode: req.body?.permissionMode ?? plan.permissionMode,
+        maxConcurrency: req.body?.maxConcurrency ?? 3,
+        budget: req.body?.budget ?? plan.budget,
+        maxReplans: req.body?.maxReplans ?? 2,
+        trafficSource: 'production',
+        isSynthetic: 0,
+      });
+      return reply.code(202).send(result);
+    } catch (error) { throw asRouteError(error); }
   });
   app.post('/v1/plans/replan', async (req) => {
     try {
@@ -156,6 +176,7 @@ export function registerIntelligenceRoutes(app, {
     try {
       const body = req.body ?? {};
       if (body.action === 'verify') fail('MEMORY_VERIFICATION_FORBIDDEN', 403, 'use trusted server-side verification evidence');
+      if (body.verified === true) fail('MEMORY_VERIFICATION_FORBIDDEN', 403, 'verified memory can only be created by trusted server-side verification');
       return memory.feedback({ id: req.params.id, ...body });
     } catch (error) { throw asRouteError(error); }
   });
