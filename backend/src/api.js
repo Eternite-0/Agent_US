@@ -21,6 +21,7 @@ export function api(
     webLogin = null,
     controlPlane = null,
     metrics = null,
+    intelligence = null,
   } = {},
 ) {
   if (!token || token.length < 24)
@@ -220,6 +221,6 @@ export function api(
     };
   });
   publicRoutes(app, store, providers);
-  v1Routes(app, { store, providers, pool, directAgent, checkin, webLogin, controlPlane, metrics });
+  v1Routes(app, { store, providers, pool, directAgent, checkin, webLogin, controlPlane, metrics, intelligence });
   return app;
 }

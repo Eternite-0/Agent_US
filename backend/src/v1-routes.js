@@ -8,8 +8,9 @@ import { ScheduledTaskRunner } from './governance/scheduler.js';
 import { registerRuntimeRoutes } from './routes/runtime-routes.js';
 import { registerSwarmRoutes } from './routes/swarm-routes.js';
 import { registerScheduleRoutes } from './routes/schedule-routes.js';
-import { classifyTrafficSource, withTraceContext } from './observability/trace.js';
+import { getTraceContext, withTraceContext } from './observability/trace.js';
 import { MetricsCollector } from './observability/metrics.js';
+import { registerIntelligenceRoutes } from './routes/intelligence-routes.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -93,9 +94,11 @@ export function v1Routes(
     webLogin = null,
     controlPlane = null,
     metrics = null,
+    intelligence = null,
     startedAt = Date.now(),
   },
 ) {
+  registerIntelligenceRoutes(app, intelligence ?? {});
   if (!pool || !directAgent) return;
 
   const streams = new Set();
@@ -143,11 +146,11 @@ export function v1Routes(
 
   app.post('/v1/sessions', async (req) => {
     const body = req.body ?? {};
-    const traffic = classifyTrafficSource({
-      headers: req.headers,
-      trafficSource: body.trafficSource,
-      isSynthetic: body.isSynthetic,
-    });
+    const trace = getTraceContext();
+    const traffic = {
+      trafficSource: trace.trafficSource || 'production',
+      isSynthetic: Boolean(trace.isSynthetic),
+    };
     return directAgent.createSession({
       id: body.id,
       title: body.title,
@@ -159,7 +162,6 @@ export function v1Routes(
       isSynthetic: traffic.isSynthetic,
     });
   });
-
   app.get('/v1/sessions/:id', async (req) =>
     directAgent.getSession(req.params.id),
   );
@@ -183,22 +185,11 @@ export function v1Routes(
 
   app.post('/v1/sessions/:id/turns', async (req) => {
     const body = req.body ?? {};
-    const hasTrafficOverride =
-      body.trafficSource !== undefined ||
-      body.isSynthetic !== undefined ||
-      Boolean(
-        req.headers?.['x-agent-traffic-source'] ||
-          req.headers?.['x-traffic-source'] ||
-          req.headers?.['x-agent-synthetic'] ||
-          req.headers?.['x-synthetic'],
-      );
-    const traffic = hasTrafficOverride
-      ? classifyTrafficSource({
-          headers: req.headers,
-          trafficSource: body.trafficSource,
-          isSynthetic: body.isSynthetic,
-        })
-      : null;
+    const trace = getTraceContext();
+    const traffic = {
+      trafficSource: trace.trafficSource || 'production',
+      isSynthetic: Boolean(trace.isSynthetic),
+    };
     return directAgent.startTurn(req.params.id, {
       input: body.input,
       clientTurnId: body.clientTurnId,

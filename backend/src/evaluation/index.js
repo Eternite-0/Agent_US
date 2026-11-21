@@ -7,3 +7,10 @@ export * from './recorder.js';
 export * from './regression.js';
 export * from './fixtures.js';
 export * from './runner.js';
+export {
+  BENCHMARK_ID,
+  BENCHMARK_VERSION,
+  DATASET_VERSION,
+  EvaluationService,
+  createDirectRuntimeAdapter,
+} from './service.js';

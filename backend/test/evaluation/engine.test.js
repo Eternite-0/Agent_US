@@ -20,7 +20,7 @@ test('evaluation dataset exposes 30 deterministic local metadata tasks', () => {
 test('registry rejects duplicate ids and filters metadata tasks', () => {
   const registry = new EvaluationRegistry(BENCHMARK_DATASET);
   assert.equal(registry.size, 30);
-  assert.equal(registry.list({ category: 'metadata-identity' }).length, 5);
+  assert.equal(registry.list({ category: 'code-generation-repair' }).length, 8);
   assert.throws(() => registry.register(BENCHMARK_DATASET[0]), /Duplicate evaluation task/);
 });
 
@@ -123,4 +123,3 @@ test('recorder persistence is injectable and regression scoring is deterministic
   });
   assert.equal(compareRegression({ passRate: 1, timedOut: 0, meanDurationMs: 1 }, { passRate: 0.5, timedOut: 1, meanDurationMs: 2 }).passed, false);
 });
-

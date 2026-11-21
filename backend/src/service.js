@@ -19,6 +19,7 @@ import { createDefaultSeams } from './seams.js';
 import { ControlPlane } from './governance/control-plane.js';
 import { ShutdownCoordinator } from './runtime/shutdown.js';
 import { MetricsCollector } from './observability/metrics.js';
+import { createIntelligenceServices } from './intelligence-services.js';
 
 const ROLES = ['Researcher', 'Planner', 'Coder', 'Reviewer', 'Tester'];
 
@@ -54,7 +55,7 @@ export async function service({
 }) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const store = new Store(join(root, 'engine.sqlite'));
-  let ctx, providers, pool, directAgent, controlPlane, checkin, engine, app;
+  let ctx, providers, pool, directAgent, controlPlane, checkin, engine, app, intelligence;
   try {
     ctx = await bundle(store, '', {
       seams: seams === undefined ? createDefaultSeams(store) : seams,
@@ -94,6 +95,7 @@ export async function service({
       };
     };
     controlPlane = new ControlPlane({ store, pool, directAgent, metrics });
+    intelligence = createIntelligenceServices({ store, directAgent, providers });
     app = api(ctx.taskEngine, token, providers, {
       snapshotPin,
       pool,
@@ -102,6 +104,7 @@ export async function service({
       webLogin,
       controlPlane,
       metrics,
+      intelligence,
     });
     const refinement = new RefinementService(store, {
       enabled: configuration.refinement?.enabled ?? false,
@@ -159,6 +162,10 @@ export async function service({
       },
       { order: 20, timeoutMs: 3000 },
     );
+    shutdownCoordinator.registerStage('evaluation', () => intelligence?.evaluation?.close(), {
+      order: 25,
+      timeoutMs: 3000,
+    });
     shutdownCoordinator.registerStage('direct_agent', () => directAgent?.close(), {
       order: 30,
       timeoutMs: 5000,
@@ -184,6 +191,7 @@ export async function service({
       directAgent,
       controlPlane,
       metrics,
+      intelligence,
       checkin,
       judgment,
       refinement,
@@ -196,6 +204,7 @@ export async function service({
   } catch (e) {
     checkin?.stop();
     controlPlane?.close();
+    intelligence?.evaluation?.close();
     await directAgent?.close();
     await app?.close();
     await engine?.stop();

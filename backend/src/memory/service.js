@@ -41,6 +41,24 @@ function parseJson(value, fallback) {
   }
 }
 
+function sanitizeMetadata(value, seen = new WeakSet(), depth = 0) {
+  if (depth > 8) return '[metadata-depth-limited]';
+  if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return typeof value === 'string' ? cleanText(value, 1_000) : value;
+  }
+  if (typeof value !== 'object') return undefined;
+  if (seen.has(value)) return '[metadata-cycle]';
+  seen.add(value);
+  if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitizeMetadata(item, seen, depth + 1)).filter((item) => item !== undefined);
+  const out = {};
+  for (const [key, item] of Object.entries(value).slice(0, 100)) {
+    const safe = sanitizeMetadata(item, seen, depth + 1);
+    if (safe !== undefined) out[cleanText(key, 100)] = safe;
+  }
+  seen.delete(value);
+  return out;
+}
+
 function asTags(tags) {
   const values = Array.isArray(tags) ? tags : [];
   return [...new Set(values.map((tag) => cleanText(tag, 64).toLowerCase()).filter(Boolean))].slice(0, MAX_TAGS);
@@ -151,7 +169,7 @@ export class ExperienceMemoryService {
     const key = cleanText(candidate?.key ?? candidate?.memoryKey ?? '', 200).toLowerCase();
     const type = cleanText(candidate?.type ?? 'note', 32).toLowerCase() || 'note';
     const tags = asTags(candidate?.tags);
-    const metadata = candidate?.metadata && typeof candidate.metadata === 'object' ? candidate.metadata : {};
+    const metadata = candidate?.metadata && typeof candidate.metadata === 'object' ? sanitizeMetadata(candidate.metadata) : {};
     const normalizedContent = normalizeText(content);
     return {
       projectId: project,
@@ -281,7 +299,8 @@ export class ExperienceMemoryService {
     const ranked = this.rank(rows.map(rowToMemory), { query, now }).filter((item) => !String(query).trim() || item.relevance > 0 || item.verified);
     const picked = [];
     let usedTokens = 0;
-    for (const item of ranked.slice(0, Math.max(0, Number(limit) || 0))) {
+    for (const item of ranked) {
+      if (picked.length >= Math.max(0, Number(limit) || 0)) break;
       if (item.expiresAt != null && item.expiresAt <= now) {
         this.db.prepare(`UPDATE experience_memory SET status='expired', updatedAt=? WHERE id=? AND status='active'`).run(now, item.id);
         continue;
