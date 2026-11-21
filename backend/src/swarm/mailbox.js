@@ -121,6 +121,12 @@ export class InterAgentMailbox {
     return this.bus.ack(String(messageId), String(agentId), deliveryToken);
   }
 
+  bindClaimToChildInTx(input = {}) {
+    if (!this.bus?.bindClaimToChildInTx) throw new TypeError('CommunicationBus child binding is required');
+    return this.bus.bindClaimToChildInTx(input);
+  }
+
+
   retry(messageId, agentId, options = {}) {
     return this.bus.retry(String(messageId), String(agentId), options);
   }

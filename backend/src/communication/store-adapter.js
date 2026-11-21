@@ -89,7 +89,7 @@ export class StoreCommunicationAdapter {
       const message = {
         ...clone(draft), messageId: randomUUID(), sequence, status: 'pending', attempts: 0,
         nextAttemptAt: draft.createdAt, deliveredAt: null, ackDeadline: null,
-        deliveryToken: null, acknowledgedAt: null, lastError: null,
+        deliveryToken: null, acknowledgedAt: null, lastError: null, deliveryBinding: null,
       };
       this.store.add(this.kind, message, null, null, message.messageId);
       return { status: 'created', message: clone(message) };
@@ -112,11 +112,66 @@ export class StoreCommunicationAdapter {
     });
   }
 
+  /**
+   * Binds a claimed delivery to the child turn created by the same SQLite
+   * transaction. This method is intentionally synchronous and must be called
+   * while Store.tx() is already open; that makes the claim fence durable with
+   * the child-turn row instead of leaving an ACK-only window.
+   */
+  bindClaimToChildInTx({
+    messageId,
+    agentId,
+    deliveryToken,
+    runId = null,
+    nodeId = null,
+    childSessionId,
+    childTurnId,
+    jobId = null,
+    fence = null,
+    attempt = 0,
+    now,
+  }) {
+    if (!this.store?.db?.isTransaction) {
+      throw new CommunicationStateError('BINDING_REQUIRES_TRANSACTION');
+    }
+    const message = this.#messages().find((item) => item.messageId === messageId);
+    if (!message) throw new CommunicationStateError('MESSAGE_NOT_FOUND');
+    if (message.toAgentId !== agentId) throw new CommunicationStateError('BINDING_RECIPIENT_MISMATCH');
+    if (!deliveryToken || deliveryToken !== message.deliveryToken) {
+      throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
+    }
+    const binding = {
+      runId: runId ?? message.runId ?? null,
+      nodeId: nodeId ?? null,
+      childSessionId: String(childSessionId || ''),
+      childTurnId: String(childTurnId || ''),
+      jobId: jobId ?? null,
+      fence: fence ?? null,
+      attempt: Number(attempt || 0),
+      boundAt: Number(now || Date.now()),
+    };
+    if (!binding.childSessionId || !binding.childTurnId) {
+      throw new CommunicationStateError('INVALID_CHILD_BINDING');
+    }
+    if (message.runId !== (binding.runId ?? null)) {
+      throw new CommunicationStateError('BINDING_RUN_MISMATCH');
+    }
+    if (message.deliveryBinding) {
+      const same = ['runId', 'nodeId', 'childSessionId', 'childTurnId'].every((key) =>
+        (message.deliveryBinding[key] ?? null) === (binding[key] ?? null),
+      );
+      if (!same) throw new CommunicationStateError('DELIVERY_BINDING_CONFLICT');
+      return clone(message);
+    }
+    return this.#save(message, { deliveryBinding: binding });
+  }
+
   async ack({ messageId, agentId, deliveryToken, now }) {
     return this.store.tx(() => {
       const message = this.#messages().find((item) => item.messageId === messageId);
       if (!message) return null;
       if (message.toAgentId !== agentId) throw new CommunicationStateError('ACK_RECIPIENT_MISMATCH');
+      if (message.deliveryBinding && !deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_REQUIRED');
       if (deliveryToken !== undefined && deliveryToken !== message.deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
       if (message.status === 'acked') return clone(message);
       if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');

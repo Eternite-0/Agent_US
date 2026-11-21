@@ -683,6 +683,33 @@ export class ChildAgentManager {
                 )
                 .run(turnLeaseGuard?.fence ?? null, Number(attempt || 1), turnId);
             }
+            // Unified communication fence: persist the claimed message's child
+            // binding in this very transaction, before the ACK is allowed. If the
+            // process dies after this commit and before ACK, recovery can reclaim
+            // the delivery lease and resume the same child turn without replaying
+            // the assignment as a new child.
+            if (claimedCommunicationMessage?.messageId) {
+              if (!this.communication?.bindClaimToChildInTx) {
+                throw new RecoveryError('COMMUNICATION_BINDING_UNSUPPORTED', {
+                  message: 'Unified message delivery requires an atomic child binding adapter',
+                });
+              }
+              const communicationAgentId = claimedCommunicationMessage.toAgentId || nodeKey || childSessionId;
+              this.communication.bindClaimToChildInTx({
+                messageId: claimedCommunicationMessage.messageId,
+                agentId: communicationAgentId,
+                deliveryToken: claimedCommunicationMessage.deliveryToken,
+                runId,
+                nodeId,
+                childSessionId,
+                childTurnId: turnId,
+                jobId: turnLeaseGuard?.jobId ?? null,
+                fence: turnLeaseGuard?.fence ?? null,
+                attempt,
+                now,
+              });
+            }
+
             if (Array.isArray(ackMailboxIds) && ackMailboxIds.length > 0) {
               const ackStmt = this.store.db.prepare(
                 "UPDATE agent_messages SET status='delivered', deliveredAt=? WHERE id=? AND status='queued'",
@@ -712,7 +739,8 @@ export class ChildAgentManager {
           });
 
           if (claimedCommunicationMessage?.messageId && this.communication?.ack) {
-            await this.communication.ack(claimedCommunicationMessage.messageId, nodeKey || childSessionId, claimedCommunicationMessage.deliveryToken);
+            const communicationAgentId = claimedCommunicationMessage.toAgentId || nodeKey || childSessionId;
+            await this.communication.ack(claimedCommunicationMessage.messageId, communicationAgentId, claimedCommunicationMessage.deliveryToken);
           }
 
           const session = this.sessionRepo.getSession(childSessionId);

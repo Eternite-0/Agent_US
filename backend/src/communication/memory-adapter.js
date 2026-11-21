@@ -43,7 +43,7 @@ export class MemoryCommunicationAdapter {
     const sequence = prior.reduce((max, m) => Math.max(max, m.sequence), 0) + 1;
     const message = {
       ...clone(draft), messageId: randomUUID(), sequence, status: 'pending', attempts: 0,
-      nextAttemptAt: draft.createdAt, deliveredAt: null, ackDeadline: null, deliveryToken: null, acknowledgedAt: null, lastError: null,
+      nextAttemptAt: draft.createdAt, deliveredAt: null, ackDeadline: null, deliveryToken: null, acknowledgedAt: null, lastError: null, deliveryBinding: null,
     };
     this.#messages.set(message.messageId, message);
     for (const artifact of draft.artifactManifest.artifacts) this.#artifactDigests.set(artifact.uri, artifact.sha256);
@@ -66,10 +66,51 @@ export class MemoryCommunicationAdapter {
     return null;
   }
 
+  bindClaimToChildInTx({
+    messageId,
+    agentId,
+    deliveryToken,
+    runId = null,
+    nodeId = null,
+    childSessionId,
+    childTurnId,
+    jobId = null,
+    fence = null,
+    attempt = 0,
+    now,
+  }) {
+    const message = this.#messages.get(messageId);
+    if (!message) throw new CommunicationStateError('MESSAGE_NOT_FOUND');
+    if (message.toAgentId !== agentId) throw new CommunicationStateError('BINDING_RECIPIENT_MISMATCH');
+    if (!deliveryToken || deliveryToken !== message.deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
+    const binding = {
+      runId: runId ?? message.runId ?? null,
+      nodeId: nodeId ?? null,
+      childSessionId: String(childSessionId || ''),
+      childTurnId: String(childTurnId || ''),
+      jobId: jobId ?? null,
+      fence: fence ?? null,
+      attempt: Number(attempt || 0),
+      boundAt: Number(now || Date.now()),
+    };
+    if (!binding.childSessionId || !binding.childTurnId) throw new CommunicationStateError('INVALID_CHILD_BINDING');
+    if (message.runId !== (binding.runId ?? null)) throw new CommunicationStateError('BINDING_RUN_MISMATCH');
+    if (message.deliveryBinding) {
+      const same = ['runId', 'nodeId', 'childSessionId', 'childTurnId'].every((key) =>
+        (message.deliveryBinding[key] ?? null) === (binding[key] ?? null),
+      );
+      if (!same) throw new CommunicationStateError('DELIVERY_BINDING_CONFLICT');
+      return clone(message);
+    }
+    message.deliveryBinding = binding;
+    return clone(message);
+  }
+
   async ack({ messageId, agentId, deliveryToken, now }) {
     const message = this.#messages.get(messageId);
     if (!message) return null;
     if (message.toAgentId !== agentId) throw new CommunicationStateError('ACK_RECIPIENT_MISMATCH');
+    if (message.deliveryBinding && !deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_REQUIRED');
     if (deliveryToken !== undefined && deliveryToken !== message.deliveryToken) throw new CommunicationStateError('DELIVERY_TOKEN_MISMATCH');
     if (message.status === 'acked') return clone(message);
     if (message.status !== 'delivered') throw new CommunicationStateError('MESSAGE_NOT_DELIVERED');
