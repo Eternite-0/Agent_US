@@ -714,26 +714,14 @@ export class AdaptiveSwarmOrchestrator {
             );
             if (failedDeps.length) {
               changed = true;
-              const allBudgetFailed = failedDeps.every((d) =>
-                isBudgetErrorCode(byKey.get(d)?.errorCode),
-              );
-              const upd = allBudgetFailed
-                ? transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.CANCELLED, {
-                    emitEvent: false,
-                    leaseGuard,
-                    patch: {
-                      errorCode: 'BUDGET_EXCEEDED',
-                      errorMessage: `Blocked by budget-exhausted upstream node(s): ${failedDeps.join(', ')}`,
-                    },
-                  })
-                : transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.FAILED, {
-                    emitEvent: false,
-                    leaseGuard,
-                    patch: {
-                      errorCode: 'DEPENDENCY_FAILED',
-                      errorMessage: `Blocked by upstream node(s): ${failedDeps.join(', ')}`,
-                    },
-                  });
+              const upd = transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.FAILED, {
+                emitEvent: false,
+                leaseGuard,
+                patch: {
+                  errorCode: 'DEPENDENCY_FAILED',
+                  errorMessage: `Blocked by upstream node(s): ${failedDeps.join(', ')}`,
+                },
+              });
               if (upd.changed) postEvents.push(upd);
             }
           }
@@ -1494,15 +1482,13 @@ export class AdaptiveSwarmOrchestrator {
           }
         }
 
+        if (!checkLeaseHeld(leaseGuard, { runId })) {
+          throw new RecoveryError('LEASE_LOST', {
+            message: `Lease lost after replan check for ${node.nodeKey}`,
+          });
+        }
+
         if (replanOut?.replanned) {
-          // A successful split deliberately terminalizes the superseded node. Verify
-          // only the current job/run fence here; checking the old node again would
-          // mistake the committed replan for a lease loss and strand the new DAG.
-          if (!checkLeaseHeld(leaseGuard, { runId, nodeId: null })) {
-            throw new RecoveryError('LEASE_LOST', {
-              message: `Lease lost after replan for ${node.nodeKey}`,
-            });
-          }
           enqueueSwarmJob(
             this.jobQueue,
             SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
@@ -1583,22 +1569,15 @@ export class AdaptiveSwarmOrchestrator {
       const activeNodes = run.nodes.filter((n) => !replacedKeys.has(n.nodeKey));
       const summary = buildSwarmSummary(activeNodes);
       const childSessionIds = activeNodes.map((n) => n.childSessionId).filter(Boolean);
+      const allSessionIds = [...new Set([run.sessionId, ...childSessionIds].filter(Boolean))];
       const childTurnIds = activeNodes.map((n) => n.childTurnId).filter(Boolean);
-      const rootTurn = run.rootTurnId
-        ? this.store.db.prepare('SELECT state FROM direct_turns WHERE id=?').get(run.rootTurnId)
-        : null;
-      const rootTurnActive = rootTurn && ['running', 'reconciling', 'parked'].includes(rootTurn.state);
-      const allSessionIds = [...new Set([...(rootTurnActive ? [] : [run.sessionId]), ...childSessionIds].filter(Boolean))];
-      const rootTurnIds = rootTurn && !['running', 'reconciling', 'parked'].includes(rootTurn.state)
-        ? [run.rootTurnId]
-        : [];
-      const allTurnIds = [...new Set([...rootTurnIds, ...childTurnIds].filter(Boolean))];
+      const allTurnIds = [...new Set([run.rootTurnId, ...childTurnIds].filter(Boolean))];
 
       const verdict = this.evidenceVerifier
         ? this.evidenceVerifier.verify({
             text: summary,
-            sessionId: rootTurnActive ? null : run.sessionId,
-            turnId: rootTurnActive ? null : run.rootTurnId,
+            sessionId: run.sessionId,
+            turnId: run.rootTurnId,
             sessionIds: allSessionIds,
             turnIds: allTurnIds.length ? allTurnIds : null,
             workspaceRoot: run.workspaceRoot,
