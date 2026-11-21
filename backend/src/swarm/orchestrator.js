@@ -1494,13 +1494,15 @@ export class AdaptiveSwarmOrchestrator {
           }
         }
 
-        if (!checkLeaseHeld(leaseGuard, { runId })) {
-          throw new RecoveryError('LEASE_LOST', {
-            message: `Lease lost after replan check for ${node.nodeKey}`,
-          });
-        }
-
         if (replanOut?.replanned) {
+          // A successful split deliberately terminalizes the superseded node. Verify
+          // only the current job/run fence here; checking the old node again would
+          // mistake the committed replan for a lease loss and strand the new DAG.
+          if (!checkLeaseHeld(leaseGuard, { runId, nodeId: null })) {
+            throw new RecoveryError('LEASE_LOST', {
+              message: `Lease lost after replan for ${node.nodeKey}`,
+            });
+          }
           enqueueSwarmJob(
             this.jobQueue,
             SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
