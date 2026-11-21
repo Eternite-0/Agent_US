@@ -496,7 +496,7 @@ export class DynamicReplanner {
       this.store.db
         .prepare(
           `UPDATE runtime_jobs
-           SET status='cancelled', lastError='NODE_REPLANNED', leaseExpiresAt=NULL, updatedAt=?
+           SET status='cancelled', errorMessage='NODE_REPLANNED', leaseExpiresAt=NULL, updatedAt=?
            WHERE taskId=? AND turnId=? AND id != ?
              AND status IN ('pending','parked','reconciling')`,
         )
