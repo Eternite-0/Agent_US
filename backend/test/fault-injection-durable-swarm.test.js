@@ -13,9 +13,14 @@ import {
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { renameSync } from 'node:fs';
 import { Store } from '../src/store.js';
+import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { DurableJobQueue } from '../src/durable/job-queue.js';
 import { createLeaseGuard } from '../src/durable/lease-guard.js';
+import { recoverInterruptedSwarmRuns } from '../src/swarm/recovery-helpers.js';
+import { DynamicReplanner } from '../src/swarm/replan.js';
 import { UnknownOutcomeReconciler } from '../src/durable/reconciliation.js';
 import { TaskTreeBudgetLedger } from '../src/swarm/budget-ledger.js';
 import { SwarmArtifactManager } from '../src/swarm/artifacts.js';
@@ -583,3 +588,275 @@ test('Fault injection durable #17: ATTEMPTS_EXHAUSTED converges bound swarm node
 
 
 
+
+// Worktree cleanup failpoints are test-local: git metadata is temporarily made
+// unavailable so the normal git cleanup is best-effort, while rmSync reports the
+// platform-specific lock error. The observable contract is preservation plus
+// cleanup_pending, not a fabricated successful deletion.
+test('Fault injection durable #8/#9: EBUSY and EPERM worktree cleanup are isolated', async () => {
+  const dir = makeDir('agent-us-fi-worktree-cleanup-');
+  const repo = join(dir, 'repo');
+  mkdirSync(repo, { recursive: true });
+  initGit(repo);
+  const store = new Store(join(dir, 'engine.sqlite'));
+  const req = createRequire(import.meta.url);
+  const fsModule = req('node:fs');
+  const originalRmSync = fsModule.rmSync;
+  const childProcess = req('node:child_process');
+  const originalExecFile = childProcess.execFile;
+  try {
+    for (const [label, code] of [['busy', 'EBUSY'], ['perm', 'EPERM']]) {
+      let rmInjected = false;
+      fsModule.rmSync = (target, ...args) => {
+        if (String(target).includes('agent-us-wt-')) {
+          rmInjected = true;
+          throw Object.assign(new Error(`${code}: simulated locked worktree`), { code });
+        }
+        return originalRmSync(target, ...args);
+      };
+      childProcess.execFile = (...args) => {
+        const commandArgs = Array.isArray(args[1]) ? args[1] : [];
+        const callback = args.at(-1);
+        if (commandArgs[0] === 'worktree' && (commandArgs[1] === 'remove' || commandArgs[1] === 'prune')) {
+          callback(Object.assign(new Error(`${code}: simulated git lock`), { code }));
+          return;
+        }
+        return originalExecFile(...args);
+      };
+      syncBuiltinESMExports();
+      const { GitWorktreeIsolator } = await import(`../src/tools/sandbox.js?fi=${label}-${Date.now()}`);
+      const isolator = new GitWorktreeIsolator(store);
+      const handle = await isolator.acquire(repo, {
+        ownerId: `cleanup-${label}`,
+        sessionId: `session-${label}`,
+        runId: `run-${label}`,
+        nodeKey: `node-${label}`,
+        attempt: 1,
+      });
+      const gitDir = join(repo, '.git');
+      const hiddenGitDir = join(dir, `.git-hidden-${label}`);
+      renameSync(gitDir, hiddenGitDir);
+      const result = await handle.release({ forceDiscard: true });
+      renameSync(hiddenGitDir, gitDir);
+      assert.equal(rmInjected, true, `${code} failpoint must reach the real cleanup rmSync call`);
+      assert.equal(result.cleaned, false);
+      assert.equal(result.preserved, true);
+      assert.equal(result.reason, 'rm_failed_pending_cleanup');
+      const lease = store.db.prepare('SELECT status,cleanupState FROM worktree_leases WHERE id=?').get(handle.leaseId);
+      assert.equal(lease.status, 'preserved');
+      assert.equal(lease.cleanupState, 'cleanup_pending');
+      fsModule.rmSync = originalRmSync;
+      childProcess.execFile = originalExecFile;
+      syncBuiltinESMExports();
+    }
+  } finally {
+    fsModule.rmSync = originalRmSync;
+    childProcess.execFile = originalExecFile;
+    syncBuiltinESMExports();
+    store.close();
+    rmDirSafe(dir);
+  }
+});
+// Exercise the real DynamicReplanner transaction and then present a stale
+// completion from the pre-replan plan. The completion must not overwrite the
+// READY node or the incremented plan version.
+test('Fault injection durable #10/#11/#14: real replanning CAS fences stale node completion', async () => {
+  const dir = makeDir('agent-us-fi-replan-cas-');
+  const store = new Store(join(dir, 'engine.sqlite'));
+  try {
+    const now = Date.now();
+    store.tx(() => {
+      store.db.prepare(
+        `INSERT INTO direct_sessions(id,title,state,createdAt,updatedAt)
+         VALUES('sess-replan-cas','replan','running',?,?)`,
+      ).run(now, now);
+      store.db.prepare(
+        `INSERT INTO swarm_runs(id,sessionId,goal,status,strategyJson,budgetJson,planVersion,replanCount,createdAt,updatedAt)
+         VALUES('run-replan-cas','sess-replan-cas','replan','running','{"maxReplans":2}','{}',1,0,?,?)`,
+      ).run(now, now);
+      store.db.prepare(
+        `INSERT INTO swarm_nodes(id,runId,nodeKey,agentProfileId,objective,acceptance,status,attempts,planVersion,createdAt,updatedAt)
+         VALUES('node-replan-cas','run-replan-cas','replan-node','default','retry','retry','running',1,1,?,?)`,
+      ).run(now, now);
+    });
+
+    const planner = { validateDag() {} };
+    const router = { modelRegistry: { syncFromPool: () => [] } };
+    const replanner = new DynamicReplanner({ store, planner, router, eventRouter: null });
+    const run = { ...store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get('run-replan-cas'), strategy: { maxReplans: 2 } };
+    const failedNode = { ...store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get('node-replan-cas'), attempts: 1 };
+    const results = await Promise.all([
+      replanner.replan({ run, failedNode, errorCode: 'NODE_FAILED', errorMessage: 'simulated crash', maxReplans: 2 }),
+      replanner.replan({ run, failedNode, errorCode: 'NODE_FAILED', errorMessage: 'simulated crash', maxReplans: 2 }),
+    ]);
+    assert.equal(results.filter((result) => result.replanned).length, 1);
+    assert.equal(results.filter((result) => !result.replanned).length, 1);
+
+    const liveRun = store.db.prepare('SELECT planVersion,replanCount FROM swarm_runs WHERE id=?').get('run-replan-cas');
+    const liveNode = store.db.prepare('SELECT status,planVersion,errorCode FROM swarm_nodes WHERE id=?').get('node-replan-cas');
+    assert.equal(liveRun.planVersion, 2);
+    assert.equal(liveRun.replanCount, 1);
+    assert.equal(liveNode.status, 'ready');
+    assert.equal(liveNode.planVersion, 2);
+
+    assert.throws(
+      () => transitionSwarmNode(store, null, 'node-replan-cas', SWARM_NODE_STATES.COMPLETED, {
+        expectedPlanVersion: 1,
+        patch: { resultText: 'stale completion must not win' },
+        emitEvent: false,
+      }),
+      (err) => err?.code === 'INVALID_SWARM_TRANSITION',
+    );
+    const after = store.db.prepare('SELECT status,planVersion,resultText FROM swarm_nodes WHERE id=?').get('node-replan-cas');
+    assert.equal(after.status, 'ready');
+    assert.equal(after.planVersion, 2);
+    assert.equal(after.resultText, null);
+  } finally {
+    store.close();
+    rmDirSafe(dir);
+  }
+});
+
+// Two independent SQLite runtimes recover the same interrupted run at once.
+// Both use the production recovery helper; only one transaction may converge
+// the node and enqueue the dependency resolver.
+test('Fault injection durable #10/#11/#14: dual-runtime swarm recovery is idempotent', async () => {
+  const dir = makeDir('agent-us-fi-dual-recovery-');
+  const dbPath = join(dir, 'engine.sqlite');
+  const storeA = new Store(dbPath);
+  const storeB = new Store(dbPath);
+  try {
+    const now = Date.now();
+    storeA.tx(() => {
+      storeA.db.prepare(
+        `INSERT INTO direct_sessions(id,title,state,createdAt,updatedAt)
+         VALUES('sess-dual-recovery','dual recovery','running',?,?)`,
+      ).run(now, now);
+      storeA.db.prepare(
+        `INSERT INTO direct_turns(id,sessionId,input,state,phase,createdAt,finishedAt)
+         VALUES('turn-dual-recovery','sess-dual-recovery','child','completed','completed',?,?)`,
+      ).run(now, now);
+      storeA.db.prepare(
+        `INSERT INTO direct_messages(sessionId,turnId,role,content,createdAt)
+         VALUES('sess-dual-recovery','turn-dual-recovery','assistant','once only',?)`,
+      ).run(now);
+      storeA.db.prepare(
+        `INSERT INTO swarm_runs(id,sessionId,goal,status,strategyJson,budgetJson,planVersion,replanCount,createdAt,updatedAt)
+         VALUES('run-dual-recovery','sess-dual-recovery','dual','running','{}','{}',1,0,?,?)`,
+      ).run(now, now);
+      storeA.db.prepare(
+        `INSERT INTO swarm_nodes(id,runId,nodeKey,agentProfileId,objective,acceptance,status,childTurnId,planVersion,createdAt,updatedAt)
+         VALUES('node-dual-recovery','run-dual-recovery','dual-node','default','dual','dual','running','turn-dual-recovery',1,?,?)`,
+      ).run(now, now);
+    });
+    const queueA = new DurableJobQueue(storeA);
+    const queueB = new DurableJobQueue(storeB);
+    const makeReport = (store, queue) => recoverInterruptedSwarmRuns({
+      store,
+      jobQueue: queue,
+      reconciler: new UnknownOutcomeReconciler(store, null),
+      eventRouter: null,
+      getRun: (runId) => {
+        const run = store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);
+        return { ...run, budget: {}, usage: {}, nodes: store.db.prepare('SELECT * FROM swarm_nodes WHERE runId=?').all(runId) };
+      },
+      cancelRun: () => {},
+    });
+    const [reportA, reportB] = await Promise.all([
+      Promise.resolve().then(() => makeReport(storeA, queueA)),
+      Promise.resolve().then(() => makeReport(storeB, queueB)),
+    ]);
+    assert.equal(reportA.convergedCompletedNodes + reportB.convergedCompletedNodes, 1);
+    const node = storeA.db.prepare('SELECT status,resultText FROM swarm_nodes WHERE id=?').get('node-dual-recovery');
+    assert.equal(node.status, 'completed');
+    assert.equal(node.resultText, 'once only');
+    assert.equal(
+      storeA.db.prepare("SELECT COUNT(*) AS count FROM runtime_jobs WHERE taskId=? AND kind='swarm_dependency_resolve' AND status IN ('pending','active')").get('run-dual-recovery').count,
+      1,
+    );
+  } finally {
+    storeB.close();
+    storeA.close();
+    rmDirSafe(dir);
+  }
+});
+
+class BlockingChildAdapter extends LlmAdapter {
+  async *stream(options) {
+    if (options.messages.some((message) => message.role === 'tool')) {
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
+    }
+    yield {
+      type: 'block-end',
+      index: 0,
+      block: { type: 'tool-call', id: 'child-cancel-tool', name: 'blocking_test_tool', arguments: '{}' },
+    };
+    yield { type: 'finish', reason: { kind: 'tool-calls' } };
+  }
+}
+
+// The tool itself completes after cancellation. The real dispatcher records an
+// outward non-replayable receipt as outcome_unknown, while ChildAgentManager
+// commits the child turn/session as cancelled and emits no successful completion.
+test('Fault injection durable #8/#9/#16: child cancellation fences a completing tool call', async () => {
+  const dir = makeDir('agent-us-fi-child-cancel-');
+  const store = new Store(join(dir, 'engine.sqlite'));
+  const pool = new (await import('../src/pool.js')).AccountPool(store, { root: dir });
+  pool.setDefaultModel('blocking-child-model');
+  const direct = new (await import('../src/direct-agent.js')).DirectAgentRuntime(store, pool, {
+    defaultWorkspace: dir,
+    dataRoot: dir,
+    adapter: new BlockingChildAdapter(),
+    enableHeartbeat: false,
+  });
+  let startedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  let releaseResolve;
+  const release = new Promise((resolve) => { releaseResolve = resolve; });
+  direct.childManager.getWorkspaceTools = () => [{
+    name: 'blocking_test_tool',
+    description: 'test-only blocking tool',
+    meta: { readOnly: true, replayable: false, outward: true, effectClass: 'external_network', riskLevel: 'low' },
+    validate: (args) => ({ success: args && typeof args === 'object', data: args, error: null }),
+    async execute() {
+      startedResolve();
+      await release;
+      return 'late tool completion';
+    },
+  }];
+  try {
+    const parent = direct.createSession({ workspaceRoot: dir, permissionMode: 'read-only' });
+    const childPromise = direct.childManager.spawn({
+      parentSessionId: parent.id,
+      objective: 'cancel while tool is executing',
+      workspaceRoot: dir,
+      permissionMode: 'read-only',
+      parentPermissionMode: 'read-only',
+      isolationMode: 'shared_workspace',
+    });
+    const childOutcomePromise = childPromise.then((value) => ({ value }), (error) => ({ error }));
+    await withTimeout(started, 5000, 'blocking child tool start');
+    const child = direct.childManager.activeChildren.values().next().value;
+    assert.ok(child);
+    const childSessionId = child.parentSessionId ? [...direct.childManager.activeChildren.entries()][0][0] : null;
+    assert.ok(childSessionId);
+    direct.childManager.cancel(childSessionId);
+    releaseResolve();
+    const childOutcome = await withTimeout(childOutcomePromise, 5000, 'cancelled child completion');
+    assert.ok(childOutcome.error, 'cancelled child must not resolve as a successful completion');
+    assert.equal(childOutcome.error.code, 'EPOCH_CANCELLED');
+    const session = direct.getSession(childSessionId);
+    assert.equal(session.state, 'cancelled');
+    const turn = store.db.prepare('SELECT id,state FROM direct_turns WHERE sessionId=? ORDER BY createdAt DESC LIMIT 1').get(childSessionId);
+    assert.equal(turn.state, 'cancelled');
+    const receipt = store.db.prepare("SELECT status,errorCode FROM tool_receipts WHERE sessionId=? AND callId='child-cancel-tool'").get(childSessionId);
+    assert.equal(receipt.status, 'outcome_unknown');
+    assert.equal(receipt.errorCode, 'INTERRUPTED_UNKNOWN_OUTCOME');
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM child_notifications WHERE childSessionId=? AND status='completed'").get(childSessionId).count, 0);
+  } finally {
+    await direct.close();
+    store.close();
+    rmDirSafe(dir);
+  }
+});
