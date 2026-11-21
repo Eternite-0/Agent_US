@@ -714,14 +714,26 @@ export class AdaptiveSwarmOrchestrator {
             );
             if (failedDeps.length) {
               changed = true;
-              const upd = transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.FAILED, {
-                emitEvent: false,
-                leaseGuard,
-                patch: {
-                  errorCode: 'DEPENDENCY_FAILED',
-                  errorMessage: `Blocked by upstream node(s): ${failedDeps.join(', ')}`,
-                },
-              });
+              const allBudgetFailed = failedDeps.every((d) =>
+                isBudgetErrorCode(byKey.get(d)?.errorCode),
+              );
+              const upd = allBudgetFailed
+                ? transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.CANCELLED, {
+                    emitEvent: false,
+                    leaseGuard,
+                    patch: {
+                      errorCode: 'BUDGET_EXCEEDED',
+                      errorMessage: `Blocked by budget-exhausted upstream node(s): ${failedDeps.join(', ')}`,
+                    },
+                  })
+                : transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.FAILED, {
+                    emitEvent: false,
+                    leaseGuard,
+                    patch: {
+                      errorCode: 'DEPENDENCY_FAILED',
+                      errorMessage: `Blocked by upstream node(s): ${failedDeps.join(', ')}`,
+                    },
+                  });
               if (upd.changed) postEvents.push(upd);
             }
           }

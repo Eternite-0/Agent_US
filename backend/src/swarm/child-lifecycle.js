@@ -1360,7 +1360,7 @@ export class ChildAgentManager {
       this.store.tx(() => {
         this.store.db
           .prepare(
-            "UPDATE direct_sessions SET state='paused', updatedAt=? WHERE id=? AND state NOT IN ('completed','cancelled','failed')",
+            "UPDATE direct_sessions SET state='paused', updatedAt=? WHERE id=? AND state != 'cancelled'",
           )
           .run(Date.now(), childSessionId);
       });
