@@ -53,7 +53,7 @@ test('Fault injection durable #10/#11: stale job completion is fenced after take
     assert.notEqual(second.fence, first.fence);
     assert.throws(() => queue.complete(first.id, first.fence), (err) => err?.code === 'LEASE_LOST');
     assert.equal(store.db.prepare('SELECT status, workerId FROM runtime_jobs WHERE id=?').get(job.id).status, 'active');
-    queue.complete(second);
+    queue.complete(second.id, second.fence);
     assert.equal(store.db.prepare('SELECT status FROM runtime_jobs WHERE id=?').get(job.id).status, 'done');
   } finally { store.close(); rmDirSafe(dir); }
 });
