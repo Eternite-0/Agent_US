@@ -1,5 +1,6 @@
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { createRealEngineeringDataset, REAL_ENGINEERING_DATASET } from '../../src/evaluation/dataset.js';
 import { createFixtureWorkspace, removeFixtureWorkspace } from '../../src/evaluation/fixtures.js';
@@ -125,7 +126,7 @@ export async function resume(root) { await step(root, 'prepare'); await step(roo
       }
       if (task.id === 'real-data-processing-01') {
         await fs.mkdir(`${workspaceRoot}/output`, { recursive: true });
-        const { summarizeSales } = await import(pathToFileURL(`${workspaceRoot}\\src\\sales.js`).href);
+        const { summarizeSales } = await import(pathToFileURL(join(workspaceRoot, 'src', 'sales.js')).href);
         const rows = JSON.parse(await fs.readFile(`${workspaceRoot}/data/sales.json`, 'utf8'));
         await fs.writeFile(`${workspaceRoot}/output/summary.json`, JSON.stringify(summarizeSales(rows), null, 2));
       }
