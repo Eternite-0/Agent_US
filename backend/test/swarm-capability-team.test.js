@@ -7,6 +7,7 @@ import { Store } from '../src/store.js';
 import { CapabilityProfileRegistry } from '../src/swarm/capability-registry.js';
 import { TeamOptimizer } from '../src/swarm/team-optimizer.js';
 import { ResultAggregator } from '../src/swarm/result-aggregator.js';
+import { createIntelligenceServices } from '../src/intelligence-services.js';
 
 test('Swarm capability profiles keep declared and measured evidence distinct', () => {
   const registry = new CapabilityProfileRegistry();
@@ -53,6 +54,26 @@ test('CapabilityProfileRegistry persists declarations and evaluation-backed meas
     assert.equal(reopened.getMeasured('persisted-model').evaluation.evaluationRunId, 'eval-1');
     assert.throws(() => reopened.recordMeasured({ id: 'persisted-model', sampleCount: 1 }), /recordMeasuredFromEvaluation/);
   } finally {
+    if (store?.db?.isOpen) store.close();
+    await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
+  }
+});
+
+test('production intelligence services persist capability declarations in the injected Store', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-us-intelligence-services-'));
+  const dbPath = join(dir, 'intelligence.sqlite');
+  let store = new Store(dbPath);
+  let services;
+  try {
+    services = createIntelligenceServices({ store, providers: { models: [] } });
+    services.capabilityRegistry.registerDeclared({ id: 'service-model', capabilities: { coding: 0.91 } });
+    store.close();
+    store = new Store(dbPath);
+    const reopened = createIntelligenceServices({ store, providers: { models: [] } });
+    assert.equal(reopened.capabilityRegistry.getDeclared('service-model').capabilities.coding, 0.91);
+    await reopened.evaluation.close({ timeoutMs: 500 });
+  } finally {
+    await services?.evaluation?.close({ timeoutMs: 500 });
     if (store?.db?.isOpen) store.close();
     await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
   }

@@ -7,7 +7,7 @@ import { StoreCommunicationAdapter, CommunicationBus } from './communication/ind
 import { ExperienceMemoryService } from './memory/index.js';
 
 export function createIntelligenceServices({ store, directAgent, providers = null } = {}) {
-  const capabilityRegistry = createCapabilityProfileRegistry();
+  const capabilityRegistry = createCapabilityProfileRegistry({ store });
   for (const model of providers?.models ?? []) {
     const id = String(model.id ?? model.model ?? '').trim();
     if (id) capabilityRegistry.registerDeclared({

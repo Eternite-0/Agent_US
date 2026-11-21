@@ -23,77 +23,37 @@ function safeError(error) {
 
 function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
   if (!directAgent) throw new TypeError('Evaluation requires DirectAgentRuntime');
-  return async ({ task, workspaceRoot, signal, context }) =>
-    withTraceContext({ trafficSource: TRAFFIC_SOURCES.EVAL, isSynthetic: true },
-      async () => {
-        const session = directAgent.createSession({
-          title: `Evaluation · ${task.id}`,
-          model: model || context.model || undefined,
-          workspaceRoot,
-          mode: 'direct',
-          permissionMode: 'auto-safe',
-          trafficSource: TRAFFIC_SOURCES.EVAL,
-          isSynthetic: true,
-        });
-        const started = directAgent.startTurn(session.id, {
-          input: task.prompt,
-          model: model || context.model || undefined,
-          permissionMode: 'auto-safe',
-          maxSteps: task.resourceBudget?.maxSteps ?? 12,
-          trafficSource: TRAFFIC_SOURCES.EVAL,
-          isSynthetic: true,
-        });
-        const turnId = started?.turn?.id;
-        if (!turnId) throw new Error('DirectAgentRuntime did not create an evaluation turn');
-        const cancel = () => {
-          try { directAgent.cancelTurn(turnId); } catch { /* cancellation is best effort; durable runtime owns the state transition */ }
-        };
-        signal?.addEventListener('abort', cancel, { once: true });
-        try {
-          while (true) {
-            if (signal?.aborted) {
-              cancel();
-              const error = new Error('Evaluation cancelled');
-              error.name = 'AbortError';
-              error.code = 'E_EVAL_CANCELLED';
-              throw error;
-            }
-            const current = directAgent.listTurns(session.id, { limit: 20 })
-              .find((turn) => turn.id === turnId);
-            if (current && TERMINAL_TURN_STATES.has(current.state)) {
-              const messages = directAgent.listMessages(session.id, { after: 0, limit: 500 });
-              const text = messages
-                .filter((message) => message.turnId === turnId && message.role === 'assistant')
-                .map((message) => String(message.content ?? ''))
-                .filter(Boolean)
-                .join('\n');
-              if (current.state !== 'completed') {
-                const error = new Error(current.error || `Evaluation turn ${current.state}`);
-                error.code = current.state === 'cancelled' ? 'E_EVAL_CANCELLED' : 'E_RUNTIME_TURN_FAILED';
-                if (current.state === 'cancelled') error.name = 'AbortError';
-                throw error;
-              }
-              return {
-                output: text,
-                sessionId: session.id,
-                turnId,
-                verdict: current.verdict ?? null,
-                evidenceCount: Number(current.evidenceCount ?? 0),
-              };
-            }
-            await delay(100, undefined, { signal });
+  return ({ task, workspaceRoot, signal, context }) => {
+    let turnId = null;
+    const run = withTraceContext({ trafficSource: TRAFFIC_SOURCES.EVAL, isSynthetic: true }, async () => {
+      const session = directAgent.createSession({ title: `Evaluation · ${task.id}`, model: model || context.model || undefined, workspaceRoot, mode: 'direct', permissionMode: 'auto-safe', trafficSource: TRAFFIC_SOURCES.EVAL, isSynthetic: true });
+      const started = directAgent.startTurn(session.id, { input: task.prompt, model: model || context.model || undefined, permissionMode: 'auto-safe', maxSteps: task.resourceBudget?.maxSteps ?? 12, trafficSource: TRAFFIC_SOURCES.EVAL, isSynthetic: true });
+      turnId = started?.turn?.id;
+      if (!turnId) throw new Error('DirectAgentRuntime did not create an evaluation turn');
+      const cancel = () => { try { directAgent.cancelTurn(turnId); } catch { /* durable runtime records cancellation */ } };
+      signal?.addEventListener('abort', cancel, { once: true });
+      try {
+        while (true) {
+          if (signal?.aborted) {
+            cancel();
+            try { await directAgent.waitForTurnTerminal?.(turnId, { timeoutMs: 5_000 }); } catch { /* runner records drain state */ }
+            const error = new Error('Evaluation cancelled'); error.name = 'AbortError'; error.code = 'E_EVAL_CANCELLED'; throw error;
           }
-        } finally {
-          signal?.removeEventListener('abort', cancel);
+          const current = directAgent.listTurns(session.id, { limit: 20 }).find((turn) => turn.id === turnId);
+          if (current && TERMINAL_TURN_STATES.has(current.state)) {
+            const messages = directAgent.listMessages(session.id, { after: 0, limit: 500 });
+            const text = messages.filter((message) => message.turnId === turnId && message.role === 'assistant').map((message) => String(message.content ?? '')).filter(Boolean).join('\n');
+            if (current.state !== 'completed') { const error = new Error(current.error || `Evaluation turn ${current.state}`); error.code = current.state === 'cancelled' ? 'E_EVAL_CANCELLED' : 'E_RUNTIME_TURN_FAILED'; if (current.state === 'cancelled') error.name = 'AbortError'; throw error; }
+            return { output: text, sessionId: session.id, turnId, verdict: current.verdict ?? null, evidenceCount: Number(current.evidenceCount ?? 0) };
+          }
+          await delay(100, undefined, { signal });
         }
-      },
-    );
+      } finally { signal?.removeEventListener('abort', cancel); }
+    });
+    return { run: () => run, waitForStop: async ({ reason = 'cancelled' } = {}) => { if (!turnId) return { drained: true, error: null }; try { await directAgent.waitForTurnTerminal?.(turnId, { timeoutMs: 5_000 }); return { drained: true, reason }; } catch (error) { return { drained: false, error: safeError(error) }; } } };
+  };
 }
 
-/**
- * Durable coordinator for evaluations. Runs execute through DirectAgentRuntime and are
- * persisted as generic Store records so Schema v7 remains unchanged.
- */
 export class EvaluationService {
   #controllers = new Map();
   #activeExecutions = new Map();
@@ -124,6 +84,7 @@ export class EvaluationService {
       void execution.then(() => {}, () => {}).finally(() => this.#activeExecutions.delete(runId));
       return execution;
     });
+    recoveryWorker?.wake?.();
   }
 
   listBenchmarks() {
@@ -196,7 +157,12 @@ export class EvaluationService {
     const options = { model, concurrency, timeoutMs, maxAttempts };
     this.#update(run.id, { options });
     if (this.jobQueue?.enqueue) {
-      this.jobQueue.enqueue({ kind: 'evaluation_run', taskId: run.id, payload: { runId: run.id }, idempotencyKey: `evaluation:${run.id}`, maxAttempts: 3 });
+      const queued = this.jobQueue.enqueue({ kind: 'evaluation_run', taskId: run.id, payload: { runId: run.id }, idempotencyKey: `evaluation:${run.id}`, maxAttempts: 3 });
+      if (!queued) {
+        const execution = this.execute(run.id, tasks, options, controller);
+        this.#activeExecutions.set(run.id, execution);
+        void execution.then(() => {}, () => {}).finally(() => this.#activeExecutions.delete(run.id));
+      }
     } else {
       const execution = this.execute(run.id, tasks, options, controller);
       this.#activeExecutions.set(run.id, execution);
@@ -208,7 +174,7 @@ export class EvaluationService {
   cancel(id) {
     const key = String(id);
     const run = this.getRun(key);
-    if (!run || ['completed', 'failed', 'cancelled'].includes(run.status)) return run ?? null;
+    if (!run || ['completed', 'failed', 'cancelled', 'timeout'].includes(run.status)) return run ?? null;
     const controller = this.#controllers.get(key);
     controller?.abort('cancelled by user');
     this.jobQueue?.cancelByTask?.(key);
@@ -271,11 +237,15 @@ export class EvaluationService {
   }
 
   async close({ timeoutMs = 30_000 } = {}) {
-    for (const controller of this.#controllers.values()) controller.abort('service shutdown');
-    const pending = [...this.#activeExecutions.values()];
-    if (pending.length) {
-      await Promise.race([Promise.allSettled(pending), delay(Math.max(1, Number(timeoutMs) || 30_000))]);
+    if (!this.store?.db?.isOpen) return { drained: this.#activeExecutions.size === 0 };
+    const activeRuns = this.listRuns({ limit: 200 }).filter((run) => ['queued', 'running'].includes(run.status));
+    for (const run of activeRuns) {
+      this.#controllers.get(run.id)?.abort('service shutdown');
+      this.jobQueue?.cancelByTask?.(run.id);
+      if (run.status === 'queued') this.#update(run.id, { status: 'cancelled', finishedAt: Date.now(), cancelRequestedAt: Date.now() });
     }
+    const pending = [...this.#activeExecutions.values()];
+    if (pending.length) await Promise.race([Promise.allSettled(pending), delay(Math.max(1, Number(timeoutMs) || 30_000))]);
     this.#controllers.clear();
     return { drained: this.#activeExecutions.size === 0 };
   }
