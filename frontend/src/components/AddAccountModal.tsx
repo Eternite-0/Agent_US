@@ -6,7 +6,7 @@ import type {
   ProviderPreset,
   ProviderPresetCatalog,
 } from '../types/backend';
-import { BUILTIN_PROVIDER_PRESETS } from '../data/providerPresets';
+import { mergeProviderPresetCatalog } from '../data/providerPresets';
 import { IconClose, IconSearch } from './Icons';
 import { ProviderLogo } from './ProviderLogo';
 
@@ -121,20 +121,10 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
   const [importingLocalId, setImportingLocalId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const mergedCatalog = useMemo<ProviderPresetCatalog>(() => {
-    const remoteItems = presets?.items ?? {};
-    const remoteCategories = presets?.categories ?? [];
-    const categoriesById = new Map(
-      [...(BUILTIN_PROVIDER_PRESETS.categories ?? []), ...remoteCategories].map((category) => [category.id, category]),
-    );
-    return {
-      categories: [...categoriesById.values()],
-      items: {
-        ...BUILTIN_PROVIDER_PRESETS.items,
-        ...remoteItems,
-      },
-    };
-  }, [presets]);
+  const mergedCatalog = useMemo<ProviderPresetCatalog>(
+    () => mergeProviderPresetCatalog(presets),
+    [presets],
+  );
 
   const allPresets = useMemo<ProviderPreset[]>(
     () => Object.values(mergedCatalog.items),
