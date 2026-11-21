@@ -4,11 +4,15 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -20,6 +24,8 @@ import { Fault, id as uuid } from '../store.js';
 import { canonicalJson } from '../integrity.js';
 import { PolicyError } from '../kernel/errors.js';
 import { assertLeaseInTx } from '../durable/lease-guard.js';
+import { withTraceContext } from '../observability/trace.js';
+import { intersectPolicies } from '../tools/policy.js';
 import { resolveConfinedPath } from '../tools/sandbox.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../tools/registry.js';
 
@@ -53,6 +59,64 @@ export function isBinaryBuffer(buf) {
     if (b < 7 || (b > 13 && b < 32)) suspicious++;
   }
   return suspicious / sampleLen > 0.3;
+}
+
+function normalizeLineEndingsToLf(buf) {
+  if (!Buffer.isBuffer(buf) || !buf.length) return buf;
+  const text = buf.toString('utf8');
+  if (!text.includes('\r\n')) return buf;
+  return Buffer.from(text.replace(/\r\n/g, '\n'), 'utf8');
+}
+
+function matchesBaseContent(parentBuf, baseSha256, binary = false) {
+  if (!baseSha256) return true;
+  if (sha256Buffer(parentBuf) === baseSha256) return true;
+  if (!binary && !isBinaryBuffer(parentBuf)) {
+    const lfBuf = normalizeLineEndingsToLf(parentBuf);
+    if (lfBuf !== parentBuf && sha256Buffer(lfBuf) === baseSha256) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseGitModeMapNull(rawBuf) {
+  const text = Buffer.isBuffer(rawBuf) ? rawBuf.toString('utf8') : String(rawBuf ?? '');
+  const map = new Map();
+  if (!text) return map;
+  for (const record of text.split('\0')) {
+    if (!record) continue;
+    const tabIdx = record.indexOf('\t');
+    if (tabIdx <= 0) continue;
+    const header = record.slice(0, tabIdx).trim();
+    const path = record.slice(tabIdx + 1);
+    const mode = header.split(/\s+/)[0];
+    if (mode && path) map.set(path, mode);
+  }
+  return map;
+}
+
+function isCaseOnlyRenamePath(prevFull, nextFull) {
+  return prevFull !== nextFull && prevFull.toLowerCase() === nextFull.toLowerCase();
+}
+
+function validateSymlinkTargetInsideRoot(workspaceRoot, linkFullPath, targetStr) {
+  const linkText = String(targetStr ?? '');
+  if (!linkText || isAbsolute(linkText)) {
+    throw new PolicyError('POLICY_DENIED', {
+      status: 403,
+      message: `Refusing to apply symlink with absolute or empty target: ${linkText}`,
+    });
+  }
+  const root = resolve(workspaceRoot);
+  const resolvedTarget = resolve(dirname(linkFullPath), linkText);
+  const rel = relative(root, resolvedTarget);
+  if (rel.startsWith('..') || isAbsolute(rel) || rel.split(sep).includes('..')) {
+    throw new PolicyError('POLICY_DENIED', {
+      status: 403,
+      message: `Refusing to apply symlink escaping workspace root: ${linkText}`,
+    });
+  }
 }
 
 function normalizePosixRel(relPath) {
@@ -180,6 +244,8 @@ function hydrateArtifactRow(row) {
  * Separates archive, verify, read/handoff, and guarded apply-to-parent actions.
  */
 export class SwarmArtifactManager {
+  #activeApplies = new Set();
+
   constructor({ store, storageRoot }) {
     this.store = store;
     this.storageRoot = resolve(storageRoot);
@@ -233,198 +299,242 @@ export class SwarmArtifactManager {
     }
 
     const artifactId = uuid();
-    const uri = `${SWARM_ARTIFACT_URI_PREFIX}${runId}/${artifactId}`;
-    const safeRunDir = String(runId).replace(/[^a-zA-Z0-9._-]/g, '_');
-    const artifactDir = join(this.storageRoot, safeRunDir, artifactId);
-    const filesDir = join(artifactDir, 'files');
-    const tmpIndex = join(tmpdir(), `agent-us-art-idx-${artifactId}`);
+    return withTraceContext(
+      { runId, nodeId, artifactId, sessionId: childSessionId, turnId: childTurnId },
+      async () => {
+        const uri = `${SWARM_ARTIFACT_URI_PREFIX}${runId}/${artifactId}`;
+        const safeRunDir = String(runId).replace(/[^a-zA-Z0-9._-]/g, '_');
+        const artifactDir = join(this.storageRoot, safeRunDir, artifactId);
+        const filesDir = join(artifactDir, 'files');
+        const tmpIndex = join(tmpdir(), `agent-us-art-idx-${artifactId}`);
 
-    let committed = false;
-    try {
-      this.#ensureStorageRoot();
-      mkdirSync(filesDir, { recursive: true });
-
-      const resolvedBaseCommit =
-        baseCommit ||
-        (await runGitRaw(worktreePath, ['rev-parse', 'HEAD'])).trim();
-      let resolvedBaseRef = baseRef;
-      if (!resolvedBaseRef) {
+        let committed = false;
         try {
-          resolvedBaseRef = (await runGitRaw(worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
-        } catch {
-          resolvedBaseRef = 'HEAD';
-        }
-      }
+          this.#ensureStorageRoot();
+          mkdirSync(filesDir, { recursive: true });
 
-      // Copy existing worktree index to temp GIT_INDEX_FILE so staged chmods (+x) are preserved
-      // without mutating the worktree's real git index.
-      let realIndexPath = null;
-      try {
-        const idxOut = (await runGitRaw(worktreePath, ['rev-parse', '--git-path', 'index'])).trim();
-        realIndexPath = isAbsolute(idxOut) ? idxOut : resolve(worktreePath, idxOut);
-      } catch {
-        realIndexPath = null;
-      }
-      const gitEnv = { ...process.env, GIT_INDEX_FILE: tmpIndex };
-      if (realIndexPath && existsSync(realIndexPath)) {
-        copyFileSync(realIndexPath, tmpIndex);
-      } else {
-        await runGitRaw(worktreePath, ['read-tree', resolvedBaseCommit], { env: gitEnv });
-      }
-
-      // Stage all modifications, untracked files, and deletions into temp index, excluding handoff dir
-      await runGitRaw(
-        worktreePath,
-        ['add', '-A', '--', '.', `:(exclude)${SWARM_ARTIFACT_HANDOFF_DIR}`],
-        { env: gitEnv },
-      );
-      await runGitRaw(
-        worktreePath,
-        ['rm', '-rf', '--cached', '--ignore-unmatch', SWARM_ARTIFACT_HANDOFF_DIR],
-        { env: gitEnv },
-      ).catch(() => {});
-
-      const rawDiffBuf = await runGitRaw(
-        worktreePath,
-        ['diff', '--cached', '--raw', '-z', '-M', resolvedBaseCommit],
-        { env: gitEnv, encoding: 'buffer' },
-      );
-      const patchBuf = await runGitRaw(
-        worktreePath,
-        ['diff', '--cached', '--binary', '-M', resolvedBaseCommit],
-        { env: gitEnv, encoding: 'buffer' },
-      ).catch(() => Buffer.alloc(0));
-
-      const rawEntries = parseRawNullDiff(rawDiffBuf).filter(
-        (e) =>
-          !e.path.startsWith(`${SWARM_ARTIFACT_HANDOFF_DIR}/`) &&
-          e.path !== SWARM_ARTIFACT_HANDOFF_DIR,
-      );
-
-      const entries = [];
-      let totalBytes = 0;
-
-      for (const item of rawEntries) {
-        const normPath = normalizePosixRel(item.path);
-        const normPrev = item.previousPath ? normalizePosixRel(item.previousPath) : null;
-
-        let baseSha256 = null;
-        if (item.oldHash && !/^0+$/.test(item.oldHash)) {
-          try {
-            const baseBlob = await runGitRaw(
-              worktreePath,
-              ['cat-file', 'blob', item.oldHash],
-              { encoding: 'buffer' },
-            );
-            baseSha256 = sha256Buffer(baseBlob);
-          } catch {
-            baseSha256 = null;
-          }
-        }
-
-        if (item.changeType === 'deleted') {
-          entries.push({
-            path: normPath,
-            changeType: 'deleted',
-            previousPath: null,
-            binary: false,
-            mode: item.oldMode || '100644',
-            size: 0,
-            baseSha256,
-            sha256: null,
-            contentFile: null,
-          });
-          continue;
-        }
-
-        const src = resolveConfinedPath(worktreePath, normPath);
-        const contentBuf = readFileSync(src.full);
-        const contentSha = sha256Buffer(contentBuf);
-        const binary = isBinaryBuffer(contentBuf);
-        const dst = resolveInsideDir(filesDir, normPath);
-        mkdirSync(dirname(dst.full), { recursive: true });
-        writeFileSync(dst.full, contentBuf);
-
-        let effectiveMode = item.newMode || '100644';
-        if (process.platform !== 'win32') {
-          try {
-            const st = statSync(src.full);
-            if ((st.mode & 0o111) !== 0 && effectiveMode === '100644') {
-              effectiveMode = '100755';
+          const resolvedBaseCommit =
+            baseCommit ||
+            (await runGitRaw(worktreePath, ['rev-parse', 'HEAD'])).trim();
+          let resolvedBaseRef = baseRef;
+          if (!resolvedBaseRef) {
+            try {
+              resolvedBaseRef = (await runGitRaw(worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+            } catch {
+              resolvedBaseRef = 'HEAD';
             }
-          } catch {
-            // keep git mode
           }
-        }
 
-        totalBytes += contentBuf.length;
-        entries.push({
-          path: normPath,
-          changeType: item.changeType,
-          previousPath: normPrev,
-          binary,
-          mode: effectiveMode,
-          size: contentBuf.length,
-          baseSha256,
-          sha256: contentSha,
-          contentFile: `files/${normPath}`,
-        });
-      }
+          // Copy existing worktree index to temp GIT_INDEX_FILE so staged chmods (+x/-x) are preserved
+          // without mutating the worktree's real git index.
+          let realIndexPath = null;
+          try {
+            const idxOut = (await runGitRaw(worktreePath, ['rev-parse', '--git-path', 'index'])).trim();
+            realIndexPath = isAbsolute(idxOut) ? idxOut : resolve(worktreePath, idxOut);
+          } catch {
+            realIndexPath = null;
+          }
+          const gitEnv = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+          const explicitExecPaths = [];
+          const explicitNoExecPaths = [];
+          if (realIndexPath && existsSync(realIndexPath)) {
+            copyFileSync(realIndexPath, tmpIndex);
+            // Ubuntu/POSIX core.filemode=true fix: record explicitly staged executable bit overrides
+            // before `git add -A` can overwrite them from working-tree stat bits.
+            try {
+              const [headTreeBuf, stagedBuf] = await Promise.all([
+                runGitRaw(worktreePath, ['ls-tree', '-r', '-z', resolvedBaseCommit], {
+                  encoding: 'buffer',
+                }),
+                runGitRaw(worktreePath, ['ls-files', '--stage', '-z'], {
+                  env: gitEnv,
+                  encoding: 'buffer',
+                }),
+              ]);
+              const headModes = parseGitModeMapNull(headTreeBuf);
+              const stagedModes = parseGitModeMapNull(stagedBuf);
+              for (const [p, stagedMode] of stagedModes.entries()) {
+                if (
+                  p === SWARM_ARTIFACT_HANDOFF_DIR ||
+                  p.startsWith(`${SWARM_ARTIFACT_HANDOFF_DIR}/`)
+                ) {
+                  continue;
+                }
+                const headMode = headModes.get(p);
+                if (stagedMode === '100755' && headMode !== '100755') {
+                  explicitExecPaths.push(p);
+                } else if (stagedMode === '100644' && headMode === '100755') {
+                  explicitNoExecPaths.push(p);
+                }
+              }
+            } catch {
+              // fallback gracefully if ls-tree/ls-files fails on unborn repo
+            }
+          } else {
+            await runGitRaw(worktreePath, ['read-tree', resolvedBaseCommit], { env: gitEnv });
+          }
 
-      entries.sort((a, b) => a.path.localeCompare(b.path));
-      const patchFile = 'changes.patch';
-      writeFileSync(join(artifactDir, patchFile), patchBuf);
+          // Stage all modifications, untracked files, and deletions into temp index, excluding handoff dir
+          await runGitRaw(
+            worktreePath,
+            ['add', '-A', '--', '.', `:(exclude)${SWARM_ARTIFACT_HANDOFF_DIR}`],
+            { env: gitEnv },
+          );
+          await runGitRaw(
+            worktreePath,
+            ['rm', '-rf', '--cached', '--ignore-unmatch', SWARM_ARTIFACT_HANDOFF_DIR],
+            { env: gitEnv },
+          ).catch(() => {});
 
-      const bundleSha256 = computeBundleDigest(resolvedBaseCommit, entries);
-      const now = Date.now();
-      const manifest = {
-        version: 1,
-        artifactId,
-        uri,
-        runId,
-        nodeId,
-        nodeKey,
-        childSessionId,
-        childTurnId,
-        jobId,
-        attempt: Number(attempt || 1),
-        ownerId: String(ownerId),
-        fence: fence ?? leaseGuard?.fence ?? null,
-        workspaceRoot: resolve(workspaceRoot),
-        baseCommit: resolvedBaseCommit,
-        baseRef: resolvedBaseRef,
-        bundleSha256,
-        patchFile,
-        fileCount: entries.length,
-        totalBytes,
-        createdAt: now,
-        entries,
-      };
+          // Restore explicitly staged +x / -x mode overrides on files still present in tmpIndex
+          if (explicitExecPaths.length > 0 || explicitNoExecPaths.length > 0) {
+            let currentIndexedPaths = null;
+            try {
+              const afterBuf = await runGitRaw(worktreePath, ['ls-files', '-z'], {
+                env: gitEnv,
+                encoding: 'buffer',
+              });
+              currentIndexedPaths = new Set(afterBuf.toString('utf8').split('\0').filter(Boolean));
+            } catch {
+              currentIndexedPaths = null;
+            }
+            const applyChmodBatch = async (flag, paths) => {
+              const alive = currentIndexedPaths
+                ? paths.filter((p) => currentIndexedPaths.has(p))
+                : paths.filter((p) => existsSync(resolveInsideDir(worktreePath, p).full));
+              for (let i = 0; i < alive.length; i += 100) {
+                const chunk = alive.slice(i, i + 100);
+                await runGitRaw(worktreePath, ['update-index', flag, '--', ...chunk], { env: gitEnv });
+              }
+            };
+            if (explicitExecPaths.length > 0) {
+              await applyChmodBatch('--chmod=+x', explicitExecPaths);
+            }
+            if (explicitNoExecPaths.length > 0) {
+              await applyChmodBatch('--chmod=-x', explicitNoExecPaths);
+            }
+          }
 
-      const manifestTmp = join(artifactDir, 'manifest.json.tmp');
-      const manifestPath = join(artifactDir, 'manifest.json');
-      writeFileSync(manifestTmp, JSON.stringify(manifest, null, 2), 'utf8');
-      renameSync(manifestTmp, manifestPath);
+          const rawDiffBuf = await runGitRaw(
+            worktreePath,
+            ['diff', '--cached', '--raw', '-z', '-M', resolvedBaseCommit],
+            { env: gitEnv, encoding: 'buffer' },
+          );
+          const patchBuf = await runGitRaw(
+            worktreePath,
+            ['diff', '--cached', '--binary', '-M', resolvedBaseCommit],
+            { env: gitEnv, encoding: 'buffer' },
+          ).catch(() => Buffer.alloc(0));
 
-      // Atomic DB registration enforced by leaseGuard INSIDE SQLite transaction (Fix C5 + C10 + D5)
-      const effectiveFence = fence ?? leaseGuard?.fence ?? null;
-      this.store.tx(() => {
-        assertLeaseInTx(leaseGuard, {
-          runId,
-          nodeId,
-          turnId: childTurnId,
-          sessionId: childSessionId,
-        });
-        this.store.db
-          .prepare(
-            `INSERT INTO swarm_artifacts(
-              id, uri, runId, nodeId, nodeKey, childSessionId, childTurnId, jobId,
-              attempt, ownerId, fence, workspaceRoot, worktreePath, baseCommit, baseRef,
-              storagePath, bundleSha256, manifestJson, fileCount, totalBytes, status,
-              createdAt, updatedAt
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'archived',?,?)`,
-          )
-          .run(
+          const rawEntries = parseRawNullDiff(rawDiffBuf).filter(
+            (e) =>
+              !e.path.startsWith(`${SWARM_ARTIFACT_HANDOFF_DIR}/`) &&
+              e.path !== SWARM_ARTIFACT_HANDOFF_DIR,
+          );
+
+          const entries = [];
+          let totalBytes = 0;
+
+          for (const item of rawEntries) {
+            const normPath = normalizePosixRel(item.path);
+            const normPrev = item.previousPath ? normalizePosixRel(item.previousPath) : null;
+
+            let baseSha256 = null;
+            if (item.oldHash && !/^0+$/.test(item.oldHash)) {
+              try {
+                const baseBlob = await runGitRaw(
+                  worktreePath,
+                  ['cat-file', 'blob', item.oldHash],
+                  { encoding: 'buffer' },
+                );
+                baseSha256 = sha256Buffer(baseBlob);
+              } catch {
+                baseSha256 = null;
+              }
+            }
+
+            if (item.changeType === 'deleted') {
+              entries.push({
+                path: normPath,
+                changeType: 'deleted',
+                previousPath: null,
+                binary: false,
+                mode: item.oldMode || '100644',
+                size: 0,
+                baseSha256,
+                sha256: null,
+                contentFile: null,
+              });
+              continue;
+            }
+
+            // Symlink-safe archiving: inspect lstat BEFORE reading so broken or external symlinks
+            // never throw ENOENT or silently dereference host files outside the worktree.
+            const lexSrc = resolveInsideDir(worktreePath, normPath);
+            let lstatInfo = null;
+            try {
+              lstatInfo = lstatSync(lexSrc.full);
+            } catch {
+              lstatInfo = null;
+            }
+            const isSymlink = item.newMode === '120000' || Boolean(lstatInfo?.isSymbolicLink?.());
+
+            let contentBuf;
+            let effectiveMode = item.newMode || '100644';
+            let binary = false;
+
+            if (isSymlink) {
+              const parentRel = dirname(normPath);
+              if (parentRel && parentRel !== '.') {
+                resolveConfinedPath(worktreePath, parentRel);
+              }
+              const linkTarget = readlinkSync(lexSrc.full);
+              contentBuf = Buffer.from(linkTarget, 'utf8');
+              effectiveMode = '120000';
+              binary = false;
+            } else {
+              const src = resolveConfinedPath(worktreePath, normPath);
+              contentBuf = readFileSync(src.full);
+              binary = isBinaryBuffer(contentBuf);
+              if (process.platform !== 'win32') {
+                try {
+                  const st = statSync(src.full);
+                  if ((st.mode & 0o111) !== 0 && effectiveMode === '100644') {
+                    effectiveMode = '100755';
+                  }
+                } catch {
+                  // keep git mode
+                }
+              }
+            }
+
+            const contentSha = sha256Buffer(contentBuf);
+            const dst = resolveInsideDir(filesDir, normPath);
+            mkdirSync(dirname(dst.full), { recursive: true });
+            writeFileSync(dst.full, contentBuf);
+
+            totalBytes += contentBuf.length;
+            entries.push({
+              path: normPath,
+              changeType: item.changeType,
+              previousPath: normPrev,
+              binary,
+              mode: effectiveMode,
+              size: contentBuf.length,
+              baseSha256,
+              sha256: contentSha,
+              contentFile: `files/${normPath}`,
+            });
+          }
+
+          entries.sort((a, b) => a.path.localeCompare(b.path));
+          const patchFile = 'changes.patch';
+          writeFileSync(join(artifactDir, patchFile), patchBuf);
+
+          const bundleSha256 = computeBundleDigest(resolvedBaseCommit, entries);
+          const now = Date.now();
+          const manifest = {
+            version: 1,
             artifactId,
             uri,
             runId,
@@ -432,49 +542,97 @@ export class SwarmArtifactManager {
             nodeKey,
             childSessionId,
             childTurnId,
-            jobId ?? leaseGuard?.jobId ?? null,
-            Number(attempt || 1),
-            String(ownerId),
-            effectiveFence,
-            resolve(workspaceRoot),
-            worktreePath,
-            resolvedBaseCommit,
-            resolvedBaseRef,
-            artifactDir,
+            jobId,
+            attempt: Number(attempt || 1),
+            ownerId: String(ownerId),
+            fence: fence ?? leaseGuard?.fence ?? null,
+            workspaceRoot: resolve(workspaceRoot),
+            baseCommit: resolvedBaseCommit,
+            baseRef: resolvedBaseRef,
             bundleSha256,
-            JSON.stringify(manifest),
-            entries.length,
+            patchFile,
+            fileCount: entries.length,
             totalBytes,
-            now,
-            now,
-          );
-        if (worktreeLeaseId) {
-          this.store.db
-            .prepare(
-              `UPDATE worktree_leases
-               SET artifactId=?, cleanupState='archived', dirtyWrites=0, updatedAt=?
-               WHERE id=? AND (? IS NULL OR fence IS NULL OR fence=?)`,
-            )
-            .run(artifactId, now, worktreeLeaseId, effectiveFence, effectiveFence);
-        }
-      });
+            createdAt: now,
+            entries,
+          };
 
-      committed = true;
-      return this.getArtifact(artifactId);
-    } finally {
-      try {
-        if (existsSync(tmpIndex)) unlinkSync(tmpIndex);
-      } catch {
-        // ignore temp index cleanup error
-      }
-      if (!committed) {
-        try {
-          rmSync(artifactDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 25 });
-        } catch {
-          // ignore cleanup error
+          const manifestTmp = join(artifactDir, 'manifest.json.tmp');
+          const manifestPath = join(artifactDir, 'manifest.json');
+          writeFileSync(manifestTmp, JSON.stringify(manifest, null, 2), 'utf8');
+          renameSync(manifestTmp, manifestPath);
+
+          // Atomic DB registration enforced by leaseGuard INSIDE SQLite transaction (Fix C5 + C10 + D5)
+          const effectiveFence = fence ?? leaseGuard?.fence ?? null;
+          this.store.tx(() => {
+            assertLeaseInTx(leaseGuard, {
+              runId,
+              nodeId,
+              turnId: childTurnId,
+              sessionId: childSessionId,
+            });
+            this.store.db
+              .prepare(
+                `INSERT INTO swarm_artifacts(
+                  id, uri, runId, nodeId, nodeKey, childSessionId, childTurnId, jobId,
+                  attempt, ownerId, fence, workspaceRoot, worktreePath, baseCommit, baseRef,
+                  storagePath, bundleSha256, manifestJson, fileCount, totalBytes, status,
+                  createdAt, updatedAt
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'archived',?,?)`,
+              )
+              .run(
+                artifactId,
+                uri,
+                runId,
+                nodeId,
+                nodeKey,
+                childSessionId,
+                childTurnId,
+                jobId ?? leaseGuard?.jobId ?? null,
+                Number(attempt || 1),
+                String(ownerId),
+                effectiveFence,
+                resolve(workspaceRoot),
+                worktreePath,
+                resolvedBaseCommit,
+                resolvedBaseRef,
+                artifactDir,
+                bundleSha256,
+                JSON.stringify(manifest),
+                entries.length,
+                totalBytes,
+                now,
+                now,
+              );
+            if (worktreeLeaseId) {
+              this.store.db
+                .prepare(
+                  `UPDATE worktree_leases
+                   SET artifactId=?, cleanupState='archived', dirtyWrites=0, updatedAt=?
+                   WHERE id=? AND (? IS NULL OR fence IS NULL OR fence=?)`,
+                )
+                .run(artifactId, now, worktreeLeaseId, effectiveFence, effectiveFence);
+            }
+          });
+
+          committed = true;
+          return this.getArtifact(artifactId);
+        } finally {
+          try {
+            if (existsSync(tmpIndex)) unlinkSync(tmpIndex);
+          } catch {
+            // ignore temp index cleanup error
+          }
+          if (!committed) {
+            try {
+              rmSync(artifactDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 25 });
+            } catch {
+              // ignore cleanup error
+            }
+          }
         }
-      }
-    }
+      },
+    );
   }
 
   getArtifact(idOrUri) {
@@ -486,7 +644,7 @@ export class SwarmArtifactManager {
     return hydrateArtifactRow(row);
   }
 
-  listArtifacts({ runId = null, nodeKey = null, nodeId = null, limit = 200 } = {}) {
+  listArtifacts({ runId = null, nodeKey = null, nodeId = null, excludeSuperseded = false, limit = 200 } = {}) {
     if (!this.store?.db?.isOpen) return [];
     const where = [];
     const params = [];
@@ -502,10 +660,13 @@ export class SwarmArtifactManager {
       where.push('nodeId=?');
       params.push(nodeId);
     }
+    if (excludeSuperseded) {
+      where.push("status != 'superseded'");
+    }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const cap = Math.min(500, Math.max(1, Number(limit || 200)));
     return this.store.db
-      .prepare(`SELECT * FROM swarm_artifacts ${clause} ORDER BY createdAt DESC, attempt DESC LIMIT ?`)
+      .prepare(`SELECT * FROM swarm_artifacts ${clause} ORDER BY createdAt DESC, attempt DESC, rowid DESC LIMIT ?`)
       .all(...params, cap)
       .map(hydrateArtifactRow);
   }
@@ -514,10 +675,162 @@ export class SwarmArtifactManager {
     if (!this.store?.db?.isOpen || !runId || !nodeKey) return null;
     const row = this.store.db
       .prepare(
-        'SELECT * FROM swarm_artifacts WHERE runId=? AND nodeKey=? ORDER BY attempt DESC, createdAt DESC LIMIT 1',
+        `SELECT * FROM swarm_artifacts
+         WHERE runId=? AND nodeKey=? AND status != 'superseded'
+         ORDER BY attempt DESC, createdAt DESC, rowid DESC
+         LIMIT 1`,
       )
       .get(runId, nodeKey);
     return hydrateArtifactRow(row);
+  }
+
+  /**
+   * Marks non-applied artifacts for a replanned/superseded node as `'superseded'`
+   * so downstream consumers and verification never pick up obsolete attempts.
+   */
+  supersedeNodeArtifacts(runId, nodeIdOrKey, { leaseGuard = null } = {}) {
+    if (!this.store?.db?.isOpen || !runId || !nodeIdOrKey) return 0;
+    const now = Date.now();
+    return this.store.tx(() => {
+      assertLeaseInTx(leaseGuard, { runId });
+      const res = this.store.db
+        .prepare(
+          `UPDATE swarm_artifacts
+           SET status='superseded', updatedAt=?
+           WHERE runId=? AND (nodeId=? OR nodeKey=?) AND status NOT IN ('applied', 'superseded')`,
+        )
+        .run(now, runId, String(nodeIdOrKey), String(nodeIdOrKey));
+      return Number(res.changes ?? 0);
+    });
+  }
+
+  /**
+   * Reaps orphaned artifact directories written on disk whose SQLite metadata row never committed
+   * (e.g., process crash between disk write and SQLite commit).
+   */
+  cleanupOrphanArtifacts({ minAgeMs = 2000 } = {}) {
+    const report = { scanned: 0, removed: 0, skippedRecent: 0, errors: [] };
+    if (!this.store?.db?.isOpen || !existsSync(this.storageRoot)) return report;
+    const cutoff = Date.now() - Math.max(0, Number(minAgeMs || 0));
+    let runDirs = [];
+    try {
+      runDirs = readdirSync(this.storageRoot, { withFileTypes: true });
+    } catch {
+      return report;
+    }
+    const existsStmt = this.store.db.prepare('SELECT 1 FROM swarm_artifacts WHERE id=?');
+    for (const runEntry of runDirs) {
+      if (!runEntry.isDirectory()) continue;
+      const runDirPath = join(this.storageRoot, runEntry.name);
+      let artEntries = [];
+      try {
+        artEntries = readdirSync(runDirPath, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const artEntry of artEntries) {
+        if (!artEntry.isDirectory()) continue;
+        report.scanned++;
+        const artId = artEntry.name;
+        const artPath = join(runDirPath, artId);
+        if (existsStmt.get(artId)) continue;
+        try {
+          const st = statSync(artPath);
+          if (st.mtimeMs > cutoff) {
+            report.skippedRecent++;
+            continue;
+          }
+          rmSync(artPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+          report.removed++;
+        } catch (err) {
+          report.errors.push({ path: artPath, error: String(err?.message ?? err) });
+        }
+      }
+    }
+    return report;
+  }
+
+  /**
+   * Rehydrates a verified archived artifact's file changes into a fresh worktree directory
+   * (used during crash recovery when the original worktree was already cleaned up after archiving).
+   */
+  rehydrateArtifactToWorktree(idOrUri, targetWorktreePath) {
+    const verification = this.verifyArtifact(idOrUri);
+    if (!verification.ok) {
+      throw new Fault('ARTIFACT_VERIFICATION_FAILED', 422, {
+        message: `Cannot rehydrate corrupted artifact ${idOrUri}: ${verification.errors.join('; ')}`,
+        errors: verification.errors,
+      });
+    }
+    if (!targetWorktreePath || !existsSync(targetWorktreePath)) {
+      throw new Fault('WORKTREE_MISSING', 404, {
+        message: `Target worktree path does not exist for rehydration: ${targetWorktreePath}`,
+      });
+    }
+    const artifact = verification.artifact;
+    const root = resolve(targetWorktreePath);
+    let restoredCount = 0;
+
+    for (const entry of artifact.files) {
+      if (entry.changeType === 'deleted') {
+        const target = resolveConfinedPath(root, entry.path);
+        if (existsSync(target.full)) unlinkSync(target.full);
+        restoredCount++;
+        continue;
+      }
+      const readRes = this.readArtifactFile(artifact.id, entry.path);
+      const target =
+        entry.mode === '120000'
+          ? resolveInsideDir(root, entry.path)
+          : resolveConfinedPath(root, entry.path);
+      const prevTarget = entry.previousPath ? resolveConfinedPath(root, entry.previousPath) : null;
+      const caseOnlyRename =
+        entry.changeType === 'renamed' && prevTarget && isCaseOnlyRenamePath(prevTarget.full, target.full);
+
+      if (caseOnlyRename && existsSync(prevTarget.full)) {
+        const tmpName = join(dirname(target.full), `.agent-us-rehydrate-${uuid()}`);
+        renameSync(prevTarget.full, tmpName);
+        unlinkSync(tmpName);
+      }
+
+      mkdirSync(dirname(target.full), { recursive: true });
+      if (entry.mode === '120000') {
+        const linkTarget = readRes.buffer.toString('utf8');
+        validateSymlinkTargetInsideRoot(root, target.full, linkTarget);
+        try {
+          if (lstatSync(target.full)) unlinkSync(target.full);
+        } catch {
+          // ignore if not present
+        }
+        symlinkSync(linkTarget, target.full);
+      } else {
+        writeFileSync(target.full, readRes.buffer);
+        if (process.platform !== 'win32' && entry.mode === '100755') {
+          try {
+            chmodSync(target.full, 0o755);
+          } catch {
+            // ignore
+          }
+        }
+      }
+      if (
+        entry.changeType === 'renamed' &&
+        prevTarget &&
+        !caseOnlyRename &&
+        prevTarget.full !== target.full &&
+        existsSync(prevTarget.full)
+      ) {
+        unlinkSync(prevTarget.full);
+      }
+      restoredCount++;
+    }
+
+    return {
+      ok: true,
+      artifactId: artifact.id,
+      uri: artifact.uri,
+      restoredCount,
+    };
   }
 
   /**
@@ -691,9 +1004,16 @@ export class SwarmArtifactManager {
         });
       }
       const art = verification.artifact;
-      const safeNodeKey = String(art.nodeKey).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const rawSafeKey = String(art.nodeKey).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const safeNodeKey =
+        rawSafeKey === String(art.nodeKey)
+          ? rawSafeKey
+          : `${rawSafeKey}_${sha256Buffer(Buffer.from(String(art.nodeKey), 'utf8')).slice(0, 8)}`;
       const nodeHandoffRel = `${SWARM_ARTIFACT_HANDOFF_DIR}/${safeNodeKey}`;
       const nodeHandoffFull = join(resolve(targetWorktreeRoot), nodeHandoffRel);
+      if (existsSync(nodeHandoffFull)) {
+        rmSync(nodeHandoffFull, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+      }
       mkdirSync(nodeHandoffFull, { recursive: true });
 
       const materializedFiles = [];
@@ -804,14 +1124,22 @@ export class SwarmArtifactManager {
     const artifact = verification.artifact;
     const targetRoot = resolve(workspaceRoot || artifact.workspaceRoot);
 
-    let effectivePerm = permissionMode;
-    if (!effectivePerm && this.store?.db?.isOpen && artifact.runId) {
+    let runPerm = null;
+    if (this.store?.db?.isOpen && artifact.runId) {
       const runRow = this.store.db
         .prepare('SELECT permissionMode FROM swarm_runs WHERE id=?')
         .get(artifact.runId);
-      effectivePerm = runRow?.permissionMode || null;
+      runPerm = runRow?.permissionMode || null;
     }
-    effectivePerm = effectivePerm || 'approval';
+    let effectivePerm;
+    if (runPerm && permissionMode) {
+      effectivePerm = intersectPolicies(
+        { permissionMode: runPerm },
+        { permissionMode },
+      ).permissionMode;
+    } else {
+      effectivePerm = runPerm || permissionMode || 'approval';
+    }
 
     if (effectivePerm === 'read-only') {
       throw new PolicyError('POLICY_DENIED', {
@@ -826,60 +1154,161 @@ export class SwarmArtifactManager {
       });
     }
 
-    const conflicts = [];
-    const plan = [];
-    const skipped = [];
+    const applyLockKey = process.platform === 'win32' ? targetRoot.toLowerCase() : targetRoot;
+    if (this.#activeApplies.has(applyLockKey)) {
+      throw new Fault('APPLY_IN_PROGRESS', 409, {
+        message: `Another applyToParent operation is already in progress for ${targetRoot}`,
+        workspaceRoot: targetRoot,
+      });
+    }
+    this.#activeApplies.add(applyLockKey);
 
-    for (const entry of artifact.files) {
-      const target = resolveConfinedPath(targetRoot, entry.path);
-      const artifactFilePath =
-        entry.changeType === 'deleted'
-          ? null
-          : resolveInsideDir(join(artifact.storagePath, 'files'), entry.path).full;
+    try {
+      const conflicts = [];
+      const plan = [];
+      const skipped = [];
 
-      if (entry.changeType === 'added') {
-        if (existsSync(target.full)) {
-          const parentSha = sha256Buffer(readFileSync(target.full));
-          if (parentSha === entry.sha256) {
-            skipped.push({ path: entry.path, reason: 'already_identical' });
+      for (const entry of artifact.files) {
+        const target =
+          entry.mode === '120000'
+            ? resolveInsideDir(targetRoot, entry.path)
+            : resolveConfinedPath(targetRoot, entry.path);
+        const artifactFilePath =
+          entry.changeType === 'deleted'
+            ? null
+            : resolveInsideDir(join(artifact.storagePath, 'files'), entry.path).full;
+
+        if (entry.changeType === 'added') {
+          if (existsSync(target.full)) {
+            const parentBuf = readFileSync(target.full);
+            const parentSha = sha256Buffer(parentBuf);
+            if (parentSha === entry.sha256) {
+              skipped.push({ path: entry.path, reason: 'already_identical' });
+            } else {
+              conflicts.push({
+                path: entry.path,
+                changeType: entry.changeType,
+                reason: 'target_exists_diverged',
+                baseSha256: null,
+                parentSha256: parentSha,
+                artifactSha256: entry.sha256,
+                parentPreserved: true,
+                artifactPreserved: true,
+                artifactFilePath,
+              });
+            }
           } else {
+            plan.push({ entry, target });
+          }
+        } else if (entry.changeType === 'modified') {
+          if (!existsSync(target.full)) {
             conflicts.push({
               path: entry.path,
               changeType: entry.changeType,
-              reason: 'target_exists_diverged',
-              baseSha256: null,
-              parentSha256: parentSha,
+              reason: 'target_deleted_in_parent',
+              baseSha256: entry.baseSha256,
+              parentSha256: null,
               artifactSha256: entry.sha256,
               parentPreserved: true,
               artifactPreserved: true,
               artifactFilePath,
             });
+          } else {
+            const parentBuf = readFileSync(target.full);
+            const parentSha = sha256Buffer(parentBuf);
+            if (parentSha === entry.sha256) {
+              skipped.push({ path: entry.path, reason: 'already_applied' });
+            } else if (
+              entry.baseSha256 &&
+              !matchesBaseContent(parentBuf, entry.baseSha256, Boolean(entry.binary))
+            ) {
+              conflicts.push({
+                path: entry.path,
+                changeType: entry.changeType,
+                reason: 'parent_modified_concurrently',
+                baseSha256: entry.baseSha256,
+                parentSha256: parentSha,
+                artifactSha256: entry.sha256,
+                parentPreserved: true,
+                artifactPreserved: true,
+                artifactFilePath,
+              });
+            } else {
+              plan.push({ entry, target });
+            }
           }
-        } else {
-          plan.push({ entry, target });
-        }
-      } else if (entry.changeType === 'modified') {
-        if (!existsSync(target.full)) {
-          conflicts.push({
-            path: entry.path,
-            changeType: entry.changeType,
-            reason: 'target_deleted_in_parent',
-            baseSha256: entry.baseSha256,
-            parentSha256: null,
-            artifactSha256: entry.sha256,
-            parentPreserved: true,
-            artifactPreserved: true,
-            artifactFilePath,
-          });
-        } else {
-          const parentSha = sha256Buffer(readFileSync(target.full));
-          if (parentSha === entry.sha256) {
-            skipped.push({ path: entry.path, reason: 'already_applied' });
-          } else if (entry.baseSha256 && parentSha !== entry.baseSha256) {
+        } else if (entry.changeType === 'deleted') {
+          if (!existsSync(target.full)) {
+            skipped.push({ path: entry.path, reason: 'already_deleted' });
+          } else {
+            const parentBuf = readFileSync(target.full);
+            const parentSha = sha256Buffer(parentBuf);
+            if (
+              entry.baseSha256 &&
+              !matchesBaseContent(parentBuf, entry.baseSha256, Boolean(entry.binary))
+            ) {
+              conflicts.push({
+                path: entry.path,
+                changeType: entry.changeType,
+                reason: 'delete_vs_parent_modified',
+                baseSha256: entry.baseSha256,
+                parentSha256: parentSha,
+                artifactSha256: null,
+                parentPreserved: true,
+                artifactPreserved: true,
+                artifactFilePath: null,
+              });
+            } else {
+              plan.push({ entry, target });
+            }
+          }
+        } else if (entry.changeType === 'renamed') {
+          const prevTarget = resolveConfinedPath(targetRoot, entry.previousPath);
+          const prevExists = existsSync(prevTarget.full);
+          const nextExists = existsSync(target.full);
+          const caseOnlyRename = isCaseOnlyRenamePath(prevTarget.full, target.full);
+
+          if (
+            !caseOnlyRename &&
+            !prevExists &&
+            nextExists &&
+            sha256Buffer(readFileSync(target.full)) === entry.sha256
+          ) {
+            skipped.push({ path: entry.path, reason: 'already_renamed' });
+            continue;
+          }
+          let hasConflict = false;
+          let reason = '';
+          let parentSha = null;
+          if (prevExists) {
+            const prevBuf = readFileSync(prevTarget.full);
+            const prevSha = sha256Buffer(prevBuf);
+            if (
+              entry.baseSha256 &&
+              !matchesBaseContent(prevBuf, entry.baseSha256, Boolean(entry.binary))
+            ) {
+              hasConflict = true;
+              reason = 'rename_source_modified_concurrently';
+              parentSha = prevSha;
+            }
+          } else {
+            hasConflict = true;
+            reason = 'rename_source_missing_in_parent';
+          }
+          if (!hasConflict && !caseOnlyRename && nextExists) {
+            const nextSha = sha256Buffer(readFileSync(target.full));
+            if (nextSha !== entry.sha256) {
+              hasConflict = true;
+              reason = 'rename_target_exists_diverged';
+              parentSha = nextSha;
+            }
+          }
+          if (hasConflict) {
             conflicts.push({
               path: entry.path,
+              previousPath: entry.previousPath,
               changeType: entry.changeType,
-              reason: 'parent_modified_concurrently',
+              reason,
               baseSha256: entry.baseSha256,
               parentSha256: parentSha,
               artifactSha256: entry.sha256,
@@ -888,160 +1317,198 @@ export class SwarmArtifactManager {
               artifactFilePath,
             });
           } else {
-            plan.push({ entry, target });
+            plan.push({ entry, target, prevTarget, caseOnlyRename });
           }
-        }
-      } else if (entry.changeType === 'deleted') {
-        if (!existsSync(target.full)) {
-          skipped.push({ path: entry.path, reason: 'already_deleted' });
-        } else {
-          const parentSha = sha256Buffer(readFileSync(target.full));
-          if (entry.baseSha256 && parentSha !== entry.baseSha256) {
-            conflicts.push({
-              path: entry.path,
-              changeType: entry.changeType,
-              reason: 'delete_vs_parent_modified',
-              baseSha256: entry.baseSha256,
-              parentSha256: parentSha,
-              artifactSha256: null,
-              parentPreserved: true,
-              artifactPreserved: true,
-              artifactFilePath: null,
-            });
-          } else {
-            plan.push({ entry, target });
-          }
-        }
-      } else if (entry.changeType === 'renamed') {
-        const prevTarget = resolveConfinedPath(targetRoot, entry.previousPath);
-        const prevExists = existsSync(prevTarget.full);
-        const nextExists = existsSync(target.full);
-
-        if (!prevExists && nextExists && sha256Buffer(readFileSync(target.full)) === entry.sha256) {
-          skipped.push({ path: entry.path, reason: 'already_renamed' });
-          continue;
-        }
-        let hasConflict = false;
-        let reason = '';
-        let parentSha = null;
-        if (prevExists) {
-          const prevSha = sha256Buffer(readFileSync(prevTarget.full));
-          if (entry.baseSha256 && prevSha !== entry.baseSha256) {
-            hasConflict = true;
-            reason = 'rename_source_modified_concurrently';
-            parentSha = prevSha;
-          }
-        } else {
-          hasConflict = true;
-          reason = 'rename_source_missing_in_parent';
-        }
-        if (!hasConflict && nextExists) {
-          const nextSha = sha256Buffer(readFileSync(target.full));
-          if (nextSha !== entry.sha256) {
-            hasConflict = true;
-            reason = 'rename_target_exists_diverged';
-            parentSha = nextSha;
-          }
-        }
-        if (hasConflict) {
-          conflicts.push({
-            path: entry.path,
-            previousPath: entry.previousPath,
-            changeType: entry.changeType,
-            reason,
-            baseSha256: entry.baseSha256,
-            parentSha256: parentSha,
-            artifactSha256: entry.sha256,
-            parentPreserved: true,
-            artifactPreserved: true,
-            artifactFilePath,
-          });
-        } else {
-          plan.push({ entry, target, prevTarget });
         }
       }
-    }
 
-    if (conflicts.length > 0) {
-      const conflictResult = {
-        ok: false,
-        status: 'conflict',
-        artifactId: artifact.id,
-        uri: artifact.uri,
-        applied: [],
-        skipped,
-        conflicts,
+      if (conflicts.length > 0) {
+        const conflictResult = {
+          ok: false,
+          status: 'conflict',
+          artifactId: artifact.id,
+          uri: artifact.uri,
+          applied: [],
+          skipped,
+          conflicts,
+        };
+        if (this.store?.db?.isOpen) {
+          const now = Date.now();
+          this.store.tx(() => {
+            this.store.db
+              .prepare('UPDATE swarm_artifacts SET applyResultJson=?, updatedAt=? WHERE id=?')
+              .run(JSON.stringify({ ...conflictResult, at: now }), now, artifact.id);
+          });
+        }
+        return conflictResult;
+      }
+
+      if (dryRun) {
+        return {
+          ok: true,
+          status: 'dry_run_clean',
+          artifactId: artifact.id,
+          uri: artifact.uri,
+          applied: plan.map((p) => ({ path: p.entry.path, changeType: p.entry.changeType })),
+          skipped,
+          conflicts: [],
+        };
+      }
+
+      // Pre-validate all payloads & snapshot existing target/prev files for atomic rollback on mid-batch I/O error
+      const preparedOps = [];
+      const snapshots = new Map();
+      const captureSnapshot = (filePath) => {
+        if (!filePath || snapshots.has(filePath)) return;
+        let lst = null;
+        try {
+          lst = lstatSync(filePath);
+        } catch {
+          lst = null;
+        }
+        if (!lst) {
+          snapshots.set(filePath, { existed: false });
+        } else if (lst.isSymbolicLink()) {
+          snapshots.set(filePath, { existed: true, isSymlink: true, linkTarget: readlinkSync(filePath) });
+        } else {
+          snapshots.set(filePath, {
+            existed: true,
+            isSymlink: false,
+            content: readFileSync(filePath),
+            mode: lst.mode,
+          });
+        }
       };
-      if (this.store?.db?.isOpen) {
-        const now = Date.now();
-        this.store.tx(() => {
-          this.store.db
-            .prepare('UPDATE swarm_artifacts SET applyResultJson=?, updatedAt=? WHERE id=?')
-            .run(JSON.stringify({ ...conflictResult, at: now }), now, artifact.id);
-        });
-      }
-      return conflictResult;
-    }
 
-    if (dryRun) {
-      return {
+      for (const op of plan) {
+        const { entry, target, prevTarget } = op;
+        captureSnapshot(target.full);
+        if (prevTarget) captureSnapshot(prevTarget.full);
+        if (entry.changeType !== 'deleted') {
+          const readRes = this.readArtifactFile(artifact.id, entry.path);
+          if (entry.mode === '120000') {
+            validateSymlinkTargetInsideRoot(targetRoot, target.full, readRes.buffer.toString('utf8'));
+          }
+          preparedOps.push({ ...op, readRes });
+        } else {
+          preparedOps.push({ ...op, readRes: null });
+        }
+      }
+
+      const applied = [];
+      const mutatedPaths = [];
+      try {
+        for (const op of preparedOps) {
+          const { entry, target, prevTarget, caseOnlyRename, readRes } = op;
+          if (entry.changeType === 'deleted') {
+            if (existsSync(target.full)) {
+              mutatedPaths.push(target.full);
+              unlinkSync(target.full);
+            }
+            applied.push({ path: entry.path, changeType: 'deleted' });
+          } else {
+            if (caseOnlyRename && prevTarget && existsSync(prevTarget.full)) {
+              mutatedPaths.push(prevTarget.full);
+              const tmpName = join(dirname(target.full), `.agent-us-apply-${uuid()}`);
+              renameSync(prevTarget.full, tmpName);
+              unlinkSync(tmpName);
+            }
+            mkdirSync(dirname(target.full), { recursive: true });
+            mutatedPaths.push(target.full);
+            if (entry.mode === '120000') {
+              const linkTarget = readRes.buffer.toString('utf8');
+              try {
+                if (lstatSync(target.full)) unlinkSync(target.full);
+              } catch {
+                // ignore
+              }
+              symlinkSync(linkTarget, target.full);
+            } else {
+              writeFileSync(target.full, readRes.buffer);
+              if (process.platform !== 'win32' && entry.mode === '100755') {
+                try {
+                  chmodSync(target.full, 0o755);
+                } catch {
+                  // ignore
+                }
+              }
+            }
+            if (
+              entry.changeType === 'renamed' &&
+              prevTarget &&
+              !caseOnlyRename &&
+              prevTarget.full !== target.full &&
+              existsSync(prevTarget.full)
+            ) {
+              mutatedPaths.push(prevTarget.full);
+              unlinkSync(prevTarget.full);
+            }
+            applied.push({
+              path: entry.path,
+              changeType: entry.changeType,
+              ...(entry.previousPath ? { previousPath: entry.previousPath } : {}),
+              sha256: entry.sha256,
+            });
+          }
+        }
+      } catch (applyErr) {
+        // Best-effort rollback of already-mutated files in reverse order
+        const rolledBack = new Set();
+        for (let i = mutatedPaths.length - 1; i >= 0; i--) {
+          const fp = mutatedPaths[i];
+          if (rolledBack.has(fp)) continue;
+          rolledBack.add(fp);
+          const snap = snapshots.get(fp);
+          if (!snap) continue;
+          try {
+            if (!snap.existed) {
+              if (existsSync(fp)) unlinkSync(fp);
+            } else if (snap.isSymlink) {
+              try {
+                if (lstatSync(fp)) unlinkSync(fp);
+              } catch {
+                // ignore
+              }
+              symlinkSync(snap.linkTarget, fp);
+            } else {
+              mkdirSync(dirname(fp), { recursive: true });
+              writeFileSync(fp, snap.content);
+              if (process.platform !== 'win32' && snap.mode) {
+                try {
+                  chmodSync(fp, snap.mode & 0o777);
+                } catch {
+                  // ignore
+                }
+              }
+            }
+          } catch {
+            // continue restoring remaining files
+          }
+        }
+        throw applyErr;
+      }
+
+      const now = Date.now();
+      const result = {
         ok: true,
-        status: 'dry_run_clean',
+        status: 'applied',
         artifactId: artifact.id,
         uri: artifact.uri,
-        applied: plan.map((p) => ({ path: p.entry.path, changeType: p.entry.changeType })),
+        applied,
         skipped,
         conflicts: [],
       };
-    }
-
-    const applied = [];
-    for (const op of plan) {
-      const { entry, target, prevTarget } = op;
-      if (entry.changeType === 'deleted') {
-        if (existsSync(target.full)) unlinkSync(target.full);
-        applied.push({ path: entry.path, changeType: 'deleted' });
-      } else {
-        const readRes = this.readArtifactFile(artifact.id, entry.path);
-        mkdirSync(dirname(target.full), { recursive: true });
-        writeFileSync(target.full, readRes.buffer);
-        if (process.platform !== 'win32' && entry.mode === '100755') {
-          try {
-            chmodSync(target.full, 0o755);
-          } catch {
-            // ignore
-          }
-        }
-        if (entry.changeType === 'renamed' && prevTarget && prevTarget.full !== target.full && existsSync(prevTarget.full)) {
-          unlinkSync(prevTarget.full);
-        }
-        applied.push({
-          path: entry.path,
-          changeType: entry.changeType,
-          ...(entry.previousPath ? { previousPath: entry.previousPath } : {}),
-          sha256: entry.sha256,
+      if (this.store?.db?.isOpen) {
+        this.store.tx(() => {
+          this.store.db
+            .prepare("UPDATE swarm_artifacts SET status='applied', appliedAt=?, applyResultJson=?, updatedAt=? WHERE id=?")
+            .run(now, JSON.stringify({ ...result, at: now }), now, artifact.id);
         });
       }
+      return result;
+    } finally {
+      this.#activeApplies.delete(applyLockKey);
     }
-
-    const now = Date.now();
-    const result = {
-      ok: true,
-      status: 'applied',
-      artifactId: artifact.id,
-      uri: artifact.uri,
-      applied,
-      skipped,
-      conflicts: [],
-    };
-    if (this.store?.db?.isOpen) {
-      this.store.tx(() => {
-        this.store.db
-          .prepare("UPDATE swarm_artifacts SET status='applied', appliedAt=?, applyResultJson=?, updatedAt=? WHERE id=?")
-          .run(now, JSON.stringify({ ...result, at: now }), now, artifact.id);
-      });
-    }
-    return result;
   }
 
   /**

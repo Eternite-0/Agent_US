@@ -1,6 +1,8 @@
 import { Fault, id as uuid } from '../store.js';
 import { BudgetError } from '../kernel/errors.js';
+import { assertLeaseInTx } from '../durable/lease-guard.js';
 import { BUDGET_SCOPES, estimateRequestInputTokens } from './budget-ledger.js';
+import { SWARM_NODE_STATES, isTerminalNodeState, transitionSwarmNode } from './node-state-machine.js';
 
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
@@ -117,6 +119,7 @@ export class DynamicTaskPlanner {
     budgetLedger = null,
     treeId = null,
     sessionId = null,
+    leaseGuard = null,
   }) {
     if (budgetLedger && treeId && budgetLedger.isExhausted(treeId)) {
       throw new BudgetError('BUDGET_EXCEEDED', {
@@ -158,6 +161,7 @@ export class DynamicTaskPlanner {
           estimatedInputTokens: estimateRequestInputTokens({ messages }),
           requestedMaxOutputTokens: 1200,
           defaultMaxOutputTokens: 1200,
+          leaseGuard,
         });
       }
       let txt = '';
@@ -182,6 +186,7 @@ export class DynamicTaskPlanner {
             actualSteps: 1,
             actualInputTokens: usage.inputTokens,
             actualOutputTokens: usage.outputTokens,
+            leaseGuard,
           });
         }
         const parsed = extractJsonBlock(txt);
@@ -193,15 +198,20 @@ export class DynamicTaskPlanner {
         }
       } catch (err) {
         if (reservation?.reservationId) {
-          budgetLedger.settleReservation(reservation.reservationId, {
-            status: 'failed',
-            actualSteps: 1,
-            actualInputTokens: usage.inputTokens,
-            actualOutputTokens: usage.outputTokens,
-            errorCode: err?.code || 'PLANNING_FAILED',
-          });
+          try {
+            budgetLedger.settleReservation(reservation.reservationId, {
+              status: 'failed',
+              actualSteps: 1,
+              actualInputTokens: usage.inputTokens,
+              actualOutputTokens: usage.outputTokens,
+              errorCode: err?.code || 'PLANNING_FAILED',
+              leaseGuard: err?.code === 'LEASE_LOST' ? null : leaseGuard,
+            });
+          } catch {
+            // do not mask LEASE_LOST or primary error
+          }
         }
-        if (err instanceof BudgetError || err?.category === 'budget') {
+        if (err?.code === 'LEASE_LOST' || err instanceof BudgetError || err?.category === 'budget') {
           throw err;
         }
         // Fall through to deterministic heuristic decomposition
@@ -263,24 +273,24 @@ export class DynamicTaskPlanner {
     return normalized;
   }
 
-  addNode(store, runId, nodeSpec) {
-    const existing = store.db
-      .prepare('SELECT nodeKey, dependenciesJson FROM swarm_nodes WHERE runId=?')
-      .all(runId)
-      .map((r) => ({
-        nodeKey: r.nodeKey,
-        dependencies: parseJsonSafe(r.dependenciesJson, []),
-      }));
+  addNode(store, runId, nodeSpec, { leaseGuard = null } = {}) {
     const normalized = this.normalizeNodes([nodeSpec])[0];
-    this.validateDag([...existing, normalized]);
-
     const now = Date.now();
     const id = uuid();
     const profileId = this.router?.agentRegistry?.synthesizeProfile({
       taskType: normalized.taskType,
       objective: normalized.objective,
     })?.id ?? normalized.taskType;
-    store.tx(() => {
+    return store.tx(() => {
+      assertLeaseInTx(leaseGuard, { runId });
+      const existing = store.db
+        .prepare('SELECT nodeKey, dependenciesJson FROM swarm_nodes WHERE runId=?')
+        .all(runId)
+        .map((r) => ({
+          nodeKey: r.nodeKey,
+          dependencies: parseJsonSafe(r.dependenciesJson, []),
+        }));
+      this.validateDag([...existing, normalized]);
       store.db
         .prepare(
           `INSERT INTO swarm_nodes(
@@ -301,24 +311,32 @@ export class DynamicTaskPlanner {
           now,
           now,
         );
+      return store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(id);
     });
-    return store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(id);
   }
 
-  cancelNode(store, runId, nodeKey, reason = 'cancelled') {
-    const now = Date.now();
-    store.tx(() => {
-      store.db
-        .prepare(
-          `UPDATE swarm_nodes
-           SET status='cancelled', errorCode='NODE_CANCELLED', errorMessage=?, updatedAt=?
-           WHERE runId=? AND nodeKey=? AND status IN ('pending','running')`,
-        )
-        .run(reason, now, runId, nodeKey);
-    });
-    return store.db
+  cancelNode(
+    store,
+    runId,
+    nodeKey,
+    reason = 'cancelled',
+    { eventRouter = null, sessionId = null, rootTurnId = null, leaseGuard = null } = {},
+  ) {
+    const row = store.db
       .prepare('SELECT * FROM swarm_nodes WHERE runId=? AND nodeKey=?')
       .get(runId, nodeKey);
+    if (!row) return null;
+    if (isTerminalNodeState(row.status)) return row;
+    return transitionSwarmNode(store, eventRouter, row.id, SWARM_NODE_STATES.CANCELLED, {
+      sessionId,
+      rootTurnId,
+      leaseGuard,
+      emitEvent: Boolean(eventRouter && sessionId),
+      patch: {
+        errorCode: 'NODE_CANCELLED',
+        errorMessage: reason,
+      },
+    });
   }
 
   reprioritizeNode(store, runId, nodeKey, priority) {

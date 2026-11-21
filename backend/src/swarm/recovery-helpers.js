@@ -104,19 +104,19 @@ export function inspectNodeReconciliation(
     .all(turnId, turnId, sessId, sessId);
   if (unknownRows.length) {
     const first = unknownRows[0];
-    const existing = store.db
-      .prepare(
-        `SELECT id FROM direct_approvals
-         WHERE kind='reconciliation' AND status='pending'
-           AND ((? IS NOT NULL AND turnId=?) OR sessionId=?)
-         LIMIT 1`,
-      )
-      .get(turnId, turnId, sessId || first.sessionId);
-    if (existing) return { needsReconciliation: true, approvalId: existing.id };
-
-    const approvalId = uuid();
     const now = Date.now();
-    store.tx(() => {
+    const { approvalId, created } = store.tx(() => {
+      const existing = store.db
+        .prepare(
+          `SELECT id FROM direct_approvals
+           WHERE kind='reconciliation' AND status='pending'
+             AND ((? IS NOT NULL AND turnId=?) OR sessionId=?)
+           LIMIT 1`,
+        )
+        .get(turnId, turnId, sessId || first.sessionId);
+      if (existing) return { approvalId: existing.id, created: false };
+
+      const newId = uuid();
       store.db
         .prepare(
           `INSERT INTO direct_approvals(
@@ -125,7 +125,7 @@ export function inspectNodeReconciliation(
           ) VALUES(?,?,?,?,?,?,'pending','reconciliation',?,?,?,?,?)`,
         )
         .run(
-          approvalId,
+          newId,
           sessId || first.sessionId,
           turnId || first.turnId,
           first.callId,
@@ -144,21 +144,28 @@ export function inspectNodeReconciliation(
           now + 86_400_000,
           now,
         );
+      return { approvalId: newId, created: true };
     });
 
-    eventRouter?.emitPersisted({
-      sessionId: sessId || first.sessionId,
-      turnId: turnId || first.turnId,
-      type: RUNTIME_EVENTS.RECONCILIATION_REQUIRED,
-      data: {
-        approvalId,
-        receiptId: first.id,
-        unknownReceiptIds: unknownRows.map((u) => u.id),
-        tool: first.toolName,
-        callId: first.callId,
-      },
-      audit: true,
-    });
+    if (created) {
+      try {
+        eventRouter?.emitPersisted({
+          sessionId: sessId || first.sessionId,
+          turnId: turnId || first.turnId,
+          type: RUNTIME_EVENTS.RECONCILIATION_REQUIRED,
+          data: {
+            approvalId,
+            receiptId: first.id,
+            unknownReceiptIds: unknownRows.map((u) => u.id),
+            tool: first.toolName,
+            callId: first.callId,
+          },
+          audit: true,
+        });
+      } catch {
+        // best-effort event emission after committed approval insert
+      }
+    }
 
     return { needsReconciliation: true, approvalId };
   }
@@ -170,21 +177,19 @@ export function inspectNodeReconciliation(
       childTurnId: turnId,
     });
     if (wtState.needsReconciliation) {
-      const existing = store.db
-        .prepare(
-          `SELECT id FROM direct_approvals
-           WHERE kind='reconciliation' AND status='pending'
-             AND ((? IS NOT NULL AND turnId=?) OR (? IS NOT NULL AND sessionId=?))
-           LIMIT 1`,
-        )
-        .get(turnId, turnId, sessId, sessId);
-      if (existing) {
-        return { needsReconciliation: true, approvalId: existing.id, reason: wtState.reason };
-      }
-      const approvalId = uuid();
       const now = Date.now();
       const firstReceipt = wtState.lostReceipts?.[0] ?? null;
-      store.tx(() => {
+      const { approvalId, created } = store.tx(() => {
+        const existing = store.db
+          .prepare(
+            `SELECT id FROM direct_approvals
+             WHERE kind='reconciliation' AND status='pending'
+               AND ((? IS NOT NULL AND turnId=?) OR (? IS NOT NULL AND sessionId=?))
+             LIMIT 1`,
+          )
+          .get(turnId, turnId, sessId, sessId);
+        if (existing) return { approvalId: existing.id, created: false };
+        const newId = uuid();
         store.db
           .prepare(
             `INSERT INTO direct_approvals(
@@ -193,7 +198,7 @@ export function inspectNodeReconciliation(
             ) VALUES(?,?,?,?,?,?,'pending','reconciliation',?,?,?,?,?)`,
           )
           .run(
-            approvalId,
+            newId,
             sessId || node.runId,
             turnId,
             firstReceipt?.callId || `wt:${node.nodeKey}`,
@@ -213,20 +218,27 @@ export function inspectNodeReconciliation(
             now + 86_400_000,
             now,
           );
+        return { approvalId: newId, created: true };
       });
-      eventRouter?.emitPersisted({
-        sessionId: sessId || node.runId,
-        turnId,
-        type: RUNTIME_EVENTS.RECONCILIATION_REQUIRED,
-        data: {
-          approvalId,
-          reason: 'WORKTREE_STATE_LOST',
-          runId: node.runId,
-          nodeKey: node.nodeKey,
-          lostReceiptIds: (wtState.lostReceipts ?? []).map((r) => r.id),
-        },
-        audit: true,
-      });
+      if (created) {
+        try {
+          eventRouter?.emitPersisted({
+            sessionId: sessId || node.runId,
+            turnId,
+            type: RUNTIME_EVENTS.RECONCILIATION_REQUIRED,
+            data: {
+              approvalId,
+              reason: 'WORKTREE_STATE_LOST',
+              runId: node.runId,
+              nodeKey: node.nodeKey,
+              lostReceiptIds: (wtState.lostReceipts ?? []).map((r) => r.id),
+            },
+            audit: true,
+          });
+        } catch {
+          // best-effort event emission
+        }
+      }
       return { needsReconciliation: true, approvalId, reason: 'WORKTREE_STATE_LOST' };
     }
   }
@@ -261,15 +273,26 @@ export function recoverInterruptedSwarmRuns({
   const report = {
     recoveredRuns: [],
     recoveredNodes: 0,
+    convergedCompletedNodes: 0,
+    replayedReconciliations: 0,
     reconcilingNodes: [],
     skippedTerminal: 0,
     skippedLiveOwners: 0,
     budgetReconciliation: null,
+    orphanArtifacts: null,
+    errors: [],
   };
   if (!store?.db?.isOpen || !jobQueue) return report;
 
   if (budgetLedger?.reconcileAfterRestart) {
     report.budgetReconciliation = budgetLedger.reconcileAfterRestart();
+  }
+  if (artifactManager?.cleanupOrphanArtifacts) {
+    try {
+      report.orphanArtifacts = artifactManager.cleanupOrphanArtifacts();
+    } catch {
+      // non-fatal startup cleanup
+    }
   }
 
   // Ensure cancelled runs never retain pending/active jobs
@@ -292,251 +315,388 @@ export function recoverInterruptedSwarmRuns({
     .all();
 
   for (const runRow of rows) {
-    const parentSess = store.db
-      .prepare('SELECT state FROM direct_sessions WHERE id=?')
-      .get(runRow.sessionId);
-    if (!parentSess || parentSess.state === 'cancelled') {
-      cancelRun(runRow.id);
-      report.skippedTerminal++;
-      continue;
-    }
-
-    const now = Date.now();
-    // Fix D1-D4/D9: Inspect jobs by lease ownership — NEVER blindly cancel pending or live-owned active jobs!
-    const existingJobs = store.db
-      .prepare(
-        `SELECT * FROM runtime_jobs
-         WHERE taskId=? AND status IN ('pending', 'active')
-         ORDER BY createdAt ASC`,
-      )
-      .all(runRow.id);
-
-    const pendingKinds = new Set();
-    const liveKinds = new Set();
-    const liveNodeIds = new Set();
-    const liveNodeKeys = new Set();
-    const pendingNodeIds = new Set();
-    const pendingNodeKeys = new Set();
-    let runRecovered = false;
-
-    for (const j of existingJobs) {
-      const payload = parseJsonSafe(j.payload, {});
-      if (j.status === 'pending') {
-        pendingKinds.add(j.kind);
-        if (j.kind === SWARM_JOB_KINDS.NODE_EXECUTE) {
-          if (payload.nodeId) pendingNodeIds.add(payload.nodeId);
-          if (payload.nodeKey) pendingNodeKeys.add(payload.nodeKey);
-        } else if (j.kind === SWARM_JOB_KINDS.DISPATCH && Array.isArray(payload.nodeKeys)) {
-          for (const nk of payload.nodeKeys) pendingNodeKeys.add(nk);
-        }
+    try {
+      const parentSess = store.db
+        .prepare('SELECT state FROM direct_sessions WHERE id=?')
+        .get(runRow.sessionId);
+      if (!parentSess || parentSess.state === 'cancelled') {
+        cancelRun(runRow.id);
+        report.skippedTerminal++;
         continue;
       }
 
-      // Active job: classify ownership
-      const ownership = classifyJobOwnership(store, j, { now, markDeadInDb: true });
-      if (ownership.liveOwner) {
-        liveKinds.add(j.kind);
-        report.skippedLiveOwners++;
-        if (j.kind === SWARM_JOB_KINDS.NODE_EXECUTE) {
-          if (payload.nodeId) liveNodeIds.add(payload.nodeId);
-          if (payload.nodeKey) liveNodeKeys.add(payload.nodeKey);
-        } else if (j.kind === SWARM_JOB_KINDS.DISPATCH && Array.isArray(payload.nodeKeys)) {
-          for (const nk of payload.nodeKeys) liveNodeKeys.add(nk);
-        }
-        continue;
-      }
+      const now = Date.now();
+      const pendingResolutions = [];
+      const postTxEvents = [];
 
-      if (!ownership.reclaimable) continue;
+      const runRecovered = store.tx(() => {
+        // Re-read fresh run inside transaction to avoid TOCTOU with live workers
+        const liveRunRow = store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runRow.id);
+        if (!liveRunRow || isTerminalRunState(liveRunRow.status)) return false;
 
-      if (j.kind === SWARM_JOB_KINDS.NODE_EXECUTE) {
-        // Retire only the dead/expired active node job (guarded by its dead fence) so recovery can inspect reconciliation and safely reschedule
-        store.tx(() => {
-          store.db
-            .prepare(
-              `UPDATE runtime_jobs
-               SET status='cancelled', fence=NULL, leaseExpiresAt=NULL, errorCode='OWNER_LOST_RECOVERED', updatedAt=?
-               WHERE id=? AND status='active' AND (? IS NULL OR fence=?)`,
-            )
-            .run(now, j.id, j.fence ?? null, j.fence ?? null);
-        });
-        runRecovered = true;
-      } else {
-        // Reclaim dead/expired control job cleanly back to pending (without cancelling or duplicating!)
-        const reclaimed = store.tx(() => {
-          const res = store.db
-            .prepare(
-              `UPDATE runtime_jobs
-               SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=?
-               WHERE id=? AND status='active' AND (? IS NULL OR fence=?)`,
-            )
-            .run(now, j.id, j.fence ?? null, j.fence ?? null);
-          return (res.changes ?? 0) > 0;
-        });
-        if (reclaimed) {
-          pendingKinds.add(j.kind);
-          if (j.kind === SWARM_JOB_KINDS.DISPATCH && Array.isArray(payload.nodeKeys)) {
-            for (const nk of payload.nodeKeys) pendingNodeKeys.add(nk);
+        // Fix D1-D4/D9: Inspect jobs by lease ownership atomically inside tx — NEVER cancel pending or live-owned active jobs!
+        const existingJobs = store.db
+          .prepare(
+            `SELECT * FROM runtime_jobs
+             WHERE taskId=? AND status IN ('pending', 'active')
+             ORDER BY createdAt ASC`,
+          )
+          .all(runRow.id);
+
+        const pendingKinds = new Set();
+        const liveKinds = new Set();
+        const liveNodeIds = new Set();
+        const liveNodeKeys = new Set();
+        const pendingNodeIds = new Set();
+        const pendingNodeKeys = new Set();
+        let mutated = false;
+
+        for (const j of existingJobs) {
+          const payload = parseJsonSafe(j.payload, {});
+          if (j.status === 'pending') {
+            pendingKinds.add(j.kind);
+            if (j.kind === SWARM_JOB_KINDS.NODE_EXECUTE) {
+              if (payload.nodeId) pendingNodeIds.add(payload.nodeId);
+              if (payload.nodeKey) pendingNodeKeys.add(payload.nodeKey);
+            } else if (j.kind === SWARM_JOB_KINDS.DISPATCH && Array.isArray(payload.nodeKeys)) {
+              for (const nk of payload.nodeKeys) pendingNodeKeys.add(nk);
+            }
+            continue;
           }
-          runRecovered = true;
+
+          // Active job: classify ownership atomically inside tx
+          const ownership = classifyJobOwnership(store, j, { now, markDeadInDb: true });
+          if (ownership.liveOwner) {
+            liveKinds.add(j.kind);
+            report.skippedLiveOwners++;
+            if (j.kind === SWARM_JOB_KINDS.NODE_EXECUTE) {
+              if (payload.nodeId) liveNodeIds.add(payload.nodeId);
+              if (payload.nodeKey) liveNodeKeys.add(payload.nodeKey);
+            } else if (j.kind === SWARM_JOB_KINDS.DISPATCH && Array.isArray(payload.nodeKeys)) {
+              for (const nk of payload.nodeKeys) liveNodeKeys.add(nk);
+            }
+            continue;
+          }
+
+          if (!ownership.reclaimable) continue;
+
+          if (j.kind === SWARM_JOB_KINDS.NODE_EXECUTE) {
+            const res = store.db
+              .prepare(
+                `UPDATE runtime_jobs
+                 SET status='cancelled', fence=NULL, leaseExpiresAt=NULL, errorCode='OWNER_LOST_RECOVERED', updatedAt=?
+                 WHERE id=? AND status='active' AND (? IS NULL OR fence=?)`,
+              )
+              .run(now, j.id, j.fence ?? null, j.fence ?? null);
+            if ((res.changes ?? 0) > 0) mutated = true;
+          } else {
+            const res = store.db
+              .prepare(
+                `UPDATE runtime_jobs
+                 SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=?
+                 WHERE id=? AND status='active' AND (? IS NULL OR fence=?)`,
+              )
+              .run(now, j.id, j.fence ?? null, j.fence ?? null);
+            if ((res.changes ?? 0) > 0) {
+              pendingKinds.add(j.kind);
+              if (j.kind === SWARM_JOB_KINDS.DISPATCH && Array.isArray(payload.nodeKeys)) {
+                for (const nk of payload.nodeKeys) pendingNodeKeys.add(nk);
+              }
+              mutated = true;
+            }
+          }
         }
-      }
-    }
 
-    const hasPendingOrLive = (kind) => pendingKinds.has(kind) || liveKinds.has(kind);
-    const run = getRun(runRow.id);
-    if (!run) continue;
+        const hasPendingOrLive = (kind) => pendingKinds.has(kind) || liveKinds.has(kind);
+        const run = getRun(runRow.id);
+        if (!run) return mutated;
 
-    budgetLedger?.ensureLedger?.({
-      treeId: run.id,
-      rootSessionId: run.sessionId,
-      budget: run.budget,
-      initialUsage: run.usage,
-    });
+        budgetLedger?.ensureLedger?.({
+          treeId: run.id,
+          rootSessionId: run.sessionId,
+          budget: run.budget,
+          initialUsage: run.usage,
+          trafficSource: run.trafficSource || 'production',
+          isSynthetic: run.isSynthetic ? 1 : 0,
+        });
 
-    if (run.status === SWARM_RUN_STATES.PENDING || run.status === SWARM_RUN_STATES.PLANNING) {
-      if (run.nodes.length === 0) {
-        if (!hasPendingOrLive(SWARM_JOB_KINDS.PLAN)) {
-          enqueueSwarmJob(
-            jobQueue,
-            SWARM_JOB_KINDS.PLAN,
-            { runId: run.id, sessionId: run.sessionId, goal: run.goal, planVersion: run.planVersion || 1 },
-            { idempotencyKey: `swarm:plan:${run.id}:v${run.planVersion || 1}:rec:${now}` },
+        const planVer = run.planVersion || 1;
+        if (run.status === SWARM_RUN_STATES.PENDING || run.status === SWARM_RUN_STATES.PLANNING) {
+          if (run.nodes.length === 0) {
+            if (!hasPendingOrLive(SWARM_JOB_KINDS.PLAN)) {
+              enqueueSwarmJob(
+                jobQueue,
+                SWARM_JOB_KINDS.PLAN,
+                { runId: run.id, sessionId: run.sessionId, goal: run.goal, planVersion: planVer },
+                { idempotencyKey: `swarm:plan:${run.id}:v${planVer}:rec:${uuid().slice(0, 8)}` },
+              );
+              mutated = true;
+            }
+          } else if (!liveKinds.has(SWARM_JOB_KINDS.PLAN)) {
+            transitionSwarmRun(store, run.id, SWARM_RUN_STATES.RUNNING, {
+              patch: { currentPhase: 'running' },
+            });
+            if (!hasPendingOrLive(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE)) {
+              enqueueSwarmJob(
+                jobQueue,
+                SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
+                {
+                  runId: run.id,
+                  sessionId: run.sessionId,
+                  planVersion: planVer,
+                  epoch: now,
+                },
+                { idempotencyKey: `swarm:resolve:${run.id}:v${planVer}:planned_rec:${uuid().slice(0, 8)}` },
+              );
+              mutated = true;
+            }
+          }
+          return mutated;
+        }
+
+        if (run.status === SWARM_RUN_STATES.RUNNING || run.status === SWARM_RUN_STATES.RECONCILING) {
+          let recoveredInThisRun = 0;
+          for (const n of run.nodes) {
+            if (
+              isTerminalNodeState(n.status) ||
+              n.status === SWARM_NODE_STATES.PENDING ||
+              n.status === SWARM_NODE_STATES.READY ||
+              n.status === SWARM_NODE_STATES.PARKED
+            ) {
+              continue;
+            }
+            if (n.status === SWARM_NODE_STATES.RECONCILING) {
+              // P1-1: Auto-replay reconciliation resolution if approval was already decided before crash
+              if (n.reconcileApprovalId) {
+                const appr = store.db
+                  .prepare('SELECT id, sessionId, turnId, status, outcome, reason FROM direct_approvals WHERE id=?')
+                  .get(n.reconcileApprovalId);
+                if (appr && appr.status !== 'pending' && appr.outcome) {
+                  pendingResolutions.push({
+                    id: appr.id,
+                    sessionId: appr.sessionId,
+                    turnId: appr.turnId,
+                    outcome: appr.outcome,
+                    reason: appr.reason,
+                  });
+                  mutated = true;
+                  continue;
+                }
+              }
+              report.reconcilingNodes.push({ runId: run.id, nodeKey: n.nodeKey, approvalId: n.reconcileApprovalId });
+              continue;
+            }
+
+            // Skip nodes actively owned by a live worker OR already queued by a pending job
+            if (
+              liveNodeIds.has(n.id) ||
+              liveNodeKeys.has(n.nodeKey) ||
+              pendingNodeIds.has(n.id) ||
+              pendingNodeKeys.has(n.nodeKey)
+            ) {
+              continue;
+            }
+
+            // P0-4: If childTurnId ALREADY committed 'completed' before crash (between child-turn commit
+            // and swarm_node commit), converge directly to COMPLETED instead of re-executing!
+            if (n.status === SWARM_NODE_STATES.RUNNING && n.childTurnId) {
+              const turnRow = store.db
+                .prepare('SELECT id, state FROM direct_turns WHERE id=?')
+                .get(n.childTurnId);
+              if (turnRow?.state === 'completed') {
+                let verifiedArt = null;
+                if (n.isolationMode === 'worktree' && artifactManager) {
+                  const candidate = n.latestArtifactId
+                    ? artifactManager.getArtifact(n.latestArtifactId)
+                    : artifactManager.getLatestNodeArtifact(run.id, n.nodeKey);
+                  if (candidate) {
+                    const v = artifactManager.verifyArtifact(candidate.id);
+                    if (v.ok) verifiedArt = candidate;
+                  }
+                }
+                const canConvergeDirectly =
+                  n.isolationMode !== 'worktree' || !artifactManager || Boolean(verifiedArt);
+                if (canConvergeDirectly) {
+                  const lastMsg = store.db
+                    .prepare(
+                      "SELECT content FROM direct_messages WHERE turnId=? AND role='assistant' ORDER BY seq DESC LIMIT 1",
+                    )
+                    .get(n.childTurnId);
+                  const resultText = n.resultText || lastMsg?.content || '';
+                  const uris = [
+                    ...new Set([
+                      ...(verifiedArt?.uri ? [verifiedArt.uri] : []),
+                      ...extractArtifactUris(resultText),
+                    ]),
+                  ];
+                  const updated = transitionSwarmNode(store, null, n.id, SWARM_NODE_STATES.COMPLETED, {
+                    emitEvent: false,
+                    patch: {
+                      resultText,
+                      artifactUrisJson: JSON.stringify(uris),
+                      latestArtifactId: verifiedArt?.id ?? n.latestArtifactId ?? null,
+                      activeFence: null,
+                      activeJobId: null,
+                    },
+                  });
+                  postTxEvents.push({
+                    sessionId: run.sessionId,
+                    turnId: run.rootTurnId,
+                    node: updated,
+                  });
+                  recoveredInThisRun++;
+                  report.convergedCompletedNodes++;
+                  report.recoveredNodes++;
+                  mutated = true;
+                  continue;
+                }
+              }
+            }
+
+            const rec = inspectNodeReconciliation(
+              store,
+              reconciler,
+              eventRouter,
+              n,
+              n.childSessionId,
+              n.childTurnId,
+              { artifactManager },
+            );
+            if (rec.needsReconciliation) {
+              parkNodeAndRunForReconciliation(store, eventRouter, run, n, rec.approvalId);
+              report.reconcilingNodes.push({ runId: run.id, nodeKey: n.nodeKey, approvalId: rec.approvalId });
+              mutated = true;
+              continue;
+            }
+            if (n.status === SWARM_NODE_STATES.RUNNING) {
+              transitionSwarmNode(store, null, n.id, SWARM_NODE_STATES.INTERRUPTED, {
+                emitEvent: false,
+                patch: { activeFence: null, activeJobId: null },
+              });
+            }
+            const readyNode = transitionSwarmNode(store, null, n.id, SWARM_NODE_STATES.READY, {
+              emitEvent: false,
+              patch: { activeFence: null, activeJobId: null },
+            });
+            postTxEvents.push({
+              sessionId: run.sessionId,
+              turnId: run.rootTurnId,
+              node: readyNode,
+            });
+            recoveredInThisRun++;
+            report.recoveredNodes++;
+            mutated = true;
+          }
+
+          const freshRun = getRun(run.id);
+          const hasReadyOrPendingWork = freshRun?.nodes.some(
+            (n) => n.status === SWARM_NODE_STATES.READY || n.status === SWARM_NODE_STATES.PENDING,
           );
-          runRecovered = true;
+          const allTerminal = freshRun?.nodes.every((n) => isTerminalNodeState(n.status));
+          const anyLiveOrPendingControl =
+            hasPendingOrLive(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE) ||
+            hasPendingOrLive(SWARM_JOB_KINDS.DISPATCH);
+          const anyLiveNode = liveNodeIds.size > 0 || liveNodeKeys.size > 0;
+          const anyPendingNode = pendingNodeIds.size > 0 || pendingNodeKeys.size > 0;
+
+          if (
+            !anyLiveOrPendingControl &&
+            (recoveredInThisRun > 0 ||
+              (freshRun?.status === SWARM_RUN_STATES.RUNNING &&
+                !anyLiveNode &&
+                !anyPendingNode &&
+                (hasReadyOrPendingWork || allTerminal)))
+          ) {
+            const existingPendingResolve = store.db
+              .prepare(
+                "SELECT 1 FROM runtime_jobs WHERE taskId=? AND kind=? AND status IN ('pending','active') LIMIT 1",
+              )
+              .get(run.id, SWARM_JOB_KINDS.DEPENDENCY_RESOLVE);
+            if (!existingPendingResolve) {
+              enqueueSwarmJob(
+                jobQueue,
+                SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
+                {
+                  runId: run.id,
+                  sessionId: run.sessionId,
+                  planVersion: planVer,
+                  epoch: now,
+                },
+                { idempotencyKey: `swarm:resolve:${run.id}:v${planVer}:rec:${recoveredInThisRun}:${freshRun?.nodes.filter((x) => isTerminalNodeState(x.status)).length ?? 0}` },
+              );
+              mutated = true;
+            }
+          }
+          return mutated;
         }
-      } else {
-        transitionSwarmRun(store, run.id, SWARM_RUN_STATES.RUNNING, {
-          patch: { currentPhase: 'running' },
-        });
-        if (!hasPendingOrLive(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE)) {
-          enqueueSwarmJob(jobQueue, SWARM_JOB_KINDS.DEPENDENCY_RESOLVE, {
-            runId: run.id,
-            sessionId: run.sessionId,
-            planVersion: run.planVersion || 1,
-            epoch: now,
+
+        if (run.status === SWARM_RUN_STATES.AGGREGATING) {
+          if (!hasPendingOrLive(SWARM_JOB_KINDS.AGGREGATE)) {
+            enqueueSwarmJob(
+              jobQueue,
+              SWARM_JOB_KINDS.AGGREGATE,
+              { runId: run.id, sessionId: run.sessionId, planVersion: planVer },
+              { idempotencyKey: `swarm:agg:${run.id}:v${planVer}:rec:${uuid().slice(0, 8)}` },
+            );
+            mutated = true;
+          }
+          return mutated;
+        }
+
+        if (run.status === SWARM_RUN_STATES.VERIFYING) {
+          if (!hasPendingOrLive(SWARM_JOB_KINDS.VERIFY)) {
+            enqueueSwarmJob(
+              jobQueue,
+              SWARM_JOB_KINDS.VERIFY,
+              { runId: run.id, sessionId: run.sessionId, planVersion: planVer },
+              { idempotencyKey: `swarm:ver:${run.id}:v${planVer}:rec:${uuid().slice(0, 8)}` },
+            );
+            mutated = true;
+          }
+          return mutated;
+        }
+
+        return mutated;
+      });
+
+      for (const ev of postTxEvents) {
+        try {
+          eventRouter?.emitPersisted({
+            sessionId: ev.sessionId,
+            turnId: ev.turnId,
+            type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
+            data: {
+              runId: ev.node.runId,
+              nodeId: ev.node.id,
+              nodeKey: ev.node.nodeKey,
+              status: ev.node.status,
+              childSessionId: ev.node.childSessionId || undefined,
+              errorCode: ev.node.errorCode || undefined,
+            },
+            audit: false,
           });
-          runRecovered = true;
+        } catch {
+          // best-effort event emission
         }
       }
-      if (runRecovered) report.recoveredRuns.push(run.id);
-      continue;
-    }
 
-    if (run.status === SWARM_RUN_STATES.RUNNING || run.status === SWARM_RUN_STATES.RECONCILING) {
-      let recoveredInThisRun = 0;
-      for (const n of run.nodes) {
-        if (
-          isTerminalNodeState(n.status) ||
-          n.status === SWARM_NODE_STATES.PENDING ||
-          n.status === SWARM_NODE_STATES.READY
-        ) {
-          continue;
-        }
-        if (n.status === SWARM_NODE_STATES.RECONCILING) {
-          report.reconcilingNodes.push({ runId: run.id, nodeKey: n.nodeKey, approvalId: n.reconcileApprovalId });
-          continue;
-        }
-
-        // Skip nodes actively owned by a live worker OR already queued by a pending job
-        if (
-          liveNodeIds.has(n.id) ||
-          liveNodeKeys.has(n.nodeKey) ||
-          pendingNodeIds.has(n.id) ||
-          pendingNodeKeys.has(n.nodeKey)
-        ) {
-          continue;
-        }
-
-        const rec = inspectNodeReconciliation(
+      for (const res of pendingResolutions) {
+        applyReconciliationResolution({
           store,
-          reconciler,
+          jobQueue,
           eventRouter,
-          n,
-          n.childSessionId,
-          n.childTurnId,
-          { artifactManager },
-        );
-        if (rec.needsReconciliation) {
-          parkNodeAndRunForReconciliation(store, eventRouter, run, n, rec.approvalId);
-          report.reconcilingNodes.push({ runId: run.id, nodeKey: n.nodeKey, approvalId: rec.approvalId });
-          runRecovered = true;
-          continue;
-        }
-        if (n.status === SWARM_NODE_STATES.RUNNING) {
-          transitionSwarmNode(store, eventRouter, n.id, SWARM_NODE_STATES.INTERRUPTED, {
-            sessionId: run.sessionId,
-            rootTurnId: run.rootTurnId,
-            patch: { activeFence: null, activeJobId: null },
-          });
-        }
-        transitionSwarmNode(store, eventRouter, n.id, SWARM_NODE_STATES.READY, {
-          sessionId: run.sessionId,
-          rootTurnId: run.rootTurnId,
-          patch: { activeFence: null, activeJobId: null },
+          getRun,
+          result: res,
         });
-        recoveredInThisRun++;
-        report.recoveredNodes++;
-        runRecovered = true;
+        report.replayedReconciliations++;
       }
 
-      const freshRun = getRun(run.id);
-      const hasReadyOrPendingWork = freshRun?.nodes.some(
-        (n) => n.status === SWARM_NODE_STATES.READY || n.status === SWARM_NODE_STATES.PENDING,
-      );
-      const allTerminal = freshRun?.nodes.every((n) => isTerminalNodeState(n.status));
-      const anyLiveOrPendingControl =
-        hasPendingOrLive(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE) ||
-        hasPendingOrLive(SWARM_JOB_KINDS.DISPATCH);
-      const anyLiveNode = liveNodeIds.size > 0 || liveNodeKeys.size > 0;
-      const anyPendingNode = pendingNodeIds.size > 0 || pendingNodeKeys.size > 0;
-
-      if (
-        !anyLiveOrPendingControl &&
-        (recoveredInThisRun > 0 ||
-          (freshRun?.status === SWARM_RUN_STATES.RUNNING &&
-            !anyLiveNode &&
-            !anyPendingNode &&
-            (hasReadyOrPendingWork || allTerminal)))
-      ) {
-        enqueueSwarmJob(
-          jobQueue,
-          SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
-          {
-            runId: run.id,
-            sessionId: run.sessionId,
-            planVersion: run.planVersion || 1,
-            epoch: now,
-          },
-          { idempotencyKey: `swarm:resolve:${run.id}:rec:${uuid().slice(0, 8)}` },
-        );
-        runRecovered = true;
-      }
-      if (runRecovered) report.recoveredRuns.push(run.id);
-      continue;
-    }
-
-    if (run.status === SWARM_RUN_STATES.AGGREGATING) {
-      if (!hasPendingOrLive(SWARM_JOB_KINDS.AGGREGATE)) {
-        enqueueSwarmJob(
-          jobQueue,
-          SWARM_JOB_KINDS.AGGREGATE,
-          { runId: run.id, sessionId: run.sessionId, planVersion: run.planVersion || 1 },
-          { idempotencyKey: `swarm:agg:${run.id}:rec:${now}` },
-        );
-        runRecovered = true;
-      }
-      if (runRecovered) report.recoveredRuns.push(run.id);
-    } else if (run.status === SWARM_RUN_STATES.VERIFYING) {
-      if (!hasPendingOrLive(SWARM_JOB_KINDS.VERIFY)) {
-        enqueueSwarmJob(
-          jobQueue,
-          SWARM_JOB_KINDS.VERIFY,
-          { runId: run.id, sessionId: run.sessionId, planVersion: run.planVersion || 1 },
-          { idempotencyKey: `swarm:ver:${run.id}:rec:${now}` },
-        );
-        runRecovered = true;
-      }
-      if (runRecovered) report.recoveredRuns.push(run.id);
+      if (runRecovered) report.recoveredRuns.push(runRow.id);
+    } catch (runErr) {
+      report.errors.push({
+        runId: runRow.id,
+        error: String(runErr?.message ?? runErr),
+      });
     }
   }
 
@@ -545,89 +705,115 @@ export function recoverInterruptedSwarmRuns({
 
 export function applyReconciliationResolution({ store, jobQueue, eventRouter, getRun, result }) {
   if (!store?.db?.isOpen || !result) return null;
-  const node = store.db
-    .prepare(
-      `SELECT * FROM swarm_nodes
-       WHERE status='reconciling'
-         AND (reconcileApprovalId=? OR (? IS NOT NULL AND childTurnId=?) OR (? IS NOT NULL AND childSessionId=?))
-       LIMIT 1`,
-    )
-    .get(
-      result.id,
-      result.turnId || null,
-      result.turnId || null,
-      result.sessionId || null,
-      result.sessionId || null,
-    );
-  if (!node) return null;
-
-  const run = getRun(node.runId);
-  if (!run || isTerminalRunState(run.status)) return null;
-
-  const approvalRow = result.id
-    ? store.db.prepare('SELECT tool, effectClass FROM direct_approvals WHERE id=?').get(result.id)
-    : null;
-  const isWorktreeStateLost =
-    approvalRow?.effectClass === 'worktree_state_lost' || approvalRow?.tool === 'worktree_recovery';
-
   const now = Date.now();
-  store.tx(() => {
+  const outcome = store.tx(() => {
+    const node = store.db
+      .prepare(
+        `SELECT * FROM swarm_nodes
+         WHERE status='reconciling'
+           AND (reconcileApprovalId=? OR (? IS NOT NULL AND childTurnId=?) OR (? IS NOT NULL AND childSessionId=?))
+         LIMIT 1`,
+      )
+      .get(
+        result.id,
+        result.turnId || null,
+        result.turnId || null,
+        result.sessionId || null,
+        result.sessionId || null,
+      );
+    if (!node) return null;
+
+    const run = getRun(node.runId);
+    if (!run || isTerminalRunState(run.status)) return null;
+
+    const approvalRow = result.id
+      ? store.db.prepare('SELECT tool, effectClass FROM direct_approvals WHERE id=?').get(result.id)
+      : null;
+    const isWorktreeStateLost =
+      approvalRow?.effectClass === 'worktree_state_lost' || approvalRow?.tool === 'worktree_recovery';
+
     store.db
       .prepare(
         `UPDATE runtime_jobs SET status='done', updatedAt=?
          WHERE turnId=? AND status IN ('pending','reconciling','parked')`,
       )
       .run(now, `swarm:${run.id}:${node.nodeKey}`);
+
+    let updatedNode;
+    if (result.outcome === 'abort') {
+      updatedNode = transitionSwarmNode(store, null, node.id, SWARM_NODE_STATES.FAILED, {
+        emitEvent: false,
+        patch: {
+          reconcileApprovalId: null,
+          activeFence: null,
+          activeJobId: null,
+          errorCode: 'RECONCILIATION_ABORTED',
+          errorMessage: result.reason || 'Operator aborted reconciliation',
+        },
+      });
+    } else {
+      // Fix C9: If worktree state was lost and operator requests clean re-execution (`not_applied`),
+      // clear stale childSessionId/childTurnId so node starts cleanly from HEAD instead of hallucinating lost files.
+      const patch =
+        isWorktreeStateLost && result.outcome === 'not_applied'
+          ? {
+              reconcileApprovalId: null,
+              activeFence: null,
+              activeJobId: null,
+              childSessionId: null,
+              childTurnId: null,
+              worktreeLeaseId: null,
+            }
+          : { reconcileApprovalId: null, activeFence: null, activeJobId: null };
+      updatedNode = transitionSwarmNode(store, null, node.id, SWARM_NODE_STATES.READY, {
+        emitEvent: false,
+        patch,
+      });
+    }
+
+    if (run.status === SWARM_RUN_STATES.RECONCILING) {
+      transitionSwarmRun(store, run.id, SWARM_RUN_STATES.RUNNING, {
+        patch: { currentPhase: 'running' },
+      });
+    }
+
+    return { run, updatedNode };
   });
 
-  if (result.outcome === 'abort') {
-    transitionSwarmNode(store, eventRouter, node.id, SWARM_NODE_STATES.FAILED, {
-      sessionId: run.sessionId,
-      rootTurnId: run.rootTurnId,
-      patch: {
-        reconcileApprovalId: null,
-        activeFence: null,
-        errorCode: 'RECONCILIATION_ABORTED',
-        errorMessage: result.reason || 'Operator aborted reconciliation',
-      },
-    });
-  } else {
-    // Fix C9: If worktree state was lost and operator requests clean re-execution (`not_applied`),
-    // clear stale childSessionId/childTurnId so node starts cleanly from HEAD instead of hallucinating lost files.
-    const patch =
-      isWorktreeStateLost && result.outcome === 'not_applied'
-        ? {
-            reconcileApprovalId: null,
-            activeFence: null,
-            childSessionId: null,
-            childTurnId: null,
-            worktreeLeaseId: null,
-          }
-        : { reconcileApprovalId: null, activeFence: null };
-    transitionSwarmNode(store, eventRouter, node.id, SWARM_NODE_STATES.READY, {
-      sessionId: run.sessionId,
-      rootTurnId: run.rootTurnId,
-      patch,
-    });
-  }
+  if (!outcome) return null;
 
-  if (run.status === SWARM_RUN_STATES.RECONCILING) {
-    transitionSwarmRun(store, run.id, SWARM_RUN_STATES.RUNNING, {
-      patch: { currentPhase: 'running' },
+  try {
+    eventRouter?.emitPersisted({
+      sessionId: outcome.run.sessionId,
+      turnId: outcome.run.rootTurnId,
+      type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
+      data: {
+        runId: outcome.updatedNode.runId,
+        nodeId: outcome.updatedNode.id,
+        nodeKey: outcome.updatedNode.nodeKey,
+        status: outcome.updatedNode.status,
+        childSessionId: outcome.updatedNode.childSessionId || undefined,
+        errorCode: outcome.updatedNode.errorCode || undefined,
+      },
+      audit: false,
     });
+  } catch {
+    // best-effort event emission
   }
 
   enqueueSwarmJob(
     jobQueue,
     SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
     {
-      runId: run.id,
-      sessionId: run.sessionId,
-      planVersion: run.planVersion || 1,
+      runId: outcome.run.id,
+      sessionId: outcome.run.sessionId,
+      planVersion: outcome.run.planVersion || 1,
       epoch: now,
     },
-    { idempotencyKey: `swarm:resolve:${run.id}:reconcile:${uuid().slice(0, 8)}` },
+    {
+      idempotencyKey: `swarm:resolve:${outcome.run.id}:reconcile:${result.id || uuid().slice(0, 8)}`,
+    },
   );
 
-  return getRun(run.id);
+  return getRun(outcome.run.id);
 }

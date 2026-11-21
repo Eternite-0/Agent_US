@@ -209,6 +209,7 @@ export function assertJobOwnershipInTx(
     jobId,
     fence,
     attempt = null,
+    nodeAttempt = null,
     sessionId = null,
     turnId = null,
     runId = null,
@@ -294,7 +295,7 @@ export function assertJobOwnershipInTx(
 
   if (nodeId) {
     const node = store.db
-      .prepare('SELECT status, activeFence, activeJobId FROM swarm_nodes WHERE id=?')
+      .prepare('SELECT status, activeFence, activeJobId, activeAttempt FROM swarm_nodes WHERE id=?')
       .get(nodeId);
     if (node) {
       if (TERMINAL_NODE_STATES.has(node.status)) {
@@ -315,6 +316,18 @@ export function assertJobOwnershipInTx(
           detail: { jobId, nodeId, activeJobId: node.activeJobId },
         });
       }
+      if (
+        !bindingOwnership &&
+        nodeAttempt !== null &&
+        nodeAttempt !== undefined &&
+        Number(node.activeAttempt || 0) > 0 &&
+        Number(node.activeAttempt) !== Number(nodeAttempt)
+      ) {
+        throw new RecoveryError('LEASE_LOST', {
+          message: `Swarm node ${nodeId} superseded by newer attempt ${node.activeAttempt} (expected ${nodeAttempt})`,
+          detail: { jobId, nodeId, expectedNodeAttempt: nodeAttempt, actualNodeAttempt: node.activeAttempt },
+        });
+      }
     }
   }
 
@@ -330,12 +343,13 @@ export function createLeaseGuard({
   fence,
   workerId = null,
   attempt = null,
+  nodeAttempt = null,
   sessionId = null,
   turnId = null,
   runId = null,
   nodeId = null,
 }) {
-  const baseCtx = { jobId, fence, attempt, sessionId, turnId, runId, nodeId };
+  const baseCtx = { jobId, fence, attempt, nodeAttempt, sessionId, turnId, runId, nodeId };
 
   const assertInTx = (override = {}) =>
     assertJobOwnershipInTx(store, {
@@ -348,6 +362,7 @@ export function createLeaseGuard({
   guard.fence = fence;
   guard.workerId = workerId;
   guard.attempt = attempt;
+  guard.nodeAttempt = nodeAttempt;
   guard.sessionId = sessionId;
   guard.turnId = turnId;
   guard.runId = runId;

@@ -127,11 +127,20 @@ export class ModelCapabilityRegistry {
 
   syncFromPool() {
     this.entries.clear();
+    const allAccounts =
+      typeof this.pool?.listAccounts === 'function'
+        ? this.pool.listAccounts()
+        : [];
     const accounts =
       typeof this.pool?.listAccounts === 'function'
         ? this.pool.listAccounts({ enabled: true })
         : [];
     const accountByPreset = new Map();
+    for (const acc of allAccounts) {
+      if (acc?.preset && !accountByPreset.has(acc.preset)) {
+        accountByPreset.set(acc.preset, false);
+      }
+    }
     const now = Date.now();
     for (const acc of accounts) {
       const ok = (!acc.cooldownUntil || acc.cooldownUntil <= now) && acc.status !== 'disabled';
@@ -150,8 +159,12 @@ export class ModelCapabilityRegistry {
         const targets = Array.isArray(item.targets) ? item.targets : [];
         const provider = targets[0]?.provider || 'pool';
         const profile = catalog.profiles?.[alias] ?? null;
+        const hasAnyAccounts = allAccounts.length > 0;
         const healthy = targets.length
-          ? targets.some((t) => accountByPreset.get(t.provider) ?? true)
+          ? targets.some((t) => {
+              if (accountByPreset.has(t.provider)) return accountByPreset.get(t.provider);
+              return !hasAnyAccounts;
+            })
           : true;
         this.entries.set(alias, scoreModelCapabilities(alias, { preset: provider, profile, healthy }));
       }

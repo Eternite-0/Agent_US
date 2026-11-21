@@ -203,6 +203,8 @@ function hydrateLedgerRow(row) {
     isTokenExhausted,
     isExhausted: isPermanentlyExhausted || isStepExhausted || isTokenExhausted,
     isPermanentlyExhausted,
+    trafficSource: row.trafficSource ?? 'production',
+    isSynthetic: Boolean(row.isSynthetic),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -222,7 +224,14 @@ export class TaskTreeBudgetLedger {
     return Boolean(this.store?.db?.isOpen);
   }
 
-  ensureLedger({ treeId, rootSessionId = null, budget = {}, initialUsage = null } = {}) {
+  ensureLedger({
+    treeId,
+    rootSessionId = null,
+    budget = {},
+    initialUsage = null,
+    trafficSource = 'production',
+    isSynthetic = 0,
+  } = {}) {
     if (!treeId || !this.#dbReady()) return null;
     const limits = normalizeTreeBudget(budget);
     return this.store.tx(() => {
@@ -261,8 +270,9 @@ export class TaskTreeBudgetLedger {
             treeId, rootSessionId, maxTotalSteps, maxTotalTokens, maxOutputTokens,
             usedSteps, usedInputTokens, usedOutputTokens,
             reservedSteps, reservedTokens, estimationErrorTokens,
-            overageSteps, overageTokens, exhausted, exhaustedReason, createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?,?)`,
+            overageSteps, overageTokens, exhausted, exhaustedReason,
+            trafficSource, isSynthetic, createdAt, updatedAt
+          ) VALUES(?,?,?,?,?,?,?,?,0,0,0,?,?,?,?,?,?,?,?)`,
         )
         .run(
           treeId,
@@ -277,6 +287,8 @@ export class TaskTreeBudgetLedger {
           overageTokens,
           exhausted,
           exhaustedReason,
+          String(trafficSource || 'interactive'),
+          isSynthetic ? 1 : 0,
           now,
           now,
         );
@@ -328,6 +340,8 @@ export class TaskTreeBudgetLedger {
     sessionId = null,
     turnId = null,
     attempt = 1,
+    jobId = null,
+    fence = null,
     estimatedInputTokens = 0,
     requestedMaxOutputTokens = null,
     nodeBudget = null,
@@ -353,6 +367,8 @@ export class TaskTreeBudgetLedger {
     const estIn = Math.max(0, Math.ceil(Number(estimatedInputTokens || 0)));
     const reqMaxOut = normalizeBudgetLimit(requestedMaxOutputTokens);
     const now = Date.now();
+    const effectiveJobId = jobId ?? leaseGuard?.jobId ?? null;
+    const effectiveFence = fence ?? leaseGuard?.fence ?? null;
 
     const outcome = this.store.tx(() => {
       assertLeaseInTx(leaseGuard);
@@ -464,11 +480,8 @@ export class TaskTreeBudgetLedger {
           };
         }
         if (estIn >= availableTokens) {
-          if (reservedTokens === 0) {
-            this.store.db
-              .prepare("UPDATE budget_ledgers SET exhausted=1, exhaustedReason='TOKEN_BUDGET', updatedAt=? WHERE treeId=?")
-              .run(now, treeId);
-          }
+          // Reject this oversized prompt without permanently marking the entire tree exhausted
+          // so smaller sibling prompts can still consume the remaining tree tokens.
           return {
             admitted: false,
             errorCode: 'TOKEN_BUDGET',
@@ -506,11 +519,11 @@ export class TaskTreeBudgetLedger {
       this.store.db
         .prepare(
           `INSERT INTO budget_reservations(
-            id, treeId, scope, nodeId, nodeKey, sessionId, turnId, attempt,
+            id, treeId, scope, nodeId, nodeKey, sessionId, turnId, attempt, jobId, fence,
             status, reservedSteps, estimatedInputTokens, reservedOutputTokens, reservedTotalTokens,
             actualSteps, actualInputTokens, actualOutputTokens, estimationErrorTokens, overageTokens,
             createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,?,?,'reserved',1,?,?,?,0,0,0,0,0,?,?)`,
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,'reserved',1,?,?,?,0,0,0,0,0,?,?)`,
         )
         .run(
           reservationId,
@@ -521,6 +534,8 @@ export class TaskTreeBudgetLedger {
           sessionId,
           turnId,
           Math.max(1, Math.floor(Number(attempt || 1))),
+          effectiveJobId,
+          effectiveFence,
           estIn,
           constrainedMaxOutput,
           reservedTotalTokens,
@@ -703,16 +718,53 @@ export class TaskTreeBudgetLedger {
   /**
    * Checks whether an in-flight `'reserved'` row belongs to a live worker with an active,
    * non-expired lease (via Group 2's `classifyJobOwnership` & `runtime_workers`).
-   * Protects Runtime A's active reservations when Runtime B joins the shared SQLite DB.
+   * Protects Runtime A's active reservations when Runtime B joins the shared SQLite DB,
+   * while rejecting stale-attempt/fence reservations even if a newer attempt is now live on the same node.
    */
   #isReservationOwnedByLiveWorker(res, now) {
+    // 0. Exact (jobId, fence) ownership check when recorded (prevents stale attempt misattribution!)
+    if (res.jobId) {
+      const boundJob = this.store.db.prepare('SELECT * FROM runtime_jobs WHERE id=?').get(res.jobId);
+      if (!boundJob || boundJob.status !== 'active') {
+        return false;
+      }
+      if (
+        res.fence !== null &&
+        res.fence !== undefined &&
+        Number(boundJob.fence) !== Number(res.fence)
+      ) {
+        return false;
+      }
+      return Boolean(classifyJobOwnership(this.store, boundJob, { now }).liveOwner);
+    }
+
     // 1. Check active job bound directly to swarm_nodes(nodeId / treeId+nodeKey)
     if (res.nodeId || (res.treeId && res.nodeKey)) {
       const nodeRow = res.nodeId
-        ? this.store.db.prepare('SELECT activeJobId, jobId FROM swarm_nodes WHERE id=?').get(res.nodeId)
+        ? this.store.db
+            .prepare('SELECT activeJobId, jobId, activeFence, activeAttempt FROM swarm_nodes WHERE id=?')
+            .get(res.nodeId)
         : this.store.db
-            .prepare('SELECT activeJobId, jobId FROM swarm_nodes WHERE runId=? AND nodeKey=?')
+            .prepare('SELECT activeJobId, jobId, activeFence, activeAttempt FROM swarm_nodes WHERE runId=? AND nodeKey=?')
             .get(res.treeId, res.nodeKey);
+      if (
+        nodeRow &&
+        Number(nodeRow.activeAttempt ?? 0) > 0 &&
+        res.attempt &&
+        Number(res.attempt) !== Number(nodeRow.activeAttempt)
+      ) {
+        return false;
+      }
+      if (
+        nodeRow &&
+        res.fence !== null &&
+        res.fence !== undefined &&
+        nodeRow.activeFence !== null &&
+        nodeRow.activeFence !== undefined &&
+        Number(res.fence) !== Number(nodeRow.activeFence)
+      ) {
+        return false;
+      }
       const jobId = nodeRow?.activeJobId || nodeRow?.jobId || null;
       if (jobId) {
         const job = this.store.db.prepare('SELECT * FROM runtime_jobs WHERE id=?').get(jobId);
@@ -728,6 +780,13 @@ export class TaskTreeBudgetLedger {
         .prepare("SELECT * FROM runtime_jobs WHERE status='active' AND turnId=?")
         .all(res.turnId);
       for (const job of turnJobs) {
+        if (
+          res.fence !== null &&
+          res.fence !== undefined &&
+          Number(job.fence) !== Number(res.fence)
+        ) {
+          continue;
+        }
         if (classifyJobOwnership(this.store, job, { now }).liveOwner) return true;
       }
     }
@@ -747,6 +806,13 @@ export class TaskTreeBudgetLedger {
         .all(res.treeId);
       for (const job of treeJobs) {
         if (!classifyJobOwnership(this.store, job, { now }).liveOwner) continue;
+        if (
+          res.fence !== null &&
+          res.fence !== undefined &&
+          Number(job.fence) !== Number(res.fence)
+        ) {
+          continue;
+        }
         if (!res.nodeId && !res.nodeKey) return true;
         const payload = parseJsonSafe(job.payload, {});
         if (
@@ -759,6 +825,138 @@ export class TaskTreeBudgetLedger {
     }
 
     return false;
+  }
+
+  #reconcileReservationRowTx(res, now, reason) {
+    const ledger = this.store.db
+      .prepare('SELECT * FROM budget_ledgers WHERE treeId=?')
+      .get(res.treeId);
+    if (!ledger) return null;
+
+    const actSteps = Math.max(0, Number(res.reservedSteps ?? 1));
+    const actIn = Math.max(0, Number(res.estimatedInputTokens ?? 0));
+    const actOut = 0;
+    const releasedOut = Math.max(0, Number(res.reservedOutputTokens ?? 0));
+
+    const maxTotalSteps = normalizeBudgetLimit(ledger.maxTotalSteps);
+    const maxTotalTokens = normalizeBudgetLimit(ledger.maxTotalTokens);
+    const nextUsedSteps = Number(ledger.usedSteps ?? 0) + actSteps;
+    const nextUsedIn = Number(ledger.usedInputTokens ?? 0) + actIn;
+    const nextUsedOut = Number(ledger.usedOutputTokens ?? 0) + actOut;
+    const nextUsedTokens = nextUsedIn + nextUsedOut;
+    const nextReservedSteps = Math.max(0, Number(ledger.reservedSteps ?? 0) - actSteps);
+    const nextReservedTokens = Math.max(
+      0,
+      Number(ledger.reservedTokens ?? 0) - Number(res.reservedTotalTokens ?? 0),
+    );
+    const nextOverSteps =
+      maxTotalSteps !== null ? Math.max(0, nextUsedSteps - maxTotalSteps) : 0;
+    const nextOverTokens =
+      maxTotalTokens !== null ? Math.max(0, nextUsedTokens - maxTotalTokens) : 0;
+
+    let exhausted = Number(ledger.exhausted ?? 0);
+    let exhaustedReason = ledger.exhaustedReason ?? null;
+    if (maxTotalSteps !== null && nextUsedSteps >= maxTotalSteps) {
+      exhausted = 1;
+      exhaustedReason = exhaustedReason || 'STEP_BUDGET';
+    } else if (maxTotalTokens !== null && nextUsedTokens >= maxTotalTokens) {
+      exhausted = 1;
+      exhaustedReason = exhaustedReason || 'TOKEN_BUDGET';
+    }
+
+    const upd = this.store.db
+      .prepare(
+        `UPDATE budget_reservations
+         SET status='reconciled', actualSteps=?, actualInputTokens=?, actualOutputTokens=?,
+             errorCode=?, settledAt=?, updatedAt=?
+         WHERE id=? AND status='reserved'`,
+      )
+      .run(actSteps, actIn, actOut, reason, now, now, res.id);
+    if (!upd.changes) return null;
+
+    this.store.db
+      .prepare(
+        `UPDATE budget_ledgers
+         SET usedSteps=?, usedInputTokens=?, usedOutputTokens=?,
+             reservedSteps=?, reservedTokens=?,
+             overageSteps=?, overageTokens=?,
+             exhausted=?, exhaustedReason=?, updatedAt=?
+         WHERE treeId=?`,
+      )
+      .run(
+        nextUsedSteps,
+        nextUsedIn,
+        nextUsedOut,
+        nextReservedSteps,
+        nextReservedTokens,
+        nextOverSteps,
+        nextOverTokens,
+        exhausted,
+        exhaustedReason,
+        now,
+        res.treeId,
+      );
+
+    return { actSteps, actIn, releasedOut };
+  }
+
+  /**
+   * Reconciles any leaked `'reserved'` rows left by a prior attempt/fence of the SAME node
+   * right before a new attempt begins executing under `(activeJobId, activeFence)`.
+   */
+  reconcileStaleNodeReservations({
+    treeId,
+    nodeId = null,
+    nodeKey = null,
+    activeJobId = null,
+    activeFence = null,
+    reason = 'STALE_ATTEMPT_RESERVATION_RECONCILED',
+  } = {}) {
+    const report = {
+      reconciledCount: 0,
+      committedOrphanSteps: 0,
+      committedOrphanInputTokens: 0,
+      releasedOutputTokens: 0,
+    };
+    if (!treeId || (!nodeId && !nodeKey) || !this.#dbReady()) return report;
+    const now = Date.now();
+    this.store.tx(() => {
+      const rows = nodeId
+        ? this.store.db
+            .prepare(
+              "SELECT * FROM budget_reservations WHERE treeId=? AND nodeId=? AND status='reserved' ORDER BY createdAt ASC",
+            )
+            .all(treeId, nodeId)
+        : this.store.db
+            .prepare(
+              "SELECT * FROM budget_reservations WHERE treeId=? AND nodeKey=? AND status='reserved' ORDER BY createdAt ASC",
+            )
+            .all(treeId, nodeKey);
+      let touched = false;
+      for (const res of rows) {
+        const matchesCurrent =
+          activeJobId &&
+          res.jobId === activeJobId &&
+          (activeFence === null ||
+            activeFence === undefined ||
+            res.fence === null ||
+            res.fence === undefined ||
+            Number(res.fence) === Number(activeFence));
+        if (matchesCurrent) continue;
+        const delta = this.#reconcileReservationRowTx(res, now, reason);
+        if (delta) {
+          touched = true;
+          report.reconciledCount++;
+          report.committedOrphanSteps += delta.actSteps;
+          report.committedOrphanInputTokens += delta.actIn;
+          report.releasedOutputTokens += delta.releasedOut;
+        }
+      }
+      if (touched) {
+        this.#syncSwarmRunUsageTx(treeId, now);
+      }
+    });
+    return report;
   }
 
   /**
@@ -803,80 +1001,14 @@ export class TaskTreeBudgetLedger {
           report.skippedLiveCount++;
           continue;
         }
-        const ledger = this.store.db
-          .prepare('SELECT * FROM budget_ledgers WHERE treeId=?')
-          .get(res.treeId);
-        if (!ledger) continue;
-
-        const actSteps = Math.max(0, Number(res.reservedSteps ?? 1));
-        const actIn = Math.max(0, Number(res.estimatedInputTokens ?? 0));
-        const actOut = 0;
-        const releasedOut = Math.max(0, Number(res.reservedOutputTokens ?? 0));
-
-        const maxTotalSteps = normalizeBudgetLimit(ledger.maxTotalSteps);
-        const maxTotalTokens = normalizeBudgetLimit(ledger.maxTotalTokens);
-        const nextUsedSteps = Number(ledger.usedSteps ?? 0) + actSteps;
-        const nextUsedIn = Number(ledger.usedInputTokens ?? 0) + actIn;
-        const nextUsedOut = Number(ledger.usedOutputTokens ?? 0) + actOut;
-        const nextUsedTokens = nextUsedIn + nextUsedOut;
-        const nextReservedSteps = Math.max(0, Number(ledger.reservedSteps ?? 0) - actSteps);
-        const nextReservedTokens = Math.max(
-          0,
-          Number(ledger.reservedTokens ?? 0) - Number(res.reservedTotalTokens ?? 0),
-        );
-        const nextOverSteps =
-          maxTotalSteps !== null ? Math.max(0, nextUsedSteps - maxTotalSteps) : 0;
-        const nextOverTokens =
-          maxTotalTokens !== null ? Math.max(0, nextUsedTokens - maxTotalTokens) : 0;
-
-        let exhausted = Number(ledger.exhausted ?? 0);
-        let exhaustedReason = ledger.exhaustedReason ?? null;
-        if (maxTotalSteps !== null && nextUsedSteps >= maxTotalSteps) {
-          exhausted = 1;
-          exhaustedReason = exhaustedReason || 'STEP_BUDGET';
-        } else if (maxTotalTokens !== null && nextUsedTokens >= maxTotalTokens) {
-          exhausted = 1;
-          exhaustedReason = exhaustedReason || 'TOKEN_BUDGET';
-        }
-
-        const upd = this.store.db
-          .prepare(
-            `UPDATE budget_reservations
-             SET status='reconciled', actualSteps=?, actualInputTokens=?, actualOutputTokens=?,
-                 errorCode=?, settledAt=?, updatedAt=?
-             WHERE id=? AND status='reserved'`,
-          )
-          .run(actSteps, actIn, actOut, reason, now, now, res.id);
-        if (!upd.changes) continue;
-
-        this.store.db
-          .prepare(
-            `UPDATE budget_ledgers
-             SET usedSteps=?, usedInputTokens=?, usedOutputTokens=?,
-                 reservedSteps=?, reservedTokens=?,
-                 overageSteps=?, overageTokens=?,
-                 exhausted=?, exhaustedReason=?, updatedAt=?
-             WHERE treeId=?`,
-          )
-          .run(
-            nextUsedSteps,
-            nextUsedIn,
-            nextUsedOut,
-            nextReservedSteps,
-            nextReservedTokens,
-            nextOverSteps,
-            nextOverTokens,
-            exhausted,
-            exhaustedReason,
-            now,
-            res.treeId,
-          );
+        const delta = this.#reconcileReservationRowTx(res, now, reason);
+        if (!delta) continue;
 
         touchedTrees.add(res.treeId);
         report.reconciledCount++;
-        report.committedOrphanSteps += actSteps;
-        report.committedOrphanInputTokens += actIn;
-        report.releasedOutputTokens += releasedOut;
+        report.committedOrphanSteps += delta.actSteps;
+        report.committedOrphanInputTokens += delta.actIn;
+        report.releasedOutputTokens += delta.releasedOut;
       }
 
       // Defensive self-heal: clear any nonzero reserved counters that have no active reservations

@@ -20,7 +20,7 @@ export class CheckpointStore {
   }
 
   save({ sessionId, turnId, step = 0, phase, state = {}, ledgerSeq = 0, leaseGuard = null }) {
-    if (!this.store?.db || !sessionId || !turnId) return null;
+    if (!this.store?.db?.isOpen || !sessionId || !turnId) return null;
     const id = uuid();
     const now = Date.now();
     this.store.tx(() => {
@@ -46,7 +46,7 @@ export class CheckpointStore {
   }
 
   loadLatest(turnId) {
-    if (!this.store?.db || !turnId) return null;
+    if (!this.store?.db?.isOpen || !turnId) return null;
     const row = this.store.db
       .prepare(
         'SELECT * FROM runtime_checkpoints WHERE turnId=? ORDER BY step DESC, createdAt DESC, rowid DESC LIMIT 1',
@@ -60,7 +60,7 @@ export class CheckpointStore {
   }
 
   loadLatestForSession(sessionId) {
-    if (!this.store?.db || !sessionId) return null;
+    if (!this.store?.db?.isOpen || !sessionId) return null;
     const row = this.store.db
       .prepare(
         'SELECT * FROM runtime_checkpoints WHERE sessionId=? ORDER BY createdAt DESC, rowid DESC LIMIT 1',
@@ -74,10 +74,10 @@ export class CheckpointStore {
   }
 
   listByTurn(turnId) {
-    if (!this.store?.db || !turnId) return [];
+    if (!this.store?.db?.isOpen || !turnId) return [];
     return this.store.db
       .prepare(
-        'SELECT * FROM runtime_checkpoints WHERE turnId=? ORDER BY step ASC, createdAt ASC',
+        'SELECT * FROM runtime_checkpoints WHERE turnId=? ORDER BY step ASC, createdAt ASC, rowid ASC',
       )
       .all(turnId)
       .map((r) => ({ ...r, state: parseJsonSafe(r.stateJson, {}) }));

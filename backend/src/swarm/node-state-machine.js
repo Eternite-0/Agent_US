@@ -41,7 +41,7 @@ const TERMINAL_RUN = new Set([
 
 export const NODE_TRANSITIONS = Object.freeze({
   pending: new Set(['ready', 'queued', 'failed', 'cancelled']),
-  ready: new Set(['queued', 'running', 'completed', 'failed', 'cancelled']),
+  ready: new Set(['pending', 'queued', 'running', 'failed', 'cancelled']),
   queued: new Set(['ready', 'running', 'interrupted', 'cancelled']),
   running: new Set([
     'parked',
@@ -54,7 +54,7 @@ export const NODE_TRANSITIONS = Object.freeze({
   ]),
   parked: new Set(['ready', 'queued', 'running', 'cancelled', 'failed']),
   interrupted: new Set(['ready', 'queued', 'running', 'reconciling', 'failed', 'cancelled']),
-  reconciling: new Set(['ready', 'queued', 'running', 'completed', 'failed', 'cancelled']),
+  reconciling: new Set(['ready', 'queued', 'running', 'failed', 'cancelled']),
   completed: new Set([]),
   failed: new Set(['pending', 'ready']), // only explicit replanning unlocks a failed node
   cancelled: new Set([]),
@@ -106,7 +106,19 @@ const ALLOWED_RUN_PATCH_COLS = new Set([
   'verdictJson',
   'errorCode',
   'errorMessage',
+  'finishedAt',
 ]);
+
+function attachChangedFlag(row, changed) {
+  if (row && typeof row === 'object') {
+    Object.defineProperty(row, 'changed', {
+      value: Boolean(changed),
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return row;
+}
 
 export function isTerminalNodeState(status) {
   return TERMINAL_NODE.has(status);
@@ -208,22 +220,26 @@ export function transitionSwarmNode(
   });
 
   if (changed && emitEvent && sessionId && eventRouter) {
-    eventRouter.emitPersisted({
-      sessionId,
-      turnId: rootTurnId,
-      type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
-      data: {
-        runId: updated.runId,
-        nodeId: updated.id,
-        nodeKey: updated.nodeKey,
-        status: updated.status,
-        childSessionId: updated.childSessionId || undefined,
-        errorCode: updated.errorCode || undefined,
-      },
-      audit: false,
-    });
+    try {
+      eventRouter.emitPersisted({
+        sessionId,
+        turnId: rootTurnId,
+        type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
+        data: {
+          runId: updated.runId,
+          nodeId: updated.id,
+          nodeKey: updated.nodeKey,
+          status: updated.status,
+          childSessionId: updated.childSessionId || undefined,
+          errorCode: updated.errorCode || undefined,
+        },
+        audit: false,
+      });
+    } catch {
+      // best-effort event emission after committed node transition
+    }
   }
-  return updated;
+  return attachChangedFlag(updated, changed);
 }
 
 export function transitionSwarmRun(
@@ -238,7 +254,7 @@ export function transitionSwarmRun(
     expectedReplanCount = undefined,
   } = {},
 ) {
-  return store.tx(() => {
+  const { updated, changed } = store.tx(() => {
     const row = store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);
     if (!row) {
       throw new RuntimeError('SWARM_RUN_NOT_FOUND', { detail: { runId } });
@@ -257,14 +273,14 @@ export function transitionSwarmRun(
             detail: { runId, from, toStatus },
           });
         }
-        return row;
+        return { updated: row, changed: false };
       }
       if (
         validEntries.length === 0 &&
         expectedPlanVersion === undefined &&
         expectedReplanCount === undefined
       ) {
-        return row;
+        return { updated: row, changed: false };
       }
     } else {
       if (from === 'failed' && !allowResume) {
@@ -285,9 +301,15 @@ export function transitionSwarmRun(
     const now = Date.now();
     const fields = ['status=?', 'updatedAt=?'];
     const values = [toStatus, now];
+    let hasFinishedAt = false;
     for (const [k, v] of validEntries) {
+      if (k === 'finishedAt') hasFinishedAt = true;
       fields.push(`${k}=?`);
       values.push(v);
+    }
+    if (isTerminalRunState(toStatus) && !hasFinishedAt) {
+      fields.push('finishedAt=COALESCE(finishedAt, ?)');
+      values.push(now);
     }
 
     const where = ['id=?', 'status=?'];
@@ -316,6 +338,10 @@ export function transitionSwarmRun(
         },
       });
     }
-    return store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);
+    return {
+      updated: store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId),
+      changed: true,
+    };
   });
+  return attachChangedFlag(updated, changed);
 }

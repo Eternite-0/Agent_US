@@ -3,6 +3,7 @@ import { verifyTurn } from '../verifier.js';
 import { resolveConfinedPath } from '../tools/sandbox.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import { buildPlainTextPassVerdict } from '../kernel/verdict.js';
+import { classifyJobOwnership } from '../durable/lease-guard.js';
 
 const PASS_CLAIM_RE =
   /(?:全部|所有|tests?|suites?|checks?|build|lint|typecheck|npm run check).*?(?:pass(?:ed|es)?|通过|成功|0\s*(?:fail(?:ure)?s?|errors?))|(?:验证通过|测试通过|构建成功|编译通过|0\s*(?:failures|errors))/i;
@@ -48,7 +49,7 @@ export class EvidenceVerifier {
     ];
 
     let turnReceipts = [];
-    if (this.store?.db && allSessionIds.length > 0) {
+    if (this.store?.db?.isOpen && allSessionIds.length > 0) {
       const sPh = allSessionIds.map(() => '?').join(',');
       const pendingUnknown = this.store.db
         .prepare(
@@ -60,7 +61,38 @@ export class EvidenceVerifier {
           `SELECT id, tool FROM direct_approvals WHERE sessionId IN (${sPh}) AND kind='reconciliation' AND status='pending'`,
         )
         .all(...allSessionIds);
-      checks.pendingReconciliations = pendingUnknown.length + pendingAppr.length;
+
+      // Also detect stranded/orphaned 'executing' non-replayable/outward receipts (P0-2)
+      const executingNonReplay = this.store.db
+        .prepare(
+          `SELECT id, toolName, turnId, sessionId FROM tool_receipts
+           WHERE sessionId IN (${sPh}) AND status='executing' AND (replayable = 0 OR outward = 1)`,
+        )
+        .all(...allSessionIds);
+      const verifiedTurnSet = new Set(allTurnIds);
+      const strandedExecuting = [];
+      const now = Date.now();
+      for (const r of executingNonReplay) {
+        // Inside the turn(s) currently at idle/final verification, no tool can legitimately still be executing
+        if (r.turnId && verifiedTurnSet.has(r.turnId)) {
+          strandedExecuting.push(r);
+          continue;
+        }
+        // For receipts from other turns in the same session, check whether a live owner still holds the job
+        let liveOwned = false;
+        if (r.turnId) {
+          const activeJobs = this.store.db
+            .prepare("SELECT * FROM runtime_jobs WHERE turnId=? AND status='active'")
+            .all(r.turnId);
+          liveOwned = activeJobs.some((j) => classifyJobOwnership(this.store, j, { now }).liveOwner);
+        }
+        if (!liveOwned) {
+          strandedExecuting.push(r);
+        }
+      }
+
+      checks.pendingReconciliations =
+        pendingUnknown.length + pendingAppr.length + strandedExecuting.length;
       if (checks.pendingReconciliations > 0) {
         const blocker = {
           verdict: 'block_reconciliation',
@@ -68,9 +100,9 @@ export class EvidenceVerifier {
           evidenceRequired: true,
           verificationMode: 'reconciliation_gate',
           reasons: [
-            `存在 ${checks.pendingReconciliations} 个状态未知的外部副作用 (outcome_unknown)，需人工核对后方可完成`,
+            `存在 ${checks.pendingReconciliations} 个状态未知或未收敛的外部副作用 (outcome_unknown/executing)，需人工核对后方可完成`,
           ],
-          evidenceCount: pendingUnknown.length,
+          evidenceCount: pendingUnknown.length + strandedExecuting.length,
           checks,
         };
         if (sessionId) this.#emitVerdict(sessionId, turnId, blocker);

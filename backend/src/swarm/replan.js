@@ -1,6 +1,7 @@
 import { id as uuid } from '../store.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import { BudgetError } from '../kernel/errors.js';
+import { assertLeaseInTx } from '../durable/lease-guard.js';
 import {
   BUDGET_SCOPES,
   estimateRequestInputTokens,
@@ -67,6 +68,7 @@ export class DynamicReplanner {
     model = null,
     budgetLedger = null,
     signal = undefined,
+    leaseGuard = null,
   }) {
     const adapter = this.adapter;
     if (!adapter) return null;
@@ -108,6 +110,7 @@ export class DynamicReplanner {
         estimatedInputTokens,
         requestedMaxOutputTokens: 512,
         defaultMaxOutputTokens: 512,
+        leaseGuard,
       });
     }
 
@@ -133,18 +136,24 @@ export class DynamicReplanner {
           actualSteps: 1,
           actualInputTokens: usage.inputTokens,
           actualOutputTokens: usage.outputTokens,
+          leaseGuard,
         });
       }
       return { text: text.trim(), usage };
     } catch (err) {
       if (reservation?.reservationId) {
-        ledger.settleReservation(reservation.reservationId, {
-          status: 'failed',
-          actualSteps: 1,
-          actualInputTokens: usage.inputTokens,
-          actualOutputTokens: usage.outputTokens,
-          errorCode: err?.code || 'REPLAN_DIAGNOSIS_FAILED',
-        });
+        try {
+          ledger.settleReservation(reservation.reservationId, {
+            status: 'failed',
+            actualSteps: 1,
+            actualInputTokens: usage.inputTokens,
+            actualOutputTokens: usage.outputTokens,
+            errorCode: err?.code || 'REPLAN_DIAGNOSIS_FAILED',
+            leaseGuard: err?.code === 'LEASE_LOST' ? null : leaseGuard,
+          });
+        } catch {
+          // ignore settle error when lease already lost
+        }
       }
       throw err;
     }
@@ -159,6 +168,7 @@ export class DynamicReplanner {
     budgetLedger = null,
     useModelDiagnosis = false,
     signal = undefined,
+    leaseGuard = null,
   }) {
     const codeStr = String(errorCode || '');
     if (NON_REPLANABLE_ERRORS.has(codeStr) || isBudgetErrorCode(codeStr)) {
@@ -176,9 +186,11 @@ export class DynamicReplanner {
           errorMessage,
           budgetLedger: activeLedger,
           signal,
+          leaseGuard,
         });
         diagnosisNote = diag?.text || null;
       } catch (err) {
+        if (err?.code === 'LEASE_LOST') throw err;
         if (err instanceof BudgetError || err?.category === 'budget' || isBudgetErrorCode(err?.code)) {
           return {
             replanned: false,
@@ -193,6 +205,7 @@ export class DynamicReplanner {
     const allModels = this.router?.modelRegistry?.syncFromPool?.() ?? [];
 
     const outcome = this.store.tx(() => {
+      assertLeaseInTx(leaseGuard, { runId: run.id, nodeId: failedNode?.id });
       const liveRun = this.store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(run.id);
       if (!liveRun || isTerminalRunState(liveRun.status)) {
         return { replanned: false, strategy: 'none', reason: 'RUN_NOT_ACTIVE' };
@@ -275,18 +288,35 @@ export class DynamicReplanner {
         (m) => m.model && !triedModels.has(m.model) && m.healthy !== false,
       );
 
+      const resetPatch = {
+        activeFence: null,
+        activeJobId: null,
+        childSessionId: null,
+        childTurnId: null,
+        worktreeLeaseId: null,
+        worktreePath: null,
+        latestArtifactId: null,
+        artifactUrisJson: '[]',
+        resultText: null,
+        reconcileApprovalId: null,
+        errorCode: null,
+        errorMessage: null,
+      };
+
       // 1. Transient retry on same model (first failure, unless model already failed out in this run)
       if (attempts < 2 && !(liveNode.model && runKnownFailedModels.has(liveNode.model) && altModel)) {
         if (liveNode.status !== SWARM_NODE_STATES.FAILED) {
           transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.FAILED, {
             emitEvent: false,
+            leaseGuard,
             patch: { errorCode, errorMessage },
           });
         }
         updatedNode = transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.READY, {
           emitEvent: false,
           allowReplanReset: true,
-          patch: { planVersion: nextVersion, errorCode: null, errorMessage: null },
+          leaseGuard,
+          patch: { ...resetPatch, planVersion: nextVersion },
         });
         strategy = 'retry_same';
         reason = errorMessage || errorCode || 'transient failure retry';
@@ -297,6 +327,7 @@ export class DynamicReplanner {
           if (liveNode.status !== SWARM_NODE_STATES.FAILED) {
             transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.FAILED, {
               emitEvent: false,
+              leaseGuard,
               patch: { errorCode, errorMessage },
             });
           }
@@ -308,12 +339,12 @@ export class DynamicReplanner {
             {
               emitEvent: false,
               allowReplanReset: true,
+              leaseGuard,
               patch: {
+                ...resetPatch,
                 model: altModel.model,
                 provider: altModel.provider || 'pool',
                 planVersion: nextVersion,
-                errorCode: null,
-                errorMessage: null,
               },
             },
           );
@@ -327,12 +358,13 @@ export class DynamicReplanner {
         } else if (!liveNode.nodeKey.includes('__split')) {
           // 3. Split subgraph into two smaller deterministic sub-nodes while preserving completed nodes
           const existingNodes = this.store.db
-            .prepare('SELECT id, nodeKey, dependenciesJson, status FROM swarm_nodes WHERE runId=?')
+            .prepare('SELECT id, nodeKey, dependenciesJson, status, errorCode FROM swarm_nodes WHERE runId=?')
             .all(liveRun.id)
             .map((r) => ({
               id: r.id,
               nodeKey: r.nodeKey,
               status: r.status,
+              errorCode: r.errorCode,
               dependencies: parseJsonSafe(r.dependenciesJson, []),
             }));
           const deps = parseJsonSafe(liveNode.dependenciesJson, []);
@@ -378,6 +410,7 @@ export class DynamicReplanner {
               SWARM_NODE_STATES.FAILED,
               {
                 emitEvent: false,
+                leaseGuard,
                 patch: { errorCode: errorCode || 'REPLANNED', errorMessage },
               },
             );
@@ -422,9 +455,23 @@ export class DynamicReplanner {
             'UPDATE swarm_nodes SET dependenciesJson=?, planVersion=?, updatedAt=? WHERE id=?',
           );
           for (const n of existingNodes) {
-            if (n.status === 'pending' && n.dependencies.includes(liveNode.nodeKey)) {
-              const nextDeps = n.dependencies.map((d) => (d === liveNode.nodeKey ? s2Key : d));
+            if (!n.dependencies.includes(liveNode.nodeKey)) continue;
+            const nextDeps = n.dependencies.map((d) => (d === liveNode.nodeKey ? s2Key : d));
+            if (n.status === 'pending') {
               updDep.run(JSON.stringify(nextDeps), nextVersion, now, n.id);
+            } else if (n.status === 'failed' && n.errorCode === 'DEPENDENCY_FAILED') {
+              // Revive downstream nodes that prematurely failed due to DEPENDENCY_FAILED before split completed
+              transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.PENDING, {
+                emitEvent: false,
+                allowReplanReset: true,
+                leaseGuard,
+                patch: {
+                  dependenciesJson: JSON.stringify(nextDeps),
+                  planVersion: nextVersion,
+                  errorCode: null,
+                  errorMessage: null,
+                },
+              });
             }
           }
           strategy = 'split_subgraph';
@@ -441,10 +488,31 @@ export class DynamicReplanner {
         diff = { ...diff, diagnosis: diagnosisNote.slice(0, 500) };
       }
 
+      // Mark any non-applied artifacts from the superseded attempt/node as 'superseded'
+      this.store.db
+        .prepare(
+          `UPDATE swarm_artifacts
+           SET status='superseded', updatedAt=?
+           WHERE runId=? AND (nodeId=? OR nodeKey=?) AND status NOT IN ('applied', 'superseded')`,
+        )
+        .run(now, liveRun.id, liveNode.id, liveNode.nodeKey);
+
+      // Cancel stale pending/parked/reconciling runtime_jobs targeting this superseded node attempt
+      const currentJobId = leaseGuard?.jobId ?? '';
+      this.store.db
+        .prepare(
+          `UPDATE runtime_jobs
+           SET status='cancelled', lastError='NODE_REPLANNED', leaseExpiresAt=NULL, updatedAt=?
+           WHERE taskId=? AND turnId=? AND id != ?
+             AND status IN ('pending','parked','reconciling')`,
+        )
+        .run(now, liveRun.id, `swarm:${liveRun.id}:${liveNode.nodeKey}`, currentJobId);
+
       // Single atomic CAS update of planVersion + replanCount alongside node mutations + swarm_replans row
       transitionSwarmRun(this.store, liveRun.id, liveRun.status, {
         expectedPlanVersion: currentPlanVersion,
         expectedReplanCount: currentReplanCount,
+        leaseGuard,
         patch: {
           planVersion: nextVersion,
           replanCount: nextReplanCount,
@@ -486,38 +554,46 @@ export class DynamicReplanner {
     if (!outcome.replanned) return outcome;
 
     if (outcome.updatedNode && outcome.sessionId && this.eventRouter) {
-      this.eventRouter.emitPersisted({
-        sessionId: outcome.sessionId,
-        turnId: outcome.rootTurnId,
-        type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
-        data: {
-          runId: run.id,
-          nodeId: outcome.updatedNode.id,
-          nodeKey: outcome.updatedNode.nodeKey,
-          status: outcome.updatedNode.status,
-          childSessionId: outcome.updatedNode.childSessionId || undefined,
-          errorCode: outcome.updatedNode.errorCode || undefined,
-        },
-        audit: false,
-      });
+      try {
+        this.eventRouter.emitPersisted({
+          sessionId: outcome.sessionId,
+          turnId: outcome.rootTurnId,
+          type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
+          data: {
+            runId: run.id,
+            nodeId: outcome.updatedNode.id,
+            nodeKey: outcome.updatedNode.nodeKey,
+            status: outcome.updatedNode.status,
+            childSessionId: outcome.updatedNode.childSessionId || undefined,
+            errorCode: outcome.updatedNode.errorCode || undefined,
+          },
+          audit: false,
+        });
+      } catch {
+        // best-effort event emission after committed replan
+      }
     }
 
-    this.eventRouter?.emitPersisted({
-      sessionId: outcome.sessionId,
-      turnId: outcome.rootTurnId,
-      type: RUNTIME_EVENTS.SWARM_REPLANNED,
-      data: {
-        replanId: outcome.replanId,
-        runId: run.id,
-        version: outcome.version,
-        replanCount: outcome.replanCount,
-        failedNodeKey: failedNode.nodeKey,
-        strategy: outcome.strategy,
-        reason: outcome.reason,
-        diff: outcome.diff,
-      },
-      audit: true,
-    });
+    try {
+      this.eventRouter?.emitPersisted({
+        sessionId: outcome.sessionId,
+        turnId: outcome.rootTurnId,
+        type: RUNTIME_EVENTS.SWARM_REPLANNED,
+        data: {
+          replanId: outcome.replanId,
+          runId: run.id,
+          version: outcome.version,
+          replanCount: outcome.replanCount,
+          failedNodeKey: failedNode.nodeKey,
+          strategy: outcome.strategy,
+          reason: outcome.reason,
+          diff: outcome.diff,
+        },
+        audit: true,
+      });
+    } catch {
+      // best-effort event emission after committed replan
+    }
 
     return {
       replanned: true,

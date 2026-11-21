@@ -1,3 +1,7 @@
+import { resolve } from 'node:path';
+import { intersectPolicies } from '../tools/policy.js';
+import { classifyTrafficSource } from '../observability/trace.js';
+
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
   try {
@@ -5,6 +9,13 @@ function parseJsonSafe(str, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function sameWorkspacePath(a, b) {
+  if (!a || !b) return false;
+  const ra = resolve(String(a));
+  const rb = resolve(String(b));
+  return process.platform === 'win32' ? ra.toLowerCase() === rb.toLowerCase() : ra === rb;
 }
 
 export function registerSwarmRoutes(app, { store, directAgent }) {
@@ -37,6 +48,21 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
         error: { code: 'EMPTY_GOAL', message: 'Swarm goal is required', status: 400 },
       });
     }
+    const maxConcurrency =
+      body.maxConcurrency !== undefined ? Number(body.maxConcurrency) : 3;
+    const maxReplans =
+      body.maxReplans !== undefined ? Number(body.maxReplans) : 2;
+    if (!Number.isFinite(maxConcurrency) || maxConcurrency < 1 || !Number.isFinite(maxReplans) || maxReplans < 0) {
+      return reply.code(400).send({
+        error: {
+          code: 'INVALID_SWARM_CONFIG',
+          message: 'maxConcurrency must be a finite number >= 1 and maxReplans must be >= 0',
+          status: 400,
+        },
+      });
+    }
+
+    const traffic = classifyTrafficSource(req.headers);
     const session = body.sessionId
       ? directAgent.getSession(String(body.sessionId))
       : directAgent.createSession({
@@ -45,15 +71,39 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
           permissionMode: body.permissionMode ?? 'auto-safe',
         });
 
+    if (
+      body.sessionId &&
+      body.workspaceRoot &&
+      session.workspaceRoot &&
+      !sameWorkspacePath(body.workspaceRoot, session.workspaceRoot)
+    ) {
+      return reply.code(403).send({
+        error: {
+          code: 'WORKSPACE_MISMATCH',
+          message: 'Requested workspaceRoot does not match session workspaceRoot',
+          status: 403,
+        },
+      });
+    }
+
+    const effectivePermissionMode = body.permissionMode
+      ? intersectPolicies(
+          { permissionMode: session.permissionMode || 'auto-safe' },
+          { permissionMode: String(body.permissionMode) },
+        ).permissionMode
+      : session.permissionMode || 'auto-safe';
+
     const opts = {
       sessionId: session.id,
       goal,
-      workspaceRoot: body.workspaceRoot || session.workspaceRoot || directAgent.getWorkspaceRoot(),
-      parentPermissionMode: body.permissionMode || session.permissionMode || 'auto-safe',
-      maxConcurrency: Number(body.maxConcurrency ?? 3),
+      workspaceRoot: session.workspaceRoot || body.workspaceRoot || directAgent.getWorkspaceRoot(),
+      parentPermissionMode: effectivePermissionMode,
+      maxConcurrency,
       budget: body.budget ?? {},
       nodes: Array.isArray(body.nodes) ? body.nodes : null,
-      maxReplans: body.maxReplans !== undefined ? Number(body.maxReplans) : 2,
+      maxReplans,
+      trafficSource: traffic.trafficSource,
+      isSynthetic: traffic.isSynthetic ? 1 : 0,
     };
 
     if (body.wait === true || req.query?.wait === 'true') {
@@ -176,9 +226,30 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
       });
     }
     const body = req.body ?? {};
+    const run = directAgent?.swarmOrchestrator?.getRun?.(req.params.id) ?? null;
+    const expectedRoot = art.workspaceRoot || run?.workspaceRoot || null;
+    if (body.workspaceRoot && expectedRoot && !sameWorkspacePath(body.workspaceRoot, expectedRoot)) {
+      return reply.code(403).send({
+        error: {
+          code: 'WORKSPACE_MISMATCH',
+          message: 'Requested workspaceRoot does not match artifact workspaceRoot',
+          status: 403,
+        },
+      });
+    }
+    const effectivePermissionMode =
+      run?.permissionMode && body.permissionMode
+        ? intersectPolicies(
+            { permissionMode: run.permissionMode },
+            { permissionMode: String(body.permissionMode) },
+          ).permissionMode
+        : body.permissionMode
+          ? String(body.permissionMode)
+          : run?.permissionMode ?? null;
+
     const result = mgr.applyToParent(art.id, {
-      workspaceRoot: body.workspaceRoot ? String(body.workspaceRoot) : null,
-      permissionMode: body.permissionMode ? String(body.permissionMode) : null,
+      workspaceRoot: expectedRoot || (body.workspaceRoot ? String(body.workspaceRoot) : null),
+      permissionMode: effectivePermissionMode,
       approved: Boolean(body.approved),
       dryRun: Boolean(body.dryRun),
     });

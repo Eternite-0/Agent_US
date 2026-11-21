@@ -1,6 +1,8 @@
 import { Fault, id as uuid } from '../store.js';
-import { sha256Hex } from '../integrity.js';
+import { canonicalJson, sha256Hex } from '../integrity.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
+import { convergeScheduledRunForTurn } from '../governance/scheduler.js';
+import { assertLeaseInTx, isLeaseLostError } from './lease-guard.js';
 
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
@@ -8,6 +10,15 @@ function parseJsonSafe(str, fallback) {
     return JSON.parse(str);
   } catch {
     return fallback;
+  }
+}
+
+function safeEmit(eventRouter, payload) {
+  if (!eventRouter) return;
+  try {
+    eventRouter.emitPersisted(payload);
+  } catch {
+    // Isolate SSE/event listener failures from durable DB commits
   }
 }
 
@@ -20,6 +31,14 @@ export class UnknownOutcomeReconciler {
     this.store = store;
     this.eventRouter = eventRouter;
     this.resolvedListeners = [];
+  }
+
+  #dbOpen() {
+    try {
+      return Boolean(this.store?.db?.isOpen);
+    } catch {
+      return false;
+    }
   }
 
   onResolved(fn) {
@@ -42,10 +61,15 @@ export class UnknownOutcomeReconciler {
     permitEffectId = null,
     approvedArgsDigest = null,
     hookDigest = null,
+    leaseGuard = null,
   }) {
+    if (!this.#dbOpen()) return null;
     const now = Date.now();
-    const argsDigest = sha256Hex(JSON.stringify(args ?? {}));
+    const argsDigest = sha256Hex(
+      canonicalJson({ tool: String(toolName || ''), args: args ?? {} }),
+    );
     this.store.tx(() => {
+      assertLeaseInTx(leaseGuard, { sessionId, turnId, runId: taskId });
       this.store.db
         .prepare(
           `INSERT INTO tool_receipts(
@@ -95,24 +119,62 @@ export class UnknownOutcomeReconciler {
 
   recordReceiptFinish(
     receiptId,
-    { status = 'finished', output = '', exitCode = null, durationMs = 0, errorCode = null } = {},
+    {
+      status = 'finished',
+      output = '',
+      exitCode = null,
+      durationMs = 0,
+      errorCode = null,
+      leaseGuard = null,
+    } = {},
   ) {
-    if (!receiptId || !this.store?.db) return null;
+    if (!receiptId || !this.#dbOpen()) return null;
     const now = Date.now();
     const outputDigest = output ? sha256Hex(String(output)) : null;
     this.store.tx(() => {
+      const existing = this.store.db
+        .prepare('SELECT * FROM tool_receipts WHERE id=?')
+        .get(receiptId);
+      if (!existing || existing.status !== 'executing') {
+        // Never overwrite outcome_unknown, reconciled_*, or already-finished receipts
+        return;
+      }
+
+      let effectiveStatus = status;
+      let effectiveErrorCode = errorCode;
+
+      if (leaseGuard) {
+        try {
+          assertLeaseInTx(leaseGuard, {
+            sessionId: existing.sessionId,
+            turnId: existing.turnId,
+            runId: existing.taskId,
+          });
+        } catch (err) {
+          if (!isLeaseLostError(err)) throw err;
+          // Lease lost mid-tool: never record 'finished'; preserve unknown outcome for non-replayable/outward tools
+          if (!existing.replayable || existing.outward) {
+            effectiveStatus = 'outcome_unknown';
+            effectiveErrorCode = errorCode || 'LEASE_LOST_UNKNOWN_OUTCOME';
+          } else {
+            effectiveStatus = 'interrupted_replayable';
+            effectiveErrorCode = errorCode || 'LEASE_LOST';
+          }
+        }
+      }
+
       this.store.db
         .prepare(
           `UPDATE tool_receipts
            SET status=?, outputDigest=?, exitCode=?, durationMs=?, errorCode=?, updatedAt=?
-           WHERE id=?`,
+           WHERE id=? AND status='executing'`,
         )
         .run(
-          status,
+          effectiveStatus,
           outputDigest,
           exitCode !== undefined && exitCode !== null ? Number(exitCode) : null,
           Math.max(0, Number(durationMs || 0)),
-          errorCode,
+          effectiveErrorCode,
           now,
           receiptId,
         );
@@ -121,10 +183,12 @@ export class UnknownOutcomeReconciler {
   }
 
   getReceipt(receiptId) {
+    if (!this.#dbOpen() || !receiptId) return null;
     return this.store.db.prepare('SELECT * FROM tool_receipts WHERE id=?').get(receiptId) ?? null;
   }
 
   listReceipts({ sessionId = null, turnId = null, status = null, limit = 200 } = {}) {
+    if (!this.#dbOpen()) return [];
     const where = [];
     const params = [];
     if (sessionId) {
@@ -151,13 +215,8 @@ export class UnknownOutcomeReconciler {
    * transition to `outcome_unknown` and create a durable reconciliation request.
    */
   inspectInterruptedTurn(turnId, { sessionId = null } = {}) {
-    const rows = this.store.db
-      .prepare(
-        "SELECT * FROM tool_receipts WHERE turnId=? AND status IN ('executing','outcome_unknown') ORDER BY createdAt ASC",
-      )
-      .all(turnId);
-    if (!rows.length) {
-      return { needsReconciliation: false, unknownReceipts: [] };
+    if (!this.#dbOpen() || !turnId) {
+      return { needsReconciliation: false, approvalId: null, unknownReceipts: [] };
     }
 
     const now = Date.now();
@@ -166,21 +225,28 @@ export class UnknownOutcomeReconciler {
     let newlyCreatedApproval = false;
 
     this.store.tx(() => {
+      const rows = this.store.db
+        .prepare(
+          "SELECT * FROM tool_receipts WHERE turnId=? AND status IN ('executing','outcome_unknown') ORDER BY createdAt ASC, rowid ASC",
+        )
+        .all(turnId);
+      if (!rows.length) return;
+
       for (const r of rows) {
         if (r.status === 'outcome_unknown') {
           unknown.push(r);
           continue;
         }
-        if (r.replayable) {
+        if (r.replayable && !r.outward) {
           this.store.db
             .prepare(
-              "UPDATE tool_receipts SET status='interrupted_replayable', updatedAt=? WHERE id=?",
+              "UPDATE tool_receipts SET status='interrupted_replayable', updatedAt=? WHERE id=? AND status='executing'",
             )
             .run(now, r.id);
         } else {
           this.store.db
             .prepare(
-              "UPDATE tool_receipts SET status='outcome_unknown', updatedAt=? WHERE id=?",
+              "UPDATE tool_receipts SET status='outcome_unknown', updatedAt=? WHERE id=? AND status='executing'",
             )
             .run(now, r.id);
           unknown.push(r);
@@ -192,11 +258,24 @@ export class UnknownOutcomeReconciler {
         const sid = sessionId || first.sessionId;
         const existingPending = this.store.db
           .prepare(
-            "SELECT id FROM direct_approvals WHERE turnId=? AND kind='reconciliation' AND status='pending' LIMIT 1",
+            "SELECT id, arguments FROM direct_approvals WHERE turnId=? AND kind='reconciliation' AND status='pending' LIMIT 1",
           )
           .get(turnId);
         if (existingPending) {
           approvalId = existingPending.id;
+          // Ensure newly discovered unknown receipts are merged into existing pending reconciliation
+          const prevArgs = parseJsonSafe(existingPending.arguments, {});
+          const mergedIds = [
+            ...new Set([
+              ...(Array.isArray(prevArgs.unknownReceiptIds) ? prevArgs.unknownReceiptIds : []),
+              ...unknown.map((u) => u.id),
+            ]),
+          ];
+          if (mergedIds.length !== (prevArgs.unknownReceiptIds?.length ?? 0)) {
+            this.store.db
+              .prepare('UPDATE direct_approvals SET arguments=? WHERE id=?')
+              .run(JSON.stringify({ ...prevArgs, unknownReceiptIds: mergedIds }), approvalId);
+          }
         } else {
           approvalId = uuid();
           newlyCreatedApproval = true;
@@ -231,11 +310,15 @@ export class UnknownOutcomeReconciler {
         }
 
         this.store.db
-          .prepare("UPDATE direct_turns SET state='reconciling', phase='reconciling' WHERE id=? AND state IN ('running','reconciling')")
+          .prepare(
+            "UPDATE direct_turns SET state='reconciling', phase='reconciling', activeFence=NULL WHERE id=? AND state IN ('running','reconciling')",
+          )
           .run(turnId);
         if (sid) {
           this.store.db
-            .prepare("UPDATE direct_sessions SET state='reconciling', updatedAt=? WHERE id=? AND state IN ('running','reconciling')")
+            .prepare(
+              "UPDATE direct_sessions SET state='reconciling', updatedAt=? WHERE id=? AND state IN ('running','reconciling')",
+            )
             .run(now, sid);
         }
         this.store.db
@@ -246,10 +329,10 @@ export class UnknownOutcomeReconciler {
       }
     });
 
-    if (unknown.length > 0 && newlyCreatedApproval && this.eventRouter) {
+    if (unknown.length > 0 && newlyCreatedApproval) {
       const first = unknown[0];
       const sid = sessionId || first.sessionId;
-      this.eventRouter.emitPersisted({
+      safeEmit(this.eventRouter, {
         sessionId: sid,
         turnId,
         type: RUNTIME_EVENTS.RECONCILIATION_REQUIRED,
@@ -276,28 +359,37 @@ export class UnknownOutcomeReconciler {
    * `outcome_unknown` receipts (e.g. when `block_reconciliation` parks a turn).
    */
   ensurePendingReconciliationForSession(sessionId, { turnId = null } = {}) {
-    if (!sessionId || !this.store?.db?.isOpen) return { approvalId: null, unknownReceipts: [] };
-    const unknown = this.store.db
-      .prepare(
-        "SELECT * FROM tool_receipts WHERE sessionId=? AND status='outcome_unknown' ORDER BY createdAt ASC",
-      )
-      .all(sessionId);
-    if (!unknown.length) return { approvalId: null, unknownReceipts: [] };
+    if (!sessionId || !this.#dbOpen()) return { approvalId: null, unknownReceipts: [] };
 
-    const existingPending = this.store.db
-      .prepare(
-        "SELECT id FROM direct_approvals WHERE sessionId=? AND kind='reconciliation' AND status='pending' LIMIT 1",
-      )
-      .get(sessionId);
-    if (existingPending) {
-      return { approvalId: existingPending.id, unknownReceipts: unknown };
-    }
-
-    const first = unknown[0];
-    const approvalId = uuid();
     const now = Date.now();
-    const targetTurnId = turnId || first.turnId || null;
-    this.store.tx(() => {
+    const txOut = this.store.tx(() => {
+      const unknown = this.store.db
+        .prepare(
+          "SELECT * FROM tool_receipts WHERE sessionId=? AND status='outcome_unknown' ORDER BY createdAt ASC, rowid ASC",
+        )
+        .all(sessionId);
+      if (!unknown.length) {
+        return { approvalId: null, unknownReceipts: [], newlyCreated: false, first: null, targetTurnId: null };
+      }
+
+      const existingPending = this.store.db
+        .prepare(
+          "SELECT id FROM direct_approvals WHERE sessionId=? AND kind='reconciliation' AND status='pending' LIMIT 1",
+        )
+        .get(sessionId);
+      if (existingPending) {
+        return {
+          approvalId: existingPending.id,
+          unknownReceipts: unknown,
+          newlyCreated: false,
+          first: unknown[0],
+          targetTurnId: turnId || unknown[0].turnId || null,
+        };
+      }
+
+      const first = unknown[0];
+      const approvalId = uuid();
+      const targetTurnId = turnId || first.turnId || null;
       this.store.db
         .prepare(
           `INSERT INTO direct_approvals(
@@ -325,27 +417,29 @@ export class UnknownOutcomeReconciler {
           now + 86_400_000,
           now,
         );
+      return { approvalId, unknownReceipts: unknown, newlyCreated: true, first, targetTurnId };
     });
 
-    if (this.eventRouter) {
-      this.eventRouter.emitPersisted({
+    if (txOut.newlyCreated && txOut.first) {
+      safeEmit(this.eventRouter, {
         sessionId,
-        turnId: targetTurnId,
+        turnId: txOut.targetTurnId,
         type: RUNTIME_EVENTS.RECONCILIATION_REQUIRED,
         data: {
-          approvalId,
-          receiptId: first.id,
-          unknownReceiptIds: unknown.map((u) => u.id),
-          tool: first.toolName,
-          callId: first.callId,
+          approvalId: txOut.approvalId,
+          receiptId: txOut.first.id,
+          unknownReceiptIds: txOut.unknownReceipts.map((u) => u.id),
+          tool: txOut.first.toolName,
+          callId: txOut.first.callId,
         },
         audit: true,
       });
     }
-    return { approvalId, unknownReceipts: unknown };
+    return { approvalId: txOut.approvalId, unknownReceipts: txOut.unknownReceipts };
   }
 
   listReconciliations({ sessionId = null, status = null, limit = 100 } = {}) {
+    if (!this.#dbOpen()) return [];
     const where = ["kind='reconciliation'"];
     const params = [];
     if (sessionId) {
@@ -383,7 +477,7 @@ export class UnknownOutcomeReconciler {
       });
     }
 
-    const result = this.store.tx(() => {
+    const { result, turnAborted } = this.store.tx(() => {
       const row = this.store.db
         .prepare("SELECT * FROM direct_approvals WHERE id=? AND kind='reconciliation'")
         .get(approvalId);
@@ -392,11 +486,12 @@ export class UnknownOutcomeReconciler {
 
       const now = Date.now();
       const args = parseJsonSafe(row.arguments, {});
-      const receiptIds = Array.isArray(args.unknownReceiptIds) && args.unknownReceiptIds.length
-        ? args.unknownReceiptIds
-        : row.receiptId
-          ? [row.receiptId]
-          : [];
+      const receiptIds =
+        Array.isArray(args.unknownReceiptIds) && args.unknownReceiptIds.length
+          ? [...new Set(args.unknownReceiptIds)]
+          : row.receiptId
+            ? [row.receiptId]
+            : [];
 
       const nextReceiptStatus =
         normalizedOutcome === 'happened'
@@ -405,7 +500,12 @@ export class UnknownOutcomeReconciler {
             ? 'reconciled_not_applied'
             : 'reconciled_aborted';
 
+      const receiptRows = [];
       for (const rid of receiptIds) {
+        const recRow = this.store.db
+          .prepare('SELECT id, callId, toolName, turnId, sessionId FROM tool_receipts WHERE id=?')
+          .get(rid);
+        if (recRow) receiptRows.push(recRow);
         this.store.db
           .prepare(
             `UPDATE tool_receipts
@@ -422,65 +522,111 @@ export class UnknownOutcomeReconciler {
         )
         .run(approvalStatus, normalizedOutcome, note || null, now, approvalId);
 
+      let abortedTurnFlag = false;
       if (normalizedOutcome === 'abort') {
         if (row.turnId) {
-          this.store.db
+          const tRes = this.store.db
             .prepare(
-              "UPDATE direct_turns SET state='failed', phase='failed', error='RECONCILIATION_ABORTED', finishedAt=? WHERE id=?",
+              `UPDATE direct_turns
+               SET state='failed', phase='failed', error='RECONCILIATION_ABORTED',
+                   finishedAt=COALESCE(finishedAt, ?), activeFence=NULL
+               WHERE id=? AND state NOT IN ('completed','failed','cancelled')`,
             )
             .run(now, row.turnId);
+          abortedTurnFlag = (tRes.changes ?? 0) > 0;
           this.store.db
             .prepare(
-              "UPDATE runtime_jobs SET status='failed', fence=NULL, leaseExpiresAt=NULL, errorCode='RECONCILIATION_ABORTED', updatedAt=? WHERE turnId=?",
+              `UPDATE runtime_jobs
+               SET status='failed', fence=NULL, leaseExpiresAt=NULL,
+                   errorCode='RECONCILIATION_ABORTED', updatedAt=?
+               WHERE turnId=? AND status IN ('pending','active','reconciling','parked')`,
             )
             .run(now, row.turnId);
+          convergeScheduledRunForTurn(this.store, row.turnId, {
+            status: 'failed',
+            error: 'RECONCILIATION_ABORTED',
+            finishedAt: now,
+          });
         }
         this.store.db
-          .prepare("UPDATE direct_sessions SET state='failed', updatedAt=? WHERE id=?")
+          .prepare(
+            "UPDATE direct_sessions SET state='failed', updatedAt=? WHERE id=? AND state NOT IN ('completed','cancelled')",
+          )
           .run(now, row.sessionId);
       } else {
-        const messageText =
+        const formatNote = (toolName, callId) =>
           normalizedOutcome === 'happened'
-            ? `[系统核对结论] 工具 ${row.tool} (${row.callId || 'unknown'}) 已由人工确认在崩溃前已实际执行生效${note ? ` (${note})` : ''}。请勿重复执行同一副作用，基于当前状态继续后续步骤。`
-            : `[系统核对结论] 工具 ${row.tool} (${row.callId || 'unknown'}) 已由人工确认未生效${note ? ` (${note})` : ''}。请先检查当前工作区状态再决定是否重新执行。`;
+            ? `[系统核对结论] 工具 ${toolName} (${callId || 'unknown'}) 已由人工确认在崩溃前已实际执行生效${note ? ` (${note})` : ''}。请勿重复执行同一副作用，基于当前状态继续后续步骤。`
+            : `[系统核对结论] 工具 ${toolName} (${callId || 'unknown'}) 已由人工确认未生效${note ? ` (${note})` : ''}。请先检查当前工作区状态再决定是否重新执行。`;
 
-        // Preserve strict assistant(tool_call) -> tool(tool_result) adjacency if callId exists in direct_messages
-        let hasUnansweredToolCall = false;
-        if (row.turnId && row.callId) {
-          const hasResult = this.store.db
+        // Preserve strict assistant(tool_call) -> tool(tool_result) adjacency for EVERY unanswered callId
+        let insertedToolMsgs = 0;
+        if (row.turnId) {
+          const assistantMsgs = this.store.db
             .prepare(
-              "SELECT 1 FROM direct_messages WHERE sessionId=? AND turnId=? AND role='tool' AND toolCallId=? LIMIT 1",
+              "SELECT toolCalls FROM direct_messages WHERE sessionId=? AND turnId=? AND role='assistant' AND toolCalls IS NOT NULL",
             )
-            .get(row.sessionId, row.turnId, row.callId);
-          if (!hasResult) {
-            const assistantMsgs = this.store.db
+            .all(row.sessionId, row.turnId);
+          const allAssistantToolCalls = new Map();
+          for (const m of assistantMsgs) {
+            for (const tc of parseJsonSafe(m.toolCalls, [])) {
+              if (tc?.id) allAssistantToolCalls.set(tc.id, tc);
+            }
+          }
+
+          const existingToolResultIds = new Set(
+            this.store.db
               .prepare(
-                "SELECT toolCalls FROM direct_messages WHERE sessionId=? AND turnId=? AND role='assistant' AND toolCalls IS NOT NULL",
+                "SELECT toolCallId FROM direct_messages WHERE sessionId=? AND turnId=? AND role='tool' AND toolCallId IS NOT NULL",
               )
-              .all(row.sessionId, row.turnId);
-            hasUnansweredToolCall = assistantMsgs.some((m) =>
-              parseJsonSafe(m.toolCalls, []).some((tc) => tc.id === row.callId),
-            );
+              .all(row.sessionId, row.turnId)
+              .map((r) => r.toolCallId),
+          );
+
+          const candidateCalls = [];
+          const seenCallIds = new Set();
+          for (const rec of receiptRows) {
+            if (rec.callId && !seenCallIds.has(rec.callId)) {
+              seenCallIds.add(rec.callId);
+              candidateCalls.push({ callId: rec.callId, toolName: rec.toolName || row.tool });
+            }
+          }
+          if (row.callId && !seenCallIds.has(row.callId)) {
+            seenCallIds.add(row.callId);
+            candidateCalls.push({ callId: row.callId, toolName: row.tool });
+          }
+          // Also answer any remaining unanswered assistant toolCalls in this turn so provider API never 400s
+          for (const [cid, tc] of allAssistantToolCalls.entries()) {
+            if (!seenCallIds.has(cid) && !existingToolResultIds.has(cid)) {
+              seenCallIds.add(cid);
+              candidateCalls.push({ callId: cid, toolName: tc.name || row.tool });
+            }
+          }
+
+          for (const cand of candidateCalls) {
+            if (allAssistantToolCalls.has(cand.callId) && !existingToolResultIds.has(cand.callId)) {
+              this.store.db
+                .prepare(
+                  `INSERT INTO direct_messages(
+                    sessionId, turnId, role, content, toolCallId, toolName, meta, createdAt
+                  ) VALUES(?,?,'tool',?,?,?,?,?)`,
+                )
+                .run(
+                  row.sessionId,
+                  row.turnId,
+                  formatNote(cand.toolName, cand.callId),
+                  cand.callId,
+                  cand.toolName,
+                  JSON.stringify({ reconciled: true, outcome: normalizedOutcome }),
+                  now,
+                );
+              existingToolResultIds.add(cand.callId);
+              insertedToolMsgs++;
+            }
           }
         }
 
-        if (hasUnansweredToolCall) {
-          this.store.db
-            .prepare(
-              `INSERT INTO direct_messages(
-                sessionId, turnId, role, content, toolCallId, toolName, meta, createdAt
-              ) VALUES(?,?,'tool',?,?,?,?,?)`,
-            )
-            .run(
-              row.sessionId,
-              row.turnId,
-              messageText,
-              row.callId,
-              row.tool,
-              JSON.stringify({ reconciled: true, outcome: normalizedOutcome }),
-              now,
-            );
-        } else {
+        if (insertedToolMsgs === 0) {
           this.store.db
             .prepare(
               `INSERT INTO direct_messages(
@@ -490,7 +636,7 @@ export class UnknownOutcomeReconciler {
             .run(
               row.sessionId,
               row.turnId ?? null,
-              messageText,
+              formatNote(row.tool, row.callId),
               JSON.stringify({ reconciled: true, outcome: normalizedOutcome }),
               now,
             );
@@ -502,9 +648,10 @@ export class UnknownOutcomeReconciler {
               "UPDATE direct_turns SET state='running', phase='checkpoint' WHERE id=? AND state='reconciling'",
             )
             .run(row.turnId);
+          // Narrow unpark strictly to 'reconciling' jobs so APPROVAL_PARKED jobs are never unparked prematurely
           this.store.db
             .prepare(
-              "UPDATE runtime_jobs SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE turnId=? AND status IN ('reconciling','parked')",
+              "UPDATE runtime_jobs SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE turnId=? AND status='reconciling'",
             )
             .run(now, row.turnId);
         }
@@ -522,7 +669,7 @@ export class UnknownOutcomeReconciler {
             .run(row.sessionId);
           this.store.db
             .prepare(
-              "UPDATE runtime_jobs SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE sessionId=? AND status IN ('reconciling','parked')",
+              "UPDATE runtime_jobs SET status='pending', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE sessionId=? AND status='reconciling'",
             )
             .run(now, row.sessionId);
         }
@@ -534,26 +681,41 @@ export class UnknownOutcomeReconciler {
       }
 
       return {
-        id: approvalId,
-        sessionId: row.sessionId,
-        turnId: row.turnId,
-        callId: row.callId,
-        tool: row.tool,
-        kind: 'reconciliation',
-        status: approvalStatus,
-        outcome: normalizedOutcome,
-        reason: note || null,
-        resolvedAt: now,
-        receiptIds,
+        turnAborted: abortedTurnFlag,
+        result: {
+          id: approvalId,
+          sessionId: row.sessionId,
+          turnId: row.turnId,
+          callId: row.callId,
+          tool: row.tool,
+          kind: 'reconciliation',
+          status: approvalStatus,
+          outcome: normalizedOutcome,
+          reason: note || null,
+          resolvedAt: now,
+          receiptIds,
+        },
       };
     });
 
-    if (this.eventRouter) {
-      this.eventRouter.emitPersisted({
+    safeEmit(this.eventRouter, {
+      sessionId: result.sessionId,
+      turnId: result.turnId,
+      type: RUNTIME_EVENTS.RECONCILIATION_RESOLVED,
+      data: result,
+      audit: true,
+    });
+    if (normalizedOutcome === 'abort' && turnAborted && result.turnId) {
+      safeEmit(this.eventRouter, {
         sessionId: result.sessionId,
         turnId: result.turnId,
-        type: RUNTIME_EVENTS.RECONCILIATION_RESOLVED,
-        data: result,
+        type: RUNTIME_EVENTS.TURN_FAILED,
+        data: {
+          turnId: result.turnId,
+          sessionId: result.sessionId,
+          code: 'RECONCILIATION_ABORTED',
+          error: result.reason || 'RECONCILIATION_ABORTED',
+        },
         audit: true,
       });
     }

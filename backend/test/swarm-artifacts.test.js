@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -351,6 +353,7 @@ test('Fix C3/C7: artifacts capture tracked edit, untracked add, deletion, rename
     'obsolete.txt': 'remove me\n',
     'before-rename.txt': 'movable content line 1\nmovable content line 2\n',
     'run.sh': '#!/bin/sh\necho hi\n',
+    'disk-exec.sh': '#!/bin/sh\necho disk\n',
   });
 
   const store = new Store(join(dir, 'engine.sqlite'));
@@ -381,7 +384,11 @@ test('Fix C3/C7: artifacts capture tracked edit, untracked add, deletion, rename
     rmSync(join(wt.path, 'before-rename.txt'));
     const binaryPayload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0x42]);
     writeFileSync(join(wt.path, 'icon.bin'), binaryPayload);
+    // Test BOTH explicit git index chmod (+x) AND (on POSIX) real disk chmodSync(0o755)
     execFileSync('git', ['update-index', '--chmod=+x', 'run.sh'], { cwd: wt.path });
+    if (process.platform !== 'win32') {
+      chmodSync(join(wt.path, 'disk-exec.sh'), 0o755);
+    }
 
     const artifact = await direct.artifactManager.archiveWorktree({
       runId: 'run-types-1',
@@ -408,9 +415,13 @@ test('Fix C3/C7: artifacts capture tracked edit, untracked add, deletion, rename
     assert.equal(byPath.get('icon.bin')?.binary, true);
     assert.equal(byPath.get('icon.bin')?.sha256, sha256Buf(binaryPayload));
     assert.equal(byPath.get('run.sh')?.mode, '100755');
+    if (process.platform !== 'win32') {
+      assert.equal(byPath.get('disk-exec.sh')?.mode, '100755');
+    }
 
-    // Parent is still untouched before explicit apply
+    // Parent is still untouched before explicit apply (simulate CRLF checkout on parent tracked.txt to ensure no false conflict!)
     assert.equal(readFileSync(join(workDir, 'tracked.txt'), 'utf8'), 'original line\n');
+    writeFileSync(join(workDir, 'tracked.txt'), 'original line\r\n', 'utf8');
     assert.equal(existsSync(join(workDir, 'obsolete.txt')), true);
     assert.equal(existsSync(join(workDir, 'icon.bin')), false);
 
@@ -427,6 +438,10 @@ test('Fix C3/C7: artifacts capture tracked edit, untracked add, deletion, rename
     assert.equal(existsSync(join(workDir, 'before-rename.txt')), false);
     assert.equal(existsSync(join(workDir, 'after-rename.txt')), true);
     assert.deepEqual(readFileSync(join(workDir, 'icon.bin')), binaryPayload);
+    if (process.platform !== 'win32') {
+      assert.ok((statSync(join(workDir, 'run.sh')).mode & 0o111) !== 0);
+      assert.ok((statSync(join(workDir, 'disk-exec.sh')).mode & 0o111) !== 0);
+    }
   } finally {
     await direct.close();
     store.close();

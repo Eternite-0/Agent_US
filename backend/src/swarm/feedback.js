@@ -26,6 +26,8 @@ export class ModelFeedbackTracker {
     outputTokens = 0,
     contextWindow = 128_000,
     recovered = false,
+    trafficSource = 'production',
+    isSynthetic = 0,
   }) {
     if (!model || !this.store?.db?.isOpen) return null;
     const now = Date.now();
@@ -58,8 +60,8 @@ export class ModelFeedbackTracker {
           `INSERT INTO model_feedback(
             model, provider, taskType, success, toolTotal, toolSuccess, verifiedPass,
             latencyMs, timedOut, inputTokens, outputTokens, contextWindow, recovered,
-            verificationStatus, failureKind, cancelled, createdAt
-          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            verificationStatus, failureKind, cancelled, trafficSource, isSynthetic, createdAt
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           String(model),
@@ -78,28 +80,31 @@ export class ModelFeedbackTracker {
           normVerStatus,
           normFailureKind,
           isCancelled ? 1 : 0,
+          String(trafficSource || 'production'),
+          isSynthetic ? 1 : 0,
           now,
         );
     });
     return true;
   }
 
-  getStats(model, { taskType = null, windowDays = 30 } = {}) {
+  getStats(model, { taskType = null, windowDays = 30, includeSynthetic = false } = {}) {
     if (!model || !this.store?.db?.isOpen) {
       return this.#emptyStats();
     }
     const cutoff = Date.now() - Math.max(1, Number(windowDays || 30)) * 86_400_000;
+    const synthClause = includeSynthetic ? '' : ' AND isSynthetic = 0';
     let rows = taskType
       ? this.store.db
           .prepare(
-            'SELECT * FROM model_feedback WHERE model=? AND taskType=? AND createdAt>=? ORDER BY createdAt DESC LIMIT 200',
+            `SELECT * FROM model_feedback WHERE model=? AND taskType=? AND createdAt>=?${synthClause} ORDER BY createdAt DESC LIMIT 200`,
           )
           .all(model, taskType, cutoff)
       : [];
     if (rows.length < 3) {
       rows = this.store.db
         .prepare(
-          'SELECT * FROM model_feedback WHERE model=? AND createdAt>=? ORDER BY createdAt DESC LIMIT 200',
+          `SELECT * FROM model_feedback WHERE model=? AND createdAt>=?${synthClause} ORDER BY createdAt DESC LIMIT 200`,
         )
         .all(model, cutoff);
     }
@@ -118,7 +123,8 @@ export class ModelFeedbackTracker {
     let sumTimedOut = 0;
     let sumTokens = 0;
     let sumCtxUtil = 0;
-    let sumRecovered = 0;
+    let sumRecoveredTotal = 0;
+    let sumRecoveredSucceeded = 0;
     let sumCancelled = 0;
     const failureBreakdown = {
       task_failure: 0,
@@ -136,6 +142,7 @@ export class ModelFeedbackTracker {
       } else {
         nonCancelledCount++;
         sumSuccess += Number(r.success || 0);
+        sumTimedOut += Number(r.timedOut || 0);
       }
 
       const tt = Number(r.toolTotal || 0);
@@ -156,11 +163,15 @@ export class ModelFeedbackTracker {
       }
 
       sumLatency += Number(r.latencyMs || 0);
-      sumTimedOut += Number(r.timedOut || 0);
       const tok = Number(r.inputTokens || 0) + Number(r.outputTokens || 0);
       sumTokens += tok;
       sumCtxUtil += Math.min(1, tok / Math.max(1, Number(r.contextWindow || 128_000)));
-      sumRecovered += Number(r.recovered || 0);
+      if (Number(r.recovered || 0) === 1 && !rowCancelled) {
+        sumRecoveredTotal++;
+        if (Number(r.success || 0) === 1) {
+          sumRecoveredSucceeded++;
+        }
+      }
 
       if (r.failureKind && Object.hasOwn(failureBreakdown, r.failureKind)) {
         failureBreakdown[r.failureKind]++;
@@ -174,7 +185,7 @@ export class ModelFeedbackTracker {
     const timeoutRate = nonCancelledCount > 0 ? sumTimedOut / nonCancelledCount : 0;
     const avgTokens = sumTokens / n;
     const contextUtilization = sumCtxUtil / n;
-    const recoveryRate = sumRecovered / n;
+    const recoveryRate = sumRecoveredTotal > 0 ? sumRecoveredSucceeded / sumRecoveredTotal : 0;
     const cancellationRate = sumCancelled / n;
     const confidence = Number((n / (n + CONFIDENCE_PRIOR_WEIGHT)).toFixed(4));
 
