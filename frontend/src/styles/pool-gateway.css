@@ -509,6 +509,18 @@
   margin-bottom: 10px;
 }
 
+.a2a-provider-login-group-head {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.a2a-provider-section-description {
+  margin-top: 4px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .a2a-provider-section-title {
   font-size: 13px;
   font-weight: 600;
@@ -580,6 +592,27 @@
 
 .a2a-provider-card-meta[data-has-accounts='true'] {
   color: var(--color-accent);
+}
+
+.a2a-provider-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.a2a-provider-mode-badge[data-mode='web'] {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.a2a-provider-mode-badge[data-mode='file'] {
+  background: color-mix(in srgb, var(--color-success, #16a34a) 11%, var(--bg-surface));
+  color: var(--color-success, #15803d);
 }
 
 .a2a-provider-card-arrow {

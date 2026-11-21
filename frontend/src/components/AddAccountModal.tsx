@@ -54,17 +54,47 @@ function findEditionGroup(presetId: string): EditionGroup | null {
   return EDITION_GROUPS.find((g) => g.options.some((o) => o.presetId === presetId)) ?? null;
 }
 
-const CATEGORY_ORDER = ['official', 'oauth', 'custom'];
-const CATEGORY_LABELS: Record<string, string> = {
-  official: '官方 API',
-  oauth: '网页登录 / 订阅',
-  custom: '本地 / 反代网关',
+
+type ProviderLoginGroupId = 'ready' | 'manual';
+
+const PROVIDER_LOGIN_GROUPS: Record<
+  ProviderLoginGroupId,
+  { label: string; description: string }
+> = {
+  ready: {
+    label: '可直接登录 / 导入',
+    description: '通过内置网页登录，或扫描本机凭证，完成后自动返回 Token 并加入账号池。',
+  },
+  manual: {
+    label: '需手动获取 Token / 配置网关',
+    description: '请从官方控制台、客户端或兼容网关获取 Token / API Key 与 Base URL。',
+  },
 };
 
 function defaultMethodForPreset(p: ProviderPreset): AddMethod {
+  if (p.loginMode) return p.loginMode;
   if (p.id === 'openrouter' || p.id === 'github-copilot') return 'web';
   if (p.id === 'claude-code' || p.id === 'openai-codex' || p.id === 'gemini-cli') return 'file';
   return 'manual';
+}
+
+function providerLoginMode(p: ProviderPreset): AddMethod {
+  return defaultMethodForPreset(p);
+}
+
+function providerLoginGroup(p: ProviderPreset): ProviderLoginGroupId {
+  return providerLoginMode(p) === 'manual' ? 'manual' : 'ready';
+}
+
+function providerLoginBadge(p: ProviderPreset): string {
+  switch (providerLoginMode(p)) {
+    case 'web':
+      return '一键网页登录';
+    case 'file':
+      return '一键导入本机凭证';
+    default:
+      return p.protocol === 'anthropic' ? '手动 Token / Anthropic 网关' : '手动 Token / 兼容网关';
+  }
 }
 
 export const AddAccountModal: React.FC<AddAccountModalProps> = ({
@@ -259,13 +289,23 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
   }, [allPresets, category, search]);
 
   const groupedPresets = useMemo(() => {
-    const groups: Array<{ id: string; label: string; items: ProviderPreset[] }> = [];
-    for (const catId of CATEGORY_ORDER) {
-      const items = filteredPresets.filter((p) => p.category === catId);
+    const groups: Array<{
+      id: ProviderLoginGroupId;
+      label: string;
+      description: string;
+      items: ProviderPreset[];
+    }> = [];
+    (['ready', 'manual'] as ProviderLoginGroupId[]).forEach((groupId) => {
+      const items = filteredPresets.filter((p) => providerLoginGroup(p) === groupId);
       if (items.length > 0) {
-        groups.push({ id: catId, label: CATEGORY_LABELS[catId] ?? catId, items });
+        groups.push({
+          id: groupId,
+          label: PROVIDER_LOGIN_GROUPS[groupId].label,
+          description: PROVIDER_LOGIN_GROUPS[groupId].description,
+          items,
+        });
       }
-    }
+    });
     return groups;
   }, [filteredPresets]);
 
@@ -521,25 +561,20 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
           ) : (
             groupedPresets.map((group) => (
               <section key={group.id}>
-                <div className="a2a-provider-section-head">
+                <div className="a2a-provider-section-head a2a-provider-login-group-head">
                   <div>
-                    <span className="a2a-provider-section-title">{group.label}</span>
-                    <span className="a2a-provider-section-count">{group.items.length} 项</span>
+                    <div>
+                      <span className="a2a-provider-section-title">{group.label}</span>
+                      <span className="a2a-provider-section-count">{group.items.length} 项</span>
+                    </div>
+                    <div className="a2a-provider-section-description">{group.description}</div>
                   </div>
                 </div>
                 <div className="a2a-provider-grid">
                   {group.items.map((p) => {
                     const existingCount = accountCountsByPreset.get(p.id) ?? 0;
-                    const badge =
-                      p.id === 'github-copilot'
-                        ? '原生设备码登录'
-                        : p.id === 'openrouter'
-                          ? '原生 OAuth / Key'
-                          : p.category === 'oauth'
-                            ? '本地凭证 / 直连'
-                            : p.protocol === 'anthropic'
-                              ? 'Anthropic 双向反代'
-                              : 'OpenAI 兼容直连';
+                    const loginMode = providerLoginMode(p);
+                    const badge = providerLoginBadge(p);
                     return (
                       <button
                         key={p.id}
@@ -560,7 +595,13 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                             className="a2a-provider-card-meta"
                             data-has-accounts={existingCount > 0 ? 'true' : undefined}
                           >
-                            {existingCount > 0 ? `${existingCount} 个账号 · ${badge}` : badge}
+                            {existingCount > 0 ? `${existingCount} 个账号 · ` : ''}
+                            <span
+                              className="a2a-provider-mode-badge"
+                              data-mode={loginMode}
+                            >
+                              {badge}
+                            </span>
                           </div>
                         </div>
                         <span className="a2a-provider-card-arrow">›</span>
@@ -648,17 +689,19 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                   >
                     API Key / 反代地址
                   </button>
-                  <button
-                    type="button"
-                    className="a2a-segment-btn"
-                    data-active={method === 'web' ? 'true' : undefined}
-                    onClick={() => {
-                      setError(null);
-                      setMethod('web');
-                    }}
-                  >
-                    {isNativeOAuth ? '网页登录 (原生 OAuth)' : '打开官网获取 Key'}
-                  </button>
+                  {(isNativeOAuth || selectedPreset.category !== 'custom' || selectedPreset.officialUrl) && (
+                    <button
+                      type="button"
+                      className="a2a-segment-btn"
+                      data-active={method === 'web' ? 'true' : undefined}
+                      onClick={() => {
+                        setError(null);
+                        setMethod('web');
+                      }}
+                    >
+                      {isNativeOAuth ? '网页登录 (原生 OAuth)' : '打开官网获取 Key'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="a2a-segment-btn"

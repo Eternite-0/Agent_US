@@ -37,6 +37,7 @@ const thirdPartyGateway = (
   supportsCheckin: false,
   fields: GATEWAY_FIELDS,
   accountCount: 0,
+  loginMode: 'manual',
 });
 
 /** Channels exposed by Agent2API Provider Enhancement, plus MagPie community channels. */
@@ -733,6 +734,8 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
       supportsCheckin: false,
       fields: OPENAI_FIELDS,
       accountCount: 0,
+      loginMode: 'web',
+      officialUrl: 'https://github.com/login/device',
     },
     'claude-code': {
       id: 'claude-code',
@@ -749,6 +752,8 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
       supportsCheckin: false,
       fields: OPENAI_FIELDS,
       accountCount: 0,
+      loginMode: 'file',
+      officialUrl: 'https://console.anthropic.com/settings/keys',
     },
     'openai-codex': {
       id: 'openai-codex',
@@ -765,6 +770,8 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
       supportsCheckin: false,
       fields: OPENAI_FIELDS,
       accountCount: 0,
+      loginMode: 'file',
+      officialUrl: 'https://platform.openai.com/api-keys',
     },
     'gemini-cli': {
       id: 'gemini-cli',
@@ -781,6 +788,8 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
       supportsCheckin: false,
       fields: OPENAI_FIELDS,
       accountCount: 0,
+      loginMode: 'file',
+      officialUrl: 'https://aistudio.google.com/app/apikey',
     },
     'opencode-go': {
       id: 'opencode-go',
@@ -895,6 +904,8 @@ export const BUILTIN_PROVIDER_PRESETS: ProviderPresetCatalog = {
       supportsCheckin: false,
       fields: OPENAI_FIELDS,
       accountCount: 0,
+      loginMode: 'web',
+      officialUrl: 'https://openrouter.ai/settings/keys',
     },
     siliconflow: {
       id: 'siliconflow',

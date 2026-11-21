@@ -283,6 +283,10 @@ export interface ProviderPreset {
   supportsBalance?: boolean;
   supportsCheckin?: boolean;
   accountCount?: number;
+  /** How the frontend can connect this provider without inventing unsupported OAuth flows. */
+  loginMode?: 'web' | 'file' | 'manual';
+  /** Optional stable URL shown when the user needs to obtain a key/token. */
+  officialUrl?: string;
   fields: ProviderPresetField[];
 }
 
