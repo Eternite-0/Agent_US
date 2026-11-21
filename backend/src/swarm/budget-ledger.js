@@ -731,7 +731,7 @@ export class TaskTreeBudgetLedger {
       if (
         res.fence !== null &&
         res.fence !== undefined &&
-        Number(boundJob.fence) !== Number(res.fence)
+        String(boundJob.fence ?? '') !== String(res.fence)
       ) {
         return false;
       }
@@ -761,7 +761,7 @@ export class TaskTreeBudgetLedger {
         res.fence !== undefined &&
         nodeRow.activeFence !== null &&
         nodeRow.activeFence !== undefined &&
-        Number(res.fence) !== Number(nodeRow.activeFence)
+        String(res.fence) !== String(nodeRow.activeFence)
       ) {
         return false;
       }
@@ -783,7 +783,7 @@ export class TaskTreeBudgetLedger {
         if (
           res.fence !== null &&
           res.fence !== undefined &&
-          Number(job.fence) !== Number(res.fence)
+          String(job.fence ?? '') !== String(res.fence)
         ) {
           continue;
         }
@@ -809,7 +809,7 @@ export class TaskTreeBudgetLedger {
         if (
           res.fence !== null &&
           res.fence !== undefined &&
-          Number(job.fence) !== Number(res.fence)
+          String(job.fence ?? '') !== String(res.fence)
         ) {
           continue;
         }

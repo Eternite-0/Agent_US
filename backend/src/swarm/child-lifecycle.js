@@ -56,6 +56,9 @@ export class ChildAgentManager {
     dataRoot = null,
     getWorkspaceTools,
     getDefaultModel,
+    getLivePolicy = null,
+    requestApproval = null,
+    approvalManager = null,
   }) {
     this.store = store;
     this.kernel = kernel;
@@ -69,6 +72,9 @@ export class ChildAgentManager {
     this.hookTrust = hookTrust;
     this.dataRoot = dataRoot;
     this.getWorkspaceTools = getWorkspaceTools;
+    this.getLivePolicy = getLivePolicy;
+    this.requestApproval = requestApproval;
+    this.approvalManager = approvalManager;
     this.getDefaultModel = getDefaultModel;
     this.activeChildren = new Map(); // childSessionId -> { controller, parentSessionId, paused, shuttingDown, model }
     this.shuttingDown = false;
@@ -259,6 +265,10 @@ export class ChildAgentManager {
     nonce,
     signal,
     isolatedWorktree,
+    getApprovedPrefixes = () => [],
+    requestApproval = null,
+    approvalManager = null,
+    getLivePolicy = null,
     isChild = true,
     extraTools = [],
   }) {
@@ -268,6 +278,10 @@ export class ChildAgentManager {
         sessionId,
         permissionMode: policy.permissionMode,
         nonce,
+        getLivePolicy,
+        getApprovedPrefixes,
+        requestApproval,
+        approvalManager,
         signal,
       }),
       ...extraTools,
@@ -459,6 +473,34 @@ export class ChildAgentManager {
             runId,
             nodeId,
           }) ?? leaseGuard;
+
+        const readLivePolicy = () => {
+          const childLive = this.getLivePolicy?.(childSessionId) ?? null;
+          const parentLive =
+            parentSessionId && parentSessionId !== childSessionId
+              ? this.getLivePolicy?.(parentSessionId) ?? null
+              : null;
+          let live = intersectPolicies(effectivePolicy, childLive ?? {});
+          if (parentLive) live = intersectPolicies(live, parentLive);
+          return {
+            ...live,
+            // Prefix approvals are session-scoped. Never implicitly copy the parent cache.
+            approvedPrefixes: Array.isArray(childLive?.approvedPrefixes)
+              ? childLive.approvedPrefixes
+              : [],
+          };
+        };
+        const readApprovedPrefixes = () => readLivePolicy().approvedPrefixes;
+        const childRequestApproval =
+          typeof this.requestApproval === 'function'
+            ? (req) =>
+                this.requestApproval({
+                  ...req,
+                  sessionId: childSessionId,
+                  turnId,
+                  signal: combinedSignal,
+                })
+            : null;
 
         let wt = null;
         let effectiveRoot = workspaceRoot;
@@ -682,6 +724,10 @@ export class ChildAgentManager {
             nonce,
             signal: combinedSignal,
             isolatedWorktree: isIsolated,
+            getLivePolicy: readLivePolicy,
+            getApprovedPrefixes: readApprovedPrefixes,
+            requestApproval: childRequestApproval,
+            approvalManager: this.approvalManager,
             extraTools,
           });
 
@@ -747,6 +793,10 @@ export class ChildAgentManager {
             permissionMode: effectivePolicy.permissionMode,
             allowTools: effectivePolicy.allowTools,
             denyTools: [...new Set([...(effectivePolicy.denyTools ?? []), 'spawn_subagent'])],
+            getLivePolicy: readLivePolicy,
+            getApprovedPrefixes: readApprovedPrefixes,
+            requestApproval: childRequestApproval,
+            approvalManager: this.approvalManager,
             messages: assembled.messages,
             tools,
             budgetLedger: activeLedger,
@@ -1360,7 +1410,7 @@ export class ChildAgentManager {
       this.store.tx(() => {
         this.store.db
           .prepare(
-            "UPDATE direct_sessions SET state='paused', updatedAt=? WHERE id=? AND state NOT IN ('completed','cancelled','failed')",
+            "UPDATE direct_sessions SET state='paused', updatedAt=? WHERE id=? AND state != 'cancelled'",
           )
           .run(Date.now(), childSessionId);
       });

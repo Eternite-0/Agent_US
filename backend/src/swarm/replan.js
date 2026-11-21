@@ -308,14 +308,12 @@ export class DynamicReplanner {
         if (liveNode.status !== SWARM_NODE_STATES.FAILED) {
           transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.FAILED, {
             emitEvent: false,
-            leaseGuard,
             patch: { errorCode, errorMessage },
           });
         }
         updatedNode = transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.READY, {
           emitEvent: false,
           allowReplanReset: true,
-          leaseGuard,
           patch: { ...resetPatch, planVersion: nextVersion },
         });
         strategy = 'retry_same';
@@ -327,7 +325,6 @@ export class DynamicReplanner {
           if (liveNode.status !== SWARM_NODE_STATES.FAILED) {
             transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.FAILED, {
               emitEvent: false,
-              leaseGuard,
               patch: { errorCode, errorMessage },
             });
           }
@@ -339,7 +336,6 @@ export class DynamicReplanner {
             {
               emitEvent: false,
               allowReplanReset: true,
-              leaseGuard,
               patch: {
                 ...resetPatch,
                 model: altModel.model,
@@ -410,7 +406,6 @@ export class DynamicReplanner {
               SWARM_NODE_STATES.FAILED,
               {
                 emitEvent: false,
-                leaseGuard,
                 patch: { errorCode: errorCode || 'REPLANNED', errorMessage },
               },
             );
@@ -464,7 +459,6 @@ export class DynamicReplanner {
               transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.PENDING, {
                 emitEvent: false,
                 allowReplanReset: true,
-                leaseGuard,
                 patch: {
                   dependenciesJson: JSON.stringify(nextDeps),
                   planVersion: nextVersion,
@@ -502,17 +496,17 @@ export class DynamicReplanner {
       this.store.db
         .prepare(
           `UPDATE runtime_jobs
-           SET status='cancelled', lastError='NODE_REPLANNED', leaseExpiresAt=NULL, updatedAt=?
+           SET status='cancelled', errorMessage='NODE_REPLANNED', leaseExpiresAt=NULL, updatedAt=?
            WHERE taskId=? AND turnId=? AND id != ?
              AND status IN ('pending','parked','reconciling')`,
         )
         .run(now, liveRun.id, `swarm:${liveRun.id}:${liveNode.nodeKey}`, currentJobId);
 
       // Single atomic CAS update of planVersion + replanCount alongside node mutations + swarm_replans row
+      // (outer store.tx() already verified assertLeaseInTx(leaseGuard) under SQLite BEGIN IMMEDIATE lock)
       transitionSwarmRun(this.store, liveRun.id, liveRun.status, {
         expectedPlanVersion: currentPlanVersion,
         expectedReplanCount: currentReplanCount,
-        leaseGuard,
         patch: {
           planVersion: nextVersion,
           replanCount: nextReplanCount,
