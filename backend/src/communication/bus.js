@@ -17,7 +17,7 @@ export class CommunicationBus {
   }
   async receive(agentId, options = {}) {
     if (typeof agentId !== 'string' || !agentId) throw new TypeError('agentId is required');
-    return this.adapter.claimNext({ agentId, now: this.clock(), visibilityTimeoutMs: options.visibilityTimeoutMs ?? this.options.visibilityTimeoutMs });
+    return this.adapter.claimNext({ agentId, runId: options.runId ?? null, now: this.clock(), visibilityTimeoutMs: options.visibilityTimeoutMs ?? this.options.visibilityTimeoutMs });
   }
   async ack(messageId, agentId, deliveryToken = undefined) { return this.adapter.ack({ messageId, agentId, deliveryToken, now: this.clock() }); }
   async retry(messageId, agentId, { delayMs = this.options.retryDelayMs, error = null, deliveryToken = undefined } = {}) {

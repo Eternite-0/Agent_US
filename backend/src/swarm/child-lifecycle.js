@@ -59,6 +59,7 @@ export class ChildAgentManager {
     getLivePolicy = null,
     requestApproval = null,
     approvalManager = null,
+    communication = null,
   }) {
     this.store = store;
     this.kernel = kernel;
@@ -75,6 +76,7 @@ export class ChildAgentManager {
     this.getLivePolicy = getLivePolicy;
     this.requestApproval = requestApproval;
     this.approvalManager = approvalManager;
+    this.communication = communication;
     this.getDefaultModel = getDefaultModel;
     this.activeChildren = new Map(); // childSessionId -> { controller, parentSessionId, paused, shuttingDown, model }
     this.shuttingDown = false;
@@ -268,6 +270,7 @@ export class ChildAgentManager {
     getApprovedPrefixes = () => [],
     requestApproval = null,
     approvalManager = null,
+    communication = null,
     getLivePolicy = null,
     isChild = true,
     extraTools = [],
@@ -415,6 +418,7 @@ export class ChildAgentManager {
     predecessorArtifacts = [],
     rehydrateFromArtifactId = null,
     ackMailboxIds = [],
+    claimedCommunicationMessage = null,
     budget = {},
     budgetLedger = null,
     budgetScope = BUDGET_SCOPES.NODE_EXECUTION,
@@ -706,6 +710,10 @@ export class ChildAgentManager {
                 );
             }
           });
+
+          if (claimedCommunicationMessage?.messageId && this.communication?.ack) {
+            await this.communication.ack(claimedCommunicationMessage.messageId, nodeKey || childSessionId, claimedCommunicationMessage.deliveryToken);
+          }
 
           const session = this.sessionRepo.getSession(childSessionId);
           const nonce = this.sessionRepo.ensureSessionNonce(childSessionId);
@@ -1197,6 +1205,7 @@ export class ChildAgentManager {
     predecessorArtifacts = [],
     rehydrateFromArtifactId = null,
     ackMailboxIds = [],
+    claimedCommunicationMessage = null,
     budgetLedger = null,
     budgetScope = BUDGET_SCOPES.NODE_EXECUTION,
     existingChildSessionId = null,
@@ -1282,6 +1291,7 @@ export class ChildAgentManager {
       predecessorArtifacts,
       rehydrateFromArtifactId,
       ackMailboxIds,
+      claimedCommunicationMessage,
       budget,
       budgetLedger,
       budgetScope,

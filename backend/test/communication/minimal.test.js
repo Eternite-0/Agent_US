@@ -74,6 +74,17 @@ test('store communication claims are fenced and atomically exclusive', async () 
   }
 });
 
+test('run-scoped claims isolate messages across communication adapters', async () => {
+  const { bus } = harness();
+  const first = await bus.send({ conversationId: 'same-conversation', runId: 'run-a', fromAgentId: 'parent', toAgentId: 'worker', idempotencyKey: 'same-key', payload: { run: 'a' } });
+  const second = await bus.send({ conversationId: 'same-conversation', runId: 'run-b', fromAgentId: 'parent', toAgentId: 'worker', idempotencyKey: 'same-key', payload: { run: 'b' } });
+  assert.equal(first.status, 'created');
+  assert.equal(second.status, 'created', 'idempotency scope must include runId');
+  const claim = await bus.receive('worker', { runId: 'run-b' });
+  assert.equal(claim.messageId, second.message.messageId);
+  assert.equal(claim.runId, 'run-b');
+  assert.equal(await bus.receive('worker', { runId: 'run-a' }).then((message) => message?.runId ?? null), 'run-a');
+});
 test('expiry, cancellation, parent-child links, and per-stream order are enforced', async () => {
   const { bus, advance } = harness();
   const parent = await bus.send({ conversationId: 'c1', runId: 'r1', fromAgentId: 'parent', toAgentId: 'child', idempotencyKey: 'p', payload: {} });

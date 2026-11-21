@@ -6,7 +6,7 @@ const ACTIVE = new Set(['pending', 'delivered']);
 
 function clone(value) { return structuredClone(value); }
 function sortMessages(rows) { return rows.sort((a, b) => a.sequence - b.sequence || a.createdAt - b.createdAt || a.messageId.localeCompare(b.messageId)); }
-function streamKey(m) { return `${m.conversationId}\0${m.fromAgentId}\0${m.toAgentId}`; }
+function streamKey(m) { return `${m.conversationId}\0${m.runId ?? ''}\0${m.fromAgentId}\0${m.toAgentId}`; }
 function conflictRecord({ reason, attempted, existingMessageId = null, details = null, now }) {
   return { conflictId: randomUUID(), reason, decision: 'reviewer-needed', status: 'open', attempted: clone(attempted), existingMessageId, details: clone(details), createdAt: now };
 }
@@ -18,7 +18,7 @@ export class MemoryCommunicationAdapter {
   #artifactDigests = new Map();
 
   async append(draft) {
-    const sameKey = [...this.#messages.values()].find((m) => m.idempotencyKey === draft.idempotencyKey && m.fromAgentId === draft.fromAgentId && m.conversationId === draft.conversationId);
+    const sameKey = [...this.#messages.values()].find((m) => m.idempotencyKey === draft.idempotencyKey && m.fromAgentId === draft.fromAgentId && m.conversationId === draft.conversationId && (m.runId ?? null) === (draft.runId ?? null));
     if (sameKey) {
       if (sameKey.payloadHash === draft.payloadHash) return { status: 'replayed', message: clone(sameKey) };
       const conflict = conflictRecord({ reason: 'IDEMPOTENCY_KEY_REUSED', attempted: draft, existingMessageId: sameKey.messageId, details: { existingPayloadHash: sameKey.payloadHash, attemptedPayloadHash: draft.payloadHash }, now: draft.createdAt });
@@ -50,9 +50,9 @@ export class MemoryCommunicationAdapter {
     return { status: 'created', message: clone(message) };
   }
 
-  async claimNext({ agentId, now, visibilityTimeoutMs }) {
+  async claimNext({ agentId, runId = null, now, visibilityTimeoutMs }) {
     this.#expireAndExhaust(now);
-    const pending = sortMessages([...this.#messages.values()].filter((m) => m.toAgentId === agentId && ACTIVE.has(m.status) && m.expiresAt > now && (m.status === 'pending' ? m.nextAttemptAt <= now : m.ackDeadline <= now)));
+    const pending = sortMessages([...this.#messages.values()].filter((m) => m.toAgentId === agentId && (!runId || m.runId === runId) && ACTIVE.has(m.status) && m.expiresAt > now && (m.status === 'pending' ? m.nextAttemptAt <= now : m.ackDeadline <= now)));
     for (const message of pending) {
       const earlier = [...this.#messages.values()].some((m) => streamKey(m) === streamKey(message) && m.sequence < message.sequence && !TERMINAL.has(m.status));
       if (earlier) continue;

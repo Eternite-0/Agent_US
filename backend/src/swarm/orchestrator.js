@@ -1226,12 +1226,15 @@ export class AdaptiveSwarmOrchestrator {
         const peekedInbox =
           typeof this.mailbox?.peekInbox === 'function'
             ? this.mailbox.peekInbox(node.nodeKey, { runId })
-            : this.mailbox.drainInbox(node.nodeKey, { runId });
-        const ackMailboxIds =
-          typeof this.mailbox?.peekInbox === 'function' ? peekedInbox.map((m) => m.id) : [];
-        const inboxMsgs = peekedInbox.map(
-          (m) => `[协同消息来自 ${m.fromAgentId}]: ${JSON.stringify(m.payload)}`,
-        );
+            : [];
+        const claimedMessage = typeof this.mailbox?.receive === 'function'
+          ? await this.mailbox.receive(node.nodeKey, { runId, visibilityTimeoutMs: 30_000 })
+          : null;
+        const ackMailboxIds = peekedInbox.map((m) => m.id);
+        const inboxMsgs = [
+          ...peekedInbox.map((m) => `[协同消息来自 ${m.fromAgentId}]: ${JSON.stringify(m.payload)}`),
+          ...(claimedMessage ? [`[统一协同消息来自 ${claimedMessage.fromAgentId}]: ${JSON.stringify(claimedMessage.payload)}`] : []),
+        ];
         const fullObjective = [...depResults, ...inboxMsgs, node.objective].join('\n\n');
 
         const cp = node.childTurnId ? this.checkpointStore?.loadLatest?.(node.childTurnId) : null;
@@ -1276,6 +1279,7 @@ export class AdaptiveSwarmOrchestrator {
           predecessorArtifacts,
           rehydrateFromArtifactId,
           ackMailboxIds,
+          claimedCommunicationMessage: claimedMessage,
           budgetLedger: this.budgetLedger,
           budgetScope,
           existingChildSessionId: node.childSessionId || null,

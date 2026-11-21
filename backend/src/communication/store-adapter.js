@@ -95,11 +95,11 @@ export class StoreCommunicationAdapter {
       return { status: 'created', message: clone(message) };
     });
   }
-  async claimNext({ agentId, now, visibilityTimeoutMs }) {
+  async claimNext({ agentId, runId = null, now, visibilityTimeoutMs }) {
     return this.store.tx(() => {
       const messages = this.#messages();
       for (const message of messages
-        .filter((item) => item.toAgentId === agentId && ACTIVE.has(item.status) && item.expiresAt > now && (item.status === 'pending' ? item.nextAttemptAt <= now : item.ackDeadline <= now))
+        .filter((item) => item.toAgentId === agentId && (!runId || item.runId === runId) && ACTIVE.has(item.status) && item.expiresAt > now && (item.status === 'pending' ? item.nextAttemptAt <= now : item.ackDeadline <= now))
         .sort((a, b) => Number(a.sequence) - Number(b.sequence) || Number(a.createdAt) - Number(b.createdAt) || a.messageId.localeCompare(b.messageId))) {
         const earlier = messages.some((item) => streamKey(item) === streamKey(message) && Number(item.sequence) < Number(message.sequence) && !TERMINAL.has(item.status));
         if (earlier) continue;

@@ -399,6 +399,7 @@ export class DirectAgentRuntime {
     this.intelligence = intelligence;
     if (intelligence?.memory) this.contextAssembler.experienceMemoryService = intelligence.memory;
     if (intelligence?.communication) this.mailbox.setCommunicationBus?.(intelligence.communication);
+    if (intelligence?.communication) this.childManager.communication = intelligence.communication;
     if (intelligence?.capabilityRegistry) {
       this.adaptiveRouter.capabilityRegistry = intelligence.capabilityRegistry;
       this.intelligenceCapabilityRegistry = intelligence.capabilityRegistry;
