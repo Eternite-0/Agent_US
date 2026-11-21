@@ -421,3 +421,165 @@ test('Fault injection durable #3/#4/#10/#11: delayed stale receipt write is outc
 
 // #3/#4/#5/#7/#10/#11/#12/#13/#14/#15/#17 are represented above by durable state-machine
 // boundaries; all resources are isolated under OS temporary directories.
+
+// #3/#5/#7: a fully written artifact directory with no SQLite registration is
+// treated as a crash orphan and reaped only after the retention age.
+test('Fault injection durable #3/#5/#7: disk artifact without SQLite registration is garbage-collected', () => {
+  const dir = makeDir('agent-us-fi-orphan-artifact-');
+  const storage = join(dir, 'artifacts');
+  const dbDir = join(dir, 'db');
+  mkdirSync(storage, { recursive: true });
+  mkdirSync(dbDir, { recursive: true });
+  const store = new Store(join(dbDir, 'engine.sqlite'));
+  try {
+    const orphanId = 'a'.repeat(64);
+    const orphanPath = join(storage, 'run-crashed', orphanId);
+    mkdirSync(join(orphanPath, 'files'), { recursive: true });
+    writeFileSync(join(orphanPath, 'files', 'result.txt'), 'written before sqlite commit\n');
+    writeFileSync(
+      join(orphanPath, 'manifest.json'),
+      JSON.stringify({ id: orphanId, runId: 'run-crashed', nodeId: 'node-crashed', files: [{ path: 'result.txt' }] }),
+    );
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(orphanPath, old, old);
+
+    const recentId = 'b'.repeat(64);
+    const recentPath = join(storage, 'run-crashed', recentId);
+    mkdirSync(join(recentPath, 'files'), { recursive: true });
+    writeFileSync(join(recentPath, 'files', 'result.txt'), 'recent\n');
+    writeFileSync(join(recentPath, 'manifest.json'), JSON.stringify({ id: recentId }));
+
+    const manager = new SwarmArtifactManager({ store, storageRoot: storage });
+    const report = manager.cleanupOrphanArtifacts({ minAgeMs: 1_000 });
+    assert.equal(report.scanned, 2);
+    assert.equal(report.removed, 1);
+    assert.equal(report.skippedRecent, 1);
+    assert.equal(existsSync(orphanPath), false);
+    assert.equal(existsSync(recentPath), true);
+    assert.equal(store.db.prepare('SELECT 1 FROM swarm_artifacts WHERE id=?').get(orphanId), undefined);
+  } finally {
+    store.close();
+    rmDirSafe(dir);
+  }
+});
+
+// #10/#11/#14: if the child turn committed before the swarm node update, startup
+// recovery converges the node from the committed assistant message instead of re-running it.
+test('Fault injection durable #10/#11/#14: committed child turn converges an uncommitted swarm node', async () => {
+  const dir = makeDir('agent-us-fi-node-recovery-');
+  const store = new Store(join(dir, 'engine.sqlite'));
+  try {
+    const now = Date.now();
+    store.tx(() => {
+      store.db.prepare(
+        `INSERT INTO direct_sessions(id,title,state,createdAt,updatedAt)
+         VALUES('sess-recover-node','recover node','running',?,?)`,
+      ).run(now, now);
+      store.db.prepare(
+        `INSERT INTO direct_turns(id,sessionId,input,state,phase,createdAt,finishedAt)
+         VALUES('turn-recover-node','sess-recover-node','child work','completed','completed',?,?)`,
+      ).run(now, now);
+      store.db.prepare(
+        `INSERT INTO direct_messages(sessionId,turnId,role,content,createdAt)
+         VALUES('sess-recover-node','turn-recover-node','assistant','recovered result',?)`,
+      ).run(now);
+      store.db.prepare(
+        `INSERT INTO swarm_runs(id,sessionId,goal,status,strategyJson,budgetJson,planVersion,replanCount,createdAt,updatedAt)
+         VALUES('run-recover-node','sess-recover-node','recover','running','{}','{}',1,0,?,?)`,
+      ).run(now, now);
+      store.db.prepare(
+        `INSERT INTO swarm_nodes(id,runId,nodeKey,agentProfileId,objective,acceptance,status,childTurnId,planVersion,createdAt,updatedAt)
+         VALUES('node-recover-node','run-recover-node','recover-node','default','recover','recover','running','turn-recover-node',1,?,?)`,
+      ).run(now, now);
+    });
+
+    const queue = new DurableJobQueue(store);
+    const { recoverInterruptedSwarmRuns } = await import('../src/swarm/recovery-helpers.js');
+    const report = recoverInterruptedSwarmRuns({
+      store,
+      jobQueue: queue,
+      reconciler: new UnknownOutcomeReconciler(store, null),
+      eventRouter: null,
+      getRun: (runId) => {
+        const run = store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);
+        const nodes = store.db.prepare('SELECT * FROM swarm_nodes WHERE runId=?').all(runId);
+        return { ...run, budget: {}, usage: {}, nodes };
+      },
+      cancelRun: () => {},
+    });
+    assert.equal(report.convergedCompletedNodes, 1);
+    const node = store.db.prepare('SELECT status,resultText,activeJobId,activeFence FROM swarm_nodes WHERE id=?').get('node-recover-node');
+    assert.equal(node.status, 'completed');
+    assert.equal(node.resultText, 'recovered result');
+    assert.equal(node.activeJobId, null);
+    assert.equal(node.activeFence, null);
+    assert.equal(
+      store.db.prepare("SELECT COUNT(*) AS count FROM runtime_jobs WHERE taskId='run-recover-node' AND kind='swarm_node_execute'").get().count,
+      0,
+    );
+  } finally {
+    store.close();
+    rmDirSafe(dir);
+  }
+});
+
+// #17: exhausting a swarm-node job also binds the terminal failure to its node
+// and creates exactly one dependency-resolution job for the owning run.
+test('Fault injection durable #17: ATTEMPTS_EXHAUSTED converges bound swarm node and run recovery', () => {
+  const dir = makeDir('agent-us-fi-attempts-bound-');
+  const store = new Store(join(dir, 'engine.sqlite'));
+  try {
+    const now = Date.now();
+    store.tx(() => {
+      store.db.prepare(
+        `INSERT INTO direct_sessions(id,title,state,createdAt,updatedAt)
+         VALUES('sess-attempts-bound','attempts','running',?,?)`,
+      ).run(now, now);
+      store.db.prepare(
+        `INSERT INTO swarm_runs(id,sessionId,goal,status,strategyJson,budgetJson,planVersion,replanCount,createdAt,updatedAt)
+         VALUES('run-attempts-bound','sess-attempts-bound','attempts','running','{}','{}',1,0,?,?)`,
+      ).run(now, now);
+      store.db.prepare(
+        `INSERT INTO swarm_nodes(id,runId,nodeKey,agentProfileId,objective,acceptance,status,planVersion,createdAt,updatedAt)
+         VALUES('node-attempts-bound','run-attempts-bound','attempts-bound','default','attempts','attempts','running',1,?,?)`,
+      ).run(now, now);
+    });
+    const queue = new DurableJobQueue(store, { defaultLeaseMs: 1_000 });
+    const job = queue.enqueue({
+      kind: 'swarm_node_execute',
+      taskId: 'run-attempts-bound',
+      payload: { runId: 'run-attempts-bound', nodeId: 'node-attempts-bound', nodeKey: 'attempts-bound' },
+      maxAttempts: 1,
+    });
+    const first = queue.claim({ workerId: 'attempts-bound-a', kinds: ['swarm_node_execute'], leaseMs: 1_000 });
+    assert.equal(first.id, job.id);
+    store.tx(() => store.db.prepare('UPDATE runtime_jobs SET leaseExpiresAt=? WHERE id=?').run(Date.now() - 1, job.id));
+    assert.equal(queue.claim({ workerId: 'attempts-bound-b', kinds: ['swarm_node_execute'], leaseMs: 1_000 }), null);
+
+    const jobRow = store.db.prepare('SELECT status,errorCode FROM runtime_jobs WHERE id=?').get(job.id);
+    const nodeRow = store.db.prepare('SELECT status,errorCode,activeJobId,activeFence FROM swarm_nodes WHERE id=?').get('node-attempts-bound');
+    assert.equal(jobRow.status, 'failed');
+    assert.equal(jobRow.errorCode, 'ATTEMPTS_EXHAUSTED');
+    assert.equal(nodeRow.status, 'failed');
+    assert.equal(nodeRow.errorCode, 'ATTEMPTS_EXHAUSTED');
+    assert.equal(nodeRow.activeJobId, null);
+    assert.equal(nodeRow.activeFence, null);
+    assert.equal(
+      store.db.prepare("SELECT COUNT(*) AS count FROM runtime_jobs WHERE taskId=? AND kind='swarm_dependency_resolve' AND status IN ('pending','active')").get('run-attempts-bound').count,
+      1,
+    );
+
+    store.tx(() => store.db.prepare("UPDATE runtime_jobs SET status='failed', errorCode='ATTEMPTS_EXHAUSTED' WHERE id=?").run(job.id));
+    assert.equal(
+      store.db.prepare("SELECT COUNT(*) AS count FROM runtime_jobs WHERE taskId=? AND kind='swarm_dependency_resolve' AND status IN ('pending','active')").get('run-attempts-bound').count,
+      1,
+      'repeated recovery must not create a second dependency-resolution job',
+    );
+  } finally {
+    store.close();
+    rmDirSafe(dir);
+  }
+});
+
+
+
