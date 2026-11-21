@@ -18,8 +18,10 @@ export function createIntelligenceServices({ store, directAgent, providers = nul
     });
   }
   const planner = new AdaptivePlanner({ permissionCeiling: 'full' });
+  const evaluation = new EvaluationService({ store, directAgent, jobQueue: directAgent?.jobQueue ?? null });
+  evaluation.registerOnWorker(directAgent?.recoveryWorker);
   return {
-    evaluation: new EvaluationService({ store, directAgent }),
+    evaluation,
     planner,
     replanner: new AdaptiveReplanner({ planner }),
     capabilityRegistry,

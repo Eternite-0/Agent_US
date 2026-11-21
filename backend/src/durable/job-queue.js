@@ -522,6 +522,16 @@ export class DurableJobQueue {
     return out;
   }
 
+  cancelByTask(taskId) {
+    if (!this.#dbOpen()) return 0;
+    return this.store.tx(() => {
+      const now = Date.now();
+      const res = this.store.db.prepare(
+        "UPDATE runtime_jobs SET status='cancelled', fence=NULL, leaseExpiresAt=NULL, updatedAt=? WHERE taskId=? AND status IN ('pending','active','parked','reconciling')",
+      ).run(now, taskId);
+      return res.changes ?? 0;
+    });
+  }
   cancelByTurn(turnId) {
     if (!this.#dbOpen()) return 0;
     return this.store.tx(() => {

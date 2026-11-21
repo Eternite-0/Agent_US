@@ -96,8 +96,9 @@ function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
  */
 export class EvaluationService {
   #controllers = new Map();
+  #activeExecutions = new Map();
 
-  constructor({ store, directAgent, runtimeFactory = null, maxConcurrency = 2, timeoutMs = 120_000 } = {}) {
+  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, maxConcurrency = 2, timeoutMs = 120_000 } = {}) {
     if (!store || typeof store.add !== 'function' || typeof store.list !== 'function') {
       throw new TypeError('EvaluationService requires Store');
     }
@@ -105,8 +106,24 @@ export class EvaluationService {
     this.directAgent = directAgent ?? null;
     this.registry = new EvaluationRegistry(createBenchmarkDataset());
     this.runtimeFactory = runtimeFactory;
+    this.jobQueue = jobQueue;
     this.maxConcurrency = Math.min(4, Math.max(1, Number(maxConcurrency) || 2));
     this.timeoutMs = Math.min(600_000, Math.max(1_000, Number(timeoutMs) || 120_000));
+  }
+
+  registerOnWorker(recoveryWorker) {
+    recoveryWorker?.registerHandler?.('evaluation_run', (job) => {
+      const runId = String(job.taskId || job.payload?.runId || '');
+      const run = this.getRun(runId);
+      if (!run || ['completed', 'failed', 'cancelled', 'timeout'].includes(run.status)) return { skipped: true };
+      const controller = this.#controllers.get(runId) ?? new AbortController();
+      this.#controllers.set(runId, controller);
+      const tasks = (run.taskIds ?? []).map((id) => this.registry.require(String(id)));
+      const execution = this.execute(runId, tasks, run.options ?? {}, controller);
+      this.#activeExecutions.set(runId, execution);
+      void execution.then(() => {}, () => {}).finally(() => this.#activeExecutions.delete(runId));
+      return execution;
+    });
   }
 
   listBenchmarks() {
@@ -172,10 +189,19 @@ export class EvaluationService {
       error: null,
       taskIds: tasks.map((task) => task.id),
       synthetic: true,
+      options: { model, concurrency, timeoutMs, maxAttempts },
     }, null, null, runId);
     const controller = new AbortController();
     this.#controllers.set(run.id, controller);
-    queueMicrotask(() => { void this.#execute(run.id, tasks, { model, concurrency, timeoutMs, maxAttempts }, controller); });
+    const options = { model, concurrency, timeoutMs, maxAttempts };
+    this.#update(run.id, { options });
+    if (this.jobQueue?.enqueue) {
+      this.jobQueue.enqueue({ kind: 'evaluation_run', taskId: run.id, payload: { runId: run.id }, idempotencyKey: `evaluation:${run.id}`, maxAttempts: 3 });
+    } else {
+      const execution = this.execute(run.id, tasks, options, controller);
+      this.#activeExecutions.set(run.id, execution);
+      void execution.then(() => {}, () => {}).finally(() => this.#activeExecutions.delete(run.id));
+    }
     return plainRun(run);
   }
 
@@ -185,11 +211,12 @@ export class EvaluationService {
     if (!run || ['completed', 'failed', 'cancelled'].includes(run.status)) return run ?? null;
     const controller = this.#controllers.get(key);
     controller?.abort('cancelled by user');
+    this.jobQueue?.cancelByTask?.(key);
     if (run.status === 'queued') return this.#update(key, { status: 'cancelled', finishedAt: Date.now() });
     return this.#update(key, { cancelRequestedAt: Date.now() });
   }
 
-  async #execute(runId, tasks, options, controller) {
+  async execute(runId, tasks, options, controller) {
     try {
       this.#update(runId, { status: 'running', startedAt: Date.now() });
       const run = this.getRun(runId);
@@ -243,9 +270,14 @@ export class EvaluationService {
     return this.store.update('evaluation_runs', current, patch);
   }
 
-  close() {
+  async close({ timeoutMs = 30_000 } = {}) {
     for (const controller of this.#controllers.values()) controller.abort('service shutdown');
+    const pending = [...this.#activeExecutions.values()];
+    if (pending.length) {
+      await Promise.race([Promise.allSettled(pending), delay(Math.max(1, Number(timeoutMs) || 30_000))]);
+    }
     this.#controllers.clear();
+    return { drained: this.#activeExecutions.size === 0 };
   }
 }
 
