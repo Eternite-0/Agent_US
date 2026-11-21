@@ -95,9 +95,28 @@ jobs:
             echo "No backend test files discovered" >&2
             exit 1
           fi
-          echo "Running ${#TESTS[@]} backend test files (--test-timeout=60000)"
-          node --test --test-concurrency=4 --test-timeout=60000 "${TESTS[@]}"
+          echo "Running ${#TESTS[@]} backend test files individually (--test-timeout=60000, concurrency=4)"
+          failed=0
+          for test_file in "${TESTS[@]}"; do
+            echo "::group::${test_file}"
+            log_file="$(mktemp)"
+            set +e
+            node --test --test-concurrency=4 --test-timeout=60000 "$test_file" >"$log_file" 2>&1
+            code=$?
+            set -e
+            cat "$log_file"
+            if [ "$code" -ne 0 ]; then
+              failed=1
+              summary="$(grep -E '(^✖|not ok|AssertionError|TypeError|Error:|ℹ fail|ℹ duration_ms)' "$log_file" | tail -8 | tr '\n' ' ' | cut -c1-900)"
+              echo "::error file=backend/${test_file},title=Backend test file failed::${summary:-exit code ${code}}"
+            fi
+            rm -f "$log_file"
+            echo "::endgroup::"
+          done
           echo "::endgroup::"
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Backend core and regression test suites (PowerShell)
         if: runner.os == 'Windows'
@@ -118,11 +137,26 @@ jobs:
             Write-Error "No backend test files discovered"
             exit 1
           }
-          Write-Host "Running $($tests.Count) backend test files (--test-timeout=60000)"
-          node --test --test-concurrency=4 --test-timeout=60000 @tests
-          $code = $LASTEXITCODE
+          Write-Host "Running $($tests.Count) backend test files individually (--test-timeout=60000, concurrency=4)"
+          $failed = $false
+          foreach ($testFile in $tests) {
+            Write-Host "::group::$testFile"
+            $logFile = Join-Path ([System.IO.Path]::GetTempPath()) ("agent-us-ci-" + [guid]::NewGuid().ToString('N') + '.log')
+            & node --test --test-concurrency=4 --test-timeout=60000 $testFile *> $logFile
+            $code = $LASTEXITCODE
+            Get-Content -LiteralPath $logFile
+            if ($code -ne 0) {
+              $failed = $true
+              $summary = (Select-String -LiteralPath $logFile -Pattern '(^✖|not ok|AssertionError|TypeError|Error:|ℹ fail|ℹ duration_ms)' | Select-Object -Last 8 | ForEach-Object { $_.Line }) -join ' '
+              if ([string]::IsNullOrWhiteSpace($summary)) { $summary = "exit code $code" }
+              $summary = $summary.Substring(0, [Math]::Min(900, $summary.Length))
+              Write-Output "::error file=backend/$testFile,title=Backend test file failed::$summary"
+            }
+            Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
+            Write-Host "::endgroup::"
+          }
           Write-Host "::endgroup::"
-          if ($code -ne 0) { exit $code }
+          if ($failed) { exit 1 }
 
       - name: Env-gated suites status — Docker & Magpie (bash)
         if: runner.os != 'Windows'
