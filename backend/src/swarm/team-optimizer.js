@@ -89,7 +89,17 @@ export class TeamOptimizer {
     const highRisk = task.artifactRisk === 'high' || task.requiresIndependentVerification === true;
     const teamRequested = task.mode === 'team' || task.preferTeam === true;
     const teamWanted = !simple && (teamRequested || workstreams > 1 || highRisk);
-    const maxBudget = numeric(budget.maxCost ?? budget.maxTokens ?? budgetSnapshot?.remaining ?? Infinity, Infinity);
+    const maxBudget = numeric(
+      budget.maxCost ??
+        budget.maxCostUsd ??
+        budget.maxTokens ??
+        budget.maxTotalTokens ??
+        budgetSnapshot?.remainingCost ??
+        budgetSnapshot?.remainingTokens ??
+        budgetSnapshot?.remaining ??
+        Infinity,
+      Infinity,
+    );
     const single = available[0] ?? null;
     const singleCost = single ? estimateCost(single, task) : Infinity;
 

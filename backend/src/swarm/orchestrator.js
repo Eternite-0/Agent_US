@@ -40,6 +40,7 @@ import {
   recoverInterruptedSwarmRuns,
 } from './recovery-helpers.js';
 import { validatePlan } from '../planning/validator.js';
+import { TeamOptimizer } from './team-optimizer.js';
 
 /**
  * Layer 6 Durable Job-Driven AdaptiveSwarmOrchestrator:
@@ -63,6 +64,8 @@ export class AdaptiveSwarmOrchestrator {
     replanner = null,
     budgetLedger = null,
     metrics = null,
+    teamOptimizer = null,
+    capabilityRegistry = null,
   }) {
     this.store = store;
     this.jobQueue = jobQueue;
@@ -78,6 +81,8 @@ export class AdaptiveSwarmOrchestrator {
     this.modelFeedback = modelFeedback;
     this.replanner = replanner;
     this.metrics = metrics;
+    this.teamOptimizer = teamOptimizer ?? new TeamOptimizer({});
+    this.capabilityRegistry = capabilityRegistry;
     this.budgetLedger = budgetLedger ?? (store ? new TaskTreeBudgetLedger(store) : null);
     if (this.replanner && !this.replanner.budgetLedger) {
       this.replanner.budgetLedger = this.budgetLedger;
@@ -837,8 +842,48 @@ export class AdaptiveSwarmOrchestrator {
         const picked = readyNodes.slice(0, dispatchSlots);
 
         if (picked.length > 0) {
+          const candidates = (this.router?.modelRegistry?.list?.() ?? []).map((candidate) => {
+            const effective = this.capabilityRegistry?.getEffectiveCapability?.(candidate.model ?? candidate.id);
+            return effective?.measured
+              ? { ...candidate, effectiveCapabilities: effective.effective, capabilityEvidence: effective.measured }
+              : candidate;
+          });
+          const budgetSnapshot = this.budgetLedger?.getSnapshot(runId) ?? null;
+          const taskRequirements = picked.reduce((acc, node) => {
+            const parsed = parseJsonSafe(node.budgetJson, {});
+            const required = parsed.requiredCapabilities ?? parsed.capabilityWeights ?? {};
+            for (const [dimension, weight] of Object.entries(required)) {
+              acc[dimension] = Math.max(Number(acc[dimension] ?? 0), Number(weight) || 0);
+            }
+            return acc;
+          }, {});
+          const team = this.teamOptimizer.optimize({
+            task: {
+              taskType: picked.length > 1 ? 'implementation' : picked[0].taskType,
+              complexity: picked.length > 1 ? 'complex' : 'simple',
+              independentWorkstreams: picked.length,
+              requiredCapabilities: taskRequirements,
+              requiresIndependentVerification: picked.some((n) => n.taskType === 'verification'),
+              artifactRisk: picked.some((n) => n.isolationMode === 'worktree') ? 'high' : undefined,
+            },
+            candidates,
+            budget: run.budget,
+            budgetSnapshot,
+            maxConcurrency: Math.min(maxConc, picked.length),
+            reviewerAvailable: picked.some((n) => n.taskType === 'verification'),
+          });
+          const dispatchCount = team.mode === 'team'
+            ? Math.min(picked.length, team.members?.length ?? 0)
+            : Math.min(1, picked.length);
           const queuedKeys = [];
-          for (const n of picked) {
+          for (const [index, n] of picked.slice(0, dispatchCount).entries()) {
+            const selectedMember = team.members?.[index] ?? team.members?.[0];
+            if (selectedMember) {
+              const candidate = candidates.find((item) => item.model === selectedMember.id || item.id === selectedMember.id);
+              if (candidate) {
+                this.store.db.prepare('UPDATE swarm_nodes SET model=?, provider=?, updatedAt=? WHERE id=? AND status=?').run(candidate.model ?? candidate.id, candidate.provider ?? 'pool', Date.now(), n.id, SWARM_NODE_STATES.READY);
+              }
+            }
             const upd = transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.QUEUED, {
               emitEvent: false,
               leaseGuard,
@@ -849,6 +894,19 @@ export class AdaptiveSwarmOrchestrator {
             }
           }
           if (queuedKeys.length > 0) {
+            this.metrics?.record?.('swarm_team_selected', {
+              runId,
+              mode: team.mode,
+              memberCount: team.members?.length ?? 0,
+              estimatedCost: team.estimatedCost,
+              rationale: team.rationale,
+              capabilityEvidence: team.members?.map((member) => ({
+                id: member.id,
+                capabilityScore: member.capabilityScore,
+                historyScore: member.historyScore,
+              })) ?? [],
+              isSynthetic: run.isSynthetic ? 1 : 0,
+            });
             return {
               action: 'dispatch',
               sessionId: run.sessionId,

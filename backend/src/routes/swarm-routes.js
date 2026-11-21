@@ -42,6 +42,28 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
       });
     }
     const body = req.body ?? {};
+    if (body.plan && directAgent.submitPlannedSwarmRun) {
+      try {
+        const session = body.sessionId
+          ? directAgent.getSession(String(body.sessionId))
+          : directAgent.createSession({ title: `[Swarm Plan] ${String(body.plan.goal ?? '').slice(0, 60)}`, workspaceRoot: body.workspaceRoot ?? null, permissionMode: body.permissionMode ?? body.plan.permissionMode ?? 'auto-safe' });
+        const result = directAgent.submitPlannedSwarmRun({
+          plan: body.plan,
+          sessionId: session.id,
+          rootTurnId: body.rootTurnId ?? null,
+          workspaceRoot: session.workspaceRoot || body.workspaceRoot || directAgent.getWorkspaceRoot(),
+          parentPermissionMode: body.permissionMode ?? session.permissionMode ?? body.plan.permissionMode,
+          maxConcurrency: body.maxConcurrency ?? 3,
+          budget: body.budget ?? body.plan.budget,
+          maxReplans: body.maxReplans ?? 2,
+          trafficSource: 'production',
+          isSynthetic: 0,
+        });
+        return reply.code(202).send(result);
+      } catch (error) {
+        return reply.code(Number(error?.status) || 400).send({ error: { code: error?.code || 'INVALID_PLAN', message: String(error?.message || 'Invalid plan') } });
+      }
+    }
     const goal = String(body.goal ?? '').trim();
     if (!goal) {
       return reply.code(400).send({
