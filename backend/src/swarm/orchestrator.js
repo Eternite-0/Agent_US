@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { id as uuid } from '../store.js';
 import { BudgetError, RecoveryError, RuntimeError } from '../kernel/errors.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
@@ -777,10 +778,12 @@ export class AdaptiveSwarmOrchestrator {
           const byKey = new Map(run.nodes.map((n) => [n.nodeKey, n]));
           for (const n of run.nodes) {
             if (n.status !== SWARM_NODE_STATES.PENDING && n.status !== SWARM_NODE_STATES.READY) continue;
+            const reviewerMetadata = parseJsonSafe(n.budgetJson, {})?.reviewerMetadata;
+            const isAutoReviewer = n.taskType === 'review' && reviewerMetadata?.autoMaterialized === true;
             const failedDeps = n.dependencies.filter((d) =>
               ['failed', 'cancelled'].includes(byKey.get(d)?.status),
             );
-            if (failedDeps.length) {
+            if (failedDeps.length && !isAutoReviewer) {
               changed = true;
               const allBudgetFailed = failedDeps.every((d) =>
                 isBudgetErrorCode(byKey.get(d)?.errorCode),
@@ -811,10 +814,17 @@ export class AdaptiveSwarmOrchestrator {
         run = this.getRun(runId);
         const byKey = new Map(run.nodes.map((n) => [n.nodeKey, n]));
         for (const n of run.nodes) {
+          const reviewerMetadata = parseJsonSafe(n.budgetJson, {})?.reviewerMetadata;
+          const isAutoReviewer = n.taskType === 'review' && reviewerMetadata?.autoMaterialized === true;
           const allDepsCompleted = n.dependencies.every(
             (d) => byKey.get(d)?.status === SWARM_NODE_STATES.COMPLETED,
           );
-          if (n.status === SWARM_NODE_STATES.PENDING && allDepsCompleted) {
+          const allDepsSettled = n.dependencies.every((d) => {
+            const status = byKey.get(d)?.status;
+            return ['completed', 'failed', 'cancelled'].includes(status);
+          });
+          const dependenciesReady = isAutoReviewer ? allDepsSettled : allDepsCompleted;
+          if (n.status === SWARM_NODE_STATES.PENDING && dependenciesReady) {
             const upd = transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.READY, {
               emitEvent: false,
               leaseGuard,
@@ -845,7 +855,12 @@ export class AdaptiveSwarmOrchestrator {
           const candidates = (this.router?.modelRegistry?.list?.() ?? []).map((candidate) => {
             const effective = this.capabilityRegistry?.getEffectiveCapability?.(candidate.model ?? candidate.id);
             return effective?.measured
-              ? { ...candidate, effectiveCapabilities: effective.effective, capabilityEvidence: effective.measured }
+              ? {
+                  ...candidate,
+                  capabilities: effective.effective,
+                  effectiveCapabilities: effective.effective,
+                  capabilityEvidence: effective.measured,
+                }
               : candidate;
           });
           const budgetSnapshot = this.budgetLedger?.getSnapshot(runId) ?? null;
@@ -870,15 +885,30 @@ export class AdaptiveSwarmOrchestrator {
             budget: run.budget,
             budgetSnapshot,
             maxConcurrency: Math.min(maxConc, picked.length),
-            reviewerAvailable: picked.some((n) => n.taskType === 'verification'),
+            reviewerAvailable: picked.some((n) => n.taskType === 'verification' || n.isolationMode === 'worktree' || n.taskType === 'review'),
           });
+          const reviewerNode = this.#materializeReviewerNode({
+            run,
+            team,
+            picked,
+            candidates,
+            now: Date.now(),
+          });
+          if (reviewerNode) postEvents.push({ ...reviewerNode, runId, changed: true });
           const dispatchCount = team.mode === 'team'
             ? picked.length
             : Math.min(1, picked.length);
           const queuedKeys = [];
           for (const [index, n] of picked.slice(0, dispatchCount).entries()) {
             const selectedMember = team.members?.[index] ?? team.members?.[0];
-            if (selectedMember && Number(n.attempts ?? 0) === 0 && Number(n.planVersion ?? 1) <= 1) {
+            const nodeBudget = parseJsonSafe(n.budgetJson, {});
+            const isMaterializedReviewer = nodeBudget?.reviewerMetadata?.autoMaterialized === true;
+            if (
+              selectedMember &&
+              !isMaterializedReviewer &&
+              Number(n.attempts ?? 0) === 0 &&
+              Number(n.planVersion ?? 1) <= 1
+            ) {
               const candidate = candidates.find((item) => item.model === selectedMember.id || item.id === selectedMember.id);
               if (candidate) {
                 this.store.db.prepare('UPDATE swarm_nodes SET model=?, provider=?, updatedAt=? WHERE id=? AND status=?').run(candidate.model ?? candidate.id, candidate.provider ?? 'pool', Date.now(), n.id, SWARM_NODE_STATES.READY);
@@ -905,6 +935,13 @@ export class AdaptiveSwarmOrchestrator {
                 capabilityScore: member.capabilityScore,
                 historyScore: member.historyScore,
               })) ?? [],
+              reviewer: team.reviewer
+                ? {
+                    id: team.reviewer.id,
+                    nodeKey: reviewerNode?.nodeKey ?? null,
+                    materialized: Boolean(reviewerNode),
+                  }
+                : null,
               isSynthetic: run.isSynthetic ? 1 : 0,
             });
             return {
@@ -1235,7 +1272,17 @@ export class AdaptiveSwarmOrchestrator {
           ...peekedInbox.map((m) => `[协同消息来自 ${m.fromAgentId}]: ${JSON.stringify(m.payload)}`),
           ...(claimedMessage ? [`[统一协同消息来自 ${claimedMessage.fromAgentId}]: ${JSON.stringify(claimedMessage.payload)}`] : []),
         ];
-        const fullObjective = [...depResults, ...inboxMsgs, node.objective].join('\n\n');
+        let fullObjective = [...depResults, ...inboxMsgs, node.objective].join('\n\n');
+        const reviewerEvidence = this.#buildReviewerEvidenceContext({ run, node, byKey });
+        if (reviewerEvidence) {
+          fullObjective = [
+            fullObjective,
+            '[独立 Reviewer 执行约束]',
+            '你是独立 Reviewer。不得把前置 Agent 的自然语言结论当作事实；必须使用 read_swarm_artifact 检查提供的持久化产物，并依据下面的 durable receipt/verdict/evidence 清单形成审查结论。Reviewer 只读，不得修改工作区。',
+            '[Durable evidence manifest]',
+            JSON.stringify(reviewerEvidence),
+          ].join('\n\n');
+        }
 
         const cp = node.childTurnId ? this.checkpointStore?.loadLatest?.(node.childTurnId) : null;
         const treeSnap = this.budgetLedger?.ensureLedger({
@@ -1793,6 +1840,239 @@ export class AdaptiveSwarmOrchestrator {
       }
       this.#notifyWaiters(settled);
     });
+  }
+
+  #materializeReviewerNode({ run, team, picked, candidates, now }) {
+    if (!run || team?.mode !== 'team' || !team.reviewer?.required || !Array.isArray(picked) || picked.length === 0) {
+      return null;
+    }
+
+    const sourceNodeKeys = [...new Set(picked.map((node) => String(node.nodeKey)).filter(Boolean))].sort();
+    if (
+      sourceNodeKeys.length === 0 ||
+      picked.some((node) => parseJsonSafe(node.budgetJson, {})?.reviewerMetadata?.autoMaterialized === true)
+    ) {
+      return null;
+    }
+
+    const reviewerCandidate = candidates.find(
+      (candidate) => candidate.id === team.reviewer.id || candidate.model === team.reviewer.id,
+    );
+    if (!reviewerCandidate) {
+      throw new RuntimeError('INVALID_REVIEWER_SELECTION', {
+        message: `TeamOptimizer selected unavailable reviewer candidate ${team.reviewer.id}`,
+        detail: { runId: run.id, reviewerId: team.reviewer.id, sourceNodeKeys },
+      });
+    }
+
+    const planVersion = Number(run.planVersion || 1);
+    const digest = createHash('sha256')
+      .update(`${run.id}:v${planVersion}:${sourceNodeKeys.join('|')}`)
+      .digest('hex')
+      .slice(0, 20);
+    const nodeKey = `reviewer:${planVersion}:${digest}`;
+    const existing = this.store.db
+      .prepare('SELECT * FROM swarm_nodes WHERE runId=? AND nodeKey=?')
+      .get(run.id, nodeKey);
+    if (existing) return existing;
+
+    const objective = [
+      '独立审查前置 Swarm 节点的实际产物、工具 receipt 和验证证据。',
+      `前置节点: ${sourceNodeKeys.join(', ')}`,
+      '不得修改代码或覆盖前置节点证据；如证据不足或存在冲突，必须明确报告并拒绝无证据通过。',
+    ].join('\n');
+    const acceptance =
+      '独立读取所有可用前置 artifact，并核对 durable tool receipts / verifier evidence；输出包含 evidenceRefs 的审查结论。';
+    const reviewSelection = this.router?.select?.({
+      taskType: 'review',
+      objective,
+      requiredTools: ['read_file', 'glob', 'grep', 'read_blob', 'read_swarm_artifact'],
+      budget: run.budget ?? {},
+      preferredModel: reviewerCandidate.model ?? reviewerCandidate.id,
+      readOnly: true,
+    });
+    const profile = reviewSelection?.profile ?? {};
+    const toolAllow = [
+      ...(Array.isArray(profile.toolAllow) ? profile.toolAllow : []),
+      'read_file',
+      'glob',
+      'grep',
+      'read_blob',
+      'read_swarm_artifact',
+    ];
+    const maxSteps = Number.isFinite(Number(run.budget?.maxReviewerSteps))
+      ? Math.max(1, Math.min(8, Math.floor(Number(run.budget.maxReviewerSteps))))
+      : 8;
+    const reviewerBudget = {
+      maxSteps,
+      ...(Number.isFinite(Number(run.budget?.maxReviewerTokens))
+        ? { maxTokens: Math.max(1, Math.floor(Number(run.budget.maxReviewerTokens))) }
+        : {}),
+      requiredCapabilities: { reasoning: 1, research: 1 },
+      reviewerMetadata: {
+        autoMaterialized: true,
+        candidateId: reviewerCandidate.id,
+        sourceNodeKeys,
+        reason: team.reviewer.reason ?? 'independent evidence/conclusion review',
+        evidencePolicy: team.evidencePolicy ?? null,
+      },
+    };
+
+    this.store.db
+      .prepare(
+        `INSERT OR IGNORE INTO swarm_nodes(
+          id, runId, nodeKey, agentProfileId, model, provider, objective, acceptance,
+          dependenciesJson, toolAllowJson, permissionMode, taskType, isolationMode,
+          allowIsolationFallback, planVersion, status, priority, budgetJson, createdAt, updatedAt
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`,
+      )
+      .run(
+        uuid(),
+        run.id,
+        nodeKey,
+        profile.id ?? 'dynamic:review',
+        reviewerCandidate.model ?? reviewerCandidate.id,
+        reviewerCandidate.provider ?? reviewSelection?.provider ?? 'pool',
+        objective,
+        acceptance,
+        JSON.stringify(sourceNodeKeys),
+        JSON.stringify([...new Set(toolAllow.map(String))]),
+        run.permissionMode || 'auto-safe',
+        'review',
+        'shared_readonly',
+        0,
+        planVersion,
+        100,
+        JSON.stringify(reviewerBudget),
+        now,
+        now,
+      );
+
+    return this.store.db
+      .prepare('SELECT * FROM swarm_nodes WHERE runId=? AND nodeKey=?')
+      .get(run.id, nodeKey);
+  }
+
+  #buildReviewerEvidenceContext({ run, node, byKey }) {
+    if (!node || node.taskType !== 'review') return null;
+    const budget = parseJsonSafe(node.budgetJson, {});
+    const metadata = budget?.reviewerMetadata;
+    const sourceNodeKeys = Array.isArray(metadata?.sourceNodeKeys)
+      ? [...new Set(metadata.sourceNodeKeys.map(String))]
+      : [];
+    if (sourceNodeKeys.length === 0) return null;
+
+    const sourceNodes = sourceNodeKeys.map((key) => byKey.get(key)).filter(Boolean);
+    const sourceNodeIds = sourceNodes.map((source) => source.id).filter(Boolean);
+    const childSessionIds = sourceNodes.map((source) => source.childSessionId).filter(Boolean);
+    const childTurnIds = sourceNodes.map((source) => source.childTurnId).filter(Boolean);
+
+    const artifactRows = sourceNodeIds.length
+      ? this.store.db
+          .prepare(
+            `SELECT id, uri, nodeId, nodeKey, childSessionId, childTurnId, attempt,
+                    bundleSha256, status, createdAt, updatedAt
+             FROM swarm_artifacts
+             WHERE runId=? AND nodeId IN (${sourceNodeIds.map(() => '?').join(',')})
+             ORDER BY createdAt ASC, attempt ASC`,
+          )
+          .all(run.id, ...sourceNodeIds)
+      : [];
+    const verifiedArtifacts = artifactRows
+      .filter((artifact) => artifact.status !== 'superseded')
+      .map((artifact) => {
+        let verified = null;
+        try {
+          verified = this.artifactManager?.verifyArtifact?.(artifact.id) ?? null;
+        } catch (error) {
+          verified = { ok: false, errors: [String(error?.message ?? error)] };
+        }
+        return {
+          ...artifact,
+          verified: verified?.ok === true,
+          verificationErrors: verified?.ok === true ? [] : (verified?.errors ?? ['artifact verifier unavailable']),
+        };
+      });
+
+    let receiptRows = [];
+    if (childTurnIds.length > 0) {
+      const sessionClause = childSessionIds.length
+        ? ` AND sessionId IN (${childSessionIds.map(() => '?').join(',')})`
+        : '';
+      receiptRows = this.store.db
+        .prepare(
+          `SELECT id, sessionId, turnId, callId, toolName, status, exitCode,
+                  outputDigest, errorCode, createdAt, updatedAt
+           FROM tool_receipts
+           WHERE turnId IN (${childTurnIds.map(() => '?').join(',')})${sessionClause}
+           ORDER BY createdAt ASC
+           LIMIT 200`,
+        )
+        .all(...childTurnIds, ...childSessionIds);
+    } else if (childSessionIds.length > 0) {
+      receiptRows = this.store.db
+        .prepare(
+          `SELECT id, sessionId, turnId, callId, toolName, status, exitCode,
+                  outputDigest, errorCode, createdAt, updatedAt
+           FROM tool_receipts
+           WHERE sessionId IN (${childSessionIds.map(() => '?').join(',')})
+           ORDER BY createdAt ASC
+           LIMIT 200`,
+        )
+        .all(...childSessionIds);
+    }
+
+    const verdictRows = childTurnIds.length
+      ? this.store.db
+          .prepare(
+            `SELECT id, sessionId, state, verdictJson, evidenceCount, createdAt, finishedAt
+             FROM direct_turns
+             WHERE id IN (${childTurnIds.map(() => '?').join(',')})
+             ORDER BY createdAt ASC`,
+          )
+          .all(...childTurnIds)
+      : [];
+
+    return {
+      runId: run.id,
+      reviewerNodeKey: node.nodeKey,
+      sourceNodes: sourceNodes.map((source) => ({
+        nodeId: source.id,
+        nodeKey: source.nodeKey,
+        status: source.status,
+        childSessionId: source.childSessionId ?? null,
+        childTurnId: source.childTurnId ?? null,
+        artifactUris: parseJsonSafe(source.artifactUrisJson, []),
+      })),
+      artifacts: verifiedArtifacts.map((artifact) => ({
+        artifactId: artifact.id,
+        uri: artifact.uri,
+        nodeKey: artifact.nodeKey,
+        attempt: artifact.attempt,
+        bundleSha256: artifact.bundleSha256,
+        status: artifact.status,
+        verified: artifact.verified,
+        verificationErrors: artifact.verificationErrors,
+      })),
+      receipts: receiptRows.map((receipt) => ({
+        receiptId: receipt.id,
+        sessionId: receipt.sessionId,
+        turnId: receipt.turnId,
+        callId: receipt.callId,
+        toolName: receipt.toolName,
+        status: receipt.status,
+        exitCode: receipt.exitCode,
+        outputDigest: receipt.outputDigest,
+        errorCode: receipt.errorCode,
+      })),
+      turnVerdicts: verdictRows.map((turn) => ({
+        turnId: turn.id,
+        sessionId: turn.sessionId,
+        state: turn.state,
+        verdict: parseJsonSafe(turn.verdictJson, null),
+        evidenceCount: Number(turn.evidenceCount ?? 0),
+      })),
+    };
   }
 
   #prepareNodeSpecs(rawNodes, budget) {

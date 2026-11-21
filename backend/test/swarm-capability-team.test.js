@@ -118,6 +118,25 @@ test('TeamOptimizer chooses one agent for simple work and bounds teams by concur
   assert.equal(team.evidencePolicy.requireReviewerForConflict, true);
 });
 
+
+test('TeamOptimizer does not duplicate one worker when the reviewer consumes the only spare candidate', () => {
+  const optimizer = new TeamOptimizer({ teamSize: 2 });
+  const plan = optimizer.optimize({
+    task: { complexity: 'complex', independentWorkstreams: 2, requiredCapabilities: { coding: 1 } },
+    candidates: [
+      { id: 'worker', capabilities: { coding: 0.95 }, estimatedTokens: 10 },
+      { id: 'reviewer', role: 'reviewer', capabilities: { reasoning: 0.95 }, estimatedTokens: 10 },
+    ],
+    maxConcurrency: 2,
+    reviewerAvailable: true,
+    budget: { maxCost: 1000 },
+  });
+  assert.equal(plan.mode, 'single');
+  assert.deepEqual(plan.members.map((member) => member.id), ['worker']);
+  assert.equal(plan.reviewer, null);
+});
+
+
 test('TeamOptimizer downgrades a requested team when budget is insufficient', () => {
   const optimizer = new TeamOptimizer({ teamSize: 3 });
   const plan = optimizer.optimize({

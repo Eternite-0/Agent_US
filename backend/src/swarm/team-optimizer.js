@@ -122,7 +122,14 @@ export class TeamOptimizer {
     const teamCost = members.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (reviewer ? this.reviewerCost : 0);
     const budgetAllowsTeam = teamCost <= maxBudget;
-    const mode = teamWanted && members.length >= 1 && budgetAllowsTeam && maxC > 1 ? 'team' : 'single';
+    const requiredWorkerCount = Math.min(this.teamSize, maxC, Math.max(1, workstreams));
+    const mode =
+      teamWanted &&
+      members.length >= requiredWorkerCount &&
+      budgetAllowsTeam &&
+      maxC > 1
+        ? 'team'
+        : 'single';
     const selected = mode === 'team' ? members : [single];
     const estimatedCost = selected.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (mode === 'team' && reviewer && !selected.some((member) => member.id === reviewer.id) ? this.reviewerCost : 0);
@@ -137,7 +144,16 @@ export class TeamOptimizer {
         estimatedCost: estimateCost(member, task),
       })),
       reviewer: mode === 'team' && reviewer
-        ? { id: reviewer.id, required: true, reason: 'independent evidence/conclusion review' }
+        ? {
+            id: reviewer.id,
+            model: reviewer.model ?? reviewer.id,
+            provider: reviewer.provider ?? null,
+            role: reviewer.role ?? 'reviewer',
+            capabilityScore: Number(reviewer.capabilityScore.toFixed(4)),
+            historyScore: Number(reviewer.historyScore.toFixed(4)),
+            required: true,
+            reason: 'independent evidence/conclusion review',
+          }
         : null,
       estimatedCost,
       estimatedSteps: selected.reduce((sum, member) => sum + numeric(member.estimatedSteps ?? task.estimatedSteps ?? 1, 1), 0),
