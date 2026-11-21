@@ -1269,7 +1269,6 @@ export class SwarmArtifactManager {
           const caseOnlyRename = isCaseOnlyRenamePath(prevTarget.full, target.full);
 
           if (
-            !caseOnlyRename &&
             !prevExists &&
             nextExists &&
             sha256Buffer(readFileSync(target.full)) === entry.sha256
@@ -1425,7 +1424,7 @@ export class SwarmArtifactManager {
               symlinkSync(linkTarget, target.full);
             } else {
               writeFileSync(target.full, readRes.buffer);
-              if (process.platform !== 'win32' && entry.mode === '100755') {
+              if (entry.mode === '100755') {
                 try {
                   chmodSync(target.full, 0o755);
                 } catch {
