@@ -44,7 +44,7 @@ function normalizeRuntimeOutput(value) {
 }
 
 async function drainRuntime(runtime, { reason, timeoutMs = 5_000 } = {}) {
-  if (!runtime || typeof runtime !== 'object') return { drained: true, error: null };
+  if (!runtime || !['object', 'function'].includes(typeof runtime)) return { drained: true, error: null };
   const waitForStop = runtime.waitForStop ?? runtime.drain;
   if (typeof waitForStop !== 'function') return { drained: false, error: 'runtime does not expose waitForStop/drain' };
   const drainPromise = Promise.resolve().then(() => waitForStop.call(runtime, { reason }));
@@ -171,6 +171,7 @@ export class EvaluationRunner {
       let runtimeHandle = null;
       let runtimeDrain = null;
       let runtimeStarted = false;
+      let runtimeInvocationSettled = false;
       try {
         workspaceRoot = await createFixtureWorkspace(task);
         await this.lifecycle?.onAttemptStart?.({ task, attempt, workspaceRoot, context });
@@ -181,11 +182,25 @@ export class EvaluationRunner {
         };
          const output = await withTimeout(
            async (runtimeSignal) => {
-             const invoked = await invokeRuntime(this.runtimeFactory, {
-               task, attempt, workspaceRoot, signal: runtimeSignal, context, syntheticContext,
-             });
+             runtimeStarted = true;
+             let invoked;
+             try {
+               invoked = await invokeRuntime(this.runtimeFactory, {
+                 task, attempt, workspaceRoot, signal: runtimeSignal, context, syntheticContext,
+               });
+             } catch (error) {
+               runtimeInvocationSettled = true;
+               throw error;
+             }
              runtimeHandle = invoked.handle;
-              return normalizeRuntimeOutput(await invoked.output);
+             try {
+               const normalized = normalizeRuntimeOutput(await invoked.output);
+               runtimeInvocationSettled = true;
+               return normalized;
+             } catch (error) {
+               if (!runtimeHandle) runtimeInvocationSettled = true;
+               throw error;
+             }
            },
           { timeoutMs: task.timeoutMs ?? opts.timeoutMs, signal },
         );
@@ -201,10 +216,14 @@ export class EvaluationRunner {
       } catch (error) {
         lastError = error;
          if (isAbort(error) || signal?.aborted) {
-            runtimeDrain = await drainRuntime(runtimeHandle, {
-             reason: error?.code === 'E_EVAL_TIMEOUT' ? 'timeout' : 'cancelled',
-             timeoutMs: opts.drainTimeoutMs ?? 5_000,
-           });
+            runtimeDrain = runtimeHandle
+              ? await drainRuntime(runtimeHandle, {
+                reason: error?.code === 'E_EVAL_TIMEOUT' ? 'timeout' : 'cancelled',
+                timeoutMs: opts.drainTimeoutMs ?? 5_000,
+              })
+              : runtimeInvocationSettled
+                ? { drained: true, error: null }
+                : { drained: false, error: 'runtime handle unavailable before timeout/cancellation' };
           const status = error?.code === 'E_EVAL_TIMEOUT' || error?.name === 'TimeoutError' ? 'timeout' : 'cancelled';
             const result = { taskId: task.id, status, passed: false, attempts: attempt, durationMs: Date.now() - started, error: error.message, metadata: { runtimeDrained: runtimeDrain.drained, runtimeDrainError: runtimeDrain.error } };
           await this.lifecycle?.onAttemptEnd?.({ task, attempt, workspaceRoot, result });
@@ -221,10 +240,15 @@ export class EvaluationRunner {
         await this.lifecycle?.onRetry?.({ task, attempt, nextAttempt: attempt + 1, workspaceRoot, error });
         if (opts.retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, opts.retryDelayMs));
        } finally {
-         if (runtimeHandle && typeof runtimeHandle === 'object') {
+         if (runtimeHandle && ['object', 'function'].includes(typeof runtimeHandle)) {
            runtimeDrain ??= await drainRuntime(runtimeHandle, { reason: 'settled', timeoutMs: opts.drainTimeoutMs ?? 5_000 });
            if (!runtimeDrain.drained) retainFixtureWorkspace(workspaceRoot);
            else await removeFixtureWorkspace(workspaceRoot);
+         } else if (!runtimeInvocationSettled && runtimeStarted) {
+           // The runtime factory is still pending, so the evaluator cannot prove
+           // that the runtime stopped or relinquished the workspace. Retain it
+           // for recovery/diagnostics rather than deleting a live workspace.
+           retainFixtureWorkspace(workspaceRoot);
          } else {
            await removeFixtureWorkspace(workspaceRoot);
          }

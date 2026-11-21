@@ -337,3 +337,26 @@ test('evaluation timeout retains the workspace when runtime drain is not confirm
   // and must clean it after observing the safety behavior.
   await rm(started.workspaceRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
 });
+
+test('evaluation timeout retains the workspace when the runtime factory never yields a stoppable handle', async () => {
+  const task = BENCHMARK_DATASET[0];
+  let started = null;
+  const runner = new EvaluationRunner({
+    registry: { list: () => [task], require: () => task },
+    concurrency: 1,
+    timeoutMs: 25,
+    drainTimeoutMs: 50,
+    runtimeFactory: async () => new Promise(() => {}),
+    lifecycle: {
+      onAttemptStart: ({ workspaceRoot }) => { started = workspaceRoot; },
+    },
+  });
+
+  const report = await runner.run();
+  assert.equal(report.results[0].status, 'timeout');
+  assert.equal(report.results[0].metadata.runtimeDrained, false);
+  assert.match(report.results[0].metadata.runtimeDrainError, /handle unavailable/);
+  assert.ok(started);
+  await access(started);
+  await rm(started, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+});
