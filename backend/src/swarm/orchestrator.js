@@ -878,7 +878,7 @@ export class AdaptiveSwarmOrchestrator {
           const queuedKeys = [];
           for (const [index, n] of picked.slice(0, dispatchCount).entries()) {
             const selectedMember = team.members?.[index] ?? team.members?.[0];
-            if (selectedMember) {
+            if (selectedMember && Number(n.attempts ?? 0) === 0 && Number(n.planVersion ?? 1) <= 1) {
               const candidate = candidates.find((item) => item.model === selectedMember.id || item.id === selectedMember.id);
               if (candidate) {
                 this.store.db.prepare('UPDATE swarm_nodes SET model=?, provider=?, updatedAt=? WHERE id=? AND status=?').run(candidate.model ?? candidate.id, candidate.provider ?? 'pool', Date.now(), n.id, SWARM_NODE_STATES.READY);
