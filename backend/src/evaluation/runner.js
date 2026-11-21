@@ -4,7 +4,7 @@ import { EvaluationRegistry } from './registry.js';
 import { createDeterministicJudge } from './judge.js';
 import { EvaluationRecorder } from './recorder.js';
 import { scoreResults } from './scoring.js';
-import { createFixtureWorkspace, removeFixtureWorkspace } from './fixtures.js';
+import { createFixtureWorkspace, removeFixtureWorkspace, retainFixtureWorkspace } from './fixtures.js';
 
 function abortError(reason = 'cancelled') {
   const error = new Error(String(reason));
@@ -18,17 +18,40 @@ function isAbort(error) {
 }
 
 async function invokeRuntime(runtimeFactory, args) {
-  if (!runtimeFactory) return { output: args.task.fixture?.output };
+  if (!runtimeFactory) return { handle: null, output: args.task.fixture?.output };
   const runtime = await runtimeFactory(args);
-  if (typeof runtime === 'function') return runtime(args);
-  if (runtime?.runTask) return runtime.runTask(args);
-  if (runtime?.run) return runtime.run(args);
-  if (runtime?.execute) return runtime.execute(args);
+  if (typeof runtime === 'function') return { handle: runtime, output: runtime(args) };
+  if (runtime?.runTask) return { handle: runtime, output: runtime.runTask(args) };
+  if (runtime?.run) return { handle: runtime, output: runtime.run(args) };
+  if (runtime?.execute) return { handle: runtime, output: runtime.execute(args) };
   // A runtimeFactory may itself be the injected runtime entry point and return
   // the task result directly. Keep that contract compatible with the method-
   // based adapter form above.
-  if (runtime !== null && typeof runtime === 'object') return runtime;
+  if (runtime !== null && typeof runtime === 'object') return { handle: null, output: runtime };
   throw new TypeError('runtimeFactory must return a function, a result object, or an object with runTask/run/execute');
+}
+
+async function drainRuntime(runtime, { reason, timeoutMs = 5_000 } = {}) {
+  if (!runtime || typeof runtime !== 'object') return { drained: true, error: null };
+  const waitForStop = runtime.waitForStop ?? runtime.drain;
+  if (typeof waitForStop !== 'function') return { drained: false, error: 'runtime does not expose waitForStop/drain' };
+  const drainPromise = Promise.resolve().then(() => waitForStop.call(runtime, { reason }));
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return drainPromise.then(() => true);
+  let timer;
+  try {
+    const outcome = await Promise.race([
+      drainPromise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ drained: false, error: 'runtime drain timeout' }), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    return outcome && typeof outcome === 'object' ? outcome : { drained: true, error: null };
+  } catch (error) {
+    return { drained: false, error: String(error?.message ?? error).slice(0, 500) };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function withTimeout(fn, { timeoutMs, signal }) {
@@ -74,6 +97,7 @@ export class EvaluationRunner {
     maxAttempts = 1,
     budget = {},
     retryDelayMs = 0,
+    drainTimeoutMs = 5_000,
   } = {}) {
     validateRunnerOptions({ concurrency, timeoutMs, maxAttempts, budget });
     this.registry = registry;
@@ -81,7 +105,7 @@ export class EvaluationRunner {
     this.judge = judge;
     this.recorder = recorder;
     this.syntheticContextHook = syntheticContextHook;
-    this.options = { concurrency, timeoutMs, maxAttempts, budget, retryDelayMs };
+    this.options = { concurrency, timeoutMs, maxAttempts, budget, retryDelayMs, drainTimeoutMs };
   }
 
   async run({ ids = null, tasks = null, signal = undefined, context = {}, ...overrides } = {}) {
@@ -134,10 +158,16 @@ export class EvaluationRunner {
           source: 'evaluation',
           ...(await this.syntheticContextHook?.({ task, attempt, workspaceRoot, context, signal }) ?? {}),
         };
-        const output = await withTimeout(
-          (runtimeSignal) => invokeRuntime(this.runtimeFactory, {
-            task, attempt, workspaceRoot, signal: runtimeSignal, context, syntheticContext,
-          }),
+         let runtimeHandle = null;
+         let runtimeDrain = null;
+         const output = await withTimeout(
+           async (runtimeSignal) => {
+             const invoked = await invokeRuntime(this.runtimeFactory, {
+               task, attempt, workspaceRoot, signal: runtimeSignal, context, syntheticContext,
+             });
+             runtimeHandle = invoked.handle;
+             return invoked.output;
+           },
           { timeoutMs: task.timeoutMs ?? opts.timeoutMs, signal },
         );
         const judgment = await this.judge({ task, output, context: { ...context, syntheticContext, workspaceRoot, attempt } });
@@ -150,16 +180,26 @@ export class EvaluationRunner {
         return result;
       } catch (error) {
         lastError = error;
-        if (isAbort(error) || signal?.aborted) {
+         if (isAbort(error) || signal?.aborted) {
+            runtimeDrain = await drainRuntime(runtimeHandle, {
+             reason: error?.code === 'E_EVAL_TIMEOUT' ? 'timeout' : 'cancelled',
+             timeoutMs: opts.drainTimeoutMs ?? 5_000,
+           });
           const status = error?.code === 'E_EVAL_TIMEOUT' || error?.name === 'TimeoutError' ? 'timeout' : 'cancelled';
-          const result = { taskId: task.id, status, passed: false, attempts: attempt, durationMs: Date.now() - started, error: error.message };
+            const result = { taskId: task.id, status, passed: false, attempts: attempt, durationMs: Date.now() - started, error: error.message, metadata: { runtimeDrained: runtimeDrain.drained, runtimeDrainError: runtimeDrain.error } };
           await this.recorder.record(result);
           return result;
         }
         if (attempt >= maxAttempts) break;
         if (opts.retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, opts.retryDelayMs));
-      } finally {
-        await removeFixtureWorkspace(workspaceRoot);
+       } finally {
+         if (runtimeHandle && typeof runtimeHandle === 'object') {
+           runtimeDrain ??= await drainRuntime(runtimeHandle, { reason: 'settled', timeoutMs: opts.drainTimeoutMs ?? 5_000 });
+           if (!runtimeDrain.drained) retainFixtureWorkspace(workspaceRoot);
+           else await removeFixtureWorkspace(workspaceRoot);
+         } else {
+           await removeFixtureWorkspace(workspaceRoot);
+         }
       }
     }
     const result = { taskId: task.id, status: 'failed', passed: false, attempts: maxAttempts, durationMs: Date.now() - started, error: lastError?.message ?? 'evaluation failed' };

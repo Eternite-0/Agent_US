@@ -17,6 +17,16 @@ export async function removeFixtureWorkspace(workspaceRoot) {
   if (workspaceRoot) await rm(workspaceRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
 }
 
+/**
+ * Evaluation workspaces are deliberately isolated under the OS temp directory.
+ * When a runtime does not confirm that it has stopped after cancellation or a
+ * timeout, callers must retain the directory rather than risk deleting files
+ * while a late tool call is still using them.
+ */
+export function retainFixtureWorkspace(workspaceRoot) {
+  return workspaceRoot || null;
+}
+
 export async function withFixtureWorkspace(task, fn, options = {}) {
   const workspaceRoot = await createFixtureWorkspace(task, options);
   try {
