@@ -280,8 +280,11 @@ export class DirectAgentRuntime {
       jobQueue: this.jobQueue,
       hookTrust: this.hookTrust,
       dataRoot: this.dataRoot,
+      approvalManager: this.approvalManager,
+      getLivePolicy: (sessionId) => this.#getLiveSessionPolicy(sessionId),
+      requestApproval: (request) => this.approvalManager.requestApproval(request),
       getDefaultModel: () => this.pool.getDefaultModel(),
-      getWorkspaceTools: ({ workspaceRoot, sessionId, permissionMode, nonce, signal }) =>
+      getWorkspaceTools: ({ workspaceRoot, sessionId, permissionMode, nonce, getLivePolicy, getApprovedPrefixes, requestApproval, signal }) =>
         createWorkspaceTools({
           workspaceRoot,
           dataRoot: this.dataRoot,
@@ -291,6 +294,9 @@ export class DirectAgentRuntime {
           nonce,
           processManager: this.processManager,
           sandbox: this.sandbox,
+          getLivePolicy,
+          getApprovedPrefixes,
+          requestApproval,
           onHookConfigMutated: ({ path, toolName }) =>
             this.hookTrust.onConfigMutated({ filePath: path, toolName }),
           signal,
@@ -1226,6 +1232,7 @@ export class DirectAgentRuntime {
         sessionId,
         permissionMode: effectivePermissionMode,
         nonce,
+        getLivePolicy: () => this.#getLiveSessionPolicy(sessionId),
         getApprovedPrefixes: () => this.#getLiveSessionPolicy(sessionId)?.approvedPrefixes ?? [],
         readFileState,
         processManager: this.processManager,

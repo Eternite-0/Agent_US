@@ -206,6 +206,7 @@ export class AgentLoop {
     getLivePolicy = null,
     getApprovedPrefixes = () => [],
     requestApproval = null,
+    approvalManager = null,
     onAssistantMessage = null,
     onToolResult = null,
     leaseGuard = null,
@@ -684,6 +685,7 @@ export class AgentLoop {
           getLivePolicy,
           getApprovedPrefixes,
           requestApproval,
+          approvalManager,
           tainted: Boolean(execution?.tainted),
         });
 

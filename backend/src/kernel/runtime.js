@@ -51,6 +51,8 @@ export class AgentRuntimeKernel {
     toolPolicy = null,
     eventRouter = null,
     cancellationManager = null,
+    approvalManager = null,
+    getLivePolicy = null,
   }) {
     this.store = store;
     this.eventRouter = eventRouter ?? new EventRouter(store);
@@ -66,6 +68,8 @@ export class AgentRuntimeKernel {
         eventRouter: this.eventRouter,
         reconciler: this.reconciler,
         policy: this.toolPolicy,
+        approvalManager,
+        getLivePolicy,
       });
     this.decisionEngine = new DecisionEngine({ judgment, verifier });
     this.loop = new AgentLoop({

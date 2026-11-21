@@ -76,6 +76,7 @@ export function createWorkspaceTools({
   sessionId = null,
   permissionMode = 'auto-safe',
   nonce = '',
+  getLivePolicy = null,
   getApprovedPrefixes = () => [],
   readFileState = new Map(),
   processManager = null,
@@ -109,6 +110,17 @@ export function createWorkspaceTools({
     if (ctx?.permitProof && verifyAndClearPermitProof(ctx.permitProof)) return;
     (ctx?.signal ?? signal)?.throwIfAborted?.();
 
+    const livePolicy =
+      typeof getLivePolicy === 'function'
+        ? getLivePolicy({ sessionId, toolName })
+        : null;
+    const livePermissionMode = livePolicy?.permissionMode ?? permissionMode;
+    const liveAllowTools = livePolicy && 'allowTools' in livePolicy ? livePolicy.allowTools : undefined;
+    const liveDenyTools = livePolicy && 'denyTools' in livePolicy ? livePolicy.denyTools : undefined;
+    const livePrefixes =
+      typeof getApprovedPrefixes === 'function'
+        ? getApprovedPrefixes()
+        : livePolicy?.approvedPrefixes ?? [];
     const meta = WORKSPACE_TOOL_META[toolName] ?? {
       readOnly: false,
       effectClass: toolName.startsWith('mcp__') ? 'external_network' : 'irreversible_side_effect',
@@ -125,9 +137,11 @@ export function createWorkspaceTools({
       },
       args ?? {},
       {
-        approvedPrefixes: getApprovedPrefixes(),
+        approvedPrefixes: livePrefixes,
         tainted: Boolean(ctx?.tainted),
-        permissionMode,
+        permissionMode: livePermissionMode,
+        allowTools: liveAllowTools,
+        denyTools: liveDenyTools,
       },
     );
 
