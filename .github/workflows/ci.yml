@@ -96,7 +96,7 @@ jobs:
             exit 1
           fi
           echo "Running ${#TESTS[@]} backend test files (--test-timeout=60000)"
-          node --test --test-timeout=60000 "${TESTS[@]}"
+          node --test --test-concurrency=4 --test-timeout=60000 "${TESTS[@]}"
           echo "::endgroup::"
 
       - name: Backend core and regression test suites (PowerShell)
@@ -119,7 +119,7 @@ jobs:
             exit 1
           }
           Write-Host "Running $($tests.Count) backend test files (--test-timeout=60000)"
-          node --test --test-timeout=60000 @tests
+          node --test --test-concurrency=4 --test-timeout=60000 @tests
           $code = $LASTEXITCODE
           Write-Host "::endgroup::"
           if ($code -ne 0) { exit $code }
