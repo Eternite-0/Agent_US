@@ -36,11 +36,11 @@ async function drainRuntime(runtime, { reason, timeoutMs = 5_000 } = {}) {
   const waitForStop = runtime.waitForStop ?? runtime.drain;
   if (typeof waitForStop !== 'function') return { drained: false, error: 'runtime does not expose waitForStop/drain' };
   const drainPromise = Promise.resolve().then(() => waitForStop.call(runtime, { reason }));
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return drainPromise.then(() => true);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return drainPromise.then(() => ({ drained: true, error: null }));
   let timer;
   try {
     const outcome = await Promise.race([
-      drainPromise,
+      drainPromise.then((value) => (value && typeof value === 'object' ? value : { drained: true, error: null })),
       new Promise((resolve) => {
         timer = setTimeout(() => resolve({ drained: false, error: 'runtime drain timeout' }), timeoutMs);
         timer.unref?.();
