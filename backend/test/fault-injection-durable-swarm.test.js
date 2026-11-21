@@ -19,6 +19,12 @@ import { createLeaseGuard } from '../src/durable/lease-guard.js';
 import { UnknownOutcomeReconciler } from '../src/durable/reconciliation.js';
 import { TaskTreeBudgetLedger } from '../src/swarm/budget-ledger.js';
 import { SwarmArtifactManager } from '../src/swarm/artifacts.js';
+import {
+  SWARM_NODE_STATES,
+  SWARM_RUN_STATES,
+  transitionSwarmNode,
+  transitionSwarmRun,
+} from '../src/swarm/node-state-machine.js';
 import { rmDirSafe, withTimeout } from './fixtures.js';
 
 function makeDir(prefix) { return mkdtempSync(join(tmpdir(), prefix)); }
@@ -290,6 +296,123 @@ test('Fault injection durable #17: ATTEMPTS_EXHAUSTED converges job finality', (
     assert.equal(row.attempts, 1);
     assert.equal(queue.claim({ workerId: 'attempt-worker-c', kinds: ['fault_probe'], leaseMs: 1000 }), null);
     assert.equal(first.status, 'active');
+  } finally {
+    store.close();
+    rmDirSafe(dir);
+  }
+});
+
+// #5/#7/#14: two SQLite runtimes may archive/read the same run concurrently,
+// while planVersion CAS prevents a stale replan from racing node completion.
+test('Fault injection durable #5/#7/#14: dual-runtime artifact reads and replan CAS stay fenced', async () => {
+  const dir = makeDir('agent-us-fi-dual-runtime-');
+  const repo = join(dir, 'repo');
+  const storage = join(dir, 'artifacts');
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(storage, { recursive: true });
+  initGit(repo);
+  writeFileSync(join(repo, 'shared.txt'), 'authoritative\n');
+  const dbPath = join(dir, 'engine.sqlite');
+  const storeA = new Store(dbPath);
+  const storeB = new Store(dbPath);
+  try {
+    const now = Date.now();
+    storeA.tx(() => {
+      storeA.db
+        .prepare(
+          `INSERT INTO swarm_runs(id,sessionId,goal,status,strategyJson,budgetJson,planVersion,replanCount,createdAt,updatedAt)
+           VALUES('run-dual','sess-dual','dual','running','{}','{}',1,0,?,?)`,
+        )
+        .run(now, now);
+      storeA.db
+        .prepare(
+          `INSERT INTO swarm_nodes(id,runId,nodeKey,agentProfileId,objective,acceptance,status,planVersion,createdAt,updatedAt)
+           VALUES('node-dual','run-dual','node-dual','default','dual','dual','running',1,?,?)`,
+        )
+        .run(now, now);
+    });
+    const managerA = new SwarmArtifactManager({ store: storeA, storageRoot: storage });
+    const managerB = new SwarmArtifactManager({ store: storeB, storageRoot: storage });
+    const [artifactA, artifactB] = await Promise.all([
+      managerA.archiveWorktree({
+        runId: 'run-dual', nodeId: 'node-dual-a', nodeKey: 'node-dual-a',
+        workspaceRoot: repo, worktreePath: repo, ownerId: 'runtime-a', fence: 'f-a',
+      }),
+      managerB.archiveWorktree({
+        runId: 'run-dual', nodeId: 'node-dual-b', nodeKey: 'node-dual-b',
+        workspaceRoot: repo, worktreePath: repo, ownerId: 'runtime-b', fence: 'f-b',
+      }),
+    ]);
+    assert.notEqual(artifactA.id, artifactB.id);
+    assert.equal(managerB.verifyArtifact(artifactA.id).ok, true);
+    assert.equal(managerA.verifyArtifact(artifactB.id).ok, true);
+    assert.equal(managerB.readArtifactFile(artifactA.id, 'shared.txt').text, 'authoritative\n');
+
+    const advanced = transitionSwarmRun(storeA, 'run-dual', SWARM_RUN_STATES.RUNNING, {
+      expectedPlanVersion: 1,
+      expectedReplanCount: 0,
+      patch: { planVersion: 2, replanCount: 1 },
+    });
+    assert.equal(advanced.planVersion, 2);
+    assert.throws(
+      () =>
+        transitionSwarmRun(storeB, 'run-dual', SWARM_RUN_STATES.RUNNING, {
+          expectedPlanVersion: 1,
+          expectedReplanCount: 0,
+          patch: { planVersion: 2, replanCount: 1 },
+        }),
+      (err) => err?.code === 'INVALID_SWARM_TRANSITION' && err?.detail?.casConflict === true,
+    );
+    const completed = transitionSwarmNode(storeB, null, 'node-dual', SWARM_NODE_STATES.COMPLETED, {
+      expectedPlanVersion: 1,
+      patch: { resultText: 'done' },
+      emitEvent: false,
+    });
+    assert.equal(completed.status, 'completed');
+    assert.throws(
+      () =>
+        transitionSwarmNode(storeA, null, 'node-dual', SWARM_NODE_STATES.READY, {
+          expectedPlanVersion: 1,
+          allowReplanReset: true,
+          emitEvent: false,
+        }),
+      (err) => err?.code === 'INVALID_SWARM_TRANSITION',
+    );
+  } finally {
+    storeB.close();
+    storeA.close();
+    rmDirSafe(dir);
+  }
+});
+
+// #3/#4/#10/#11: a stale receipt finish after lease takeover is converted to
+// outcome_unknown and cannot overwrite the authoritative worker's state.
+test('Fault injection durable #3/#4/#10/#11: delayed stale receipt write is outcome-unknown fenced', () => {
+  const dir = makeDir('agent-us-fi-receipt-takeover-');
+  const store = new Store(join(dir, 'engine.sqlite'));
+  try {
+    const queue = new DurableJobQueue(store, { defaultLeaseMs: 1000 });
+    const reconciler = new UnknownOutcomeReconciler(store, null);
+    const job = queue.enqueue({ kind: 'swarm_node_execute', payload: {}, maxAttempts: 3 });
+    const first = queue.claim({ workerId: 'receipt-old', kinds: ['swarm_node_execute'], leaseMs: 1000 });
+    const oldGuard = createLeaseGuard({ store, jobId: job.id, fence: first.fence });
+    const receipt = reconciler.recordReceiptStart({
+      id: 'receipt-takeover', sessionId: 's-takeover', turnId: 't-takeover', taskId: 'run-takeover',
+      callId: 'call-takeover', toolName: 'deploy', outward: true, args: { target: 'prod' }, leaseGuard: oldGuard,
+    });
+    assert.equal(receipt.status, 'executing');
+    store.tx(() => store.db.prepare('UPDATE runtime_jobs SET leaseExpiresAt=? WHERE id=?').run(Date.now() - 1, job.id));
+    const second = queue.claim({ workerId: 'receipt-new', kinds: ['swarm_node_execute'], leaseMs: 1000 });
+    assert.notEqual(second.fence, first.fence);
+    const late = reconciler.recordReceiptFinish(receipt.id, {
+      status: 'finished',
+      output: 'stale success',
+      leaseGuard: oldGuard,
+    });
+    assert.equal(late.status, 'outcome_unknown');
+    assert.equal(late.errorCode, 'LEASE_LOST_UNKNOWN_OUTCOME');
+    assert.equal(reconciler.recordReceiptFinish(receipt.id, { status: 'finished', output: 'new late write' }).status, 'outcome_unknown');
+    queue.complete(second.id, second.fence);
   } finally {
     store.close();
     rmDirSafe(dir);
