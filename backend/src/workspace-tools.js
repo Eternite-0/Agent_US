@@ -83,6 +83,7 @@ export function createWorkspaceTools({
   sandbox = null,
   mcpTools = [],
   requestApproval = null,
+  approvalManager = null,
   onBeforeMutate = () => {},
   onFileChanged = () => {},
   onHookConfigMutated = null,
@@ -187,6 +188,18 @@ export function createWorkspaceTools({
       approvalId =
         (typeof decision === 'object' && decision?.approvalId) ||
         `approved-${ctx?.callId || ++seq}`;
+      if (approvalManager && typeof approvalManager.consumeApproval === 'function') {
+        const consumed = approvalManager.consumeApproval(approvalId, {
+          expectedArgsDigest: argsDigest,
+          sessionId,
+          turnId: ctx?.turnId,
+        });
+        if (!consumed?.ok) {
+          throw new PolicyError(consumed?.code || 'APPROVAL_REVOKED', {
+            message: consumed?.reason || `Approval is no longer valid for ${toolName}`,
+          });
+        }
+      }
     }
     const effectId = `${toolName}-${ctx?.callId || 'local'}-${++seq}`;
     const binding = {

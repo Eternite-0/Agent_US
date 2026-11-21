@@ -267,6 +267,7 @@ export class ChildAgentManager {
     isolatedWorktree,
     getApprovedPrefixes = () => [],
     requestApproval = null,
+    approvalManager = null,
     getLivePolicy = null,
     isChild = true,
     extraTools = [],
@@ -280,6 +281,7 @@ export class ChildAgentManager {
         getLivePolicy,
         getApprovedPrefixes,
         requestApproval,
+        approvalManager,
         signal,
       }),
       ...extraTools,
@@ -725,6 +727,7 @@ export class ChildAgentManager {
             getLivePolicy: readLivePolicy,
             getApprovedPrefixes: readApprovedPrefixes,
             requestApproval: childRequestApproval,
+            approvalManager: this.approvalManager,
             extraTools,
           });
 
