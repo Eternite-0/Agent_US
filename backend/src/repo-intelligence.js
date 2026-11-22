@@ -13,9 +13,17 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const PROTECTED_ROOTS = ['../../upstream/', '../var/'].map((rel) =>
-  resolve(fileURLToPath(new URL(rel, import.meta.url))),
-);
+const nativeRealpathSync = (p) =>
+  typeof realpathSync.native === 'function' ? realpathSync.native(p) : realpathSync(p);
+
+const PROTECTED_ROOTS = ['../../upstream/', '../var/'].map((rel) => {
+  const abs = resolve(fileURLToPath(new URL(rel, import.meta.url)));
+  try {
+    return nativeRealpathSync(abs);
+  } catch {
+    return abs;
+  }
+});
 
 const ALWAYS_SKIP_DIRS = new Set([
   '.git',
@@ -109,7 +117,7 @@ function assertSafeWorkspaceRoot(workspaceRoot) {
   if (!st.isDirectory()) {
     throw new Error(`Workspace root is not a directory: ${abs}`);
   }
-  const real = realpathSync(abs);
+  const real = nativeRealpathSync(abs);
   if (PROTECTED_ROOTS.some((pr) => !isOutsideRoot(pr, real))) {
     throw new Error(`Access to protected directory is prohibited: ${real}`);
   }
@@ -320,11 +328,12 @@ function buildTreeLines(files, dirs, maxLines = 80) {
 }
 
 async function scanWorkspace(realRoot, { maxFiles }) {
+  const canonicalRoot = await realpath(realRoot);
   const files = [];
   const allDirs = [];
   const topLevelDirs = [];
   const rulesByDir = new Map([['', []]]);
-  const queue = [{ dir: realRoot, rel: '', depth: 0 }];
+  const queue = [{ dir: canonicalRoot, rel: '', depth: 0 }];
   const maxDirs = Math.max(250, maxFiles * 4);
   let visitedDirs = 0;
 
@@ -338,7 +347,7 @@ async function scanWorkspace(realRoot, { maxFiles }) {
     } catch {
       continue;
     }
-    if (isOutsideRoot(realRoot, canonicalDir) || canonicalDir !== current.dir) continue;
+    if (isOutsideRoot(canonicalRoot, canonicalDir) || canonicalDir !== current.dir) continue;
 
     let entries;
     try {

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmDirSafe } from './fixtures.js';
@@ -668,6 +668,48 @@ test('analyzeRepository: handles unborn git repo, requirements.txt, side-effect 
     const mainMod = res.callGraph.modules.find((m) => m.path === 'src/main.js');
     assert.ok(mainMod?.exports.includes('utils'));
     assert.ok(mainMod?.exports.includes('run'));
+  } finally {
+    rmDirSafe(workDir);
+  }
+});
+
+test('analyzeRepository: handles non-canonical root casing, dot segments, and Windows 8.3 short paths', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'AgentUs Long Segment Repo '));
+  try {
+    mkdirSync(join(workDir, 'src'), { recursive: true });
+    writeFileSync(
+      join(workDir, 'package.json'),
+      JSON.stringify({ name: 'shortpath-demo', version: '1.0.0', dependencies: { commander: '^14.0.0' } }),
+      'utf8',
+    );
+    writeFileSync(join(workDir, 'src', 'index.js'), 'export const ok = true;\n', 'utf8');
+
+    const unnormalizedRoot = join(workDir, 'src', '..');
+    const resDot = await analyzeRepository(unnormalizedRoot);
+    assert.equal(resDot.project.name, 'shortpath-demo');
+    assert.ok(resDot.project.dependencies.includes('commander'));
+    assert.deepEqual(resDot.structure.sourceFiles, ['src/index.js']);
+
+    if (process.platform === 'win32') {
+      const lowerDrive = `${workDir.slice(0, 1).toLowerCase()}${workDir.slice(1)}`;
+      const resLower = await analyzeRepository(lowerDrive);
+      assert.equal(resLower.project.name, 'shortpath-demo');
+      assert.deepEqual(resLower.structure.sourceFiles, ['src/index.js']);
+
+      const shortPath = execFileSync(
+        'cmd.exe',
+        ['/d', '/s', '/c', `for %I in ("${workDir}") do @echo %~sI`],
+        { encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true },
+      )
+        .trim()
+        .replace(/^"+|"+$/g, '');
+      if (shortPath && existsSync(shortPath) && shortPath !== workDir) {
+        const resShort = await analyzeRepository(shortPath);
+        assert.equal(resShort.project.name, 'shortpath-demo');
+        assert.ok(resShort.project.dependencies.includes('commander'));
+        assert.deepEqual(resShort.structure.sourceFiles, ['src/index.js']);
+      }
+    }
   } finally {
     rmDirSafe(workDir);
   }
