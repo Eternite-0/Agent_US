@@ -1088,6 +1088,18 @@ function resolvePluginLogoUrl(url: string | undefined): string | undefined {
   return trimmed;
 }
 
+export function getBundledPluginIcon(plugin: MarketplacePlugin, theme: 'light' | 'dark') {
+  const spec = resolvePluginLogoSpec(plugin);
+  const paths = theme === 'dark' ? [spec?.dark, spec?.light] : [spec?.light, spec?.dark];
+  for (const path of paths) {
+    const local = path?.match(/^\/?plugin-logos\/(.+)$/i);
+    if (local && pluginLogoAssets[`../assets/plugins/${local[1]}`]) {
+      return pluginLogoAssets[`../assets/plugins/${local[1]}`];
+    }
+  }
+  return undefined;
+}
+
 function getPluginTileStyle(
   plugin: MarketplacePlugin,
   theme: 'light' | 'dark',
@@ -1178,6 +1190,7 @@ const PluginTileGraphic: React.FC<{
 };
 
 interface CapabilitiesViewProps {
+  initialTab?: 'plugins' | 'skills';
   theme: 'light' | 'dark';
   catalogSource: LocalCatalogSourceInfo | null;
   plugins: MarketplacePlugin[];
@@ -1202,6 +1215,7 @@ interface CapabilitiesViewProps {
 }
 
 export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
+  initialTab = 'plugins',
   theme,
   catalogSource,
   plugins,
@@ -1224,7 +1238,7 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
   onOpenSettings,
   onToast,
 }) => {
-  const [activeTab, setActiveTab] = useState<'plugins' | 'skills'>('plugins');
+  const [activeTab, setActiveTab] = useState<'plugins' | 'skills'>(initialTab);
   const [search, setSearch] = useState('');
   const [navSearchOpen, setNavSearchOpen] = useState(false);
   const [pluginScope, setPluginScope] = useState<'public' | 'creativity' | 'installed'>('public');

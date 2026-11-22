@@ -1,3 +1,4 @@
+import type { CommandAvailability, MentionExtension, SlashCommand } from './slashCommands';
 import React, { useEffect, useRef, useState } from 'react';
 import type {
   GitStatus,
@@ -5,6 +6,7 @@ import type {
   EffortLevel,
   ModelSpec,
   PermissionMode,
+  WorkspaceEntryKind,
   Project,
 } from '../types/backend';
 import { Composer } from './Composer';
@@ -27,8 +29,8 @@ interface HomeViewProps {
   effort: EffortLevel;
   permissionMode: PermissionMode;
   gitStatus?: GitStatus | null;
-  mentionPlugins?: string[];
-  mentionSkills?: string[];
+  mentionPlugins?: MentionExtension[];
+  mentionSkills?: MentionExtension[];
   draftInjection?: { id: number; text: string; mode: 'replace' | 'append' } | null;
   submitting: boolean;
   inspectorOpen: boolean;
@@ -42,8 +44,9 @@ interface HomeViewProps {
   onRefreshGitStatus?: () => Promise<void>;
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
-  onSlashCommand: (cmd: string) => void;
-  searchMentionFiles?: (query: string, signal: AbortSignal) => Promise<string[]>;
+  onSlashCommand: (command: SlashCommand) => void;
+  commandAvailability?: CommandAvailability;
+  searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
   onSubmitTask: (text: string, files: Record<string, string>) => Promise<void>;
   onToggleInspector: () => void;
@@ -75,6 +78,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onCheckoutGitBranch,
   onInitGitRepo,
   onSlashCommand,
+  commandAvailability,
   searchMentionFiles,
   onSubmitGoal,
   onSubmitTask,
@@ -256,6 +260,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
           onCheckoutGitBranch={onCheckoutGitBranch}
           onInitGitRepo={onInitGitRepo}
           onSlashCommand={onSlashCommand}
+          commandAvailability={commandAvailability}
           searchMentionFiles={searchMentionFiles}
           onSubmitGoal={onSubmitGoal}
           onSubmit={onSubmitTask}

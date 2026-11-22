@@ -1,3 +1,4 @@
+import type { CommandAvailability, MentionExtension, SlashCommand } from './slashCommands';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   Approval,
@@ -7,6 +8,7 @@ import type {
   InspectorTab,
   ModelSpec,
   PermissionMode,
+  WorkspaceEntryKind,
   Project,
   Task,
   TaskBundle,
@@ -137,8 +139,8 @@ interface ThreadViewProps {
   permissionMode: PermissionMode;
   gitStatus?: GitStatus | null;
   mentionFiles: string[];
-  mentionPlugins?: string[];
-  mentionSkills?: string[];
+  mentionPlugins?: MentionExtension[];
+  mentionSkills?: MentionExtension[];
   submitting: boolean;
   inspectorOpen: boolean;
   inspectorTab: InspectorTab;
@@ -153,8 +155,9 @@ interface ThreadViewProps {
   onRefreshGitStatus?: () => Promise<void>;
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
-  onSlashCommand: (cmd: string) => void;
-  searchMentionFiles?: (query: string, signal: AbortSignal) => Promise<string[]>;
+  onSlashCommand: (command: SlashCommand) => void;
+  commandAvailability?: CommandAvailability;
+  searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
   onSubmitFollowup: (text: string, files: Record<string, string>) => Promise<void>;
   onControlTask: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'retry') => Promise<void>;
@@ -223,6 +226,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   onCheckoutGitBranch,
   onInitGitRepo,
   onSlashCommand,
+  commandAvailability,
   searchMentionFiles,
   onSubmitGoal,
   onSubmitFollowup,
@@ -2049,6 +2053,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
           onCheckoutGitBranch={onCheckoutGitBranch}
           onInitGitRepo={onInitGitRepo}
           onSlashCommand={onSlashCommand}
+          commandAvailability={commandAvailability}
           searchMentionFiles={searchMentionFiles}
           onSubmitGoal={onSubmitGoal}
           onSubmit={onSubmitFollowup}

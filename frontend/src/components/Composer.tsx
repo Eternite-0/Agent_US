@@ -5,8 +5,10 @@ import type {
   EffortLevel,
   ModelSpec,
   PermissionMode,
+  WorkspaceEntryKind,
   Project,
 } from '../types/backend';
+import { commandGroups, findSlashCommand, matchesSlashCommand, type CommandAvailability, type MentionExtension, type SlashCommand } from './slashCommands';
 import { encodeUtf8Base64 } from '../utils/diff';
 import { isImagePath, toImageDataUrl } from './ImageLightbox';
 import {
@@ -17,12 +19,16 @@ import {
   IconChevronDown,
   IconChevronRight,
   IconCircleClose,
+  IconDagNodes,
   IconClose,
   IconFileDoc,
   IconFolder,
   IconHand,
   IconLaptop,
   IconPlus,
+  IconPuzzle,
+  IconSkillsNode,
+  IconSparkle,
   IconReset,
   IconSearch,
   IconShieldAlert,
@@ -41,8 +47,8 @@ interface ComposerProps {
   permissionMode: PermissionMode;
   gitStatus?: GitStatus | null;
   mentionFiles?: string[];
-  mentionPlugins?: string[];
-  mentionSkills?: string[];
+  mentionPlugins?: MentionExtension[];
+  mentionSkills?: MentionExtension[];
   draftInjection?: { id: number; text: string; mode: 'replace' | 'append' } | null;
   isRunning?: boolean;
   submitting?: boolean;
@@ -54,8 +60,9 @@ interface ComposerProps {
   onRefreshGitStatus?: () => Promise<void>;
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
-  onSlashCommand?: (cmd: string) => void;
-  searchMentionFiles?: (query: string, signal: AbortSignal) => Promise<string[]>;
+  onSlashCommand?: (command: SlashCommand) => void;
+  commandAvailability?: CommandAvailability;
+  searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal?: (goal: string, files: Record<string, string>) => Promise<boolean>;
   onSubmit: (text: string, files: Record<string, string>) => Promise<void> | void;
   onStop?: () => void;
@@ -67,25 +74,6 @@ const EFFORT_STOPS: Array<{ id: EffortLevel; label: string }> = [
   { id: 'high', label: '高' },
   { id: 'xhigh', label: '极高' },
   { id: 'max', label: 'Max' },
-];
-
-const SLASH_COMMANDS = [
-  { cmd: '/goal', desc: '提交目标并启动自主任务' },
-  { cmd: '/autonomous', desc: '查看自主任务、计划和产物' },
-  { cmd: '/new', desc: '返回主页开始新对话' },
-  { cmd: '/plan', desc: '切换为先规划后执行' },
-  { cmd: '/run', desc: '切换为直接执行' },
-  { cmd: '/diff', desc: '打开右侧文件变更 Diff 检查器' },
-  { cmd: '/agents', desc: '打开右侧子智能体与执行过程面板' },
-  { cmd: '/events', desc: '打开实时 SSE 事件流与版本日志' },
-  { cmd: '/theme', desc: '立即切换浅色 / 深色主题' },
-  { cmd: '/archive', desc: '查找和恢复已归档的聊天' },
-  { cmd: '/eval', desc: '打开评测中心与历史比较' },
-  { cmd: '/memory', desc: '查看工作区经验和持久记忆' },
-  { cmd: '/settings', desc: '打开设置与后端连接配置' },
-  { cmd: '/compact', desc: '立即语义压缩当前会话上下文，释放窗口预算' },
-  { cmd: '/rewind', desc: '精准回退上一轮工作区文件变更与对话状态' },
-  { cmd: '/clear', desc: '清空当前输入与附件' },
 ];
 
 type PopoverKind = null | 'project' | 'env' | 'branch' | 'permission' | 'effort' | 'models';
@@ -115,6 +103,7 @@ export const Composer: React.FC<ComposerProps> = ({
   onCheckoutGitBranch,
   onInitGitRepo,
   onSlashCommand,
+  commandAvailability,
   searchMentionFiles,
   onSubmitGoal,
   onSubmit,
@@ -131,10 +120,12 @@ export const Composer: React.FC<ComposerProps> = ({
   const [branchBusy, setBranchBusy] = useState(false);
   const [branchError, setBranchError] = useState('');
   const [initGitBusy, setInitGitBusy] = useState(false);
-  const [menuHighlight, setMenuHighlight] = useState(0);
+  const [menuHighlight, setMenuHighlight] = useState<number | null>(null);
+  const [commandError, setCommandError] = useState('');
   const [caret, setCaret] = useState(0);
+  const [addContextOpen, setAddContextOpen] = useState(false);
   const [menuDismissed, setMenuDismissed] = useState(false);
-  const [searchResult, setSearchResult] = useState<{ query: string; files: string[]; failed?: boolean } | null>(null);
+  const [searchResult, setSearchResult] = useState<{ query: string; kind: WorkspaceEntryKind; files: string[]; failed?: boolean } | null>(null);
   const menuId = useId();
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -142,24 +133,6 @@ export const Composer: React.FC<ComposerProps> = ({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!popover) return;
-    const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
-        setPopover(null);
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPopover(null);
-    };
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [popover]);
 
   useEffect(() => {
     if (!draftInjection) return;
@@ -188,68 +161,138 @@ ${draftInjection.text}`
     el.style.height = `${Math.min(el.scrollHeight, window.innerHeight * 0.25)}px`;
   }, [text]);
 
-  const slashMatches = useMemo(() => {
-    if (menuDismissed || !/^\/[a-z]*$/i.test(text.trimStart()) || !onSlashCommand) return [];
-    const query = text.trimStart().toLowerCase();
-    return SLASH_COMMANDS.filter((item) => item.cmd.startsWith(query) && (item.cmd !== '/goal' || onSubmitGoal));
-  }, [text, menuDismissed, onSlashCommand, onSubmitGoal]);
+  const slashQuery = !menuDismissed && !addContextOpen && onSlashCommand && /^\/[\p{L}\p{N}_?-]*$/u.test(text.trimStart())
+    ? text.trimStart().toLowerCase() : null;
+  const slashGroups = useMemo(() => slashQuery === null ? [] : commandGroups.map(({ label, commands }) => ({
+    label, commands: commands.filter((command) => matchesSlashCommand(command, slashQuery)),
+  })).filter(({ commands }) => commands.length), [slashQuery]);
+  const slashMatches = slashGroups.flatMap(({ commands }) => commands);
+  const exactSlash = slashQuery ? findSlashCommand(slashQuery) : undefined;
+  const firstMatch = exactSlash ? slashMatches.indexOf(exactSlash) : 0;
+  const commandBlock = ({ cmd, threadOnly }: SlashCommand) => {
+    if (threadOnly && variant !== 'thread') return '请先打开一个会话';
+    if (cmd === '/goal' && !onSubmitGoal) return '当前连接未提供自主任务';
+    if ((isRunning || submitting) && ['/goal', '/compact', '/rewind'].includes(cmd)) return '请等待当前对话执行结束';
+    if (cmd === '/stop' && (!isRunning || !onStop)) return '当前没有运行中的对话任务';
+    if (cmd === '/branch' && !gitStatus?.available) return '当前项目没有 Git 状态';
+    if (cmd === '/folder' && !searchMentionFiles) return '当前连接未提供工作区文件夹搜索';
+    if (cmd === '/file' && !searchMentionFiles && !mentionFiles.length) return '当前连接未提供工作区文件搜索';
+    if (cmd === '/project' && (variant !== 'home' || codexMode === 'Chat')) return '请在首页的 Codex 或 Work 模式选择项目';
+    return commandAvailability?.[cmd];
+  };
 
   const mentionToken = useMemo(() => {
-    if (menuDismissed || slashMatches.length) return null;
+    if (menuDismissed || slashQuery !== null) return null;
     const left = text.slice(0, caret);
-    const match = /(?:^|\s)(@(?:"([^"\n]*)|([^\s@"]*)))$/.exec(left);
-    if (!match) return null;
+    const match = /(?:^|\s)(@(?:(file|folder|skill|plugin):)?(?:"([^"\n]*)|([^\s@"]*)))$/i.exec(left);
+    if (!match) return addContextOpen ? { start: caret, end: caret, scope: undefined, query: '' } : null;
     const right = text.slice(caret);
-    const tail = match[2] !== undefined ? /^(?:[^"\n]*")/.exec(right)?.[0] : /^[^\s@"]*/.exec(right)?.[0];
-    return { start: caret - match[1].length, end: caret + (tail?.length ?? 0), query: match[2] ?? match[3] ?? '' };
-  }, [text, caret, menuDismissed, slashMatches.length]);
+    const tail = match[3] !== undefined ? /^(?:[^"\n]*")/.exec(right)?.[0] : /^[^\s@"]*/.exec(right)?.[0];
+    const query = match[3] ?? match[4] ?? '';
+    const keyword = !match[2] && !match[3] ? /^(skills?|plugins?)$/i.exec(query)?.[0].toLowerCase() : undefined;
+    return {
+      start: caret - match[1].length,
+      end: caret + (tail?.length ?? 0),
+      scope: match[2]?.toLowerCase() ?? keyword?.replace(/s$/, ''),
+      query: keyword ? '' : query,
+    };
+  }, [text, caret, menuDismissed, slashQuery, addContextOpen]);
   const mentionQuery = mentionToken?.query;
-  const workspaceResults = searchResult?.query === mentionQuery ? searchResult : null;
+  const scope = mentionToken?.scope;
+  const entryKind: WorkspaceEntryKind = scope === 'file' || scope === 'folder' ? scope : 'all';
+  const canSearchFiles = Boolean(mentionToken && scope !== 'skill' && scope !== 'plugin');
+  const workspaceResults = searchResult?.query === mentionQuery && searchResult?.kind === entryKind ? searchResult : null;
 
   useEffect(() => {
-    if (!searchMentionFiles || mentionQuery === undefined) return;
+    if (!searchMentionFiles || !canSearchFiles || mentionQuery === undefined) return;
     const controller = new AbortController();
     setSearchResult(null);
     const timer = window.setTimeout(async () => {
       try {
-        const result = await searchMentionFiles(mentionQuery, controller.signal);
-        if (!controller.signal.aborted) setSearchResult({ query: mentionQuery, files: result });
+        const result = await searchMentionFiles(mentionQuery, controller.signal, entryKind);
+        if (!controller.signal.aborted) setSearchResult({ query: mentionQuery, kind: entryKind, files: result });
       } catch {
-        if (!controller.signal.aborted) setSearchResult({ query: mentionQuery, files: [], failed: true });
+        if (!controller.signal.aborted) setSearchResult({ query: mentionQuery, kind: entryKind, files: [], failed: true });
       }
     }, 140);
     return () => {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [mentionQuery, searchMentionFiles]);
+  }, [mentionQuery, searchMentionFiles, canSearchFiles, entryKind]);
 
-  const mentionItems = useMemo(() => {
-    if (mentionQuery === undefined) return [];
-    const query = mentionQuery.toLowerCase().replaceAll('\\', '/');
-    const matchingFiles = searchMentionFiles ? workspaceResults?.files ?? [] : mentionFiles;
-    const candidates = [
-      ...matchingFiles.map((label) => ({ label, kind: '工作区文件' })),
-      ...Object.keys(files).map((label) => ({ label, kind: '已附加文件' })),
-      ...mentionSkills.map((label) => ({ label, kind: '技能' })),
-      ...mentionPlugins.map((label) => ({ label, kind: '插件' })),
-      ...projects.map((project) => ({ label: project.name, kind: '项目' })),
+  type MentionItem = { id: string; label: string; description?: string; icon: typeof IconFileDoc; iconUrl?: string; kind?: 'skill' | 'plugin'; action?: 'attach' | 'goal' | 'plan' | 'file' | 'folder' | 'plugins' | 'skills' };
+  const mentionGroups = useMemo<Array<{ label: string; items: MentionItem[] }>>(() => {
+    if (!mentionToken) return [];
+    const query = mentionToken.query.toLowerCase().replaceAll('\\', '/');
+    const matches = (item: MentionItem) => [item.label, item.id, item.description]
+      .some((value) => value?.toLowerCase().includes(query));
+    const workFiles = searchMentionFiles ? workspaceResults?.files ?? [] : mentionFiles;
+    const choices: Array<{ label: string; items: MentionItem[] }> = [];
+    const addActions: MentionItem[] = [
+      { id: 'file', label: '工作区文件', description: '搜索并引用项目中的文件', icon: IconFileDoc, action: 'file' },
+      { id: 'folder', label: '工作区文件夹', description: '引用项目中的目录', icon: IconFolder, action: 'folder' },
+      { id: 'attach', label: '上传文件', description: '从设备选择附件', icon: IconPlus, action: 'attach' },
+      { id: 'goal', label: '目标', description: '将草稿设为自主任务的目标', icon: IconSparkle, action: 'goal' },
+      { id: 'plan', label: '计划模式', description: '先规划，再按审批执行', icon: IconDagNodes, action: 'plan' },
     ];
-    const seen = new Set<string>();
-    return candidates.filter(({ label }) => {
-      if (seen.has(label) || !label.toLowerCase().includes(query)) return false;
-      seen.add(label);
-      return true;
-    }).slice(0, 12);
-  }, [mentionQuery, workspaceResults, searchMentionFiles, files, mentionFiles, mentionSkills, mentionPlugins, projects]);
+    if (!mentionToken.scope) choices.push({ label: '添加', items: addActions.filter((item) => item.action !== 'goal' || onSubmitGoal) });
+    if (!mentionToken.scope || mentionToken.scope === 'plugin') choices.push({ label: '插件', items: mentionPlugins.map(({ id, name, description, iconUrl }) => (
+      { id, label: name, description, icon: IconPuzzle, iconUrl, kind: 'plugin' }
+    )) });
+    if (!mentionToken.scope || mentionToken.scope === 'skill') choices.push({ label: '技能', items: mentionSkills.map(({ id, name, description }) => (
+      { id, label: name, description, icon: IconSkillsNode, kind: 'skill' }
+    )) });
+    if (!query && !mentionPlugins.length && (!mentionToken.scope || mentionToken.scope === 'plugin')) {
+      choices.find(({ label }) => label === '插件')?.items.push({ id: 'manage-plugins', label: '浏览插件', icon: IconPuzzle, action: 'plugins' });
+    }
+    if (!query && !mentionSkills.length && (!mentionToken.scope || mentionToken.scope === 'skill')) {
+      choices.find(({ label }) => label === '技能')?.items.push({ id: 'manage-skills', label: '浏览技能', icon: IconSkillsNode, action: 'skills' });
+    }
+    if (canSearchFiles) {
+      const paths = [...new Set([...Object.keys(files), ...workFiles])];
+      const entries = paths.filter((path) => entryKind === 'all' || path.endsWith('/') === (entryKind === 'folder'));
+      choices.push({ label: entryKind === 'folder' ? '文件夹' : '工作区', items: entries.map((path) => ({
+        id: path, label: path, icon: path.endsWith('/') ? IconFolder : IconFileDoc,
+      })) });
+    }
+    return choices.map(({ label, items }) => ({ label, items: items.filter(matches).slice(0, 20) })).filter(({ items }) => items.length);
+  }, [mentionToken, files, mentionFiles, mentionPlugins, mentionSkills, canSearchFiles, entryKind, workspaceResults, searchMentionFiles, onSubmitGoal]);
+  const mentionItems = mentionGroups.flatMap(({ items }) => items);
 
   const menuCount = slashMatches.length || mentionItems.length;
-  const selectedIndex = Math.min(menuHighlight, Math.max(0, menuCount - 1));
-  const menuIsOpen = Boolean(slashMatches.length || mentionToken);
-  useEffect(() => { setMenuHighlight(0); }, [text, mentionQuery, workspaceResults]);
+  const selectedIndex = Math.min(menuHighlight ?? Math.max(0, firstMatch), Math.max(0, menuCount - 1));
+  const menuIsOpen = slashQuery !== null || Boolean(mentionToken);
+  useEffect(() => { setMenuHighlight(null); }, [text, mentionQuery, workspaceResults]);
   useEffect(() => {
-    menuRef.current?.querySelector('[data-selected="true"]')?.scrollIntoView({ block: 'nearest' });
-  }, [selectedIndex]);
+    const row = menuRef.current?.querySelector<HTMLElement>('[data-selected="true"]');
+    const options = menuRef.current?.querySelector('.composer-picker-options');
+    if (!row || !options) return;
+    const rowBounds = row.getBoundingClientRect();
+    const bounds = options.getBoundingClientRect();
+    if (rowBounds.top < bounds.top) options.scrollTop += rowBounds.top - bounds.top;
+    if (rowBounds.bottom > bounds.bottom) options.scrollTop += rowBounds.bottom - bounds.bottom;
+  }, [selectedIndex, slashQuery, menuCount]);
+
+  useEffect(() => {
+    if (!popover && !menuIsOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setPopover(null);
+        setAddContextOpen(false);
+        setMenuDismissed(true);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPopover(null);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [popover, menuIsOpen]);
 
   const attachFileList = async (list: FileList | File[]) => {
     const arr = Array.from(list).slice(0, 12);
@@ -291,56 +334,98 @@ ${draftInjection.text}`
     });
   };
 
-  const executeSlash = (cmd: string) => {
-    setMenuDismissed(true);
-    if (cmd === '/goal') {
-      setText('/goal ');
-      placeCaret(6);
+
+  const executeSlash = (command: SlashCommand) => {
+    const blocked = commandBlock(command);
+    if (blocked) {
+      setCommandError(blocked);
       return;
     }
-    setText('');
-    setCaret(0);
-    if (cmd === '/clear') setFiles({});
-    else onSlashCommand?.(cmd);
+    setCommandError('');
+    setAddContextOpen(false);
+    const { cmd } = command;
+    const insertion = cmd === '/goal' ? '/goal ' : cmd === '/file' ? '@file:' : cmd === '/folder' ? '@folder:' : cmd === '/help' ? '/' : cmd === '/review' ? '请审查当前工作区未提交的变更，按严重程度列出问题，并给出文件和行号。' : '';
+    setMenuDismissed(Boolean(insertion === '/goal '));
+    setText(insertion);
+    setCaret(insertion.length);
+    if (insertion) {
+      setPopover(null);
+      setMenuHighlight(null);
+      placeCaret(insertion.length);
+    } else if (command.popover === 'branch') {
+      openBranchPopover(true);
+    } else if (command.popover) {
+      setPopover(command.popover);
+    } else if (cmd === '/attach') {
+      fileInputRef.current?.click();
+    } else if (cmd === '/clear') {
+      setFiles({});
+    } else if (cmd === '/stop') {
+      onStop?.();
+    } else {
+      onSlashCommand?.(command);
+    }
   };
 
-  const insertMention = (label: string) => {
+  const insertMention = (item: (typeof mentionItems)[number]) => {
     if (!mentionToken) return;
-    const reference = `@${/[\s@"]/.test(label) ? JSON.stringify(label) : label}`;
+    const before = text.slice(0, mentionToken.start);
     const rest = text.slice(mentionToken.end);
-    const inserted = `${reference}${!rest || !/^\s/.test(rest) ? ' ' : ''}`;
-    const next = text.slice(0, mentionToken.start) + inserted + rest;
-    setText(next);
+    setAddContextOpen(false);
     setMenuDismissed(true);
-    placeCaret(mentionToken.start + inserted.length + (/^[ \t]/.test(rest) ? 1 : 0));
+    if (item.action === 'file' || item.action === 'folder') {
+      const query = `@${item.action}:`;
+      setText(before + query + rest);
+      setMenuDismissed(false);
+      placeCaret(before.length + query.length);
+    } else if (item.action === 'goal') {
+      const next = `/goal ${(before + rest).trim().replace(/^\/goal\s+/i, '')}`;
+      setText(next);
+      placeCaret(next.length);
+    } else if (item.action) {
+      setText(before + rest);
+      placeCaret(before.length);
+      if (item.action === 'attach') fileInputRef.current?.click();
+      else {
+        const command = findSlashCommand('/' + item.action);
+        if (command) onSlashCommand?.(command);
+      }
+    } else {
+      const reference = `@${item.kind ? `${item.kind}:` : ''}${/[\s@"]/.test(item.label) ? JSON.stringify(item.label) : item.label}`;
+      const inserted = `${reference}${!rest || !/^\s/.test(rest) ? ' ' : ''}`;
+      setText(before + inserted + rest);
+      placeCaret(before.length + inserted.length + (/^[ \t]/.test(rest) ? 1 : 0));
+    }
   };
 
   const handleSend = async () => {
     const trimmed = text.trim();
     if (!trimmed || submitting) return;
-    if (slashMatches.length && /^\/[a-z]*$/i.test(trimmed)) {
-      const exact = slashMatches.find((item) => item.cmd === trimmed.toLowerCase());
-      executeSlash((exact ?? slashMatches[selectedIndex]).cmd);
+    if (slashQuery !== null) {
+      if (slashMatches.length) executeSlash(slashMatches[selectedIndex]);
       return;
     }
-    const goalCommand = /^\/goal(?:\s|$)/i.exec(trimmed);
-    if (goalCommand && onSubmitGoal) {
-      const goal = trimmed.slice(goalCommand[0].length).trim();
-      if (!goal) {
-        executeSlash('/goal');
+    const [word] = trimmed.split(/\s/, 1);
+    const command = onSlashCommand ? findSlashCommand(word) : undefined;
+    if (command) {
+      const blocked = commandBlock(command);
+      if (blocked) {
+        setCommandError(blocked);
         return;
       }
-      if (await onSubmitGoal(goal, files)) {
-        setText('');
-        setCaret(0);
-        setFiles({});
-        setMenuDismissed(true);
+      const argument = trimmed.slice(word.length).trim();
+      if (!argument) {
+        executeSlash(command);
+      } else if (command.cmd === '/goal' && onSubmitGoal) {
+        if (await onSubmitGoal(argument, files)) {
+          setText('');
+          setCaret(0);
+          setFiles({});
+          setMenuDismissed(true);
+        }
+      } else {
+        setCommandError(`${command.cmd} 无需参数，请仅输入命令。`);
       }
-      return;
-    }
-    const exactCommand = SLASH_COMMANDS.find((item) => item.cmd === trimmed.toLowerCase());
-    if (exactCommand && onSlashCommand) {
-      executeSlash(exactCommand.cmd);
       return;
     }
     const attached = { ...files };
@@ -357,6 +442,7 @@ ${draftInjection.text}`
       event.preventDefault();
       event.stopPropagation();
       setMenuDismissed(true);
+      setAddContextOpen(false);
       return;
     }
     if (menuCount && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
@@ -367,13 +453,13 @@ ${draftInjection.text}`
     }
     if (menuCount && !event.shiftKey && (event.key === 'Enter' || event.key === 'Tab')) {
       event.preventDefault();
-      if (slashMatches.length) executeSlash(slashMatches[selectedIndex].cmd);
-      else insertMention(mentionItems[selectedIndex].label);
+      if (slashMatches.length) executeSlash(slashMatches[selectedIndex]);
+      else insertMention(mentionItems[selectedIndex]);
       return;
     }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      if (!mentionToken || !searchMentionFiles || workspaceResults) void handleSend();
+      if (!canSearchFiles || !searchMentionFiles || workspaceResults) void handleSend();
     }
   };
 
@@ -436,9 +522,9 @@ ${draftInjection.text}`
     : '当前目录尚无 Git 存储库，点击创建';
   const showHomeTray = variant === 'home' && codexMode !== 'Chat';
 
-  const openBranchPopover = () => {
+  const openBranchPopover = (forceOpen = false) => {
     setPopover((prev) => {
-      const next = prev === 'branch' ? null : 'branch';
+      const next = !forceOpen && prev === 'branch' ? null : 'branch';
       if (next === 'branch') {
         setBranchSearch('');
         setCreatingBranch(false);
@@ -516,7 +602,7 @@ ${draftInjection.text}`
           title={branchTitle}
           aria-expanded={popover === 'branch'}
           aria-haspopup="dialog"
-          onClick={openBranchPopover}
+          onClick={() => openBranchPopover()}
         >
           <IconBranch size={14} style={{ flex: 'none' }} />
           <span className="codex-branch-name">{branchText}</span>
@@ -674,39 +760,56 @@ ${draftInjection.text}`
 
   return (
     <div className="codex-composer-wrap" ref={rootRef}>
+      {commandError && <p className="composer-command-error" role="status">{commandError}</p>}
       {/* Slash Command Popover */}
       {menuIsOpen && (
         <div className="codex-slash-menu" ref={menuRef}>
           <div className="composer-picker-heading" aria-hidden="true">
-            {slashMatches.length ? '快捷命令' : '引用工作区文件'}
+            {slashQuery !== null ? '快捷命令' : '添加上下文'}
             <span>↑ ↓ 选择 · ↵ 确认 · Esc 关闭</span>
           </div>
-          <div id={menuId} role="listbox" aria-label={slashMatches.length ? '快捷命令' : '引用工作区文件'}>
-            {slashMatches.map((item, index) => (
-              <button key={item.cmd} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
-                aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
-                className="codex-popover-item composer-picker-row"
-                onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
-                onClick={() => executeSlash(item.cmd)}>
-                <strong>{item.cmd}</strong><small>{item.desc}</small>
-              </button>
+          <div id={menuId} className="composer-picker-options" role="listbox" aria-label={slashQuery !== null ? '快捷命令' : '添加上下文'}>
+            {slashGroups.map(({ label, commands }) => (
+              <div key={label} role="group" aria-label={label} className="composer-command-group">
+                <div className="composer-command-label" aria-hidden="true">{label}</div>
+                {commands.map((item) => {
+                  const index = slashMatches.indexOf(item);
+                  const blocked = commandBlock(item);
+                  return <button key={item.cmd} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
+                    aria-disabled={Boolean(blocked)} aria-selected={index === selectedIndex}
+                    data-selected={index === selectedIndex ? 'true' : undefined}
+                    className="codex-popover-item composer-picker-row composer-command-row"
+                    onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
+                    onClick={() => executeSlash(item)}>
+                    <item.icon size={15} aria-hidden="true" />
+                    <span className="composer-command-text"><strong>{item.cmd}</strong><small>{blocked || item.desc}</small></span>
+                  </button>;
+                })}
+              </div>
             ))}
-            {!slashMatches.length && mentionItems.map((item, index) => (
-              <button key={item.label} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
-                aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
-                className="codex-popover-item composer-picker-row"
-                onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
-                onClick={() => insertMention(item.label)}>
-                <IconFileDoc size={14} /><span className="composer-picker-path" title={item.label}>{item.label}</span><small>{item.kind}</small>
-              </button>
+            {mentionGroups.map(({ label, items }) => (
+              <div key={label} role="group" aria-label={label} className="composer-command-group">
+                <div className="composer-command-label" aria-hidden="true">{label}</div>
+                {items.map((item) => {
+                  const index = mentionItems.indexOf(item);
+                  return <button key={item.id} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
+                    aria-label={item.description ? `${item.label} ${item.description}` : item.label}
+                    aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
+                    className="codex-popover-item composer-picker-row composer-command-row"
+                    onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
+                    onClick={() => insertMention(item)}>
+                    {item.iconUrl ? <img className="composer-plugin-icon" src={item.iconUrl} alt="" /> : <item.icon size={15} aria-hidden="true" />}
+                    <span className="composer-command-text"><strong title={item.label}>{item.label}</strong>{item.description && <small title={item.description}>{item.description}</small>}</span>
+                  </button>;
+                })}
+              </div>
             ))}
           </div>
-          {mentionToken && (searchMentionFiles && (!workspaceResults || workspaceResults.failed) || !mentionItems.length) && (
-            <div className="composer-picker-state" role="status">
-              {searchMentionFiles && !workspaceResults ? '正在查找文件…'
-                : workspaceResults?.failed ? '无法加载工作区文件。' : '没有匹配的引用。'}
-            </div>
-          )}
+          {slashQuery !== null && !slashMatches.length && <div className="composer-picker-state">没有匹配的命令。按 Esc 可继续输入正文。</div>}
+          {canSearchFiles && searchMentionFiles && !workspaceResults && <div className="composer-picker-state" role="status">正在查找工作区文件…</div>}
+          {canSearchFiles && workspaceResults?.failed && <div className="composer-picker-state" role="status">工作区文件搜索失败。</div>}
+          {mentionToken && !mentionItems.length && (!canSearchFiles || !searchMentionFiles || workspaceResults && !workspaceResults.failed) &&
+            <div className="composer-picker-state">没有匹配的{mentionToken.scope === 'file' ? '文件' : '引用'}。</div>}
         </div>
       )}
 
@@ -955,6 +1058,8 @@ ${draftInjection.text}`
           aria-activedescendant={menuCount ? `${menuId}-${selectedIndex}` : undefined}
           onChange={(event) => {
             setText(event.target.value);
+            setCommandError('');
+            setAddContextOpen(false);
             setCaret(event.target.selectionStart);
             setMenuDismissed(false);
           }}
@@ -973,9 +1078,19 @@ ${draftInjection.text}`
             <button
               type="button"
               className="codex-icon-btn"
-              aria-label="附加输入文件"
-              title="附加输入文件到任务工作区（也支持拖拽）"
-              onClick={() => fileInputRef.current?.click()}
+              aria-label="添加上下文" aria-haspopup="listbox" aria-expanded={Boolean(mentionToken)}
+              title="添加文件、技能和插件（@）"
+              onClick={() => {
+                if (addContextOpen) {
+                  setAddContextOpen(false);
+                  setMenuDismissed(true);
+                } else {
+                  setPopover(null);
+                  setMenuDismissed(false);
+                  setAddContextOpen(true);
+                  placeCaret(textareaRef.current?.selectionStart ?? text.length);
+                }
+              }}
             >
               <IconPlus size={16} />
             </button>
@@ -1020,7 +1135,7 @@ ${draftInjection.text}`
                       className="codex-perm-learn-link"
                       onClick={() => {
                         setPopover(null);
-                        onSlashCommand?.('/settings');
+                        onSlashCommand?.(findSlashCommand('/settings')!);
                       }}
                     >
                       了解更多

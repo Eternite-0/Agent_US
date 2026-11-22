@@ -660,7 +660,7 @@ export type AppView =
   | { kind: 'home' }
   | { kind: 'thread'; taskId: string; focusWorkerId?: string }
   | { kind: 'tasks' }
-  | { kind: 'capabilities' }
+  | { kind: 'capabilities'; section?: 'skills' | 'mcp'; sessionId?: string }
   | { kind: 'evaluations' }
   | { kind: 'settings'; section: string };
 
@@ -697,6 +697,15 @@ export interface ToolReceiptRecord {
   durationMs: number;
   reconciliationOutcome?: string | null;
   createdAt: number;
+}
+
+export type WorkspaceEntryKind = 'file' | 'folder' | 'all';
+
+export interface McpServerStatus {
+  server: string;
+  status: string;
+  toolCount: number;
+  lastCheckedAt: number;
 }
 
 export interface SwarmNodeRecord {

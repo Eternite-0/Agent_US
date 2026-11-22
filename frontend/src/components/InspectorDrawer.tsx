@@ -20,6 +20,7 @@ import {
   IconClose,
   IconColumns,
   IconCopy,
+  IconDagNodes,
   IconDiffBox,
   IconDownload,
   IconFileDoc,
@@ -33,6 +34,7 @@ import { ImageLightbox, isImagePath, toImageDataUrl, type PreviewImageItem } fro
 import { Markdown } from './Markdown';
 import type { AgentBackendClient } from '../api/client';
 import { AutonomousRunPanel } from './AutonomousRunPanel';
+import type { SwarmSection } from './slashCommands';
 
 interface InspectorDrawerProps {
   open: boolean;
@@ -45,6 +47,8 @@ interface InspectorDrawerProps {
   client: AgentBackendClient;
   sessionId: string | null;
   preferredRunId?: string;
+  tabRequest?: number;
+  swarmSectionRequest?: { section: SwarmSection };
   onResize: (width: number) => void;
   onChangeTab: (tab: InspectorTab) => void;
   onSelectFile: (path: string) => void;
@@ -152,6 +156,8 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   client,
   sessionId,
   preferredRunId,
+  tabRequest,
+  swarmSectionRequest,
   onResize,
   onChangeTab,
   onSelectFile,
@@ -253,7 +259,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
         ensureTab({ id: 'file:__all__', kind: 'file', path: '__all__', label: '变更' });
       }
     }
-  }, [open, tab, selectedFile, diffs.length]);
+  }, [open, tab, tabRequest, selectedFile, diffs.length]);
 
   const activePaneTab = openTabs.find((t) => t.id === activeTabId) ?? openTabs[0] ?? null;
 
@@ -525,7 +531,9 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                 >
                   {t.kind === 'subagents' ? (
                     <IconAgent size={13} style={{ flex: 'none' }} />
-                  ) : t.kind === 'events' || t.kind === 'autonomous' ? (
+                  ) : t.kind === 'autonomous' ? (
+                    <IconDagNodes size={13} style={{ flex: 'none' }} />
+                  ) : t.kind === 'events' ? (
                     <IconHistory size={13} style={{ flex: 'none' }} />
                   ) : (
                     <IconFileDoc size={13} style={{ flex: 'none' }} />
@@ -571,7 +579,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     onChangeTab('autonomous');
                     ensureTab({ id: 'autonomous', kind: 'autonomous', label: '自主任务' });
                   }}>
-                    <span>自主任务</span>
+                    <span><IconDagNodes size={14} /> 自主任务</span>
                   </button>
                   <button
                     type="button"
@@ -629,7 +637,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
         {/* Empty state if no active task */}
         {activePaneTab?.kind === 'autonomous' ? (
-          open && <AutonomousRunPanel key={sessionId ?? 'no-session'} client={client} sessionId={sessionId} preferredRunId={preferredRunId} />
+          open && <AutonomousRunPanel key={sessionId ?? 'no-session'} client={client} sessionId={sessionId} preferredRunId={preferredRunId} sectionRequest={swarmSectionRequest} />
         ) : !bundle ? (
           <div
             style={{

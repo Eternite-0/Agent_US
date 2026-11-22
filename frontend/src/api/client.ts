@@ -45,6 +45,8 @@ import type {
   SwarmArtifactRecord,
   SwarmMessageRecord,
   SwarmReplanRecord,
+  McpServerStatus,
+  WorkspaceEntryKind,
   SwarmRunRecord,
   SwarmSubmitResponse,
   ChatHistoryMatch,
@@ -92,7 +94,7 @@ export interface AgentBackendClient {
     gateway?: { running: boolean; port: number; endpoint: string };
   }>;
   getWorkspace?: () => Promise<{ workspaceRoot: string }>;
-  searchWorkspaceFiles?: (query: string, sessionId?: string, signal?: AbortSignal) => Promise<string[]>;
+  searchWorkspaceFiles?: (query: string, sessionId?: string, signal?: AbortSignal, kind?: WorkspaceEntryKind) => Promise<string[]>;
   submitAutonomousGoal?: (input: {
     goal: string;
     sessionId?: string;
@@ -149,6 +151,7 @@ export interface AgentBackendClient {
   ) => Promise<Record<string, unknown>>;
   getRuntimeOverview?: () => Promise<RuntimeOverviewRecord>;
   getSessionReceipts?: (sessionId: string) => Promise<ToolReceiptRecord[]>;
+  listMcpStatus?: (sessionId?: string, signal?: AbortSignal) => Promise<McpServerStatus[]>;
   listSwarmRuns?: (params?: { sessionId?: string; limit?: number; signal?: AbortSignal }) => Promise<SwarmRunRecord[]>;
   submitSwarmRun?: (input: {
     goal: string;
@@ -651,9 +654,9 @@ export class LiveBackendClient implements AgentBackendClient {
     return data;
   }
 
-  async searchWorkspaceFiles(query: string, sessionId?: string, signal?: AbortSignal): Promise<string[]> {
+  async searchWorkspaceFiles(query: string, sessionId?: string, signal?: AbortSignal, kind?: WorkspaceEntryKind): Promise<string[]> {
     const { items } = await this.req<{ items: string[] }>('GET', '/v1/workspace/files', {
-      query: { q: query, sessionId }, signal,
+      query: { q: query, sessionId, kind }, signal,
     });
     return items;
   }
@@ -963,6 +966,12 @@ export class LiveBackendClient implements AgentBackendClient {
 
   getSessionReceipts(sessionId: string) {
     return this.rt.getSessionReceipts(sessionId);
+  }
+
+  async listMcpStatus(sessionId?: string, signal?: AbortSignal) {
+    const query = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
+    const { items } = await this.req<{ items: McpServerStatus[] }>('GET', `/v1/runtime/mcp/status${query}`, { signal });
+    return items;
   }
 
   listSwarmRuns(params?: { sessionId?: string; limit?: number; signal?: AbortSignal }) {

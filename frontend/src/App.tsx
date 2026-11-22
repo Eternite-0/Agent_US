@@ -3,6 +3,7 @@ import { ApiError, LiveBackendClient, type AgentBackendClient } from './api/clie
 import { SimulatorClient } from './api/simulator';
 import {
   CapabilitiesView,
+  getBundledPluginIcon,
   INITIAL_PLUGINS,
   INITIAL_SKILLS,
   type LocalCatalogSourceInfo,
@@ -11,6 +12,7 @@ import {
 } from './components/CapabilitiesView';
 import { CreateProjectModal } from './components/CreateProjectModal';
 import { EvaluationView } from './components/EvaluationView';
+import { McpStatusPanel } from './components/McpStatusPanel';
 import { HomeView } from './components/HomeView';
 import { InspectorDrawer } from './components/InspectorDrawer';
 import { SearchPalette } from './components/SearchPalette';
@@ -22,6 +24,7 @@ import {
   buildUpdateSchedulePayload,
   hydrateScheduleItem,
 } from './utils/schedulePayload';
+import type { CommandAvailability, SlashCommand, SwarmSection } from './components/slashCommands';
 import { ThreadView } from './components/ThreadView';
 import { ToastHost } from './components/ToastHost';
 import { TopBar } from './components/TopBar';
@@ -48,6 +51,7 @@ import type {
   ThemeMode,
   ToastItem,
   UsageItem,
+  WorkspaceEntryKind,
 } from './types/backend';
 import { randomIdempotencyKey } from './utils/format';
 import { BUILTIN_PROVIDER_PRESETS, mergeProviderPresetCatalog } from './data/providerPresets';
@@ -57,7 +61,8 @@ function parseHash(): AppView {
   const threadMatch = hash.match(/^\/t\/([^/?]+)/);
   if (threadMatch) return { kind: 'thread', taskId: decodeURIComponent(threadMatch[1]) };
   if (hash.startsWith('/tasks')) return { kind: 'tasks' };
-  if (hash.startsWith('/capabilities')) return { kind: 'capabilities' };
+  const capabilitySection = hash.match(/^\/capabilities(?:\/(mcp|skills))?$/)?.[1];
+  if (hash.startsWith('/capabilities')) return { kind: 'capabilities', section: capabilitySection === 'mcp' || capabilitySection === 'skills' ? capabilitySection : undefined };
   if (hash.startsWith('/evaluations')) return { kind: 'evaluations' };
   const settingsMatch = hash.match(/^\/settings(?:\/([\w-]+))?/);
   if (settingsMatch) return { kind: 'settings', section: settingsMatch[1] || 'general' };
@@ -73,7 +78,7 @@ function viewToHash(v: AppView): string {
     case 'tasks':
       return '#/tasks';
     case 'capabilities':
-      return '#/capabilities';
+      return v.section ? `#/capabilities/${v.section}` : '#/capabilities';
     case 'evaluations':
       return '#/evaluations';
     case 'settings':
@@ -166,6 +171,8 @@ export const App: React.FC = () => {
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [preferredSwarmRun, setPreferredSwarmRun] = useState<{ sessionId: string; runId: string } | null>(null);
+  const [swarmSectionRequest, setSwarmSectionRequest] = useState<{ section: SwarmSection }>();
+  const [inspectorRequest, setInspectorRequest] = useState(0);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('subagents');
   const [inspectorFile, setInspectorFile] = useState<string | null>(null);
   const [inspectorSubagentId, setInspectorSubagentId] = useState<string | null>(null);
@@ -1061,6 +1068,8 @@ export const App: React.FC = () => {
       navigate({ kind: 'thread', taskId: result.sessionId });
       setInspectorTaskId(result.sessionId);
       setPreferredSwarmRun(result);
+      setSwarmSectionRequest({ section: 'plan' });
+      setInspectorRequest((value) => value + 1);
       setInspectorTab('autonomous');
       setInspectorOpen(true);
       if (activeRootTaskId === result.sessionId) void refreshActiveBundles(activeChainRef.current, true);
@@ -1077,13 +1086,47 @@ export const App: React.FC = () => {
 
   const searchMentionFiles = useMemo(() => {
     if (!client.searchWorkspaceFiles) return undefined;
-    return (query: string, signal: AbortSignal) => client.searchWorkspaceFiles!(query, activeRootTaskId ?? undefined, signal);
+    return (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => client.searchWorkspaceFiles!(query, activeRootTaskId ?? undefined, signal, kind);
   }, [client, activeRootTaskId, workspaceRoot]);
 
-  const handleSlashCommand = (cmd: string) => {
+  const slashTask = activeBundles.find(({ task }) => task.id === activeRootTaskId)?.task
+    ?? tasks.find(({ id }) => id === activeRootTaskId);
+  const archiveBlock = !slashTask ? '会话尚未加载' : archiveBusy.has(slashTask.id) ? '正在更新归档状态' : undefined;
+  const swarmBlock = !client.listSwarmRuns ? '当前连接未提供自主任务' : undefined;
+  const commandAvailability: CommandAvailability = {
+    '/goal': !client.submitAutonomousGoal ? '当前连接未提供自主任务' : undefined,
+    '/swarm': swarmBlock,
+    '/messages': swarmBlock ?? (!client.listSwarmMessages ? '当前连接未提供协作消息' : undefined),
+    '/artifacts': swarmBlock ?? (!client.listSwarmArtifacts ? '当前连接未提供自主任务产物' : undefined),
+    '/compact': !client.compactSession ? '当前连接未提供上下文压缩' : undefined,
+    '/rewind': !client.rewindSession ? '当前连接未提供会话回退' : undefined,
+    '/archive-chat': archiveBlock ?? (slashTask?.archivedAt != null ? '此会话已归档' : undefined),
+    '/restore': archiveBlock ?? (slashTask?.archivedAt == null ? '此会话尚未归档' : undefined),
+  };
+
+  const handleSlashCommand = ({ cmd, view: target, inspector, swarmSection }: SlashCommand) => {
+    if (target) {
+      navigate(target.kind === 'capabilities' && target.section === 'mcp' && activeRootTaskId
+        ? { ...target, sessionId: activeRootTaskId }
+        : target);
+      return;
+    }
+    if (inspector) {
+      if (swarmSection) setSwarmSectionRequest({ section: swarmSection });
+      setInspectorTab(inspector);
+      setInspectorTaskId(activeRootTaskId);
+      setInspectorFile(null);
+      setInspectorSubagentId(null);
+      setInspectorOpen(true);
+      setInspectorRequest((value) => value + 1);
+      return;
+    }
     switch (cmd) {
-      case '/new':
-        navigate({ kind: 'home' });
+      case '/search':
+        setSearchOpen(true);
+        break;
+      case '/new-project':
+        setCreateProjectOpen(true);
         break;
       case '/plan':
         setCodexMode('Work');
@@ -1094,53 +1137,39 @@ export const App: React.FC = () => {
         setCodexMode('Codex');
         pushToast('已切换为执行模式');
         break;
-      case '/diff':
-        setInspectorTab('diff');
-        setInspectorOpen(true);
-        break;
-      case '/autonomous':
-        setInspectorTab('autonomous');
-        setInspectorOpen(true);
-        break;
-      case '/agents':
-      case '/dag':
-        setInspectorTab('subagents');
-        setInspectorOpen(true);
-        break;
-      case '/events':
-        setInspectorTab('events');
-        setInspectorOpen(true);
+      case '/chat':
+        setCodexMode('Chat');
+        pushToast('已切换为对话模式');
         break;
       case '/theme':
         toggleTheme();
         break;
       case '/compact':
-        if (activeRootTaskId) {
-          void handleCompactSession(activeRootTaskId);
-        } else {
-          pushToast('请先进入一个会话再执行 /compact', 'warning');
-        }
+        if (activeRootTaskId) void handleCompactSession(activeRootTaskId);
         break;
       case '/rewind':
-        if (activeRootTaskId) {
-          if (window.confirm('回退上一轮的对话和工作区文件变更？')) void handleRewindSession(activeRootTaskId, 'both');
-        } else {
-          pushToast('请先进入一个会话再执行 /rewind', 'warning');
+        if (activeRootTaskId && window.confirm('回退上一轮的对话和工作区文件变更？')) {
+          void handleRewindSession(activeRootTaskId, 'both');
         }
         break;
-      case '/archive':
-        navigate({ kind: 'settings', section: 'archived' });
+      case '/pin':
+        if (activeRootTaskId) handleTogglePin(activeRootTaskId);
         break;
-      case '/eval':
-        navigate({ kind: 'evaluations' });
+      case '/archive-chat':
+        if (activeRootTaskId) void handleArchiveTask(activeRootTaskId);
         break;
-      case '/memory':
-        navigate({ kind: 'settings', section: 'memory' });
+      case '/restore':
+        if (activeRootTaskId) void handleRestoreArchived(activeRootTaskId);
         break;
-      case '/settings':
-        navigate({ kind: 'settings', section: 'general' });
-        break;
-      default:
+      case '/copy-link':
+        void (async () => {
+          try {
+            await navigator.clipboard.writeText(window.location.href);
+            pushToast('已复制当前聊天链接', 'success');
+          } catch {
+            pushToast('未能访问剪贴板', 'warning');
+          }
+        })();
         break;
     }
   };
@@ -1227,12 +1256,12 @@ export const App: React.FC = () => {
     () =>
       plugins
         .filter((p) => installedPluginIds.includes(p.id))
-        .map((p) => p.name),
-    [plugins, installedPluginIds],
+        .map((plugin) => ({ id: plugin.id, name: plugin.name, description: plugin.description, iconUrl: getBundledPluginIcon(plugin, resolvedTheme) })),
+    [plugins, installedPluginIds, resolvedTheme],
   );
 
   const mentionSkills = useMemo(
-    () => skills.filter((s) => s.installed).map((s) => s.name),
+    () => skills.filter((s) => s.installed).map(({ id, name, description }) => ({ id, name, description })),
     [skills],
   );
 
@@ -1394,6 +1423,7 @@ export const App: React.FC = () => {
                 onCheckoutGitBranch={handleCheckoutGitBranch}
                 onInitGitRepo={handleInitGitRepo}
                 onSlashCommand={handleSlashCommand}
+                commandAvailability={commandAvailability}
                 searchMentionFiles={searchMentionFiles}
                 onSubmitGoal={handleSubmitGoal}
                 onSubmitTask={handleSubmitNewTask}
@@ -1450,6 +1480,7 @@ export const App: React.FC = () => {
                 onCheckoutGitBranch={handleCheckoutGitBranch}
                 onInitGitRepo={handleInitGitRepo}
                 onSlashCommand={handleSlashCommand}
+                commandAvailability={commandAvailability}
                 searchMentionFiles={searchMentionFiles}
                 onSubmitGoal={handleSubmitGoal}
                 onSubmitFollowup={handleSubmitFollowup}
@@ -1618,8 +1649,13 @@ export const App: React.FC = () => {
             {view.kind === 'evaluations' && (
               <EvaluationView client={client} models={models} onToast={pushToast} />
             )}
-            {view.kind === 'capabilities' && (
+            {view.kind === 'capabilities' && view.section === 'mcp' && (
+              <McpStatusPanel client={client} sessionId={view.sessionId} onManagePlugins={() => navigate({ kind: 'capabilities' })} />
+            )}
+            {view.kind === 'capabilities' && view.section !== 'mcp' && (
               <CapabilitiesView
+                key={view.section ?? 'plugins'}
+                initialTab={view.section === 'skills' ? 'skills' : 'plugins'}
                 theme={resolvedTheme}
                 catalogSource={catalogSource}
                 plugins={plugins}
@@ -1902,6 +1938,8 @@ export const App: React.FC = () => {
             open={inspectorOpen && (view.kind === 'thread' || view.kind === 'home')}
             width={drawerWidth}
             tab={inspectorTab}
+            tabRequest={inspectorRequest}
+            swarmSectionRequest={swarmSectionRequest}
             selectedFile={inspectorFile}
             selectedSubagentId={inspectorSubagentId}
             projectName={selectedProject?.name || 'Agent_US'}
