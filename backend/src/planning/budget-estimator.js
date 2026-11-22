@@ -276,6 +276,7 @@ export function allocatePlanBudgets({
   historicalByType = {},
   store = null,
   model = null,
+  repoContext = null,
 } = {}) {
   const list = Array.isArray(tasks) ? tasks : [];
   if (!list.length) {
@@ -293,19 +294,61 @@ export function allocatePlanBudgets({
 
   const userMaxSteps = posIntOrNull(userBudget?.maxTotalSteps ?? userBudget?.maxSteps);
   const userMaxTokens = posIntOrNull(userBudget?.maxTotalTokens ?? userBudget?.maxTokens);
+  const repoScaleFiles = repoContext
+    ? Math.max(
+        Number(repoContext.filesScanned || 0),
+        Array.isArray(repoContext.relevantFiles) ? repoContext.relevantFiles.length : 0,
+      )
+    : 0;
+  const scaledRepoFiles =
+    repoScaleFiles >= 20
+      ? Math.min(10, Math.ceil(Math.sqrt(repoScaleFiles)))
+      : repoScaleFiles > 0
+        ? Math.min(6, repoScaleFiles)
+        : 2;
 
   const strictCheck = Boolean(userBudget?.strictBudgetCheck);
   const estimates = list.map((task) => {
     const explicitSteps = posIntOrNull(task.budget?.maxSteps ?? task.budget?.maxTotalSteps);
     const meta = task.metadata ?? {};
+    const normType = normalizeTaskType(task.taskType || 'general');
     const hist = historicalByType[task.taskType] ?? queryHistoricalTaskMetrics(store, { taskType: task.taskType, model });
+    const ownedCount = Array.isArray(task.ownedPaths)
+      ? task.ownedPaths.length
+      : Array.isArray(meta.ownedPaths)
+        ? meta.ownedPaths.length
+        : 0;
+    const inferredTools = Array.isArray(task.toolAllow)
+      ? task.toolAllow
+      : Array.isArray(meta.requiredTools)
+        ? meta.requiredTools
+        : normType === 'review'
+          ? ['read_file', 'read_swarm_artifact']
+          : ['implementation', 'bug-fix', 'refactor', 'multi-file-feature', 'tests', 'verification'].includes(normType)
+            ? ['read_file', 'write_file', 'edit_file', 'bash']
+            : [];
+    const inferredComplexity =
+      meta.verificationComplexity ??
+      (normType === 'review'
+        ? 'low'
+        : ['verification', 'implementation', 'bug-fix', 'refactor', 'multi-file-feature', 'tests'].includes(normType) &&
+            repoScaleFiles >= 20
+          ? 'high'
+          : 'medium');
     const est = estimateTaskBudget({
       taskType: task.taskType || 'general',
-      fileCount: Number(meta.fileCount ?? (Array.isArray(meta.expectedArtifacts) ? Math.max(1, meta.expectedArtifacts.length) : 2)),
-      requiredTools: Array.isArray(task.toolAllow) ? task.toolAllow : (meta.requiredTools ?? []),
+      fileCount: Number(
+        meta.fileCount ??
+          Math.max(
+            ownedCount,
+            Array.isArray(meta.expectedArtifacts) ? meta.expectedArtifacts.length : 0,
+            scaledRepoFiles,
+          ),
+      ),
+      requiredTools: inferredTools,
       dependencies: task.dependencies ?? [],
       expectedArtifacts: meta.expectedArtifacts ?? [],
-      verificationComplexity: meta.verificationComplexity ?? (task.taskType === 'review' || task.taskType === 'verification' ? 'low' : 'medium'),
+      verificationComplexity: inferredComplexity,
       recoveryRequirements: Boolean(meta.recoveryRequirements || /recover|checkpoint|sigkill|audit/i.test(String(task.objective ?? ''))),
       historicalStats: hist,
       userBudget: {},

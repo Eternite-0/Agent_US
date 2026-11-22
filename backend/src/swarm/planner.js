@@ -61,6 +61,7 @@ export function toCompactRepoContext(analysis) {
         ? analysis.entryPoints.map(String).slice(0, 16)
         : [],
     relevantFiles,
+    filesScanned: Number(analysis.structure?.filesScanned ?? analysis.filesScanned ?? 0),
     summaryText: String(analysis.summaryText ?? '').slice(0, 8000),
   };
 }
@@ -284,9 +285,9 @@ export class DynamicTaskPlanner {
     }));
   }
 
-  #applyAdaptiveBudgets(nodes, { budget = {}, store = null, model = null } = {}) {
+  #applyAdaptiveBudgets(nodes, { budget = {}, store = null, model = null, repoContext = null } = {}) {
     const userBudget = budget && typeof budget === 'object' ? budget : {};
-    const allocation = allocatePlanBudgets({ tasks: nodes, userBudget, store, model });
+    const allocation = allocatePlanBudgets({ tasks: nodes, userBudget, store, model, repoContext });
     if (!allocation.feasible) {
       throw new BudgetError('BUDGET_INSUFFICIENT', {
         message: allocation.insufficientReason || 'Insufficient user budget for planned DAG',
@@ -365,6 +366,7 @@ export class DynamicTaskPlanner {
                 '{"nodes":[{"nodeKey":"branch-a","taskType":"implementation","roleTitle":"API Specialist","focus":"...","ownedPaths":["src/api.js"],"objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":true,"priority":20}]}. ' +
                 'Ground every node in the repository intelligence (entryPoints, relevantFiles, callGraph, discoveredTestCommands, discoveredBuildCommands). ' +
                 'When independent modules/files can be built or fixed concurrently, emit multiple parallel "implementation" nodes with disjoint ownedPaths, specialized roleTitle/focus, shared or empty dependencies, and isolatedWorktree:true (no fixed team size limit; scale appropriately within maxNodes). ' +
+                'Any test-authoring node whose tests import or execute newly added runtime APIs MUST list the corresponding implementation node(s) in dependencies so its isolated worktree receives those changes via artifact overlay (while independent modules like core code and TypeScript typings stay parallel). ' +
                 'For mutating goals, include a downstream "verification" node (isolatedWorktree:true so upstream branch artifacts are overlaid) that executes discovered test/build commands via bash, and include a read-only "review" node (taskType:"review", permissionMode:"readonly", isolatedWorktree:false) when changes are mutating or review is requested. ' +
                 `Use alphanumeric nodeKey matching ^[A-Za-z0-9][A-Za-z0-9._-]*$. Keep <= ${maxNodes} nodes. Return JSON only.`,
             },
@@ -422,7 +424,14 @@ export class DynamicTaskPlanner {
         if (Array.isArray(rawList) && rawList.length > 0 && rawList.every((x) => x?.objective)) {
           const normalized = this.normalizeNodes(rawList.slice(0, maxNodes));
           this.validateDag(normalized);
-          return attachRepoContext(this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked }));
+          return attachRepoContext(
+      this.#applyAdaptiveBudgets(normalized, {
+        budget,
+        store,
+        model: picked,
+        repoContext: compactRepoContext,
+      }),
+    );
         }
       } catch (err) {
         if (reservation?.reservationId) {
@@ -511,7 +520,14 @@ export class DynamicTaskPlanner {
         ];
     const normalized = this.normalizeNodes(fallback);
     this.validateDag(normalized);
-    return attachRepoContext(this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked }));
+    return attachRepoContext(
+      this.#applyAdaptiveBudgets(normalized, {
+        budget,
+        store,
+        model: picked,
+        repoContext: compactRepoContext,
+      }),
+    );
   }
 
   addNode(store, runId, nodeSpec, { leaseGuard = null } = {}) {

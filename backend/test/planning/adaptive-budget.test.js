@@ -186,6 +186,40 @@ test('historical budget exhaustion metrics adapt future estimates and AgentLoop 
     });
     assert.equal(alloc.feasible, true);
     assert.ok(alloc.tasks[0].allocatedSteps >= 22);
+
+    const largeRepoCtx = {
+      filesScanned: 120,
+      relevantFiles: Array.from({ length: 20 }, (_, i) => `lib/mod-${i}.js`),
+    };
+    const largePlanTasks = [
+      { taskKey: 'impl-core', taskType: 'implementation', ownedPaths: ['lib/option.js', 'lib/command.js'], dependencies: [], objective: 'Implement core feature' },
+      { taskKey: 'impl-types', taskType: 'implementation', ownedPaths: ['typings/index.d.ts'], dependencies: [], objective: 'Update types' },
+      { taskKey: 'impl-tests', taskType: 'tests', ownedPaths: ['tests/option.summary.test.js'], dependencies: ['impl-core'], objective: 'Write tests' },
+      { taskKey: 'verify', taskType: 'verification', dependencies: ['impl-core', 'impl-types', 'impl-tests'], objective: 'Run tests' },
+      { taskKey: 'review', taskType: 'review', dependencies: ['verify'], objective: 'Review changes' },
+    ];
+    const scaledAlloc = allocatePlanBudgets({
+      tasks: largePlanTasks,
+      userBudget: { maxSteps: 180 },
+      repoContext: largeRepoCtx,
+      store,
+      model: 'mock-model',
+    });
+    assert.equal(scaledAlloc.feasible, true);
+    const byKey = new Map(scaledAlloc.tasks.map((t) => [t.taskKey, t.allocatedSteps]));
+    assert.ok(byKey.get('impl-core') >= 25, `expected impl-core >= 25, got ${byKey.get('impl-core')}`);
+    assert.ok(byKey.get('verify') >= 20, `expected verify >= 20, got ${byKey.get('verify')}`);
+    assert.ok(scaledAlloc.totalAllocatedSteps <= 180);
+
+    const trimmedAlloc = allocatePlanBudgets({
+      tasks: largePlanTasks,
+      userBudget: { maxSteps: 50 },
+      repoContext: largeRepoCtx,
+      store,
+      model: 'mock-model',
+    });
+    assert.equal(trimmedAlloc.feasible, true);
+    assert.ok(trimmedAlloc.totalAllocatedSteps <= 50, `expected <= 50, got ${trimmedAlloc.totalAllocatedSteps}`);
   } finally {
     await direct.close();
     store.close();
