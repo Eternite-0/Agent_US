@@ -139,3 +139,81 @@ export async function resume(root) { await step(root, 'prepare'); await step(roo
     });
   }
 });
+
+test('real engineering dataset parses fenced json and trailing json without fabricating fields', async () => {
+  const assert = (await import('node:assert/strict')).default;
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { createRealEngineeringDataset } = await import('../../src/evaluation/dataset.js');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-us-eval-fenced-'));
+  try {
+    const tasks = createRealEngineeringDataset();
+    const target = tasks.find((item) => item.id === 'real-bug-fix-01');
+    assert.ok(target);
+    const repo = path.join(tmpRoot, 'repo');
+    fs.mkdirSync(repo, { recursive: true });
+    for (const [rel, body] of Object.entries(target.fixture.files)) {
+      const abs = path.join(repo, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, body, 'utf8');
+    }
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'eval@test.local'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 'Eval Test'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['add', '.'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+
+    const slugPath = path.join(repo, 'src/slug.js');
+    fs.writeFileSync(
+      slugPath,
+      'export function slugify(value) { return String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""); }\n',
+      'utf8',
+    );
+
+    const fencedOutput = [
+      'I fixed `src/slug.js` and verified `test/slug.test.js`.',
+      '```json',
+      JSON.stringify({
+        changedFiles: ['src/slug.js'],
+        testCommand: 'node --test test/slug.test.js',
+        testExitCode: 0,
+        independentVerdict: 'passed',
+      }),
+      '```',
+    ].join('\n');
+
+    const passedJudgment = await target.judge({
+      task: target,
+      output: { output: fencedOutput },
+      context: { workspaceRoot: repo },
+    });
+    assert.equal(passedJudgment.passed, true);
+    assert.equal(passedJudgment.deterministic, true);
+
+    const trailingOutput = `Completed task.\n${JSON.stringify({
+      changedFiles: ['src/slug.js'],
+      testCommand: 'node --test test/slug.test.js',
+      testExitCode: 0,
+      independentVerdict: true,
+    })}`;
+    const trailingJudgment = await target.judge({
+      task: target,
+      output: trailingOutput,
+      context: { workspaceRoot: repo },
+    });
+    assert.equal(trailingJudgment.passed, true);
+
+    const proseOnlyJudgment = await target.judge({
+      task: target,
+      output: 'All tests passed and changed src/slug.js.',
+      context: { workspaceRoot: repo },
+    });
+    assert.equal(proseOnlyJudgment.passed, false);
+    assert.equal(proseOnlyJudgment.deterministic, true);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

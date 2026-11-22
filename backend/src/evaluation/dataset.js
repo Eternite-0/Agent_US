@@ -67,11 +67,64 @@ export const BENCHMARK_CATEGORY_COUNTS = Object.freeze(
   Object.fromEntries(CATEGORY_SPECS.map(([category, count]) => [category, count])),
 );
 
+function tryParseJsonObject(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonFromLlmString(text) {
+  const direct = tryParseJsonObject(text);
+  if (direct) return direct;
+  const src = String(text ?? '');
+  const fencedMatches = [...src.matchAll(/```(?:json)?\s*\r?\n?([\s\S]*?)```/gi)];
+  for (let i = fencedMatches.length - 1; i >= 0; i -= 1) {
+    const parsed = tryParseJsonObject(fencedMatches[i][1]);
+    if (parsed) return parsed;
+  }
+  const parsedObjects = [];
+  for (let i = 0; i < src.length; i += 1) {
+    if (src[i] !== '{') continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let j = i; j < src.length; j += 1) {
+      const ch = src[j];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          const parsed = tryParseJsonObject(src.slice(i, j + 1));
+          if (parsed) {
+            parsedObjects.push(parsed);
+            i = j;
+          }
+          break;
+        }
+      }
+    }
+  }
+  return parsedObjects.length ? parsedObjects[parsedObjects.length - 1] : {};
+}
+
 function parseEvidenceOutput(output) {
   let value = output;
   if (value && typeof value === 'object') value = value.output ?? value.result ?? value;
   if (typeof value === 'string') {
-    try { value = JSON.parse(value); } catch { return {}; }
+    value = parseJsonFromLlmString(value);
   }
   if (value?.evidence && typeof value.evidence === 'object') value = value.evidence;
   return value && typeof value === 'object' ? value : {};

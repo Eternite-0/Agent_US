@@ -113,3 +113,45 @@ test('evaluation close cancels active runtime and waits for its drain confirmati
   assert.equal(service.getRun(created.id).status, 'cancelled');
   assert.equal(service.getRun(created.id).results[0].status, 'cancelled');
 });
+
+test('createDirectRuntimeAdapter grants isolated full-access without network for mutating offline benchmarks and auto-safe for smoke tasks', async () => {
+  const { createDirectRuntimeAdapter } = await import('../../src/evaluation/service.js');
+  const { createRealEngineeringDataset } = await import('../../src/evaluation/dataset.js');
+
+  const recordedCalls = [];
+  const fakeDirectAgent = {
+    createSession(opts) {
+      recordedCalls.push({ kind: 'createSession', opts });
+      return { id: `sess-${recordedCalls.length}` };
+    },
+    startTurn(sessionId, opts) {
+      recordedCalls.push({ kind: 'startTurn', sessionId, opts });
+      return { turn: { id: `turn-${recordedCalls.length}` } };
+    },
+    listTurns() {
+      return [{ id: 'turn-2', state: 'completed', verdict: null, evidenceCount: 0 }, { id: 'turn-4', state: 'completed', verdict: null, evidenceCount: 0 }];
+    },
+    listMessages() {
+      return [];
+    },
+    cancelTurn() {},
+  };
+
+  const adapter = createDirectRuntimeAdapter(fakeDirectAgent, { model: 'test-model' });
+  const engTask = createRealEngineeringDataset()[0];
+  const engHandle = adapter({ task: engTask, workspaceRoot: '/tmp/ws-eng', context: {} });
+  await engHandle.run();
+
+  assert.equal(recordedCalls[0].opts.permissionMode, 'full-access');
+  assert.deepEqual(recordedCalls[0].opts.toolDeny, ['web_fetch', 'web_search']);
+  assert.equal(recordedCalls[1].opts.permissionMode, 'full-access');
+  assert.equal(recordedCalls[1].opts.maxSteps, 16);
+
+  const smokeTask = BENCHMARK_DATASET[0];
+  const smokeHandle = adapter({ task: smokeTask, workspaceRoot: '/tmp/ws-smoke', context: {} });
+  await smokeHandle.run();
+
+  assert.equal(recordedCalls[2].opts.permissionMode, 'auto-safe');
+  assert.deepEqual(recordedCalls[2].opts.toolDeny, ['web_fetch', 'web_search']);
+  assert.equal(recordedCalls[3].opts.permissionMode, 'auto-safe');
+});

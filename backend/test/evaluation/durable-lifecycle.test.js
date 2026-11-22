@@ -360,3 +360,104 @@ test('evaluation timeout retains the workspace when the runtime factory never yi
   await access(started);
   await rm(started, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
 });
+
+test('evaluation persists failed/cancelled/timeout outcomes and never lets model judge override deterministic failure', async () => {
+  const assert = (await import('node:assert/strict')).default;
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { setTimeout: delay } = await import('node:timers/promises');
+  const { Store } = await import('../../src/store.js');
+  const { EvaluationService, BENCHMARK_ID } = await import('../../src/evaluation/service.js');
+  const { createDeterministicJudge } = await import('../../src/evaluation/judge.js');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-us-eval-contract-'));
+  let store = null;
+  let retainedDir = null;
+  try {
+    store = new Store(path.join(tmpRoot, 'eval.sqlite'));
+    const judge = createDeterministicJudge({
+      fallback: async () => ({ passed: true, score: 1, reason: 'model_judge_approved' }),
+    });
+    const service = new EvaluationService({
+      store,
+      judge,
+      runtimeFactory: async ({ task, signal, workspaceRoot }) => {
+        if (task.id === 'code-generation-repair-01') {
+          return {
+            run: async () => ({ output: { wrong: true } }),
+            waitForStop: async () => ({ drained: true, error: null }),
+          };
+        }
+        if (task.id === 'code-generation-repair-02') {
+          return {
+            run: () => new Promise((_, reject) => {
+              signal?.addEventListener('abort', () => {
+                const err = new Error('aborted by cancel');
+                err.name = 'AbortError';
+                reject(err);
+              }, { once: true });
+            }),
+            waitForStop: async () => ({ drained: true, error: null }),
+          };
+        }
+        retainedDir = workspaceRoot;
+        return {
+          run: () => new Promise(() => {}),
+          waitForStop: async () => ({ drained: false, error: 'child process unresponsive' }),
+        };
+      },
+      timeoutMs: 1_000,
+    });
+
+    const failedRun = service.start({ benchmarkId: BENCHMARK_ID, taskIds: ['code-generation-repair-01'] });
+    const deadlineFail = Date.now() + 5000;
+    while (Date.now() < deadlineFail && ['queued', 'running'].includes(service.getRun(failedRun.id)?.status)) {
+      await delay(10);
+    }
+    const persistedFail = service.getRun(failedRun.id);
+    assert.equal(persistedFail.status, 'completed');
+    assert.equal(persistedFail.score.failed, 1);
+    assert.equal(persistedFail.score.passed, 0);
+    assert.equal(persistedFail.results[0].status, 'failed');
+    assert.equal(persistedFail.results[0].passed, false);
+    assert.equal(persistedFail.results[0].judge.deterministic, true);
+    assert.equal(persistedFail.results[0].judge.reason, 'deterministic_failure');
+    assert.equal(persistedFail.results[0].judge.advisory.passed, true);
+    const failTaskRow = store.db.prepare('SELECT status FROM evaluation_tasks WHERE runId=?').get(failedRun.id);
+    const failJudgeRow = store.db.prepare('SELECT judgeType, passed FROM evaluation_judgements WHERE evaluationTaskId=?').get(`${failedRun.id}:code-generation-repair-01`);
+    assert.equal(failTaskRow.status, 'failed');
+    assert.equal(failJudgeRow.judgeType, 'deterministic');
+    assert.equal(failJudgeRow.passed, 0);
+
+    const timeoutRun = service.start({ benchmarkId: BENCHMARK_ID, taskIds: ['code-generation-repair-03'], timeoutMs: 1_000 });
+    const deadlineTimeout = Date.now() + 5000;
+    while (Date.now() < deadlineTimeout && ['queued', 'running'].includes(service.getRun(timeoutRun.id)?.status)) {
+      await delay(10);
+    }
+    const persistedTimeout = service.getRun(timeoutRun.id);
+    assert.equal(persistedTimeout.status, 'timeout');
+    assert.equal(persistedTimeout.results[0].status, 'timeout');
+    assert.equal(persistedTimeout.results[0].metadata.runtimeDrained, false);
+    assert.ok(retainedDir && fs.existsSync(retainedDir), 'workspace must be retained when runtime stop is unconfirmed');
+    const timeoutTaskRow = store.db.prepare('SELECT status FROM evaluation_tasks WHERE runId=?').get(timeoutRun.id);
+    assert.equal(timeoutTaskRow.status, 'timeout');
+
+    const cancelRun = service.start({ benchmarkId: BENCHMARK_ID, taskIds: ['code-generation-repair-02'], timeoutMs: 5_000 });
+    await delay(30);
+    service.cancel(cancelRun.id);
+    const deadlineCancel = Date.now() + 5000;
+    while (Date.now() < deadlineCancel && ['queued', 'running'].includes(service.getRun(cancelRun.id)?.status)) {
+      await delay(10);
+    }
+    const persistedCancel = service.getRun(cancelRun.id);
+    assert.equal(persistedCancel.status, 'cancelled');
+    assert.equal(persistedCancel.results[0].status, 'cancelled');
+    const cancelTaskRow = store.db.prepare('SELECT status FROM evaluation_tasks WHERE runId=?').get(cancelRun.id);
+    assert.equal(cancelTaskRow.status, 'cancelled');
+  } finally {
+    if (retainedDir) fs.rmSync(retainedDir, { recursive: true, force: true });
+    store?.close?.();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
