@@ -210,6 +210,10 @@ test('historical budget exhaustion metrics adapt future estimates and AgentLoop 
     const byKey = new Map(scaledAlloc.tasks.map((t) => [t.taskKey, t.allocatedSteps]));
     assert.ok(byKey.get('impl-core') >= 25, `expected impl-core >= 25, got ${byKey.get('impl-core')}`);
     assert.ok(byKey.get('verify') >= 20, `expected verify >= 20, got ${byKey.get('verify')}`);
+    assert.ok(
+      byKey.get('review') >= 22 && byKey.get('review') <= 26,
+      `expected review in [22, 26], got ${byKey.get('review')}`,
+    );
     assert.ok(scaledAlloc.totalAllocatedSteps <= 180);
 
     const trimmedAlloc = allocatePlanBudgets({

@@ -1086,8 +1086,13 @@ export class DynamicReplanner {
           objective: liveTrigger.objective || `Re-review after ${repairKey}`,
           ...(allExcluded.length > 0 ? { excludeModels: allExcluded } : {}),
         });
+        const triggerSteps = Number(liveTrigger.budget?.maxSteps || 6);
+        const desiredReviewSteps =
+          triggerSteps >= 12
+            ? Math.min(30, triggerSteps + Math.max(6, artifactSourceKeys.length))
+            : triggerSteps;
         const reviewBudget = {
-          maxSteps: perNodeMaxSteps(Number(liveTrigger.budget?.maxSteps || 6)),
+          maxSteps: perNodeMaxSteps(desiredReviewSteps),
           strictReviewerSchema: true,
           reviewerMetadata: {
             autoMaterialized: true,
@@ -1108,6 +1113,7 @@ export class DynamicReplanner {
           provider: reviewSel.provider,
           objective: [
             `[Re-Review Cycle v${nextVersion}] Re-inspect artifacts and verification evidence after ${repairKey} addressed prior review findings.`,
+            `Prioritize inspecting repaired artifacts from ${repairKey} and verification evidence from ${reverifyKey || repairKey} via read_swarm_artifact, and emit the strict JSON verdict promptly without redundant full-repo exploration.`,
             `Original review objective: ${liveTrigger.objective}`,
             diagBlock,
           ].join('\n\n'),

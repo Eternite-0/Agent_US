@@ -407,13 +407,16 @@ export function allocatePlanBudgets({
       if (item.explicitSteps !== null) continue;
       const normType = normalizeTaskType(item.task.taskType || 'general');
       if (
-        !['implementation', 'tests', 'verification', 'multi-file-feature', 'bug-fix', 'refactor'].includes(
+        !['implementation', 'tests', 'verification', 'review', 'multi-file-feature', 'bug-fix', 'refactor'].includes(
           normType,
         )
       ) {
         continue;
       }
-      const targetCap = Math.min(36, Math.ceil(item.allocatedSteps * 1.2));
+      const targetCap =
+        normType === 'review'
+          ? Math.min(26, Math.ceil(item.allocatedSteps * 1.3))
+          : Math.min(36, Math.ceil(item.allocatedSteps * 1.2));
       const add = Math.min(spare, Math.max(0, targetCap - item.allocatedSteps));
       if (add > 0) {
         item.allocatedSteps += add;
