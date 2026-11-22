@@ -861,6 +861,9 @@ function translateHostPathToContainer(hostPath, canonicalWs, readOnlyDirs) {
   return hostPath;
 }
 
+const DEFAULT_DOCKER_PROBE_CACHE = new Map();
+const DEFAULT_NODE_PERMISSION_PROBE_CACHE = new Map();
+
 /**
  * Docker-based benchmark sandbox enforcing network=none, read-only rootfs,
  * cap-drop=ALL, no-new-privileges, non-root user 65534:65534, pids/memory/cpu limits.
@@ -885,6 +888,15 @@ export class DockerBenchmarkSandbox {
 
   probe() {
     if (this._probeCache) return this._probeCache;
+    const nodeCacheKey = normalizeForComparison(this.nodeExecPath);
+    if (this.probes == null && DEFAULT_NODE_PERMISSION_PROBE_CACHE.has(nodeCacheKey)) {
+      this._probeCache = DEFAULT_NODE_PERMISSION_PROBE_CACHE.get(nodeCacheKey);
+      return this._probeCache;
+    }
+    if (this.probes == null && DEFAULT_DOCKER_PROBE_CACHE.has(this.image)) {
+      this._probeCache = DEFAULT_DOCKER_PROBE_CACHE.get(this.image);
+      return this._probeCache;
+    }
 
     if (this.probes?.isAvailable) {
       this._probeCache = {
@@ -916,6 +928,9 @@ export class DockerBenchmarkSandbox {
 
     if (!daemonOk) {
       this._probeCache = { available: false, image: this.image, reason: daemonReason };
+      if (this.probes == null) {
+        DEFAULT_DOCKER_PROBE_CACHE.set(this.image, this._probeCache);
+      }
       return this._probeCache;
     }
 
@@ -947,6 +962,9 @@ export class DockerBenchmarkSandbox {
       image: this.image,
       reason: imageOk ? 'ok' : imageReason,
     };
+    if (this.probes == null) {
+      DEFAULT_DOCKER_PROBE_CACHE.set(this.image, this._probeCache);
+    }
     return this._probeCache;
   }
 
@@ -1304,6 +1322,11 @@ export class NodePermissionBenchmarkSandbox {
 
   probe() {
     if (this._probeCache) return this._probeCache;
+    const nodeCacheKey = normalizeForComparison(this.nodeExecPath);
+    if (this.probes == null && DEFAULT_NODE_PERMISSION_PROBE_CACHE.has(nodeCacheKey)) {
+      this._probeCache = DEFAULT_NODE_PERMISSION_PROBE_CACHE.get(nodeCacheKey);
+      return this._probeCache;
+    }
 
     if (this.probes?.isAvailable) {
       const res = normalizeProbeOutcome(
@@ -1402,6 +1425,9 @@ export class NodePermissionBenchmarkSandbox {
       reason: permReason,
       prlimitAvailable,
     };
+    if (this.probes == null) {
+      DEFAULT_NODE_PERMISSION_PROBE_CACHE.set(nodeCacheKey, this._probeCache);
+    }
     return this._probeCache;
   }
 
