@@ -1093,7 +1093,7 @@ test('3b. Reviewer needs_revision triggers bounded repair_and_reverify and respe
     parentPermissionMode: 'full-access',
     maxConcurrency: 2,
     maxReplans: 2,
-    budget: { strictReviewerSchema: true },
+    budget: { maxSteps: 60, strictReviewerSchema: true },
     nodes: [
       { nodeKey: 'impl-div', taskType: 'implementation', objective: 'WORK_DIV', isolationMode: 'worktree' },
       {
@@ -1109,6 +1109,7 @@ test('3b. Reviewer needs_revision triggers bounded repair_and_reverify and respe
         objective: 'Audit safeDiv implementation and verification tests',
         dependencies: ['impl-div', 'verify-div'],
         isolationMode: 'shared_readonly',
+        budget: { maxSteps: 14, reviewerMetadata: { excludedModels: ['prior-worker-model'] } },
       },
     ],
   });
@@ -1119,6 +1120,17 @@ test('3b. Reviewer needs_revision triggers bounded repair_and_reverify and respe
   const pkg = direct.swarmOrchestrator.buildRunDeliveryPackage(repairedByReview.runId);
   assert.equal(pkg.reviewerVerdicts.length, 1);
   assert.equal(pkg.reviewerVerdicts[0].status, 'pass');
+
+  const rerun = direct.swarmOrchestrator.getRun(repairedByReview.runId);
+  const rereviewNode = rerun.nodes.find((n) => n.nodeKey.startsWith('rereview__'));
+  assert.ok(rereviewNode);
+  const rereviewBudget =
+    rereviewNode.budget && typeof rereviewNode.budget === 'object'
+      ? rereviewNode.budget
+      : JSON.parse(rereviewNode.budgetJson || '{}');
+  assert.ok(rereviewBudget.maxSteps >= 14 && rereviewBudget.maxSteps <= 30);
+  assert.ok(Array.isArray(rereviewBudget.reviewerMetadata?.excludedModels));
+  assert.ok(rereviewBudget.reviewerMetadata.excludedModels.includes('prior-worker-model'));
 
   // Part B: Respect maxReplans=1 and strict TaskTreeBudgetLedger ceiling (never inflate maxSteps)
   const boundedEnv = createRuntimeEnv(t, {

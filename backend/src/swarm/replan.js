@@ -767,16 +767,22 @@ export class DynamicReplanner {
         return { replanned: false, strategy: 'none', reason: 'RUN_NOT_ACTIVE' };
       }
 
-      const liveTrigger = this.store.db
+      const rawTrigger = this.store.db
         .prepare('SELECT * FROM swarm_nodes WHERE id=?')
         .get(triggerNode?.id);
       if (
-        !liveTrigger ||
-        !['running', 'failed', 'completed'].includes(liveTrigger.status) ||
-        !['verification', 'review'].includes(liveTrigger.taskType)
+        !rawTrigger ||
+        !['running', 'failed', 'completed'].includes(rawTrigger.status) ||
+        !['verification', 'review'].includes(rawTrigger.taskType)
       ) {
         return { replanned: false, strategy: 'none', reason: 'NODE_NOT_ELIGIBLE' };
       }
+      const liveTrigger = {
+        ...rawTrigger,
+        dependencies: parseJsonSafe(rawTrigger.dependenciesJson, []),
+        toolAllow: parseJsonSafe(rawTrigger.toolAllowJson, []),
+        budget: parseJsonSafe(rawTrigger.budgetJson, {}),
+      };
 
       const supersededSet = this.#collectSupersededKeysInTx(liveRun.id);
       if (supersededSet.has(liveTrigger.nodeKey)) {
