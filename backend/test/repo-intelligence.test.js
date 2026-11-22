@@ -259,6 +259,13 @@ test('analyzeRepository: inspects multi-module ESM/CJS git repo, call graph, exp
     // Without issueText, architectural centrality ranks central hub first
     const baseline = await analyzeRepository(workDir);
     assert.equal(baseline.callGraph.relevantFiles[0].path, 'src/auth/token.js');
+    assert.equal(analysis.project.hasNodeModules, false);
+    assert.ok(analysis.summaryText.includes('local node_modules/ is not installed'));
+
+    mkdirSync(join(workDir, 'node_modules'), { recursive: true });
+    const withNm = await analyzeRepository(workDir);
+    assert.equal(withNm.project.hasNodeModules, true);
+    assert.equal(withNm.summaryText.includes('local node_modules/ is not installed'), false);
   } finally {
     rmDirSafe(workDir);
   }

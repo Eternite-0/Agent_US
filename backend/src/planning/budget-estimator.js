@@ -400,6 +400,28 @@ export function allocatePlanBudgets({
   }
 
   let totalAllocated = estimates.reduce((s, item) => s + item.allocatedSteps, 0);
+  if (repoScaleFiles >= 20 && userMaxSteps !== null && totalAllocated < userMaxSteps) {
+    let spare = userMaxSteps - totalAllocated;
+    for (const item of estimates) {
+      if (spare <= 0) break;
+      if (item.explicitSteps !== null) continue;
+      const normType = normalizeTaskType(item.task.taskType || 'general');
+      if (
+        !['implementation', 'tests', 'verification', 'multi-file-feature', 'bug-fix', 'refactor'].includes(
+          normType,
+        )
+      ) {
+        continue;
+      }
+      const targetCap = Math.min(36, Math.ceil(item.allocatedSteps * 1.2));
+      const add = Math.min(spare, Math.max(0, targetCap - item.allocatedSteps));
+      if (add > 0) {
+        item.allocatedSteps += add;
+        spare -= add;
+      }
+    }
+    totalAllocated = estimates.reduce((s, item) => s + item.allocatedSteps, 0);
+  }
   if (userMaxSteps !== null && totalAllocated > userMaxSteps) {
     // Proportionally trim unconstrained (non-explicit) slack above minSteps
     const fixedSteps = estimates.filter((i) => i.explicitSteps !== null).reduce((s, i) => s + i.explicitSteps, 0);

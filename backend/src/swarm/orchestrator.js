@@ -1562,12 +1562,24 @@ export class AdaptiveSwarmOrchestrator {
 
         const parsedNodeMetaBudget = parseJsonSafe(node.budgetJson, {});
         const roleMetadata = parsedNodeMetaBudget?.roleMetadata ?? null;
-        const repoCmds = run.strategy?.repoContext?.testCommands ?? [];
-        if (
-          repoCmds.length > 0 &&
-          (node.taskType === 'verification' || node.taskType === 'implementation')
-        ) {
-          fullObjective = `${fullObjective}\n\n[Repository Verification Commands]\n${repoCmds.join(' ; ')}`;
+        const repoContext = run.strategy?.repoContext ?? null;
+        const repoCmds = repoContext?.testCommands ?? [];
+        if (repoContext && node.taskType !== 'review') {
+          const ctxParts = [];
+          const summary = String(repoContext.summaryText || '').trim();
+          if (summary) {
+            ctxParts.push(summary.slice(0, 3200));
+          } else if (repoCmds.length > 0 && (node.taskType === 'verification' || node.taskType === 'implementation')) {
+            ctxParts.push(`Verification Commands: ${repoCmds.join(' ; ')}`);
+          }
+          if (repoContext.hasNodeModules === false) {
+            ctxParts.push(
+              'Environment Note: local node_modules/ is not installed in this checkout; devDependency CLIs (tsc, tsd, eslint, prettier, jest, vitest) are unavailable locally — validate changes using built-in Node runtime checks (e.g., node --test <file>, node --check) or static inspection, and do not loop retrying missing devDependencies.',
+            );
+          }
+          if (ctxParts.length > 0) {
+            fullObjective = `${fullObjective}\n\n[Repository Intelligence Context]\n${ctxParts.join('\n\n')}`;
+          }
         }
 
         const cp = effectiveChildTurnId ? this.checkpointStore?.loadLatest?.(effectiveChildTurnId) : null;

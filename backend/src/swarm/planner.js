@@ -61,7 +61,10 @@ export function toCompactRepoContext(analysis) {
         ? analysis.entryPoints.map(String).slice(0, 16)
         : [],
     relevantFiles,
-    filesScanned: Number(analysis.structure?.filesScanned ?? analysis.filesScanned ?? 0),
+    filesScanned: Number(
+      analysis.structure?.totalFiles ?? analysis.structure?.filesScanned ?? analysis.filesScanned ?? 0,
+    ),
+    hasNodeModules: analysis.project?.hasNodeModules ?? analysis.hasNodeModules ?? null,
     summaryText: String(analysis.summaryText ?? '').slice(0, 8000),
   };
 }

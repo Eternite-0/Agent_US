@@ -1849,6 +1849,11 @@ export function formatRepositorySummary(
   if (project.buildCommands?.length) cmdLines.push(`- Build: ${project.buildCommands.join(' ; ')}`);
   if (project.lintCommands?.length) cmdLines.push(`- Lint: ${project.lintCommands.join(' ; ')}`);
   if (cmdLines.length === 1) cmdLines.push('- (no test/build/lint commands detected)');
+  if (project.hasNodeModules === false) {
+    cmdLines.push(
+      '- Environment: local node_modules/ is not installed in this checkout; devDependency CLIs (e.g., tsc, tsd, eslint, prettier, jest, vitest) may be absent locally — prefer built-in runtime commands (e.g., node --test <file>) and do not retry missing local dev binaries.',
+    );
+  }
   blocks.push(cmdLines.join('\n'));
 
   // 3. Structure & Entry Points
@@ -1967,6 +1972,9 @@ export async function analyzeRepository(
     scan.files,
     { sourceFiles, testFiles },
   );
+  project.hasNodeModules = project.manifests?.includes('package.json')
+    ? existsSync(join(realRoot, 'node_modules'))
+    : null;
 
   const fileSet = new Set(scan.files.map((f) => f.rel));
   const entrySet = new Set();

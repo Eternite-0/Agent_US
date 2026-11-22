@@ -12,6 +12,7 @@ import {
 } from '../../src/planning/budget-estimator.js';
 import { AdaptivePlanner } from '../../src/planning/planner.js';
 import { AdaptiveReplanner } from '../../src/planning/replanner.js';
+import { toCompactRepoContext } from '../../src/swarm/planner.js';
 import { createRealEngineeringDataset } from '../../src/evaluation/dataset.js';
 import { Store } from '../../src/store.js';
 import { AccountPool } from '../../src/pool.js';
@@ -220,6 +221,13 @@ test('historical budget exhaustion metrics adapt future estimates and AgentLoop 
     });
     assert.equal(trimmedAlloc.feasible, true);
     assert.ok(trimmedAlloc.totalAllocatedSteps <= 50, `expected <= 50, got ${trimmedAlloc.totalAllocatedSteps}`);
+
+    const compact = toCompactRepoContext({
+      structure: { totalFiles: 120 },
+      project: { hasNodeModules: false, testCommands: ['npm test'] },
+    });
+    assert.equal(compact.filesScanned, 120);
+    assert.equal(compact.hasNodeModules, false);
   } finally {
     await direct.close();
     store.close();
