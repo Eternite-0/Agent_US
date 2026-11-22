@@ -250,3 +250,130 @@ test('P6 DirectAgentRuntime persists verdictJson and evidenceCount and HTTP cont
     rmDirSafe(workDir);
   }
 });
+
+test('P6 EvidenceVerifier tolerates explicitly cleaned temporary files while keeping required deliverables strict', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-p6-cleanup-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-p6-cleanup-work-'));
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const verifier = new EvidenceVerifier({ store });
+
+  try {
+    writeFileSync(join(workDir, 'index.js'), 'export const ok = true;\n', 'utf8');
+
+    // 1. Optional temp file written via write_file then removed via bash passes
+    const cleanedRes = verifier.verify({
+      sessionId: 's-clean',
+      turnId: 't-clean',
+      workspaceRoot: workDir,
+      text: '已实现 index.js 并清理临时验证脚本。',
+      node: { requiredFiles: ['index.js'] },
+      execution: { files: { 'index.js': true } },
+      events: [
+        { type: 'tool/call', data: { callId: 'c1', name: 'write_file', arguments: { path: 'index.js' } } },
+        { type: 'tool/result', data: { callId: 'c1', name: 'write_file', isError: false, receipt: { callId: 'c1' } } },
+        { type: 'tool/call', data: { callId: 'c2', name: 'write_file', arguments: { path: 'tmp-check.js' } } },
+        { type: 'tool/result', data: { callId: 'c2', name: 'write_file', isError: false, receipt: { callId: 'c2' } } },
+        { type: 'tool/call', data: { callId: 'c3', name: 'bash', arguments: { command: 'rm -f tmp-check.js' } } },
+        { type: 'tool/result', data: { callId: 'c3', name: 'bash', isError: false, receipt: { callId: 'c3', exitCode: 0 } } },
+      ],
+    });
+    assert.equal(cleanedRes.accepted, true, cleanedRes.reasons.join('; '));
+    assert.deepEqual(cleanedRes.checks.missingDiskFiles, []);
+    assert.deepEqual(cleanedRes.checks.cleanedUpTempFiles, ['tmp-check.js']);
+
+    // 2. Re-writing the file AFTER deletion without another deletion fails DISK_FILE_MISSING
+    const rewrittenRes = verifier.verify({
+      sessionId: 's-clean',
+      turnId: 't-rewrite',
+      workspaceRoot: workDir,
+      text: '已重写 tmp-check.js。',
+      events: [
+        { type: 'tool/call', data: { callId: 'd1', name: 'write_file', arguments: { path: 'tmp-check.js' } } },
+        { type: 'tool/result', data: { callId: 'd1', name: 'write_file', isError: false, receipt: { callId: 'd1' } } },
+        { type: 'tool/call', data: { callId: 'd2', name: 'bash', arguments: { command: 'Remove-Item tmp-check.js' } } },
+        { type: 'tool/result', data: { callId: 'd2', name: 'bash', isError: false, receipt: { callId: 'd2', exitCode: 0 } } },
+        { type: 'tool/call', data: { callId: 'd3', name: 'write_file', arguments: { path: 'tmp-check.js' } } },
+        { type: 'tool/result', data: { callId: 'd3', name: 'write_file', isError: false, receipt: { callId: 'd3' } } },
+      ],
+    });
+    assert.equal(rewrittenRes.accepted, false);
+    assert.ok(rewrittenRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+
+    // 3. Required deliverable deleted via bash STILL fails DISK_FILE_MISSING
+    const requiredDeletedRes = verifier.verify({
+      sessionId: 's-clean',
+      turnId: 't-req',
+      workspaceRoot: workDir,
+      text: '已完成。',
+      node: { requiredFiles: ['delivered.js'] },
+      execution: { files: { 'delivered.js': true } },
+      events: [
+        { type: 'tool/call', data: { callId: 'r1', name: 'write_file', arguments: { path: 'delivered.js' } } },
+        { type: 'tool/result', data: { callId: 'r1', name: 'write_file', isError: false, receipt: { callId: 'r1' } } },
+        { type: 'tool/call', data: { callId: 'r2', name: 'bash', arguments: { command: 'rm -f delivered.js' } } },
+        { type: 'tool/result', data: { callId: 'r2', name: 'bash', isError: false, receipt: { callId: 'r2', exitCode: 0 } } },
+      ],
+    });
+    assert.equal(requiredDeletedRes.accepted, false);
+    assert.ok(requiredDeletedRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+
+    // 4. Failed delete command STILL fails DISK_FILE_MISSING
+    const failedDelRes = verifier.verify({
+      sessionId: 's-clean',
+      turnId: 't-faildel',
+      workspaceRoot: workDir,
+      text: '已测试完成。',
+      events: [
+        { type: 'tool/call', data: { callId: 'f1', name: 'write_file', arguments: { path: 'tmp-fail.js' } } },
+        { type: 'tool/result', data: { callId: 'f1', name: 'write_file', isError: false, receipt: { callId: 'f1' } } },
+        { type: 'tool/call', data: { callId: 'f2', name: 'bash', arguments: { command: 'rm -f tmp-fail.js' } } },
+        { type: 'tool/result', data: { callId: 'f2', name: 'bash', isError: true, receipt: { callId: 'f2', exitCode: 1 } } },
+      ],
+    });
+    assert.equal(failedDelRes.accepted, false);
+    assert.ok(failedDelRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+
+    // 5. Programmatic Node unlinkSync cleanup is tolerated for non-required temp files
+    const nodeUnlinkRes = verifier.verify({
+      sessionId: 's-clean',
+      turnId: 't-nodeunlink',
+      workspaceRoot: workDir,
+      text: '已完成验证并清理 tmp-node.js。',
+      events: [
+        { type: 'tool/call', data: { callId: 'n1', name: 'write_file', arguments: { path: 'tmp-node.js' } } },
+        { type: 'tool/result', data: { callId: 'n1', name: 'write_file', isError: false, receipt: { callId: 'n1' } } },
+        {
+          type: 'tool/call',
+          data: {
+            callId: 'n2',
+            name: 'bash',
+            arguments: { command: "node -e \"require('node:fs').unlinkSync('tmp-node.js')\"" },
+          },
+        },
+        { type: 'tool/result', data: { callId: 'n2', name: 'bash', isError: false, receipt: { callId: 'n2', exitCode: 0 } } },
+      ],
+    });
+    assert.equal(nodeUnlinkRes.accepted, true, nodeUnlinkRes.reasons.join('; '));
+    assert.deepEqual(nodeUnlinkRes.checks.cleanedUpTempFiles, ['tmp-node.js']);
+
+    // 6. Parallel-batch bash delete dispatched BEFORE write_file call (callIndex < lastWriteIdx) STILL fails DISK_FILE_MISSING
+    const reorderedRes = verifier.verify({
+      sessionId: 's-clean',
+      turnId: 't-reordered',
+      workspaceRoot: workDir,
+      text: '并行批处理写入。',
+      events: [
+        { type: 'tool/call', data: { callId: 'p1', name: 'bash', arguments: { command: 'rm -f tmp-race.js' } } },
+        { type: 'tool/call', data: { callId: 'p2', name: 'write_file', arguments: { path: 'tmp-race.js' } } },
+        { type: 'tool/result', data: { callId: 'p2', name: 'write_file', isError: false, receipt: { callId: 'p2' } } },
+        { type: 'tool/result', data: { callId: 'p1', name: 'bash', isError: false, receipt: { callId: 'p1', exitCode: 0 } } },
+      ],
+    });
+    assert.equal(reorderedRes.accepted, false);
+    assert.ok(reorderedRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+  } finally {
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  }
+});

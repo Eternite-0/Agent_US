@@ -10,6 +10,64 @@ import { listWorkspaceChangedFiles } from '../evaluation/fixtures.js';
 const PASS_CLAIM_RE =
   /(?:全部|所有|tests?|suites?|checks?|build|lint|typecheck|npm run check).*?(?:pass(?:ed|es)?|通过|成功|0\s*(?:fail(?:ure)?s?|errors?))|(?:验证通过|测试通过|构建成功|编译通过|0\s*(?:failures|errors))/i;
 
+const DELETE_SEGMENT_RE =
+  /^\s*(?:sudo\s+|cmd(?:\.exe)?\s+\/[cq]\s+|powershell(?:\.exe)?\s+(?:-\w+\s+)*)?(?:rm|rmdir|unlink|del|erase|remove-item|ri|git\s+rm)\b/i;
+
+const PROGRAMMATIC_DELETE_RE =
+  /\b(?:fs\.(?:promises\.)?)?(?:unlink|rm)(?:Sync)?\s*\(|\bos\.(?:remove|unlink)\s*\(/;
+
+function safeToolArgs(rawArgs) {
+  if (!rawArgs) return {};
+  if (typeof rawArgs === 'object') return rawArgs;
+  if (typeof rawArgs === 'string') {
+    try {
+      const parsed = JSON.parse(rawArgs);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function commandMentionsPath(text, rel) {
+  const posix = String(rel || '').replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!posix) return false;
+  const win = posix.replace(/\//g, '\\');
+  const escaped = [...new Set([posix, win])].map((p) =>
+    p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+  );
+  const prefix = '(?:^|[\\s"\'`=(,;]|\\.[\\\\/])';
+  const suffix = '(?=$|[\\s"\'`),;])';
+  const exactRe = new RegExp(`${prefix}(?:${escaped.join('|')})${suffix}`);
+  if (exactRe.test(text)) return true;
+  const slashIdx = posix.lastIndexOf('/');
+  if (slashIdx > 0) {
+    const dir = posix.slice(0, slashIdx);
+    const base = posix.slice(slashIdx + 1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const dirMentioned = text.includes(dir) || text.includes(dir.replace(/\//g, '\\'));
+    const baseRe = new RegExp(`${prefix}${base}${suffix}`);
+    return dirMentioned && baseRe.test(text);
+  }
+  return false;
+}
+
+function isExplicitFileDeleteCommand(command, rel) {
+  if (typeof command !== 'string' || !command.trim()) return false;
+  const segments = command.split(/(?:&&|\|\||[;\n|{}])+/);
+  for (const seg of segments) {
+    const trimmed = seg.trim();
+    if (!trimmed) continue;
+    if (
+      (DELETE_SEGMENT_RE.test(trimmed) || PROGRAMMATIC_DELETE_RE.test(trimmed)) &&
+      commandMentionsPath(trimmed, rel)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Layer 3/6 EvidenceVerifier & CompletionGate:
  * Prevents hallucinated completion claims by checking durable `tool_receipts`,
@@ -152,32 +210,112 @@ export class EvidenceVerifier {
       );
     }
 
+    const contract = execution?.evidenceContract ?? node?.evidenceContract ?? null;
+
     // 3. Verify claimed file mutations exist on disk when workspaceRoot is supplied
     if (workspaceRoot && events.length) {
       const okWritePaths = new Set();
       const succeededWriteCallIds = new Set();
-      for (const ev of events) {
-        if (ev.type === 'tool/result' && ['write_file', 'edit_file'].includes(ev.data?.name) && !ev.data?.isError) {
-          if (ev.data?.receipt?.callId) succeededWriteCallIds.add(ev.data.receipt.callId);
-          else okWritePaths.add('*');
+      const callsById = new Map();
+      const latestWriteIndex = new Map();
+      const resolvedPaths = new Map();
+      const deletionEvents = [];
+
+      for (let idx = 0; idx < events.length; idx += 1) {
+        const ev = events[idx];
+        if (ev.type === 'tool/call' && ev.data?.callId) {
+          callsById.set(ev.data.callId, {
+            index: idx,
+            name: ev.data?.name,
+            args: safeToolArgs(ev.data?.arguments),
+          });
+        }
+        if (ev.type === 'tool/result' && !ev.data?.isError) {
+          const cid = ev.data?.receipt?.callId ?? ev.data?.callId ?? null;
+          if (['write_file', 'edit_file'].includes(ev.data?.name)) {
+            if (cid) succeededWriteCallIds.add(cid);
+            else okWritePaths.add('*');
+          } else if (['bash', 'delete_file'].includes(ev.data?.name)) {
+            const exitCode = ev.data?.receipt?.exitCode ?? ev.data?.exitCode;
+            if (typeof exitCode === 'number' && exitCode !== 0) continue;
+            const call = cid ? callsById.get(cid) : null;
+            const args = call?.args ?? safeToolArgs(ev.data?.arguments);
+            deletionEvents.push({
+              index: idx,
+              callIndex: call?.index ?? idx,
+              name: ev.data?.name,
+              args,
+            });
+          }
         }
       }
-      for (const ev of events) {
+
+      for (let idx = 0; idx < events.length; idx += 1) {
+        const ev = events[idx];
         if (
           ev.type === 'tool/call' &&
           ['write_file', 'edit_file'].includes(ev.data?.name) &&
-          ev.data?.arguments?.path &&
           (succeededWriteCallIds.has(ev.data?.callId) || okWritePaths.has('*'))
         ) {
+          const args = safeToolArgs(ev.data?.arguments);
+          if (!args.path) continue;
           try {
-            const { full, rel } = resolveConfinedPath(workspaceRoot, ev.data.arguments.path);
-            if (!existsSync(full)) {
-              checks.missingDiskFiles.push(rel);
-            }
+            const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+            resolvedPaths.set(rel, full);
+            latestWriteIndex.set(rel, Math.max(latestWriteIndex.get(rel) ?? -1, idx));
           } catch {
             // Path outside workspace was already blocked before execution
           }
         }
+      }
+
+      const requiredPaths = new Set();
+      for (const reqPath of [
+        ...(Array.isArray(node?.requiredFiles) ? node.requiredFiles : []),
+        ...(Array.isArray(contract?.requiredChangedFiles) ? contract.requiredChangedFiles : []),
+      ]) {
+        try {
+          const { rel } = resolveConfinedPath(workspaceRoot, reqPath);
+          requiredPaths.add(rel);
+        } catch {
+          // ignore unresolvable requirement path here
+        }
+      }
+
+      const cleanedUpFiles = [];
+      for (const [rel, full] of resolvedPaths.entries()) {
+        if (existsSync(full)) continue;
+        const lastWriteIdx = latestWriteIndex.get(rel) ?? -1;
+        let explicitlyDeleted = false;
+        if (!requiredPaths.has(rel)) {
+          for (const delEv of deletionEvents) {
+            if (delEv.callIndex <= lastWriteIdx) continue;
+            if (delEv.name === 'delete_file' && delEv.args?.path) {
+              try {
+                if (resolveConfinedPath(workspaceRoot, delEv.args.path).rel === rel) {
+                  explicitlyDeleted = true;
+                  break;
+                }
+              } catch {
+                // ignore invalid path
+              }
+            } else if (
+              delEv.name === 'bash' &&
+              isExplicitFileDeleteCommand(delEv.args?.command, rel)
+            ) {
+              explicitlyDeleted = true;
+              break;
+            }
+          }
+        }
+        if (explicitlyDeleted) {
+          cleanedUpFiles.push(rel);
+        } else {
+          checks.missingDiskFiles.push(rel);
+        }
+      }
+      if (cleanedUpFiles.length > 0) {
+        checks.cleanedUpTempFiles = cleanedUpFiles;
       }
       if (checks.missingDiskFiles.length > 0) {
         reasons.push(
@@ -185,8 +323,6 @@ export class EvidenceVerifier {
         );
       }
     }
-
-    const contract = execution?.evidenceContract ?? node?.evidenceContract ?? null;
     let contractValidation = null;
     if (contract) {
       const callCommands = new Map();
