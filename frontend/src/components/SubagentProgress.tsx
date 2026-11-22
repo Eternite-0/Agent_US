@@ -1,6 +1,6 @@
 import type { Worker } from '../types/backend';
 import { subagentOverview } from '../utils/subagentProgress';
-import { IconAgent, IconChevronRight } from './Icons';
+import { IconAgentTeam, IconChevronRight } from './Icons';
 
 export function SubagentProgress({ workers, onOpen }: { workers: Worker[]; onOpen: () => void }) {
   const { tasks, completed, failed, description } = subagentOverview(workers);
@@ -8,7 +8,7 @@ export function SubagentProgress({ workers, onOpen }: { workers: Worker[]; onOpe
   return (
     <button type="button" className="subagent-progress" onClick={onOpen}
       title={description} aria-label={`查看子任务，${tasks.length} 项，${description}`} aria-controls="workspace-inspector">
-      <IconAgent size={15} />
+      <IconAgentTeam size={15} />
       <span>子任务</span>
       <span className="tabular-nums">{completed}/{tasks.length} 已完成</span>
       {failed > 0 && <span className="subagent-progress-error">{failed} 项失败</span>}

@@ -5,6 +5,8 @@ import type {
   SwarmArtifactFile, SwarmArtifactRecord, SwarmMessageRecord, SwarmReplanRecord, SwarmRunRecord,
 } from '../types/backend';
 
+import { WorkerStatusMark } from './WorkerStatusMark';
+import { swarmWorkerStatus } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
 import { IconActivity, IconArchive, IconBranch, IconCheck, IconChevronRight, IconCircleClose, IconDagNodes, IconDownload, IconFileDoc, IconHistory, IconPlay, IconRefresh, IconShieldCheck, IconStopSquare } from './Icons';
 import type { SwarmSection } from './slashCommands';
@@ -284,9 +286,9 @@ function NodeList({ label, nodes }: { label: string; nodes: SwarmRunRecord['node
       {nodes.map((node) => <li key={node.id}>
         <details>
           <summary className="codex-subagent-list-row swarm-row">
-            <RowContents icon={<AgentAvatar seed={`${node.childSessionId || node.id}-${node.agentProfileId}`} size={22} />}
+            <RowContents icon={<AgentAvatar role={node.agentProfileId} size={18} />}
               title={node.nodeKey} detail={[node.agentProfileId, node.model].filter(Boolean).join(' · ')}
-              end={<RunStatus value={node.status} />} expandable />
+              end={<span className="swarm-status"><WorkerStatusMark status={node.status === 'superseded' ? 'cancelled' : swarmWorkerStatus(node.status)} />{status(node.status)}</span>} expandable />
           </summary>
           <div className="swarm-row-detail">
             <p>{node.objective}</p>

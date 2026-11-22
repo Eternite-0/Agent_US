@@ -10,17 +10,13 @@ import {
 } from '../utils/worker';
 import { ActivityBlock } from './ActivityBlock';
 import { subagentOverview, workerStatusLabels } from '../utils/subagentProgress';
+import { WorkerStatusMark } from './WorkerStatusMark';
 import { AgentAvatar } from './AgentAvatar';
 import {
-  IconAgent,
+  IconAgentTeam,
   IconArrowBack,
   IconBranch,
   IconCheck,
-  IconCircleClose,
-  IconCircleOutline,
-  IconPause,
-  IconPlay,
-  IconRefresh,
   IconChevronDown,
   IconChevronRight,
   IconClose,
@@ -44,12 +40,6 @@ import type { SwarmSection } from './slashCommands';
 
 export const DEFAULT_INSPECTOR_WIDTH = 400;
 const TASK_PREVIEW_LIMIT = 10;
-const statusIcons = {
-  running: IconPlay, waiting: IconCircleOutline, done: IconCheck, failed: IconCircleClose,
-  interrupted: IconPause, parked: IconPause, reconciling: IconRefresh, cancelled: IconClose,
-  unknown: IconCircleOutline,
-} satisfies Record<Worker['status'], typeof IconCheck>;
-
 interface InspectorDrawerProps {
   open: boolean;
   width: number;
@@ -522,14 +512,13 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     : null;
 
   function renderWorkerRow(worker: Worker) {
-    const StatusIcon = statusIcons[worker.status] ?? IconCircleOutline;
     const name = getWorkerDisplayName(worker);
     return (
       <button key={worker.id} type="button" className="codex-subagent-list-row" data-worker-id={worker.id}
         data-status={worker.status} onClick={() => onSelectSubagent(worker.id)}>
-        <StatusIcon size={15} />
+        <AgentAvatar role={getWorkerDisplayRole(worker)} />
         <span className="subagent-row-name" title={name}>{name}</span>
-        <span className="subagent-row-meta">{workerStatusLabels[worker.status] ?? workerStatusLabels.unknown}</span>
+        <span className="subagent-row-meta"><WorkerStatusMark status={worker.status} />{workerStatusLabels[worker.status] ?? workerStatusLabels.unknown}</span>
       </button>
     );
   }
@@ -587,7 +576,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   }}
                 >
                   {t.kind === 'subagents' ? (
-                    <IconAgent size={13} style={{ flex: 'none' }} />
+                    <IconAgentTeam size={13} style={{ flex: 'none' }} />
                   ) : t.kind === 'autonomous' ? (
                     <IconDagNodes size={13} style={{ flex: 'none' }} />
                   ) : t.kind === 'events' ? (
@@ -730,7 +719,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     <IconArrowBack size={15} />
                   </button>
                   <AgentAvatar
-                    seed={`${focusedSubagent.id}-${focusedSubagent.role}`}
+                    role={getWorkerDisplayRole(focusedSubagent)}
                     size={16}
                   />
                   <span
@@ -746,7 +735,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     {getWorkerDisplayName(focusedSubagent)}
                   </span>
                 </div>
-                <span className="subagent-detail-status">{workerStatusLabels[focusedSubagent.status]}
+                <span className="subagent-detail-status"><WorkerStatusMark status={focusedSubagent.status} />{workerStatusLabels[focusedSubagent.status] ?? workerStatusLabels.unknown}
                 </span>
               </div>
 

@@ -1,6 +1,6 @@
 import type { AppView, InspectorTab } from '../types/backend';
 import {
-  IconActivity, IconAgent, IconArchive, IconBranch, IconColumns, IconCompose, IconCopy, IconCpu,
+  IconActivity, IconAgent, IconAgentTeam, IconArchive, IconBranch, IconColumns, IconCompose, IconCopy, IconCpu,
   IconDagNodes, IconDatabase, IconDiffBox, IconFileDoc, IconFileEdit, IconFolder, IconFolderPlus,
   IconGlobe, IconHistory, IconKeyboard, IconPin, IconPlay, IconPlus, IconPuzzle,
   IconRailClock, IconReset, IconSearch, IconSettingsGear, IconShieldCheck, IconSparkle,
@@ -56,7 +56,7 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
     { cmd: '/swarm', desc: '查看自主任务的执行计划', icon: IconDagNodes, inspector: 'autonomous', swarmSection: 'plan', aliases: ['autonomous', 'swarm-plan'] },
     { cmd: '/messages', desc: '查看 Swarm 协作消息', icon: IconActivity, inspector: 'autonomous', swarmSection: 'messages', aliases: ['swarm-messages'] },
     { cmd: '/artifacts', desc: '查看 Swarm 文件产物', icon: IconArchive, inspector: 'autonomous', swarmSection: 'artifacts', aliases: ['swarm-artifacts'] },
-    { cmd: '/agents', desc: '查看子智能体和运行详情', icon: IconAgent, inspector: 'subagents', aliases: ['dag', 'subagents'] },
+    { cmd: '/agents', desc: '查看子智能体和运行详情', icon: IconAgentTeam, inspector: 'subagents', aliases: ['dag', 'subagents'] },
     { cmd: '/plan', title: '计划模式', desc: '切换计划模式', icon: IconDagNodes },
     { cmd: '/run', desc: '切换为 Codex 执行模式', icon: IconPlay },
     { cmd: '/chat', desc: '切换为 Chat 对话模式', icon: IconCompose },

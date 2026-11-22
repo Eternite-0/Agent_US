@@ -3720,9 +3720,10 @@ button:disabled {
 .subagent-detail-meta:empty { display: none; }
 .subagent-detail-status { flex: none; }
 .codex-subagent-list-row > svg { flex: none; color: var(--text-secondary); }
-.codex-subagent-list-row[data-status="running"] > svg { color: var(--color-accent); }
-.codex-subagent-list-row[data-status="failed"] > svg,
-.codex-subagent-list-row[data-status="failed"] .subagent-row-meta,
+.subagent-row-meta, .subagent-detail-status { display: inline-flex; align-items: center; gap: 5px; }
+.worker-status-mark { flex: none; }
+.worker-status-mark[data-state="running"], .worker-status-mark[data-state="reconciling"] { color: var(--color-accent); }
+.worker-status-mark[data-state="failed"],
 .subagent-progress-error { color: var(--color-danger); }
 
 .codex-subagent-list-row {

@@ -46,7 +46,7 @@ import {
   IconClose,
   IconCompose,
   IconCopy,
-  IconAgent,
+  IconAgentTeam,
   IconDotsHorizontal,
   IconDownload,
   IconFileDoc,
@@ -1025,7 +1025,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
             title="子智能体"
             onClick={() => onOpenSubagent(null, activeTask.id)}
           >
-            <IconAgent size={16} />
+            <IconAgentTeam size={16} />
           </button>
 
           <button

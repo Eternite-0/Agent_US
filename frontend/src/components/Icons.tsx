@@ -363,6 +363,14 @@ export const IconFileDoc: React.FC<IconProps> = ({ size = 16, ...props }) => (
   </svg>
 );
 
+export const IconAgentTeam: React.FC<IconProps> = ({ size = 16, ...props }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"
+    strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>
+    <rect x="1.75" y="5.75" width="9" height="7.75" rx="2.5" />
+    <path d="M5.5 5.5V5a2.5 2.5 0 0 1 2.5-2.5h3.75A2.5 2.5 0 0 1 14.25 5v2.75a2.5 2.5 0 0 1-2.5 2.5h-.75M4.75 9v.75m3-.75v.75" />
+  </svg>
+);
+
 export const IconAgent: React.FC<IconProps> = ({ size = 16, ...props }) => (
   <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true" {...props}>
     <circle cx="8" cy="5.4" r="2.3" stroke="currentColor" strokeWidth="1.3" />

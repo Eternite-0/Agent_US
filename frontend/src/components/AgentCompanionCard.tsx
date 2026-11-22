@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { Worker } from '../types/backend';
 import type { ComputedFileDiff } from '../utils/diff';
-import { getWorkerActivityLabel, getWorkerDisplayName } from '../utils/worker';
+import { getWorkerActivityLabel, getWorkerDisplayName, getWorkerDisplayRole } from '../utils/worker';
 import { subagentGroups } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
 import {
@@ -85,7 +85,7 @@ export const AgentCompanionCard: React.FC<AgentCompanionCardProps> = ({
       {/* Header */}
       <div className="codex-agent-card-head">
         <div className="codex-agent-presence">
-          <AgentAvatar seed={displayWorkers[0] ? `${displayWorkers[0].id}-${displayWorkers[0].role}` : 'main-agent'} size={17} />
+          <AgentAvatar role={getWorkerDisplayRole(displayWorkers[0])} size={17} />
           <span className="codex-agent-presence-copy">
             <strong>{getWorkerDisplayName(displayWorkers[0])}</strong>
             <small>
@@ -173,10 +173,10 @@ export const AgentCompanionCard: React.FC<AgentCompanionCardProps> = ({
           <span className="codex-agent-avatar-strip">
             {displayWorkers.length > 0 ? (
               displayWorkers.slice(0, 4).map((w) => (
-                <AgentAvatar key={w.id} seed={`${w.id}-${w.role}`} size={15} />
+                <AgentAvatar key={w.id} role={getWorkerDisplayRole(w)} size={15} />
               ))
             ) : (
-              <AgentAvatar seed="main-agent" size={15} />
+              <AgentAvatar size={15} />
             )}
           </span>
           <span className="tabular-nums" style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>

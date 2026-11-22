@@ -12,7 +12,7 @@ import type {
 import { type DiffLine } from '../utils/diff';
 import { buildUnifiedActivityTimeline } from '../utils/activity';
 import { fmtActionCommand, fmtDuration, fmtStatusLabel } from '../utils/format';
-import { getWorkerDisplayName } from '../utils/worker';
+import { getWorkerDisplayName, getWorkerDisplayRole } from '../utils/worker';
 import { AgentAvatar } from './AgentAvatar';
 import { Collapsible } from './Collapsible';
 import { Markdown } from './Markdown';
@@ -801,13 +801,13 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
                   item.workers.map((x) => (
                     <AgentAvatar
                       key={x.worker.id}
-                      seed={`${x.worker.id}-${x.worker.role}`}
+                      role={getWorkerDisplayRole(x.worker)}
                       size={15}
                     />
                   ))
                 ) : (
                   <AgentAvatar
-                    seed={`${item.worker?.id ?? item.workerKey}-${item.role || 'agent'}`}
+                    role={item.role || getWorkerDisplayRole(item.worker)}
                     size={15}
                   />
                 )}
