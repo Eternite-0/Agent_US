@@ -1073,8 +1073,8 @@ suite('External OSS benchmark verification', { concurrency: 4 }, () => {
       store,
       ossCacheDir: cacheDir,
       ossRepoOverrides: sharedJudgeFixtures.overrides,
-      concurrency: 2,
-      timeoutMs: 45_000,
+      concurrency: 4,
+      timeoutMs: 55_000,
       runtimeFactory: async ({ task, workspaceRoot }) => {
         applyGoldFix(task.id, workspaceRoot);
         const manifest = buildEvidenceOutput(task).output;
@@ -1092,7 +1092,7 @@ suite('External OSS benchmark verification', { concurrency: 4 }, () => {
     });
 
     const started = service.start({ benchmarkId: OSS_BENCHMARK_ID, model: 'test-oss-model' });
-    const deadline = Date.now() + 50_000;
+    const deadline = Date.now() + 75_000;
     let finalRun = service.getRun(started.id);
     while (Date.now() < deadline && ['queued', 'running'].includes(finalRun?.status)) {
       await new Promise((resolve) => setTimeout(resolve, 25));

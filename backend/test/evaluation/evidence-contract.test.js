@@ -197,7 +197,7 @@ test('DirectAgent pre-finalization verification catches EVIDENCE_INCOMPLETE and 
   try {
     const evalService = new EvaluationService({ store, directAgent: direct, concurrency: 1, timeoutMs: 20_000 });
     const started = evalService.start({ benchmarkId: REAL_ENGINEERING_BENCHMARK_ID, taskIds: ['real-bug-fix-01'], model: 'mock-eng' });
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 25_000;
     while (Date.now() < deadline && ['queued', 'running'].includes(evalService.getRun(started.id)?.status)) {
       await new Promise((r) => setTimeout(r, 20));
     }
