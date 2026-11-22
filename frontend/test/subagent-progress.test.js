@@ -110,27 +110,45 @@ test('normalizeSwarmDelivery safely handles partial and legacy payloads', () => 
 });
 
 test('getSwarmDeliveryApplyState gates apply-all on zero conflicts and unapplied non-empty artifacts', () => {
-  const storedArtifact = {
+  const archivedArtifact = {
     id: 'art-1', uri: 'artifact://1', runId: 'run-1', nodeId: 'n1', nodeKey: 'impl',
     attempt: 1, ownerId: 'impl', bundleSha256: 'abc', fileCount: 2, totalBytes: 100,
-    status: 'stored', files: [], appliedAt: null, createdAt: 1, updatedAt: 1,
+    status: 'archived', files: [{ path: 'src/a.js', status: 'modified' }], appliedAt: null, createdAt: 1, updatedAt: 1,
   };
-  const appliedArtifact = { ...storedArtifact, id: 'art-2', status: 'applied', appliedAt: 200 };
-  const supersededArtifact = { ...storedArtifact, id: 'art-3', status: 'superseded' };
-  const emptyArtifact = { ...storedArtifact, id: 'art-4', fileCount: 0 };
+  const storedNoCountArtifact = {
+    id: 'art-1b', uri: 'artifact://1b', runId: 'run-1', nodeId: 'n1b', nodeKey: 'impl-b',
+    attempt: 1, ownerId: 'impl-b', bundleSha256: 'def', totalBytes: 50,
+    status: 'archived', files: [{ path: 'src/b.js', status: 'added' }], appliedAt: null, createdAt: 1, updatedAt: 1,
+  };
+  const appliedArtifact = { ...archivedArtifact, id: 'art-2', status: 'applied', appliedAt: 200 };
+  const supersededArtifact = { ...archivedArtifact, id: 'art-3', status: 'superseded' };
+  const emptyArtifact = { ...archivedArtifact, id: 'art-4', fileCount: 0, files: [] };
+  const emptyFilesNoCountArtifact = {
+    id: 'art-5', uri: 'artifact://5', runId: 'run-1', nodeId: 'n5', nodeKey: 'verify',
+    attempt: 1, ownerId: 'verify', bundleSha256: 'ghi',
+    status: 'archived', files: [], appliedAt: null, createdAt: 1, updatedAt: 1,
+  };
 
   const ready = getSwarmDeliveryApplyState(normalizeSwarmDelivery({
     runId: 'run-1',
-    artifacts: [storedArtifact, appliedArtifact, supersededArtifact, emptyArtifact],
+    artifacts: [archivedArtifact, storedNoCountArtifact, appliedArtifact, supersededArtifact, emptyArtifact, emptyFilesNoCountArtifact],
     conflicts: [],
   }));
   assert.equal(ready.canApplyAll, true);
   assert.equal(ready.allApplied, false);
-  assert.equal(ready.unappliedCount, 1);
+  assert.equal(ready.unappliedCount, 2);
+
+  const onlyEmpty = getSwarmDeliveryApplyState(normalizeSwarmDelivery({
+    runId: 'run-1',
+    artifacts: [emptyArtifact, emptyFilesNoCountArtifact],
+    conflicts: [],
+  }));
+  assert.equal(onlyEmpty.canApplyAll, false);
+  assert.equal(onlyEmpty.allApplied, false);
 
   const conflicted = getSwarmDeliveryApplyState(normalizeSwarmDelivery({
     runId: 'run-1',
-    artifacts: [storedArtifact],
+    artifacts: [archivedArtifact],
     conflicts: [{ path: 'src/a.js', nodeKeys: ['impl-1', 'impl-2'], reason: 'concurrent modification' }],
   }));
   assert.equal(conflicted.hasConflicts, true);
@@ -227,7 +245,11 @@ test('LiveBackendClient delivery & apply-all endpoints handle payloads and 404/4
         headers: { 'Content-Type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ status: 'conflict', errors: ['src/a.ts modified'] }), {
+    return new Response(JSON.stringify({
+      status: 'conflict',
+      errors: [{ artifactId: 'a1', errors: ['bundle sha mismatch'] }],
+      conflicts: [{ path: 'src/a.ts', nodeKeys: ['impl-1', 'impl-2'], reason: 'src/a.ts modified' }],
+    }), {
       status: 409,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -249,6 +271,17 @@ test('LiveBackendClient delivery & apply-all endpoints handle payloads and 404/4
       text: '已将 1 个产物（1 个文件）应用到父工作区。',
       failed: false,
     });
+    const objErrFeedback = formatSwarmApplyAllFeedback({
+      ok: false,
+      status: 'conflict',
+      runId: 'run/1',
+      conflicts: [{ path: 'src/a.ts', reason: 'concurrent edit' }],
+      errors: [{ artifactId: 'a1', errors: ['sha mismatch'] }],
+    });
+    assert.equal(objErrFeedback.failed, true);
+    assert.equal(objErrFeedback.text.includes('[object Object]'), false);
+    assert.equal(objErrFeedback.text.includes('src/a.ts: concurrent edit'), true);
+    assert.equal(objErrFeedback.text.includes('a1: sha mismatch'), true);
 
     await assert.rejects(
       () => client.getSwarmDelivery('old-server'),
@@ -256,7 +289,11 @@ test('LiveBackendClient delivery & apply-all endpoints handle payloads and 404/4
     );
     await assert.rejects(
       () => client.applyAllSwarmArtifacts('conflict-run', { approved: true }),
-      (err) => err instanceof ApiError && err.status === 409 && err.message.includes('src/a.ts modified'),
+      (err) => err instanceof ApiError
+        && err.status === 409
+        && !err.message.includes('[object Object]')
+        && err.message.includes('a1: bundle sha mismatch')
+        && err.message.includes('src/a.ts: src/a.ts modified'),
     );
     assert.equal(isUnsupportedSwarmEndpointError(new ApiError(404, 'SWARM_RUN_NOT_FOUND')), false);
     assert.equal(isUnsupportedSwarmEndpointError(new ApiError(500, 'INTERNAL')), false);

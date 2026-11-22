@@ -634,14 +634,22 @@ export class LiveBackendClient implements AgentBackendClient {
           error?: { code?: string; message?: string; requestId?: string };
           message?: unknown;
           errors?: unknown[];
+          conflicts?: unknown[];
         };
         code = data.error?.code ?? code;
+        const errorDetails = Array.isArray(data.errors)
+          ? data.errors.map(formatErrorDetail).filter(Boolean)
+          : [];
+        const conflictDetails = Array.isArray(data.conflicts)
+          ? data.conflicts.map(formatErrorDetail).filter(Boolean)
+          : [];
+        const combinedDetails = [...errorDetails, ...conflictDetails];
         message =
           data.error?.message ??
           (typeof data.message === 'string' && data.message.trim()
-            ? data.message
-            : Array.isArray(data.errors) && data.errors.length
-              ? data.errors.map(String).join('；')
+            ? data.message.trim()
+            : combinedDetails.length
+              ? combinedDetails.join('；')
               : undefined);
         requestId = data.error?.requestId;
       } catch {
@@ -2048,19 +2056,63 @@ export function normalizeSwarmDelivery(
   };
 }
 
+function formatErrorDetail(item: unknown): string {
+  if (typeof item === 'string') return item.trim();
+  if (item === null || item === undefined) return '';
+  if (typeof item === 'number' || typeof item === 'boolean') return String(item);
+  if (typeof item === 'object') {
+    const record = item as Record<string, unknown>;
+    if (typeof record.message === 'string' && record.message.trim()) return record.message.trim();
+    if (typeof record.reason === 'string' && record.reason.trim()) {
+      const path = typeof record.path === 'string' && record.path.trim() ? `${record.path.trim()}: ` : '';
+      return `${path}${record.reason.trim()}`;
+    }
+    if (Array.isArray(record.errors) && record.errors.length) {
+      const nested = record.errors.map(formatErrorDetail).filter(Boolean).join(', ');
+      if (nested) {
+        const prefix =
+          typeof record.artifactId === 'string' && record.artifactId.trim()
+            ? record.artifactId.trim()
+            : typeof record.nodeKey === 'string' && record.nodeKey.trim()
+              ? record.nodeKey.trim()
+              : '';
+        return prefix ? `${prefix}: ${nested}` : nested;
+      }
+    }
+    if (typeof record.error === 'string' && record.error.trim()) return record.error.trim();
+    if (typeof record.code === 'string' && record.code.trim()) return record.code.trim();
+    try {
+      return JSON.stringify(item);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+function artifactHasFiles(artifact: SwarmArtifactRecord): boolean {
+  const fileCount = finiteNumber(artifact.fileCount);
+  if (fileCount !== undefined) {
+    return fileCount > 0 || (Array.isArray(artifact.files) && artifact.files.length > 0);
+  }
+  if (Array.isArray(artifact.files)) return artifact.files.length > 0;
+  return true;
+}
+
 export function getSwarmDeliveryApplyState(delivery: SwarmDeliveryRecord | null | undefined) {
   const conflicts = Array.isArray(delivery?.conflicts) ? delivery.conflicts : [];
   const artifacts = Array.isArray(delivery?.artifacts) ? delivery.artifacts : [];
   const unappliedArtifacts = artifacts.filter((artifact) => {
     if (!artifact || typeof artifact !== 'object') return false;
     if (artifact.appliedAt) return false;
-    if (artifact.status === 'applied' || artifact.status === 'superseded' || artifact.status === 'archived') {
+    if (artifact.status === 'applied' || artifact.status === 'superseded') {
       return false;
     }
-    const fileCount = finiteNumber(artifact.fileCount);
-    const hasFilesArray = Array.isArray(artifact.files) && artifact.files.length > 0;
-    return fileCount === undefined || fileCount > 0 || hasFilesArray;
+    return artifactHasFiles(artifact);
   });
+  const appliedCount = artifacts.filter(
+    (artifact) => Boolean(artifact && typeof artifact === 'object' && (artifact.appliedAt || artifact.status === 'applied')),
+  ).length;
   const hasConflicts = conflicts.length > 0;
   const unappliedCount = unappliedArtifacts.length;
   return {
@@ -2070,7 +2122,7 @@ export function getSwarmDeliveryApplyState(delivery: SwarmDeliveryRecord | null 
     unappliedCount,
     hasConflicts,
     canApplyAll: !hasConflicts && unappliedCount > 0,
-    allApplied: !hasConflicts && artifacts.length > 0 && unappliedCount === 0,
+    allApplied: !hasConflicts && appliedCount > 0 && unappliedCount === 0,
   };
 }
 
@@ -2165,11 +2217,15 @@ export function formatSwarmApplyAllFeedback(
   result: SwarmApplyAllResult,
   fallbackAppliedCount = 0,
 ): { text: string; failed: boolean } {
-  const conflictsCount = Array.isArray(result.conflicts) ? result.conflicts.length : 0;
-  const errors = Array.isArray(result.errors) ? result.errors.map(String).filter(Boolean) : [];
+  const conflicts = Array.isArray(result.conflicts) ? result.conflicts : [];
+  const conflictsCount = conflicts.length;
+  const conflictDetails = conflicts.map(formatErrorDetail).filter(Boolean);
+  const errors = Array.isArray(result.errors) ? result.errors.map(formatErrorDetail).filter(Boolean) : [];
   if (!result.ok || conflictsCount > 0 || errors.length > 0 || result.status === 'conflict') {
     const details = [
-      conflictsCount > 0 ? `检测到 ${conflictsCount} 处文件冲突` : '',
+      conflictsCount > 0
+        ? `检测到 ${conflictsCount} 处文件冲突${conflictDetails.length ? `（${conflictDetails.join('；')}）` : ''}`
+        : '',
       errors.length > 0 ? errors.join('；') : '',
     ].filter(Boolean).join('：');
     return {
