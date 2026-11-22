@@ -1135,6 +1135,10 @@ export class DockerBenchmarkSandbox {
 
     return {
       ...result,
+      cpuLimitExceeded: Boolean(
+        result.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(result.stderr),
+      ),
+      outputTruncated: Boolean(result.truncated),
       backend: SANDBOX_MODES.DOCKER,
     };
   }
@@ -1593,6 +1597,10 @@ export class NodePermissionBenchmarkSandbox {
 
       return {
         ...result,
+        cpuLimitExceeded: Boolean(
+          result.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(result.stderr),
+        ),
+        outputTruncated: Boolean(result.truncated),
         backend: SANDBOX_MODES.NODE_PERMISSION,
       };
     } finally {
@@ -1827,19 +1835,75 @@ function validateReadOnlyGitArgv(gitArgs) {
   }
 }
 
+function mergeShorthandProbes(probes) {
+  if (!probes || typeof probes !== 'object') {
+    return { dockerProbes: null, nodeProbes: null };
+  }
+  let dockerProbes = null;
+  if (probes.docker !== undefined) {
+    if (typeof probes.docker === 'function') {
+      dockerProbes = { isAvailable: probes.docker };
+    } else if (typeof probes.docker === 'boolean') {
+      const val = probes.docker;
+      dockerProbes = { isAvailable: () => val };
+    } else if (probes.docker && typeof probes.docker === 'object') {
+      dockerProbes = { ...probes.docker };
+    }
+  }
+
+  let nodeProbes = null;
+  if (probes.nodePermission !== undefined) {
+    if (typeof probes.nodePermission === 'function') {
+      nodeProbes = { isAvailable: probes.nodePermission };
+    } else if (typeof probes.nodePermission === 'boolean') {
+      const val = probes.nodePermission;
+      nodeProbes = { isAvailable: () => val };
+    } else if (probes.nodePermission && typeof probes.nodePermission === 'object') {
+      nodeProbes = { ...probes.nodePermission };
+    }
+  }
+  if (probes.permission !== undefined) {
+    nodeProbes = {
+      ...(nodeProbes || {}),
+      permission:
+        typeof probes.permission === 'function'
+          ? probes.permission
+          : () => Boolean(probes.permission),
+    };
+  }
+  if (probes.prlimit !== undefined) {
+    nodeProbes = {
+      ...(nodeProbes || {}),
+      prlimit:
+        typeof probes.prlimit === 'function'
+          ? probes.prlimit
+          : () => Boolean(probes.prlimit),
+    };
+  }
+  return { dockerProbes, nodeProbes };
+}
+
 /**
  * Fail-closed unified benchmark sandbox facade resolving Docker or Node `--permission`.
  * Never falls back to `HostSandboxAdapter` or unsandboxed host execution.
  */
 export class BenchmarkSandbox {
   constructor({
-    mode = SANDBOX_MODES.AUTO,
+    mode = process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || SANDBOX_MODES.AUTO,
     workspaceRoot = null,
     dependencyPolicy = DEFAULT_DEPENDENCY_POLICY,
     dockerSandbox = null,
     nodePermissionSandbox = null,
     dockerOptions = {},
     nodePermissionOptions = {},
+    probes = null,
+    dockerImage = undefined,
+    pidsLimit = undefined,
+    allowWorkspaceNodeCli = false,
+    timeoutMs = 30000,
+    cpuLimitSec = null,
+    memoryLimitMb = 512,
+    maxOutputBytes = 256 * 1024,
   } = {}) {
     if (!Object.values(SANDBOX_MODES).includes(mode)) {
       throw new SandboxUnavailableError(
@@ -1850,9 +1914,45 @@ export class BenchmarkSandbox {
     this.mode = mode;
     this.workspaceRoot = workspaceRoot;
     this.dependencyPolicy = validateDependencyPolicy(dependencyPolicy);
-    this.dockerSandbox = dockerSandbox ?? new DockerBenchmarkSandbox(dockerOptions);
+    this.allowWorkspaceNodeCli = Boolean(allowWorkspaceNodeCli);
+    this.timeoutMs = timeoutMs;
+    this.cpuLimitSec = cpuLimitSec;
+    this.memoryLimitMb = memoryLimitMb;
+    this.maxOutputBytes = maxOutputBytes;
+
+    const { dockerProbes, nodeProbes } = mergeShorthandProbes(probes);
+    const mergedDockerOpts = {
+      memoryLimitMb,
+      maxOutputBytes,
+      ...dockerOptions,
+      ...(dockerImage !== undefined ? { image: dockerImage } : {}),
+      ...(pidsLimit !== undefined ? { pidsLimit } : {}),
+      ...(dockerOptions.probes || dockerProbes
+        ? { probes: { ...(dockerOptions.probes || {}), ...(dockerProbes || {}) } }
+        : {}),
+    };
+    const mergedNodeOpts = {
+      maxOutputBytes,
+      ...nodePermissionOptions,
+      ...(nodePermissionOptions.probes || nodeProbes
+        ? { probes: { ...(nodePermissionOptions.probes || {}), ...(nodeProbes || {}) } }
+        : {}),
+    };
+
+    this.dockerSandbox = dockerSandbox ?? new DockerBenchmarkSandbox(mergedDockerOpts);
     this.nodePermissionSandbox =
-      nodePermissionSandbox ?? new NodePermissionBenchmarkSandbox(nodePermissionOptions);
+      nodePermissionSandbox ?? new NodePermissionBenchmarkSandbox(mergedNodeOpts);
+  }
+
+  #withRunDefaults(opts = {}) {
+    return {
+      ...opts,
+      allowWorkspaceNodeCli: opts.allowWorkspaceNodeCli ?? this.allowWorkspaceNodeCli,
+      timeoutMs: opts.timeoutMs ?? this.timeoutMs,
+      cpuLimitSec: opts.cpuLimitSec !== undefined ? opts.cpuLimitSec : this.cpuLimitSec,
+      memoryLimitMb: opts.memoryLimitMb ?? this.memoryLimitMb,
+      maxOutputBytes: opts.maxOutputBytes ?? this.maxOutputBytes,
+    };
   }
 
   resolveBackend() {
@@ -1986,6 +2086,7 @@ export class BenchmarkSandbox {
   }
 
   async execArgv(argv, opts = {}) {
+    const effectiveOpts = this.#withRunDefaults(opts);
     if (!Array.isArray(argv) || argv.length === 0) {
       throw new SandboxPolicyError('argv must be a non-empty array', 'E_SANDBOX_COMMAND_BLOCKED');
     }
@@ -1994,17 +2095,17 @@ export class BenchmarkSandbox {
       throw new SandboxPolicyError('NUL byte in argv is blocked', 'E_SANDBOX_COMMAND_BLOCKED');
     }
 
-    const depPolicy = opts.dependencyPolicy
-      ? validateDependencyPolicy(opts.dependencyPolicy)
+    const depPolicy = effectiveOpts.dependencyPolicy
+      ? validateDependencyPolicy(effectiveOpts.dependencyPolicy)
       : this.dependencyPolicy;
     assertCommandAllowedByDependencyPolicy(normalizedArgv, depPolicy);
 
-    const { canonicalWs, canonicalCwd } = this.#resolveWorkspaceAndCwd(opts);
+    const { canonicalWs, canonicalCwd } = this.#resolveWorkspaceAndCwd(effectiveOpts);
     const { mode, backend } = this.resolveBackend();
 
     if (mode === SANDBOX_MODES.DOCKER) {
       return backend.execArgv(normalizedArgv, {
-        ...opts,
+        ...effectiveOpts,
         workspaceRoot: canonicalWs,
         cwd: canonicalCwd,
       });
@@ -2021,7 +2122,7 @@ export class BenchmarkSandbox {
 
     if (isNodeBinary) {
       return backend.execNode(normalizedArgv.slice(1), {
-        ...opts,
+        ...effectiveOpts,
         workspaceRoot: canonicalWs,
         cwd: canonicalCwd,
       });
@@ -2035,7 +2136,7 @@ export class BenchmarkSandbox {
         depPolicy,
       );
       return backend.execNode(nodeArgs, {
-        ...opts,
+        ...effectiveOpts,
         workspaceRoot: canonicalWs,
         cwd: canonicalCwd,
       });
@@ -2047,14 +2148,18 @@ export class BenchmarkSandbox {
       const res = await runHardenedGit(gitArgs, {
         cwd: canonicalCwd,
         allowNetwork: false,
-        timeoutMs: opts.timeoutMs,
-        maxOutputBytes: opts.maxOutputBytes,
-        extraEnv: opts.extraEnv,
-        signal: opts.signal,
-        onOutput: opts.onOutput,
+        timeoutMs: effectiveOpts.timeoutMs,
+        maxOutputBytes: effectiveOpts.maxOutputBytes,
+        extraEnv: effectiveOpts.extraEnv,
+        signal: effectiveOpts.signal,
+        onOutput: effectiveOpts.onOutput,
       });
       return {
         ...res,
+        cpuLimitExceeded: Boolean(
+          res.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(res.stderr),
+        ),
+        outputTruncated: Boolean(res.truncated),
         backend: SANDBOX_MODES.NODE_PERMISSION,
       };
     }
@@ -2071,11 +2176,12 @@ export class BenchmarkSandbox {
    */
   async run(commandString, cwd, opts = {}) {
     let effectiveCwd = cwd;
-    let effectiveOpts = opts;
+    let rawOpts = opts;
     if (cwd && typeof cwd === 'object' && !Array.isArray(cwd)) {
-      effectiveOpts = cwd;
-      effectiveCwd = effectiveOpts.cwd;
+      rawOpts = cwd;
+      effectiveCwd = rawOpts.cwd;
     }
+    const effectiveOpts = this.#withRunDefaults(rawOpts);
 
     const cmd = String(commandString ?? '').trim();
     if (!cmd) {
@@ -2129,13 +2235,14 @@ export class BenchmarkSandbox {
    * and `AGENT_US_WORKSPACE_ROOT`.
    */
   async runHiddenAcceptance({
-    workspaceRoot,
+    workspaceRoot = this.workspaceRoot,
     scriptSource,
     scriptFilename = 'hidden-acceptance.test.mjs',
-    allowWorkspaceNodeCli = false,
-    timeoutMs = 30000,
-    cpuLimitSec = null,
-    memoryLimitMb = 512,
+    allowWorkspaceNodeCli = this.allowWorkspaceNodeCli,
+    timeoutMs = this.timeoutMs,
+    cpuLimitSec = this.cpuLimitSec,
+    memoryLimitMb = this.memoryLimitMb,
+    maxOutputBytes = this.maxOutputBytes,
     extraEnv = {},
     onOutput = null,
     signal = null,
@@ -2184,6 +2291,7 @@ export class BenchmarkSandbox {
         timeoutMs,
         cpuLimitSec,
         memoryLimitMb,
+        maxOutputBytes,
         onOutput,
         signal,
         extraEnv: {
@@ -2199,8 +2307,10 @@ export class BenchmarkSandbox {
         stdout: res.stdout,
         stderr: res.stderr,
         timedOut: Boolean(res.timedOut),
+        cpuLimitExceeded: Boolean(res.cpuLimitExceeded),
         backend: res.backend,
         truncated: Boolean(res.truncated),
+        outputTruncated: Boolean(res.outputTruncated ?? res.truncated),
       };
     } finally {
       if (process.platform !== 'win32') {
