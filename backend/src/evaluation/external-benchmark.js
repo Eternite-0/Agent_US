@@ -1,6 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   EVIDENCE_MANIFEST_SCHEMA_VERSION,
@@ -10,50 +8,41 @@ import {
   validateEvidenceManifest,
 } from './schemas.js';
 import { listWorkspaceChangedFiles, verifyWorkspacePinnedBaseline } from './fixtures.js';
+import {
+  BenchmarkSandbox,
+  isPathInsideRoot,
+  runHardenedGitSync,
+} from '../tools/benchmark-sandbox.js';
+import { DEFAULT_DEPENDENCY_POLICY, validatePackageDependencies } from './dependency-policy.js';
 import { estimateTaskBudget } from '../planning/budget-estimator.js';
 
 export const OSS_BENCHMARK_ID = 'agent-us-oss-benchmark';
 export const OSS_BENCHMARK_VERSION = '1.0.0';
 export const OSS_DATASET_VERSION = '1.0.0';
 
-function makeCleanTestEnv(extra = {}) {
-  const env = { ...process.env, ...extra };
-  // Prevent nested `node --test` processes from inheriting parent runner state
-  // and reporting exit code 0 on inner test failures.
-  delete env.NODE_TEST_CONTEXT;
-  delete env.NODE_TEST_WORKER_ID;
-  return env;
-}
+const DEFAULT_SANDBOX_BY_MODE = new Map();
 
-function runCommandSync(workspaceRoot, commandParts, { timeoutMs = 30_000 } = {}) {
-  const [cmd, ...args] = commandParts;
-  const binary = cmd === 'node' ? process.execPath : cmd;
-  try {
-    execFileSync(binary, args, {
-      cwd: workspaceRoot,
-      stdio: 'ignore',
-      timeout: timeoutMs,
-      env: makeCleanTestEnv(),
-    });
-    return 0;
-  } catch (error) {
-    return Number.isInteger(error?.status) ? error.status : 1;
+function getDefaultBenchmarkSandbox() {
+  const modeKey = process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || 'auto';
+  let sbx = DEFAULT_SANDBOX_BY_MODE.get(modeKey);
+  if (!sbx) {
+    sbx = new BenchmarkSandbox();
+    DEFAULT_SANDBOX_BY_MODE.set(modeKey, sbx);
   }
+  return sbx;
 }
 
 function checkFilesUnmodifiedSince(workspaceRoot, baselineCommit, protectedFiles = []) {
   if (!protectedFiles.length) return { ok: true, modified: [] };
   try {
-    const out = execFileSync(
-      'git',
+    const res = runHardenedGitSync(
       ['diff', '--no-ext-diff', '--name-only', baselineCommit, '--', ...protectedFiles],
-      {
-        cwd: workspaceRoot,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      },
+      { cwd: workspaceRoot, allowNetwork: false },
     );
-    const modified = out
+    if (res.error || res.exitCode !== 0) {
+      return { ok: false, modified: [...protectedFiles] };
+    }
+    const modified = res.stdout
       .split(/\r?\n/)
       .map(normalizeEvidencePath)
       .filter(Boolean);
@@ -71,17 +60,18 @@ function hasRealSourceDiff(workspaceRoot, baselineCommit, sourceFiles = []) {
     const full = join(workspaceRoot, rel);
     if (!existsSync(full)) return false;
     try {
-      const tracked = execFileSync('git', ['ls-files', '--', rel], {
+      const lsRes = runHardenedGitSync(['ls-files', '--', rel], {
         cwd: workspaceRoot,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      }).trim();
+        allowNetwork: false,
+      });
+      if (lsRes.error || lsRes.exitCode !== 0) return false;
+      const tracked = lsRes.stdout.trim();
       if (tracked) {
-        const res = spawnSync('git', ['diff', '--no-ext-diff', '--quiet', baselineCommit, '--', rel], {
-          cwd: workspaceRoot,
-          stdio: 'ignore',
-        });
-        if (res.status !== 1) return false;
+        const diffRes = runHardenedGitSync(
+          ['diff', '--no-ext-diff', '--quiet', baselineCommit, '--', rel],
+          { cwd: workspaceRoot, allowNetwork: false },
+        );
+        if (diffRes.error || diffRes.exitCode !== 1) return false;
       } else if (readFileSync(full, 'utf8').trim().length === 0) {
         return false;
       }
@@ -90,35 +80,6 @@ function hasRealSourceDiff(workspaceRoot, baselineCommit, sourceFiles = []) {
     }
   }
   return true;
-}
-
-function runHiddenAcceptanceSuite(workspaceRoot, scriptSource) {
-  const hiddenDir = mkdtempSync(join(tmpdir(), 'agent-us-oss-judge-'));
-  const hiddenFile = join(hiddenDir, 'hidden-acceptance.test.mjs');
-  try {
-    writeFileSync(hiddenFile, scriptSource, 'utf8');
-    const result = spawnSync(process.execPath, ['--test', hiddenFile], {
-      cwd: workspaceRoot,
-      encoding: 'utf8',
-      timeout: 30_000,
-      env: makeCleanTestEnv({
-        AGENT_US_EVAL_WORKSPACE: workspaceRoot,
-      }),
-    });
-    return {
-      passed: result.status === 0,
-      exitCode: Number.isInteger(result.status) ? result.status : 1,
-      error: result.status === 0 ? null : String(result.stderr || result.stdout || 'hidden acceptance test failed').slice(0, 1000),
-    };
-  } catch (error) {
-    return {
-      passed: false,
-      exitCode: 1,
-      error: String(error?.message ?? error).slice(0, 1000),
-    };
-  } finally {
-    rmSync(hiddenDir, { recursive: true, force: true });
-  }
 }
 
 function classifyOssJudgeFailure({ historyUntouched, baselineTestsUntampered, implementationPassed, testsPassed, validation }) {
@@ -141,6 +102,42 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
     const baselineTestFiles = task.fixture?.baselineTestFiles ?? [];
     const baselineTestCommand = task.fixture?.baselineTestCommand ?? ['node', '--test', ...baselineTestFiles];
 
+    const activeSandbox = context.sandbox ?? getDefaultBenchmarkSandbox();
+    const resolvedBackend = activeSandbox.resolveBackend();
+    const sandboxBackend = resolvedBackend?.mode ?? activeSandbox.mode ?? null;
+
+    const isolationMeta = task.metadata?.sandboxIsolation ?? {};
+    const allowWorkspaceNodeCli = Boolean(isolationMeta.allowWorkspaceNodeCli);
+    const memoryLimitMb = isolationMeta.memoryLimitMb ?? 512;
+    const cpuLimitSec = isolationMeta.cpuLimitSec ?? 20;
+    const timeoutMs = isolationMeta.timeoutMs ?? 30_000;
+    const dependencyPolicy = task.metadata?.dependencyPolicy ?? DEFAULT_DEPENDENCY_POLICY;
+
+    let depCheck = { ok: true, violations: [], dependencyCount: 0, hasLifecycleScripts: false };
+    const pkgPath = join(workspaceRoot, 'package.json');
+    if (existsSync(pkgPath)) {
+      if (!isPathInsideRoot(workspaceRoot, pkgPath, { allowEqual: false })) {
+        depCheck = {
+          ok: false,
+          violations: [{ type: 'symlink_escape', message: 'package.json escapes workspaceRoot' }],
+          dependencyCount: 0,
+          hasLifecycleScripts: false,
+        };
+      } else {
+        try {
+          const pkgJson = JSON.parse(readFileSync(pkgPath, 'utf8'));
+          depCheck = validatePackageDependencies(pkgJson, dependencyPolicy);
+        } catch (err) {
+          depCheck = {
+            ok: false,
+            violations: [{ type: 'invalid_package_json', message: String(err?.message ?? err) }],
+            dependencyCount: 0,
+            hasLifecycleScripts: false,
+          };
+        }
+      }
+    }
+
     const historyCheck = verifyWorkspacePinnedBaseline(workspaceRoot, pinnedCommit);
     const baselineFileCheck = checkFilesUnmodifiedSince(workspaceRoot, pinnedCommit, baselineTestFiles);
     const actualFiles = listWorkspaceChangedFiles(workspaceRoot);
@@ -148,9 +145,44 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
       ? hasRealSourceDiff(workspaceRoot, pinnedCommit, sourceFiles)
       : false;
 
-    const baselineTestExitCode = runCommandSync(workspaceRoot, baselineTestCommand);
-    const actualTestExitCode = runCommandSync(workspaceRoot, acceptance.testCommand);
-    const hiddenResult = runHiddenAcceptanceSuite(workspaceRoot, hiddenAcceptanceScript);
+    const baselineRun = await activeSandbox.execArgv(baselineTestCommand, {
+      workspaceRoot,
+      cwd: workspaceRoot,
+      allowWorkspaceNodeCli,
+      dependencyPolicy,
+      memoryLimitMb,
+      cpuLimitSec,
+      timeoutMs,
+    });
+    const baselineTestExitCode = baselineRun.timedOut ? 124 : baselineRun.exitCode;
+
+    const actualRun = await activeSandbox.execArgv(acceptance.testCommand, {
+      workspaceRoot,
+      cwd: workspaceRoot,
+      allowWorkspaceNodeCli,
+      dependencyPolicy,
+      memoryLimitMb,
+      cpuLimitSec,
+      timeoutMs,
+    });
+    const actualTestExitCode = actualRun.timedOut ? 124 : actualRun.exitCode;
+
+    const hiddenRun = await activeSandbox.runHiddenAcceptance({
+      workspaceRoot,
+      scriptSource: hiddenAcceptanceScript,
+      allowWorkspaceNodeCli,
+      memoryLimitMb,
+      cpuLimitSec,
+      timeoutMs,
+      extraEnv: { AGENT_US_EVAL_WORKSPACE: workspaceRoot },
+    });
+    const hiddenResult = {
+      passed: Boolean(hiddenRun.passed),
+      exitCode: hiddenRun.exitCode,
+      error: hiddenRun.passed
+        ? null
+        : String(hiddenRun.stderr || hiddenRun.stdout || 'hidden acceptance test failed').slice(0, 1000),
+    };
     const extraChecks = extraCheck ? extraCheck({ workspaceRoot, actualFiles }) : {};
     const extraPassed = Object.values(extraChecks).every(Boolean);
 
@@ -177,6 +209,8 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
       sourceDiffPresent,
       baselineTestsPassed: baselineTestExitCode === 0,
       hiddenAcceptancePassed: hiddenResult.passed,
+      sandboxIsolated: true,
+      dependencyPolicyPassed: depCheck.ok,
       ...extraChecks,
     };
 
@@ -185,6 +219,7 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
     const implementationPassed =
       historyUntouched &&
       baselineTestsUntampered &&
+      depCheck.ok &&
       sourceDiffPresent &&
       hiddenResult.passed &&
       extraPassed &&
@@ -203,6 +238,12 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
       testsPassed,
       validation,
     });
+
+    const errorMessages = [
+      ...validation.errors,
+      ...(hiddenResult.error ? [hiddenResult.error] : []),
+      ...depCheck.violations.map((v) => v.message),
+    ];
 
     return {
       passed,
@@ -225,7 +266,7 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
         planVersion: evidence.planVersion ?? context.planVersion ?? 1,
         manifestStatus: validation.status,
         missingFields: validation.missingFields,
-        errors: hiddenResult.error ? [...validation.errors, hiddenResult.error] : validation.errors,
+        errors: errorMessages,
         actualChangedFiles: actualFiles,
         reportedChangedFiles: Array.isArray(evidence.changedFiles) ? evidence.changedFiles.map(normalizeEvidencePath) : [],
         actualTestExitCode,
@@ -237,6 +278,10 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
         implementationPassed,
         testsPassed,
         evidenceCompliant,
+        sandboxIsolated: true,
+        sandboxBackend,
+        dependencyPolicyPassed: depCheck.ok,
+        ...(depCheck.violations.length ? { dependencyPolicyViolations: depCheck.violations } : {}),
         independentVerdictSource: validation.independentVerdictSource,
         failureCategory,
         checks,
@@ -252,7 +297,7 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const ws = process.env.AGENT_US_EVAL_WORKSPACE;
+const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
 
 test('hidden acceptance: nanoidBatch in index.js and index.browser.js', async () => {
   const nodeMod = await import(pathToFileURL(join(ws, 'index.js')).href);
@@ -326,7 +371,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const ws = process.env.AGENT_US_EVAL_WORKSPACE;
+const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
 
 test('hidden acceptance: trough preserves exports and implements clone, prepend, runAsync', async () => {
   const mod = await import(pathToFileURL(join(ws, 'index.js')).href);
@@ -370,7 +415,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
-const ws = process.env.AGENT_US_EVAL_WORKSPACE;
+const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
 const require = createRequire(import.meta.url);
 
 test('hidden acceptance: fast-content-type-parse format round-trip and validation', () => {
@@ -430,7 +475,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const ws = process.env.AGENT_US_EVAL_WORKSPACE;
+const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
 
 test('hidden acceptance: nanoevents prototype safety, once, and clear', async () => {
   const { createNanoEvents } = await import(pathToFileURL(join(ws, 'index.js')).href);
@@ -492,7 +537,7 @@ test('hidden acceptance: nanoevents prototype safety, once, and clear', async ()
 });
 `;
 
-function ossMetadata({ requiredChangedFiles, testFiles, testCommand, repoFileCount }) {
+function ossMetadata({ id, requiredChangedFiles, testFiles, testCommand, repoFileCount }) {
   return {
     source: OSS_BENCHMARK_ID,
     adapter: 'direct-agent-runtime',
@@ -501,6 +546,15 @@ function ossMetadata({ requiredChangedFiles, testFiles, testCommand, repoFileCou
     requiresWorkspaceMutation: true,
     requiresGitDiff: true,
     requiresIndependentVerification: true,
+    sandboxIsolation: {
+      required: true,
+      failClosed: true,
+      allowWorkspaceNodeCli: id === 'oss-nanoid-batch-cli-01',
+      memoryLimitMb: 512,
+      cpuLimitSec: 20,
+      timeoutMs: 30000,
+    },
+    dependencyPolicy: { ...DEFAULT_DEPENDENCY_POLICY },
     repoFileCount,
     acceptance: [
       'pinned_commit_history_untouched',
@@ -555,6 +609,7 @@ const RAW_OSS_TASKS = [
       hiddenAcceptanceScript: NANOID_HIDDEN_TEST,
     }),
     metadata: ossMetadata({
+      id: 'oss-nanoid-batch-cli-01',
       requiredChangedFiles: ['index.js', 'index.browser.js', 'bin/nanoid.js', 'test/batch.test.js'],
       testFiles: ['test/index.test.js', 'test/non-secure.test.js', 'test/pool.test.js', 'test/bin.test.js', 'test/batch.test.js'],
       testCommand: ['node', '--test', 'test/index.test.js', 'test/non-secure.test.js', 'test/pool.test.js', 'test/bin.test.js', 'test/batch.test.js'],
@@ -587,6 +642,7 @@ const RAW_OSS_TASKS = [
       hiddenAcceptanceScript: TROUGH_HIDDEN_TEST,
     }),
     metadata: ossMetadata({
+      id: 'oss-trough-pipeline-01',
       requiredChangedFiles: ['lib/index.js', 'test/extensions.test.js'],
       testFiles: ['test.js', 'test/extensions.test.js'],
       testCommand: ['node', '--test', 'test.js', 'test/extensions.test.js'],
@@ -621,6 +677,7 @@ const RAW_OSS_TASKS = [
       hiddenAcceptanceScript: CONTENT_TYPE_HIDDEN_TEST,
     }),
     metadata: ossMetadata({
+      id: 'oss-content-type-format-01',
       requiredChangedFiles: ['index.js', 'test/format.test.js'],
       testFiles: ['test/index.test.js', 'test/format.test.js'],
       testCommand: ['node', '--test', 'test/index.test.js', 'test/format.test.js'],
@@ -654,6 +711,7 @@ const RAW_OSS_TASKS = [
       hiddenAcceptanceScript: NANOEVENTS_HIDDEN_TEST,
     }),
     metadata: ossMetadata({
+      id: 'oss-nanoevents-hardening-01',
       requiredChangedFiles: ['index.js', 'index.d.ts', 'test/hardening.test.ts'],
       testFiles: ['test/index.test.ts', 'test/hardening.test.ts'],
       testCommand: ['node', '--test', 'test/index.test.ts', 'test/hardening.test.ts'],
@@ -662,7 +720,7 @@ const RAW_OSS_TASKS = [
   },
 ];
 
-function finalizeOssTask(rawTask, override = null) {
+function finalizeOssTask(rawTask, override = null, datasetSandbox = null) {
   const budgetPlan = estimateTaskBudget({
     taskType: rawTask.id,
     fileCount: rawTask.metadata.repoFileCount ?? 8,
@@ -697,6 +755,12 @@ function finalizeOssTask(rawTask, override = null) {
   };
   return {
     ...rawTask,
+    judge: ({ task, output, context = {} }) =>
+      rawTask.judge({
+        task,
+        output,
+        context: context?.sandbox || !datasetSandbox ? context : { ...context, sandbox: datasetSandbox },
+      }),
     fixture,
     prompt: `${rawTask.prompt}\n\n${formatEvidenceManifestContract({
       taskId: rawTask.id,
@@ -723,10 +787,16 @@ function finalizeOssTask(rawTask, override = null) {
   };
 }
 
-export function createOssBenchmarkDataset({ repoOverrides = null } = {}) {
+export function createOssBenchmarkDataset({
+  repoOverrides = null,
+  sandbox = null,
+  sandboxOptions = null,
+} = {}) {
+  const datasetSandbox =
+    sandbox ?? (sandboxOptions ? new BenchmarkSandbox(sandboxOptions) : getDefaultBenchmarkSandbox());
   return RAW_OSS_TASKS.map((task) => {
     const override = repoOverrides && typeof repoOverrides === 'object' ? repoOverrides[task.id] ?? null : null;
-    return finalizeOssTask(task, override);
+    return finalizeOssTask(task, override, datasetSandbox);
   });
 }
 

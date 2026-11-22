@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
-import { execFile as execFileCallback, execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { promisify } from 'node:util';
-
-const execFile = promisify(execFileCallback);
+import {
+  BenchmarkSandbox,
+  runHardenedGit,
+  runHardenedGitSync,
+} from '../tools/benchmark-sandbox.js';
+import { DEFAULT_DEPENDENCY_POLICY } from './dependency-policy.js';
 
 const COMMIT_SHA_40 = /^[0-9a-f]{40}$/i;
 const COMMIT_SHA_ANY = /^[0-9a-f]{40,64}$/i;
@@ -14,11 +16,14 @@ const BASELINE_FILE_NAME = 'agent-us-eval-base';
 const MIRROR_LOCKS = new Map();
 
 function resolveGitDirSync(workspaceRoot) {
-  const raw = execFileSync('git', ['rev-parse', '--git-dir'], {
+  const res = runHardenedGitSync(['rev-parse', '--git-dir'], {
     cwd: workspaceRoot,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-  }).trim();
+    allowNetwork: false,
+  });
+  if (res.error || res.exitCode !== 0) {
+    throw new Error(res.stderr?.trim() || 'Failed to resolve git directory');
+  }
+  const raw = res.stdout.trim();
   return raw ? resolve(workspaceRoot, raw) : resolve(workspaceRoot, '.git');
 }
 
@@ -50,19 +55,30 @@ async function withMirrorLock(mirrorPath, fn) {
   }
 }
 
-async function runGit(args, { cwd = undefined, timeoutMs = 120_000 } = {}) {
-  const { stdout } = await execFile('git', args, {
+async function runGit(args, { cwd = undefined, timeoutMs = 120_000, allowNetwork = false } = {}) {
+  const res = await runHardenedGit(args, {
     cwd,
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    maxBuffer: 10 * 1024 * 1024,
+    timeoutMs,
+    allowNetwork,
   });
-  return stdout;
+  if (res.timedOut || res.exitCode !== 0) {
+    const err = new Error(
+      res.stderr?.trim() || `git ${args[0] ?? ''} exited with code ${res.exitCode}`,
+    );
+    err.exitCode = res.exitCode;
+    err.stdout = res.stdout;
+    err.stderr = res.stderr;
+    throw err;
+  }
+  return res.stdout;
 }
 
 async function mirrorHasCommit(mirrorPath, commitSha) {
   try {
-    const out = await runGit(['-C', mirrorPath, 'cat-file', '-t', commitSha], { timeoutMs: 15_000 });
+    const out = await runGit(['-C', mirrorPath, 'cat-file', '-t', commitSha], {
+      timeoutMs: 15_000,
+      allowNetwork: false,
+    });
     return out.trim() === 'commit';
   } catch {
     return false;
@@ -92,12 +108,15 @@ function makeMirrorDirName(repoUrl) {
 }
 
 async function prepareMirror(repoUrl, expectedCommit, mirrorPath) {
+  const allowNetwork = /^(?:https?:|ssh:|git:)/i.test(repoUrl);
   return withMirrorLock(mirrorPath, async () => {
     if (!existsSync(mirrorPath)) {
       await mkdir(join(mirrorPath, '..'), { recursive: true });
       const stagingPath = `${mirrorPath}.tmp-${process.pid}-${Date.now()}`;
       try {
-        await runGit(['clone', '--quiet', '--mirror', '--', repoUrl, stagingPath]);
+        await runGit(['clone', '--quiet', '--mirror', '--', repoUrl, stagingPath], {
+          allowNetwork,
+        });
         await rename(stagingPath, mirrorPath);
       } catch (error) {
         await removeFixtureWorkspace(stagingPath).catch(() => {});
@@ -105,14 +124,27 @@ async function prepareMirror(repoUrl, expectedCommit, mirrorPath) {
       }
     } else if (!(await mirrorHasCommit(mirrorPath, expectedCommit))) {
       try {
-        const currentOrigin = (await runGit(['-C', mirrorPath, 'remote', 'get-url', 'origin'], { timeoutMs: 15_000 })).trim();
+        const currentOrigin = (
+          await runGit(['-C', mirrorPath, 'remote', 'get-url', 'origin'], {
+            timeoutMs: 15_000,
+            allowNetwork: false,
+          })
+        ).trim();
         if (currentOrigin !== repoUrl) {
-          await runGit(['-C', mirrorPath, 'remote', 'set-url', 'origin', '--', repoUrl], { timeoutMs: 15_000 });
+          await runGit(['-C', mirrorPath, 'remote', 'set-url', 'origin', '--', repoUrl], {
+            timeoutMs: 15_000,
+            allowNetwork: false,
+          });
         }
       } catch {
-        await runGit(['-C', mirrorPath, 'remote', 'add', 'origin', '--', repoUrl], { timeoutMs: 15_000 }).catch(() => {});
+        await runGit(['-C', mirrorPath, 'remote', 'add', 'origin', '--', repoUrl], {
+          timeoutMs: 15_000,
+          allowNetwork: false,
+        }).catch(() => {});
       }
-      await runGit(['-C', mirrorPath, 'fetch', '--quiet', '--prune', 'origin']);
+      await runGit(['-C', mirrorPath, 'fetch', '--quiet', '--prune', 'origin'], {
+        allowNetwork,
+      });
     }
 
     if (!(await mirrorHasCommit(mirrorPath, expectedCommit))) {
@@ -157,7 +189,16 @@ function resolveConfinedFixtureFile(workspaceRoot, relativePath) {
   return target;
 }
 
-export async function createGitRepoWorkspace(task, { cacheDir = null, prefix = 'agent-us-eval-git-', retainOnError = false } = {}) {
+export async function createGitRepoWorkspace(
+  task,
+  {
+    cacheDir = null,
+    prefix = 'agent-us-eval-git-',
+    retainOnError = false,
+    sandbox = null,
+    sandboxOptions = null,
+  } = {},
+) {
   const repoUrl = normalizeRepoSource(task?.fixture?.repoUrl);
   const expectedCommit = normalizePinnedCommit(task?.fixture?.commit);
   const resolvedCacheDir = cacheDir ?? task?.fixture?.cacheDir ?? null;
@@ -178,16 +219,31 @@ export async function createGitRepoWorkspace(task, { cacheDir = null, prefix = '
     await prepareMirror(repoUrl, expectedCommit, mirrorPath);
 
     workspaceRoot = await mkdtemp(join(tmpdir(), prefix));
-    await runGit(['clone', '--quiet', '--no-checkout', '--', mirrorPath, workspaceRoot]);
-    await runGit(['-C', workspaceRoot, 'checkout', '--quiet', '--detach', expectedCommit]);
+    await runGit(['clone', '--quiet', '--no-checkout', '--', mirrorPath, workspaceRoot], {
+      allowNetwork: false,
+    });
+    await runGit(['-C', workspaceRoot, 'checkout', '--quiet', '--detach', expectedCommit], {
+      allowNetwork: false,
+    });
 
-    const actualHead = (await runGit(['-C', workspaceRoot, 'rev-parse', 'HEAD'], { timeoutMs: 15_000 })).trim().toLowerCase();
+    const actualHead = (
+      await runGit(['-C', workspaceRoot, 'rev-parse', 'HEAD'], {
+        timeoutMs: 15_000,
+        allowNetwork: false,
+      })
+    ).trim().toLowerCase();
     if (actualHead !== expectedCommit) {
       throw new Error(`Pinned commit verification failed: expected ${expectedCommit}, got ${actualHead}`);
     }
 
-    await runGit(['-C', workspaceRoot, 'config', 'user.email', 'evaluation@agent-us.invalid'], { timeoutMs: 15_000 });
-    await runGit(['-C', workspaceRoot, 'config', 'user.name', 'Agent_US Evaluation'], { timeoutMs: 15_000 });
+    await runGit(['-C', workspaceRoot, 'config', 'user.email', 'evaluation@agent-us.invalid'], {
+      timeoutMs: 15_000,
+      allowNetwork: false,
+    });
+    await runGit(['-C', workspaceRoot, 'config', 'user.name', 'Agent_US Evaluation'], {
+      timeoutMs: 15_000,
+      allowNetwork: false,
+    });
     await writeWorkspaceBaselineCommitSync(workspaceRoot, expectedCommit);
 
     if (task?.fixture?.overlayFiles && typeof task.fixture.overlayFiles === 'object') {
@@ -199,8 +255,23 @@ export async function createGitRepoWorkspace(task, { cacheDir = null, prefix = '
     }
 
     if (Array.isArray(task?.fixture?.verifyReadyCommand) && task.fixture.verifyReadyCommand.length > 0) {
-      const [cmd, ...args] = task.fixture.verifyReadyCommand.map(String);
-      await execFile(cmd, args, { cwd: workspaceRoot, encoding: 'utf8', timeout: 30_000 });
+      const activeSandbox = sandbox ?? new BenchmarkSandbox(sandboxOptions ?? {});
+      activeSandbox.resolveBackend();
+      const readyRes = await activeSandbox.execArgv(
+        task.fixture.verifyReadyCommand.map(String),
+        {
+          workspaceRoot,
+          cwd: workspaceRoot,
+          allowWorkspaceNodeCli: Boolean(task?.metadata?.sandboxIsolation?.allowWorkspaceNodeCli),
+          dependencyPolicy: task?.metadata?.dependencyPolicy ?? DEFAULT_DEPENDENCY_POLICY,
+        },
+      );
+      if (readyRes.timedOut || readyRes.exitCode !== 0) {
+        throw new Error(
+          readyRes.stderr?.trim() ||
+            `Offline readiness check failed with exit code ${readyRes.exitCode}`,
+        );
+      }
     } else if (task?.fixture?.requirePackageJson) {
       const pkgPath = join(workspaceRoot, 'package.json');
       if (!existsSync(pkgPath)) {
@@ -236,16 +307,19 @@ export async function createFixtureWorkspace(task, options = {}) {
     await writeFile(target, content, 'utf8');
   }
   if (task.metadata?.requiresGitDiff) {
-    execFileSync('git', ['init', '-q'], { cwd: workspaceRoot, stdio: 'ignore' });
-    execFileSync('git', ['config', 'user.email', 'evaluation@agent-us.invalid'], { cwd: workspaceRoot, stdio: 'ignore' });
-    execFileSync('git', ['config', 'user.name', 'Agent_US Evaluation'], { cwd: workspaceRoot, stdio: 'ignore' });
-    execFileSync('git', ['add', '-A'], { cwd: workspaceRoot, stdio: 'ignore' });
-    execFileSync('git', ['commit', '-qm', 'evaluation baseline'], { cwd: workspaceRoot, stdio: 'ignore' });
-    const headCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
+    const runInitGit = (args) => {
+      const res = runHardenedGitSync(args, { cwd: workspaceRoot, allowNetwork: false });
+      if (res.error || res.exitCode !== 0) {
+        throw new Error(res.stderr?.trim() || `git ${args[0] ?? ''} failed`);
+      }
+      return res.stdout;
+    };
+    runInitGit(['init', '-q']);
+    runInitGit(['config', 'user.email', 'evaluation@agent-us.invalid']);
+    runInitGit(['config', 'user.name', 'Agent_US Evaluation']);
+    runInitGit(['add', '-A']);
+    runInitGit(['commit', '-qm', 'evaluation baseline']);
+    const headCommit = runInitGit(['rev-parse', 'HEAD']).trim();
     await writeWorkspaceBaselineCommitSync(workspaceRoot, headCommit);
   }
   return workspaceRoot;
@@ -283,19 +357,23 @@ export function getWorkspaceBaselineCommit(workspaceRoot) {
     if (existsSync(baseFile)) {
       const recorded = readFileSync(baseFile, 'utf8').trim().toLowerCase();
       if (COMMIT_SHA_ANY.test(recorded)) {
-        const verified = execFileSync('git', ['rev-parse', '--verify', '--quiet', `${recorded}^{commit}`], {
-          cwd: workspaceRoot,
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore'],
-        }).trim().toLowerCase();
+        const verifiedRes = runHardenedGitSync(
+          ['rev-parse', '--verify', '--quiet', `${recorded}^{commit}`],
+          { cwd: workspaceRoot, allowNetwork: false },
+        );
+        const verified =
+          !verifiedRes.error && verifiedRes.exitCode === 0
+            ? verifiedRes.stdout.trim().toLowerCase()
+            : '';
         if (verified === recorded) return verified;
       }
     }
-    const head = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+    const headRes = runHardenedGitSync(['rev-parse', '--verify', 'HEAD'], {
       cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim().toLowerCase();
+      allowNetwork: false,
+    });
+    const head =
+      !headRes.error && headRes.exitCode === 0 ? headRes.stdout.trim().toLowerCase() : '';
     return head || null;
   } catch {
     return null;
@@ -317,23 +395,28 @@ export function verifyWorkspacePinnedBaseline(workspaceRoot, expectedCommit) {
     if (recordedCommit !== normalized) {
       return { ok: false, expectedCommit: normalized, recordedCommit, headCommit: null, reason: 'baseline_marker_tampered' };
     }
-    const objectType = execFileSync('git', ['cat-file', '-t', normalized], {
+    const typeRes = runHardenedGitSync(['cat-file', '-t', normalized], {
       cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (objectType !== 'commit') {
+      allowNetwork: false,
+    });
+    if (typeRes.error || typeRes.exitCode !== 0 || typeRes.stdout.trim() !== 'commit') {
       return { ok: false, expectedCommit: normalized, recordedCommit, headCommit: null, reason: 'missing_pinned_commit' };
     }
-    const headCommit = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+    const headRes = runHardenedGitSync(['rev-parse', '--verify', 'HEAD'], {
       cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim().toLowerCase();
-    execFileSync('git', ['merge-base', '--is-ancestor', normalized, headCommit], {
-      cwd: workspaceRoot,
-      stdio: 'ignore',
+      allowNetwork: false,
     });
+    if (headRes.error || headRes.exitCode !== 0) {
+      return { ok: false, expectedCommit: normalized, recordedCommit: null, headCommit: null, reason: 'pinned_history_tampered' };
+    }
+    const headCommit = headRes.stdout.trim().toLowerCase();
+    const ancRes = runHardenedGitSync(['merge-base', '--is-ancestor', normalized, headCommit], {
+      cwd: workspaceRoot,
+      allowNetwork: false,
+    });
+    if (ancRes.error || ancRes.exitCode !== 0) {
+      return { ok: false, expectedCommit: normalized, recordedCommit: null, headCommit: null, reason: 'pinned_history_tampered' };
+    }
     return { ok: true, expectedCommit: normalized, recordedCommit, headCommit, reason: null };
   } catch {
     return { ok: false, expectedCommit: normalized, recordedCommit: null, headCommit: null, reason: 'pinned_history_tampered' };
@@ -345,17 +428,24 @@ export function listWorkspaceChangedFiles(workspaceRoot) {
   const normalizePath = (value) => String(value ?? '').replaceAll('\\', '/').replace(/^\.\//, '');
   try {
     const baseRef = getWorkspaceBaselineCommit(workspaceRoot) || 'HEAD';
-    const modified = execFileSync('git', ['diff', '--no-ext-diff', '--name-only', baseRef], {
+    const modRes = runHardenedGitSync(['diff', '--no-ext-diff', '--name-only', baseRef], {
       cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      allowNetwork: false,
     });
-    const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], {
+    if (modRes.error || modRes.exitCode !== 0) return [];
+    const untrackedRes = runHardenedGitSync(['ls-files', '--others', '--exclude-standard'], {
       cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      allowNetwork: false,
     });
-    return [...new Set(`${modified}\n${untracked}`.split(/\r?\n/).map(normalizePath).filter(Boolean))].sort();
+    if (untrackedRes.error || untrackedRes.exitCode !== 0) return [];
+    return [
+      ...new Set(
+        `${modRes.stdout}\n${untrackedRes.stdout}`
+          .split(/\r?\n/)
+          .map(normalizePath)
+          .filter(Boolean),
+      ),
+    ].sort();
   } catch {
     return [];
   }

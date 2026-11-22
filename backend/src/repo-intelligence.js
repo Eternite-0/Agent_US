@@ -7,8 +7,9 @@ import { promisify } from 'node:util';
 import { redactSecrets, sanitize } from './envelope.js';
 import {
   PROTECTED_BASENAMES,
+  buildGitAllowlistEnv,
+  getHardenedGitArgs,
   normalizeProtectedSegment,
-  sanitizeChildEnv,
 } from './tools/sandbox.js';
 
 const execFileAsync = promisify(execFile);
@@ -451,11 +452,11 @@ async function scanWorkspace(realRoot, { maxFiles }) {
 // ---- Git Metadata ----
 
 async function runGit(cwd, args) {
-  const { stdout } = await execFileAsync('git', args, {
+  const { stdout } = await execFileAsync('git', getHardenedGitArgs(args), {
     cwd,
     windowsHide: true,
     timeout: 4000,
-    env: sanitizeChildEnv(process.env),
+    env: buildGitAllowlistEnv({ allowNetwork: false }),
   });
   return stdout.trim();
 }

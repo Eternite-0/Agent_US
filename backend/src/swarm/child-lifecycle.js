@@ -61,6 +61,7 @@ export class ChildAgentManager {
     approvalManager = null,
     communication = null,
     onBeforeCommunicationAck = null,
+    resolveSessionSandbox = null,
   }) {
     this.store = store;
     this.kernel = kernel;
@@ -79,6 +80,8 @@ export class ChildAgentManager {
     this.approvalManager = approvalManager;
     this.communication = communication;
     this.onBeforeCommunicationAck = onBeforeCommunicationAck;
+    this.resolveSessionSandbox =
+      typeof resolveSessionSandbox === 'function' ? resolveSessionSandbox : null;
     this.getDefaultModel = getDefaultModel;
     this.activeChildren = new Map(); // childSessionId -> { controller, parentSessionId, paused, shuttingDown, model }
     this.shuttingDown = false;
@@ -572,6 +575,19 @@ export class ChildAgentManager {
           effectivePolicy = intersectPolicies(effectivePolicy, { permissionMode: 'read-only' });
         }
 
+        const sandboxConfig = this.resolveSessionSandbox?.(childSessionId) ?? null;
+        if (sandboxConfig?.forcedToolDeny?.length) {
+          effectivePolicy = {
+            ...effectivePolicy,
+            denyTools: [
+              ...new Set([
+                ...(effectivePolicy.denyTools ?? []),
+                ...sandboxConfig.forcedToolDeny,
+              ]),
+            ],
+          };
+        }
+
         const turnLeaseGuard =
           baseLeaseGuard?.withContext?.({
             sessionId: childSessionId,
@@ -856,16 +872,20 @@ export class ChildAgentManager {
             assembled.messages.splice(-1, 0, ...extraUserMessages);
           }
 
-          // Wire parent workspace HookRunner (sharing HookTrustManager) so child/swarm turns NEVER bypass PreToolUse security hooks!
+          // Wire parent workspace HookRunner (sharing HookTrustManager) unless session sandbox disables workspace hooks
           const hookWorkspaceRoot = workspaceRoot || effectiveRoot;
-          const hooks = hookWorkspaceRoot
-            ? new HookRunner(hookWorkspaceRoot, {
-                dataRoot: this.dataRoot,
-                store: this.store,
-                trustManager: this.hookTrust,
-                eventRouter: this.eventRouter,
-              })
-            : null;
+          const disableHooksForSandbox = Boolean(
+            sandboxConfig && sandboxConfig.disableWorkspaceHooks !== false,
+          );
+          const hooks =
+            !disableHooksForSandbox && hookWorkspaceRoot
+              ? new HookRunner(hookWorkspaceRoot, {
+                  dataRoot: this.dataRoot,
+                  store: this.store,
+                  trustManager: this.hookTrust,
+                  eventRouter: this.eventRouter,
+                })
+              : null;
 
           const kernelProfile = this.kernel.getProfile('swarm_worker') ?? this.kernel.getProfile('subagent');
           const result = await this.kernel.executeTurn({
@@ -891,7 +911,13 @@ export class ChildAgentManager {
             provider,
             permissionMode: effectivePolicy.permissionMode,
             allowTools: effectivePolicy.allowTools,
-            denyTools: [...new Set([...(effectivePolicy.denyTools ?? []), 'spawn_subagent'])],
+            denyTools: [
+              ...new Set([
+                ...(effectivePolicy.denyTools ?? []),
+                ...(sandboxConfig?.forcedToolDeny ?? []),
+                'spawn_subagent',
+              ]),
+            ],
             getLivePolicy: readLivePolicy,
             getApprovedPrefixes: readApprovedPrefixes,
             requestApproval: childRequestApproval,

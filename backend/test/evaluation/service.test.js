@@ -143,7 +143,9 @@ test('createDirectRuntimeAdapter grants isolated full-access without network for
   await engHandle.run();
 
   assert.equal(recordedCalls[0].opts.permissionMode, 'full-access');
-  assert.deepEqual(recordedCalls[0].opts.toolDeny, ['web_fetch', 'web_search']);
+  assert.equal(recordedCalls[0].opts.sandboxProfile, 'benchmark');
+  assert.ok(recordedCalls[0].opts.sandbox);
+  assert.deepEqual(recordedCalls[0].opts.toolDeny, ['web_fetch', 'web_search', 'start_process']);
   assert.equal(recordedCalls[1].opts.permissionMode, 'full-access');
   assert.equal(recordedCalls[1].opts.maxSteps, engTask.metadata.resourceBudget.maxSteps);
   assert.ok(recordedCalls[1].opts.maxSteps > 16, 'complex engineering tasks should use complexity-derived step budget');
@@ -154,6 +156,8 @@ test('createDirectRuntimeAdapter grants isolated full-access without network for
   await smokeHandle.run();
 
   assert.equal(recordedCalls[2].opts.permissionMode, 'auto-safe');
-  assert.deepEqual(recordedCalls[2].opts.toolDeny, ['web_fetch', 'web_search']);
+  assert.equal(recordedCalls[2].opts.sandboxProfile, 'benchmark');
+  assert.ok(recordedCalls[2].opts.sandbox);
+  assert.deepEqual(recordedCalls[2].opts.toolDeny, ['web_fetch', 'web_search', 'start_process']);
   assert.equal(recordedCalls[3].opts.permissionMode, 'auto-safe');
 });

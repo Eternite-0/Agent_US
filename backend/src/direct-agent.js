@@ -1,7 +1,5 @@
-import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { Fault, id as uuid } from './store.js';
 import { excerpt } from './context.js';
 import { AgentRuntimeKernel } from './kernel/runtime.js';
@@ -37,10 +35,19 @@ import {
 } from './workspace-tools.js';
 import { McpHub } from './mcp-client.js';
 import { ToolDispatcher } from './tools/dispatcher.js';
-import { ToolPermissionPolicy, intersectPolicies } from './tools/policy.js';
+import {
+  ToolPermissionPolicy,
+  filterToolsByPolicy,
+  intersectPolicies,
+} from './tools/policy.js';
 import { validatePlan } from './planning/validator.js';
 import { HookTrustManager } from './tools/hook-trust.js';
 import { GitWorktreeIsolator, HostSandboxAdapter } from './tools/sandbox.js';
+import {
+  BenchmarkSandbox,
+  isPathInsideRoot,
+  runHardenedGit,
+} from './tools/benchmark-sandbox.js';
 import { McpLifecycleManager } from './tools/mcp-lifecycle.js';
 import { DirectSessionRepo } from './runtime/session-repo.js';
 import { DirectApprovalManager } from './runtime/approval-manager.js';
@@ -66,8 +73,6 @@ import { DynamicReplanner } from './swarm/replan.js';
 import { AdaptiveSwarmOrchestrator } from './swarm/orchestrator.js';
 import { SwarmArtifactManager } from './swarm/artifacts.js';
 
-const execFileAsync = promisify(execFile);
-
 function todayDateStr() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -75,12 +80,13 @@ function todayDateStr() {
 
 async function detectGitBranch(cwd) {
   try {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['rev-parse', '--abbrev-ref', 'HEAD'],
-      { cwd, windowsHide: true, timeout: 2500 },
-    );
-    return stdout.trim() || null;
+    const res = await runHardenedGit(['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd,
+      allowNetwork: false,
+      timeoutMs: 2500,
+    });
+    if (res.timedOut || res.exitCode !== 0) return null;
+    return res.stdout.trim() || null;
   } catch {
     return null;
   }
@@ -164,6 +170,7 @@ export class DirectAgentRuntime {
     this.activeSessionTurn = new Map(); // sessionId -> turnId
     this.steeringQueues = new Map(); // sessionId -> string[]
     this.readFileStates = new Map(); // sessionId -> Map(relPath -> { sha256, at })
+    this.sessionSandboxes = new Map(); // sessionId -> { sandbox, disableWorkspaceHooks, disableWorkspaceMcp, forcedToolDeny }
 
     this.processManager = new BackgroundProcessManager();
     this.mcpHub = new McpHub({
@@ -216,6 +223,7 @@ export class DirectAgentRuntime {
         this.activeSessionTurn.delete(sessionId);
         this.steeringQueues.delete(sessionId);
         this.readFileStates.delete(sessionId);
+        this.sessionSandboxes.delete(sessionId);
         this.contextAssembler.clearSession(sessionId);
       },
       onBeforeRewind: (sessionId) => {
@@ -289,11 +297,16 @@ export class DirectAgentRuntime {
       dataRoot: this.dataRoot,
       approvalManager: this.approvalManager,
       communication: this.mailbox.bus,
+      resolveSessionSandbox: (sid) => this.#resolveSessionSandboxConfig(sid),
       getLivePolicy: (sessionId) => this.#getLiveSessionPolicy(sessionId),
       requestApproval: (request) => this.approvalManager.requestApproval(request),
       getDefaultModel: () => this.pool.getDefaultModel(),
-      getWorkspaceTools: ({ workspaceRoot, sessionId, permissionMode, nonce, getLivePolicy, getApprovedPrefixes, requestApproval, approvalManager, signal }) =>
-        createWorkspaceTools({
+      getWorkspaceTools: ({ workspaceRoot, sessionId, permissionMode, nonce, getLivePolicy, getApprovedPrefixes, requestApproval, approvalManager, signal }) => {
+        const sbxCfg = this.#resolveSessionSandboxConfig(sessionId);
+        const toolSandbox = sbxCfg?.sandbox
+          ? this.#scopeSandboxForWorkspace(sbxCfg.sandbox, workspaceRoot)
+          : this.sandbox;
+        return createWorkspaceTools({
           workspaceRoot,
           dataRoot: this.dataRoot,
           store: this.store,
@@ -301,7 +314,7 @@ export class DirectAgentRuntime {
           permissionMode,
           nonce,
           processManager: this.processManager,
-          sandbox: this.sandbox,
+          sandbox: toolSandbox,
           getLivePolicy,
           getApprovedPrefixes,
           requestApproval,
@@ -309,7 +322,8 @@ export class DirectAgentRuntime {
           onHookConfigMutated: ({ path, toolName }) =>
             this.hookTrust.onConfigMutated({ filePath: path, toolName }),
           signal,
-        }),
+        });
+      },
     });
     this.swarmReplanner = new DynamicReplanner({
       store: this.store,
@@ -611,8 +625,123 @@ export class DirectAgentRuntime {
   getSession(sessionId) {
     return this.sessionRepo.getSession(sessionId);
   }
-  createSession(opts) {
-    return this.sessionRepo.createSession(opts);
+  #resolveSessionSandboxConfig(sessionOrId) {
+    if (!sessionOrId) return null;
+    const isObj = typeof sessionOrId === 'object';
+    const directId = isObj ? sessionOrId.id : String(sessionOrId);
+    if (directId && this.sessionSandboxes.has(directId)) {
+      return this.sessionSandboxes.get(directId);
+    }
+    let session = isObj ? sessionOrId : null;
+    if (!session && directId && this.store?.db?.isOpen) {
+      session =
+        this.store.db
+          .prepare('SELECT id, parentSessionId, rootSessionId FROM direct_sessions WHERE id=?')
+          .get(directId) ?? null;
+    }
+    if (!session) return null;
+    for (const cid of [session.id, session.parentSessionId, session.rootSessionId]) {
+      if (cid && this.sessionSandboxes.has(cid)) {
+        return this.sessionSandboxes.get(cid);
+      }
+    }
+    let curParentId = session.parentSessionId;
+    const seen = new Set([session.id, session.parentSessionId, session.rootSessionId].filter(Boolean));
+    let hops = 0;
+    while (curParentId && hops++ < 12 && this.store?.db?.isOpen) {
+      if (this.sessionSandboxes.has(curParentId)) {
+        return this.sessionSandboxes.get(curParentId);
+      }
+      if (seen.has(curParentId)) break;
+      seen.add(curParentId);
+      const parentRow = this.store.db
+        .prepare('SELECT parentSessionId, rootSessionId FROM direct_sessions WHERE id=?')
+        .get(curParentId);
+      if (!parentRow) break;
+      if (parentRow.rootSessionId && this.sessionSandboxes.has(parentRow.rootSessionId)) {
+        return this.sessionSandboxes.get(parentRow.rootSessionId);
+      }
+      curParentId = parentRow.parentSessionId;
+    }
+    return null;
+  }
+
+  #scopeSandboxForWorkspace(baseSandbox, workspaceRoot) {
+    if (!baseSandbox || !workspaceRoot) return baseSandbox;
+    if (!(baseSandbox instanceof BenchmarkSandbox)) return baseSandbox;
+    if (!baseSandbox.workspaceRoot) return baseSandbox;
+    let inside = false;
+    try {
+      inside = isPathInsideRoot(baseSandbox.workspaceRoot, workspaceRoot, { allowEqual: true });
+    } catch {
+      inside = resolve(baseSandbox.workspaceRoot) === resolve(workspaceRoot);
+    }
+    if (inside) return baseSandbox;
+    return new BenchmarkSandbox({
+      mode: baseSandbox.mode,
+      workspaceRoot,
+      dependencyPolicy: baseSandbox.dependencyPolicy,
+      dockerSandbox: baseSandbox.dockerSandbox,
+      nodePermissionSandbox: baseSandbox.nodePermissionSandbox,
+      allowWorkspaceNodeCli: baseSandbox.allowWorkspaceNodeCli,
+      timeoutMs: baseSandbox.timeoutMs,
+      cpuLimitSec: baseSandbox.cpuLimitSec,
+      memoryLimitMb: baseSandbox.memoryLimitMb,
+      maxOutputBytes: baseSandbox.maxOutputBytes,
+    });
+  }
+
+  createSession(opts = {}) {
+    const {
+      sandbox = null,
+      sandboxProfile = null,
+      disableWorkspaceHooks = undefined,
+      disableWorkspaceMcp = undefined,
+      callerSessionId = null,
+      ...sessionOpts
+    } = opts ?? {};
+
+    const inheritedCfg =
+      this.#resolveSessionSandboxConfig(sessionOpts.parentSessionId) ??
+      this.#resolveSessionSandboxConfig(sessionOpts.rootSessionId) ??
+      this.#resolveSessionSandboxConfig(callerSessionId);
+
+    const activeProfile = sandboxProfile ?? (inheritedCfg ? 'benchmark' : null);
+    const useBenchmarkSandbox = Boolean(sandbox || inheritedCfg || activeProfile === 'benchmark');
+    if (!useBenchmarkSandbox) {
+      return this.sessionRepo.createSession(sessionOpts);
+    }
+
+    const resolvedSandbox =
+      sandbox ??
+      inheritedCfg?.sandbox ??
+      new BenchmarkSandbox({
+        workspaceRoot: sessionOpts.workspaceRoot ?? null,
+      });
+    resolvedSandbox.resolveBackend();
+
+    const forcedToolDeny = ['start_process', 'web_fetch', 'web_search'];
+    const mergedToolDeny = [
+      ...new Set([
+        ...(Array.isArray(sessionOpts.toolDeny) ? sessionOpts.toolDeny.map(String) : []),
+        ...forcedToolDeny,
+      ]),
+    ];
+
+    const created = this.sessionRepo.createSession({
+      ...sessionOpts,
+      toolDeny: mergedToolDeny,
+    });
+
+    this.sessionSandboxes.set(created.id, {
+      sandbox: resolvedSandbox,
+      disableWorkspaceHooks:
+        disableWorkspaceHooks ?? inheritedCfg?.disableWorkspaceHooks ?? true,
+      disableWorkspaceMcp:
+        disableWorkspaceMcp ?? inheritedCfg?.disableWorkspaceMcp ?? true,
+      forcedToolDeny,
+    });
+    return created;
   }
   updateSession(sessionId, patch) {
     return this.sessionRepo.updateSession(sessionId, patch);
@@ -765,10 +894,15 @@ export class DirectAgentRuntime {
       .get(sessionId);
     if (!row) return null;
     const hydrated = this.sessionRepo.hydrateSessionRow(row);
+    const sbxCfg = this.#resolveSessionSandboxConfig(sessionId);
+    const baseDeny = Array.isArray(hydrated.toolDeny) ? hydrated.toolDeny : [];
+    const effectiveDeny = sbxCfg?.forcedToolDeny?.length
+      ? [...new Set([...baseDeny, ...sbxCfg.forcedToolDeny])]
+      : baseDeny;
     return {
       permissionMode: hydrated.permissionMode || 'auto-safe',
       allowTools: hydrated.toolAllow ?? undefined,
-      denyTools: hydrated.toolDeny?.length ? hydrated.toolDeny : undefined,
+      denyTools: effectiveDeny.length ? effectiveDeny : undefined,
       approvedPrefixes: hydrated.approvedPrefixes ?? [],
     };
   }
@@ -1348,11 +1482,29 @@ export class DirectAgentRuntime {
   }) {
     const started = Date.now();
     const nonce = this.sessionRepo.ensureSessionNonce(sessionId);
-    const hooks = new HookRunner(workspaceRoot, {
-      dataRoot: this.dataRoot,
-      store: this.store,
-      trustManager: this.hookTrust,
-    });
+    const sbxCfg = this.#resolveSessionSandboxConfig(sessionId);
+    if (sbxCfg?.sandbox) {
+      sbxCfg.sandbox.resolveBackend();
+    }
+    const disableWorkspaceHooks = Boolean(sbxCfg?.disableWorkspaceHooks);
+    const disableWorkspaceMcp = Boolean(sbxCfg?.disableWorkspaceMcp);
+    const hooks = disableWorkspaceHooks
+      ? {
+          run: async () => ({
+            blocked: false,
+            reason: null,
+            updatedInput: null,
+            transformApplied: false,
+            additionalContexts: [],
+            warnings: [],
+          }),
+          hasHooks: () => false,
+        }
+      : new HookRunner(workspaceRoot, {
+          dataRoot: this.dataRoot,
+          store: this.store,
+          trustManager: this.hookTrust,
+        });
     let totalIn = 0;
     let totalOut = 0;
     let totalCacheRead = 0;
@@ -1396,7 +1548,9 @@ export class DirectAgentRuntime {
 
       const [gitBranch, mcpTools, startHook] = await Promise.all([
         detectGitBranch(workspaceRoot),
-        this.mcpManager.discoverTools(workspaceRoot).catch(() => []),
+        disableWorkspaceMcp
+          ? Promise.resolve([])
+          : this.mcpManager.discoverTools(workspaceRoot).catch(() => []),
         hooks
           .run('SessionStart', { sessionId, turnId, input }, { signal, permissionMode: effectivePermissionMode })
           .catch(() => ({ blocked: false, additionalContexts: [] })),
@@ -1407,6 +1561,10 @@ export class DirectAgentRuntime {
         this.store,
         { dataRoot: this.dataRoot },
       );
+
+      const turnSandbox = sbxCfg?.sandbox
+        ? this.#scopeSandboxForWorkspace(sbxCfg.sandbox, workspaceRoot)
+        : this.sandbox;
 
       const tools = createWorkspaceTools({
         workspaceRoot,
@@ -1419,7 +1577,7 @@ export class DirectAgentRuntime {
         getApprovedPrefixes: () => this.#getLiveSessionPolicy(sessionId)?.approvedPrefixes ?? [],
         readFileState,
         processManager: this.processManager,
-        sandbox: this.sandbox,
+        sandbox: turnSandbox,
         mcpTools,
         signal,
         onHookConfigMutated: ({ path, toolName }) =>
@@ -1556,6 +1714,12 @@ export class DirectAgentRuntime {
       }
 
       const livePolicy = this.#getLiveSessionPolicy(sessionId);
+      const effectiveTurnDenyTools = sbxCfg?.forcedToolDeny?.length
+        ? [...new Set([...(livePolicy?.denyTools ?? []), ...sbxCfg.forcedToolDeny])]
+        : livePolicy?.denyTools;
+      const effectiveTools = sbxCfg?.forcedToolDeny?.length
+        ? filterToolsByPolicy(tools, { denyTools: effectiveTurnDenyTools })
+        : tools;
       contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
       const defaultMaxOutputTokens = Math.min(
         16384,
@@ -1572,11 +1736,11 @@ export class DirectAgentRuntime {
         workspaceRoot,
         execution: evidenceContract ? { evidenceContract } : null,
         messages: assembled.messages,
-        tools,
+        tools: effectiveTools,
         hooks,
         permissionMode: livePolicy?.permissionMode || effectivePermissionMode,
         allowTools: livePolicy?.allowTools,
-        denyTools: livePolicy?.denyTools,
+        denyTools: effectiveTurnDenyTools,
         getLivePolicy: () => this.#getLiveSessionPolicy(sessionId),
         getApprovedPrefixes: () => this.#getLiveSessionPolicy(sessionId)?.approvedPrefixes ?? [],
         requestApproval: ({ tool, arguments: args, callId, riskLevel, effectClass, argsDigest }) =>

@@ -16,6 +16,8 @@ import { TRAFFIC_SOURCES, withTraceContext } from '../observability/trace.js';
 import { redactSecrets } from '../envelope.js';
 import { scoreResults } from './scoring.js';
 import { estimateTaskBudget, queryHistoricalTaskMetrics } from '../planning/budget-estimator.js';
+import { BenchmarkSandbox } from '../tools/benchmark-sandbox.js';
+import { DEFAULT_DEPENDENCY_POLICY } from './dependency-policy.js';
 
 export const BENCHMARK_ID = 'agent-us-deterministic-core';
 export const BENCHMARK_VERSION = '1.0.0';
@@ -328,16 +330,79 @@ function collectTurnTelemetry(directAgent, sessionId, turnId, currentTurn) {
   return { toolReceipts, parsedVerdict, stepUsage, tokenUsage };
 }
 
-function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
+function resolveTaskSandbox({
+  baseSandbox = null,
+  sandboxOptions = null,
+  workspaceRoot = null,
+  task = null,
+} = {}) {
+  const isolation = task?.metadata?.sandboxIsolation ?? {};
+  const depPolicy = task?.metadata?.dependencyPolicy ?? DEFAULT_DEPENDENCY_POLICY;
+  const allowCli =
+    isolation.allowWorkspaceNodeCli !== undefined
+      ? Boolean(isolation.allowWorkspaceNodeCli)
+      : undefined;
+
+  if (baseSandbox) {
+    if (!(baseSandbox instanceof BenchmarkSandbox)) {
+      return baseSandbox;
+    }
+    const needsWsOverride =
+      Boolean(workspaceRoot) && baseSandbox.workspaceRoot !== workspaceRoot;
+    const needsCliOverride =
+      allowCli !== undefined && allowCli !== baseSandbox.allowWorkspaceNodeCli;
+    const needsPolicyOverride =
+      Boolean(task?.metadata?.dependencyPolicy) &&
+      baseSandbox.dependencyPolicy !== task.metadata.dependencyPolicy;
+    if (!needsWsOverride && !needsCliOverride && !needsPolicyOverride) {
+      return baseSandbox;
+    }
+    return new BenchmarkSandbox({
+      mode: baseSandbox.mode,
+      workspaceRoot: workspaceRoot ?? baseSandbox.workspaceRoot ?? null,
+      dependencyPolicy: task?.metadata?.dependencyPolicy ?? baseSandbox.dependencyPolicy,
+      dockerSandbox: baseSandbox.dockerSandbox,
+      nodePermissionSandbox: baseSandbox.nodePermissionSandbox,
+      allowWorkspaceNodeCli: allowCli ?? baseSandbox.allowWorkspaceNodeCli,
+      timeoutMs: isolation.timeoutMs ?? baseSandbox.timeoutMs,
+      cpuLimitSec:
+        isolation.cpuLimitSec !== undefined ? isolation.cpuLimitSec : baseSandbox.cpuLimitSec,
+      memoryLimitMb: isolation.memoryLimitMb ?? baseSandbox.memoryLimitMb,
+      maxOutputBytes: baseSandbox.maxOutputBytes,
+    });
+  }
+
+  return new BenchmarkSandbox({
+    ...(sandboxOptions ?? {}),
+    workspaceRoot: workspaceRoot ?? sandboxOptions?.workspaceRoot ?? null,
+    dependencyPolicy: depPolicy,
+    ...(allowCli !== undefined ? { allowWorkspaceNodeCli: allowCli } : {}),
+    ...(isolation.timeoutMs !== undefined ? { timeoutMs: isolation.timeoutMs } : {}),
+    ...(isolation.cpuLimitSec !== undefined ? { cpuLimitSec: isolation.cpuLimitSec } : {}),
+    ...(isolation.memoryLimitMb !== undefined ? { memoryLimitMb: isolation.memoryLimitMb } : {}),
+  });
+}
+
+function createDirectRuntimeAdapter(directAgent, { model = null, sandbox = null, sandboxOptions = null } = {}) {
   if (!directAgent) throw new TypeError('Evaluation requires DirectAgentRuntime');
-  return ({ task, attempt = 1, workspaceRoot, signal, context }) => {
+  return ({ task, attempt = 1, workspaceRoot, signal, context = {} }) => {
     let turnId = null;
     const attemptId = `attempt-${Number(attempt || 1)}`;
     const planVersion = Number(task.metadata?.planVersion ?? 1);
     const evalPermissionMode =
       task.metadata?.requiresWorkspaceMutation === true ? 'full-access' : 'auto-safe';
-    const evalToolDeny =
-      task.metadata?.externalNetwork === false ? ['web_fetch', 'web_search'] : null;
+    const isBenchmarkTask = Boolean(
+      workspaceRoot ||
+        task?.fixture ||
+        task?.metadata?.acceptanceCriteria ||
+        task?.metadata?.externalNetwork === false ||
+        task?.metadata?.sandboxIsolation,
+    );
+    const evalToolDeny = isBenchmarkTask
+      ? ['web_fetch', 'web_search', 'start_process']
+      : task.metadata?.externalNetwork === false
+        ? ['web_fetch', 'web_search']
+        : null;
     const hasAcceptanceCriteria = Boolean(task.metadata?.acceptanceCriteria);
     const evidenceContract = hasAcceptanceCriteria
       ? {
@@ -355,6 +420,16 @@ function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
         ? `${task.prompt}\n\n[Execution Binding] taskId=${task.id}, attemptId=${attemptId}, planVersion=${planVersion}`
         : task.prompt;
     const run = withTraceContext({ trafficSource: TRAFFIC_SOURCES.EVAL, isSynthetic: true }, async () => {
+      let taskSandbox = null;
+      if (isBenchmarkTask) {
+        taskSandbox = resolveTaskSandbox({
+          baseSandbox: context?.sandbox ?? sandbox ?? null,
+          sandboxOptions: context?.sandboxOptions ?? sandboxOptions ?? null,
+          workspaceRoot,
+          task,
+        });
+        taskSandbox.resolveBackend();
+      }
       const session = directAgent.createSession({
         title: `Evaluation · ${task.id}`,
         model: model || context.model || undefined,
@@ -362,6 +437,7 @@ function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
         mode: 'direct',
         permissionMode: evalPermissionMode,
         ...(evalToolDeny ? { toolDeny: evalToolDeny } : {}),
+        ...(taskSandbox ? { sandbox: taskSandbox, sandboxProfile: 'benchmark' } : {}),
         trafficSource: TRAFFIC_SOURCES.EVAL,
         isSynthetic: true,
       });
@@ -489,7 +565,7 @@ export class EvaluationService {
   #controllers = new Map();
   #activeExecutions = new Map();
 
-  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, judge = null, maxConcurrency = 2, timeoutMs = 120_000, memory = null, capabilityRegistry = null, ossCacheDir = null, ossRepoOverrides = null } = {}) {
+  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, judge = null, maxConcurrency = 2, timeoutMs = 120_000, memory = null, capabilityRegistry = null, ossCacheDir = null, ossRepoOverrides = null, sandbox = null, sandboxOptions = null } = {}) {
     if (!store || typeof store.add !== 'function' || typeof store.list !== 'function') {
       throw new TypeError('EvaluationService requires Store');
     }
@@ -497,10 +573,19 @@ export class EvaluationService {
     this.directAgent = directAgent ?? null;
     this.ossCacheDir = ossCacheDir ? String(ossCacheDir) : null;
     this.ossRepoOverrides = ossRepoOverrides && typeof ossRepoOverrides === 'object' ? ossRepoOverrides : null;
+    this.sandbox = sandbox ?? null;
+    this.sandboxOptions = sandboxOptions && typeof sandboxOptions === 'object' ? sandboxOptions : null;
+    const datasetSandboxOpts = {
+      ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+      ...(this.sandboxOptions ? { sandboxOptions: this.sandboxOptions } : {}),
+    };
     this.registry = new EvaluationRegistry([
       ...createBenchmarkDataset(),
-      ...createRealEngineeringDataset(),
-      ...createOssBenchmarkDataset({ repoOverrides: this.ossRepoOverrides }),
+      ...createRealEngineeringDataset(datasetSandboxOpts),
+      ...createOssBenchmarkDataset({
+        repoOverrides: this.ossRepoOverrides,
+        ...datasetSandboxOpts,
+      }),
     ]);
     this.runtimeFactory = runtimeFactory;
     this.jobQueue = jobQueue;
@@ -513,10 +598,15 @@ export class EvaluationService {
 
   async createTaskWorkspace(task, options = {}) {
     const resolvedCacheDir = options.cacheDir ?? this.ossCacheDir ?? task?.fixture?.cacheDir ?? null;
+    const sbxOpts = {
+      ...options,
+      ...(this.sandbox && !options.sandbox ? { sandbox: this.sandbox } : {}),
+      ...(this.sandboxOptions && !options.sandboxOptions ? { sandboxOptions: this.sandboxOptions } : {}),
+    };
     if (task?.fixture?.repoUrl && task?.fixture?.commit) {
-      return createGitRepoWorkspace(task, { ...options, cacheDir: resolvedCacheDir });
+      return createGitRepoWorkspace(task, { ...sbxOpts, cacheDir: resolvedCacheDir });
     }
-    return createFixtureWorkspace(task, options);
+    return createFixtureWorkspace(task, sbxOpts);
   }
 
   registerOnWorker(recoveryWorker) {
@@ -613,6 +703,10 @@ export class EvaluationService {
   }
 
   listBenchmarks() {
+    const datasetSandboxOpts = {
+      ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+      ...(this.sandboxOptions ? { sandboxOptions: this.sandboxOptions } : {}),
+    };
     const benchmarks = [
       {
         id: BENCHMARK_ID,
@@ -627,7 +721,7 @@ export class EvaluationService {
         title: 'Agent_US Real Software Engineering Benchmark',
         version: REAL_ENGINEERING_BENCHMARK_VERSION,
         datasetVersion: REAL_ENGINEERING_DATASET_VERSION,
-        tasks: createRealEngineeringDataset(),
+        tasks: createRealEngineeringDataset(datasetSandboxOpts),
         description: 'Isolated multi-file engineering fixtures with real file edits, tests, Git diff evidence, and deterministic independent verification.',
       },
       {
@@ -635,7 +729,10 @@ export class EvaluationService {
         title: 'Agent_US Open-Source Pinned-Commit Benchmark',
         version: OSS_BENCHMARK_VERSION,
         datasetVersion: OSS_DATASET_VERSION,
-        tasks: createOssBenchmarkDataset({ repoOverrides: this.ossRepoOverrides }),
+        tasks: createOssBenchmarkDataset({
+          repoOverrides: this.ossRepoOverrides,
+          ...datasetSandboxOpts,
+        }),
         description: 'Real open-source GitHub repositories pinned to immutable commit SHAs with multi-commit git baseline tracking, baseline regression suites, and hidden behavioral judges.',
       },
     ];
@@ -758,7 +855,13 @@ export class EvaluationService {
         },
       });
       this.#ensureDurableRun(run, tasks, options);
-      const runtimeFactory = this.runtimeFactory ?? createDirectRuntimeAdapter(this.directAgent, { model: options.model });
+      const runtimeFactory =
+        this.runtimeFactory ??
+        createDirectRuntimeAdapter(this.directAgent, {
+          model: options.model,
+          ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+          ...(this.sandboxOptions ? { sandboxOptions: this.sandboxOptions } : {}),
+        });
       const runner = new EvaluationRunner({
         runtimeFactory,
         ...(this.judge ? { judge: this.judge } : {}),
@@ -789,7 +892,13 @@ export class EvaluationService {
         }
         return task;
       });
-      const report = await runner.run({ tasks: preparedTasks, signal: controller.signal, context: { model: options.model, runId } });
+      const runnerContext = {
+        model: options.model,
+        runId,
+        ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+        ...(this.sandboxOptions ? { sandboxOptions: this.sandboxOptions } : {}),
+      };
+      const report = await runner.run({ tasks: preparedTasks, signal: controller.signal, context: runnerContext });
       const previousResults = Array.isArray(run.results) ? run.results : [];
       const mergedByTask = new Map(previousResults.map((result) => [String(result.taskId), result]));
       for (const result of report.results) mergedByTask.set(String(result.taskId), result);

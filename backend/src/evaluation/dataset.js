@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -10,6 +9,8 @@ import {
   validateEvidenceManifest,
 } from './schemas.js';
 import { listWorkspaceChangedFiles } from './fixtures.js';
+import { BenchmarkSandbox, isPathInsideRoot } from '../tools/benchmark-sandbox.js';
+import { DEFAULT_DEPENDENCY_POLICY, validatePackageDependencies } from './dependency-policy.js';
 import { estimateTaskBudget } from '../planning/budget-estimator.js';
 
 const CATEGORY_SPECS = Object.freeze([
@@ -86,17 +87,36 @@ function readFixtureJson(workspaceRoot, relativePath) {
   try { return JSON.parse(text); } catch { return null; }
 }
 
-function runFixtureTests(workspaceRoot, testFiles) {
-  try {
-    execFileSync(process.execPath, ['--test', ...testFiles], {
-      cwd: workspaceRoot,
-      stdio: 'ignore',
-      timeout: 30_000,
-    });
-    return 0;
-  } catch (error) {
-    return Number.isInteger(error?.status) ? error.status : 1;
+const DEFAULT_SANDBOX_BY_MODE = new Map();
+
+function getDefaultBenchmarkSandbox() {
+  const modeKey = process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || 'auto';
+  let sbx = DEFAULT_SANDBOX_BY_MODE.get(modeKey);
+  if (!sbx) {
+    sbx = new BenchmarkSandbox();
+    DEFAULT_SANDBOX_BY_MODE.set(modeKey, sbx);
   }
+  return sbx;
+}
+
+async function runFixtureTests(
+  workspaceRoot,
+  testFiles,
+  {
+    sandbox = null,
+    allowWorkspaceNodeCli = false,
+    dependencyPolicy = DEFAULT_DEPENDENCY_POLICY,
+  } = {},
+) {
+  const activeSandbox = sandbox ?? getDefaultBenchmarkSandbox();
+  activeSandbox.resolveBackend();
+  const result = await activeSandbox.execArgv([process.execPath, '--test', ...testFiles], {
+    workspaceRoot,
+    cwd: workspaceRoot,
+    allowWorkspaceNodeCli,
+    dependencyPolicy,
+  });
+  return result.timedOut ? 124 : result.exitCode;
 }
 
 function sha256Text(text) {
@@ -131,11 +151,51 @@ function classifyJudgeFailure(specificPassed, actualTestExitCode, validation) {
   return 'evidence_invalid';
 }
 
-function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }) {
+async function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }) {
   const workspaceRoot = context.workspaceRoot;
   const acceptance = task.metadata.acceptanceCriteria;
+  const activeSandbox = context.sandbox ?? getDefaultBenchmarkSandbox();
+  const resolvedBackend = activeSandbox.resolveBackend();
+  const sandboxBackend = resolvedBackend?.mode ?? activeSandbox.mode ?? null;
+
+  const isolationMeta = task.metadata?.sandboxIsolation ?? {};
+  const allowWorkspaceNodeCli =
+    isolationMeta.allowWorkspaceNodeCli !== undefined
+      ? Boolean(isolationMeta.allowWorkspaceNodeCli)
+      : task.id === 'real-data-processing-01';
+  const dependencyPolicy = task.metadata?.dependencyPolicy ?? DEFAULT_DEPENDENCY_POLICY;
+
+  let depCheck = { ok: true, violations: [], dependencyCount: 0, hasLifecycleScripts: false };
+  const pkgPath = join(workspaceRoot, 'package.json');
+  if (existsSync(pkgPath)) {
+    if (!isPathInsideRoot(workspaceRoot, pkgPath, { allowEqual: false })) {
+      depCheck = {
+        ok: false,
+        violations: [{ type: 'symlink_escape', message: 'package.json escapes workspaceRoot' }],
+        dependencyCount: 0,
+        hasLifecycleScripts: false,
+      };
+    } else {
+      try {
+        const pkgJson = JSON.parse(readFileSync(pkgPath, 'utf8'));
+        depCheck = validatePackageDependencies(pkgJson, dependencyPolicy);
+      } catch (err) {
+        depCheck = {
+          ok: false,
+          violations: [{ type: 'invalid_package_json', message: String(err?.message ?? err) }],
+          dependencyCount: 0,
+          hasLifecycleScripts: false,
+        };
+      }
+    }
+  }
+
   let actualFiles = listWorkspaceChangedFiles(workspaceRoot);
-  const actualTestExitCode = runFixtureTests(workspaceRoot, acceptance.testFiles);
+  const actualTestExitCode = await runFixtureTests(workspaceRoot, acceptance.testFiles, {
+    sandbox: activeSandbox,
+    allowWorkspaceNodeCli,
+    dependencyPolicy,
+  });
   actualFiles = listWorkspaceChangedFiles(workspaceRoot);
   if (acceptance.requiredChangedFiles.includes('output/summary.json') && existsSync(join(workspaceRoot, 'output/summary.json')) && !actualFiles.includes('output/summary.json')) {
     actualFiles = [...actualFiles, 'output/summary.json'];
@@ -144,12 +204,20 @@ function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }) {
   const evidence = validation.manifest ?? {};
   const specificChecks = taskChecks({ workspaceRoot, actualFiles, evidence });
   const specificPassed = Object.values(specificChecks).every(Boolean);
-  const checks = { ...validation.checks, ...specificChecks };
-  const implementationPassed = specificPassed && Boolean(checks.changedFiles);
+  const checks = {
+    ...validation.checks,
+    ...specificChecks,
+    sandboxIsolated: true,
+    dependencyPolicyPassed: depCheck.ok,
+  };
+  const implementationPassed = specificPassed && depCheck.ok && Boolean(checks.changedFiles);
   const testsPassed = actualTestExitCode === 0 && Boolean(checks.testReceiptVerified);
   const evidenceCompliant = Boolean(validation.valid);
   const passed = implementationPassed && testsPassed && evidenceCompliant;
-  const failureCategory = passed ? 'none' : classifyJudgeFailure(specificPassed, actualTestExitCode, validation);
+  const failureCategory = passed ? 'none' : classifyJudgeFailure(specificPassed && depCheck.ok, actualTestExitCode, validation);
+  const errors = depCheck.violations.length
+    ? [...validation.errors, ...depCheck.violations.map((v) => v.message)]
+    : validation.errors;
 
   return {
     passed,
@@ -167,7 +235,7 @@ function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }) {
       planVersion: evidence.planVersion ?? context.planVersion ?? 1,
       manifestStatus: validation.status,
       missingFields: validation.missingFields,
-      errors: validation.errors,
+      errors,
       actualChangedFiles: actualFiles,
       reportedChangedFiles: Array.isArray(evidence.changedFiles) ? evidence.changedFiles.map(normalizeEvidencePath) : [],
       actualTestExitCode,
@@ -177,6 +245,10 @@ function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }) {
       implementationPassed,
       testsPassed,
       evidenceCompliant,
+      sandboxIsolated: true,
+      sandboxBackend,
+      dependencyPolicyPassed: depCheck.ok,
+      ...(depCheck.violations.length ? { dependencyPolicyViolations: depCheck.violations } : {}),
       independentVerdictSource: validation.independentVerdictSource,
       failureCategory,
       checks,
@@ -189,7 +261,7 @@ function readmeContains(workspaceRoot, terms) {
   return terms.every((term) => readme.toLowerCase().includes(term.toLowerCase()));
 }
 
-function featureJudge(args) {
+async function featureJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => ({
@@ -199,7 +271,7 @@ function featureJudge(args) {
   });
 }
 
-function bugFixJudge(args) {
+async function bugFixJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => ({
@@ -209,7 +281,7 @@ function bugFixJudge(args) {
   });
 }
 
-function codebaseAnalysisJudge(args) {
+async function codebaseAnalysisJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => {
@@ -222,7 +294,7 @@ function codebaseAnalysisJudge(args) {
   });
 }
 
-function refactorJudge(args) {
+async function refactorJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => ({
@@ -233,7 +305,7 @@ function refactorJudge(args) {
   });
 }
 
-function testsJudge(args) {
+async function testsJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => {
@@ -247,7 +319,7 @@ function testsJudge(args) {
   });
 }
 
-function apiCompatibilityJudge(args) {
+async function apiCompatibilityJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => ({
@@ -257,7 +329,7 @@ function apiCompatibilityJudge(args) {
   });
 }
 
-function securityAuditJudge(args) {
+async function securityAuditJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => {
@@ -271,7 +343,7 @@ function securityAuditJudge(args) {
   });
 }
 
-function dataProcessingJudge(args) {
+async function dataProcessingJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => {
@@ -285,7 +357,7 @@ function dataProcessingJudge(args) {
   });
 }
 
-function recoveryJudge(args) {
+async function recoveryJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => ({
@@ -295,7 +367,7 @@ function recoveryJudge(args) {
   });
 }
 
-function multiAgentJudge(args) {
+async function multiAgentJudge(args) {
   return judgeTask({
     ...args,
     taskChecks: ({ workspaceRoot }) => {
@@ -647,6 +719,15 @@ test('parallel artifacts are handed off and independently reviewable', async () 
     resourceBudget,
     metadata: {
       ...task.metadata,
+      sandboxIsolation: {
+        required: true,
+        failClosed: true,
+        allowWorkspaceNodeCli: task.id === 'real-data-processing-01',
+        memoryLimitMb: 512,
+        cpuLimitSec: 20,
+        timeoutMs: 30000,
+      },
+      dependencyPolicy: { ...DEFAULT_DEPENDENCY_POLICY },
       resourceBudget,
     },
     category: 'real-software-engineering',
@@ -656,9 +737,21 @@ test('parallel artifacts are handed off and independently reviewable', async () 
   };
 }));
 
-export function createRealEngineeringDataset() {
+export function createRealEngineeringDataset({ sandbox = null, sandboxOptions = null } = {}) {
+  const datasetSandbox =
+    sandbox ?? (sandboxOptions ? new BenchmarkSandbox(sandboxOptions) : null);
   return REAL_ENGINEERING_TASKS.map((task) => ({
     ...task,
+    ...(datasetSandbox
+      ? {
+          judge: ({ task: t, output, context = {} }) =>
+            task.judge({
+              task: t,
+              output,
+              context: context?.sandbox ? context : { ...context, sandbox: datasetSandbox },
+            }),
+        }
+      : {}),
     fixture: { files: { ...task.fixture.files } },
     expected: structuredClone(task.expected),
     metadata: structuredClone(task.metadata),
