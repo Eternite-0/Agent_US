@@ -15,7 +15,7 @@ import { CreateProjectModal } from './components/CreateProjectModal';
 import { EvaluationView } from './components/EvaluationView';
 import { McpStatusPanel } from './components/McpStatusPanel';
 import { HomeView } from './components/HomeView';
-import { InspectorDrawer } from './components/InspectorDrawer';
+import { DEFAULT_INSPECTOR_WIDTH, InspectorDrawer } from './components/InspectorDrawer';
 import { SearchPalette } from './components/SearchPalette';
 import { SettingsView } from './components/SettingsView';
 import { Sidebar } from './components/Sidebar';
@@ -169,9 +169,22 @@ export const App: React.FC = () => {
   const [fontSize, setFontSize] = useState<'compact' | 'default' | 'comfortable'>('default');
   const [reducedMotion, setReducedMotion] = useState(false);
   const [codexMode, setCodexMode] = useState<CodexMode>('Codex');
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [compactWindow, setCompactWindow] = useState(() => window.matchMedia('(max-width: 820px)').matches);
+  const [sidebarPreferences, setSidebarPreferences] = useState({ compact: true, wide: false });
+  const layout = compactWindow ? 'compact' : 'wide';
+  const sidebarCollapsed = sidebarPreferences[layout];
+  const toggleSidebar = useCallback(() => {
+    setSidebarPreferences(previous => ({ ...previous, [layout]: !previous[layout] }));
+  }, [layout]);
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 820px)');
+    const sync = () => setCompactWindow(media.matches);
+    sync();
+    media.addEventListener('change', sync);
+    return () => media.removeEventListener('change', sync);
+  }, []);
   const [sidebarWidth, setSidebarWidth] = useState(248);
-  const [drawerWidth, setDrawerWidth] = useState(640);
+  const [drawerWidth, setDrawerWidth] = useState(DEFAULT_INSPECTOR_WIDTH);
   const [searchOpen, setSearchOpen] = useState(false);
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -304,7 +317,7 @@ export const App: React.FC = () => {
         setSearchOpen((v) => !v);
       } else if (mod && e.key.toLowerCase() === 'b') {
         e.preventDefault();
-        setSidebarCollapsed((v) => !v);
+        toggleSidebar();
       } else if (mod && e.key.toLowerCase() === 'n') {
         e.preventDefault();
         navigate({ kind: 'home' });
@@ -318,7 +331,7 @@ export const App: React.FC = () => {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [navigate]);
+  }, [navigate, toggleSidebar]);
 
   const toggleTheme = useCallback(() => {
     setThemeMode(resolvedTheme === 'dark' ? 'light' : 'dark');
@@ -1390,7 +1403,7 @@ export const App: React.FC = () => {
         theme={resolvedTheme}
         onBack={goBack}
         onForward={goForward}
-        onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
+        onToggleSidebar={toggleSidebar}
         onNewChat={() => navigate({ kind: 'home' })}
         onNewProject={() => setCreateProjectOpen(true)}
         onOpenSettings={(sec) => navigate({ kind: 'settings', section: sec || 'general' })}

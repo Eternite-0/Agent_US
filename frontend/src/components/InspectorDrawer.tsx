@@ -9,13 +9,18 @@ import {
   getWorkerDisplayRole,
 } from '../utils/worker';
 import { ActivityBlock } from './ActivityBlock';
-import { subagentGroups, workerStatusLabels } from '../utils/subagentProgress';
+import { subagentOverview, workerStatusLabels } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
 import {
   IconAgent,
   IconArrowBack,
   IconBranch,
   IconCheck,
+  IconCircleClose,
+  IconCircleOutline,
+  IconPause,
+  IconPlay,
+  IconRefresh,
   IconChevronDown,
   IconChevronRight,
   IconClose,
@@ -36,6 +41,14 @@ import { Markdown } from './Markdown';
 import type { AgentBackendClient } from '../api/client';
 import { AutonomousRunPanel } from './AutonomousRunPanel';
 import type { SwarmSection } from './slashCommands';
+
+export const DEFAULT_INSPECTOR_WIDTH = 400;
+const TASK_PREVIEW_LIMIT = 10;
+const statusIcons = {
+  running: IconPlay, waiting: IconCircleOutline, done: IconCheck, failed: IconCircleClose,
+  interrupted: IconPause, parked: IconPause, reconciling: IconRefresh, cancelled: IconClose,
+  unknown: IconCircleOutline,
+} satisfies Record<Worker['status'], typeof IconCheck>;
 
 interface InspectorDrawerProps {
   open: boolean;
@@ -181,6 +194,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   const [collapsedDirs, setCollapsedDirs] = useState<Record<string, boolean>>({});
   const [copiedFile, setCopiedFile] = useState(false);
   const [showAllSubagents, setShowAllSubagents] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [lightbox, setLightbox] = useState<{ images: PreviewImageItem[]; index: number } | null>(null);
 
   // Version snapshot state
@@ -498,12 +512,27 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     return resolveWorkerName(w, { assignment: asgn });
   };
 
-  const progressGroups = useMemo(() => subagentGroups(bundle?.workers ?? []), [bundle?.workers]);
-  const eventWorkers = (bundle?.workers ?? []).filter((worker) => !worker.assignmentId);
-  useEffect(() => setShowAllSubagents(false), [bundle?.task.id]);
+  const { tasks, history } = useMemo(() => subagentOverview(bundle?.workers ?? []), [bundle?.workers]);
+  useEffect(() => {
+    setShowAllSubagents(false);
+    setHistoryOpen(false);
+  }, [bundle?.task.id]);
   const focusedSubagent = selectedSubagentId
-    ? (bundle?.workers ?? []).find((w) => w.id === selectedSubagentId) ?? null
+    ? tasks.find(worker => worker.id === selectedSubagentId) ?? history.find(worker => worker.id === selectedSubagentId)
     : null;
+
+  function renderWorkerRow(worker: Worker) {
+    const StatusIcon = statusIcons[worker.status] ?? IconCircleOutline;
+    const name = getWorkerDisplayName(worker);
+    return (
+      <button key={worker.id} type="button" className="codex-subagent-list-row" data-worker-id={worker.id}
+        data-status={worker.status} onClick={() => onSelectSubagent(worker.id)}>
+        <StatusIcon size={15} />
+        <span className="subagent-row-name" title={name}>{name}</span>
+        <span className="subagent-row-meta">{workerStatusLabels[worker.status] ?? workerStatusLabels.unknown}</span>
+      </button>
+    );
+  }
 
   return (
     <aside
@@ -646,7 +675,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
               className="codex-icon-btn"
               style={{ width: 26, height: 26 }}
               title={width > 700 ? '还原分屏宽度' : '加宽分屏视图'}
-              onClick={() => onResize(width > 700 ? 580 : 860)}
+              onClick={() => onResize(width > 700 ? DEFAULT_INSPECTOR_WIDTH : 860)}
             >
               <IconColumns size={14} />
             </button>
@@ -717,12 +746,15 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     {getWorkerDisplayName(focusedSubagent)}
                   </span>
                 </div>
-                <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flex: 'none' }}>
-                  {[focusedSubagent.model, getWorkerDisplayRole(focusedSubagent)].filter(Boolean).join(' · ')}
+                <span className="subagent-detail-status">{workerStatusLabels[focusedSubagent.status]}
                 </span>
               </div>
 
               <div className="codex-subagent-panel">
+                <div className="subagent-detail-meta">
+                  {[getWorkerDisplayRole(focusedSubagent), focusedSubagent.model,
+                    focusedSubagent.attempt > 1 && `第 ${focusedSubagent.attempt} 次尝试`].filter(Boolean).join(' · ')}
+                </div>
                 {(() => {
                   const wEvidence = bundle.evidence.filter((e) => e.workerId === focusedSubagent.id);
                   const wApprovals = bundle.approvals.filter((a) => a.workerId === focusedSubagent.id);
@@ -781,7 +813,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
                       {!wEvidence.length && !finalBlocks.length && (
                         <div style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>
-                          该子智能体当前暂无工具执行或输出记录（状态：{workerStatusLabels[focusedSubagent.status]}）。
+                          暂无工具执行或输出记录。
                         </div>
                       )}
 
@@ -813,26 +845,26 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
               </div>
             </div>
           ) : (
-            <div className="codex-subagent-panel">
-              {!progressGroups.length && <p className="subagent-empty">暂无子任务记录</p>}
-              {[...progressGroups, ...(eventWorkers.length ? [{ status: 'events', label: '其他执行记录', members: eventWorkers }] : [])].map(({ status, label, members }) => (
-                <section key={status} aria-label={label}>
-                  <div className="codex-subagent-section-head tabular-nums">{label} · {members.length}</div>
-                  {(showAllSubagents ? members : members.slice(0, 10)).map((worker) => (
-                    <button key={worker.id} type="button" className="codex-subagent-list-row" data-worker-id={worker.id}
-                      onClick={() => onSelectSubagent(worker.id)}>
-                      <AgentAvatar seed={`${worker.id}-${worker.role}`} size={16} />
-                      <span className="subagent-row-name">{getWorkerDisplayName(worker)}</span>
-                      <span className="subagent-row-meta">{worker.attempt > 1 ? `第 ${worker.attempt} 次尝试` : getWorkerDisplayRole(worker)}</span>
-                    </button>
-                  ))}
-                  {!showAllSubagents && members.length > 10 && (
-                    <button type="button" className="codex-sidebar-more-btn" onClick={() => setShowAllSubagents(true)}>
-                      再显示 {members.length - 10} 个
-                    </button>
-                  )}
+            <div className="codex-subagent-panel subagent-list">
+              {tasks.length ? (
+                <section aria-label="子任务列表">
+                  <div className="subagent-list-heading"><span>任务 · {tasks.length}</span><span>状态</span></div>
+                  {(showAllSubagents ? tasks : tasks.slice(0, TASK_PREVIEW_LIMIT)).map(renderWorkerRow)}
                 </section>
-              ))}
+              ) : <p className="subagent-empty">暂无子任务记录</p>}
+              {history.length > 0 && (
+                <section className="subagent-history">
+                  <button type="button" className="subagent-history-toggle" aria-expanded={historyOpen}
+                    onClick={() => setHistoryOpen(open => !open)}>
+                    {historyOpen ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
+                    执行历史 · {history.length}
+                  </button>
+                  {historyOpen && (showAllSubagents ? history : history.slice(0, TASK_PREVIEW_LIMIT)).map(renderWorkerRow)}
+                </section>
+              )}
+              {!showAllSubagents && (tasks.length > TASK_PREVIEW_LIMIT || (historyOpen && history.length > TASK_PREVIEW_LIMIT)) && (
+                <button type="button" className="codex-sidebar-more-btn" onClick={() => setShowAllSubagents(true)}>显示全部记录</button>
+              )}
             </div>
           )
         ) : activePaneTab?.kind === 'file' ? (

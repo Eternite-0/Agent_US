@@ -43,3 +43,23 @@ export function subagentGroups(workers: readonly Worker[]) {
     return members ? [{ status, label: workerStatusLabels[status], members }] : [];
   });
 }
+
+/** One visible row per assignment. Previous attempts and runtime events remain inspectable. */
+export function subagentOverview(workers: readonly Worker[]) {
+  const groups = subagentGroups(workers);
+  const tasks = groups.flatMap(({ members }) => members);
+  const currentIds = new Set(tasks.map(worker => worker.id));
+  const historyById = new Map<string, Worker>();
+  for (const worker of workers) {
+    if (currentIds.has(worker.id)) continue;
+    const previous = historyById.get(worker.id);
+    if (!previous || worker.version >= previous.version) historyById.set(worker.id, worker);
+  }
+  return {
+    tasks,
+    history: Array.from(historyById.values()),
+    completed: groups.find(group => group.status === 'done')?.members.length ?? 0,
+    failed: groups.find(group => group.status === 'failed')?.members.length ?? 0,
+    description: groups.map(({ label, members }) => `${members.length} ${label}`).join(' · '),
+  };
+}

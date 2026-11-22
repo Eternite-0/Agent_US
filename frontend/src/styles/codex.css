@@ -3692,12 +3692,38 @@ button:disabled {
   gap: 18px;
 }
 
-.codex-subagent-section-head {
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--text-tertiary);
-  margin-bottom: 6px;
+.subagent-list {
+  padding: 16px 12px;
+  gap: 12px;
 }
+.subagent-list-heading {
+  display: flex;
+  justify-content: space-between;
+  margin: 0 10px 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.subagent-history { border-top: 1px solid var(--border-subtle); padding-top: 6px; }
+.subagent-history-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.subagent-history-toggle:hover { color: var(--text-default); }
+.subagent-detail-meta, .subagent-detail-status { color: var(--text-secondary); font-size: 12px; }
+.subagent-detail-meta { overflow-wrap: anywhere; }
+.subagent-detail-meta:empty { display: none; }
+.subagent-detail-status { flex: none; }
+.codex-subagent-list-row > svg { flex: none; color: var(--text-secondary); }
+.codex-subagent-list-row[data-status="running"] > svg { color: var(--color-accent); }
+.codex-subagent-list-row[data-status="failed"] > svg,
+.codex-subagent-list-row[data-status="failed"] .subagent-row-meta,
+.subagent-progress-error { color: var(--color-danger); }
 
 .codex-subagent-list-row {
   width: 100%;
@@ -5394,11 +5420,13 @@ button:focus-visible {
 }
 .subagent-progress:hover, .subagent-progress:focus-visible { background: var(--bg-ghost-hover); color: var(--text-default); }
 .subagent-progress :is(svg, span:first-of-type) { flex: none; }
-.subagent-progress-counts, .subagent-row-name, .subagent-row-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-row-name, .subagent-row-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .subagent-row-name { flex: 1; min-width: 0; text-align: start; }
 .subagent-empty, .subagent-row-meta { color: var(--text-secondary); font-size: 12px; }
 .subagent-row-meta { max-width: 40%; }
 .subagent-empty { margin: 8px 10px; }
+.direct-turn-options { min-width: 132px; inset-inline-start: 0; }
+.a2a-direct-actions:empty { display: none; }
 
 /* ---- Composer adapts to its own width (narrow thread / split view) ------- */
 .codex-composer-card {

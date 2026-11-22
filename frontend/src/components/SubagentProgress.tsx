@@ -1,17 +1,17 @@
 import type { Worker } from '../types/backend';
-import { subagentGroups } from '../utils/subagentProgress';
+import { subagentOverview } from '../utils/subagentProgress';
 import { IconAgent, IconChevronRight } from './Icons';
 
 export function SubagentProgress({ workers, onOpen }: { workers: Worker[]; onOpen: () => void }) {
-  const groups = subagentGroups(workers);
-  if (!groups.length) return null;
-  const summary = groups.map(({ label, members }) => `${members.length} ${label}`).join(' · ');
+  const { tasks, completed, failed, description } = subagentOverview(workers);
+  if (!tasks.length) return null;
   return (
     <button type="button" className="subagent-progress" onClick={onOpen}
-      title={`查看子任务进度 · ${summary}`} aria-controls="workspace-inspector">
+      title={description} aria-label={`查看子任务，${tasks.length} 项，${description}`} aria-controls="workspace-inspector">
       <IconAgent size={15} />
       <span>子任务</span>
-      <span className="subagent-progress-counts">{summary}</span>
+      <span className="tabular-nums">{completed}/{tasks.length} 已完成</span>
+      {failed > 0 && <span className="subagent-progress-error">{failed} 项失败</span>}
       <IconChevronRight size={13} />
     </button>
   );

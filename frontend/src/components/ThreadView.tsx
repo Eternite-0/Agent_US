@@ -293,6 +293,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (turnMenuRef.current?.contains(document.activeElement)) turnMenuRef.current.querySelector('button')?.focus();
         setTitleMenuOpen(false);
         setOpenTurnMenuId(null);
       }
@@ -1448,37 +1449,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                           data-variant="outline"
                           onClick={() => onOpenSettings('providers')}
                         >
-                          配置账号号池
+                          配置账号池
                         </button>
-                      </div>
-                    )}
-
-                    {!isLive && (onRewindSession || onCompactSession || task.verdict || (task.evidenceCount ?? 0) > 0) && (
-                      <div className="a2a-direct-actions">
-                        <EvidenceBadge
-                          verdict={task.verdict}
-                          evidenceCount={task.evidenceCount}
-                        />
-                        {onRewindSession && (
-                          <button
-                            type="button"
-                            className="a2a-mini-btn"
-                            title="按快照确定性回退上一轮工作区文件变更"
-                            onClick={() => void onRewindSession(tid, 'code')}
-                          >
-                            回退代码 / Rewind
-                          </button>
-                        )}
-                        {onCompactSession && (
-                          <button
-                            type="button"
-                            className="a2a-mini-btn"
-                            title="触发语义上下文压缩，释放窗口 Token 预算"
-                            onClick={() => void onCompactSession(tid)}
-                          >
-                            压缩上下文 / Compact
-                          </button>
-                        )}
                       </div>
                     )}
 
@@ -1502,7 +1474,36 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                         />
                       </div>
                     )}
-                    {progress}
+                    <div className="a2a-direct-actions">
+                      {!isLive && <EvidenceBadge verdict={task.verdict} evidenceCount={task.evidenceCount} />}
+                      {progress}
+                      {!isLive && (onRewindSession || onCompactSession) && (
+                        <div className="codex-turn-menu-wrap" ref={openTurnMenuId === tid ? turnMenuRef : undefined}
+                          onBlur={event => {
+                            if (openTurnMenuId === tid && !event.currentTarget.contains(event.relatedTarget)) setOpenTurnMenuId(null);
+                          }}>
+                          <button type="button" className="codex-icon-btn" title="更多操作" aria-label="更多操作"
+                            aria-expanded={openTurnMenuId === tid}
+                            onClick={() => setOpenTurnMenuId(current => current === tid ? null : tid)}>
+                            <IconDotsHorizontal size={16} />
+                          </button>
+                          {openTurnMenuId === tid && (
+                            <div className="codex-popover direct-turn-options" data-side="top">
+                              {onCompactSession && <button type="button" className="codex-popover-item" onClick={() => {
+                                turnMenuRef.current?.querySelector('button')?.focus();
+                                setOpenTurnMenuId(null);
+                                void onCompactSession(tid);
+                              }}>压缩上下文</button>}
+                              {onRewindSession && <button type="button" className="codex-popover-item" onClick={() => {
+                                turnMenuRef.current?.querySelector('button')?.focus();
+                                setOpenTurnMenuId(null);
+                                void onRewindSession(tid, 'code');
+                              }}>回退代码</button>}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </React.Fragment>
               );
