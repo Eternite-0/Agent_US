@@ -712,6 +712,7 @@ export class AgentLoop {
           verifierEvents.push({
             type: 'tool/result',
             data: {
+              callId: tc.id,
               name: tc.name,
               isError,
               content: output,

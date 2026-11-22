@@ -40,6 +40,14 @@ function normalizeRuntimeOutput(value) {
     turnId: value.turnId ?? null,
     artifacts: Array.isArray(value.artifacts) ? value.artifacts : [],
     checkpoint: value.checkpoint ?? null,
+    attemptId: value.attemptId ?? null,
+    planVersion: value.planVersion ?? null,
+    toolReceipts: Array.isArray(value.toolReceipts) ? value.toolReceipts : null,
+    trustedVerdict: value.trustedVerdict ?? null,
+    reviewerVerdict: value.reviewerVerdict ?? null,
+    stepUsage: value.stepUsage ?? null,
+    tokenUsage: value.tokenUsage ?? null,
+    turnState: value.turnState ?? null,
   };
 }
 
@@ -180,34 +188,62 @@ export class EvaluationRunner {
           source: 'evaluation',
           ...(await this.syntheticContextHook?.({ task, attempt, workspaceRoot, context, signal }) ?? {}),
         };
-         const output = await withTimeout(
-           async (runtimeSignal) => {
-             runtimeStarted = true;
-             let invoked;
-             try {
-               invoked = await invokeRuntime(this.runtimeFactory, {
-                 task, attempt, workspaceRoot, signal: runtimeSignal, context, syntheticContext,
-               });
-             } catch (error) {
-               runtimeInvocationSettled = true;
-               throw error;
-             }
-             runtimeHandle = invoked.handle;
-             try {
-               const normalized = normalizeRuntimeOutput(await invoked.output);
-               runtimeInvocationSettled = true;
-               return normalized;
-             } catch (error) {
-               if (!runtimeHandle) runtimeInvocationSettled = true;
-               throw error;
-             }
-           },
+        const output = await withTimeout(
+          async (runtimeSignal) => {
+            runtimeStarted = true;
+            let invoked;
+            try {
+              invoked = await invokeRuntime(this.runtimeFactory, {
+                task, attempt, workspaceRoot, signal: runtimeSignal, context, syntheticContext,
+              });
+            } catch (error) {
+              runtimeInvocationSettled = true;
+              throw error;
+            }
+            runtimeHandle = invoked.handle;
+            try {
+              const normalized = normalizeRuntimeOutput(await invoked.output);
+              runtimeInvocationSettled = true;
+              return normalized;
+            } catch (error) {
+              if (!runtimeHandle) runtimeInvocationSettled = true;
+              throw error;
+            }
+          },
           { timeoutMs: task.timeoutMs ?? opts.timeoutMs, signal },
         );
-        const judgment = await this.judge({ task, output, context: { ...context, syntheticContext, workspaceRoot, attempt } });
+        const judgment = await this.judge({
+          task,
+          output,
+          context: {
+            ...context,
+            syntheticContext,
+            workspaceRoot,
+            attempt,
+            attemptId: output.attemptId ?? `attempt-${attempt}`,
+            planVersion: output.planVersion ?? context.planVersion ?? 1,
+            toolReceipts: output.toolReceipts ?? context.toolReceipts ?? null,
+            trustedVerdict: output.trustedVerdict ?? context.trustedVerdict ?? null,
+            reviewerVerdict: output.reviewerVerdict ?? context.reviewerVerdict ?? null,
+          },
+        });
+        const telemetry = {
+          attemptId: output.attemptId ?? `attempt-${attempt}`,
+          planVersion: output.planVersion ?? context.planVersion ?? 1,
+          runtimeStatus: output.turnState ?? (judgment.passed ? 'completed' : 'failed'),
+          stepUsage: output.stepUsage ?? null,
+          tokenUsage: output.tokenUsage ?? null,
+          retries: Math.max(0, attempt - 1),
+          toolReceiptCount: Array.isArray(output.toolReceipts) ? output.toolReceipts.length : null,
+          toolReceiptSuccessCount: Array.isArray(output.toolReceipts)
+            ? output.toolReceipts.filter((r) => r.status === 'finished').length
+            : null,
+          trustedVerdict: output.trustedVerdict ?? null,
+          reviewerVerdict: output.reviewerVerdict ?? null,
+        };
         const result = {
           taskId: task.id, status: judgment.passed ? 'passed' : 'failed', passed: Boolean(judgment.passed),
-          attempts: attempt, durationMs: Date.now() - started, output, judge: judgment,
+          attempts: attempt, durationMs: Date.now() - started, output, judge: judgment, telemetry,
         };
         validateResult(result);
         await this.lifecycle?.onAttemptEnd?.({ task, attempt, workspaceRoot, result });
@@ -215,17 +251,17 @@ export class EvaluationRunner {
         return result;
       } catch (error) {
         lastError = error;
-         if (isAbort(error) || signal?.aborted) {
-            runtimeDrain = runtimeHandle
-              ? await drainRuntime(runtimeHandle, {
-                reason: error?.code === 'E_EVAL_TIMEOUT' ? 'timeout' : 'cancelled',
-                timeoutMs: opts.drainTimeoutMs ?? 5_000,
-              })
-              : runtimeInvocationSettled
-                ? { drained: true, error: null }
-                : { drained: false, error: 'runtime handle unavailable before timeout/cancellation' };
+        if (isAbort(error) || signal?.aborted) {
+          runtimeDrain = runtimeHandle
+            ? await drainRuntime(runtimeHandle, {
+              reason: error?.code === 'E_EVAL_TIMEOUT' ? 'timeout' : 'cancelled',
+              timeoutMs: opts.drainTimeoutMs ?? 5_000,
+            })
+            : runtimeInvocationSettled
+              ? { drained: true, error: null }
+              : { drained: false, error: 'runtime handle unavailable before timeout/cancellation' };
           const status = error?.code === 'E_EVAL_TIMEOUT' || error?.name === 'TimeoutError' ? 'timeout' : 'cancelled';
-            const result = { taskId: task.id, status, passed: false, attempts: attempt, durationMs: Date.now() - started, error: error.message, metadata: { runtimeDrained: runtimeDrain.drained, runtimeDrainError: runtimeDrain.error } };
+          const result = { taskId: task.id, status, passed: false, attempts: attempt, durationMs: Date.now() - started, error: error.message, metadata: { runtimeDrained: runtimeDrain.drained, runtimeDrainError: runtimeDrain.error } };
           await this.lifecycle?.onAttemptEnd?.({ task, attempt, workspaceRoot, result });
           await this.recorder.record(result);
           return result;
@@ -239,22 +275,31 @@ export class EvaluationRunner {
         });
         await this.lifecycle?.onRetry?.({ task, attempt, nextAttempt: attempt + 1, workspaceRoot, error });
         if (opts.retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, opts.retryDelayMs));
-       } finally {
-         if (runtimeHandle && ['object', 'function'].includes(typeof runtimeHandle)) {
-           runtimeDrain ??= await drainRuntime(runtimeHandle, { reason: 'settled', timeoutMs: opts.drainTimeoutMs ?? 5_000 });
-           if (!runtimeDrain.drained) retainFixtureWorkspace(workspaceRoot);
-           else await removeFixtureWorkspace(workspaceRoot);
-         } else if (!runtimeInvocationSettled && runtimeStarted) {
-           // The runtime factory is still pending, so the evaluator cannot prove
-           // that the runtime stopped or relinquished the workspace. Retain it
-           // for recovery/diagnostics rather than deleting a live workspace.
-           retainFixtureWorkspace(workspaceRoot);
-         } else {
-           await removeFixtureWorkspace(workspaceRoot);
-         }
+      } finally {
+        if (runtimeHandle && ['object', 'function'].includes(typeof runtimeHandle)) {
+          runtimeDrain ??= await drainRuntime(runtimeHandle, { reason: 'settled', timeoutMs: opts.drainTimeoutMs ?? 5_000 });
+          if (!runtimeDrain.drained) retainFixtureWorkspace(workspaceRoot);
+          else await removeFixtureWorkspace(workspaceRoot);
+        } else if (!runtimeInvocationSettled && runtimeStarted) {
+          // The runtime factory is still pending, so the evaluator cannot prove
+          // that the runtime stopped or relinquished the workspace. Retain it
+          // for recovery/diagnostics rather than deleting a live workspace.
+          retainFixtureWorkspace(workspaceRoot);
+        } else {
+          await removeFixtureWorkspace(workspaceRoot);
+        }
       }
     }
-    const result = { taskId: task.id, status: 'failed', passed: false, attempts: finalAttempt, durationMs: Date.now() - started, error: lastError?.message ?? 'evaluation failed' };
+    const result = {
+      taskId: task.id,
+      status: 'failed',
+      passed: false,
+      attempts: finalAttempt,
+      durationMs: Date.now() - started,
+      error: lastError?.message ?? 'evaluation failed',
+      ...(lastError?.code ? { errorCode: lastError.code } : {}),
+      ...(lastError?.telemetry ? { telemetry: { ...lastError.telemetry, retries: Math.max(0, finalAttempt - 1) } } : {}),
+    };
     await this.lifecycle?.onAttemptEnd?.({ task, attempt: finalAttempt, workspaceRoot: null, result });
     await this.recorder.record(result);
     return result;
@@ -264,4 +309,3 @@ export class EvaluationRunner {
 export function createEvaluationRunner(options) {
   return new EvaluationRunner(options);
 }
-

@@ -2,6 +2,14 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  EVIDENCE_MANIFEST_SCHEMA_VERSION,
+  EVIDENCE_STATUSES,
+  formatEvidenceManifestContract,
+  normalizeEvidencePath,
+  validateEvidenceManifest,
+} from './schemas.js';
+import { listWorkspaceChangedFiles } from './fixtures.js';
 
 const CATEGORY_SPECS = Object.freeze([
   ['code-generation-repair', 8, '代码生成与修复'],
@@ -67,92 +75,6 @@ export const BENCHMARK_CATEGORY_COUNTS = Object.freeze(
   Object.fromEntries(CATEGORY_SPECS.map(([category, count]) => [category, count])),
 );
 
-function tryParseJsonObject(raw) {
-  if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = JSON.parse(trimmed);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function parseJsonFromLlmString(text) {
-  const direct = tryParseJsonObject(text);
-  if (direct) return direct;
-  const src = String(text ?? '');
-  const fencedMatches = [...src.matchAll(/```(?:json)?\s*\r?\n?([\s\S]*?)```/gi)];
-  for (let i = fencedMatches.length - 1; i >= 0; i -= 1) {
-    const parsed = tryParseJsonObject(fencedMatches[i][1]);
-    if (parsed) return parsed;
-  }
-  const parsedObjects = [];
-  for (let i = 0; i < src.length; i += 1) {
-    if (src[i] !== '{') continue;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let j = i; j < src.length; j += 1) {
-      const ch = src[j];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch === '\\') escaped = true;
-        else if (ch === '"') inString = false;
-        continue;
-      }
-      if (ch === '"') inString = true;
-      else if (ch === '{') depth += 1;
-      else if (ch === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          const parsed = tryParseJsonObject(src.slice(i, j + 1));
-          if (parsed) {
-            parsedObjects.push(parsed);
-            i = j;
-          }
-          break;
-        }
-      }
-    }
-  }
-  return parsedObjects.length ? parsedObjects[parsedObjects.length - 1] : {};
-}
-
-function parseEvidenceOutput(output) {
-  let value = output;
-  if (value && typeof value === 'object') value = value.output ?? value.result ?? value;
-  if (typeof value === 'string') {
-    value = parseJsonFromLlmString(value);
-  }
-  if (value?.evidence && typeof value.evidence === 'object') value = value.evidence;
-  return value && typeof value === 'object' ? value : {};
-}
-
-function normalizePath(value) {
-  return String(value ?? '').replaceAll('\\', '/').replace(/^\.\//, '');
-}
-
-function listChangedFiles(workspaceRoot) {
-  if (!workspaceRoot) return [];
-  try {
-    const modified = execFileSync('git', ['diff', '--no-ext-diff', '--name-only'], {
-      cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], {
-      cwd: workspaceRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return [...new Set(`${modified}\n${untracked}`.split(/\r?\n/).map(normalizePath).filter(Boolean))].sort();
-  } catch {
-    return [];
-  }
-}
-
 function readFixtureText(workspaceRoot, relativePath) {
   try { return readFileSync(join(workspaceRoot, relativePath), 'utf8'); } catch { return null; }
 }
@@ -180,57 +102,82 @@ function sha256Text(text) {
   return createHash('sha256').update(text).digest('hex');
 }
 
-function hasAllChangedFiles(actualFiles, requiredFiles) {
-  return requiredFiles.every((file) => actualFiles.includes(normalizePath(file)));
-}
-
-function hasAllReportedFiles(actualFiles, reportedFiles) {
-  return Array.isArray(reportedFiles) && reportedFiles.length > 0 && reportedFiles.every((file) => actualFiles.includes(normalizePath(file)));
-}
-
-function evidenceManifestAccepted(task, output, actualFiles, actualTestExitCode) {
-  const evidence = parseEvidenceOutput(output);
+function evidenceManifestAccepted(task, output, actualFiles, actualTestExitCode, context = {}) {
   const acceptance = task.metadata.acceptanceCriteria;
-  const expectedCommand = acceptance.testCommand.join(' ');
-  const reportedCommand = Array.isArray(evidence.testCommand) ? evidence.testCommand.join(' ') : String(evidence.testCommand ?? '');
-  const reportedExitCode = Number(evidence.testExitCode);
-  const independentVerdict = evidence.independentVerdict === true || evidence.independentVerdict === 'passed';
-  const commandMatches = reportedCommand === expectedCommand;
-  const normalizedReportedFiles = Array.isArray(evidence.changedFiles) ? evidence.changedFiles.map(normalizePath) : [];
-  const reportFilesMatch = hasAllReportedFiles(actualFiles, normalizedReportedFiles);
-  const baseChecks = {
-    changedFiles: hasAllChangedFiles(actualFiles, acceptance.requiredChangedFiles),
-    reportedChangedFiles: reportFilesMatch && hasAllChangedFiles(normalizedReportedFiles, acceptance.requiredChangedFiles),
-    tests: actualTestExitCode === 0 && reportedExitCode === 0,
-    testCommand: commandMatches,
-    independentVerdict,
-  };
-  return { evidence, baseChecks, passed: Object.values(baseChecks).every(Boolean) };
+  const validation = validateEvidenceManifest(output, {
+    taskId: task.id,
+    attemptId: context.attemptId ?? output?.attemptId ?? (context.attempt != null ? `attempt-${context.attempt}` : null),
+    planVersion: context.planVersion ?? output?.planVersion ?? 1,
+    expectedTestCommand: acceptance.testCommand,
+    requiredChangedFiles: acceptance.requiredChangedFiles,
+    actualChangedFiles: actualFiles,
+    actualTestExitCode,
+    toolReceipts: context.toolReceipts ?? output?.toolReceipts ?? null,
+    workspaceRoot: context.workspaceRoot ?? null,
+    artifactVerifier: context.artifactVerifier ?? output?.artifactVerifier ?? null,
+    trustedVerdict: context.trustedVerdict ?? output?.trustedVerdict ?? null,
+    requireIndependentVerdict: true,
+  });
+  return validation;
+}
+
+function classifyJudgeFailure(specificPassed, actualTestExitCode, validation) {
+  if (specificPassed && actualTestExitCode === 0 && validation.valid) return 'none';
+  if (!specificPassed || !validation.checks.changedFiles) return 'implementation_failed';
+  if (actualTestExitCode !== 0 || !validation.checks.testReceiptVerified) return 'test_failed';
+  if (validation.status === EVIDENCE_STATUSES.INCOMPLETE) return 'evidence_incomplete';
+  if (!validation.checks.independentVerdict) return 'independent_verdict_failed';
+  return 'evidence_invalid';
 }
 
 function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }) {
   const workspaceRoot = context.workspaceRoot;
   const acceptance = task.metadata.acceptanceCriteria;
-  let actualFiles = listChangedFiles(workspaceRoot);
+  let actualFiles = listWorkspaceChangedFiles(workspaceRoot);
   const actualTestExitCode = runFixtureTests(workspaceRoot, acceptance.testFiles);
-  actualFiles = listChangedFiles(workspaceRoot);
-  if (acceptance.requiredChangedFiles.includes('output/summary.json') && existsSync(join(workspaceRoot, 'output/summary.json')) && !actualFiles.includes('output/summary.json')) actualFiles = [...actualFiles, 'output/summary.json'];
-  const { evidence, baseChecks } = evidenceManifestAccepted(task, output, actualFiles, actualTestExitCode);
-  const checks = { ...baseChecks, ...taskChecks({ workspaceRoot, actualFiles, evidence }) };
-  const passed = Object.values(checks).every(Boolean);
+  actualFiles = listWorkspaceChangedFiles(workspaceRoot);
+  if (acceptance.requiredChangedFiles.includes('output/summary.json') && existsSync(join(workspaceRoot, 'output/summary.json')) && !actualFiles.includes('output/summary.json')) {
+    actualFiles = [...actualFiles, 'output/summary.json'];
+  }
+  const validation = evidenceManifestAccepted(task, output, actualFiles, actualTestExitCode, context);
+  const evidence = validation.manifest ?? {};
+  const specificChecks = taskChecks({ workspaceRoot, actualFiles, evidence });
+  const specificPassed = Object.values(specificChecks).every(Boolean);
+  const checks = { ...validation.checks, ...specificChecks };
+  const implementationPassed = specificPassed && Boolean(checks.changedFiles);
+  const testsPassed = actualTestExitCode === 0 && Boolean(checks.testReceiptVerified);
+  const evidenceCompliant = Boolean(validation.valid);
+  const passed = implementationPassed && testsPassed && evidenceCompliant;
+  const failureCategory = passed ? 'none' : classifyJudgeFailure(specificPassed, actualTestExitCode, validation);
+
   return {
     passed,
     score: passed ? 1 : 0,
     deterministic: true,
-    reason: passed ? 'engineering_acceptance_complete' : 'engineering_acceptance_incomplete',
+    reason: passed
+      ? 'engineering_acceptance_complete'
+      : validation.status === EVIDENCE_STATUSES.INCOMPLETE && implementationPassed && testsPassed
+        ? EVIDENCE_STATUSES.INCOMPLETE
+        : 'engineering_acceptance_incomplete',
     evidence: {
       taskId: task.id,
+      schemaVersion: EVIDENCE_MANIFEST_SCHEMA_VERSION,
+      attemptId: evidence.attemptId ?? context.attemptId ?? null,
+      planVersion: evidence.planVersion ?? context.planVersion ?? 1,
+      manifestStatus: validation.status,
+      missingFields: validation.missingFields,
+      errors: validation.errors,
       actualChangedFiles: actualFiles,
-      reportedChangedFiles: Array.isArray(evidence.changedFiles) ? evidence.changedFiles.map(normalizePath) : [],
+      reportedChangedFiles: Array.isArray(evidence.changedFiles) ? evidence.changedFiles.map(normalizeEvidencePath) : [],
       actualTestExitCode,
-      reportedTestExitCode: Number(evidence.testExitCode),
+      reportedTestExitCode: Number.isInteger(evidence.testExitCode) ? evidence.testExitCode : null,
       expectedTestCommand: acceptance.testCommand,
       reportedTestCommand: evidence.testCommand ?? null,
+      implementationPassed,
+      testsPassed,
+      evidenceCompliant,
+      independentVerdictSource: validation.independentVerdictSource,
+      failureCategory,
       checks,
     },
   };
@@ -656,10 +603,17 @@ test('parallel artifacts are handed off and independently reviewable', async () 
   },
 ].map((task) => ({
   ...task,
+  prompt: `${task.prompt}\n\n${formatEvidenceManifestContract({
+    taskId: task.id,
+    attemptId: 'attempt-1',
+    planVersion: 1,
+    testCommand: task.metadata.acceptanceCriteria.testCommand,
+    requiredChangedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
+  })}`,
   category: 'real-software-engineering',
   difficulty: 'hard',
   tags: ['benchmark', 'real-engineering', task.id.replace(/^real-/, '')],
-  expected: { output: { taskId: task.id, evidenceRequired: true } },
+  expected: { output: { taskId: task.id, evidenceRequired: true, schemaVersion: EVIDENCE_MANIFEST_SCHEMA_VERSION } },
 })));
 
 export function createRealEngineeringDataset() {

@@ -5,12 +5,43 @@ import assert from 'node:assert/strict';
 import { createRealEngineeringDataset, REAL_ENGINEERING_DATASET } from '../../src/evaluation/dataset.js';
 import { createFixtureWorkspace, removeFixtureWorkspace } from '../../src/evaluation/fixtures.js';
 
-const evidenceFor = (task) => ({
+const evidenceFor = (task, { attemptId = 'attempt-1', planVersion = 1 } = {}) => ({
   output: {
+    schemaVersion: '1.0.0',
+    taskId: task.id,
+    attemptId,
+    planVersion,
+    summary: `Completed ${task.id} with verified tests.`,
     changedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
     testCommand: task.metadata.acceptanceCriteria.testCommand,
     testExitCode: 0,
-    independentVerdict: true,
+    testEvidence: [
+      {
+        command: task.metadata.acceptanceCriteria.testCommand.join(' '),
+        exitCode: 0,
+      },
+    ],
+    artifactRefs: [],
+  },
+});
+
+const trustedContextFor = (task, workspaceRoot, attemptId = 'attempt-1') => ({
+  workspaceRoot,
+  attemptId,
+  planVersion: 1,
+  toolReceipts: [
+    {
+      id: `receipt-${task.id}`,
+      toolName: 'bash',
+      status: 'finished',
+      exitCode: 0,
+      command: task.metadata.acceptanceCriteria.testCommand.join(' '),
+    },
+  ],
+  trustedVerdict: {
+    status: 'pass',
+    source: 'trusted_server_verifier',
+    evidenceRefs: [`receipt-${task.id}`],
   },
 });
 
@@ -47,7 +78,7 @@ test('real engineering dataset has ten stable task-specific definitions', () => 
 test('task-specific judges reject an untouched workspace and incomplete evidence', async () => {
   const task = createRealEngineeringDataset()[0];
   await withTask(task, async (workspaceRoot) => {
-    const judgment = await task.judge({ task, output: evidenceFor(task), context: { workspaceRoot } });
+    const judgment = await task.judge({ task, output: evidenceFor(task), context: trustedContextFor(task, workspaceRoot) });
     assert.equal(judgment.passed, false);
     assert.equal(judgment.deterministic, true);
     assert.equal(judgment.evidence.checks.changedFiles, false);
@@ -60,7 +91,7 @@ test('feature judge requires the requested implementation and documentation, not
     const fs = await import('node:fs/promises');
     await fs.writeFile(`${workspaceRoot}/src/catalog.js`, "export function formatProduct(product) { return `${product.name}: ${product.priceCents}`; }\nexport function summarizeCatalog(items) { return { count: items.length, totalCents: items.reduce((sum, item) => sum + item.priceCents, 0), labels: items.map((item) => item.name) }; }\n");
     await fs.writeFile(`${workspaceRoot}/README.md`, '# Catalog fixture\n\nsummarizeCatalog returns count and totalCents.\n');
-    const judgment = await task.judge({ task, output: evidenceFor(task), context: { workspaceRoot } });
+    const judgment = await task.judge({ task, output: evidenceFor(task), context: trustedContextFor(task, workspaceRoot) });
     assert.equal(judgment.passed, true);
     assert.equal(judgment.evidence.checks.documentation, true);
   });
@@ -132,9 +163,10 @@ export async function resume(root) { await step(root, 'prepare'); await step(roo
       }
       const taskEvidence = evidenceFor(task);
       if (task.id === 'real-multi-agent-01') taskEvidence.output.changedFiles = [...taskEvidence.output.changedFiles, 'artifacts/manifest.json'];
-      const judgment = await task.judge({ task, output: taskEvidence, context: { workspaceRoot } });
+      const ctx = trustedContextFor(task, workspaceRoot);
+      const judgment = await task.judge({ task, output: taskEvidence, context: ctx });
       assert.equal(judgment.passed, true, `${task.id}: ${JSON.stringify(judgment.evidence.checks)}`);
-      const altered = await task.judge({ task, output: { output: { ...evidenceFor(task).output, testExitCode: 1 } }, context: { workspaceRoot } });
+      const altered = await task.judge({ task, output: { output: { ...evidenceFor(task).output, testExitCode: 1 } }, context: ctx });
       assert.equal(altered.passed, false, `${task.id} accepted altered evidence`);
     });
   }
@@ -177,42 +209,55 @@ test('real engineering dataset parses fenced json and trailing json without fabr
       'I fixed `src/slug.js` and verified `test/slug.test.js`.',
       '```json',
       JSON.stringify({
+        schemaVersion: '1.0.0',
+        taskId: 'real-bug-fix-01',
+        attemptId: 'attempt-1',
+        planVersion: 1,
+        summary: 'Fixed slugifier punctuation and separator collapsing',
         changedFiles: ['src/slug.js'],
         testCommand: 'node --test test/slug.test.js',
         testExitCode: 0,
-        independentVerdict: 'passed',
+        testEvidence: [{ command: 'node --test test/slug.test.js', exitCode: 0 }],
+        artifactRefs: [],
       }),
       '```',
     ].join('\n');
 
+    const trustedCtx = trustedContextFor(target, repo);
     const passedJudgment = await target.judge({
       task: target,
       output: { output: fencedOutput },
-      context: { workspaceRoot: repo },
+      context: trustedCtx,
     });
     assert.equal(passedJudgment.passed, true);
     assert.equal(passedJudgment.deterministic, true);
 
     const trailingOutput = `Completed task.\n${JSON.stringify({
+      schemaVersion: '1.0.0',
+      taskId: 'real-bug-fix-01',
+      attemptId: 'attempt-1',
+      planVersion: 1,
+      summary: 'Fixed slugifier',
       changedFiles: ['src/slug.js'],
       testCommand: 'node --test test/slug.test.js',
       testExitCode: 0,
-      independentVerdict: true,
+      testEvidence: [{ command: 'node --test test/slug.test.js', exitCode: 0 }],
     })}`;
     const trailingJudgment = await target.judge({
       task: target,
       output: trailingOutput,
-      context: { workspaceRoot: repo },
+      context: trustedCtx,
     });
     assert.equal(trailingJudgment.passed, true);
 
     const proseOnlyJudgment = await target.judge({
       task: target,
       output: 'All tests passed and changed src/slug.js.',
-      context: { workspaceRoot: repo },
+      context: trustedCtx,
     });
     assert.equal(proseOnlyJudgment.passed, false);
     assert.equal(proseOnlyJudgment.deterministic, true);
+    assert.equal(proseOnlyJudgment.evidence.manifestStatus, 'EVIDENCE_INCOMPLETE');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

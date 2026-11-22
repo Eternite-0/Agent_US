@@ -98,14 +98,96 @@ function deriveMeasuredCapabilities(results = [], score = {}) {
   };
 }
 
+function extractCallCommandsFromMessages(db, sessionId, turnId) {
+  const map = new Map();
+  if (!db?.isOpen || !sessionId || !turnId) return map;
+  try {
+    const rows = db
+      .prepare("SELECT toolCalls FROM direct_messages WHERE sessionId=? AND turnId=? AND role='assistant' AND toolCalls IS NOT NULL")
+      .all(sessionId, turnId);
+    for (const row of rows) {
+      try {
+        const calls = JSON.parse(row.toolCalls);
+        if (!Array.isArray(calls)) continue;
+        for (const tc of calls) {
+          if (!tc?.id) continue;
+          const args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
+          if (typeof args?.command === 'string') map.set(tc.id, args.command);
+        }
+      } catch {
+        // ignore malformed historical toolCalls
+      }
+    }
+  } catch {
+    // ignore in minimal DB mocks
+  }
+  return map;
+}
+
+function collectTurnTelemetry(directAgent, sessionId, turnId, currentTurn) {
+  const db = directAgent?.store?.db;
+  let toolReceipts = null;
+  let parsedVerdict = parseJson(currentTurn?.verdict ?? currentTurn?.verdictJson, null);
+  let stepUsage = currentTurn?.step != null ? { steps: Number(currentTurn.step) } : null;
+  let tokenUsage = currentTurn?.inputTokens != null || currentTurn?.outputTokens != null
+    ? {
+        inputTokens: Number(currentTurn.inputTokens ?? 0),
+        outputTokens: Number(currentTurn.outputTokens ?? 0),
+        totalTokens: Number(currentTurn.inputTokens ?? 0) + Number(currentTurn.outputTokens ?? 0),
+      }
+    : null;
+  if (db?.isOpen && sessionId && turnId) {
+    try {
+      const cmdMap = extractCallCommandsFromMessages(db, sessionId, turnId);
+      const rawReceipts = db
+        .prepare('SELECT id, sessionId, turnId, callId, toolName, status, exitCode, outputDigest, errorCode FROM tool_receipts WHERE sessionId=? AND turnId=? ORDER BY createdAt ASC')
+        .all(sessionId, turnId);
+      toolReceipts = rawReceipts.map((r) => ({ ...r, command: cmdMap.get(r.callId) ?? '' }));
+      const turnRow = db.prepare('SELECT step, inputTokens, outputTokens, verdictJson FROM direct_turns WHERE id=?').get(turnId);
+      if (turnRow) {
+        if (turnRow.step != null) stepUsage = { steps: Number(turnRow.step) };
+        tokenUsage = {
+          inputTokens: Number(turnRow.inputTokens ?? 0),
+          outputTokens: Number(turnRow.outputTokens ?? 0),
+          totalTokens: Number(turnRow.inputTokens ?? 0) + Number(turnRow.outputTokens ?? 0),
+        };
+        if (!parsedVerdict && turnRow.verdictJson) {
+          parsedVerdict = parseJson(turnRow.verdictJson, null);
+        }
+      }
+    } catch {
+      // minimal store mock fallback
+    }
+  }
+  return { toolReceipts, parsedVerdict, stepUsage, tokenUsage };
+}
+
 function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
   if (!directAgent) throw new TypeError('Evaluation requires DirectAgentRuntime');
-  return ({ task, workspaceRoot, signal, context }) => {
+  return ({ task, attempt = 1, workspaceRoot, signal, context }) => {
     let turnId = null;
+    const attemptId = `attempt-${Number(attempt || 1)}`;
+    const planVersion = Number(task.metadata?.planVersion ?? 1);
     const evalPermissionMode =
       task.metadata?.requiresWorkspaceMutation === true ? 'full-access' : 'auto-safe';
     const evalToolDeny =
       task.metadata?.externalNetwork === false ? ['web_fetch', 'web_search'] : null;
+    const hasAcceptanceCriteria = Boolean(task.metadata?.acceptanceCriteria);
+    const evidenceContract = hasAcceptanceCriteria
+      ? {
+          taskId: task.id,
+          attemptId,
+          planVersion,
+          expectedTestCommand: task.metadata.acceptanceCriteria.testCommand,
+          requiredChangedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
+          workspaceRoot,
+          requireIndependentVerdict: false,
+        }
+      : null;
+    const turnInput =
+      hasAcceptanceCriteria && Number(attempt) > 1
+        ? `${task.prompt}\n\n[Execution Binding] taskId=${task.id}, attemptId=${attemptId}, planVersion=${planVersion}`
+        : task.prompt;
     const run = withTraceContext({ trafficSource: TRAFFIC_SOURCES.EVAL, isSynthetic: true }, async () => {
       const session = directAgent.createSession({
         title: `Evaluation · ${task.id}`,
@@ -118,10 +200,11 @@ function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
         isSynthetic: true,
       });
       const started = directAgent.startTurn(session.id, {
-        input: task.prompt,
+        input: turnInput,
         model: model || context.model || undefined,
         permissionMode: evalPermissionMode,
         maxSteps: task.resourceBudget?.maxSteps ?? task.metadata?.resourceBudget?.maxSteps ?? 16,
+        ...(evidenceContract ? { evidenceContract } : {}),
         trafficSource: TRAFFIC_SOURCES.EVAL,
         isSynthetic: true,
       });
@@ -140,8 +223,66 @@ function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
           if (current && TERMINAL_TURN_STATES.has(current.state)) {
             const messages = directAgent.listMessages(session.id, { after: 0, limit: 500 });
             const text = messages.filter((message) => message.turnId === turnId && message.role === 'assistant').map((message) => String(message.content ?? '')).filter(Boolean).join('\n');
-            if (current.state !== 'completed') { const error = new Error(current.error || `Evaluation turn ${current.state}`); error.code = current.state === 'cancelled' ? 'E_EVAL_CANCELLED' : 'E_RUNTIME_TURN_FAILED'; if (current.state === 'cancelled') error.name = 'AbortError'; throw error; }
-            return { output: text, sessionId: session.id, turnId, verdict: current.verdict ?? null, evidenceCount: Number(current.evidenceCount ?? 0) };
+            const telemetry = collectTurnTelemetry(directAgent, session.id, turnId, current);
+            const shellReceipts = Array.isArray(telemetry.toolReceipts)
+              ? telemetry.toolReceipts.filter((r) => ['bash', 'start_process'].includes(String(r.toolName)))
+              : [];
+            const latestShell = shellReceipts.at(-1) ?? null;
+            const shellHealthy =
+              shellReceipts.length === 0 ||
+              (latestShell?.status === 'finished' && (latestShell.exitCode == null || Number(latestShell.exitCode) === 0));
+            const serverPassed =
+              current.state === 'completed' &&
+              (!telemetry.parsedVerdict || (telemetry.parsedVerdict.verdict === 'pass' && telemetry.parsedVerdict.accepted !== false)) &&
+              Number(telemetry.parsedVerdict?.checks?.pendingReconciliations ?? 0) === 0 &&
+              shellHealthy;
+            const evidenceRefs = [
+              `turn:${session.id}:${turnId}`,
+              ...(Array.isArray(telemetry.toolReceipts) ? telemetry.toolReceipts.map((r) => `receipt:${r.id}`) : []),
+            ];
+            const trustedVerdict = serverPassed
+              ? { status: 'pass', source: 'trusted_server_verifier', evidenceRefs }
+              : { status: 'fail', source: 'trusted_server_verifier', evidenceRefs, reasons: telemetry.parsedVerdict?.reasons ?? [current.error || current.state] };
+
+            const isSoftEvidenceFailure =
+              current.state === 'failed' &&
+              (telemetry.parsedVerdict?.status === 'EVIDENCE_INCOMPLETE' ||
+                /EVIDENCE_INCOMPLETE|VERIFICATION_FAILED/i.test(String(current.error ?? '')));
+
+            if (current.state !== 'completed' && !isSoftEvidenceFailure) {
+              const error = new Error(current.error || `Evaluation turn ${current.state}`);
+              error.code = current.state === 'cancelled'
+                ? 'E_EVAL_CANCELLED'
+                : /STEP_BUDGET/i.test(String(current.error ?? ''))
+                  ? 'STEP_BUDGET_EXHAUSTED'
+                  : 'E_RUNTIME_TURN_FAILED';
+              if (current.state === 'cancelled') error.name = 'AbortError';
+              error.telemetry = {
+                attemptId,
+                planVersion,
+                runtimeStatus: current.state,
+                errorCode: error.code,
+                stepUsage: telemetry.stepUsage,
+                tokenUsage: telemetry.tokenUsage,
+                toolReceiptCount: telemetry.toolReceipts?.length ?? 0,
+                trustedVerdict,
+              };
+              throw error;
+            }
+            return {
+              output: text,
+              sessionId: session.id,
+              turnId,
+              attemptId,
+              planVersion,
+              turnState: current.state,
+              verdict: telemetry.parsedVerdict ?? current.verdict ?? null,
+              evidenceCount: Number(current.evidenceCount ?? 0),
+              toolReceipts: telemetry.toolReceipts,
+              trustedVerdict,
+              stepUsage: telemetry.stepUsage,
+              tokenUsage: telemetry.tokenUsage,
+            };
           }
           await delay(100, undefined, { signal });
         }

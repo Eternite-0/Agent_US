@@ -185,7 +185,7 @@ export function resolveTurnOutcome({
     return {
       status: TERMINAL_STATES.FAILED,
       phase: TERMINAL_STATES.FAILED,
-      errorCode: 'VERIFICATION_FAILED',
+      errorCode: normalized.status === 'EVIDENCE_INCOMPLETE' ? 'EVIDENCE_INCOMPLETE' : 'VERIFICATION_FAILED',
       errorMessage:
         normalized.reasons.join('; ') || '任务结果未通过验证门禁（已达到修复上限）',
       verdict: normalized,

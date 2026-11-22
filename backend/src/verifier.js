@@ -150,10 +150,21 @@ export function buildRepairNote(result) {
     const explain = REASON_TEXT[code];
     return `- ${reason}${explain ? `: ${explain(result)}` : ''}`;
   });
+  const extra = [];
+  if (Array.isArray(result.missingFields) && result.missingFields.length > 0) {
+    extra.push(`Missing or incomplete evidence fields: ${result.missingFields.join(', ')}.`);
+  }
+  if (Array.isArray(result.actualChangedFiles) && result.actualChangedFiles.length > 0) {
+    extra.push(`Actual modified workspace files detected by git: ${JSON.stringify(result.actualChangedFiles)}.`);
+  }
+  if (result.expectedTestCommand) {
+    extra.push(`Required test command: ${Array.isArray(result.expectedTestCommand) ? result.expectedTestCommand.join(' ') : result.expectedTestCommand}.`);
+  }
   return [
-    `The turn's automatic verification gate did not pass (${result.verdict}). Checks that failed:`,
+    `The turn's automatic verification gate did not pass (${result.status || result.verdict}). Checks that failed:`,
     ...lines,
-    'Keep any work you have already verified and do not undo it. Fix only the items listed above, use tools to produce real artifacts/evidence where required, and then provide the final answer. If something cannot be completed, state the limitation plainly without fabricating verification.',
+    ...extra,
+    'Keep any work you have already verified and do not undo it. Fix only the items listed above, use tools (such as bash for tests and write_file/edit_file for changes) to produce real artifacts/evidence where required, and return the complete JSON evidence manifest matching schemaVersion "1.0.0".',
   ].join('\n');
 }
 

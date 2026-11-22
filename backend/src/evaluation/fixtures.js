@@ -35,6 +35,42 @@ export function retainFixtureWorkspace(workspaceRoot) {
   return workspaceRoot || null;
 }
 
+export function getWorkspaceBaselineCommit(workspaceRoot) {
+  if (!workspaceRoot) return null;
+  try {
+    const out = execFileSync('git', ['rev-list', '--max-parents=0', 'HEAD'], {
+      cwd: workspaceRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const first = out.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0];
+    return first || 'HEAD';
+  } catch {
+    return null;
+  }
+}
+
+export function listWorkspaceChangedFiles(workspaceRoot) {
+  if (!workspaceRoot) return [];
+  const normalizePath = (value) => String(value ?? '').replaceAll('\\', '/').replace(/^\.\//, '');
+  try {
+    const baseRef = getWorkspaceBaselineCommit(workspaceRoot) || 'HEAD';
+    const modified = execFileSync('git', ['diff', '--no-ext-diff', '--name-only', baseRef], {
+      cwd: workspaceRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], {
+      cwd: workspaceRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return [...new Set(`${modified}\n${untracked}`.split(/\r?\n/).map(normalizePath).filter(Boolean))].sort();
+  } catch {
+    return [];
+  }
+}
+
 export async function withFixtureWorkspace(task, fn, options = {}) {
   const workspaceRoot = await createFixtureWorkspace(task, options);
   try {

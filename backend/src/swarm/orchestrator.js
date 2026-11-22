@@ -1511,6 +1511,8 @@ export class AdaptiveSwarmOrchestrator {
           nodeId: node.id,
           nodeKey: node.nodeKey,
           attempt: nextAttempt,
+          planVersion: Number(node.planVersion || run.planVersion || 1),
+          evidenceContract: node.evidenceContract ?? null,
           workerId,
           predecessorArtifacts,
           rehydrateFromArtifactId,

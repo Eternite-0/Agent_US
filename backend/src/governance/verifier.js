@@ -4,6 +4,8 @@ import { resolveConfinedPath } from '../tools/sandbox.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import { buildPlainTextPassVerdict } from '../kernel/verdict.js';
 import { classifyJobOwnership } from '../durable/lease-guard.js';
+import { validateEvidenceManifest } from '../evaluation/schemas.js';
+import { listWorkspaceChangedFiles } from '../evaluation/fixtures.js';
 
 const PASS_CLAIM_RE =
   /(?:全部|所有|tests?|suites?|checks?|build|lint|typecheck|npm run check).*?(?:pass(?:ed|es)?|通过|成功|0\s*(?:fail(?:ure)?s?|errors?))|(?:验证通过|测试通过|构建成功|编译通过|0\s*(?:failures|errors))/i;
@@ -184,19 +186,96 @@ export class EvidenceVerifier {
       }
     }
 
+    const contract = execution?.evidenceContract ?? node?.evidenceContract ?? null;
+    let contractValidation = null;
+    if (contract) {
+      const callCommands = new Map();
+      for (const ev of events) {
+        if (ev.type === 'tool/call' && ev.data?.callId) {
+          const cmd = ev.data?.arguments?.command;
+          if (typeof cmd === 'string') callCommands.set(ev.data.callId, cmd);
+        }
+      }
+      if (this.store?.db?.isOpen && allSessionIds.length > 0) {
+        try {
+          const sPh = allSessionIds.map(() => '?').join(',');
+          const msgRows = allTurnIds.length > 0
+            ? this.store.db
+                .prepare(`SELECT toolCalls FROM direct_messages WHERE sessionId IN (${sPh}) AND turnId IN (${allTurnIds.map(() => '?').join(',')}) AND role='assistant' AND toolCalls IS NOT NULL`)
+                .all(...allSessionIds, ...allTurnIds)
+            : this.store.db
+                .prepare(`SELECT toolCalls FROM direct_messages WHERE sessionId IN (${sPh}) AND role='assistant' AND toolCalls IS NOT NULL`)
+                .all(...allSessionIds);
+          for (const row of msgRows) {
+            try {
+              const calls = JSON.parse(row.toolCalls);
+              if (!Array.isArray(calls)) continue;
+              for (const tc of calls) {
+                if (!tc?.id) continue;
+                const args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
+                if (typeof args?.command === 'string') callCommands.set(tc.id, args.command);
+              }
+            } catch {
+              // ignore unparseable historical toolCalls
+            }
+          }
+        } catch {
+          // table unavailable in minimal store mocks
+        }
+      }
+
+      const receiptsForContract = turnReceipts.length > 0
+        ? turnReceipts.map((r) => ({ ...r, command: callCommands.get(r.callId) ?? '' }))
+        : events
+            .filter((ev) => ev.type === 'tool/result')
+            .map((ev) => {
+              const cid = ev.data?.callId ?? ev.data?.receipt?.callId ?? null;
+              const name = ev.data?.name ?? ev.data?.receipt?.toolName ?? '';
+              return {
+                id: ev.data?.receipt?.id ?? cid ?? 'event-receipt',
+                callId: cid,
+                toolName: name,
+                status: ev.data?.receipt?.status ?? (ev.data?.isError ? 'failed' : 'finished'),
+                exitCode: ev.data?.receipt?.exitCode ?? (ev.data?.isError ? 1 : 0),
+                command: (cid ? callCommands.get(cid) : '') ?? '',
+              };
+            });
+
+      const contractWorkspace = contract.workspaceRoot || workspaceRoot || null;
+      const actualChangedFiles = contractWorkspace ? listWorkspaceChangedFiles(contractWorkspace) : undefined;
+      contractValidation = validateEvidenceManifest(text, {
+        ...contract,
+        workspaceRoot: contractWorkspace,
+        actualChangedFiles,
+        toolReceipts: receiptsForContract,
+        requireIndependentVerdict: contract.requireIndependentVerdict === true,
+      });
+      checks.manifestStatus = contractValidation.status;
+      checks.missingFields = contractValidation.missingFields;
+      checks.evidenceContract = contractValidation.checks;
+      if (!contractValidation.valid) {
+        const detail = contractValidation.missingFields.length
+          ? `missing=${contractValidation.missingFields.join(',')}`
+          : contractValidation.errors.join('; ');
+        reasons.push(`${contractValidation.status}: ${detail}`);
+      }
+    }
+
     const hasToolActivity =
       events.some((e) => e.type === 'tool/call' || e.type === 'tool/result') ||
       turnReceipts.length > 0 ||
-      Boolean(node?.requiredFiles?.length);
+      Boolean(node?.requiredFiles?.length) ||
+      Boolean(contract);
 
     const out =
       reasons.length === 0 && !hasToolActivity
         ? buildPlainTextPassVerdict(checks)
         : {
             verdict: reasons.length ? 'fail' : 'pass',
+            ...(contractValidation && !contractValidation.valid ? { status: contractValidation.status, missingFields: contractValidation.missingFields, expectedTestCommand: contract.expectedTestCommand, actualChangedFiles: checks.evidenceContract ? (contract.workspaceRoot || workspaceRoot ? listWorkspaceChangedFiles(contract.workspaceRoot || workspaceRoot) : undefined) : undefined } : {}),
             accepted: reasons.length === 0,
             evidenceRequired: true,
-            verificationMode: 'evidence_checked',
+            verificationMode: contract ? 'evidence_contract_checked' : 'evidence_checked',
             reasons,
             evidenceCount: turnReceipts.length,
             checks,

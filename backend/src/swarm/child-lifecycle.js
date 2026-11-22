@@ -416,6 +416,8 @@ export class ChildAgentManager {
     nodeId = null,
     nodeKey = null,
     attempt = 1,
+    planVersion = 1,
+    evidenceContract = null,
     workerId = null,
     predecessorArtifacts = [],
     rehydrateFromArtifactId = null,
@@ -827,6 +829,7 @@ export class ChildAgentManager {
             parentEpochId: parentTurnId,
             externalSignal: combinedSignal,
             workspaceRoot: effectiveRoot,
+            execution: evidenceContract ? { evidenceContract } : null,
             hooks,
             leaseGuard: turnLeaseGuard,
             parentGuard: () => this.#assertAncestorsActive(childSessionId),
@@ -982,6 +985,11 @@ export class ChildAgentManager {
             text: result.text || '',
             verdict: result.verdict ?? null,
             resumeMode,
+            binding: {
+              taskId: nodeKey || nodeId || subId,
+              attemptId: `attempt-${attempt}`,
+              planVersion: Number(planVersion || 1),
+            },
             ...(archivedArtifact
               ? { artifactId: archivedArtifact.id, artifactUri: archivedArtifact.uri }
               : {}),
@@ -1068,6 +1076,7 @@ export class ChildAgentManager {
             verifiedPass: result.verifiedPass ?? null,
             diffSummary,
             artifact: archivedArtifact,
+            binding: payload.binding,
           };
         } catch (err) {
           // Graceful runtime shutdown is an interruption, NOT user cancellation or failure — preserve state & dirty worktree!
@@ -1244,6 +1253,8 @@ export class ChildAgentManager {
     nodeId = null,
     nodeKey = null,
     attempt = 1,
+    planVersion = 1,
+    evidenceContract = null,
     workerId = null,
     predecessorArtifacts = [],
     rehydrateFromArtifactId = null,
@@ -1330,6 +1341,8 @@ export class ChildAgentManager {
       nodeId,
       nodeKey,
       attempt,
+      planVersion,
+      evidenceContract,
       workerId,
       predecessorArtifacts,
       rehydrateFromArtifactId,
