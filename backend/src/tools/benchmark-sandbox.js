@@ -535,6 +535,40 @@ function assertGitArgsAllowed(gitArgs, { allowNetwork = false } = {}) {
   }
 }
 
+export const SIGNAL_EXIT_CODES = Object.freeze({
+  SIGHUP: 129,
+  SIGINT: 130,
+  SIGQUIT: 131,
+  SIGILL: 132,
+  SIGABRT: 134,
+  SIGBUS: 135,
+  SIGFPE: 136,
+  SIGKILL: 137,
+  SIGSEGV: 139,
+  SIGPIPE: 141,
+  SIGALRM: 142,
+  SIGTERM: 143,
+  SIGXCPU: 152,
+  SIGXFSZ: 153,
+});
+
+function resolveSignalExitCode(code, termSignal) {
+  if (Number.isInteger(code)) return code;
+  if (termSignal) return SIGNAL_EXIT_CODES[termSignal] ?? 137;
+  return 1;
+}
+
+function isCpuLimitExceeded(result) {
+  if (!result) return false;
+  if (result.signal === 'SIGXCPU') return true;
+  if (result.timedOut) return false;
+  return Boolean(
+    result.exitCode === 152 ||
+      result.exitCode === 137 ||
+      /ERR_SANDBOX_CPU_LIMIT|CPU time limit exceeded/i.test(result.stderr ?? ''),
+  );
+}
+
 /**
  * Runs hardened `git` synchronously with allowlisted env and empty hooks path.
  */
@@ -565,7 +599,7 @@ export function runHardenedGitSync(
     shell: false,
   });
   return {
-    exitCode: Number.isInteger(res.status) ? res.status : 1,
+    exitCode: resolveSignalExitCode(res.status, res.signal),
     stdout: typeof res.stdout === 'string' ? res.stdout : res.stdout?.toString(encoding) ?? '',
     stderr: typeof res.stderr === 'string' ? res.stderr : res.stderr?.toString(encoding) ?? '',
     timedOut: res.error?.code === 'ETIMEDOUT',
@@ -661,6 +695,7 @@ function spawnCollected({
         stdout,
         stderr,
         timedOut: true,
+        signal: null,
         truncated,
       });
     }, effectiveTimeout);
@@ -691,16 +726,17 @@ function spawnCollected({
       signal?.removeEventListener('abort', onAbort);
       rejectRun(err);
     });
-    child.on('close', (code) => {
+    child.on('close', (code, termSignal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
       resolveRun({
-        exitCode: code ?? 0,
+        exitCode: resolveSignalExitCode(code, termSignal),
         stdout: Buffer.concat(stdoutChunks).toString('utf8'),
         stderr: Buffer.concat(stderrChunks).toString('utf8'),
         timedOut: false,
+        signal: termSignal ?? null,
         truncated,
       });
     });
@@ -1156,9 +1192,7 @@ export class DockerBenchmarkSandbox {
 
     return {
       ...result,
-      cpuLimitExceeded: Boolean(
-        result.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(result.stderr),
-      ),
+      cpuLimitExceeded: isCpuLimitExceeded(result),
       outputTruncated: Boolean(result.truncated),
       backend: SANDBOX_MODES.DOCKER,
     };
@@ -1636,9 +1670,7 @@ export class NodePermissionBenchmarkSandbox {
 
       return {
         ...result,
-        cpuLimitExceeded: Boolean(
-          result.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(result.stderr),
-        ),
+        cpuLimitExceeded: isCpuLimitExceeded(result),
         outputTruncated: Boolean(result.truncated),
         backend: SANDBOX_MODES.NODE_PERMISSION,
       };
@@ -2190,9 +2222,7 @@ export class BenchmarkSandbox {
       });
       return {
         ...res,
-        cpuLimitExceeded: Boolean(
-          res.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(res.stderr),
-        ),
+        cpuLimitExceeded: isCpuLimitExceeded(res),
         outputTruncated: Boolean(res.truncated),
         backend: SANDBOX_MODES.NODE_PERMISSION,
       };
@@ -2341,6 +2371,7 @@ export class BenchmarkSandbox {
         stdout: res.stdout,
         stderr: res.stderr,
         timedOut: Boolean(res.timedOut),
+        signal: res.signal ?? null,
         cpuLimitExceeded: Boolean(res.cpuLimitExceeded),
         backend: res.backend,
         truncated: Boolean(res.truncated),
