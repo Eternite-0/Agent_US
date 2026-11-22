@@ -4,6 +4,13 @@ import { EvaluationRunner } from './runner.js';
 import { EvaluationRecorder } from './recorder.js';
 import { EvaluationRegistry } from './registry.js';
 import { createBenchmarkDataset, createRealEngineeringDataset } from './dataset.js';
+import {
+  OSS_BENCHMARK_ID,
+  OSS_BENCHMARK_VERSION,
+  OSS_DATASET_VERSION,
+  createOssBenchmarkDataset,
+} from './external-benchmark.js';
+import { createFixtureWorkspace, createGitRepoWorkspace } from './fixtures.js';
 import { compareRegression } from './regression.js';
 import { TRAFFIC_SOURCES, withTraceContext } from '../observability/trace.js';
 import { redactSecrets } from '../envelope.js';
@@ -16,6 +23,7 @@ export const DATASET_VERSION = '1.0.0';
 export const REAL_ENGINEERING_BENCHMARK_ID = 'agent-us-real-engineering';
 export const REAL_ENGINEERING_BENCHMARK_VERSION = '1.0.0';
 export const REAL_ENGINEERING_DATASET_VERSION = '1.0.0';
+export { OSS_BENCHMARK_ID, OSS_BENCHMARK_VERSION, OSS_DATASET_VERSION };
 const TERMINAL_TURN_STATES = new Set(['completed', 'failed', 'cancelled']);
 const TERMINAL_EVALUATION_STATUSES = new Set(['passed', 'failed', 'cancelled', 'timeout']);
 
@@ -128,10 +136,10 @@ export function deriveLayeredCapabilities(results = [], score = {}) {
   };
 
   const analysisAuditRate = partialRate(
-    /code-generation|unfamiliar-codebase|real-security-audit|real-recovery|real-bug-fix|real-refactor|real-codebase-analysis/i,
+    /code-generation|unfamiliar-codebase|real-security-audit|real-recovery|real-bug-fix|real-refactor|real-codebase-analysis|oss-/i,
   );
   const planningCompletionRate = partialRate(
-    /multi-file-refactor|long-task-recovery|multi-agent|real-refactor|real-recovery|real-multi-agent|real-multi-file-feature/i,
+    /multi-file-refactor|long-task-recovery|multi-agent|real-refactor|real-recovery|real-multi-agent|real-multi-file-feature|oss-/i,
   );
   const reasoningScore = roundMetric4(0.6 * analysisAuditRate + 0.4 * planningCompletionRate);
 
@@ -245,14 +253,14 @@ function deriveMeasuredCapabilities(results = [], score = {}) {
   const speedBase = Math.max(0.05, Math.min(1, 1 - layered.efficiency.meanDurationMs / 60_000));
   const speed = Number(((activeSignal > 0 ? 0.2 : 0) + 0.8 * speedBase * Math.max(0.2, activeSignal)).toFixed(4));
   return {
-    coding: roundMetric4(partialFor(/code-generation|multi-file-refactor|real-multi-file-feature|real-bug-fix|real-refactor|real-tests|real-api-compat|real-data-processing|real-recovery|real-multi-agent/i)),
-    reasoning: roundMetric4(partialFor(/code-generation|unfamiliar-codebase|real-security-audit|real-recovery|real-bug-fix|real-refactor/i)),
+    coding: roundMetric4(partialFor(/code-generation|multi-file-refactor|real-multi-file-feature|real-bug-fix|real-refactor|real-tests|real-api-compat|real-data-processing|real-recovery|real-multi-agent|oss-/i)),
+    reasoning: roundMetric4(partialFor(/code-generation|unfamiliar-codebase|real-security-audit|real-recovery|real-bug-fix|real-refactor|oss-/i)),
     research: roundMetric4(partialFor(/unfamiliar-codebase|network-research|real-codebase-analysis|real-security-audit/i)),
-    planning: roundMetric4(partialFor(/multi-file-refactor|long-task-recovery|multi-agent|real-refactor|real-recovery|real-multi-agent/i)),
+    planning: roundMetric4(partialFor(/multi-file-refactor|long-task-recovery|multi-agent|real-refactor|real-recovery|real-multi-agent|oss-/i)),
     speed,
     contextCapacity: roundMetric4(valid.length ? 0.4 + 0.6 * activeSignal : 0),
     multimodal: 0,
-    toolCompatibility: roundMetric4(Math.max(layered.execution.toolSuccessRate * (activeSignal > 0 ? 1 : 0.5), partialFor(/real-|multi-agent|recovery/i))),
+    toolCompatibility: roundMetric4(Math.max(layered.execution.toolSuccessRate * (activeSignal > 0 ? 1 : 0.5), partialFor(/real-|multi-agent|recovery|oss-/i))),
   };
 }
 
@@ -365,7 +373,7 @@ function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
       const adaptiveBudget = histStats && histStats.sampleCount > 0 && hasAcceptanceCriteria
         ? estimateTaskBudget({
             taskType: task.id,
-            fileCount: Object.keys(task.fixture?.files ?? {}).length || 1,
+            fileCount: Object.keys(task.fixture?.files ?? {}).length || task.metadata?.repoFileCount || 1,
             requiredTools: ['read_file', 'write_file', 'edit_file', 'bash'],
             expectedArtifacts: task.metadata?.expectedArtifacts ?? [],
             verificationComplexity: /security-audit|recovery|multi-agent/.test(task.id) ? 'high' : 'medium',
@@ -481,15 +489,18 @@ export class EvaluationService {
   #controllers = new Map();
   #activeExecutions = new Map();
 
-  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, judge = null, maxConcurrency = 2, timeoutMs = 120_000, memory = null, capabilityRegistry = null } = {}) {
+  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, judge = null, maxConcurrency = 2, timeoutMs = 120_000, memory = null, capabilityRegistry = null, ossCacheDir = null, ossRepoOverrides = null } = {}) {
     if (!store || typeof store.add !== 'function' || typeof store.list !== 'function') {
       throw new TypeError('EvaluationService requires Store');
     }
     this.store = store;
     this.directAgent = directAgent ?? null;
+    this.ossCacheDir = ossCacheDir ? String(ossCacheDir) : null;
+    this.ossRepoOverrides = ossRepoOverrides && typeof ossRepoOverrides === 'object' ? ossRepoOverrides : null;
     this.registry = new EvaluationRegistry([
       ...createBenchmarkDataset(),
       ...createRealEngineeringDataset(),
+      ...createOssBenchmarkDataset({ repoOverrides: this.ossRepoOverrides }),
     ]);
     this.runtimeFactory = runtimeFactory;
     this.jobQueue = jobQueue;
@@ -498,6 +509,14 @@ export class EvaluationService {
     this.capabilityRegistry = capabilityRegistry;
     this.maxConcurrency = Math.min(4, Math.max(1, Number(maxConcurrency) || 2));
     this.timeoutMs = Math.min(600_000, Math.max(1_000, Number(timeoutMs) || 120_000));
+  }
+
+  async createTaskWorkspace(task, options = {}) {
+    const resolvedCacheDir = options.cacheDir ?? this.ossCacheDir ?? task?.fixture?.cacheDir ?? null;
+    if (task?.fixture?.repoUrl && task?.fixture?.commit) {
+      return createGitRepoWorkspace(task, { ...options, cacheDir: resolvedCacheDir });
+    }
+    return createFixtureWorkspace(task, options);
   }
 
   registerOnWorker(recoveryWorker) {
@@ -610,6 +629,14 @@ export class EvaluationService {
         datasetVersion: REAL_ENGINEERING_DATASET_VERSION,
         tasks: createRealEngineeringDataset(),
         description: 'Isolated multi-file engineering fixtures with real file edits, tests, Git diff evidence, and deterministic independent verification.',
+      },
+      {
+        id: OSS_BENCHMARK_ID,
+        title: 'Agent_US Open-Source Pinned-Commit Benchmark',
+        version: OSS_BENCHMARK_VERSION,
+        datasetVersion: OSS_DATASET_VERSION,
+        tasks: createOssBenchmarkDataset({ repoOverrides: this.ossRepoOverrides }),
+        description: 'Real open-source GitHub repositories pinned to immutable commit SHAs with multi-commit git baseline tracking, baseline regression suites, and hidden behavioral judges.',
       },
     ];
     return benchmarks.map(({ tasks, ...benchmark }) => ({
@@ -755,7 +782,14 @@ export class EvaluationService {
           evaluationRunId: run.id,
         }),
       });
-      const report = await runner.run({ tasks, signal: controller.signal, context: { model: options.model, runId } });
+      const preparedTasks = tasks.map((task) => {
+        const resolvedCacheDir = options.cacheDir ?? this.ossCacheDir ?? task?.fixture?.cacheDir ?? null;
+        if (task?.fixture?.repoUrl && task?.fixture?.commit && resolvedCacheDir && !task.fixture.cacheDir) {
+          return { ...task, fixture: { ...task.fixture, cacheDir: resolvedCacheDir } };
+        }
+        return task;
+      });
+      const report = await runner.run({ tasks: preparedTasks, signal: controller.signal, context: { model: options.model, runId } });
       const previousResults = Array.isArray(run.results) ? run.results : [];
       const mergedByTask = new Map(previousResults.map((result) => [String(result.taskId), result]));
       for (const result of report.results) mergedByTask.set(String(result.taskId), result);

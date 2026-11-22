@@ -1,6 +1,7 @@
 export * from './schemas.js';
 export * from './registry.js';
 export * from './dataset.js';
+export * from './external-benchmark.js';
 export * from './judge.js';
 export * from './scoring.js';
 export * from './recorder.js';
