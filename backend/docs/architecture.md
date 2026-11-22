@@ -1,98 +1,83 @@
-# Agent_US — Autonomous Agent Framework Architecture
+# Agent_US 2.3 后端架构
 
-> Updated upon completing **Agent_US 2.1 — Runtime Security & Durable Swarm Engineering** on top of the P0–P8 modular baseline (`5b41a04`).
-> See also: [`p0-audit-and-research.md`](./p0-audit-and-research.md) for codebase audit and clean-room reference notes.
+Agent_US 2.3 以 `DirectAgentRuntime` 组装交互会话和自治执行，普通 turn 与 Swarm 子 turn 共用 `AgentRuntimeKernel`。本文对应 `c7c3558136541b70121fec7b1a84fcedd591b967` 的实现快照。真实 Provider、独立验收与确定性控制对照见 [2.3 验收报告](2.3-general-autonomous-agent-report.md)。
 
-## 1. Seven-Layer Target Architecture
+## 七层逻辑架构
 
-| Layer | Responsibility | Key Modules |
-|---|---|---|
-| **Layer 1: Application / Client** | UI presentation, SSE streaming consumer, typed SDKs, desktop host | [`frontend/src/App.tsx`](../../frontend/src/App.tsx), [`frontend/src/api/runtimeClient.ts`](../../frontend/src/api/runtimeClient.ts), [`frontend/src/api/client.ts`](../../frontend/src/api/client.ts), [`frontend/src/components/ReconciliationCard.tsx`](../../frontend/src/components/ReconciliationCard.tsx), [`frontend/src/components/EvidenceBadge.tsx`](../../frontend/src/components/EvidenceBadge.tsx), [`backend/client/index.ts`](../../client/index.ts), [`desktop/main.mjs`](../../desktop/main.mjs) |
-| **Layer 2: Control Plane** | Unified routing, approvals, durable cron/timezone schedules, audit views, HTTP/SSE endpoints | [`backend/src/governance/control-plane.js`](../src/governance/control-plane.js), [`backend/src/governance/cron.js`](../src/governance/cron.js), [`backend/src/governance/scheduler.js`](../src/governance/scheduler.js), [`backend/src/routes/runtime-routes.js`](../src/routes/runtime-routes.js), [`backend/src/routes/swarm-routes.js`](../src/routes/swarm-routes.js), [`backend/src/routes/schedule-routes.js`](../src/routes/schedule-routes.js), [`backend/src/v1-routes.js`](../src/v1-routes.js) |
-| **Layer 3: Agent Runtime Kernel** | Single Fail-Closed execution contract across profiles (phase transitions, inference, dispatch, cancellation, verification) | [`backend/src/kernel/runtime.js`](../src/kernel/runtime.js), [`backend/src/kernel/agent-loop.js`](../src/kernel/agent-loop.js), [`backend/src/kernel/state-machine.js`](../src/kernel/state-machine.js), [`backend/src/kernel/cancellation.js`](../src/kernel/cancellation.js), [`backend/src/kernel/inference.js`](../src/kernel/inference.js), [`backend/src/kernel/events.js`](../src/kernel/events.js), [`backend/src/kernel/errors.js`](../src/kernel/errors.js), [`backend/src/governance/verifier.js`](../src/governance/verifier.js) |
-| **Layer 4: Tool Runtime** | Schema validation, effect classification, Fail-Closed policy & digest-bound permits, strict security/transform/observation hooks, SSRF/sandboxing, worktree leases | [`backend/src/tools/registry.js`](../src/tools/registry.js), [`backend/src/tools/dispatcher.js`](../src/tools/dispatcher.js), [`backend/src/tools/policy.js`](../src/tools/policy.js), [`backend/src/agent-context.js`](../src/agent-context.js), [`backend/src/permits.js`](../src/permits.js), [`backend/src/tools/command-analyzer.js`](../src/tools/command-analyzer.js), [`backend/src/tools/ssrf-guard.js`](../src/tools/ssrf-guard.js), [`backend/src/tools/sandbox.js`](../src/tools/sandbox.js), [`backend/src/tools/mcp-lifecycle.js`](../src/tools/mcp-lifecycle.js) |
-| **Layer 5: Context & Memory** | Prompt Cache-preserving tail diff assembly, token budgeting, non-destructive multi-stage compaction, hybrid memory retrieval | [`backend/src/context/assembler.js`](../src/context/assembler.js), [`backend/src/context/budget.js`](../src/context/budget.js), [`backend/src/context/compaction.js`](../src/context/compaction.js), [`backend/src/context/memory.js`](../src/context/memory.js), [`backend/src/context.js`](../src/context.js) |
-| **Layer 6: Adaptive Swarm** | Empirical Bayesian routing, job-driven DAG scheduler, state machines, dynamic replanning, persistent child turns & crash recovery | [`backend/src/swarm/capabilities.js`](../src/swarm/capabilities.js), [`backend/src/swarm/feedback.js`](../src/swarm/feedback.js), [`backend/src/swarm/router.js`](../src/swarm/router.js), [`backend/src/swarm/planner.js`](../src/swarm/planner.js), [`backend/src/swarm/jobs.js`](../src/swarm/jobs.js), [`backend/src/swarm/node-state-machine.js`](../src/swarm/node-state-machine.js), [`backend/src/swarm/replan.js`](../src/swarm/replan.js), [`backend/src/swarm/recovery-helpers.js`](../src/swarm/recovery-helpers.js), [`backend/src/swarm/child-lifecycle.js`](../src/swarm/child-lifecycle.js), [`backend/src/swarm/orchestrator.js`](../src/swarm/orchestrator.js), [`backend/src/swarm/mailbox.js`](../src/swarm/mailbox.js) |
-| **Layer 7: Persistence / Infrastructure** | SQLite WAL Schema v6, JCS-SHA256 hash-chained ledger, fenced job queue, checkpoints, reconciler, ordered async shutdown | [`backend/src/store.js`](../src/store.js), [`backend/src/runtime/session-repo.js`](../src/runtime/session-repo.js), [`backend/src/runtime/approval-manager.js`](../src/runtime/approval-manager.js), [`backend/src/runtime/shutdown.js`](../src/runtime/shutdown.js), [`backend/src/durable/job-queue.js`](../src/durable/job-queue.js), [`backend/src/durable/checkpoint.js`](../src/durable/checkpoint.js), [`backend/src/durable/reconciliation.js`](../src/durable/reconciliation.js), [`backend/src/durable/recovery.js`](../src/durable/recovery.js), [`backend/src/governance/audit.js`](../src/governance/audit.js), [`backend/src/pool.js`](../src/pool.js) |
+[README 的系统架构图](../../README.md#系统架构)展示执行、反馈和持久化关系。下表提供对应的实现入口。
 
-## 2. Fail-Closed Security Architecture (2.1)
+| 层 | 职责 | 代码 |
+| --- | --- | --- |
+| Application / Client | React 工作台使用类型化 REST/SSE 客户端。Electron 托管桌面进程和本地后端。外部客户端可调用原生 API 或模型兼容端点。 | [App](../../frontend/src/App.tsx)、[REST 客户端](../../frontend/src/api/client.ts)、[Runtime 客户端](../../frontend/src/api/runtimeClient.ts)、[Desktop Host](../../desktop/main.mjs) |
+| Control Plane | Fastify API、会话和工作区管理、turn 与 Swarm 入口、审批、调度、模型路由和事件分发。 | [v1-routes](../src/v1-routes.js)、[ControlPlane](../src/governance/control-plane.js)、[Scheduler](../src/governance/scheduler.js)、[模型路由](../src/swarm/router.js)、[EventRouter](../src/kernel/events.js) |
+| Agent Runtime Kernel | 运行 Agent Loop，协调 turn 状态、推理、工具分发、取消、上下文与完成门禁。 | [Runtime](../src/direct-agent.js)、[Kernel](../src/kernel/runtime.js)、[AgentLoop](../src/kernel/agent-loop.js)、[ContextAssembler](../src/context/assembler.js)、[EvidenceVerifier](../src/governance/verifier.js) |
+| Adaptive Intelligence | 仓库分析、规划、能力画像、团队优化、通信、经验记忆与独立评测。 | [服务装配](../src/intelligence-services.js)、[仓库分析](../src/repo-intelligence.js)、[Planning](../src/planning/)、[Capability Registry](../src/swarm/capability-registry.js)、[TeamOptimizer](../src/swarm/team-optimizer.js)、[Communication](../src/communication/)、[Memory](../src/memory/)、[Evaluation](../src/evaluation/) |
+| Execution & Orchestration | 管理运行树、依赖图、并行窗口、子 turn、预算、重规划、产物、Reviewer 与结果聚合。 | [Swarm](../src/swarm/orchestrator.js)、[ChildAgentManager](../src/swarm/child-lifecycle.js)、[Jobs](../src/swarm/jobs.js)、[Replanner](../src/swarm/replan.js)、[Artifacts](../src/swarm/artifacts.js)、[Reviewer](../src/swarm/reviewer.js)、[Aggregator](../src/swarm/result-aggregator.js) |
+| Tool & Runtime Infrastructure | 工作区工具、补丁与诊断、子进程管理、MCP、Skills、桌面扩展、策略、Permit 和 worktree 隔离。 | [Workspace tools](../src/workspace-tools.js)、[Patch](../src/patch-and-diagnostics.js)、[Tools](../src/tools/)、[MCP](../src/mcp-client.js)、[Context & Skills](../src/agent-context.js)、[Extension Hub](../../desktop/extension-hub.mjs) |
+| Persistence & Observability | SQLite WAL、持久任务队列、Checkpoint、恢复、事件账本、经验记录、产物文件、Metrics、Trace 和结构化日志。 | [Store](../src/store.js)、[Durable](../src/durable/)、[Audit](../src/governance/audit.js)、[Observability](../src/observability/) |
 
-1. **ToolDispatcher Fail-Closed Gate (`tools/dispatcher.js`)**:
-   - Mandatory `ToolPermissionPolicy` defaulting to `permissionMode: 'approval'`.
-   - `ASK` requires an injected `requestApproval` handler returning structured approval matching the canonical RFC 8785 (`canonicalJson`) + SHA-256 `argsDigest` of the final tool call. Missing service (`APPROVAL_SERVICE_UNAVAILABLE`), timeout (`APPROVAL_TIMEOUT`), denial (`APPROVAL_DENIED`), error (`APPROVAL_ERROR`), or digest drift (`APPROVAL_ARGS_MISMATCH`) block before permit issuance (`rejected_before_effect`).
-   - Re-checks `signal?.aborted`, `leaseGuard?.()`, and `parentGuard?.()` immediately before consuming single-use `ExecutePermit`.
-   - `tool_receipts` records final `status` consistently with actual exit code (`failed` on non-zero `exitCode`) and transitions aborted non-replayable/outward executions to `outcome_unknown`.
-2. **Hook Semantic Isolation (`agent-context.js`, `tools/dispatcher.js`)**:
-   - Strictly separates `security` (default for `PreToolUse`, Fail-Closed on non-zero exit/timeout/block/deny), `transform` (structured `updatedInput`, triggers full Zod schema re-validation and policy re-evaluation before execution), and `observation` (default for `SessionStart`/`PostToolUse`/`Stop`; never grants authorization, never mutates args, surfaces `warnings[]`).
-3. **Kernel Fail-Closed Default (`kernel/runtime.js`)**:
-   - Removed insecure permissive `DefaultKernelToolDispatcher`. `AgentRuntimeKernel` defaults to real Fail-Closed `ToolDispatcher` + `ToolPermissionPolicy({ permissionMode: 'approval' })`, while still allowing explicit mock dispatchers via `setToolDispatcher(...)` in isolated unit tests.
-4. **Fail-Closed Worktree Isolation (`tools/sandbox.js`, `swarm/child-lifecycle.js`)**:
-   - Explicit `isolationMode` (`worktree`, `shared_readonly`, `shared_write`) never implicitly downgrades on `git worktree` failure (`WORKTREE_ISOLATION_FAILED`).
-   - Only when `allowIsolationFallback: true` is set does a failed worktree clamp strictly to `read-only` (explicitly denying `write_file`, `edit_file`, `apply_patch`, `bash`, `start_process`, `kill_process`).
-   - Active temporary worktrees are leased in `worktree_leases` and automatically scrubbed on cancel, exit, shutdown, and startup orphan recovery (`cleanupOrphans()`).
+## 执行入口与调用关系
 
-## 3. Durable Job-Driven Swarm & Crash Recovery
+1. [main.js](../src/main.js) 或 [Electron Host](../../desktop/main.mjs) 启动 [service.js](../src/service.js)。服务创建 `Store`、`AccountPool`、`DirectAgentRuntime` 和 `ControlPlane`，并装配 intelligence services。评测服务注册持久任务 handler，能力画像、团队优化、通信与经验记忆注入对应运行时组件。
+2. `POST /v1/sessions/:id/turns` 启动交互 turn。`DirectAgentRuntime` 负责会话、队列、审批与上下文，内核运行推理和工具循环。会话使用固定 `nonce` 和稳定的 System Prompt，工作区、Git、日期等动态事实进入上下文尾部。SSE 由 `/v1/stream` 和 `/v1/sessions/:id/stream` 独立读取。见 [Direct Runtime](../src/direct-agent.js)、[AgentLoop](../src/kernel/agent-loop.js)、[ContextAssembler](../src/context/assembler.js) 和 [SSE 路由](../src/v1-routes.js)。
+3. `POST /v1/autonomous/runs` 接收目标。`submitAutonomousGoal()` 分析工作区，调用 `DynamicTaskPlanner` 生成节点，再用结构化规划验证、权限上限与预算约束检查 DAG，最后提交 `AdaptiveSwarmOrchestrator`。`POST /v1/plans/execute` 也接受已提供的结构化计划。普通会话继续走自己的 turn 路径。见 [Intelligence 路由](../src/routes/intelligence-routes.js)、[仓库分析](../src/repo-intelligence.js)、[Swarm Planner](../src/swarm/planner.js) 和 [Plan Validator](../src/planning/validator.js)。
+4. Swarm 通过 `swarm_plan`、`swarm_dependency_resolve`、`swarm_dispatch`、`swarm_node_execute`、`swarm_aggregate` 和 `swarm_verify` 等持久任务推进运行。调度窗口允许依赖就绪的节点并行。`AdaptiveModelRouter` 和 `TeamOptimizer` 使用任务能力需求、路由候选和反馈，团队规模随工作流与预算变化。子 Agent 在内核中执行，`InterAgentMailbox` 通过 `CommunicationBus` 收发消息。见 [Job 定义](../src/swarm/jobs.js)、[编排器](../src/swarm/orchestrator.js)、[通信](../src/communication/) 和 [Mailbox](../src/swarm/mailbox.js)。
+5. Worktree 节点交付持久 Artifact。依赖节点可叠加上游产物，同文件冲突阻止叠加或批量写回。启用 Reviewer 的计划由只读子 Agent 检查上游产物和收据，严格 JSON 结论还要通过代码侧证据检查。失败可在预算内触发 `repair_and_reverify`，并产生新的计划版本。`GET /v1/swarm/runs/:id/delivery` 返回交付信息，`POST /v1/swarm/runs/:id/artifacts/apply-all` 检查验收与冲突后写回父工作区。见 [Artifact Manager](../src/swarm/artifacts.js)、[Reviewer](../src/swarm/reviewer.js)、[动态重规划](../src/swarm/replan.js) 和 [Swarm 路由](../src/routes/swarm-routes.js)。
 
-```mermaid
-flowchart LR
-  Submit["POST /v1/swarm/runs (202 Accepted)"] --> SP["swarm_plan"]
-  Submit -->|Explicit DAG Nodes| SDR["swarm_dependency_resolve"]
-  SP --> SDR
-  SDR -->|Priority + Concurrency Window| SD["swarm_dispatch"]
-  SD --> SNE["swarm_node_execute (ChildTurn + Checkpoint + Lease)"]
-  SNE -->|Success| SDR
-  SNE -->|outcome_unknown| REC["Park reconciling (Approval Gate)"]
-  REC -->|resolve: happened or not_applied| SDR
-  SNE -->|Recoverable Failure| RP["DynamicReplanner (retry_same / switch_model / split_subgraph)"]
-  RP --> SDR
-  SDR -->|All Dependencies Settled| SA["swarm_aggregate"]
-  SA --> SV["swarm_verify (EvidenceVerifier)"]
-  SV --> Done["SWARM_RUN_COMPLETED"]
-```
+### 模型、评测与兼容面
+
+- `AccountPool` 为内核推理提供模型选择与流式适配。`GatewayProxy` 单独服务 `POST /v1/chat/completions` 和 `POST /v1/messages`，两条路径共享账号池。见 [AccountPool](../src/pool.js)、[GatewayProxy](../src/gateway-proxy.js) 和 [v1-routes](../src/v1-routes.js)。
+- `AdaptivePlanner` 的计划创建、验证与 `AdaptiveReplanner` 的计划修订可独立调用。运行期由 Swarm 的 `DynamicReplanner` 处理受预算限制的修复与复验。团队优化与能力测量也提供独立 API。见 [Planning](../src/planning/)、[Swarm replanner](../src/swarm/replan.js) 和 [Intelligence 路由](../src/routes/intelligence-routes.js)。
+- `EvaluationService` 通过独立入口执行数据集、Judge 与回归分析，并更新能力画像和合格的经验记录。Runtime 执行也可产生经验候选，ContextAssembler 和 Swarm 使用经验服务检索。项目上下文记忆与经验记忆分别管理。见 [Evaluation](../src/evaluation/service.js)、[Experience Memory](../src/memory/service.js) 和 [Project Memory](../src/context/memory.js)。
+- `/api/v1/*` 继续挂载旧 DAG 入口供 legacy / compatibility 客户端使用。当前自治运行与交互 turn 均使用 `/v1/*`。见 [API 装配](../src/api.js)、[旧路由](../src/routes.js) 和 [旧 Engine](../src/engine.js)。
+
+## 工具与审批边界
+
+- `ToolDispatcher` 校验工具参数、分类副作用并执行策略。子 Agent 的能力受父会话、节点与实时策略交集限制。需要审批的调用在放行后复核参数摘要与租约，命令前缀授权按规则匹配。见 [Dispatcher](../src/tools/dispatcher.js)、[Policy](../src/tools/policy.js)、[Approval Manager](../src/runtime/approval-manager.js) 和 [Permits](../src/permits.js)。
+- 文件操作校验工作区边界。终端、网络与 MCP 受对应策略和主机适配器约束，Git worktree 隔离工作区改动。隔离能力取决于实际 profile 与宿主环境。见 [Sandbox](../src/tools/sandbox.js)、[SSRF Guard](../src/tools/ssrf-guard.js) 和 [MCP 生命周期](../src/tools/mcp-lifecycle.js)。
+- 工作区 Hook 需要信任校验。`PreToolUse` 的参数转换经过后续策略检查，工具收据和结构化审计可供复核。见 [Hook Trust](../src/tools/hook-trust.js)、[Agent Context](../src/agent-context.js) 和 [Audit](../src/governance/audit.js)。
+
+## Durable Runtime 与状态机
+
+Turn 在 `checkpoint`、`inference`、`tools` 和适用的 `compacting`、`verifying` 等阶段推进。等待或结果未知可进入 `parked` 或 `reconciling`，终态为 `completed`、`failed` 或 `cancelled`。Swarm 节点维护独立状态机，下面保留其主要路径。完整转换以 [Turn State Machine](../src/kernel/state-machine.js) 和 [Swarm State Machine](../src/swarm/node-state-machine.js) 为准。
 
 ```mermaid
 stateDiagram-v2
-  [*] --> pending
-  pending --> ready: Dependencies Met
-  pending --> failed: DEPENDENCY_FAILED
-  pending --> cancelled: BUDGET_EXCEEDED or Cancel
-  ready --> queued: Window Dispatched
-  ready --> cancelled
-  queued --> running: Worker Claimed
-  queued --> ready: Crash Recovered
-  running --> completed: Lease + Evidence OK
-  running --> reconciling: outcome_unknown
-  running --> interrupted: Process Crash
-  running --> parked: Lease or Pause
-  running --> failed: Unrecoverable Error
-  running --> cancelled: PARENT_CANCELLED
-  interrupted --> ready: Startup Recovery
-  parked --> ready: Resume
-  reconciling --> ready: Resolved (happened/not_applied)
-  reconciling --> failed: Resolved (abort)
-  failed --> ready: Explicit Replan or Resume
+    [*] --> pending
+    pending --> ready: 依赖就绪
+    ready --> queued: 进入调度窗口
+    queued --> running: Worker 取得租约
+    running --> completed: 提交结果
+    running --> interrupted: 进程中断
+    interrupted --> ready: 启动恢复
+    running --> parked: 挂起
+    parked --> ready: 恢复调度
+    running --> reconciling: 副作用结果未知
+    reconciling --> ready: 核对后可继续
+    reconciling --> failed: 中止
+    running --> failed: 执行失败
+    running --> cancelled: 取消
+    failed --> ready: 显式重规划
 ```
 
-- **Swarm Job Types (`swarm/jobs.js`)**: Zod-validated payloads, idempotency keys, retry policies (`swarm_plan`, `swarm_dependency_resolve`, `swarm_dispatch`, `swarm_node_execute`, `swarm_aggregate`, `swarm_verify`), leased execution, and fencing tokens (`LEASE_LOST` blocks stale workers before state commit).
-- **10-Node Crash Recovery (`swarm/recovery-helpers.js`)**: On reboot, `RecoveryWorker` delegates Swarm-owned turns (`swarm_nodes.childTurnId`) to `recoverInterruptedRuns()`, preserving all `completed` nodes without re-execution, resuming `running` nodes via saved checkpoints & receipts (or parking `outcome_unknown` into `reconciling`), scheduling dependent `pending` nodes, keeping parent-child trees intact, and refusing to revive `cancelled` runs (`409 SWARM_RUN_CANCELLED`).
+- 队列以租约和 fencing token 协调 worker，过期持有者无法提交状态。恢复结合 Checkpoint 与工具收据，保留完成节点并推进可恢复任务。对结果未知的外部副作用进入 reconciliation，等待确认已发生、未应用或中止。见 [Job Queue](../src/durable/job-queue.js)、[Lease Guard](../src/durable/lease-guard.js)、[Recovery](../src/durable/recovery.js) 和 [Swarm 恢复](../src/swarm/recovery-helpers.js)。
+- Scheduler 持久化计划任务与每次运行，支持时区、并发策略、错过运行处理与取消。`ShutdownCoordinator` 协调有序关闭，SQLite 在服务组件收尾后关闭。见 [Scheduler](../src/governance/scheduler.js)、[Cron](../src/governance/cron.js) 和 [Shutdown](../src/runtime/shutdown.js)。
 
-## 4. Schema v6, Graceful Shutdown, Durable Cron & Empirical Routing
+## 持久化、迁移与观测
 
-- **Schema v6 (`store.js`)**:
-  - New tables: `worktree_leases`, `swarm_replans`, `child_notifications`, `model_feedback`, `scheduled_task_runs`.
-  - New columns: `direct_approvals.argsDigest`, `tool_receipts.{approvedArgsDigest,hookDigest}`, `swarm_runs.{workspaceRoot,permissionMode,planVersion,currentPhase,replanCount,errorCode,errorMessage}`, `swarm_nodes.{taskType,isolationMode,allowIsolationFallback,childTurnId,jobId,reconcileApprovalId,planVersion}`, `scheduled_tasks.{timezone,concurrencyPolicy,misfirePolicy,maxConcurrency}`.
-  - Additive `ALTER TABLE` migration checks `user_version` so existing SQLite databases upgrade losslessly.
-- **Ordered Idempotent Shutdown (`runtime/shutdown.js`)**: `DirectAgentRuntime.close()` and `service.close()` run synchronous turn/timer abort hooks immediately, share a single idempotent async Promise across concurrent callers, enforce per-stage timeouts, and close SQLite strictly last.
-- **Timezone-Aware Durable Scheduler (`governance/cron.js`, `governance/scheduler.js`)**: Strict validator (`400 INVALID_SCHEDULE_CONFIG`), IANA `Intl.DateTimeFormat` timezone calculations, durable `scheduled_task_runs` deduplicated by `sched:<id>:<scheduledFor>`, `concurrencyPolicy` (`skip|queue|allow`), `misfirePolicy` (`fire_once|skip|catch_up`), cancellation (`/v1/schedules/:id/runs/:runId/cancel`), and **zero-idle-polling** (`timer === null` when idle).
-- **Bayesian Empirical Model Routing (`swarm/feedback.js`, `swarm/router.js`)**: Computes 8 empirical metrics (`successRate`, `toolSuccessRate`, `verificationPassRate`, `avgLatencyMs`, `timeoutRate`, `avgTokens`, `contextUtilization`, `recoveryRate`) with shrinkage confidence `n / (n + 10)`, blending prior + empirical scores into a structured `explanation`.
-- **Backward Compatibility**: `DirectAgentRuntime.startRun()` wraps `submitRun() + waitForRun()`, `POST /v1/swarm/runs` defaults to `202 Accepted` (supporting `wait: true` -> `201`), `POST /v1/schedules/:id/run` preserves `{ schedule, run, session, turn }`, and unawaited legacy `direct.close()` remains safe before `store.close()`.
+`Store` 对文件数据库启用 SQLite WAL，当前顶层 `PRAGMA user_version` 为 **7**。迁移在事务内更新历史结构，包含旧调度值归一化、历史搜索 FTS5、模型反馈数据转换以及重规划、运行序号和产物的唯一索引。迁移中断会回滚，超出支持范围的未来 schema 会被拒绝。经验记忆有独立的 schema 标识。见 [Store](../src/store.js)、[迁移测试](../test/migration-v5-v6-v7.test.js) 和 [Memory Schema](../src/memory/schema.js)。
 
-## 5. Verification & Benchmark Baseline
+| 数据 | 持久化或查询入口 |
+| --- | --- |
+| 会话、turn、消息、SSE 事件、审批、工具收据和 Checkpoint | SQLite，按会话查询。见 [Runtime Routes](../src/routes/runtime-routes.js)。 |
+| Job、租约、Swarm 节点、重规划、产物索引与树预算 | SQLite，产物内容通过 Artifact Store 持久化。见 [Artifact Manager](../src/swarm/artifacts.js) 和 [Budget Ledger](../src/swarm/budget-ledger.js)。 |
+| 调度、经验记忆、评测与能力反馈 | SQLite，由各服务读写。见 [服务装配](../src/intelligence-services.js) 和 [Scheduler](../src/governance/scheduler.js)。 |
+| 审计、指标、Trace 和日志 | 账本使用 JCS-SHA256 哈希链接，运行时提供审计完整性、指标与 Trace 查询，并输出结构化日志。见 [Audit](../src/governance/audit.js) 和 [Observability](../src/observability/)。 |
 
-- **Backend Full Suite**: `cd backend && npm run check && node --test --test-timeout=60000 test/*.test.js` — **84 / 89 tests pass** (100% pass across all new and existing unit, security, durable swarm, `SIGKILL` 10-node recovery, scheduler/shutdown/routing, E2E, and stress tests). The 5 pre-existing environment-gated failures (`integration.test.js`, `providers.test.js`, and 3 in `security.test.js`) fail only when Docker daemon or Magpie CLI is unavailable (`CONTAINER_UNAVAILABLE` / `MAGPIE_UNAVAILABLE`).
-- **P8 Stress Benchmark (`stress-benchmark.test.js`)**:
-  - `20` concurrent sessions: `1027.3 ms` total (`p50 = 690.81 ms`, `p95 = 975.61 ms`).
-  - `50` mixed tool dispatches: `45` succeeded, `5` policy-blocked in `182.2 ms`.
-  - `30` contended `DurableJobQueue` jobs across `4` workers: `0` duplicate executions.
-  - `5` crash-recovery cycles: `5 / 5` recovered (`100%`).
-- **Frontend & Desktop**: `cd frontend && npx tsc --noEmit && npm run build` (exit 0) and `node --check desktop/main.mjs` (exit 0).
+## 验证口径
+
+- 真实 Provider 的 `agent-us-oss-benchmark@1.0.0` 最终报告为 4/4。四个外部样本的能力画像仍为 `provisional_low_sample`。
+- 陌生仓库验收覆盖自主规划、并行 worktree、真实 `SIGKILL`、人工核对恢复、Reviewer、产物应用及应用后测试。`tj/commander.js` 的 `1393 PASS / 0 FAIL / 2 SKIP` 属于该次任务。
+- 确定性离线测试覆盖迁移、租约、审批、并行产物冲突、Reviewer 契约和预算边界，独立于真实模型评分。大型仓库仍需按范围复查，外置工具链的验证取决于环境是否已安装所需依赖。
+
+详见 [2.3 验收报告](2.3-general-autonomous-agent-report.md)、[后端启动与测试命令](../README.md) 和 [CI 工作流](../../.github/workflows/ci.yml)。

@@ -2,108 +2,207 @@
 
 <img src="desktop/assets/icon.png" alt="Agent_US Logo" width="96" height="96" />
 
-# Agent_US
+# Agent_US — General-Purpose Autonomous Agent Framework
 
-**面向全生命周期代码工程的轻量化多模型自主智能体平台与零依赖双向反代网关**
+**面向复杂软件工程任务的本地优先自主智能体平台**
 
-[![Release](https://img.shields.io/github/v/release/Eternite-0/Agent_US?display_name=tag&style=flat-square&color=0ea5e9&label=Windows%20.exe)](https://github.com/Eternite-0/Agent_US/releases/latest)
+[![Release](https://img.shields.io/github/v/release/Eternite-0/Agent_US?display_name=tag&style=flat-square&color=0ea5e9&label=Latest%20Release)](https://github.com/Eternite-0/Agent_US/releases/latest)
+[![CI](https://github.com/Eternite-0/Agent_US/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Eternite-0/Agent_US/actions/workflows/ci.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-24%2B%20ESM-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Electron](https://img.shields.io/badge/Electron-35%20Desktop-47848F?style=flat-square&logo=electron&logoColor=white)](https://www.electronjs.org/)
-[![React](https://img.shields.io/badge/React-19%20%2B%20TS%205.9-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
+[![React](https://img.shields.io/badge/React-19%20%2B%20TypeScript-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
 [![Fastify](https://img.shields.io/badge/Fastify-5%20%2B%20SQLite%20WAL-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
-[![Tests](https://img.shields.io/badge/Tests-46%2F46%20Passing-10b981?style=flat-square)](#质量验证与测试)
 
-[下载 Windows 安装包 / 绿色版 `.exe`](https://github.com/Eternite-0/Agent_US/releases/latest) · [核心特性](#核心特性) · [系统架构](#系统架构) · [界面预览](#界面预览) · [网关接入指南](#外部工具接入本地统一网关) · [源码运行与打包](#源码本地开发与构建) · [配套文档](#配套文档)
+[下载 Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest) · [系统架构](#系统架构) · [自主开发流程](#autonomous-software-engineering-workflow) · [核心能力](#核心能力) · [界面预览](#界面预览) · [本地开发](#本地开发与构建) · [配套文档](#配套文档)
 
 </div>
 
 ---
 
-## 项目简介
+## 项目定位
 
-**Agent_US** 是一套完全本地优先（Local-First）的多模型代码智能体工作台与统一模型反代网关。与依赖重型 Docker 编排、多进程 Sidecar 或外部中转服务的方案不同，Agent_US 将 **Direct Multi-Turn Streaming Agent（直连流式智能体）**、**5 角色 DAG 工程编排流水线**、**单进程零依赖 OpenAI ⇄ Anthropic 双向反代网关**、**25+ 供应商账号号池与原生网页授权登录** 以及 **React 19 + Electron 35 桌面工作台** 高度收敛在同一套轻量化运行时内。
+Agent_US 是一套 **Local-First Autonomous Agent Framework**。它将 **Agent Runtime Kernel**、**Adaptive Planner**、**Dynamic Swarm**、**Repository Intelligence**、**Agent Communication**、**Experience Memory** 和 **Evaluation Engine** 组合为一条可验证的工程执行链路，使系统能够理解陌生代码库、规划复杂任务、按任务需求组建 Agent 团队、并行开发、恢复中断、验证证据并完成交付。
 
-| 实测关键指标 | 测量结果 | 说明 |
-| :--- | :---: | :--- |
-| **后端单进程常驻内存 (RSS)** | **92.5 MB** | 合并网关与智能体运行时，较双进程 / 容器方案内存降低 > 60% |
-| **冷启动就绪耗时** | **1,032 ms** | 从进程启动到 `GET /health` 返回 `{"ok":true}` |
-| **空闲后台负载** | **0 定时器 / 0 写入** | 彻底移除后台轮询空转，静默状态下 0% 空载 CPU / 磁盘消耗 |
-| **双向协议翻译** | **OpenAI ⇄ Anthropic** | 纯原生 `fetch` + ReadableStream 零外部代理实时流式互转 |
-| **核心自动化回归测试** | **46 / 46 通过** | 覆盖 18 套非 Docker 后端测试（网关、OAuth、状态机、熔断与审计） |
+模型网关、多供应商 `AccountPool`、MCP 和 Skills 为 Agent Runtime 与外部客户端提供模型接入和工具扩展。
 
----
+### Why Agent_US
 
-## 下载 Windows 独立 `.exe`（前后端全内置，开箱即用）
+| 普通 AI 应用 | Agent_US |
+| --- | --- |
+| 用户手动拆分任务 | 从仓库事实出发自主规划，并支持有限重规划 |
+| 单 Agent 串行执行 | 根据能力和工作流动态组建团队，支持并行子 Agent |
+| 只返回文字答案 | 交付真实代码、测试结果和可追溯 Artifact |
+| 进程退出后任务丢失 | Durable Execution、Checkpoint、Recovery 和 outcome reconciliation |
 
-无需预先安装 Node.js、Python 或 Docker。直接前往 [**GitHub Releases**](https://github.com/Eternite-0/Agent_US/releases/latest) 下载构建好的 Windows x64 客户端（已完整内嵌前端界面、Fastify + SQLite 后端引擎及 Electron 内置 Node 运行时）：
-
-| 发布安装包 | 类型 | 适用场景 |
-| :--- | :---: | :--- |
-| **`Agent_US-2.0.0-win-x64-setup.exe`** | 标准安装版 (NSIS) | 推荐日常使用：无需管理员权限，支持自定义安装路径、桌面与开始菜单快捷方式，二次启动秒开 |
-| **`Agent_US-2.0.0-win-x64-portable.exe`** | 单文件免安装版 (Portable) | 推荐评审演示 / U 盘便携：单文件零安装，双击直接解压并拉起完整前后端工作台 |
-
-> **数据与安全隔离说明**：安装包内**绝不包含**任何开发凭证或本地数据库。首次启动时，程序会在当前用户的 `%APPDATA%\@agent-us\desktop\backend-var\` 目录自动初始化独立的 SQLite WAL 数据库、AES-256-GCM 号池主密钥及本机随机 Bearer Token；若本机 `8787` 端口已被占用，桌面壳会自动无感回退至 `18787` 或系统空闲端口。
-
----
-
-## 核心特性
-
-### 1. 双轨自主智能体运行时（Direct Agent + 5 角色 DAG）
-- **直连多轮流式 Agent（`/v1/sessions`）**：
-  - **Prompt Cache 友好架构**：会话级固定 `nonce` 保持 System Prompt 静态不变，易变的工作区 / Git / 日期状态追加在动态上下文尾部，最大化上游模型缓存命中率。
-  - **读并行 / 写屏障调度**：只读工具并发执行，文件修改与终端命令自动串行写屏障隔离，配合防脏写校验杜绝覆盖冲突。
-  - **4 级模糊 `edit_file` + 多文件原子 `apply_patch`**：支持精确匹配、去尾空格、去缩进与行片段定位，编辑完成后自动触发即时语法诊断（T0 门禁）。
-  - **全链路可控交互**：支持确定性文件快照回滚 `/rewind`、两阶段语义上下文压缩 `/compact`、执行中实时纠偏 `/steer`、防死循环熔断、会话级命令前缀审批白名单、`AGENTS.md` 层级规则发现与生命周期 Hooks。
-- **5 角色 DAG 流水线（`/api/v1/*`）**：内置 Architect、Coder、Tester、Reviewer、Verifier 五类协作角色，结合 T0/T1/T2 三级结果验证与 RFC 8785 规范化哈希链审计账本，确保复杂任务的确定性闭环。
-
-### 2. 单进程零依赖双向反代网关与多供应商号池
-- **统一协议端点**：同一服务直接暴露 OpenAI 兼容端点（`POST /v1/chat/completions`、`GET /v1/models`）与 Anthropic Messages 兼容端点（`POST /v1/messages`），内建零依赖 `GatewayProxy` 实现双向请求/响应与 SSE 流式分片无损转换。
-- **25+ 供应商全覆盖与高还原度账号池**：覆盖 OpenAI、Anthropic、Google Gemini、DeepSeek、OpenRouter、GitHub Copilot、硅基流动、智谱、月之暗面、通义千问、火山方舟、Groq、Ollama、LM Studio 等 25+ 供应商预设及原生图标。
-- **原生网页授权与多模态接入**：内建 OpenRouter OAuth PKCE 网页授权回调、GitHub Copilot Device Flow 扫码授权 + 短时效令牌 TTL 自动换票、通用凭证文件导入与 API Key 录入。
-- **高可用调度与加密落盘**：凭证采用 AES-256-GCM + 本地独立 `.pool-key` 加密存储；支持模型别名映射、上下文窗口/视觉能力元数据同步、429 速率限制指数冷却与多账号自动故障转移。
-
-### 3. 本地扩展生态与签到中心
-- **MCP Stdio Hub**：原生挂载本地 Model Context Protocol (MCP) 工具服务，热扩展外部能力。
-- **内置扩展中心与签到中心（`/v1/checkin/*`）**：提供开箱即用的技能与插件目录（支持从 GitHub 仓库实时拉取 `SKILL.md`），同时支持签到桥接模式与本地 `checkin-plugins/` 插件化签到任务管理。
+用户目标不需要预先提供固定 DAG。任务规模、仓库结构、依赖关系和能力画像共同影响规划与团队形成。
 
 ---
 
 ## 系统架构
 
+七层按职责划分。实线表示请求、调用或持久化，虚线表示评测与记忆的读写关系。
+
+```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 390
+    nodeSpacing: 25
+    rankSpacing: 30
+---
+flowchart TB
+    subgraph L1["1 · Application / Client"]
+        CLIENT["React 19 · Electron 35 Desktop Host<br/>REST API · SSE Streaming · Typed SDK · External Clients"]
+    end
+    subgraph L2["2 · Control Plane"]
+        API["API Gateway /v1 · Event Router · Scheduler<br/>Session / Task / Workspace Managers · Approval Center"]
+        MODEL["AccountPool · Model Router<br/>Gateway Proxy · 兼容协议"]
+    end
+    subgraph L3["3 · Agent Runtime Kernel"]
+        KERNEL["Agent Loop · Turn Manager · Inference Engine<br/>Tool Dispatcher · State Machine · Cancellation Manager<br/>Context Manager · Evidence Verification"]
+    end
+    subgraph L4["4 · Adaptive Intelligence"]
+        INTEL["Repository Intelligence · Adaptive Planner · Plan Validator<br/>Capability Registry · Dynamic Team Optimizer<br/>Agent Communication · Experience Memory · Evaluation Engine"]
+    end
+    subgraph L5["5 · Execution & Orchestration"]
+        SWARM["Adaptive Swarm Orchestrator · Child Agent Lifecycle<br/>DAG Scheduler · Dynamic Replanner · Artifact Manager<br/>Independent Reviewer · Result Aggregation"]
+    end
+    subgraph L6["6 · Tool & Runtime Infrastructure"]
+        TOOLING["Workspace Tools · MCP · Skills · Plugins<br/>Sandbox · Git Worktree · Approval / Permit · Process Manager"]
+    end
+    subgraph L7["7 · Persistence & Observability"]
+        DURABLE["SQLite WAL · Durable Job Queue · Checkpoint<br/>Recovery Worker · Event Ledger · Memory Store · Artifact Store<br/>Metrics · Trace · Structured Logs"]
+    end
+    subgraph EXT["External Ecosystem"]
+        PROVIDERS["OpenAI / Anthropic-compatible Providers<br/>DeepSeek · Gemini · OpenRouter"]
+        INTEGRATIONS["GitHub · External MCP Servers"]
+    end
+
+    CLIENT <-->|REST / SSE| API
+    CLIENT -->|模型兼容端点| MODEL
+    API -->|交互 turn| KERNEL
+    API -->|自治目标| INTEL
+    MODEL <-->|AccountPool 推理| KERNEL
+    MODEL --> PROVIDERS
+    INTEL <-->|计划、能力与执行反馈| SWARM
+    KERNEL <-->|运行子 turn| SWARM
+    KERNEL -->|工具调用| TOOLING
+    TOOLING -->|MCP 与扩展| INTEGRATIONS
+    KERNEL <--> DURABLE
+    SWARM <--> DURABLE
+    INTEL -.评测与记忆读写.-> DURABLE
+```
+
+- `DirectAgentRuntime` 是主要执行编排入口，内部装配 `AgentRuntimeKernel`、上下文、工具、Durable、Swarm 和治理组件。
+- `GatewayProxy` 负责协议兼容和模型请求转发。Agent Loop 的推理使用 AccountPool，外部模型客户端的协议转换由 GatewayProxy 处理。
+- `Evaluation`、`Memory` 和 `Planner` 通过服务、事件和持久化状态互相反馈。评测由独立入口调度，经验检索按上下文和任务需要执行。
+- `Control Plane` 的 `/v1` 路由是当前主 API 面。旧 `/api/v1/*` DAG 路由仍挂载于 [`routes.js`](backend/src/routes.js) 和 [`engine.js`](backend/src/engine.js)，仅用于 legacy / compatibility。
+
+---
+
+## Autonomous Software Engineering Workflow
+
 ```mermaid
 flowchart TB
-    subgraph Client["桌面工作台 & 外部生态客户端"]
-        UI["React 19 + Vite 6 + Electron 35<br/>(对话流 / 号池 / 网关 / 扩展 / 签到)"]
-        EXT["外部客户端接入<br/>Claude Code · Cursor · OpenAI SDK"]
-    end
-
-    subgraph Desktop["Electron 桌面壳 (desktop/main.mjs)"]
-        PROXY["同源反代 + SSE 透传 + Extension Hub<br/>自动拉起并托管内嵌后端进程"]
-    end
-
-    subgraph Backend["单进程轻量化后端 (Node.js ESM + Fastify 5 · RSS 92.5 MB)"]
-        ROUTES["统一 API 路由层<br/>/v1/sessions · /v1/chat/completions · /v1/messages<br/>/v1/accounts · /v1/models/* · /v1/auth/* · /v1/checkin/*"]
-        AGENT["DirectAgentRuntime<br/>静态 Prompt 缓存 · 读并行写屏障<br/>4 级模糊 edit / apply_patch · /rewind /compact /steer"]
-        DAG["5 角色 DAG 编排与验证闭环<br/>T0 语法诊断 · T1 测试验证 · T2 语义评审"]
-        GW["GatewayProxy (零依赖双向翻译)<br/>OpenAI ⇄ Anthropic SSE 互转<br/>GitHub Copilot Token TTL 换票"]
-        POOL["AccountPool & WebLoginService<br/>AES-256-GCM 凭证加密 · 429 冷却故障转移<br/>OpenRouter PKCE · GitHub Device Flow"]
-        TOOLS["Workspace Tools · Patch/Diagnostics · MCP Stdio Hub"]
-        DB[("SQLite WAL<br/>会话 / 号池 / 模型 / RFC 8785 审计链")]
-    end
-
-    UI --> PROXY --> ROUTES
-    EXT -->|"HTTP/SSE (127.0.0.1:8787)"| ROUTES
-    ROUTES --> AGENT
-    ROUTES --> DAG
-    ROUTES --> GW
-    ROUTES --> POOL
-    AGENT --> TOOLS
-    AGENT --> POOL
-    GW --> POOL
-    POOL --> DB
-    AGENT --> DB
-    DAG --> DB
+    GOAL["User Goal"] --> PLAN["Repository Intelligence → Adaptive Planner<br/>→ Plan Validation"]
+    PLAN --> TEAM["Capability Routing → Dynamic Team Formation"]
+    TEAM --> SWARM["Adaptive Swarm → Parallel Execution"]
+    SWARM --> HANDOFF["Agent Communication · Artifact Handoff"]
+    HANDOFF --> TEST["Testing → Independent Review<br/>→ Evidence Verification"]
+    TEST --> DELIVERY["Delivery"]
+    DELIVERY -.验收结果与经验候选.-> LEARN["Evaluation & Experience Memory"]
+    LEARN -.能力与经验反馈.-> TEAM
+    TEST -.有限重规划.-> PLAN
+    SWARM -.中断或结果未知.-> RECOVERY["Checkpoint Recovery<br/>必要时人工核对"]
+    RECOVERY --> SWARM
+    SWARM -.受控操作.-> APPROVAL["Human Approval"]
+    APPROVAL -->|放行后继续| SWARM
 ```
+
+- 通过 `POST /v1/autonomous/runs` 提交目标和工作区信息，运行时生成并验证 DAG。普通会话继续走 `/v1/sessions/:id/turns`。
+- Agent 数量由任务复杂度、独立工作流、能力画像、成本和验证要求共同决定。
+- 可并行的子 Agent 使用独立 worktree 或受控共享路径执行。
+- 失败可以触发有预算上限的 `repair_and_reverify` 或其他有限重规划。
+- 已完成节点产生的 Artifact 会进入后续 Overlay、Review、Verify 和 Delivery。
+- 文件写入、命令执行、Hook、MCP 和外部副作用受工具策略、Permit、Sandbox 或人工审批控制。
+- 带独立验证要求的计划在交付前执行测试、只读 Reviewer 审查和 Evidence Verification。检查项随计划与证据契约变化。
+
+---
+
+## 核心能力
+
+仓库分析、动态团队、子 turn、恢复和交付已接入自治运行。计划创建与提案修订、团队优化、通信、经验反馈和评测也有独立 API，可通过后端文档按需调用。
+
+### 1. Autonomous Repository Intelligence
+
+[`analyzeRepository()`](backend/src/repo-intelligence.js) 和只读工具 `inspect_repository` 会识别代码文件、测试文件、入口、语言、调用关系、Git 状态、依赖准备情况和敏感路径。扫描默认限制为 120 个文件，以控制首次分析开销。更大的仓库可以按任务焦点多次深入。
+
+### 2. Adaptive Planning
+
+[`AdaptivePlanner`](backend/src/planning/planner.js)、[`AdaptiveReplanner`](backend/src/planning/replanner.js) 和 [`validatePlan`](backend/src/planning/validator.js) 提供计划创建、验证和提案修订 API。线上自治路径由 [`swarm/planner.js`](backend/src/swarm/planner.js) 结合仓库摘要生成执行节点，再执行结构化计划校验。运行期修复由 [`swarm/replan.js`](backend/src/swarm/replan.js) 处理。
+
+### 3. Dynamic Multi-Agent Swarm
+
+[`AdaptiveSwarmOrchestrator`](backend/src/swarm/orchestrator.js) 负责运行树、子 Agent、依赖调度、并行 worktree、Artifact Overlay、Reviewer 和交付状态。`TeamOptimizer` 根据工作流和模型能力选择单 Agent 或团队规模，运行时不固定为五种角色。
+
+### 4. Durable Agent Runtime
+
+[`AgentRuntimeKernel`](backend/src/kernel/runtime.js) 和 [`AgentLoop`](backend/src/kernel/agent-loop.js) 统一推理、工具调用、状态转换、取消、预算与证据收口。Durable 层提供 [`DurableJobQueue`](backend/src/durable/job-queue.js)、[`CheckpointStore`](backend/src/durable/checkpoint.js)、Recovery Worker 和未知结果核对。
+
+### 5. Inter-Agent Communication
+
+[`CommunicationBus`](backend/src/communication/bus.js) 提供持久化消息通道，Swarm 内部的 [`InterAgentMailbox`](backend/src/swarm/mailbox.js) 负责子 Agent 间的消息收取与投递。消息会在节点边界进入后续上下文，并受运行状态和权限约束。
+
+### 6. Experience Memory
+
+[`ExperienceMemoryService`](backend/src/memory/service.js) 记录可复用的执行经验和反馈。[`ProjectMemoryService`](backend/src/context/memory.js) 服务于项目上下文。经验记录支持候选、验证与反馈，项目记忆用于组装会话上下文。
+
+### 7. Evaluation & Benchmark
+
+[`EvaluationService`](backend/src/evaluation/service.js)、[`external-benchmark.js`](backend/src/evaluation/external-benchmark.js) 和 [`EvidenceVerifier`](backend/src/governance/verifier.js) 将实现、测试、历史、Artifact 和证据分开检查。Benchmark 数据见 [2.3 验收报告](backend/docs/2.3-general-autonomous-agent-report.md)。
+
+### 8. Secure Tool Runtime
+
+[`ToolDispatcher`](backend/src/tools/dispatcher.js)、[`ToolPermissionPolicy`](backend/src/tools/policy.js)、[`sandbox.js`](backend/src/tools/sandbox.js)、[`permits.js`](backend/src/permits.js) 和 Hook Trust 组件共同控制文件、终端、网络、MCP、工作树和外部副作用。工具收据、审批决定和审计事件进入持久化账本。
+
+### 9. Multi-Provider Gateway
+
+[`AccountPool`](backend/src/pool.js) 维护供应商账号、模型目录、能力元数据、健康度和路由信息。[`GatewayProxy`](backend/src/gateway-proxy.js) 通过 `POST /v1/chat/completions` 和 `POST /v1/messages` 提供 OpenAI / Anthropic 兼容协议。外部兼容请求经过 GatewayProxy，Agent Runtime 则通过 AccountPool 的推理适配器使用同一模型基础设施。
+
+---
+
+## 2.3 验收与 Benchmark
+
+以下是固定任务、模型与运行配置下的结果。详见 [2.3 General-Purpose Autonomous Agent 验收报告](backend/docs/2.3-general-autonomous-agent-report.md)。
+
+### 外部开源 Benchmark
+
+- Benchmark 契约为 `agent-us-oss-benchmark@1.0.0`。
+- 数据集覆盖 4 个 MIT 开源仓库，分别为 `ai/nanoid`、`wooorm/trough`、`fastify/fast-content-type-parse` 和 `ai/nanoevents`。
+- 真实 Provider 运行通过 OpenAI-compatible 端点调用 `deepseek-v4.1-flash`。
+
+| 轮次 | 结果 | 主要发现 |
+| --- | --- | --- |
+| Run 1 | 3/4 PASS | 临时校验脚本已清理，证据检查误判文件缺失。 |
+| Run 2 | 2/4 PASS | 固定输出上限造成两项任务的模型输出截断。 |
+| Run 3 | 3/4 PASS | 两路请求竞争本地代理，一项任务超时。 |
+| Run 4 | **4/4 PASS** | 并发设为 1，超时设为 480 秒。无失败、超时或重试。 |
+
+该模型的外部 Benchmark 能力画像只有四个样本，状态为 `provisional_low_sample`。
+
+### 陌生代码库端到端任务
+
+- 仓库为 [`tj/commander.js`](https://github.com/tj/commander.js)，固定 Commit 为 `a5a7dc084d4d2b7932e85ca049c5204e50a2c721`。
+- 运行时自主生成 5 个规划节点和 2 个并行开发分支，节点数量由任务规划产生，不是系统固定角色数。
+- 验收过程覆盖真实进程 `SIGKILL`、已完成节点去重、`outcome_unknown` 人工核对恢复、Artifact 交付与只读独立 Reviewer。Reviewer 检查产物后给出 `pass`。
+- 应用交付后独立重跑目标仓库测试，结果为 `1393 PASS / 0 FAIL / 2 SKIP`。
+- 该结果只代表这一次特定仓库和特定任务的实测。
+
+### 离线控制与验证边界
+
+- 确定性测试使用 `ScriptedAdapter`、故障注入或参考解验证状态机、预算、迁移、产物冲突与证据门禁。报告中的离线负对照为 `0/1`，如预期被拒绝，单独计入离线结果。
+- 外部 Benchmark 的四个样本不足以推断通用成功率。大型仓库需按子目录进一步扫描。缺少目标仓库依赖时，`tsc`、`tsd` 等外置工具链需在具备依赖的环境中补验。
+- [前端 simulator](frontend/src/api/simulator.ts) 提供演示数据。实际执行、审批与交付结果由 `/v1` 后端返回。
 
 ---
 
@@ -113,134 +212,105 @@ flowchart TB
   <tr>
     <td width="50%" align="center">
       <img src="docs/images/workbench.png" alt="Agent_US 主工作台" />
-      <br /><sub><b>多轮直连流式 Agent 主工作台</b>（会话流 / 工作区 / 审批护栏）</sub>
+      <br /><sub><b>主工作台</b>（会话流、工作区、审批和交付状态）</sub>
     </td>
     <td width="50%" align="center">
       <img src="docs/images/accounts-pool.png" alt="多供应商账号号池管理" />
-      <br /><sub><b>多供应商账号号池管理</b>（AES-256-GCM 加密 / 额度与健康度状态）</sub>
+      <br /><sub><b>账号号池</b>（供应商账号、模型和健康度）</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="docs/images/add-account.png" alt="25+ 供应商接入面板" />
-      <br /><sub><b>25+ 供应商快速接入面板</b>（官方图标 / 分类筛选 / 协议自适应）</sub>
+      <img src="docs/images/add-account.png" alt="供应商接入面板" />
+      <br /><sub><b>供应商接入</b>（协议和凭证配置）</sub>
     </td>
     <td width="50%" align="center">
       <img src="docs/images/native-oauth.png" alt="原生网页登录与 OAuth 授权" />
-      <br /><sub><b>原生网页 OAuth / Device Flow 授权</b>（自动回传令牌与凭证导入）</sub>
+      <br /><sub><b>网页登录与 OAuth</b></sub>
     </td>
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="docs/images/model-gateway.png" alt="模型管理与统一反代网关" width="76%" />
-      <br /><sub><b>模型管理与单进程统一反代网关</b>（模型映射 / 能力同步 / OpenAI & Anthropic 统一端点）</sub>
+      <img src="docs/images/model-gateway.png" alt="模型管理与统一网关" width="76%" />
+      <br /><sub><b>模型管理与统一网关</b>（模型目录、映射和兼容端点）</sub>
     </td>
   </tr>
 </table>
 
 ---
 
-## 外部工具接入本地统一网关
+## 外部客户端与模型网关
 
-当 Agent_US 桌面端或后端服务运行后，默认在 `http://127.0.0.1:8787` 提供兼容 **OpenAI** 与 **Anthropic** 的双协议反代网关。
+后端在本地服务启动后提供兼容端点。常用入口如下。
 
-- 桌面安装版 Token 位于：`%APPDATA%\@agent-us\desktop\backend-var\.dev-token`
-- 源码开发版 Token 位于：`backend/var/.dev-token`
-
-### OpenAI SDK / Cursor / Continue 接入
-
-```bash
-export OPENAI_BASE_URL="http://127.0.0.1:8787/v1"
-export OPENAI_API_KEY="<你的本地 .dev-token>"
-```
-
-```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H "Authorization: Bearer <你的本地 .dev-token>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o-mini",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Hello from Agent_US Gateway!"}]
-  }'
-```
-
-### Claude Code / Anthropic SDK 接入（支持自动翻译至任意 OpenAI 兼容上游）
-
-```powershell
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
-$env:ANTHROPIC_AUTH_TOKEN = Get-Content "$env:APPDATA\@agent-us\desktop\backend-var\.dev-token"
-claude
-```
+- OpenAI 兼容客户端的 Base URL 为 `http://127.0.0.1:8787/v1`（采用源码后端默认端口），调用 `POST /v1/chat/completions` 和 `GET /v1/models`。
+- Anthropic 兼容客户端使用服务根地址并调用 `POST /v1/messages`。客户端鉴权使用本地服务的 `BACKEND_TOKEN`，可通过 Bearer 或 `x-api-key` 请求头传递。
+- 多供应商账号和模型配置使用 `/v1/accounts`、`/v1/models/*` 与 `/v1/auth/*`。
+- 运行时会话、SSE、审批、自治运行和交付使用 `/v1/sessions/*`、`/v1/stream`、`/v1/approvals`、`/v1/autonomous/*` 和 `/v1/swarm/*`。
+- 旧 `/api/v1/*` DAG 路由仍用于兼容旧客户端，新的功能说明和集成应以 `/v1/*` 为准。
 
 ---
 
-## 源码本地开发与构建
+## 本地开发与构建
 
 ### 环境要求
-- **操作系统**：Windows 10 / 11（PowerShell 7）
-- **Node.js**：`v24.9.0+`（ESM 原生 `node:sqlite`，桌面打包后内嵌运行无需环境依赖）
 
-### 一键启动开发环境
+- Windows、macOS 或 Linux
+- Node.js `>=24.9.0`
+- npm
+- Git
+- 外部 Provider 或本地 OpenAI-compatible Provider
 
-在仓库根目录执行：
+### 启动后端
 
 ```powershell
-.\start-dev.ps1
+Set-Location D:\Agent_US\backend
+npm ci
+$env:BACKEND_TOKEN = node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+npm start
 ```
 
-或分终端手动启动前后端：
+默认地址为 `http://127.0.0.1:8787`。数据目录默认是 `backend/var`，可以通过 `BACKEND_DATA` 覆盖。工作区可以通过 `AGENT_WORKSPACE` 或 `PUT /v1/workspace` 设置。
+
+### 启动前端
 
 ```powershell
-# 1. 启动后端（默认监听 http://127.0.0.1:8787）
-Set-Location backend
+Set-Location D:\Agent_US\frontend
 npm ci
-npm start
-
-# 2. 启动前端工作台（默认监听 http://127.0.0.1:5173）
-Set-Location frontend
-npm ci
+$env:BACKEND_URL = "http://127.0.0.1:8787"
+$env:BACKEND_TOKEN = "<与 backend 相同的 BACKEND_TOKEN>"
 npm run dev
 ```
 
-### 自行构建 Windows `.exe` 安装包与绿色版
+浏览器访问 `http://127.0.0.1:5173`。Vite 开发服务器代理 `/v1` 和 `/api/v1`。
+
+### 桌面端预览与打包
 
 ```powershell
-# 确保 backend、frontend、desktop 均已安装依赖
-Set-Location backend  && npm ci
-Set-Location ../frontend && npm ci
-Set-Location ../desktop  && npm ci
-
-# 构建前端 + 自动安全审计（剔除 devDependencies 与敏感 var/）+ 打包 NSIS 安装版与 Portable 单文件版
-npm run build
+# 从仓库根目录执行，先按上文安装后端和前端依赖
+npm --prefix frontend run build
+npm --prefix desktop ci
+npm --prefix desktop start
 ```
 
-构建完成后，产物将输出至 `desktop/release/`：
-- `Agent_US-2.0.0-win-x64-setup.exe`
-- `Agent_US-2.0.0-win-x64-portable.exe`
+Electron Host 管理本地后端与同源通信。Windows x64 安装版和便携版可从 [Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest) 下载，具体资产以发布页为准。本地执行 `npm --prefix desktop run build` 会生成 Windows 包。见 [桌面端入口](desktop/main.mjs)和[发布工作流](.github/workflows/release-windows.yml)。
 
----
-
-## 质量验证与测试
+### 验证命令
 
 ```powershell
-# 1. 后端语法检查、代码规范检查与类型校验
-Set-Location backend
+Set-Location D:\Agent_US\backend
 npm run check
+node --test test/repo-intelligence.test.js test/swarm/autonomous-generalization.test.js
 
-# 2. 运行核心非 Docker 回归测试（含双向网关流式翻译、网页登录、状态机、熔断与签名账本）
-node --test test/gateway-proxy.test.js test/web-login.test.js test/direct-agent.test.js test/pool.test.js
-
-# 3. 前端 TypeScript 严格校验与生产构建
-Set-Location ../frontend
+Set-Location D:\Agent_US\frontend
 npx tsc --noEmit
 npm run build
 
-# 4. Electron 桌面壳与打包脚本语法检查
-Set-Location ..
+Set-Location D:\Agent_US
 node --check desktop/main.mjs
-node --check desktop/pack-win.mjs
 ```
+
+CI 的实际矩阵见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。它在 Ubuntu 和 Windows 上使用 Node 24，后端核心回归步骤按工作流排除三个环境依赖套件。
 
 ---
 
@@ -248,39 +318,53 @@ node --check desktop/pack-win.mjs
 
 ```text
 Agent_US/
-├── backend/                    # Node.js ESM + Fastify 5 + SQLite WAL 核心运行时
-│   ├── src/
-│   │   ├── direct-agent.js     # DirectAgentRuntime 多轮流式智能体与并发/回滚/压缩引擎
-│   │   ├── gateway-proxy.js    # 零依赖 OpenAI ⇄ Anthropic 双向流式翻译与 Copilot 换票
-│   │   ├── pool.js             # AccountPool 多供应商号池、AES-256-GCM 加密与 429 冷却
-│   │   ├── web-login.js        # 原生 OpenRouter PKCE / GitHub Device Flow / 凭证导入
-│   │   ├── v1-routes.js        # /v1/* 统一 REST & SSE 路由与网关入口
-│   │   ├── workspace-tools.js  # 工作区工具链、防脏写保护与命令审批白名单
-│   │   ├── patch-and-diagnostics.js # 4 级模糊 edit_file、apply_patch 与 T0 语法诊断
-│   │   ├── agent-context.js    # AGENTS.md 层级发现与生命周期 Hooks
-│   │   ├── mcp-client.js       # MCP Stdio Hub 客户端
-│   │   ├── checkin.js          # 签到中心（桥接 + 插件双模式）
-│   │   └── engine.js / routes.js # 5 角色 DAG 编排与 RFC 8785 审计账本
-│   ├── test/                   # 自动化单元与集成测试套件
-│   └── docs/architecture.md    # 后端架构与设计详述
-├── frontend/                   # React 19 + TypeScript 5.9 + Vite 6 前端工作台
-│   ├── src/                    # 对话工作台、号池弹窗、模型网关、扩展中心、签到中心
-│   └── public/provider-logos/  # 25+ 供应商高清原生图标资源
-├── desktop/                    # Electron 35 桌面端壳、同源代理与 Windows 打包脚本
-│   ├── main.mjs                # 窗口生命周期、端口自协商、内嵌后端托管与 SSE 透传
-│   ├── extension-hub.mjs       # 独立扩展中心与 GitHub SKILL.md 安装引擎
-│   ├── pack-win.mjs            # 前后端净荷安全审计与 electron-builder Windows 打包脚本
-│   └── assets/                 # 桌面端应用图标 (.ico / .png)
-├── docs/images/                # README 展示高清界面截图
-├── Agent_US_方案设计书.pdf      # 完整平台方案设计书（20 页，含架构图、实验评测与 AI 使用说明）
-└── start-dev.ps1               # Windows 一键启动开发环境脚本
+├─ backend/
+│  ├─ src/
+│  │  ├─ kernel/                 # Agent Loop、推理、状态机、取消和事件
+│  │  ├─ runtime/                # 会话仓库、审批管理、关闭协调
+│  │  ├─ durable/                # Job Queue、Checkpoint、恢复和租约
+│  │  ├─ governance/             # Control Plane、调度、审计和证据验证
+│  │  ├─ tools/                  # 工具注册、分发、策略、Sandbox 和 MCP 生命周期
+│  │  ├─ context/                # 上下文组装、预算、压缩和项目记忆
+│  │  ├─ planning/               # Adaptive Planner、验证和重规划
+│  │  ├─ swarm/                  # 团队优化、编排、子 Agent、消息和 Artifact
+│  │  ├─ communication/          # Agent Communication Bus 和持久化适配器
+│  │  ├─ memory/                 # Experience Memory
+│  │  ├─ evaluation/             # Benchmark、评测、记录和评分
+│  │  ├─ observability/          # Metrics、Trace 和 Structured Logs
+│  │  ├─ direct-agent.js         # DirectAgentRuntime 主编排入口
+│  │  ├─ intelligence-services.js # Planner、Evaluation、Memory、Communication 装配
+│  │  ├─ repo-intelligence.js    # 仓库结构和调用关系分析
+│  │  ├─ pool.js                 # AccountPool 与模型能力路由
+│  │  ├─ gateway-proxy.js        # OpenAI / Anthropic 协议适配
+│  │  ├─ service.js              # Store、Pool、Runtime、Control Plane 装配
+│  │  ├─ v1-routes.js            # 主 REST / SSE API 注册
+│  │  └─ main.js                 # 后端进程入口
+│  ├─ test/                      # 后端单元、集成、恢复、安全和评测测试
+│  └─ docs/
+├─ frontend/
+│  ├─ src/
+│  │  ├─ api/                    # REST、SSE 和运行时客户端
+│  │  ├─ components/             # 会话、Swarm、交付、审批和设置界面
+│  │  └─ App.tsx                 # React 应用入口
+│  ├─ test/
+│  └─ README.md
+├─ desktop/
+│  ├─ main.mjs                   # Electron Desktop Host
+│  ├─ preload.cjs
+│  └─ pack-win.mjs               # Windows 打包入口
+├─ docs/images/                  # README 使用的真实 UI 截图
+├─ README.md
+└─ AGENTS.md
 ```
 
 ---
 
 ## 配套文档
 
-- 📘 [完整方案设计书 (PDF)](Agent_US_方案设计书.pdf) — 涵盖选题背景、总体架构、5 角色与直连双轨调度算法、结果验证与自我循环机制、核心代码剖析、性能实测与 AI 工具使用说明
-- 🏗️ [后端系统架构文档](backend/docs/architecture.md)
-- ⚙️ [后端运行时说明](backend/README.md)
-- 🖥️ [前端工作台说明](frontend/README.md)
+- [后端启动、API 和测试](backend/README.md)
+- [2.3 真实验收报告](backend/docs/2.3-general-autonomous-agent-report.md)
+- [后端 2.3 架构说明](backend/docs/architecture.md)
+- [前端启动与界面能力](frontend/README.md)
+- [CI 工作流](.github/workflows/ci.yml)
+- [GitHub Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest)
