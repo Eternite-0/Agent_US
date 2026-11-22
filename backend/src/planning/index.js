@@ -3,3 +3,4 @@ export * from './validator.js';
 export * from './planner.js';
 export * from './replanner.js';
 export * from './feedback.js';
+export * from './budget-estimator.js';

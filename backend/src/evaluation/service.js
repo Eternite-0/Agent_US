@@ -8,6 +8,7 @@ import { compareRegression } from './regression.js';
 import { TRAFFIC_SOURCES, withTraceContext } from '../observability/trace.js';
 import { redactSecrets } from '../envelope.js';
 import { scoreResults } from './scoring.js';
+import { estimateTaskBudget, queryHistoricalTaskMetrics } from '../planning/budget-estimator.js';
 
 export const BENCHMARK_ID = 'agent-us-deterministic-core';
 export const BENCHMARK_VERSION = '1.0.0';
@@ -199,11 +200,38 @@ function createDirectRuntimeAdapter(directAgent, { model = null } = {}) {
         trafficSource: TRAFFIC_SOURCES.EVAL,
         isSynthetic: true,
       });
+      const baseBudgetSteps = task.resourceBudget?.maxSteps ?? task.metadata?.resourceBudget?.maxSteps ?? 16;
+      const resolvedModel = model || context.model || undefined;
+      const histStats = directAgent?.store
+        ? queryHistoricalTaskMetrics(directAgent.store, { taskType: task.id, model: resolvedModel })
+        : null;
+      const adaptiveBudget = histStats && histStats.sampleCount > 0 && hasAcceptanceCriteria
+        ? estimateTaskBudget({
+            taskType: task.id,
+            fileCount: Object.keys(task.fixture?.files ?? {}).length || 1,
+            requiredTools: ['read_file', 'write_file', 'edit_file', 'bash'],
+            expectedArtifacts: task.metadata?.expectedArtifacts ?? [],
+            verificationComplexity: /security-audit|recovery|multi-agent/.test(task.id) ? 'high' : 'medium',
+            recoveryRequirements: /recovery/.test(task.id),
+            historicalStats: histStats,
+            userBudget: context.maxSteps ? { maxSteps: context.maxSteps } : {},
+          })
+        : null;
+      const effectiveMaxSteps = adaptiveBudget
+        ? Math.min(40, Math.max(baseBudgetSteps, adaptiveBudget.maxSteps))
+        : baseBudgetSteps;
+      const finalVerificationReserve =
+        adaptiveBudget?.finalVerificationReserve ??
+        task.resourceBudget?.finalVerificationReserve ??
+        task.metadata?.resourceBudget?.finalVerificationReserve ??
+        null;
+
       const started = directAgent.startTurn(session.id, {
         input: turnInput,
-        model: model || context.model || undefined,
+        model: resolvedModel,
         permissionMode: evalPermissionMode,
-        maxSteps: task.resourceBudget?.maxSteps ?? task.metadata?.resourceBudget?.maxSteps ?? 16,
+        maxSteps: effectiveMaxSteps,
+        ...(finalVerificationReserve != null ? { finalVerificationReserve } : {}),
         ...(evidenceContract ? { evidenceContract } : {}),
         trafficSource: TRAFFIC_SOURCES.EVAL,
         isSynthetic: true,

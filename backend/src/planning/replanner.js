@@ -9,6 +9,24 @@ function effectMap(task) {
   return new Map((task.sideEffects ?? []).map((effect) => [effect.effectKey, effect]));
 }
 
+const BUDGET_LIMIT_KEYS = ['maxInputTokens', 'maxOutputTokens', 'maxSteps', 'maxTotalTokens', 'maxCostUsd'];
+
+function assertBudgetNotInflated(ceilingBudget = {}, nextBudget = {}) {
+  for (const key of BUDGET_LIMIT_KEYS) {
+    const cap = ceilingBudget?.[key];
+    const req = nextBudget?.[key];
+    if (cap !== undefined && cap !== null) {
+      if (req === undefined || req === null || Number(req) > Number(cap)) {
+        throw plannerFault('PLANNER_BUDGET_INFLATION_DENIED', {
+          field: key,
+          ceiling: Number(cap),
+          requested: req ?? null,
+        });
+      }
+    }
+  }
+}
+
 export class AdaptiveReplanner {
   constructor({ planner, permissionCeiling = 'full' } = {}) {
     this.planner = planner;
@@ -17,12 +35,21 @@ export class AdaptiveReplanner {
 
   replan(currentPlan, proposal, { completedTaskKeys = [], appliedEffectKeys = [] } = {}) {
     const current = validatePlan(normalizePlan(currentPlan), { permissionCeiling: this.permissionCeiling });
+    const initialBudget = current.metadata?.initialBudget && typeof current.metadata.initialBudget === 'object'
+      ? { ...current.metadata.initialBudget }
+      : { ...current.budget };
     const completed = new Set(completedTaskKeys);
     const applied = new Set(appliedEffectKeys);
     const currentTasks = taskMap(current);
     const proposed = proposal?.tasks || proposal?.nodes
       ? normalizePlan({ ...current, ...proposal, planVersion: current.planVersion + 1 })
-      : normalizePlan({ ...current, tasks: [...current.tasks, ...(proposal?.addTasks ?? proposal?.addNodes ?? [])], planVersion: current.planVersion + 1 });
+      : normalizePlan({
+          ...current,
+          ...(proposal?.budget ? { budget: proposal.budget } : {}),
+          tasks: [...current.tasks, ...(proposal?.addTasks ?? proposal?.addNodes ?? [])],
+          planVersion: current.planVersion + 1,
+        });
+    assertBudgetNotInflated(initialBudget, proposed.budget);
     const proposedTasks = taskMap(proposed);
 
     for (const taskKey of completed) {
@@ -52,7 +79,11 @@ export class AdaptiveReplanner {
       }
     }
 
-    const next = validatePlan({ ...proposed, planVersion: current.planVersion + 1 }, { permissionCeiling: this.permissionCeiling });
+    const next = validatePlan({
+      ...proposed,
+      metadata: { ...(proposed.metadata ?? {}), initialBudget },
+      planVersion: current.planVersion + 1,
+    }, { permissionCeiling: this.permissionCeiling });
     if (next.planVersion !== current.planVersion + 1) {
       throw plannerFault('PLANNER_VERSION_INVALID', { expected: current.planVersion + 1, actual: next.planVersion });
     }

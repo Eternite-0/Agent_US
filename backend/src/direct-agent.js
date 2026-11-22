@@ -482,6 +482,8 @@ export class DirectAgentRuntime {
       workspaceSummary,
       maxNodes,
       model: session.model || null,
+      budget: pickPlannerBudget(budget),
+      store: this.store,
       signal,
     });
     const draftPlan = {
@@ -505,6 +507,10 @@ export class DirectAgentRuntime {
           isolatedWorktree: Boolean(node.isolatedWorktree),
           ...(node.isolationMode ? { isolationMode: node.isolationMode } : {}),
           allowIsolationFallback: Boolean(node.allowIsolationFallback),
+          ...(node.budget?.finalVerificationReserve != null
+            ? { finalVerificationReserve: Number(node.budget.finalVerificationReserve) }
+            : {}),
+          ...(node.budgetEstimate ? { budgetBreakdown: node.budgetEstimate } : {}),
         },
       })),
     };
@@ -854,6 +860,7 @@ export class DirectAgentRuntime {
       permissionMode = null,
       effort = null,
       maxSteps = 24,
+      finalVerificationReserve = null,
       files = null,
       evidenceContract = null,
       trafficSource = undefined,
@@ -909,6 +916,10 @@ export class DirectAgentRuntime {
       effort: effort || null,
       workspaceRoot: resolvedWorkspace,
       maxSteps: resolvedMaxSteps,
+      finalVerificationReserve:
+        finalVerificationReserve !== null && Number.isFinite(Number(finalVerificationReserve))
+          ? Math.max(0, Math.floor(Number(finalVerificationReserve)))
+          : null,
       evidenceContract: evidenceContract && typeof evidenceContract === 'object' ? evidenceContract : null,
       trafficSource: classifiedTraffic.trafficSource,
       isSynthetic: classifiedTraffic.isSynthetic,
@@ -1111,6 +1122,7 @@ export class DirectAgentRuntime {
             effort: payload.effort ?? null,
             workspaceRoot: payload.workspaceRoot ?? session.workspaceRoot ?? this.getWorkspaceRoot(),
             maxSteps: Number(payload.maxSteps ?? 24),
+            finalVerificationReserve: payload.finalVerificationReserve ?? null,
             evidenceContract: payload.evidenceContract ?? null,
             initialStep: checkpoint?.step ?? payload.resumedFromStep ?? 0,
             isRecovery: Boolean(job.reclaimedFromCrash || checkpoint?.step > 0 || job.attempts > 1),
@@ -1301,6 +1313,7 @@ export class DirectAgentRuntime {
     effort,
     workspaceRoot,
     maxSteps,
+    finalVerificationReserve = null,
     evidenceContract = null,
     initialStep = 0,
     isRecovery = false,
@@ -1556,6 +1569,7 @@ export class DirectAgentRuntime {
         deferTerminalPhase: true,
         budget: {
           maxSteps,
+          ...(finalVerificationReserve != null ? { finalVerificationReserve } : {}),
           ...(sessionBudget?.maxTokens !== undefined ? { maxTokens: sessionBudget.maxTokens } : {}),
           ...(sessionBudget?.maxTotalTokens !== undefined && sessionBudget?.maxTokens === undefined
             ? { maxTokens: sessionBudget.maxTotalTokens }

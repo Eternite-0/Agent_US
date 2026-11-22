@@ -583,7 +583,7 @@ export class ChildAgentManager {
         const explicitMaxSteps = normalizeBudgetLimit(effectiveBudget.maxSteps);
         const maxSteps =
           explicitMaxSteps !== null
-            ? Math.min(20, explicitMaxSteps)
+            ? Math.min(40, explicitMaxSteps)
             : Math.min(20, Math.max(1, Number(profile?.defaultMaxSteps ?? 8)));
         const resolvedModel = model || this.getDefaultModel();
 
@@ -865,6 +865,9 @@ export class ChildAgentManager {
               : null,
             budget: {
               maxSteps,
+              ...(normalizeBudgetLimit(effectiveBudget.finalVerificationReserve) !== null
+                ? { finalVerificationReserve: normalizeBudgetLimit(effectiveBudget.finalVerificationReserve) }
+                : {}),
               maxOutputTokens:
                 normalizeBudgetLimit(effectiveBudget.maxOutputTokens) !== null
                   ? normalizeBudgetLimit(effectiveBudget.maxOutputTokens)

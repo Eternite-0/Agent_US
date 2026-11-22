@@ -353,6 +353,15 @@ export class DynamicReplanner {
           };
         } else if (!liveNode.nodeKey.includes('__split')) {
           // 3. Split subgraph into two smaller deterministic sub-nodes while preserving completed nodes
+          const snapForSplit = activeLedger ? activeLedger.getSnapshot(liveRun.id) : null;
+          if (snapForSplit?.remainingSteps != null && snapForSplit.remainingSteps < 2) {
+            return {
+              replanned: false,
+              strategy: 'none',
+              reason: 'BUDGET_INSUFFICIENT_FOR_REPLAN',
+              errorCode: 'BUDGET_EXCEEDED',
+            };
+          }
           const existingNodes = this.store.db
             .prepare('SELECT id, nodeKey, dependenciesJson, status, errorCode FROM swarm_nodes WHERE runId=?')
             .all(liveRun.id)
@@ -420,8 +429,18 @@ export class DynamicReplanner {
               allowIsolationFallback, planVersion, status, priority, budgetJson, createdAt, updatedAt
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`,
           );
+          const baseNodeBudget = parseJsonSafe(liveNode.budgetJson, {});
+          const splitBudgetCap = snapForSplit?.remainingSteps != null
+            ? Math.max(1, Math.floor(snapForSplit.remainingSteps / subNodes.length))
+            : null;
           for (const sub of subNodes) {
             const sel = this.router.select({ taskType: sub.taskType, objective: sub.objective });
+            const subBudget = { ...baseNodeBudget };
+            if (splitBudgetCap !== null) {
+              subBudget.maxSteps = subBudget.maxSteps != null
+                ? Math.min(Number(subBudget.maxSteps), splitBudgetCap)
+                : splitBudgetCap;
+            }
             ins.run(
               uuid(),
               liveRun.id,
@@ -441,7 +460,7 @@ export class DynamicReplanner {
               sub.allowIsolationFallback ? 1 : 0,
               nextVersion,
               sub.priority,
-              liveNode.budgetJson || '{}',
+              JSON.stringify(subBudget),
               now,
               now,
             );

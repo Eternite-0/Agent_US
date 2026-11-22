@@ -330,7 +330,10 @@ export class AdaptiveSwarmOrchestrator {
       dependencies: task.dependencies,
       permissionMode: normalizeRuntimePermission(task.permissionMode),
       toolAllow: task.toolAllow,
-      budget: task.budget,
+      budget: {
+        ...task.budget,
+        ...(task.metadata?.finalVerificationReserve != null ? { finalVerificationReserve: task.metadata.finalVerificationReserve } : {}),
+      },
       isolatedWorktree: Boolean(task.metadata?.isolatedWorktree),
       isolationMode:
         task.metadata?.isolationMode ??
@@ -672,6 +675,8 @@ export class AdaptiveSwarmOrchestrator {
           planned = await this.planner.decompose({
             goal: goal || run.goal,
             signal,
+            budget: run.budget,
+            store: this.store,
             budgetLedger: this.budgetLedger,
             treeId: runId,
             sessionId: run.sessionId,
@@ -679,12 +684,12 @@ export class AdaptiveSwarmOrchestrator {
           });
         } catch (err) {
           if (isLeaseLostError(err)) throw err;
-          if (err instanceof BudgetError || err?.category === 'budget' || isBudgetErrorCode(err?.code)) {
+          if (err instanceof BudgetError || err?.category === 'budget' || isBudgetErrorCode(err?.code) || err?.code === 'BUDGET_INSUFFICIENT') {
             const failedRun = transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.FAILED, {
               leaseGuard,
               patch: {
                 currentPhase: SWARM_RUN_STATES.FAILED,
-                errorCode: 'BUDGET_EXCEEDED',
+                errorCode: err?.code === 'BUDGET_INSUFFICIENT' ? 'BUDGET_INSUFFICIENT' : 'BUDGET_EXCEEDED',
                 errorMessage: String(err?.message ?? 'Planning blocked by task-tree budget'),
               },
             });
@@ -732,6 +737,8 @@ export class AdaptiveSwarmOrchestrator {
                 isolatedWorktree: Boolean(n.isolatedWorktree),
                 ...(n.isolationMode ? { isolationMode: n.isolationMode } : {}),
                 allowIsolationFallback: Boolean(n.allowIsolationFallback),
+                ...(n.budget?.finalVerificationReserve != null ? { finalVerificationReserve: n.budget.finalVerificationReserve } : {}),
+                ...(n.budgetEstimate ? { budgetBreakdown: n.budgetEstimate } : {}),
               },
             })),
           },

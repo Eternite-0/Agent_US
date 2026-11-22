@@ -1,6 +1,7 @@
 import { Fault, id as uuid } from '../store.js';
 import { BudgetError } from '../kernel/errors.js';
 import { assertLeaseInTx } from '../durable/lease-guard.js';
+import { allocatePlanBudgets } from '../planning/budget-estimator.js';
 import { BUDGET_SCOPES, estimateRequestInputTokens } from './budget-ledger.js';
 import { SWARM_NODE_STATES, isTerminalNodeState, transitionSwarmNode } from './node-state-machine.js';
 
@@ -189,12 +190,41 @@ export class DynamicTaskPlanner {
     }));
   }
 
+  #applyAdaptiveBudgets(nodes, { budget = {}, store = null, model = null } = {}) {
+    const userBudget = budget && typeof budget === 'object' ? budget : {};
+    const allocation = allocatePlanBudgets({ tasks: nodes, userBudget, store, model });
+    if (!allocation.feasible) {
+      throw new BudgetError('BUDGET_INSUFFICIENT', {
+        message: allocation.insufficientReason || 'Insufficient user budget for planned DAG',
+        detail: allocation,
+      });
+    }
+    const byKey = new Map(allocation.tasks.map((t) => [t.taskKey, t]));
+    return nodes.map((node) => {
+      const alloc = byKey.get(node.nodeKey);
+      const hasExplicitSteps = Number.isFinite(Number(node.budget?.maxSteps ?? node.budget?.maxTotalSteps));
+      return {
+        ...node,
+        budget: {
+          ...(node.budget && typeof node.budget === 'object' ? node.budget : {}),
+          ...(!hasExplicitSteps && alloc?.allocatedSteps ? { maxSteps: alloc.allocatedSteps } : {}),
+          ...(alloc?.finalVerificationReserve != null && node.budget?.finalVerificationReserve == null
+            ? { finalVerificationReserve: alloc.finalVerificationReserve }
+            : {}),
+        },
+        ...(alloc?.estimate ? { budgetEstimate: alloc.estimate } : {}),
+      };
+    });
+  }
+
   async decompose({
     goal,
     workspaceSummary = '',
     maxNodes = 6,
     model = null,
     signal = undefined,
+    budget = {},
+    store = null,
     budgetLedger = null,
     treeId = null,
     sessionId = null,
@@ -274,7 +304,7 @@ export class DynamicTaskPlanner {
         if (Array.isArray(rawList) && rawList.length > 0 && rawList.every((x) => x?.objective)) {
           const normalized = this.normalizeNodes(rawList.slice(0, maxNodes));
           this.validateDag(normalized);
-          return normalized;
+          return this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked });
         }
       } catch (err) {
         if (reservation?.reservationId) {
@@ -350,7 +380,7 @@ export class DynamicTaskPlanner {
         ];
     const normalized = this.normalizeNodes(fallback);
     this.validateDag(normalized);
-    return normalized;
+    return this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked });
   }
 
   addNode(store, runId, nodeSpec, { leaseGuard = null } = {}) {

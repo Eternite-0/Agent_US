@@ -145,7 +145,9 @@ test('createDirectRuntimeAdapter grants isolated full-access without network for
   assert.equal(recordedCalls[0].opts.permissionMode, 'full-access');
   assert.deepEqual(recordedCalls[0].opts.toolDeny, ['web_fetch', 'web_search']);
   assert.equal(recordedCalls[1].opts.permissionMode, 'full-access');
-  assert.equal(recordedCalls[1].opts.maxSteps, 16);
+  assert.equal(recordedCalls[1].opts.maxSteps, engTask.metadata.resourceBudget.maxSteps);
+  assert.ok(recordedCalls[1].opts.maxSteps > 16, 'complex engineering tasks should use complexity-derived step budget');
+  assert.equal(recordedCalls[1].opts.finalVerificationReserve, engTask.metadata.resourceBudget.finalVerificationReserve);
 
   const smokeTask = BENCHMARK_DATASET[0];
   const smokeHandle = adapter({ task: smokeTask, workspaceRoot: '/tmp/ws-smoke', context: {} });

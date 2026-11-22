@@ -108,6 +108,7 @@ export function normalizeNodeBudget(raw = {}) {
       maxTokens: null,
       maxOutputTokens: null,
       maxDurationMs: null,
+      finalVerificationReserve: null,
     };
   }
   return {
@@ -115,6 +116,7 @@ export function normalizeNodeBudget(raw = {}) {
     maxTokens: minDefinedLimit(raw.maxTokens, raw.maxTotalTokens),
     maxOutputTokens: normalizeBudgetLimit(raw.maxOutputTokens),
     maxDurationMs: normalizeBudgetLimit(raw.maxDurationMs),
+    finalVerificationReserve: normalizeBudgetLimit(raw.finalVerificationReserve),
   };
 }
 
@@ -138,11 +140,18 @@ export function computeEffectiveNodeBudget(nodeBudgetRaw = {}, treeSnapshot = nu
       ? treeSnapshot.maxOutputTokens
       : tb.maxOutputTokens;
 
+  const effMaxSteps = minDefinedLimit(nb.maxSteps, treeRemSteps);
+  const effReserve =
+    nb.finalVerificationReserve !== null && effMaxSteps !== null
+      ? Math.min(nb.finalVerificationReserve, Math.max(0, effMaxSteps - 1))
+      : nb.finalVerificationReserve;
+
   return {
-    maxSteps: minDefinedLimit(nb.maxSteps, treeRemSteps),
+    maxSteps: effMaxSteps,
     maxTokens: minDefinedLimit(nb.maxTokens, treeRemTokens),
     maxOutputTokens: minDefinedLimit(nb.maxOutputTokens, treeMaxOut),
     maxDurationMs: minDefinedLimit(nb.maxDurationMs, tb.maxDurationMs),
+    ...(effReserve !== null ? { finalVerificationReserve: effReserve } : {}),
   };
 }
 

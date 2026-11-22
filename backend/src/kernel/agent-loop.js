@@ -268,12 +268,14 @@ export class AgentLoop {
     const maxTotalTokens = normalizeBudgetLimit(budget.maxTokens);
     const explicitMaxOutput = normalizeBudgetLimit(budget.maxOutputTokens);
     const baseMaxOutputTokens = explicitMaxOutput !== null ? explicitMaxOutput : 4096;
+    const verificationReserve = normalizeBudgetLimit(budget.finalVerificationReserve) ?? 0;
     const verifierEvents = [];
     const argStrikes = new Map();
 
     let steps = Number(initialStep || 0);
     let executedStepsThisTurn = 0;
     let stopContinuedOnce = false;
+    let verificationReserveAdvised = false;
     let repairedOnce = false;
     let repairRound = 0;
     let finalAssistantText = '';
@@ -324,6 +326,23 @@ export class AgentLoop {
 
         steps++;
         sm.transition(TURN_PHASES.CHECKPOINT, { step: steps, persist: profile?.persistTurn !== false });
+        if (
+          !verificationReserveAdvised &&
+          verificationReserve > 0 &&
+          maxSteps > verificationReserve &&
+          steps >= maxSteps - verificationReserve
+        ) {
+          verificationReserveAdvised = true;
+          messages.push({
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `[预算收尾提醒] 距离最大步数上限仅剩最后 ${verificationReserve} 步（最终验证预留）。请停止继续大范围探索，立即运行必需测试验证并在最终回复中输出完整的 Evidence Manifest v1.0.0。`,
+              },
+            ],
+          });
+        }
 
         // Drain mid-turn steering input and inter-agent mailbox messages at step boundary
         const steers = drainSteering() ?? [];

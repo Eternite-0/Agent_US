@@ -10,6 +10,7 @@ import {
   validateEvidenceManifest,
 } from './schemas.js';
 import { listWorkspaceChangedFiles } from './fixtures.js';
+import { estimateTaskBudget } from '../planning/budget-estimator.js';
 
 const CATEGORY_SPECS = Object.freeze([
   ['code-generation-repair', 8, '代码生成与修复'],
@@ -601,20 +602,59 @@ test('parallel artifacts are handed off and independently reviewable', async () 
     judge: multiAgentJudge,
     metadata: acceptanceMetadata({ testFiles: ['test/multi-agent.test.js'], requiredChangedFiles: ['src/left.js', 'src/right.js', 'artifacts/manifest.json', 'REVIEW.md'] }),
   },
-].map((task) => ({
-  ...task,
-  prompt: `${task.prompt}\n\n${formatEvidenceManifestContract({
-    taskId: task.id,
-    attemptId: 'attempt-1',
-    planVersion: 1,
-    testCommand: task.metadata.acceptanceCriteria.testCommand,
-    requiredChangedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
-  })}`,
-  category: 'real-software-engineering',
-  difficulty: 'hard',
-  tags: ['benchmark', 'real-engineering', task.id.replace(/^real-/, '')],
-  expected: { output: { taskId: task.id, evidenceRequired: true, schemaVersion: EVIDENCE_MANIFEST_SCHEMA_VERSION } },
-})));
+].map((task) => {
+  const fileCount = Object.keys(task.fixture?.files ?? {}).length || 1;
+  const expectedArtifacts = task.metadata?.expectedArtifacts ?? [];
+  const verificationComplexity = /security-audit|recovery|multi-agent/.test(task.id)
+    ? 'high'
+    : /refactor|data-processing|multi-file-feature/.test(task.id)
+      ? 'medium'
+      : 'low';
+  const recoveryRequirements = /recovery/.test(task.id);
+  const budgetPlan = estimateTaskBudget({
+    taskType: task.id,
+    fileCount,
+    requiredTools: ['read_file', 'write_file', 'edit_file', 'bash'],
+    expectedArtifacts,
+    verificationComplexity,
+    recoveryRequirements,
+  });
+  const resourceBudget = {
+    maxSteps: budgetPlan.maxSteps,
+    maxTokens: budgetPlan.estimatedTokens,
+    finalVerificationReserve: budgetPlan.finalVerificationReserve,
+    maxDurationMs: Math.max(30_000, budgetPlan.maxSteps * 5_000),
+    breakdown: {
+      planningSteps: budgetPlan.planningSteps,
+      researchSteps: budgetPlan.researchSteps,
+      implementationSteps: budgetPlan.implementationSteps,
+      testingSteps: budgetPlan.testingSteps,
+      reviewSteps: budgetPlan.reviewSteps,
+      repairReserve: budgetPlan.repairReserve,
+      finalVerificationReserve: budgetPlan.finalVerificationReserve,
+    },
+    suggestedStages: budgetPlan.suggestedStages,
+  };
+  return {
+    ...task,
+    prompt: `${task.prompt}\n\n${formatEvidenceManifestContract({
+      taskId: task.id,
+      attemptId: 'attempt-1',
+      planVersion: 1,
+      testCommand: task.metadata.acceptanceCriteria.testCommand,
+      requiredChangedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
+    })}`,
+    resourceBudget,
+    metadata: {
+      ...task.metadata,
+      resourceBudget,
+    },
+    category: 'real-software-engineering',
+    difficulty: 'hard',
+    tags: ['benchmark', 'real-engineering', task.id.replace(/^real-/, '')],
+    expected: { output: { taskId: task.id, evidenceRequired: true, schemaVersion: EVIDENCE_MANIFEST_SCHEMA_VERSION } },
+  };
+}));
 
 export function createRealEngineeringDataset() {
   return REAL_ENGINEERING_TASKS.map((task) => ({
