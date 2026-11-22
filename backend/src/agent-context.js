@@ -166,9 +166,10 @@ export function discoverMemoryAndSkills(workspaceRoot, store, { dataRoot = null 
   }
 
   // Discover SKILL.md files from workspace `.agent-us/skills` & dataRoot `skills`
+  const extensionSkillDir = dataRoot ? join(resolve(dataRoot), 'extensions', 'skills') : null;
   const skillDirs = [
     join(resolve(workspaceRoot), '.agent-us', 'skills'),
-    ...(dataRoot ? [join(resolve(dataRoot), 'skills'), join(resolve(dataRoot), 'extensions', 'skills')] : []),
+    ...(dataRoot ? [join(resolve(dataRoot), 'skills'), extensionSkillDir] : []),
   ];
   const skills = [];
   for (const dir of skillDirs) {
@@ -193,7 +194,13 @@ export function discoverMemoryAndSkills(workspaceRoot, store, { dataRoot = null 
         )
           .trim()
           .slice(0, 180);
-        skills.push(`- **${name}** (${skillPath}): ${desc}`);
+        // The bundled office workflows live outside the workspace tool sandbox.
+        // Supply their bounded instructions here without granting arbitrary file access.
+        if (dir === extensionSkillDir && /^office-(documents|pdf|spreadsheets|presentations)$/.test(ent.name)) {
+          skills.push(`- **${name}** (installed office workflow): ${desc}\n${stripFrontmatter(raw).trim().slice(0, 1800)}`);
+        } else {
+          skills.push(`- **${name}** (${skillPath}): ${desc}`);
+        }
       }
     } catch {
       // ignore

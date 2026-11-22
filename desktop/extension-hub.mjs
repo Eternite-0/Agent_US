@@ -4,10 +4,12 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { officePlugins, officeSkill } from './office-skills.mjs';
 
 /**
  * 100% Standalone Extension Hub for Agent_US (ZERO dependency on ~/.codex!).
@@ -46,7 +48,7 @@ function loadSeed() {
     return {
       channelName: raw.channelName || 'Agent_US Open Hub (GitHub / MCP)',
       upstreamSkillsRepo: raw.upstreamSkillsRepo || 'openai/skills',
-      plugins: Array.isArray(raw.plugins) ? raw.plugins : [],
+      plugins: [...officePlugins, ...(Array.isArray(raw.plugins) ? raw.plugins : [])],
       skills: Array.isArray(raw.skills)
         ? raw.skills.map((s) => ({ ...s, hue: s.hue || pickHue(s.slug || s.id || s.name) }))
         : [],
@@ -55,7 +57,7 @@ function loadSeed() {
     return {
       channelName: 'Agent_US Open Hub (GitHub / MCP)',
       upstreamSkillsRepo: 'openai/skills',
-      plugins: [],
+      plugins: officePlugins,
       skills: [],
     };
   }
@@ -373,7 +375,7 @@ export async function handleExtensionHubRequest(req, res, backendDataDir) {
 
     if (req.method === 'POST' && url.pathname === '/api/extensions/plugins/install') {
       const body = await readJsonBody(req);
-      const plugin = body.plugin;
+      const plugin = officePlugins.find(({ id }) => id === body.plugin?.id) ?? body.plugin;
       if (!plugin || !plugin.id) {
         sendJson(res, 400, { error: 'Missing plugin payload' });
         return true;
@@ -392,6 +394,12 @@ export async function handleExtensionHubRequest(req, res, backendDataDir) {
       const safeId = String(plugin.id).replace(/[^a-zA-Z0-9_-]/g, '_');
       const targetDir = join(extDir, 'plugins', safeId);
       mkdirSync(targetDir, { recursive: true });
+      const bundledInstructions = officeSkill(plugin.id);
+      if (bundledInstructions) {
+        const skillDir = join(extDir, 'skills', plugin.id);
+        mkdirSync(skillDir, { recursive: true });
+        writeFileSync(join(skillDir, 'SKILL.md'), bundledInstructions, 'utf8');
+      }
 
       // Attempt live GitHub raw SKILL.md download when plugin declares a public githubSkillSpec!
       let fetchedFromGithub = false;
@@ -515,6 +523,10 @@ export async function handleExtensionHubRequest(req, res, backendDataDir) {
       writeRegistry(extDir, reg);
       const targetDir = join(extDir, 'plugins', id.replace(/[^a-zA-Z0-9_-]/g, '_'));
       if (existsSync(targetDir)) rmSync(targetDir, { recursive: true, force: true });
+      if (officeSkill(id)) {
+        const skillFile = join(extDir, 'skills', id, 'SKILL.md');
+        if (existsSync(skillFile)) unlinkSync(skillFile);
+      }
       sendJson(res, 200, { ok: true, installedPluginIds: reg.installedPluginIds });
       return true;
     }

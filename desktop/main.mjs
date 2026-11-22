@@ -371,6 +371,22 @@ async function createMainWindow() {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     try {
       const parsed = new URL(url);
+      const ui = new URL(targetUrl);
+      if (parsed.origin === ui.origin && parsed.pathname === ui.pathname &&
+          !parsed.hash && parsed.searchParams.has('side-project') && [...parsed.searchParams].length === 1) {
+        const [x, y, width] = mainWindow.getBounds();
+        return {
+          action: 'allow',
+          overrideBrowserWindowOptions: {
+            title: 'Agent_US · 侧边聊天', x: x + Math.max(0, width - 700), y: y + 40,
+            width: 700, height: 750, minWidth: 520, minHeight: 440,
+            frame: false, backgroundColor: '#13161a',
+            webPreferences: {
+              preload: join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true,
+            },
+          },
+        };
+      }
       if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
         void shell.openExternal(url);
       }
@@ -380,34 +396,55 @@ async function createMainWindow() {
     return { action: 'deny' };
   });
 
+  mainWindow.webContents.on('did-create-window', (child) => {
+    // Child chats may navigate in-app, but cannot open more desktop windows.
+    child.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    for (const event of ['maximize', 'unmaximize']) {
+      child.on(event, () => child.webContents.send('window:maximized-changed', child.isMaximized()));
+    }
+  });
+
   await mainWindow.loadURL(targetUrl);
 }
 
-ipcMain.handle('window:minimize', () => {
-  mainWindow?.minimize();
-});
+function senderWindow(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event.senderFrame !== event.sender.mainFrame) return null;
+  const sender = BrowserWindow.fromWebContents(event.sender);
+  if (!sender) return null;
+  const sourceUrl = new URL(event.senderFrame.url);
+  const mainUrl = new URL(mainWindow.webContents.getURL());
+  return sourceUrl.origin === mainUrl.origin && sourceUrl.pathname === mainUrl.pathname ? sender : null;
+}
 
-ipcMain.handle('window:toggle-maximize', () => {
-  if (!mainWindow) return false;
-  if (mainWindow.isMaximized()) {
-    mainWindow.unmaximize();
+ipcMain.handle('window:minimize', (event) => senderWindow(event)?.minimize());
+
+ipcMain.handle('window:toggle-maximize', (event) => {
+  const sender = senderWindow(event);
+  if (!sender) return false;
+  if (sender.isMaximized()) {
+    sender.unmaximize();
     return false;
   }
-  mainWindow.maximize();
+  sender.maximize();
   return true;
 });
 
-ipcMain.handle('window:close', () => {
-  mainWindow?.close();
+ipcMain.handle('window:close', (event) => senderWindow(event)?.close());
+ipcMain.handle('window:is-maximized', (event) => Boolean(senderWindow(event)?.isMaximized()));
+
+ipcMain.handle('window:capture', async (event) => {
+  const sender = senderWindow(event);
+  if (!sender) return null;
+  const image = await sender.webContents.capturePage();
+  if (image.isEmpty()) return null;
+  const { width } = image.getSize();
+  return (width > 1600 ? image.resize({ width: 1600, quality: 'good' }) : image).toPNG().toString('base64');
 });
 
-ipcMain.handle('window:is-maximized', () => {
-  return Boolean(mainWindow?.isMaximized());
-});
-
-ipcMain.handle('dialog:pick-directory', async () => {
-  if (!mainWindow) return null;
-  const res = await dialog.showOpenDialog(mainWindow, {
+ipcMain.handle('dialog:pick-directory', async (event) => {
+  const sender = senderWindow(event);
+  if (!sender) return null;
+  const res = await dialog.showOpenDialog(sender, {
     title: '选择项目源文件夹',
     properties: ['openDirectory'],
   });

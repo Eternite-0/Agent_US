@@ -110,6 +110,7 @@ if (unpackedOnly) {
     'preload.cjs',
     'package.json',
     'extension-hub.mjs',
+    'office-skills.mjs',
     'catalog-seed.json',
   ]) {
     cpSync(join(__dirname, file), join(appDir, file));

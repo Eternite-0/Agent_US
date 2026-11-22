@@ -6,6 +6,7 @@ import { redactSecrets, sanitize } from './envelope.js';
 import { decide as decideLegacyApproval } from './tools.js';
 import { AuditLedgerService } from './governance/audit.js';
 import { ScheduledTaskRunner } from './governance/scheduler.js';
+import { forkChatSession } from './routes/session-fork.js';
 import { registerRuntimeRoutes } from './routes/runtime-routes.js';
 import { registerSwarmRoutes } from './routes/swarm-routes.js';
 import { registerScheduleRoutes } from './routes/schedule-routes.js';
@@ -176,6 +177,10 @@ export function v1Routes(
       isSynthetic: traffic.isSynthetic,
     });
   });
+  app.post('/v1/sessions/:id/fork', async (req) =>
+    forkChatSession({ store, directAgent, runGit }, req.params.id, req.body?.workspaceMode),
+  );
+
   app.get('/v1/sessions/:id', async (req) =>
     directAgent.getSession(req.params.id),
   );
@@ -721,12 +726,14 @@ export function v1Routes(
 
   // ---- Git on Active Workspace ----
 
-  app.get('/v1/git/status', async () =>
-    getGitStatusFor(directAgent.getWorkspaceRoot()),
-  );
+  const gitWorkspace = (sessionId) => typeof sessionId === 'string' && sessionId
+    ? directAgent.getSession(sessionId).workspaceRoot || directAgent.getWorkspaceRoot()
+    : directAgent.getWorkspaceRoot();
+
+  app.get('/v1/git/status', async (req) => getGitStatusFor(gitWorkspace(req.query?.sessionId)));
 
   app.post('/v1/git/checkout', async (req) => {
-    const cwd = directAgent.getWorkspaceRoot();
+    const cwd = gitWorkspace(req.body?.sessionId);
     const branch = String(req.body?.branch || '').trim();
     if (!isSafeGitBranchName(branch)) {
       throw new Fault('INVALID_BRANCH_NAME', 400);
@@ -739,7 +746,7 @@ export function v1Routes(
   });
 
   app.post('/v1/git/init', async (req) => {
-    const cwd = directAgent.getWorkspaceRoot();
+    const cwd = gitWorkspace(req.body?.sessionId);
     const initialBranch = String(req.body?.initialBranch || 'main').trim();
     if (!isSafeGitBranchName(initialBranch)) {
       throw new Fault('INVALID_BRANCH_NAME', 400);

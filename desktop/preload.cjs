@@ -14,5 +14,6 @@ contextBridge.exposeInMainWorld('codexDesktop', {
     ipcRenderer.on('window:maximized-changed', handler);
     return () => ipcRenderer.removeListener('window:maximized-changed', handler);
   },
+  captureWindow: () => ipcRenderer.invoke('window:capture'),
   pickDirectory: () => ipcRenderer.invoke('dialog:pick-directory'),
 });

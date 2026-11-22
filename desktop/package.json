@@ -30,6 +30,7 @@
       "main.mjs",
       "preload.cjs",
       "extension-hub.mjs",
+      "office-skills.mjs",
       "catalog-seed.json",
       "package.json"
     ],
