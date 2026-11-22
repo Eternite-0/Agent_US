@@ -16,4 +16,5 @@ export {
   REAL_ENGINEERING_DATASET_VERSION,
   EvaluationService,
   createDirectRuntimeAdapter,
+  deriveLayeredCapabilities,
 } from './service.js';
