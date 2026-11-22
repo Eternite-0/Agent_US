@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   compareBenchmarkMetrics,
   compareRegression,
+  scoreDetailedResults,
   scoreResults,
   summarizeBenchmarkMetrics,
 } from '../../src/evaluation/index.js';
@@ -155,7 +156,8 @@ test('summarizeBenchmarkMetrics extracts all 11 metrics across legacy 2.2.2 base
   assert.equal(diff.regressedTasks.length, 0);
 
   const scored = scoreResults(candidate.results);
+  const detailed = scoreDetailedResults(candidate.results);
   assert.equal(scored.passRate, 1);
-  assert.equal(scored.evidenceComplianceRate, 1);
+  assert.equal(detailed.evidenceComplianceRate, 1);
   assert.equal(compareRegression({ score: scoreResults(baseline.results) }, { score: scored }).passed, true);
 });

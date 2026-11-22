@@ -100,20 +100,13 @@ export function extractResultTelemetry(result = {}) {
 }
 
 export function scoreResults(results = []) {
-  const rows = results.map((r) => extractResultTelemetry(r));
-  const total = rows.length;
-  const passed = rows.filter((r) => r.status === 'passed').length;
-  const failed = rows.filter((r) => r.status === 'failed').length;
-  const cancelled = rows.filter((r) => r.status === 'cancelled').length;
-  const timedOut = rows.filter((r) => r.status === 'timeout').length;
-  const attempts = rows.reduce((sum, r) => sum + r.attempts, 0);
-  const durationMs = rows.reduce((sum, r) => sum + r.durationMs, 0);
-  const implPassed = rows.filter((r) => r.implementationPassed).length;
-  const testsPassed = rows.filter((r) => r.testsPassed).length;
-  const evidencePassed = rows.filter((r) => r.evidenceCompliant).length;
-  const stepBudgetExhaustedCount = rows.filter((r) => r.stepBudgetExhausted).length;
-  const stepSamples = rows.map((r) => r.steps).filter((v) => v !== null);
-  const tokenSamples = rows.map((r) => r.totalTokens).filter((v) => v !== null);
+  const total = results.length;
+  const passed = results.filter((r) => r.status === 'passed').length;
+  const failed = results.filter((r) => r.status === 'failed').length;
+  const cancelled = results.filter((r) => r.status === 'cancelled').length;
+  const timedOut = results.filter((r) => r.status === 'timeout').length;
+  const attempts = results.reduce((sum, r) => sum + Number(r.attempts || 0), 0);
+  const durationMs = results.reduce((sum, r) => sum + Number(r.durationMs || 0), 0);
   return {
     total,
     passed,
@@ -121,15 +114,30 @@ export function scoreResults(results = []) {
     cancelled,
     timedOut,
     attempts,
-    passRate: total ? round4(passed / total) : 0,
+    passRate: total ? passed / total : 0,
+    meanDurationMs: total ? durationMs / total : 0,
+    totalDurationMs: durationMs,
+  };
+}
+
+export function scoreDetailedResults(results = []) {
+  const base = scoreResults(results);
+  const rows = results.map((r) => extractResultTelemetry(r));
+  const total = rows.length;
+  const implPassed = rows.filter((r) => r.implementationPassed).length;
+  const testsPassed = rows.filter((r) => r.testsPassed).length;
+  const evidencePassed = rows.filter((r) => r.evidenceCompliant).length;
+  const stepBudgetExhaustedCount = rows.filter((r) => r.stepBudgetExhausted).length;
+  const stepSamples = rows.map((r) => r.steps).filter((v) => v !== null);
+  const tokenSamples = rows.map((r) => r.totalTokens).filter((v) => v !== null);
+  return {
+    ...base,
     implementationPassRate: total ? round4(implPassed / total) : 0,
     testPassRate: total ? round4(testsPassed / total) : 0,
     evidenceComplianceRate: total ? round4(evidencePassed / total) : 0,
     stepBudgetExhaustedCount,
     meanSteps: stepSamples.length ? Number((stepSamples.reduce((a, b) => a + b, 0) / stepSamples.length).toFixed(2)) : null,
     meanTokens: tokenSamples.length ? Math.round(tokenSamples.reduce((a, b) => a + b, 0) / tokenSamples.length) : null,
-    meanDurationMs: total ? durationMs / total : 0,
-    totalDurationMs: durationMs,
   };
 }
 

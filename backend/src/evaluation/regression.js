@@ -1,4 +1,4 @@
-import { extractResultTelemetry, scoreResults } from './scoring.js';
+import { extractResultTelemetry, scoreDetailedResults } from './scoring.js';
 
 function round4(value) {
   return Number((Number(value) || 0).toFixed(4));
@@ -16,7 +16,7 @@ export function summarizeBenchmarkMetrics(runOrReport = {}) {
       ? runOrReport
       : [];
   const tasks = results.map((r) => extractResultTelemetry(r));
-  const scored = scoreResults(results);
+  const scored = scoreDetailedResults(results);
   const total = tasks.length || Number(runOrReport?.score?.total ?? 0);
 
   const reviewerRows = tasks.filter((t) => t.reviewerValid !== null);
