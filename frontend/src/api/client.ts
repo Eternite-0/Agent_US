@@ -1,3 +1,4 @@
+import { swarmWorkerStatus } from '../utils/subagentProgress';
 import type {
   AccountBalance,
   Approval,
@@ -1770,14 +1771,7 @@ export class LiveBackendClient implements AgentBackendClient {
     const seenWorker = new Set<string>();
     for (const run of swarmRuns) {
       for (const n of run.nodes ?? []) {
-        const wStatus: Worker['status'] =
-          n.status === 'running'
-            ? 'running'
-            : n.status === 'failed'
-              ? 'failed'
-              : n.status === 'cancelled'
-                ? 'interrupted'
-                : 'done';
+        const wStatus = swarmWorkerStatus(n.status);
         const wid = n.childSessionId || `${run.id}:${n.nodeKey}`;
         assignments.push({
           id: n.id,
@@ -1816,7 +1810,7 @@ export class LiveBackendClient implements AgentBackendClient {
             workerName: n.nodeKey,
             workerRole: n.agentProfileId,
             status: wStatus,
-            attempt: 1,
+            attempt: n.attempts ?? 0,
           });
         }
       }
@@ -1837,7 +1831,7 @@ export class LiveBackendClient implements AgentBackendClient {
           role: normalizeLegacyWorkerRole(
             typeof ev.payload?.workerRole === 'string' ? ev.payload.workerRole : undefined,
           ),
-          status: task.status === 'running' ? 'running' : 'done',
+          status: 'unknown',
           attempt: 1,
         });
       }

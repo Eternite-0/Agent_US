@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import type { Worker } from '../types/backend';
 import type { ComputedFileDiff } from '../utils/diff';
 import { getWorkerActivityLabel, getWorkerDisplayName } from '../utils/worker';
+import { subagentGroups } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
 import {
   IconDiffBox,
@@ -58,24 +59,10 @@ export const AgentCompanionCard: React.FC<AgentCompanionCardProps> = ({
   const totalAdd = diffs.reduce((s, d) => s + d.added, 0);
   const totalDel = diffs.reduce((s, d) => s + d.deleted, 0);
 
-  // Deduplicate retries by assignmentId and exclude internal control-plane (assignmentId === null)
-  const displayWorkers = React.useMemo(() => {
-    const subWorkers = workers.filter((w) => w.assignmentId !== null);
-    const pool = subWorkers.length > 0 ? subWorkers : workers;
-    const byAsgn = new Map<string, Worker>();
-    for (const w of pool) {
-      const k = w.assignmentId || w.id;
-      const prev = byAsgn.get(k);
-      if (!prev || (w.attempt ?? 1) >= (prev.attempt ?? 1)) {
-        byAsgn.set(k, w);
-      }
-    }
-    return [...byAsgn.values()];
-  }, [workers]);
-
-  const activeCount = displayWorkers.filter((w) => w.status === 'running').length;
-  const doneCount = displayWorkers.filter((w) => w.status === 'done').length;
-  const failedCount = displayWorkers.filter((w) => w.status === 'failed').length;
+  const groups = React.useMemo(() => subagentGroups(workers), [workers]);
+  const displayWorkers = groups.flatMap((group) => group.members);
+  const runningWorker = displayWorkers.find((worker) => worker.status === 'running');
+  const summary = groups.map(({ label, members }) => `${members.length} ${label}`).join(' · ');
 
   const allSources = Array.from(
     new Set([...sourceFiles, ...diffs.map((d) => d.path)]),
@@ -102,11 +89,7 @@ export const AgentCompanionCard: React.FC<AgentCompanionCardProps> = ({
           <span className="codex-agent-presence-copy">
             <strong>{getWorkerDisplayName(displayWorkers[0])}</strong>
             <small>
-              {activeCount > 0
-                ? getWorkerActivityLabel(displayWorkers.find((w) => w.status === 'running')) || '正在工作'
-                : failedCount > 0
-                  ? '需要关注'
-                  : '就绪'}
+              {runningWorker ? getWorkerActivityLabel(runningWorker) || '正在工作' : '任务概览'}
             </small>
           </span>
         </div>
@@ -197,13 +180,7 @@ export const AgentCompanionCard: React.FC<AgentCompanionCardProps> = ({
             )}
           </span>
           <span className="tabular-nums" style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-            {displayWorkers.length === 0
-              ? '等待调度'
-              : activeCount > 0
-                ? `${activeCount} 运行中 · ${doneCount} 完成`
-                : failedCount > 0 && doneCount > 0
-                  ? `${doneCount} 完成 · ${failedCount} 未完`
-                  : `${doneCount || displayWorkers.length} 完成`}
+            {summary || '暂无子任务记录'}
           </span>
         </button>
       </div>

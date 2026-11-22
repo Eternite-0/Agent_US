@@ -132,7 +132,7 @@ export interface Worker extends Entity {
   model: string;
   provider: string;
   assignmentId: string | null;
-  status: 'running' | 'done' | 'failed' | 'interrupted';
+  status: 'waiting' | 'running' | 'parked' | 'reconciling' | 'done' | 'failed' | 'interrupted' | 'cancelled' | 'unknown';
   attempt: number;
   code?: string;
 }
@@ -710,6 +710,7 @@ export interface McpServerStatus {
 
 export interface SwarmNodeRecord {
   id: string;
+  attempts?: number;
   runId: string;
   nodeKey: string;
   agentProfileId: string;

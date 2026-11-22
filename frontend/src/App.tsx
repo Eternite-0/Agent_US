@@ -1571,6 +1571,7 @@ export const App: React.FC = () => {
                   if (targetTaskId) setInspectorTaskId(targetTaskId);
                   setInspectorSubagentId(workerId);
                   setInspectorTab('subagents');
+                  setInspectorRequest((value) => value + 1);
                   setInspectorOpen(true);
                 }}
                 onToggleInspector={() => setInspectorOpen((v) => !v)}

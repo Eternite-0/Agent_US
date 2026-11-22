@@ -5367,6 +5367,39 @@ button:focus-visible {
   min-width: 0;
 }
 
+.codex-main-surface:has(> .codex-drawer) { container: workspace / inline-size; }
+@container workspace (max-width: 720px) {
+  .codex-drawer[data-open="true"] {
+    position: absolute;
+    inset: 0 0 0 auto;
+    max-width: 100%;
+    z-index: 85;
+    box-shadow: var(--workspace-picker-shadow);
+  }
+  .codex-drawer-resizer { display: none; }
+}
+
+.subagent-progress {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  min-height: 30px;
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.subagent-progress:hover, .subagent-progress:focus-visible { background: var(--bg-ghost-hover); color: var(--text-default); }
+.subagent-progress :is(svg, span:first-of-type) { flex: none; }
+.subagent-progress-counts, .subagent-row-name, .subagent-row-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-row-name { flex: 1; min-width: 0; text-align: start; }
+.subagent-empty, .subagent-row-meta { color: var(--text-secondary); font-size: 12px; }
+.subagent-row-meta { max-width: 40%; }
+.subagent-empty { margin: 8px 10px; }
+
 /* ---- Composer adapts to its own width (narrow thread / split view) ------- */
 .codex-composer-card {
   container-type: inline-size;

@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { InspectorTab, Task, TaskBundle, Worker } from '../types/backend';
 import { aggregateFileChanges, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
-import { fmtClock, fmtRelative, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
+import { fmtClock, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
 import {
   eventMatchesWorker,
   getWorkerActivityLabel,
@@ -9,6 +9,7 @@ import {
   getWorkerDisplayRole,
 } from '../utils/worker';
 import { ActivityBlock } from './ActivityBlock';
+import { subagentGroups, workerStatusLabels } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
 import {
   IconAgent,
@@ -187,6 +188,24 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   const [loadingVersion, setLoadingVersion] = useState(false);
 
   const plusMenuRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const closePanelRef = useRef<HTMLButtonElement>(null);
+  const backToWorkersRef = useRef<HTMLButtonElement>(null);
+  const previousWorkerRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      if (openerRef.current?.isConnected) openerRef.current.focus({ preventScroll: true });
+      openerRef.current = null;
+      return;
+    }
+    const opener = document.activeElement;
+    if (opener instanceof HTMLElement && opener !== document.body && !panelRef.current?.contains(opener)) {
+      openerRef.current = opener;
+      closePanelRef.current?.focus({ preventScroll: true });
+    }
+  }, [open, tabRequest]);
 
   useEffect(() => {
     if (!plusMenuOpen) return;
@@ -262,6 +281,17 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   }, [open, tab, tabRequest, selectedFile, diffs.length]);
 
   const activePaneTab = openTabs.find((t) => t.id === activeTabId) ?? openTabs[0] ?? null;
+
+  useEffect(() => {
+    const previousWorker = previousWorkerRef.current;
+    previousWorkerRef.current = selectedSubagentId;
+    if (!open || activePaneTab?.kind !== 'subagents') return;
+    if (selectedSubagentId) {
+      backToWorkersRef.current?.focus({ preventScroll: true });
+    } else if (previousWorker) {
+      panelRef.current?.querySelector<HTMLButtonElement>(`[data-worker-id="${CSS.escape(previousWorker)}"]`)?.focus();
+    }
+  }, [open, activePaneTab?.kind, selectedSubagentId]);
 
   const activeFileDiff = useMemo(() => {
     if (activePaneTab?.kind === 'file' && activePaneTab.path !== '__all__') {
@@ -468,27 +498,25 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     return resolveWorkerName(w, { assignment: asgn });
   };
 
-  const dedupedWorkers = useMemo(() => {
-    const all = bundle?.workers ?? [];
-    const sub = all.filter((w) => w.assignmentId !== null);
-    const pool = sub.length > 0 ? sub : all;
-    const byAsgn = new Map<string, Worker>();
-    for (const w of pool) {
-      const k = w.assignmentId || w.id;
-      const prev = byAsgn.get(k);
-      if (!prev || (w.attempt ?? 1) >= (prev.attempt ?? 1)) byAsgn.set(k, w);
-    }
-    return [...byAsgn.values()];
-  }, [bundle?.workers]);
-
-  const activeWorkers = dedupedWorkers.filter((w) => w.status === 'running');
-  const doneWorkers = dedupedWorkers.filter((w) => w.status !== 'running');
+  const progressGroups = useMemo(() => subagentGroups(bundle?.workers ?? []), [bundle?.workers]);
+  const eventWorkers = (bundle?.workers ?? []).filter((worker) => !worker.assignmentId);
+  useEffect(() => setShowAllSubagents(false), [bundle?.task.id]);
   const focusedSubagent = selectedSubagentId
     ? (bundle?.workers ?? []).find((w) => w.id === selectedSubagentId) ?? null
     : null;
 
   return (
     <aside
+      id="workspace-inspector"
+      ref={panelRef}
+      tabIndex={-1}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape' && !event.defaultPrevented && !lightbox) {
+          event.stopPropagation();
+          if (plusMenuOpen) setPlusMenuOpen(false);
+          else onClose();
+        }
+      }}
       className="codex-drawer"
       data-open={open ? 'true' : undefined}
       data-resizing={resizing ? 'true' : undefined}
@@ -627,6 +655,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
               className="codex-icon-btn"
               style={{ width: 26, height: 26 }}
               aria-label="关闭右侧面板"
+              ref={closePanelRef}
               title="关闭右侧面板"
               onClick={onClose}
             >
@@ -666,6 +695,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     className="codex-icon-btn"
                     style={{ width: 26, height: 26 }}
                     aria-label="返回子智能体列表"
+                    ref={backToWorkersRef}
                     onClick={() => onSelectSubagent(null)}
                   >
                     <IconArrowBack size={15} />
@@ -751,7 +781,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
                       {!wEvidence.length && !finalBlocks.length && (
                         <div style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>
-                          该子智能体当前暂无工具执行或输出记录（状态：{fmtStatusLabel(focusedSubagent.status)}）。
+                          该子智能体当前暂无工具执行或输出记录（状态：{workerStatusLabels[focusedSubagent.status]}）。
                         </div>
                       )}
 
@@ -784,82 +814,25 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
             </div>
           ) : (
             <div className="codex-subagent-panel">
-              {/* 已开启 · N */}
-              <div>
-                <div className="codex-subagent-section-head tabular-nums">
-                  已开启 · {activeWorkers.length}
-                </div>
-                {activeWorkers.length === 0 ? (
-                  <div style={{ padding: '4px 10px', fontSize: 13, color: 'var(--text-tertiary)' }}>
-                    没有已开启的子代理
-                  </div>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    {activeWorkers.map((w) => (
-                      <button
-                        key={w.id}
-                        type="button"
-                        className="codex-subagent-list-row"
-                        onClick={() => onSelectSubagent(w.id)}
-                      >
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-                          <AgentAvatar seed={`${w.id}-${w.role}`} size={16} />
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {getWorkerDisplayName(w)}
-                          </span>
-                          <span className="codex-status-dot" data-tone="pulse" />
-                        </span>
-                        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flex: 'none' }}>
-                          运行中
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* 完成 · M */}
-              <div>
-                <div className="codex-subagent-section-head tabular-nums">
-                  完成 · {doneWorkers.length}
-                </div>
-                {doneWorkers.length === 0 ? (
-                  <div style={{ padding: '4px 10px', fontSize: 13, color: 'var(--text-tertiary)' }}>
-                    暂无已完成的子代理
-                  </div>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    {(showAllSubagents ? doneWorkers : doneWorkers.slice(0, 10)).map((w) => (
-                      <button
-                        key={w.id}
-                        type="button"
-                        className="codex-subagent-list-row"
-                        onClick={() => onSelectSubagent(w.id)}
-                      >
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-                          <AgentAvatar seed={`${w.id}-${w.role}`} size={16} />
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {getWorkerDisplayName(w)}
-                          </span>
-                        </span>
-                        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flex: 'none' }}>
-                          {bundle.task.createdAt ? fmtRelative(bundle.task.createdAt) : w.model}
-                        </span>
-                      </button>
-                    ))}
-                    {!showAllSubagents && doneWorkers.length > 10 && (
-                      <button
-                        type="button"
-                        className="codex-sidebar-more-btn"
-                        style={{ paddingLeft: 10, marginTop: 4 }}
-                        onClick={() => setShowAllSubagents(true)}
-                      >
-                        再显示 {doneWorkers.length - 10} 个
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
+              {!progressGroups.length && <p className="subagent-empty">暂无子任务记录</p>}
+              {[...progressGroups, ...(eventWorkers.length ? [{ status: 'events', label: '其他执行记录', members: eventWorkers }] : [])].map(({ status, label, members }) => (
+                <section key={status} aria-label={label}>
+                  <div className="codex-subagent-section-head tabular-nums">{label} · {members.length}</div>
+                  {(showAllSubagents ? members : members.slice(0, 10)).map((worker) => (
+                    <button key={worker.id} type="button" className="codex-subagent-list-row" data-worker-id={worker.id}
+                      onClick={() => onSelectSubagent(worker.id)}>
+                      <AgentAvatar seed={`${worker.id}-${worker.role}`} size={16} />
+                      <span className="subagent-row-name">{getWorkerDisplayName(worker)}</span>
+                      <span className="subagent-row-meta">{worker.attempt > 1 ? `第 ${worker.attempt} 次尝试` : getWorkerDisplayRole(worker)}</span>
+                    </button>
+                  ))}
+                  {!showAllSubagents && members.length > 10 && (
+                    <button type="button" className="codex-sidebar-more-btn" onClick={() => setShowAllSubagents(true)}>
+                      再显示 {members.length - 10} 个
+                    </button>
+                  )}
+                </section>
+              ))}
             </div>
           )
         ) : activePaneTab?.kind === 'file' ? (

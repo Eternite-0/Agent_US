@@ -32,6 +32,7 @@ import {
 } from '../utils/format';
 import { ActivityBlock, ApprovalGateCard } from './ActivityBlock';
 import { AgentCompanionCard } from './AgentCompanionCard';
+import { SubagentProgress } from './SubagentProgress';
 import { Composer } from './Composer';
 import { EvidenceBadge } from './EvidenceBadge';
 import { FileChangeCard } from './FileChangeCard';
@@ -269,7 +270,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   const [selectionOverlay, setSelectionOverlay] = useState<SelectionOverlay | null>(null);
 
   // Composer draft injection (Quote-to-Reply or Edit & Resend)
-  const [companionVisible, setCompanionVisible] = useState(true);
+  const [companionVisible, setCompanionVisible] = useState(false);
   const [draftInjection, setDraftInjection] = useState<{
     id: number;
     text: string;
@@ -726,13 +727,12 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
 
   const activeTask = latestBundle.task;
   const anyLive = turnModels.some((tm) => tm.isLive);
-  const allWorkers = bundles.flatMap((b) => b.workers);
-  const allDiffs = turnModels.flatMap((tm) => tm.computedFiles);
+  const companionDiffs = turnModels.at(-1)?.computedFiles ?? [];
   const allSourceFiles = Array.from(
     new Set([
-      ...bundles.flatMap((b) => Object.keys(b.task.files ?? {})),
-      ...bundles.flatMap((b) => b.evidence.filter((e) => e.path).map((e) => e.path!)),
-      ...allDiffs.map((d) => d.path),
+      ...Object.keys(activeTask.files ?? {}),
+      ...latestBundle.evidence.flatMap((e) => e.path ? [e.path] : []),
+      ...companionDiffs.map((d) => d.path),
     ]),
   ).filter((p) => !/^inputs\//i.test(p.replace(/\\/g, '/')));
   const allPendingApprovals = turnModels.flatMap((tm) =>
@@ -1102,10 +1102,10 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       {/* Floating Top-Right "Agent" Companion Card (1:1 with User Screenshots 1 & 2, shown when right split pane is closed) */}
       {!inspectorOpen && companionVisible && (
         <AgentCompanionCard
-          workers={allWorkers}
-          diffs={allDiffs}
+          workers={latestBundle.workers}
+          diffs={companionDiffs}
           sourceFiles={allSourceFiles}
-          onOpenChanges={() => onOpenInspector('diff', allDiffs[0]?.path, activeTask.id)}
+          onOpenChanges={() => onOpenInspector('diff', companionDiffs[0]?.path, activeTask.id)}
           onOpenSubagents={() => onOpenSubagent(null, activeTask.id)}
           onOpenFile={(path) => onOpenInspector('diff', path, activeTask.id)}
           onOpenEvents={() => onOpenInspector('events', undefined, activeTask.id)}
@@ -1265,6 +1265,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
               tm;
             const { task, assignments, workers, sessions, histories } = bundle;
             const tid = task.id;
+            const progress = <SubagentProgress workers={workers} onOpen={() => onOpenSubagent(null, tid)} />;
             const longUserInput = task.input.length > 360 || task.input.split('\n').length > 6;
             const userExpanded = Boolean(expandedUsers[tid]);
             const inputFiles = Object.keys(task.files ?? {});
@@ -1501,6 +1502,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                         />
                       </div>
                     )}
+                    {progress}
                   </div>
                 </React.Fragment>
               );
@@ -2008,6 +2010,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       )}
                     </div>
                   )}
+                  {progress}
                 </div>
               </React.Fragment>
             );

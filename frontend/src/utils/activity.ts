@@ -1317,6 +1317,7 @@ export function buildUnifiedActivityTimeline(input: UnifiedTimelineInput): Unifi
 
   // Remaining legacy collab workers (only when not covered by runtime worker/node events)
   for (const w of collabWorkers) {
+    if (w.status === 'waiting' || w.status === 'unknown' || (w.status === 'cancelled' && !w.attempt)) continue;
     const asgn = w.assignmentId ? assignmentById.get(w.assignmentId) : undefined;
     const label = getWorkerDisplayName(w, { assignment: asgn });
     if (!legacyStartedWorkers.has(w.id) && !isWorkerCoveredByRuntime(w)) {
