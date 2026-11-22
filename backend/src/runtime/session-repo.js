@@ -94,13 +94,26 @@ export class DirectSessionRepo {
     });
   }
 
-  listSessions({ limit = 200, offset = 0 } = {}) {
+  listSessions({ limit = 200, offset = 0, archived = null, search = '', userChatsOnly = false } = {}) {
+    const pageSize = Math.min(500, Math.max(1, Math.trunc(Number(limit) || 200)));
+    const start = Math.max(0, Math.trunc(Number(offset) || 0));
+    const query = String(search).trim().slice(0, 200);
+    const filters = [];
+    const params = [];
+    if (userChatsOnly) filters.push('parentSessionId IS NULL', 'isSynthetic = 0');
+    if (archived !== null) {
+      filters.push(archived ? 'archivedAt IS NOT NULL' : 'archivedAt IS NULL');
+    }
+    if (query) {
+      filters.push("(instr(lower(title), lower(?)) > 0 OR instr(lower(coalesce(workspaceRoot, '')), lower(?)) > 0)");
+      params.push(query, query);
+    }
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const order = archived ? 'archivedAt DESC, id' : 'updatedAt DESC, createdAt DESC, id';
     return this.store.db
-      .prepare(
-        'SELECT * FROM direct_sessions ORDER BY updatedAt DESC, createdAt DESC LIMIT ? OFFSET ?',
-      )
-      .all(Math.min(500, Math.max(1, Number(limit))), Math.max(0, Number(offset)))
-      .map((r) => this.hydrateSessionRow(r));
+      .prepare(`SELECT * FROM direct_sessions ${where} ORDER BY ${order} LIMIT ? OFFSET ?`)
+      .all(...params, pageSize, Number.isSafeInteger(start) ? start : 0)
+      .map((row) => this.hydrateSessionRow(row));
   }
 
   getSession(sessionId) {
@@ -195,9 +208,19 @@ export class DirectSessionRepo {
   }
 
   updateSession(sessionId, patch = {}) {
-    const s = this.getSession(sessionId);
-    const now = Date.now();
-    this.store.tx(() => {
+    if (patch.archived !== undefined && typeof patch.archived !== 'boolean') {
+      throw new Fault('INVALID_SESSION_ARCHIVE', 400, { message: 'archived must be a boolean' });
+    }
+    return this.store.tx(() => {
+      const s = this.getSession(sessionId);
+      const now = Date.now();
+      if (patch.archived !== undefined) {
+        this.store.db.prepare(
+          'UPDATE direct_sessions SET archivedAt=? WHERE id=?',
+        ).run(patch.archived ? (s.archivedAt ?? now) : null, sessionId);
+        // Archive state is independent of session activity and editable metadata.
+        if (Object.keys(patch).length === 1) return this.getSession(sessionId);
+      }
       this.store.db
         .prepare(
           `UPDATE direct_sessions
@@ -217,8 +240,8 @@ export class DirectSessionRepo {
           now,
           sessionId,
         );
+      return this.getSession(sessionId);
     });
-    return this.getSession(sessionId);
   }
 
   #collectSessionSubtreeIds(rootId) {

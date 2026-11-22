@@ -1,3 +1,4 @@
+import { searchWorkspaceFiles } from './workspace-file-search.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Fault, id as uuid } from './store.js';
@@ -127,6 +128,15 @@ export function v1Routes(
     workspaceRoot: directAgent.getWorkspaceRoot(),
   }));
 
+  app.get('/v1/workspace/files', async (req) => {
+    const q = req.query ?? {};
+    const root = typeof q.sessionId === 'string' && q.sessionId
+      ? directAgent.getSession(q.sessionId).workspaceRoot || directAgent.getWorkspaceRoot()
+      : directAgent.getWorkspaceRoot();
+    if (!root) return { items: [] };
+    return { items: await searchWorkspaceFiles(root, { search: q.q, limit: q.limit }) };
+  });
+
   app.put('/v1/workspace', async (req) => {
     const body = req.body ?? {};
     return directAgent.setWorkspaceRoot(body.workspaceRoot);
@@ -140,6 +150,9 @@ export function v1Routes(
       items: directAgent.listSessions({
         limit: q.limit ? Number(q.limit) : 200,
         offset: q.offset ? Number(q.offset) : 0,
+        archived: q.archived === 'true' ? true : q.archived === 'false' ? false : null,
+        search: typeof q.search === 'string' ? q.search : '',
+        userChatsOnly: q.scope === 'chats',
       }),
     };
   });
@@ -226,9 +239,10 @@ export function v1Routes(
   app.get('/v1/history/search', async (req) => {
     const q = req.query ?? {};
     return {
-      items: store.searchDirectHistory(String(q.q ?? ''), {
+      items: store.searchDirectHistory(String(q.q ?? '').slice(0, 200), {
         excludeSessionId: q.excludeSessionId || null,
         limit: q.limit ? Number(q.limit) : 20,
+        userChatsOnly: q.scope === 'chats',
       }),
     };
   });

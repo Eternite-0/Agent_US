@@ -116,6 +116,7 @@ const REQUIRED_V7_COLUMNS = Object.freeze({
     'toolDenyJson',
     'trafficSource',
     'isSynthetic',
+    'archivedAt',
   ],
   direct_turns: [
     'jobId',
@@ -486,6 +487,7 @@ export class Store {
         ['toolDenyJson', 'TEXT'],
         ['trafficSource', "TEXT NOT NULL DEFAULT 'production'"],
         ['isSynthetic', 'INTEGER NOT NULL DEFAULT 0'],
+        ['archivedAt', 'INTEGER'],
       ]);
       ensureColumns('direct_turns', [
         ['jobId', 'TEXT'],
@@ -1022,11 +1024,14 @@ export class Store {
   }
   searchDirectHistory(
     query,
-    { excludeSessionId = null, workspaceRoot = null, limit = 12 } = {},
+    { excludeSessionId = null, workspaceRoot = null, limit = 12, userChatsOnly = false } = {},
   ) {
     const q = String(query ?? '').trim();
     if (!q) return [];
-    const cap = Math.min(50, Math.max(1, Number(limit || 12)));
+    const cap = Math.min(50, Math.max(1, Math.trunc(Number(limit) || 12)));
+    const chatFilter = userChatsOnly
+      ? "AND s.parentSessionId IS NULL AND s.isSynthetic = 0 AND m.role IN ('user', 'assistant')"
+      : '';
     if (this.ftsEnabled) {
       try {
         // Escape FTS5 syntax safely into phrase terms
@@ -1037,10 +1042,10 @@ export class Store {
           .map((t) => `"${t.replace(/"/g, '""')}"`)
           .join(' ');
         if (terms) {
-          return this.db
+          const matches = this.db
             .prepare(
               `SELECT m.seq, m.sessionId, m.turnId, m.role, m.createdAt,
-                      s.title AS sessionTitle, s.workspaceRoot,
+                      s.title AS sessionTitle, s.workspaceRoot, s.archivedAt,
                       snippet(direct_messages_fts, 0, '[', ']', '…', 24) AS snippet
                FROM direct_messages_fts
                JOIN direct_messages m ON m.seq = direct_messages_fts.rowid
@@ -1048,6 +1053,7 @@ export class Store {
                WHERE direct_messages_fts MATCH ?
                  AND (? IS NULL OR m.sessionId != ?)
                  AND (? IS NULL OR s.workspaceRoot = ?)
+                 ${chatFilter}
                ORDER BY bm25(direct_messages_fts), m.createdAt DESC
                LIMIT ?`,
             )
@@ -1059,27 +1065,29 @@ export class Store {
               workspaceRoot,
               cap,
             );
+          if (matches.length || !userChatsOnly) return matches;
         }
       } catch {
-        // fallback to LIKE below
+        // Continue with literal substring search if FTS is unavailable.
       }
     }
-    const pat = `%${q}%`;
     return this.db
       .prepare(
         `SELECT m.seq, m.sessionId, m.turnId, m.role, m.createdAt,
-                s.title AS sessionTitle, s.workspaceRoot,
-                substr(m.content, 1, 240) AS snippet
+                s.title AS sessionTitle, s.workspaceRoot, s.archivedAt,
+                substr(m.content, max(1, instr(lower(m.content), lower(?)) - 50), 240) AS snippet
          FROM direct_messages m
          JOIN direct_sessions s ON s.id = m.sessionId
-         WHERE m.content LIKE ?
+         WHERE instr(lower(m.content), lower(?)) > 0
            AND (? IS NULL OR m.sessionId != ?)
            AND (? IS NULL OR s.workspaceRoot = ?)
+           ${chatFilter}
          ORDER BY m.createdAt DESC
          LIMIT ?`,
       )
       .all(
-        pat,
+        q,
+        q,
         excludeSessionId,
         excludeSessionId,
         workspaceRoot,
