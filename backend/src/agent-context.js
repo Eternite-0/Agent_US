@@ -219,6 +219,7 @@ export function buildRuntimeContextMessage({
   mode = 'direct',
   permissionMode = 'auto-safe',
   projectInstructions = null,
+  repoSummary = '',
   memoryText = '',
   skillsText = '',
   planState = null,
@@ -241,6 +242,10 @@ export function buildRuntimeContextMessage({
   }
   if (projectInstructions?.text) {
     parts.push(`<project_instructions>\n${projectInstructions.text}\n</project_instructions>`);
+  }
+  const trimmedRepoSummary = typeof repoSummary === 'string' ? repoSummary.trim() : '';
+  if (trimmedRepoSummary) {
+    parts.push(`<repository_intelligence>\n${trimmedRepoSummary}\n</repository_intelligence>`);
   }
   if (memoryText) {
     parts.push(`<workspace_memory>\n${memoryText}\n</workspace_memory>`);

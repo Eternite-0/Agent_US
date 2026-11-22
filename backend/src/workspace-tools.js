@@ -1,3 +1,6 @@
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
+import { z } from 'zod';
 import {
   ExecutePermitRegistry,
   dispatchWithPermit,
@@ -5,9 +8,14 @@ import {
 } from './permits.js';
 import { PolicyError } from './kernel/errors.js';
 import { canonicalizeCommandPrefix } from './patch-and-diagnostics.js';
-import { ToolRegistry } from './tools/registry.js';
+import { analyzeRepository, formatRepositorySummary } from './repo-intelligence.js';
+import { EFFECT_CLASSES, RISK_LEVELS, ToolRegistry, defineTool } from './tools/registry.js';
 import { ToolPermissionPolicy } from './tools/policy.js';
-import { HostSandboxAdapter, resolveConfinedPath } from './tools/sandbox.js';
+import {
+  HostSandboxAdapter,
+  normalizeProtectedSegment,
+  resolveConfinedPath,
+} from './tools/sandbox.js';
 import { ToolResultProcessor, computeArgsDigest } from './tools/dispatcher.js';
 import { createFsTools } from './tools/builtin/fs-tools.js';
 import {
@@ -23,6 +31,7 @@ export const WORKSPACE_TOOL_META = Object.freeze({
   glob: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   grep: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   read_blob: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
+  inspect_repository: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   web_fetch: { readOnly: true, risk: 'low', effectClass: 'external_network', replayable: true, outward: false },
   search_history: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   read_process_output: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
@@ -67,6 +76,90 @@ export function needsApproval(
     { approvedPrefixes, tainted, permissionMode },
   );
   return verdict.decision !== 'allow';
+}
+
+function isBlockedRepoFocusRel(relPath) {
+  const segments = String(relPath ?? '')
+    .split(/[\\/]/)
+    .filter(Boolean);
+  return segments.some((seg) => {
+    const norm = normalizeProtectedSegment(seg);
+    return (
+      norm === 'upstream' ||
+      norm === 'var' ||
+      /^\.env(?:$|[._-])/i.test(norm) ||
+      /\.(?:pem|key|pfx|p12|crt|der|sqlite(?:3)?|sqlite-wal|sqlite-shm)$/i.test(norm)
+    );
+  });
+}
+
+function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback }) {
+  return defineTool({
+    name: 'inspect_repository',
+    description:
+      '只读分析工作区仓库结构、Git 状态、项目配置与测试/构建命令、模块调用图及问题相关文件排序（严格受沙箱与密钥隔离约束）。',
+    effectClass: EFFECT_CLASSES.READ_ONLY,
+    riskLevel: RISK_LEVELS.LOW,
+    readOnly: true,
+    replayable: true,
+    outward: false,
+    zodSchema: z.object({
+      focus: z
+        .string()
+        .optional()
+        .describe('可选：限定分析的工作区内子目录路径，或待排查的问题关键词/模块路径'),
+      includeGraph: z
+        .boolean()
+        .optional()
+        .describe('是否在摘要中包含模块调用图依赖边与导出符号明细（默认 true）'),
+      maxFiles: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe('最多扫描的工作区文件数上限（默认 120）'),
+    }),
+    async execute(args = {}, ctx) {
+      await guardFallback('inspect_repository', args, ctx);
+      let targetRoot = resolve(workspaceRoot);
+      let issueText = '';
+      if (typeof args.focus === 'string' && args.focus.trim()) {
+        const rawFocus = args.focus.trim();
+        const confined = resolveConfinedPath(workspaceRoot, rawFocus);
+        if (isBlockedRepoFocusRel(confined.rel)) {
+          throw new Error(`受保护目录或密钥文件不允许访问: ${rawFocus}`);
+        }
+        if (existsSync(confined.full)) {
+          const realRoot = realpathSync(resolve(workspaceRoot));
+          const realTarget = realpathSync(confined.full);
+          const realRel = relative(realRoot, realTarget).replace(/\\/g, '/');
+          if (isBlockedRepoFocusRel(realRel)) {
+            throw new Error(`受保护目录或密钥文件不允许访问: ${rawFocus}`);
+          }
+          const st = statSync(realTarget);
+          if (st.isDirectory()) {
+            targetRoot = realTarget;
+          } else {
+            issueText = confined.rel;
+          }
+        } else {
+          issueText = rawFocus;
+        }
+      }
+      const includeGraph = args.includeGraph !== false;
+      const maxFiles = args.maxFiles ? Number(args.maxFiles) : 120;
+      const analysis = await analyzeRepository(targetRoot, {
+        issueText,
+        maxFiles,
+      });
+      const summary = formatRepositorySummary(analysis, {
+        maxBytes: 8000,
+        includeGraph,
+      });
+      return wrapResult('inspect_repository', summary);
+    },
+  });
 }
 
 export function createWorkspaceTools({
@@ -248,6 +341,11 @@ export function createWorkspaceTools({
       orchestrateSwarm,
       sendAgentMessage,
       signal,
+    }),
+    createInspectRepositoryTool({
+      workspaceRoot,
+      wrapResult,
+      guardFallback,
     }),
   ]);
 
