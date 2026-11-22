@@ -281,6 +281,86 @@ export function registerSwarmRoutes(app, { store, directAgent }) {
     return reply.code(200).send(result);
   });
 
+  app.get('/v1/swarm/runs/:id/delivery', async (req, reply) => {
+    const orchestrator = directAgent?.swarmOrchestrator;
+    if (!orchestrator?.buildRunDeliveryPackage) {
+      return reply.code(503).send({
+        error: { code: 'SWARM_UNAVAILABLE', message: 'Swarm delivery service unavailable', status: 503 },
+      });
+    }
+    const pkg = orchestrator.buildRunDeliveryPackage(req.params.id);
+    if (!pkg) {
+      return reply.code(404).send({
+        error: { code: 'SWARM_RUN_NOT_FOUND', message: 'Swarm run not found', status: 404 },
+      });
+    }
+    return reply.code(200).send(pkg);
+  });
+
+  app.post('/v1/swarm/runs/:id/artifacts/apply-all', async (req, reply) => {
+    const orchestrator = directAgent?.swarmOrchestrator;
+    if (!orchestrator?.applyAllRunArtifacts) {
+      return reply.code(503).send({
+        error: { code: 'SWARM_UNAVAILABLE', message: 'Swarm orchestrator unavailable', status: 503 },
+      });
+    }
+    const run = orchestrator.getRun(req.params.id);
+    if (!run) {
+      return reply.code(404).send({
+        error: { code: 'SWARM_RUN_NOT_FOUND', message: 'Swarm run not found', status: 404 },
+      });
+    }
+    const body = req.body ?? {};
+    if (body.workspaceRoot && run.workspaceRoot && !sameWorkspacePath(body.workspaceRoot, run.workspaceRoot)) {
+      return reply.code(403).send({
+        ok: false,
+        status: 'forbidden',
+        runId: req.params.id,
+        appliedArtifacts: [],
+        appliedFiles: [],
+        conflicts: [],
+        errors: ['Requested workspaceRoot does not match run workspaceRoot'],
+        error: {
+          code: 'WORKSPACE_MISMATCH',
+          message: 'Requested workspaceRoot does not match run workspaceRoot',
+          status: 403,
+        },
+      });
+    }
+    if (body.approved !== true) {
+      return reply.code(403).send({
+        ok: false,
+        status: 'forbidden',
+        runId: req.params.id,
+        appliedArtifacts: [],
+        appliedFiles: [],
+        conflicts: [],
+        errors: ['Explicit approved: true is required to apply swarm run artifacts'],
+        error: {
+          code: 'APPROVAL_REQUIRED',
+          message: 'Applying all run artifacts requires explicit approved: true',
+          status: 403,
+        },
+      });
+    }
+    const result = orchestrator.applyAllRunArtifacts(req.params.id, {
+      approved: true,
+      permissionMode: body.permissionMode ? String(body.permissionMode) : null,
+      workspaceRoot: run.workspaceRoot || (body.workspaceRoot ? String(body.workspaceRoot) : null),
+      stopOnConflict: body.stopOnConflict !== false,
+    });
+    const code = result.statusCode === 403 ? 403 : result.ok ? 200 : 409;
+    return reply.code(code).send({
+      ok: result.ok,
+      status: result.status,
+      runId: result.runId,
+      appliedArtifacts: result.appliedArtifacts ?? [],
+      appliedFiles: result.appliedFiles ?? [],
+      conflicts: result.conflicts ?? [],
+      errors: result.errors ?? [],
+    });
+  });
+
   // Replaces legacy empty stub with unified Swarm + Session active plans view
   app.get('/v1/plans', async (req) => {
     const q = req.query ?? {};

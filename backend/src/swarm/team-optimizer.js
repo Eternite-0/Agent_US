@@ -57,9 +57,17 @@ function evidencePolicy() {
  * spawn children, reserve budget, or mutate durable swarm state.
  */
 export class TeamOptimizer {
-  constructor({ defaultMaxConcurrency = 4, teamSize = 2, reviewerCost = 1 } = {}) {
-    this.defaultMaxConcurrency = Math.max(1, Number(defaultMaxConcurrency) || 4);
-    this.teamSize = Math.max(2, Number(teamSize) || 2);
+  constructor({ defaultMaxConcurrency = 6, teamSize = undefined, maxTeamSize = 8, reviewerCost = 1 } = {}) {
+    this.defaultMaxConcurrency = Math.max(1, Number(defaultMaxConcurrency) || 6);
+    if (teamSize !== undefined && teamSize !== null) {
+      this.hasExplicitTeamSize = true;
+      this.teamSize = Math.max(2, Number(teamSize) || 2);
+      this.maxTeamSize = this.teamSize;
+    } else {
+      this.hasExplicitTeamSize = false;
+      this.maxTeamSize = Math.max(2, Number(maxTeamSize) || 8);
+      this.teamSize = this.maxTeamSize;
+    }
     this.reviewerCost = Math.max(0, Number(reviewerCost) || 1);
   }
 
@@ -105,14 +113,25 @@ export class TeamOptimizer {
     if (!single) {
       return {
         mode: 'single', members: [], reviewer: null, estimatedCost: 0, estimatedSteps: 0,
+        recommendedTeamSize: 0,
         rationale: 'no healthy candidate is available', evidencePolicy: evidencePolicy(),
         replacementPolicy: 'replace only after preserving evidence',
         budgetDowngraded: false, parallelBudgetAllowed: true,
       };
     }
 
-    const memberCount = Math.min(this.teamSize, limit, Math.max(1, workstreams));
-    const requiredWorkerCount = Math.min(this.teamSize, maxC, Math.max(1, workstreams));
+    const explicitTaskCap =
+      task.teamSize !== undefined && task.teamSize !== null
+        ? Math.max(1, Number(task.teamSize) || 1)
+        : null;
+    const effectiveTeamCap = this.hasExplicitTeamSize
+      ? this.teamSize
+      : explicitTaskCap !== null
+        ? Math.min(this.maxTeamSize, explicitTaskCap)
+        : Math.min(this.maxTeamSize, Math.max(2, workstreams));
+
+    const targetWorkerCount = Math.min(effectiveTeamCap, limit, Math.max(1, workstreams));
+    const requiredWorkerCount = Math.min(effectiveTeamCap, maxC, Math.max(1, workstreams));
     const explicitReviewer = reviewerAvailable && available.length > 1
       ? (available.find((candidate) =>
           candidate.role === 'reviewer' || candidate.role === 'review' || /review|verify|audit/i.test(candidate.id),
@@ -127,13 +146,50 @@ export class TeamOptimizer {
       : null;
     const reviewer = explicitReviewer ?? distinctHighRiskReviewer;
     const workerPool = reviewer ? available.filter((candidate) => candidate.id !== reviewer.id) : available;
-    const members = workerPool.slice(0, memberCount);
-    const teamCost = members.reduce((sum, member) => sum + estimateCost(member, task), 0)
+    const selectWorkers = (count) => {
+      if (workerPool.length >= 2 && count > workerPool.length) {
+        return Array.from({ length: count }, (_, idx) => workerPool[idx % workerPool.length]);
+      }
+      return workerPool.slice(0, count);
+    };
+
+    let members = selectWorkers(targetWorkerCount);
+    const calcCost = (slice) =>
+      slice.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (reviewer ? this.reviewerCost : 0);
-    const budgetAllowsTeam = teamCost <= maxBudget;
+
+    let teamCost = calcCost(members);
+    let budgetScaledFrom = null;
+    const maxStepsAvail = numeric(
+      budgetSnapshot?.remainingSteps ??
+        budget.maxSteps ??
+        Infinity,
+      Infinity,
+    );
+    if (teamWanted && !this.hasExplicitTeamSize && members.length > 2 && Number.isFinite(maxStepsAvail) && maxStepsAvail < members.length && maxStepsAvail >= 2) {
+      const stepCap = Math.max(2, Math.floor(maxStepsAvail));
+      budgetScaledFrom = members.length;
+      members = selectWorkers(stepCap);
+      teamCost = calcCost(members);
+    }
+    if (teamWanted && teamCost > maxBudget && !this.hasExplicitTeamSize && members.length > 2) {
+      for (let k = members.length - 1; k >= 2; k--) {
+        const candidateSlice = selectWorkers(k);
+        const candidateCost = calcCost(candidateSlice);
+        if (candidateCost <= maxBudget) {
+          if (budgetScaledFrom === null) budgetScaledFrom = members.length;
+          members = candidateSlice;
+          teamCost = candidateCost;
+          break;
+        }
+      }
+    }
+
+    const minTeamMembersRequired = budgetScaledFrom !== null ? 2 : requiredWorkerCount;
+    const budgetAllowsTeam = teamCost <= maxBudget && maxStepsAvail >= 2;
     const mode =
       teamWanted &&
-      members.length >= requiredWorkerCount &&
+      members.length >= minTeamMembersRequired &&
       budgetAllowsTeam &&
       maxC > 1
         ? 'team'
@@ -145,16 +201,29 @@ export class TeamOptimizer {
     const selected = mode === 'team' ? members : [single];
     const estimatedCost = selected.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (mode === 'team' && reviewer && !selected.some((member) => member.id === reviewer.id) ? this.reviewerCost : 0);
+    const roleHints = Array.isArray(task.workstreamRoles)
+      ? task.workstreamRoles
+      : Array.isArray(task.roles)
+        ? task.roles
+        : [];
 
     return {
       mode,
-      members: selected.map((member) => ({
-        id: member.id,
-        role: member.role ?? (member === single ? 'primary' : 'worker'),
-        capabilityScore: Number(member.capabilityScore.toFixed(4)),
-        historyScore: Number(member.historyScore.toFixed(4)),
-        estimatedCost: estimateCost(member, task),
-      })),
+      recommendedTeamSize: selected.length,
+      ...(budgetScaledFrom !== null ? { budgetScaledFrom } : {}),
+      members: selected.map((member, idx) => {
+        const hint = roleHints[idx] && typeof roleHints[idx] === 'object' ? roleHints[idx] : null;
+        return {
+          id: member.id,
+          role: hint?.role ?? member.role ?? (member === single ? 'primary' : 'worker'),
+          ...(hint?.roleTitle ? { roleTitle: String(hint.roleTitle) } : {}),
+          ...(hint?.focus ? { focus: String(hint.focus) } : {}),
+          ...(Array.isArray(hint?.ownedPaths) ? { ownedPaths: hint.ownedPaths.map(String) } : {}),
+          capabilityScore: Number(member.capabilityScore.toFixed(4)),
+          historyScore: Number(member.historyScore.toFixed(4)),
+          estimatedCost: estimateCost(member, task),
+        };
+      }),
       reviewer: mode === 'team' && reviewer
         ? {
             id: reviewer.id,
@@ -170,7 +239,9 @@ export class TeamOptimizer {
       estimatedCost,
       estimatedSteps: selected.reduce((sum, member) => sum + numeric(member.estimatedSteps ?? task.estimatedSteps ?? 1, 1), 0),
       rationale: mode === 'team'
-        ? `team selected for ${workstreams} independent workstreams/risk; budget and concurrency allow it`
+        ? budgetScaledFrom !== null
+          ? `team scaled dynamically from ${budgetScaledFrom} to ${selected.length} workers to fit remaining budget`
+          : `team of ${selected.length} selected for ${workstreams} independent workstreams/risk; budget and concurrency allow it`
         : teamWanted && !budgetAllowsTeam
           ? 'team request downgraded because the available budget is insufficient'
           : 'single agent is sufficient for this task shape',

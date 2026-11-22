@@ -5,6 +5,95 @@ import { allocatePlanBudgets } from '../planning/budget-estimator.js';
 import { BUDGET_SCOPES, estimateRequestInputTokens } from './budget-ledger.js';
 import { SWARM_NODE_STATES, isTerminalNodeState, transitionSwarmNode } from './node-state-machine.js';
 
+let repoIntelligenceLoader = null;
+async function loadRepoIntelligence() {
+  if (!repoIntelligenceLoader) {
+    repoIntelligenceLoader = import('../repo-intelligence.js').catch(() => null);
+  }
+  const mod = await repoIntelligenceLoader;
+  if (!mod) {
+    // Allow subsequent calls to retry if repo-intelligence.js lands later
+    repoIntelligenceLoader = null;
+  }
+  return mod;
+}
+
+export async function analyzeWorkspaceRepository(
+  workspaceRoot,
+  { issueText = '', maxBytes = 12000, maxFiles = 120 } = {},
+) {
+  if (!workspaceRoot) return null;
+  try {
+    const mod = await loadRepoIntelligence();
+    if (typeof mod?.analyzeRepository !== 'function') return null;
+    return await mod.analyzeRepository(workspaceRoot, { issueText, maxBytes, maxFiles });
+  } catch {
+    return null;
+  }
+}
+
+export function toCompactRepoContext(analysis) {
+  if (!analysis || typeof analysis !== 'object') return null;
+  const relevantFiles = Array.isArray(analysis.callGraph?.relevantFiles)
+    ? analysis.callGraph.relevantFiles
+        .map((f) => (typeof f === 'string' ? f : f?.path))
+        .filter(Boolean)
+        .slice(0, 32)
+    : Array.isArray(analysis.relevantFiles)
+      ? analysis.relevantFiles.map(String).slice(0, 32)
+      : [];
+  return {
+    branch: analysis.git?.branch ?? analysis.branch ?? null,
+    headSha: analysis.git?.headSha ?? analysis.headSha ?? null,
+    testCommands: Array.isArray(analysis.project?.testCommands)
+      ? analysis.project.testCommands.map(String).slice(0, 10)
+      : Array.isArray(analysis.testCommands)
+        ? analysis.testCommands.map(String).slice(0, 10)
+        : [],
+    buildCommands: Array.isArray(analysis.project?.buildCommands)
+      ? analysis.project.buildCommands.map(String).slice(0, 10)
+      : Array.isArray(analysis.buildCommands)
+        ? analysis.buildCommands.map(String).slice(0, 10)
+        : [],
+    entryPoints: Array.isArray(analysis.structure?.entryPoints)
+      ? analysis.structure.entryPoints.map(String).slice(0, 16)
+      : Array.isArray(analysis.entryPoints)
+        ? analysis.entryPoints.map(String).slice(0, 16)
+        : [],
+    relevantFiles,
+    summaryText: String(analysis.summaryText ?? '').slice(0, 8000),
+  };
+}
+
+export function formatRepoContextForPlanner(analysis, extraSummary = '') {
+  const parts = [];
+  if (extraSummary && String(extraSummary).trim()) {
+    parts.push(String(extraSummary).trim());
+  }
+  if (analysis && typeof analysis === 'object') {
+    if (analysis.summaryText && String(analysis.summaryText).trim()) {
+      parts.push(String(analysis.summaryText).trim());
+    }
+    const compact = toCompactRepoContext(analysis);
+    const metaLines = [];
+    if (compact.branch) metaLines.push(`gitBranch: ${compact.branch}${compact.headSha ? ` (${compact.headSha.slice(0, 10)})` : ''}`);
+    if (compact.testCommands.length) metaLines.push(`discoveredTestCommands: ${JSON.stringify(compact.testCommands)}`);
+    if (compact.buildCommands.length) metaLines.push(`discoveredBuildCommands: ${JSON.stringify(compact.buildCommands)}`);
+    if (compact.entryPoints.length) metaLines.push(`entryPoints: ${JSON.stringify(compact.entryPoints)}`);
+    if (compact.relevantFiles.length) metaLines.push(`relevantFiles: ${JSON.stringify(compact.relevantFiles)}`);
+    const edges = Array.isArray(analysis.callGraph?.edges) ? analysis.callGraph.edges.slice(0, 20) : [];
+    if (edges.length) {
+      metaLines.push(
+        `callGraphEdges: ${edges.map((e) => `${e.from || e.source} -> ${e.to || e.target}`).join(', ')}`,
+      );
+    }
+    if (metaLines.length) {
+      parts.push(`[Repository Intelligence]\n${metaLines.join('\n')}`);
+    }
+  }
+  return parts.join('\n\n').slice(0, 14000);
+}
+
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
   try {
@@ -177,6 +266,11 @@ export class DynamicTaskPlanner {
         isolatedWorktree: Boolean(n.isolatedWorktree),
         isolationMode: n.isolationMode ? String(n.isolationMode) : null,
         allowIsolationFallback: Boolean(n.allowIsolationFallback),
+        roleTitle: n.roleTitle ? String(n.roleTitle).trim().slice(0, 120) : null,
+        focus: n.focus ? String(n.focus).trim().slice(0, 240) : null,
+        ownedPaths: Array.isArray(n.ownedPaths)
+          ? [...new Set(n.ownedPaths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 32)
+          : [],
         priority: Number(n.priority ?? 0),
         budget: n.budget && typeof n.budget === 'object' ? { ...n.budget } : {},
       };
@@ -220,7 +314,9 @@ export class DynamicTaskPlanner {
   async decompose({
     goal,
     workspaceSummary = '',
-    maxNodes = 6,
+    workspaceRoot = null,
+    repoContext = null,
+    maxNodes = 8,
     model = null,
     signal = undefined,
     budget = {},
@@ -236,6 +332,26 @@ export class DynamicTaskPlanner {
         detail: { treeId, scope: BUDGET_SCOPES.PLANNING },
       });
     }
+    const effectiveAnalysis =
+      repoContext && typeof repoContext === 'object'
+        ? repoContext
+        : workspaceRoot
+          ? await analyzeWorkspaceRepository(workspaceRoot, { issueText: goal, maxBytes: 12000 })
+          : null;
+    const effectiveSummary = formatRepoContextForPlanner(effectiveAnalysis, workspaceSummary);
+    const compactRepoContext = toCompactRepoContext(effectiveAnalysis);
+
+    const attachRepoContext = (nodes) => {
+      if (compactRepoContext) {
+        Object.defineProperty(nodes, 'repoContext', {
+          value: compactRepoContext,
+          enumerable: false,
+          configurable: true,
+        });
+      }
+      return nodes;
+    };
+
     const picked = model || this.router?.select({ taskType: 'planning', objective: goal })?.model;
     if (this.adapter && picked) {
       const messages = [
@@ -246,8 +362,10 @@ export class DynamicTaskPlanner {
               type: 'text',
               text:
                 'Decompose the engineering goal into an acyclic JSON DAG: ' +
-                '{"nodes":[{"nodeKey":"branch-a","taskType":"implementation","objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":true,"priority":20}]}. ' +
-                'For independent parallel branches that modify files, set dependencies to [] (or their shared prerequisite) and isolatedWorktree:true so they run concurrently. Include a read-only "review" node when review is requested. ' +
+                '{"nodes":[{"nodeKey":"branch-a","taskType":"implementation","roleTitle":"API Specialist","focus":"...","ownedPaths":["src/api.js"],"objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":true,"priority":20}]}. ' +
+                'Ground every node in the repository intelligence (entryPoints, relevantFiles, callGraph, discoveredTestCommands, discoveredBuildCommands). ' +
+                'When independent modules/files can be built or fixed concurrently, emit multiple parallel "implementation" nodes with disjoint ownedPaths, specialized roleTitle/focus, shared or empty dependencies, and isolatedWorktree:true (no fixed team size limit; scale appropriately within maxNodes). ' +
+                'For mutating goals, include a downstream "verification" node (isolatedWorktree:true so upstream branch artifacts are overlaid) that executes discovered test/build commands via bash, and include a read-only "review" node (taskType:"review", permissionMode:"readonly", isolatedWorktree:false) when changes are mutating or review is requested. ' +
                 `Use alphanumeric nodeKey matching ^[A-Za-z0-9][A-Za-z0-9._-]*$. Keep <= ${maxNodes} nodes. Return JSON only.`,
             },
           ],
@@ -257,7 +375,7 @@ export class DynamicTaskPlanner {
           content: [
             {
               type: 'text',
-              text: workspaceSummary ? `${goal}\n\nContext:\n${workspaceSummary}` : goal,
+              text: effectiveSummary ? `${goal}\n\nContext:\n${effectiveSummary}` : goal,
             },
           ],
         },
@@ -304,7 +422,7 @@ export class DynamicTaskPlanner {
         if (Array.isArray(rawList) && rawList.length > 0 && rawList.every((x) => x?.objective)) {
           const normalized = this.normalizeNodes(rawList.slice(0, maxNodes));
           this.validateDag(normalized);
-          return this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked });
+          return attachRepoContext(this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked }));
         }
       } catch (err) {
         if (reservation?.reservationId) {
@@ -331,12 +449,19 @@ export class DynamicTaskPlanner {
     const isMutating = /implement|edit|write|fix|refactor|create|实现|重构|修改|新增|修复/i.test(
       goal,
     );
+    const testHint = compactRepoContext?.testCommands?.length
+      ? `（优先运行已发现命令：${compactRepoContext.testCommands.join(' ; ')}）`
+      : '';
+    const fileHint = compactRepoContext?.relevantFiles?.length
+      ? `（重点文件：${compactRepoContext.relevantFiles.slice(0, 6).join(', ')}）`
+      : '';
     const fallback = isMutating
       ? [
           {
             nodeKey: 'analyze',
             taskType: 'research',
-            objective: `调研工作区上下文并定位关键代码边界：${goal}`,
+            roleTitle: 'Repository Architecture Researcher',
+            objective: `调研工作区上下文并定位关键代码边界${fileHint}：${goal}`,
             acceptance: '给出精确文件路径、依赖约束与改动切入点',
             dependencies: [],
             priority: 20,
@@ -344,7 +469,8 @@ export class DynamicTaskPlanner {
           {
             nodeKey: 'implement',
             taskType: 'implementation',
-            objective: `按调研结论完成模块实现与边界检查：${goal}`,
+            roleTitle: 'Core Implementation Specialist',
+            objective: `按调研结论完成模块实现与边界检查${fileHint}：${goal}`,
             acceptance: '完成代码编写并保持最小职责边界',
             dependencies: ['analyze'],
             isolatedWorktree: true,
@@ -354,9 +480,12 @@ export class DynamicTaskPlanner {
           {
             nodeKey: 'verify',
             taskType: 'verification',
-            objective: `执行真实检查并汇总交付证据：${goal}`,
+            roleTitle: 'Integration & Test Verifier',
+            objective: `执行真实检查并汇总交付证据${testHint}：${goal}`,
             acceptance: '验证通过并报告完整证据',
             dependencies: ['implement'],
+            isolatedWorktree: true,
+            allowIsolationFallback: true,
             priority: 5,
           },
         ]
@@ -364,7 +493,8 @@ export class DynamicTaskPlanner {
           {
             nodeKey: 'investigate',
             taskType: 'research',
-            objective: `只读检索并收集关键事实：${goal}`,
+            roleTitle: 'Repository Architecture Researcher',
+            objective: `只读检索并收集关键事实${fileHint}：${goal}`,
             acceptance: '提供事实与源码位置摘要',
             dependencies: [],
             priority: 10,
@@ -372,6 +502,7 @@ export class DynamicTaskPlanner {
           {
             nodeKey: 'synthesize',
             taskType: 'review',
+            roleTitle: 'Independent Code Reviewer',
             objective: `复核并归纳最终结论：${goal}`,
             acceptance: '生成准确清晰的总结结论',
             dependencies: ['investigate'],
@@ -380,7 +511,7 @@ export class DynamicTaskPlanner {
         ];
     const normalized = this.normalizeNodes(fallback);
     this.validateDag(normalized);
-    return this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked });
+    return attachRepoContext(this.#applyAdaptiveBudgets(normalized, { budget, store, model: picked }));
   }
 
   addNode(store, runId, nodeSpec, { leaseGuard = null } = {}) {

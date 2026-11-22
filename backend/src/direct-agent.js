@@ -55,7 +55,11 @@ import {
   ModelCapabilityRegistry,
 } from './swarm/capabilities.js';
 import { AdaptiveModelRouter } from './swarm/router.js';
-import { DynamicTaskPlanner } from './swarm/planner.js';
+import {
+  DynamicTaskPlanner,
+  analyzeWorkspaceRepository,
+  toCompactRepoContext,
+} from './swarm/planner.js';
 import { InterAgentMailbox } from './swarm/mailbox.js';
 import { ChildAgentManager } from './swarm/child-lifecycle.js';
 import { DynamicReplanner } from './swarm/replan.js';
@@ -431,10 +435,10 @@ export class DirectAgentRuntime {
     sessionId = null,
     workspaceRoot = null,
     permissionMode = null,
-    maxConcurrency = 3,
+    maxConcurrency = null,
     budget = {},
     maxReplans = 2,
-    maxNodes = 6,
+    maxNodes = 8,
     workspaceSummary = '',
     wait = false,
     trafficSource = 'production',
@@ -476,9 +480,15 @@ export class DirectAgentRuntime {
       return out;
     };
 
+    const analyzedRepo = effectiveWorkspace
+      ? await analyzeWorkspaceRepository(effectiveWorkspace, { issueText: cleanGoal })
+      : null;
+
     const planPerm = toPlannerPerm(effectivePerm);
     const decomposed = await this.swarmPlanner.decompose({
       goal: cleanGoal,
+      workspaceRoot: effectiveWorkspace,
+      repoContext: analyzedRepo ?? undefined,
       workspaceSummary,
       maxNodes,
       model: session.model || null,
@@ -486,6 +496,15 @@ export class DirectAgentRuntime {
       store: this.store,
       signal,
     });
+    const compactRepoContext = toCompactRepoContext(decomposed?.repoContext ?? analyzedRepo);
+    const parallelRootCount = decomposed.filter(
+      (n) => !Array.isArray(n.dependencies) || n.dependencies.length === 0,
+    ).length;
+    const resolvedMaxConcurrency =
+      maxConcurrency !== null && maxConcurrency !== undefined
+        ? Math.min(8, Math.max(1, Number(maxConcurrency)))
+        : Math.min(8, Math.max(3, parallelRootCount, decomposed.length > 2 ? decomposed.length - 1 : 3));
+
     const draftPlan = {
       planVersion: 1,
       goal: cleanGoal,
@@ -507,12 +526,16 @@ export class DirectAgentRuntime {
           isolatedWorktree: Boolean(node.isolatedWorktree),
           ...(node.isolationMode ? { isolationMode: node.isolationMode } : {}),
           allowIsolationFallback: Boolean(node.allowIsolationFallback),
+          ...(node.roleTitle ? { roleTitle: node.roleTitle } : {}),
+          ...(node.focus ? { focus: node.focus } : {}),
+          ...(Array.isArray(node.ownedPaths) && node.ownedPaths.length > 0 ? { ownedPaths: node.ownedPaths } : {}),
           ...(node.budget?.finalVerificationReserve != null
             ? { finalVerificationReserve: Number(node.budget.finalVerificationReserve) }
             : {}),
           ...(node.budgetEstimate ? { budgetBreakdown: node.budgetEstimate } : {}),
         },
       })),
+      ...(compactRepoContext ? { metadata: { repoContext: compactRepoContext } } : {}),
     };
     const validatedPlan = this.intelligence?.planner
       ? validatePlan(this.intelligence.planner.validate(draftPlan), { permissionCeiling: planPerm })
@@ -523,7 +546,7 @@ export class DirectAgentRuntime {
       sessionId: session.id,
       workspaceRoot: effectiveWorkspace,
       parentPermissionMode: effectivePerm,
-      maxConcurrency,
+      maxConcurrency: resolvedMaxConcurrency,
       budget: budget ?? validatedPlan.budget,
       maxReplans,
       trafficSource,

@@ -420,6 +420,7 @@ export class ChildAgentManager {
     evidenceContract = null,
     workerId = null,
     predecessorArtifacts = [],
+    dependenciesByNodeKey = null,
     rehydrateFromArtifactId = null,
     ackMailboxIds = [],
     claimedCommunicationMessage = null,
@@ -515,6 +516,8 @@ export class ChildAgentManager {
         let effectivePolicy = { ...policy };
         let isIsolated = false;
         let materializedHandoffs = [];
+        let overlaidState = null;
+        let overlayFailedDiscard = false;
         let archivedArtifact = null;
         let leaseLost = false;
         let explicitCancel = false;
@@ -546,10 +549,6 @@ export class ChildAgentManager {
                 rehydrateExisting: Boolean(runId && nodeKey),
                 leaseGuard: baseLeaseGuard,
               });
-              // P0-4: If recovery found a verified archived artifact for a cleaned worktree, rehydrate it!
-              if (wt && !wt.rehydrated && rehydrateFromArtifactId && this.artifactManager?.rehydrateArtifactToWorktree) {
-                this.artifactManager.rehydrateArtifactToWorktree(rehydrateFromArtifactId, wt.path);
-              }
               effectiveRoot = wt.path;
               isIsolated = true;
             } catch (wtErr) {
@@ -610,6 +609,43 @@ export class ChildAgentManager {
         }
 
         try {
+          // Overlay verified predecessor artifacts onto isolated worktree BEFORE child execution
+          if (
+            isIsolated &&
+            wt &&
+            !wt.rehydrated &&
+            predecessorArtifacts.length &&
+            typeof this.artifactManager?.applyArtifactsToWorktree === 'function'
+          ) {
+            const overlayRes = this.artifactManager.applyArtifactsToWorktree(
+              predecessorArtifacts,
+              wt.path,
+              {
+                dependenciesByNodeKey,
+                saveOverlayState: true,
+              },
+            );
+            if (!overlayRes?.ok || (overlayRes.conflicts?.length ?? 0) > 0) {
+              overlayFailedDiscard = true;
+              throw new Fault('WORKTREE_ARTIFACT_CONFLICT', 409, {
+                message: `Predecessor artifact collision while preparing worktree for node ${nodeKey || subId}: ${(overlayRes?.conflicts || []).map((c) => `${c.path} (${c.reason})`).join('; ')}`,
+                conflicts: overlayRes?.conflicts || [],
+              });
+            }
+            overlaidState = overlayRes.overlayState || overlayRes;
+          }
+
+          // P0-4: If recovery found a verified archived artifact for a cleaned worktree, rehydrate it after base overlays!
+          if (
+            isIsolated &&
+            wt &&
+            !wt.rehydrated &&
+            rehydrateFromArtifactId &&
+            this.artifactManager?.rehydrateArtifactToWorktree
+          ) {
+            this.artifactManager.rehydrateArtifactToWorktree(rehydrateFromArtifactId, wt.path);
+          }
+
           // Fix C6: Materialize predecessor artifacts into isolated handoff dir & build structured context
           let artifactContext = '';
           if (predecessorArtifacts.length && this.artifactManager) {
@@ -637,9 +673,18 @@ export class ChildAgentManager {
               });
             }
           }
-          const effectiveObjective = artifactContext
-            ? `${artifactContext}\n\n${objective}`
-            : objective;
+          const roleHints = [];
+          if (profile?.roleTitle) roleHints.push(`Role: ${profile.roleTitle}`);
+          if (profile?.focus) roleHints.push(`Focus: ${profile.focus}`);
+          if (Array.isArray(profile?.ownedPaths) && profile.ownedPaths.length > 0) {
+            roleHints.push(`Owned Paths: ${profile.ownedPaths.join(', ')}`);
+          }
+          const roleContext = roleHints.length
+            ? `[Specialized Role]\n${roleHints.join('\n')}`
+            : '';
+          const effectiveObjective = [artifactContext, roleContext, objective]
+            .filter(Boolean)
+            .join('\n\n');
 
           const now = Date.now();
           this.store.tx(() => {
@@ -971,6 +1016,7 @@ export class ChildAgentManager {
               worktreeLeaseId: wt.leaseId,
               baseCommit: wt.baseCommit,
               baseRef: wt.baseRef,
+              overlaidState,
               leaseGuard: turnLeaseGuard,
             });
           }
@@ -1221,8 +1267,8 @@ export class ChildAgentManager {
               try {
                 await wt.release({
                   archivedArtifactId: archivedArtifact?.id ?? null,
-                  forceDiscard: explicitCancel,
-                  preserveDirty: true,
+                  forceDiscard: explicitCancel || overlayFailedDiscard,
+                  preserveDirty: !overlayFailedDiscard,
                   leaseGuard: explicitCancel || shuttingDownTurn ? null : baseLeaseGuard,
                 });
               } catch {
@@ -1260,6 +1306,7 @@ export class ChildAgentManager {
     evidenceContract = null,
     workerId = null,
     predecessorArtifacts = [],
+    dependenciesByNodeKey = null,
     rehydrateFromArtifactId = null,
     ackMailboxIds = [],
     claimedCommunicationMessage = null,
@@ -1348,6 +1395,7 @@ export class ChildAgentManager {
       evidenceContract,
       workerId,
       predecessorArtifacts,
+      dependenciesByNodeKey,
       rehydrateFromArtifactId,
       ackMailboxIds,
       claimedCommunicationMessage,

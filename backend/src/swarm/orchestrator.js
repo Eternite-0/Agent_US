@@ -42,11 +42,13 @@ import {
 } from './recovery-helpers.js';
 import { validatePlan } from '../planning/validator.js';
 import { intersectPolicies } from '../tools/policy.js';
+import { analyzeWorkspaceRepository, toCompactRepoContext } from './planner.js';
 import { TeamOptimizer } from './team-optimizer.js';
 import {
   MAX_REVIEWER_FORMAT_RETRIES,
   buildReviewerFormatRepairPrompt,
   buildReviewerPromptConstraints,
+  parseReviewerOutput,
   validateReviewerExecution,
 } from './reviewer.js';
 
@@ -206,6 +208,7 @@ export class AdaptiveSwarmOrchestrator {
     isSynthetic = 0,
     planVersion = 1,
     plan = null,
+    repoContext = null,
   }) {
     const runId = uuid();
     const now = Date.now();
@@ -213,10 +216,14 @@ export class AdaptiveSwarmOrchestrator {
       ? Number(planVersion)
       : 1;
     const persistedPlan = plan ? structuredClone(plan) : null;
+    const resolvedRepoContext = repoContext
+      ? toCompactRepoContext(repoContext)
+      : toCompactRepoContext(persistedPlan?.metadata?.repoContext ?? null);
     const strategy = {
-      maxConcurrency: Math.min(6, Math.max(1, Number(maxConcurrency || 3))),
+      maxConcurrency: Math.min(8, Math.max(1, Number(maxConcurrency || 3))),
       maxReplans: Math.max(0, Number(maxReplans ?? 2)),
       ...(persistedPlan ? { plan: persistedPlan } : {}),
+      ...(resolvedRepoContext ? { repoContext: resolvedRepoContext } : {}),
     };
     const usageTotals = { inputTokens: 0, outputTokens: 0, steps: 0, completedNodes: 0 };
     const hasExplicitNodes = Array.isArray(nodes) && nodes.length > 0;
@@ -339,7 +346,19 @@ export class AdaptiveSwarmOrchestrator {
       budget: {
         ...task.budget,
         ...(task.metadata?.finalVerificationReserve != null ? { finalVerificationReserve: task.metadata.finalVerificationReserve } : {}),
+        ...(task.metadata?.roleTitle || task.metadata?.focus || Array.isArray(task.metadata?.ownedPaths)
+          ? {
+              roleMetadata: {
+                ...(task.metadata?.roleTitle ? { roleTitle: String(task.metadata.roleTitle) } : {}),
+                ...(task.metadata?.focus ? { focus: String(task.metadata.focus) } : {}),
+                ...(Array.isArray(task.metadata?.ownedPaths) ? { ownedPaths: task.metadata.ownedPaths } : {}),
+              },
+            }
+          : {}),
       },
+      ...(task.metadata?.roleTitle ? { roleTitle: String(task.metadata.roleTitle) } : {}),
+      ...(task.metadata?.focus ? { focus: String(task.metadata.focus) } : {}),
+      ...(Array.isArray(task.metadata?.ownedPaths) ? { ownedPaths: task.metadata.ownedPaths } : {}),
       isolatedWorktree: Boolean(task.metadata?.isolatedWorktree),
       isolationMode:
         task.metadata?.isolationMode ??
@@ -347,6 +366,9 @@ export class AdaptiveSwarmOrchestrator {
       allowIsolationFallback: Boolean(task.metadata?.allowIsolationFallback),
       priority: Number.isFinite(Number(task.metadata?.priority)) ? Number(task.metadata.priority) : 0,
     }));
+    const planRepoContext = toCompactRepoContext(
+      validated.metadata?.repoContext ?? plan?.metadata?.repoContext ?? null,
+    );
     return this.submitRun({
       sessionId,
       rootTurnId,
@@ -361,6 +383,7 @@ export class AdaptiveSwarmOrchestrator {
       isSynthetic,
       planVersion: validated.planVersion,
       plan: validated,
+      repoContext: planRepoContext,
     });
   }
 
@@ -667,6 +690,7 @@ export class AdaptiveSwarmOrchestrator {
 
       let routedSpecs = null;
       let validatedPlan = null;
+      let compactRepoContext = run.strategy?.repoContext ?? null;
       if (run.nodes.length === 0) {
         this.budgetLedger?.ensureLedger({
           treeId: runId,
@@ -676,10 +700,21 @@ export class AdaptiveSwarmOrchestrator {
           trafficSource: run.trafficSource || 'production',
           isSynthetic: run.isSynthetic ? 1 : 0,
         });
+        const analyzedRepo =
+          !compactRepoContext && run.workspaceRoot
+            ? await analyzeWorkspaceRepository(run.workspaceRoot, {
+                issueText: goal || run.goal,
+              })
+            : null;
+        if (!compactRepoContext && analyzedRepo) {
+          compactRepoContext = toCompactRepoContext(analyzedRepo);
+        }
         let planned;
         try {
           planned = await this.planner.decompose({
             goal: goal || run.goal,
+            workspaceRoot: run.workspaceRoot,
+            repoContext: analyzedRepo ?? compactRepoContext ?? undefined,
             signal,
             budget: run.budget,
             store: this.store,
@@ -719,6 +754,9 @@ export class AdaptiveSwarmOrchestrator {
           throw err;
         }
         assertLeaseInTx(leaseGuard, { runId });
+        if (!compactRepoContext && planned?.repoContext) {
+          compactRepoContext = toCompactRepoContext(planned.repoContext);
+        }
         this.planner.validateDag(planned);
         const planPermission = normalizePlannerPermission(run.permissionMode || 'auto-safe');
         validatedPlan = validatePlan(
@@ -743,10 +781,14 @@ export class AdaptiveSwarmOrchestrator {
                 isolatedWorktree: Boolean(n.isolatedWorktree),
                 ...(n.isolationMode ? { isolationMode: n.isolationMode } : {}),
                 allowIsolationFallback: Boolean(n.allowIsolationFallback),
+                ...(n.roleTitle ? { roleTitle: n.roleTitle } : {}),
+                ...(n.focus ? { focus: n.focus } : {}),
+                ...(Array.isArray(n.ownedPaths) && n.ownedPaths.length > 0 ? { ownedPaths: n.ownedPaths } : {}),
                 ...(n.budget?.finalVerificationReserve != null ? { finalVerificationReserve: n.budget.finalVerificationReserve } : {}),
                 ...(n.budgetEstimate ? { budgetBreakdown: n.budgetEstimate } : {}),
               },
             })),
+            ...(compactRepoContext ? { metadata: { repoContext: compactRepoContext } } : {}),
           },
           { permissionCeiling: planPermission },
         );
@@ -759,8 +801,12 @@ export class AdaptiveSwarmOrchestrator {
         if (!fresh || isTerminalRunState(fresh.status)) {
           return { shouldResolve: false, effectivePlanVersion: fresh?.planVersion || 1 };
         }
-        if (validatedPlan && !fresh.plan) {
-          const nextStrategy = { ...(fresh.strategy ?? {}), plan: validatedPlan };
+        if ((validatedPlan && !fresh.plan) || (compactRepoContext && !fresh.strategy?.repoContext)) {
+          const nextStrategy = {
+            ...(fresh.strategy ?? {}),
+            ...(validatedPlan && !fresh.plan ? { plan: validatedPlan } : {}),
+            ...(compactRepoContext ? { repoContext: compactRepoContext } : {}),
+          };
           this.store.db
             .prepare('UPDATE swarm_runs SET strategyJson=?, updatedAt=? WHERE id=?')
             .run(JSON.stringify(nextStrategy), Date.now(), runId);
@@ -963,12 +1009,19 @@ export class AdaptiveSwarmOrchestrator {
             }
             return acc;
           }, {});
+          const workstreamRoles = picked.map((node) => {
+            const parsed = parseJsonSafe(node.budgetJson, {});
+            return parsed.roleMetadata
+              ? { nodeKey: node.nodeKey, taskType: node.taskType, ...parsed.roleMetadata }
+              : { nodeKey: node.nodeKey, taskType: node.taskType };
+          });
           const team = this.teamOptimizer.optimize({
             task: {
               taskType: picked.length > 1 ? 'implementation' : picked[0].taskType,
               complexity: picked.length > 1 ? 'complex' : 'simple',
               independentWorkstreams: picked.length,
               requiredCapabilities: taskRequirements,
+              workstreamRoles,
               requiresIndependentVerification: picked.some((n) => n.taskType === 'verification'),
               artifactRisk: picked.some((n) => n.isolationMode === 'worktree') ? 'high' : undefined,
             },
@@ -1357,10 +1410,30 @@ export class AdaptiveSwarmOrchestrator {
           })
           .filter(Boolean);
 
-        // Fix C6: Collect real verified predecessor artifacts directly from durable registry (excluding superseded)
+        // Collect all transitive non-superseded upstream artifacts in topological order for worktree overlay
+        const dependenciesByNodeKey = Object.fromEntries(
+          run.nodes.map((n) => [n.nodeKey, Array.isArray(n.dependencies) ? n.dependencies : []]),
+        );
+        const visitedAncestors = new Set();
+        const orderedAncestors = [];
+        const visitAncestor = (depKey) => {
+          if (!depKey || visitedAncestors.has(depKey) || replacedKeysAtStart.has(depKey)) return;
+          visitedAncestors.add(depKey);
+          const dn = byKey.get(depKey);
+          if (dn && Array.isArray(dn.dependencies)) {
+            for (const parentKey of dn.dependencies) {
+              visitAncestor(parentKey);
+            }
+          }
+          orderedAncestors.push(depKey);
+        };
+        for (const depKey of node.dependencies) {
+          visitAncestor(depKey);
+        }
+
         const predecessorArtifacts = [];
-        if (this.artifactManager && node.dependencies.length) {
-          for (const depKey of node.dependencies) {
+        if (this.artifactManager && orderedAncestors.length > 0) {
+          for (const depKey of orderedAncestors) {
             const dn = byKey.get(depKey);
             let art = dn?.latestArtifactId
               ? this.artifactManager.getArtifact(dn.latestArtifactId)
@@ -1487,6 +1560,16 @@ export class AdaptiveSwarmOrchestrator {
           ].join('\n\n');
         }
 
+        const parsedNodeMetaBudget = parseJsonSafe(node.budgetJson, {});
+        const roleMetadata = parsedNodeMetaBudget?.roleMetadata ?? null;
+        const repoCmds = run.strategy?.repoContext?.testCommands ?? [];
+        if (
+          repoCmds.length > 0 &&
+          (node.taskType === 'verification' || node.taskType === 'implementation')
+        ) {
+          fullObjective = `${fullObjective}\n\n[Repository Verification Commands]\n${repoCmds.join(' ; ')}`;
+        }
+
         const cp = effectiveChildTurnId ? this.checkpointStore?.loadLatest?.(effectiveChildTurnId) : null;
         const treeSnap = this.budgetLedger?.ensureLedger({
           treeId: runId,
@@ -1510,7 +1593,7 @@ export class AdaptiveSwarmOrchestrator {
           parentSessionId: run.sessionId,
           parentTurnId: run.rootTurnId,
           objective: fullObjective,
-          profile: { id: node.agentProfileId },
+          profile: { id: node.agentProfileId, ...(roleMetadata ?? {}) },
           model: node.model,
           provider: node.provider || 'pool',
           permissionMode: node.permissionMode || run.permissionMode || 'auto-safe',
@@ -1529,6 +1612,7 @@ export class AdaptiveSwarmOrchestrator {
           evidenceContract: node.evidenceContract ?? null,
           workerId,
           predecessorArtifacts,
+          dependenciesByNodeKey,
           rehydrateFromArtifactId,
           ackMailboxIds,
           claimedCommunicationMessage: claimedMessage,
@@ -1585,6 +1669,36 @@ export class AdaptiveSwarmOrchestrator {
 
         let finalChildResult = childRes;
         const parsedNodeBudget = parseJsonSafe(node.budgetJson, {});
+
+        // Inspect real shell/test command outcome for verification nodes before committing completion
+        let latestVerifySummary = null;
+        if (node.taskType === 'verification') {
+          latestVerifySummary = this.#inspectVerificationShellOutcome(
+            childRes.childSessionId,
+            childRes.childTurnId,
+            childRes.text,
+            childRes.verifiedPass,
+          );
+          if (latestVerifySummary && latestVerifySummary.status === 'failed') {
+            throw new RuntimeError('VERIFICATION_FAILED', {
+              message: `Verification node ${node.nodeKey} failed${latestVerifySummary.command ? ` (${latestVerifySummary.command})` : ''} with exitCode=${latestVerifySummary.exitCode}`,
+              usage: childRes.usage,
+              steps: childRes.steps,
+              detail: {
+                verificationResult: latestVerifySummary,
+                failureDiagnostics: [
+                  latestVerifySummary.command ? `Command: ${latestVerifySummary.command}` : null,
+                  `Exit code: ${latestVerifySummary.exitCode}`,
+                  latestVerifySummary.summary ? `Output:\n${latestVerifySummary.summary}` : null,
+                ]
+                  .filter(Boolean)
+                  .join('\n'),
+                verdict: { accepted: false, verdict: 'fail' },
+              },
+            });
+          }
+        }
+
         const strictReviewerRequired = Boolean(
           node.taskType === 'review' &&
           reviewerEvidence &&
@@ -1706,6 +1820,23 @@ export class AdaptiveSwarmOrchestrator {
           };
         }
 
+        let nonStrictReviewerVerdict = null;
+        if (node.taskType === 'review' && !strictReviewerRequired) {
+          const parsedReview = parseReviewerOutput(finalChildResult.text);
+          if (parsedReview?.valid && parsedReview.verdict) {
+            nonStrictReviewerVerdict = {
+              schemaVersion: parsedReview.verdict.schemaVersion ?? 1,
+              status: parsedReview.verdict.verdict,
+              summary: parsedReview.verdict.summary ?? '',
+              checkedArtifacts: parsedReview.verdict.checkedArtifacts ?? [],
+              evidenceRefs: parsedReview.verdict.evidenceRefs ?? [],
+              findings: parsedReview.verdict.findings ?? [],
+              reviewerModel: node.model,
+              validatedAt: Date.now(),
+            };
+          }
+        }
+
         const uris = [
           ...new Set([
             ...(finalChildResult.artifact?.uri ? [finalChildResult.artifact.uri] : []),
@@ -1783,24 +1914,32 @@ export class AdaptiveSwarmOrchestrator {
             parsedCurBudget && typeof parsedCurBudget === 'object' && !Array.isArray(parsedCurBudget)
               ? parsedCurBudget
               : {};
-          const mergedBudgetJson = reviewerValidation?.valid
-            ? JSON.stringify({
-                ...baseBudgetObj,
-                reviewerVerdict: {
-                  schemaVersion: reviewerValidation.verdict.schemaVersion,
-                  status: reviewerValidation.status,
-                  summary: reviewerValidation.verdict.summary,
-                  evidenceDigest: reviewerValidation.evidenceDigest,
-                  checkedArtifacts: reviewerValidation.verdict.checkedArtifacts,
-                  evidenceRefs: reviewerValidation.verdict.evidenceRefs,
-                  findings: reviewerValidation.verdict.findings,
-                  formatRetriesUsed: reviewerFormatRetriesUsed,
-                  readArtifactCount: reviewerValidation.readArtifactCount,
-                  reviewerModel: node.model,
-                  validatedAt: now,
-                },
-              })
-            : curNode.budgetJson;
+          const resolvedReviewVerdict = reviewerValidation?.valid
+            ? {
+                schemaVersion: reviewerValidation.verdict.schemaVersion,
+                status: reviewerValidation.status,
+                summary: reviewerValidation.verdict.summary,
+                evidenceDigest: reviewerValidation.evidenceDigest,
+                checkedArtifacts: reviewerValidation.verdict.checkedArtifacts,
+                evidenceRefs: reviewerValidation.verdict.evidenceRefs,
+                findings: reviewerValidation.verdict.findings,
+                formatRetriesUsed: reviewerFormatRetriesUsed,
+                readArtifactCount: reviewerValidation.readArtifactCount,
+                reviewerModel: node.model,
+                validatedAt: now,
+              }
+            : nonStrictReviewerVerdict;
+          const mergedBudgetObj = { ...baseBudgetObj };
+          if (resolvedReviewVerdict) {
+            mergedBudgetObj.reviewerVerdict = resolvedReviewVerdict;
+          }
+          if (latestVerifySummary) {
+            mergedBudgetObj.verificationResult = latestVerifySummary;
+          }
+          const mergedBudgetJson =
+            resolvedReviewVerdict || latestVerifySummary
+              ? JSON.stringify(mergedBudgetObj)
+              : curNode.budgetJson;
           this.store.db
             .prepare('UPDATE swarm_runs SET usageJson=?, updatedAt=? WHERE id=? AND status=?')
             .run(JSON.stringify(nextUsage), now, runId, curRun.status);
@@ -1878,6 +2017,65 @@ export class AdaptiveSwarmOrchestrator {
         });
 
         await this.#publishHandoffsAndDrainInbox(committedNode, runId, uris);
+
+        const committedBudgetObj = parseJsonSafe(committedNode.budgetJson, {});
+        const committedReviewVerdict = committedBudgetObj?.reviewerVerdict ?? null;
+        if (
+          node.taskType === 'review' &&
+          (committedReviewVerdict?.status === 'fail' ||
+            committedReviewVerdict?.status === 'needs_revision') &&
+          this.replanner?.replanRepairAndReverify
+        ) {
+          const liveRunForRepair = this.getRun(runId);
+          if (liveRunForRepair && !isTerminalRunState(liveRunForRepair.status)) {
+            const runLevelGuard =
+              leaseGuard?.withContext?.({ runId, nodeId: null, nodeAttempt: null }) ?? leaseGuard;
+            let revReplan = { replanned: false };
+            try {
+              revReplan = await this.replanner.replanRepairAndReverify({
+                run: liveRunForRepair,
+                triggerNode: committedNode,
+                errorCode:
+                  committedReviewVerdict.status === 'needs_revision'
+                    ? 'REVIEW_NEEDS_REVISION'
+                    : 'REVIEW_FAILED',
+                errorMessage:
+                  committedReviewVerdict.summary ||
+                  `Reviewer ${committedNode.nodeKey} returned ${committedReviewVerdict.status}`,
+                failureDiagnostics: committedReviewVerdict.summary || '',
+                reviewerFindings: committedReviewVerdict.findings ?? [],
+                testCommands: liveRunForRepair.strategy?.repoContext?.testCommands ?? [],
+                maxReplans: liveRunForRepair.strategy?.maxReplans ?? 2,
+                budgetLedger: this.budgetLedger,
+                leaseGuard: runLevelGuard,
+              });
+            } catch (revErr) {
+              if (isLeaseLostError(revErr)) throw revErr;
+              revReplan = { replanned: false };
+            }
+            if (revReplan?.replanned) {
+              if (!checkLeaseHeld(runLevelGuard, { runId, nodeId: null })) {
+                throw new RecoveryError('LEASE_LOST', {
+                  message: `Lease lost after review repair replan for ${node.nodeKey}`,
+                });
+              }
+              enqueueSwarmJob(
+                this.jobQueue,
+                SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
+                {
+                  runId,
+                  sessionId: run.sessionId,
+                  planVersion: revReplan.version || liveRunForRepair.planVersion || 1,
+                  epoch: Date.now(),
+                },
+                {
+                  idempotencyKey: `swarm:resolve:${runId}:${node.nodeKey}:revrepair:${uuid().slice(0, 8)}`,
+                },
+              );
+              return;
+            }
+          }
+        }
 
         enqueueSwarmJob(
           this.jobQueue,
@@ -2015,6 +2213,15 @@ export class AdaptiveSwarmOrchestrator {
               maxReplans: freshRun.strategy?.maxReplans ?? 2,
               budgetLedger: this.budgetLedger,
               leaseGuard: nodeGuard,
+              ...(errorCode === 'VERIFICATION_FAILED'
+                ? {
+                    repairContext: {
+                      failureDiagnostics: err?.detail?.failureDiagnostics ?? errorMessage,
+                      testCommands: freshRun.strategy?.repoContext?.testCommands ?? [],
+                      wantVerification: true,
+                    },
+                  }
+                : {}),
             });
           } catch (replanErr) {
             if (isLeaseLostError(replanErr)) throw replanErr;
@@ -2023,7 +2230,7 @@ export class AdaptiveSwarmOrchestrator {
         }
 
         if (replanOut?.replanned) {
-          // A successful split deliberately terminalizes the superseded node. Verify
+          // A successful split/repair deliberately terminalizes the superseded node. Verify
           // only the current job/run fence here; checking the old node again would
           // mistake the committed replan for a lease loss and strand the new DAG.
           if (!checkLeaseHeld(leaseGuard, { runId, nodeId: null })) {
@@ -2045,11 +2252,23 @@ export class AdaptiveSwarmOrchestrator {
           return;
         }
 
+        const failedExtraBudget = err?.detail?.verificationResult
+          ? JSON.stringify({
+              ...parseJsonSafe(freshNode.budgetJson, {}),
+              verificationResult: err.detail.verificationResult,
+            })
+          : undefined;
         transitionSwarmNode(this.store, this.eventRouter, freshNode.id, SWARM_NODE_STATES.FAILED, {
           sessionId: freshRun.sessionId,
           rootTurnId: freshRun.rootTurnId,
           leaseGuard: nodeGuard,
-          patch: { activeFence: null, activeJobId: null, errorCode, errorMessage },
+          patch: {
+            activeFence: null,
+            activeJobId: null,
+            errorCode,
+            errorMessage,
+            ...(failedExtraBudget ? { budgetJson: failedExtraBudget } : {}),
+          },
         });
         enqueueSwarmJob(
           this.jobQueue,
@@ -2276,8 +2495,10 @@ export class AdaptiveSwarmOrchestrator {
       return null;
     }
 
+    const replacedKeys = this.#getReplacedNodeKeys(run.id);
     const existingPlannedReview = (run.nodes ?? []).find(
       (n) =>
+        !replacedKeys.has(n.nodeKey) &&
         n.taskType === 'review' &&
         Array.isArray(n.dependencies) &&
         sourceNodeKeys.every((key) => n.dependencies.includes(key)),
@@ -2368,7 +2589,7 @@ export class AdaptiveSwarmOrchestrator {
         acceptance,
         JSON.stringify(sourceNodeKeys),
         JSON.stringify([...new Set(toolAllow.map(String))]),
-        run.permissionMode || 'auto-safe',
+        'read-only',
         'review',
         'shared_readonly',
         0,
@@ -2513,17 +2734,38 @@ export class AdaptiveSwarmOrchestrator {
     const plannedNodes = this.planner.normalizeNodes(rawNodes);
     this.planner.validateDag(plannedNodes);
     const nonReviewSelections = new Map();
+    const synthesizeNodeProfile = (n, baseProfile) => {
+      if (!this.router?.agentRegistry?.synthesizeProfile) return baseProfile;
+      const strictReadOnly = n.taskType === 'review' || n.taskType === 'research';
+      const isWorktree =
+        !strictReadOnly &&
+        (n.isolationMode === 'worktree' || Boolean(n.isolatedWorktree));
+      return this.router.agentRegistry.synthesizeProfile({
+        taskType: n.taskType,
+        objective: n.objective,
+        requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
+        isolationMode: strictReadOnly
+          ? 'shared_readonly'
+          : n.isolationMode || (isWorktree ? 'worktree' : 'shared_readonly'),
+        isolatedWorktree: isWorktree,
+        roleTitle: n.roleTitle,
+        focus: n.focus,
+        ownedPaths: n.ownedPaths,
+        readOnly: strictReadOnly ? true : undefined,
+      });
+    };
     for (const n of plannedNodes) {
       if (n.taskType === 'review') continue;
-      nonReviewSelections.set(
-        n.nodeKey,
-        this.router.select({
-          taskType: n.taskType,
-          objective: n.objective,
-          requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
-          budget: n.budget ?? budget,
-        }),
-      );
+      const sel = this.router.select({
+        taskType: n.taskType,
+        objective: n.objective,
+        requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
+        budget: n.budget ?? budget,
+      });
+      nonReviewSelections.set(n.nodeKey, {
+        ...sel,
+        profile: synthesizeNodeProfile(n, sel.profile),
+      });
     }
     const workerModels = [...new Set([...nonReviewSelections.values()].map((s) => s?.model).filter(Boolean))];
     const highRiskRun = plannedNodes.some(
@@ -2533,11 +2775,10 @@ export class AdaptiveSwarmOrchestrator {
         n.taskType === 'verification' ||
         /security|audit|review/i.test(String(n.objective ?? '')),
     );
-    return plannedNodes.map((n) => ({
-      spec: n,
-      selection:
-        nonReviewSelections.get(n.nodeKey) ??
-        this.router.select({
+    return plannedNodes.map((n) => {
+      let selection = nonReviewSelections.get(n.nodeKey);
+      if (!selection) {
+        const revSel = this.router.select({
           taskType: n.taskType,
           objective: n.objective,
           requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
@@ -2545,8 +2786,36 @@ export class AdaptiveSwarmOrchestrator {
           ...(n.taskType === 'review' && highRiskRun && workerModels.length > 0
             ? { excludeModels: workerModels }
             : {}),
-        }),
-    }));
+        });
+        selection = {
+          ...revSel,
+          profile: synthesizeNodeProfile(n, revSel.profile),
+        };
+      }
+      const nextBudget = { ...(n.budget ?? {}) };
+      if (
+        !nextBudget.roleMetadata &&
+        (n.roleTitle || n.focus || (Array.isArray(n.ownedPaths) && n.ownedPaths.length > 0))
+      ) {
+        nextBudget.roleMetadata = {
+          ...(n.roleTitle ? { roleTitle: n.roleTitle } : {}),
+          ...(n.focus ? { focus: n.focus } : {}),
+          ...(Array.isArray(n.ownedPaths) && n.ownedPaths.length > 0 ? { ownedPaths: n.ownedPaths } : {}),
+        };
+      } else if (!nextBudget.roleMetadata && selection.profile?.roleTitle) {
+        nextBudget.roleMetadata = {
+          roleTitle: selection.profile.roleTitle,
+          ...(selection.profile.focus ? { focus: selection.profile.focus } : {}),
+          ...(Array.isArray(selection.profile.ownedPaths) && selection.profile.ownedPaths.length > 0
+            ? { ownedPaths: selection.profile.ownedPaths }
+            : {}),
+        };
+      }
+      return {
+        spec: { ...n, budget: nextBudget },
+        selection,
+      };
+    });
   }
 
   #insertNodes(runId, routedSpecs, parentPermissionMode, planVersion, now) {
@@ -2558,26 +2827,37 @@ export class AdaptiveSwarmOrchestrator {
       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`,
     );
     const parentRuntimePerm = normalizeRuntimePermission(parentPermissionMode || 'auto-safe');
+    const MUTATING_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'bash', 'start_process', 'kill_process']);
     for (const { spec, selection } of routedSpecs) {
+      const isReadOnlyTask = spec.taskType === 'review' || spec.taskType === 'research';
+      const isolationMode = isReadOnlyTask
+        ? 'shared_readonly'
+        : spec.isolationMode || (spec.isolatedWorktree ? 'worktree' : 'shared_readonly');
+      const strictNonMutating = isReadOnlyTask || isolationMode === 'shared_readonly';
+
       // Never widen an explicit empty allowlist (`[]`) by injecting `read_swarm_artifact`.
       const defaultToolAllow =
         Array.isArray(selection.profile.toolAllow) && selection.profile.toolAllow.length > 0
           ? [...new Set([...selection.profile.toolAllow, 'read_swarm_artifact'])]
           : selection.profile.toolAllow;
-      const requestedPerm =
-        spec.taskType === 'review'
-          ? 'read-only'
-          : spec.permissionMode
-            ? normalizeRuntimePermission(spec.permissionMode)
-            : parentRuntimePerm;
+      const requestedToolAllow =
+        spec.toolAllow !== null && spec.toolAllow !== undefined
+          ? spec.toolAllow
+          : defaultToolAllow;
+      const effectiveToolAllow =
+        strictNonMutating && Array.isArray(requestedToolAllow)
+          ? requestedToolAllow.filter((t) => !MUTATING_TOOLS.has(t))
+          : requestedToolAllow;
+
+      const requestedPerm = strictNonMutating
+        ? 'read-only'
+        : spec.permissionMode
+          ? normalizeRuntimePermission(spec.permissionMode)
+          : parentRuntimePerm;
       const effectiveNodePerm = intersectPolicies(
         { permissionMode: parentRuntimePerm },
         { permissionMode: requestedPerm },
       ).permissionMode;
-      const isolationMode =
-        spec.taskType === 'review'
-          ? 'shared_readonly'
-          : spec.isolationMode || (spec.isolatedWorktree ? 'worktree' : 'shared_readonly');
       ins.run(
         uuid(),
         runId,
@@ -2588,9 +2868,7 @@ export class AdaptiveSwarmOrchestrator {
         spec.objective,
         spec.acceptance,
         JSON.stringify(spec.dependencies),
-        spec.toolAllow !== null && spec.toolAllow !== undefined
-          ? JSON.stringify(spec.toolAllow)
-          : JSON.stringify(defaultToolAllow),
+        JSON.stringify(effectiveToolAllow),
         effectiveNodePerm,
         spec.taskType || 'research',
         isolationMode,
@@ -2667,13 +2945,27 @@ export class AdaptiveSwarmOrchestrator {
   }
 
   #getReplacedNodeKeys(runId) {
-    return new Set(
-      this.store.db
-        .prepare("SELECT failedNodeKey FROM swarm_replans WHERE runId=? AND strategy='split_subgraph'")
-        .all(runId)
-        .map((r) => r.failedNodeKey)
-        .filter(Boolean),
-    );
+    const rows = this.store.db
+      .prepare(
+        "SELECT failedNodeKey, strategy, diffJson FROM swarm_replans WHERE runId=? AND strategy IN ('split_subgraph', 'repair_and_reverify')",
+      )
+      .all(runId);
+    const set = new Set();
+    for (const r of rows) {
+      if (r.strategy === 'split_subgraph') {
+        if (r.failedNodeKey) set.add(r.failedNodeKey);
+      } else if (r.strategy === 'repair_and_reverify') {
+        const diff = parseJsonSafe(r.diffJson, {});
+        if (Array.isArray(diff.supersededNodeKeys)) {
+          for (const k of diff.supersededNodeKeys) {
+            if (k) set.add(k);
+          }
+        } else if (r.failedNodeKey) {
+          set.add(r.failedNodeKey);
+        }
+      }
+    }
+    return set;
   }
 
   #getRunController(runId) {
@@ -2708,5 +3000,372 @@ export class AdaptiveSwarmOrchestrator {
     const set = this.waiters.get(run.id);
     if (!set) return;
     for (const fn of [...set]) fn(run);
+  }
+
+  #inspectVerificationShellOutcome(
+    childSessionId,
+    childTurnId,
+    resultText = '',
+    explicitVerifiedPass = null,
+  ) {
+    if (childSessionId && this.store?.db?.isOpen) {
+      const shellReceipts = this.store.db
+        .prepare(
+          `SELECT id, callId, toolName, status, exitCode, errorCode, createdAt, updatedAt
+           FROM tool_receipts
+           WHERE sessionId=? AND (? IS NULL OR turnId=?) AND toolName IN ('bash', 'start_process')
+           ORDER BY createdAt ASC`,
+        )
+        .all(childSessionId, childTurnId ?? null, childTurnId ?? null);
+      if (shellReceipts.length > 0) {
+        const toolMsgs = this.store.db
+          .prepare(
+            `SELECT toolCallId, content
+             FROM direct_messages
+             WHERE sessionId=? AND (? IS NULL OR turnId=?) AND role='tool'
+             ORDER BY seq ASC`,
+          )
+          .all(childSessionId, childTurnId ?? null, childTurnId ?? null);
+        const msgByCallId = new Map(toolMsgs.map((m) => [m.toolCallId, m.content]));
+
+        const assistantMsgs = this.store.db
+          .prepare(
+            `SELECT toolCalls
+             FROM direct_messages
+             WHERE sessionId=? AND (? IS NULL OR turnId=?) AND role='assistant' AND toolCalls IS NOT NULL
+             ORDER BY seq ASC`,
+          )
+          .all(childSessionId, childTurnId ?? null, childTurnId ?? null);
+        const cmdByCallId = new Map();
+        for (const am of assistantMsgs) {
+          const tcs = parseJsonSafe(am.toolCalls, []);
+          for (const tc of tcs) {
+            if (!tc?.id) continue;
+            const args =
+              typeof tc.arguments === 'string'
+                ? parseJsonSafe(tc.arguments, {})
+                : (tc.arguments || {});
+            if (args?.command) cmdByCallId.set(tc.id, String(args.command));
+          }
+        }
+
+        const latest = shellReceipts.at(-1);
+        const rawOut = String(msgByCallId.get(latest.callId) ?? '');
+        const unwrappedOut = rawOut.replace(/^<untrusted\b[^>]*>/, '').replace(/<\/untrusted>\s*$/, '');
+        const parsedOut = parseJsonSafe(unwrappedOut, null);
+        const cmd = cmdByCallId.get(latest.callId) || parsedOut?.command || null;
+        const exitCode =
+          latest.exitCode !== null && latest.exitCode !== undefined
+            ? Number(latest.exitCode)
+            : latest.status === 'failed'
+              ? 1
+              : 0;
+        const summary = String(
+          (parsedOut && (parsedOut.stderr || parsedOut.stdout || parsedOut.output || parsedOut.error)) ||
+            unwrappedOut ||
+            resultText ||
+            '',
+        ).slice(0, 1500);
+        return {
+          command: cmd,
+          exitCode,
+          status: exitCode === 0 && latest.status === 'finished' ? 'passed' : 'failed',
+          summary,
+        };
+      }
+    }
+
+    if (explicitVerifiedPass === false) {
+      return {
+        command: null,
+        exitCode: 1,
+        status: 'failed',
+        summary: String(resultText || 'Verification failed').slice(0, 1200),
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Assemble unified delivery package for inspection by UI / API callers.
+   */
+  buildRunDeliveryPackage(runId) {
+    const run = this.getRun(runId);
+    if (!run) return null;
+
+    const replacedKeys = this.#dbOpen() ? this.#getReplacedNodeKeys(runId) : new Set();
+    const activeNodes = (run.nodes ?? []).filter((n) => !replacedKeys.has(n.nodeKey));
+    const dependenciesByNodeKey = Object.fromEntries(
+      (run.nodes ?? []).map((n) => [n.nodeKey, Array.isArray(n.dependencies) ? n.dependencies : []]),
+    );
+
+    const allArtifacts = this.artifactManager?.listRunArtifacts?.(runId) ?? [];
+    const activeArtifacts = allArtifacts.filter(
+      (a) => a && a.status !== 'superseded' && !replacedKeys.has(a.nodeKey),
+    );
+    const analysis =
+      this.artifactManager && typeof this.artifactManager.analyzeRunArtifacts === 'function'
+        ? this.artifactManager.analyzeRunArtifacts(activeArtifacts, {
+            dependenciesByNodeKey,
+            workspaceRoot: run.workspaceRoot,
+          })
+        : {
+            verifiedArtifacts: activeArtifacts,
+            changedFiles: [],
+            conflicts: [],
+            verificationErrors: [],
+            unifiedDiffPreview: '',
+          };
+
+    const conflicts = [...(analysis.conflicts || [])];
+    for (const errItem of analysis.verificationErrors || []) {
+      conflicts.push({
+        path: '<artifact>',
+        nodeKeys: errItem.nodeKey ? [errItem.nodeKey] : [],
+        reason: `artifact_verification_failed:${(errItem.errors || []).join(';')}`,
+      });
+    }
+
+    const testResults = activeNodes
+      .filter((n) => n.taskType === 'verification')
+      .map((n) => {
+        const b = parseJsonSafe(n.budgetJson, {});
+        const inspected =
+          b.verificationResult ??
+          this.#inspectVerificationShellOutcome(
+            n.childSessionId,
+            n.childTurnId,
+            n.resultText || n.errorMessage || '',
+            n.status === SWARM_NODE_STATES.COMPLETED
+              ? true
+              : n.status === SWARM_NODE_STATES.FAILED
+                ? false
+                : null,
+          );
+        const derivedStatus = inspected?.status
+          ? inspected.status
+          : n.status === SWARM_NODE_STATES.COMPLETED
+            ? 'passed'
+            : n.status === SWARM_NODE_STATES.FAILED
+              ? 'failed'
+              : n.status;
+        return {
+          nodeKey: n.nodeKey,
+          command: inspected?.command ?? null,
+          exitCode:
+            inspected?.exitCode ??
+            (n.status === SWARM_NODE_STATES.COMPLETED
+              ? 0
+              : n.status === SWARM_NODE_STATES.FAILED
+                ? 1
+                : null),
+          status: derivedStatus,
+          summary:
+            inspected?.summary ||
+            String(n.resultText || n.errorMessage || '').slice(0, 600),
+        };
+      });
+
+    const reviewerVerdicts = activeNodes
+      .filter((n) => n.taskType === 'review')
+      .map((n) => {
+        const b = parseJsonSafe(n.budgetJson, {});
+        const rv = b.reviewerVerdict ?? null;
+        return {
+          nodeKey: n.nodeKey,
+          status: rv?.status ?? (n.status === SWARM_NODE_STATES.FAILED ? 'fail' : n.status),
+          summary: rv?.summary ?? String(n.resultText || n.errorMessage || '').slice(0, 500),
+          reviewerModel: rv?.reviewerModel ?? n.model ?? null,
+          checkedArtifacts: Array.isArray(rv?.checkedArtifacts) ? rv.checkedArtifacts : [],
+          evidenceRefs: Array.isArray(rv?.evidenceRefs) ? rv.evidenceRefs : [],
+          evidenceDigest: rv?.evidenceDigest ?? null,
+          findings: Array.isArray(rv?.findings) ? rv.findings : [],
+        };
+      });
+
+    const verifiedMap = new Map(
+      (analysis.verifiedArtifacts || []).map((v) => [v.id, v]),
+    );
+    const verErrMap = new Map(
+      (analysis.verificationErrors || []).map((v) => [v.artifactId, v.errors]),
+    );
+    const artifacts = activeArtifacts.map((a) => ({
+      id: a.id,
+      artifactId: a.id,
+      uri: a.uri,
+      runId: a.runId ?? run.id,
+      nodeId: a.nodeId ?? null,
+      nodeKey: a.nodeKey,
+      ownerId: a.ownerId ?? null,
+      attempt: a.attempt,
+      status: a.status,
+      bundleSha256: a.bundleSha256,
+      fileCount: Number(a.fileCount ?? (a.files?.length ?? 0)),
+      totalBytes: Number(a.totalBytes ?? 0),
+      verified: verifiedMap.has(a.id) && !verErrMap.has(a.id),
+      verificationErrors: verErrMap.get(a.id) ?? [],
+      files: a.files ?? [],
+      appliedAt: a.appliedAt ?? null,
+      createdAt: a.createdAt,
+      updatedAt: a.updatedAt ?? a.createdAt,
+    }));
+
+    return {
+      runId: run.id,
+      status: run.status,
+      goal: run.goal,
+      planVersion: Number(run.planVersion || 1),
+      repoContext: run.strategy?.repoContext ?? null,
+      changedFiles: (analysis.changedFiles || []).map((f) => ({
+        path: f.path,
+        changeType: f.changeType,
+        previousPath: f.previousPath ?? null,
+        sha256: f.sha256 ?? null,
+        nodeKey: f.nodeKey,
+        artifactId: f.artifactId,
+        uri: f.uri,
+      })),
+      conflicts: conflicts.map((c) => ({
+        path: c.path,
+        nodeKeys: Array.isArray(c.nodeKeys) ? c.nodeKeys : [],
+        reason: c.reason,
+      })),
+      unifiedDiffPreview: analysis.unifiedDiffPreview || '',
+      testResults,
+      reviewerVerdicts,
+      verdict: run.verdict ?? null,
+      usage: {
+        steps: Number(run.usage?.steps ?? 0),
+        inputTokens: Number(run.usage?.inputTokens ?? 0),
+        outputTokens: Number(run.usage?.outputTokens ?? 0),
+        completedNodes: Number(
+          run.usage?.completedNodes ??
+            activeNodes.filter((n) => n.status === SWARM_NODE_STATES.COMPLETED).length,
+        ),
+        replanCount: Number(run.replanCount ?? 0),
+      },
+      artifacts,
+    };
+  }
+
+  /**
+   * Guarded, conflict-aware, SHA-256 verified apply-all of a completed swarm run's artifacts.
+   * Fails closed on missing approval, read-only permissions, unverified/failed runs,
+   * tampered artifacts, or file conflicts; idempotent for already-applied artifacts.
+   */
+  applyAllRunArtifacts(
+    runId,
+    {
+      approved = false,
+      permissionMode = null,
+      workspaceRoot = null,
+      stopOnConflict = true,
+    } = {},
+  ) {
+    const run = this.getRun(runId);
+    if (!run) return null;
+
+    if (approved !== true) {
+      return {
+        ok: false,
+        statusCode: 403,
+        status: 'forbidden',
+        code: 'APPROVAL_REQUIRED',
+        runId,
+        appliedArtifacts: [],
+        appliedFiles: [],
+        conflicts: [],
+        errors: ['Explicit approved: true is required to apply swarm run artifacts'],
+      };
+    }
+
+    const effectivePerm = permissionMode
+      ? intersectPolicies(
+          { permissionMode: normalizeRuntimePermission(run.permissionMode || 'auto-safe') },
+          { permissionMode: normalizeRuntimePermission(permissionMode) },
+        ).permissionMode
+      : normalizeRuntimePermission(run.permissionMode || 'auto-safe');
+
+    if (effectivePerm === 'read-only') {
+      return {
+        ok: false,
+        statusCode: 403,
+        status: 'forbidden',
+        code: 'POLICY_DENIED',
+        runId,
+        appliedArtifacts: [],
+        appliedFiles: [],
+        conflicts: [],
+        errors: ['Cannot apply artifacts to parent workspace in read-only permission mode'],
+      };
+    }
+
+    const replacedKeys = this.#dbOpen() ? this.#getReplacedNodeKeys(runId) : new Set();
+    const activeNodes = (run.nodes ?? []).filter((n) => !replacedKeys.has(n.nodeKey));
+    const hasFailedOrIncompleteNode = activeNodes.some(
+      (n) => n.status !== SWARM_NODE_STATES.COMPLETED,
+    );
+
+    if (
+      run.status !== SWARM_RUN_STATES.COMPLETED ||
+      run.verdict?.accepted === false ||
+      hasFailedOrIncompleteNode
+    ) {
+      return {
+        ok: false,
+        statusCode: 409,
+        status: 'unverified',
+        code: 'RUN_NOT_VERIFIED',
+        runId,
+        appliedArtifacts: [],
+        appliedFiles: [],
+        conflicts: [],
+        errors: [
+          `Run ${runId} is not cleanly verified and completed (status=${run.status}, accepted=${run.verdict?.accepted ?? null})`,
+        ],
+      };
+    }
+
+    if (!this.artifactManager || typeof this.artifactManager.applyAllArtifacts !== 'function') {
+      return {
+        ok: false,
+        statusCode: 409,
+        status: 'unavailable',
+        code: 'ARTIFACT_MANAGER_UNAVAILABLE',
+        runId,
+        appliedArtifacts: [],
+        appliedFiles: [],
+        conflicts: [],
+        errors: ['SwarmArtifactManager is not configured'],
+      };
+    }
+
+    const allArtifacts = this.artifactManager.listRunArtifacts(runId);
+    const activeArtifacts = allArtifacts.filter(
+      (a) => a && a.status !== 'superseded' && !replacedKeys.has(a.nodeKey),
+    );
+    const dependenciesByNodeKey = Object.fromEntries(
+      (run.nodes ?? []).map((n) => [n.nodeKey, Array.isArray(n.dependencies) ? n.dependencies : []]),
+    );
+
+    const res = this.artifactManager.applyAllArtifacts(activeArtifacts, {
+      workspaceRoot: workspaceRoot || run.workspaceRoot,
+      permissionMode: effectivePerm,
+      approved: true,
+      stopOnConflict: stopOnConflict !== false,
+      dependenciesByNodeKey,
+      runId,
+    });
+
+    return {
+      ok: Boolean(res?.ok),
+      statusCode: res?.ok ? 200 : 409,
+      status: res?.status || (res?.ok ? 'applied' : 'conflict'),
+      runId,
+      appliedArtifacts: res?.appliedArtifacts ?? [],
+      appliedFiles: res?.appliedFiles ?? [],
+      conflicts: res?.conflicts ?? [],
+      errors: res?.errors ?? [],
+    };
   }
 }

@@ -9,6 +9,15 @@ export const CAPABILITY_DIMENSIONS = Object.freeze([
   'toolCompatibility',
 ]);
 
+const MUTATING_TOOLS = new Set([
+  'edit_file',
+  'write_file',
+  'apply_patch',
+  'bash',
+  'start_process',
+  'kill_process',
+]);
+
 const BASE_CAPABILITIES = Object.freeze({
   research: {
     id: 'research',
@@ -16,7 +25,8 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 8,
     readOnly: true,
     weights: { coding: 0.4, reasoning: 0.6, research: 1.0, planning: 0.3, speed: 0.7, contextCapacity: 0.8, multimodal: 0.1, toolCompatibility: 0.8 },
-    toolAllow: ['read_file', 'glob', 'grep', 'read_blob', 'web_fetch', 'search_history'],
+    toolAllow: ['read_file', 'glob', 'grep', 'read_blob', 'web_fetch', 'search_history', 'inspect_repository'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'read_blob', 'web_fetch', 'search_history', 'inspect_repository', 'read_swarm_artifact'],
     instruction: '专注于只读代码检索、调用链梳理与事实提取，引用精确文件路径与符号名。',
   },
   implementation: {
@@ -25,8 +35,11 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 20,
     readOnly: false,
     weights: { coding: 1.0, reasoning: 0.7, research: 0.4, planning: 0.4, speed: 0.5, contextCapacity: 0.6, multimodal: 0.1, toolCompatibility: 1.0 },
-    toolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob'],
-    instruction: '编写模块化、高内聚的生产级代码修改，保持既有接口与风格一致。',
+    toolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository'],
+    worktreeToolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'bash'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'read_swarm_artifact'],
+    worktreeToolCeiling: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'bash', 'read_process_output', 'read_swarm_artifact'],
+    instruction: '编写模块化、高内聚的生产级代码修改，保持既有接口与风格一致；在隔离 worktree 中可运行局部测试或构建命令自检。',
   },
   verification: {
     id: 'verification',
@@ -34,7 +47,8 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 10,
     readOnly: false,
     weights: { coding: 0.8, reasoning: 0.8, research: 0.5, planning: 0.3, speed: 0.6, contextCapacity: 0.5, multimodal: 0.1, toolCompatibility: 1.0 },
-    toolAllow: ['read_file', 'glob', 'grep', 'bash', 'read_process_output', 'read_blob'],
+    toolAllow: ['read_file', 'glob', 'grep', 'bash', 'read_process_output', 'read_blob', 'inspect_repository'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'bash', 'read_process_output', 'read_blob', 'inspect_repository', 'read_swarm_artifact'],
     instruction: '运行真实测试/编译检查并以可观测退出码与输出作为客观验证证据。',
   },
   planning: {
@@ -43,7 +57,8 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 6,
     readOnly: true,
     weights: { coding: 0.25, reasoning: 1.4, research: 0.4, planning: 1.4, speed: 0.15, contextCapacity: 0.35, multimodal: 0.05, toolCompatibility: 0.4 },
-    toolAllow: ['read_file', 'glob', 'grep', 'update_plan', 'search_history'],
+    toolAllow: ['read_file', 'glob', 'grep', 'update_plan', 'search_history', 'inspect_repository'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'update_plan', 'search_history', 'inspect_repository', 'read_swarm_artifact'],
     instruction: '分析系统边界、状态流与模块依赖，产出无环可执行步骤与清晰验收标准。',
   },
   review: {
@@ -53,9 +68,38 @@ const BASE_CAPABILITIES = Object.freeze({
     readOnly: true,
     weights: { coding: 0.8, reasoning: 0.9, research: 0.7, planning: 0.4, speed: 0.5, contextCapacity: 0.8, multimodal: 0.1, toolCompatibility: 0.7 },
     toolAllow: ['read_file', 'glob', 'grep', 'read_blob'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'read_blob', 'inspect_repository', 'read_swarm_artifact'],
     instruction: '独立核对实现边界、回归风险、错误处理与权限安全，禁止直接篡改产物。',
   },
 });
+
+function inferSpecializedRoleTitle(baseKey, taskType, objective, explicitTitle) {
+  if (explicitTitle && String(explicitTitle).trim()) {
+    return String(explicitTitle).trim().slice(0, 120);
+  }
+  const cleanType = String(taskType || '').trim();
+  if (cleanType && !Object.hasOwn(BASE_CAPABILITIES, cleanType)) {
+    return cleanType.slice(0, 120);
+  }
+  const text = String(objective || '').toLowerCase();
+  if (baseKey === 'implementation') {
+    if (/frontend|ui|react|css|component|组件|前端|样式/i.test(text)) return 'Frontend UI Specialist';
+    if (/api|route|server|backend|db|sqlite|后端|接口|路由/i.test(text)) return 'Backend Systems Specialist';
+    if (/repair|fix|patch|bug|修复|补丁/i.test(text)) return 'Targeted Repair Specialist';
+    if (/test|spec|fixture|测试|用例/i.test(text)) return 'Test Authoring Specialist';
+  }
+  if (baseKey === 'verification') {
+    return 'Integration & Test Verifier';
+  }
+  if (baseKey === 'review') {
+    if (/security|auth|policy|permission|安全|权限/i.test(text)) return 'Security & Policy Auditor';
+    return 'Independent Code Reviewer';
+  }
+  if (baseKey === 'research') {
+    return 'Repository Architecture Researcher';
+  }
+  return BASE_CAPABILITIES[baseKey]?.label ?? 'Autonomous Specialist';
+}
 
 export function scoreModelCapabilities(
   modelId,
@@ -243,6 +287,11 @@ export class AgentCapabilityRegistry {
     requiredTools = null,
     readOnly = undefined,
     maxSteps = undefined,
+    isolationMode = null,
+    isolatedWorktree = false,
+    roleTitle = null,
+    focus = null,
+    ownedPaths = null,
   } = {}) {
     const hint = `${taskType} ${objective}`.toLowerCase();
     let baseKey = 'research';
@@ -259,24 +308,58 @@ export class AgentCapabilityRegistry {
     }
 
     const base = this.archetypes.get(baseKey);
-    const effectiveTools = Array.isArray(requiredTools)
-      ? [...new Set(requiredTools.map(String))]
-      : [...base.toolAllow];
+    const isSharedReadonly = isolationMode === 'shared_readonly';
+    const isWorktree = !isSharedReadonly && (isolatedWorktree === true || isolationMode === 'worktree');
+    const forcedReadOnly = Boolean(base.readOnly || readOnly === true || isSharedReadonly);
+
+    const rawCeiling =
+      isWorktree && Array.isArray(base.worktreeToolCeiling)
+        ? base.worktreeToolCeiling
+        : Array.isArray(base.toolCeiling)
+          ? base.toolCeiling
+          : base.toolAllow;
+    const ceilingList = forcedReadOnly
+      ? rawCeiling.filter((t) => !MUTATING_TOOLS.has(t))
+      : [...rawCeiling];
+    const ceilingSet = new Set(ceilingList);
+
+    const defaultTools =
+      isWorktree && Array.isArray(base.worktreeToolAllow)
+        ? base.worktreeToolAllow
+        : base.toolAllow;
+
+    let effectiveTools;
+    if (Array.isArray(requiredTools)) {
+      // Preserve explicit `[]` and enforce archetype ceiling on non-empty allowlists
+      effectiveTools = [...new Set(requiredTools.map(String))].filter((t) => ceilingSet.has(t));
+    } else {
+      effectiveTools = forcedReadOnly
+        ? defaultTools.filter((t) => !MUTATING_TOOLS.has(t))
+        : [...defaultTools];
+    }
+
     const isReadOnly =
-      readOnly !== undefined
-        ? Boolean(readOnly)
-        : !effectiveTools.some((t) =>
-            ['edit_file', 'write_file', 'apply_patch', 'bash', 'start_process', 'kill_process'].includes(t),
-          );
+      forcedReadOnly ||
+      !effectiveTools.some((t) => MUTATING_TOOLS.has(t));
+
+    const resolvedRoleTitle = inferSpecializedRoleTitle(baseKey, taskType, objective, roleTitle);
+    const resolvedFocus = focus && String(focus).trim() ? String(focus).trim().slice(0, 240) : null;
+    const resolvedOwnedPaths = Array.isArray(ownedPaths)
+      ? [...new Set(ownedPaths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 32)
+      : [];
 
     return {
       id: `dynamic:${baseKey}`,
       archetype: baseKey,
-      name: base.label,
+      name: resolvedRoleTitle,
+      roleTitle: resolvedRoleTitle,
+      focus: resolvedFocus,
+      ownedPaths: resolvedOwnedPaths,
       readOnly: isReadOnly,
       defaultMaxSteps: maxSteps ?? base.defaultMaxSteps,
       weights: { ...base.weights },
       toolAllow: effectiveTools,
+      toolCeiling: ceilingList,
       staticSystemInstruction: base.instruction,
     };
   }

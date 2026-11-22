@@ -32,9 +32,83 @@ import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../tools/registry.js';
 const execFileAsync = promisify(execFile);
 
 export const SWARM_ARTIFACT_HANDOFF_DIR = '.agent-us-handoff';
+export const SWARM_ARTIFACT_OVERLAY_STATE_FILE = '_overlay_state.json';
 export const SWARM_ARTIFACT_URI_PREFIX = 'swarm-artifact://';
 
 const MUTATING_WRITE_TOOLS = new Set(['write_file', 'edit_file', 'apply_patch', 'bash']);
+
+function isCausalAncestorNode(candidateAncestorKey, candidateDescendantKey, dependenciesByNodeKey) {
+  if (!candidateAncestorKey || !candidateDescendantKey || candidateAncestorKey === candidateDescendantKey) {
+    return false;
+  }
+  if (!dependenciesByNodeKey || !(dependenciesByNodeKey instanceof Map)) return false;
+  const visited = new Set();
+  const queue = [...(dependenciesByNodeKey.get(candidateDescendantKey) ?? [])];
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    if (!cur || visited.has(cur)) continue;
+    if (cur === candidateAncestorKey) return true;
+    visited.add(cur);
+    const parents = dependenciesByNodeKey.get(cur);
+    if (Array.isArray(parents)) {
+      for (const p of parents) queue.push(p);
+    }
+  }
+  return false;
+}
+
+function isCausalArtifactOverride(prevMeta, nextArt, dependenciesByNodeKey) {
+  if (!prevMeta || !nextArt) return false;
+  if (prevMeta.artifactId && nextArt.id && prevMeta.artifactId === nextArt.id) return false;
+  const overlaidList = Array.isArray(nextArt.manifest?.overlaidArtifacts)
+    ? nextArt.manifest.overlaidArtifacts
+    : [];
+  if (
+    overlaidList.some(
+      (o) =>
+        (o?.artifactId && o.artifactId === prevMeta.artifactId) ||
+        (o?.uri && o.uri === prevMeta.uri),
+    )
+  ) {
+    return true;
+  }
+  return isCausalAncestorNode(prevMeta.nodeKey, nextArt.nodeKey, dependenciesByNodeKey);
+}
+
+function sortArtifactsTopologically(artifacts, dependenciesByNodeKey = null) {
+  const ordered = [...artifacts].sort(
+    (a, b) =>
+      Number(a.createdAt ?? 0) - Number(b.createdAt ?? 0) ||
+      Number(a.attempt ?? 1) - Number(b.attempt ?? 1),
+  );
+  if (!dependenciesByNodeKey || !(dependenciesByNodeKey instanceof Map) || ordered.length <= 1) {
+    return ordered;
+  }
+  const result = [];
+  const remaining = [...ordered];
+  while (remaining.length > 0) {
+    let pickedIdx = remaining.findIndex((candidate) =>
+      remaining.every(
+        (other) =>
+          other === candidate ||
+          !isCausalAncestorNode(other.nodeKey, candidate.nodeKey, dependenciesByNodeKey),
+      ),
+    );
+    if (pickedIdx < 0) pickedIdx = 0;
+    result.push(remaining.splice(pickedIdx, 1)[0]);
+  }
+  return result;
+}
+
+function isIdenticalOverlayEntry(a, b) {
+  if (!a || !b) return false;
+  return (
+    a.changeType === b.changeType &&
+    (a.sha256 ?? null) === (b.sha256 ?? null) &&
+    (a.mode ?? '100644') === (b.mode ?? '100644') &&
+    (a.previousPath ?? null) === (b.previousPath ?? null)
+  );
+}
 
 function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
@@ -256,6 +330,31 @@ export class SwarmArtifactManager {
     mkdirSync(this.storageRoot, { recursive: true });
   }
 
+  #overlayStatePath(worktreePath) {
+    return join(resolve(worktreePath), SWARM_ARTIFACT_HANDOFF_DIR, SWARM_ARTIFACT_OVERLAY_STATE_FILE);
+  }
+
+  #loadOverlayState(worktreePath) {
+    try {
+      const p = this.#overlayStatePath(worktreePath);
+      if (!existsSync(p)) return null;
+      const parsed = JSON.parse(readFileSync(p, 'utf8'));
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #saveOverlayState(worktreePath, state) {
+    try {
+      const p = this.#overlayStatePath(worktreePath);
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, JSON.stringify(state, null, 2), 'utf8');
+    } catch {
+      // non-fatal overlay metadata persistence
+    }
+  }
+
   /**
    * Captures all isolated worktree changes (tracked edits, untracked adds, deletions, renames,
    * binary files, file modes) to durable local bundle + SQLite metadata BEFORE worktree cleanup.
@@ -275,6 +374,7 @@ export class SwarmArtifactManager {
     worktreeLeaseId = null,
     baseCommit = null,
     baseRef = null,
+    overlaidState = null,
     leaseGuard = null,
   }) {
     if (!runId || !nodeId || !nodeKey || !worktreePath) {
@@ -420,11 +520,6 @@ export class SwarmArtifactManager {
             ['diff', '--cached', '--raw', '-z', '-M', resolvedBaseCommit],
             { env: gitEnv, encoding: 'buffer' },
           );
-          const patchBuf = await runGitRaw(
-            worktreePath,
-            ['diff', '--cached', '--binary', '-M', resolvedBaseCommit],
-            { env: gitEnv, encoding: 'buffer' },
-          ).catch(() => Buffer.alloc(0));
 
           const rawEntries = parseRawNullDiff(rawDiffBuf).filter(
             (e) =>
@@ -432,12 +527,25 @@ export class SwarmArtifactManager {
               e.path !== SWARM_ARTIFACT_HANDOFF_DIR,
           );
 
+          const effectiveOverlayState =
+            overlaidState?.entries && typeof overlaidState.entries === 'object'
+              ? overlaidState
+              : this.#loadOverlayState(worktreePath);
+          const overlaidEntriesMap =
+            effectiveOverlayState?.entries && typeof effectiveOverlayState.entries === 'object'
+              ? effectiveOverlayState.entries
+              : null;
+          let skippedOverlaidCount = 0;
+
           const entries = [];
           let totalBytes = 0;
+          const seenRawPaths = new Set();
 
           for (const item of rawEntries) {
             const normPath = normalizePosixRel(item.path);
             const normPrev = item.previousPath ? normalizePosixRel(item.previousPath) : null;
+            seenRawPaths.add(normPath);
+            if (normPrev) seenRawPaths.add(normPrev);
 
             let baseSha256 = null;
             if (item.oldHash && !/^0+$/.test(item.oldHash)) {
@@ -454,7 +562,7 @@ export class SwarmArtifactManager {
             }
 
             if (item.changeType === 'deleted') {
-              entries.push({
+              const delEntry = {
                 path: normPath,
                 changeType: 'deleted',
                 previousPath: null,
@@ -464,7 +572,13 @@ export class SwarmArtifactManager {
                 baseSha256,
                 sha256: null,
                 contentFile: null,
-              });
+              };
+              const overlaidPrev = overlaidEntriesMap?.[normPath];
+              if (overlaidPrev && overlaidPrev.changeType === 'deleted') {
+                skippedOverlaidCount++;
+                continue;
+              }
+              entries.push(delEntry);
               continue;
             }
 
@@ -509,12 +623,7 @@ export class SwarmArtifactManager {
             }
 
             const contentSha = sha256Buffer(contentBuf);
-            const dst = resolveInsideDir(filesDir, normPath);
-            mkdirSync(dirname(dst.full), { recursive: true });
-            writeFileSync(dst.full, contentBuf);
-
-            totalBytes += contentBuf.length;
-            entries.push({
+            const candidateEntry = {
               path: normPath,
               changeType: item.changeType,
               previousPath: normPrev,
@@ -524,10 +633,101 @@ export class SwarmArtifactManager {
               baseSha256,
               sha256: contentSha,
               contentFile: `files/${normPath}`,
-            });
+            };
+
+            const overlaidPrev = overlaidEntriesMap?.[normPath];
+            if (overlaidPrev && isIdenticalOverlayEntry(overlaidPrev, candidateEntry)) {
+              skippedOverlaidCount++;
+              continue;
+            }
+
+            const dst = resolveInsideDir(filesDir, normPath);
+            mkdirSync(dirname(dst.full), { recursive: true });
+            writeFileSync(dst.full, contentBuf);
+
+            totalBytes += contentBuf.length;
+            entries.push(candidateEntry);
+          }
+
+          if (overlaidEntriesMap) {
+            for (const overlaidPrev of Object.values(overlaidEntriesMap)) {
+              if (!overlaidPrev?.path || seenRawPaths.has(overlaidPrev.path)) continue;
+              if (overlaidPrev.changeType === 'added') {
+                const curTarget = resolveInsideDir(worktreePath, overlaidPrev.path);
+                if (!existsSync(curTarget.full)) {
+                  entries.push({
+                    path: overlaidPrev.path,
+                    changeType: 'deleted',
+                    previousPath: null,
+                    binary: Boolean(overlaidPrev.binary),
+                    mode: overlaidPrev.mode || '100644',
+                    size: 0,
+                    baseSha256: null,
+                    sha256: null,
+                    contentFile: null,
+                    overlaidDeleted: true,
+                  });
+                }
+              } else if (
+                overlaidPrev.changeType === 'modified' ||
+                overlaidPrev.changeType === 'deleted'
+              ) {
+                try {
+                  const headBuf = await runGitRaw(
+                    worktreePath,
+                    ['show', `${resolvedBaseCommit}:${overlaidPrev.path}`],
+                    { encoding: 'buffer' },
+                  );
+                  const headSha = sha256Buffer(headBuf);
+                  const dst = resolveInsideDir(filesDir, overlaidPrev.path);
+                  mkdirSync(dirname(dst.full), { recursive: true });
+                  writeFileSync(dst.full, headBuf);
+                  totalBytes += headBuf.length;
+                  entries.push({
+                    path: overlaidPrev.path,
+                    changeType: 'modified',
+                    previousPath: null,
+                    binary: isBinaryBuffer(headBuf),
+                    mode: overlaidPrev.mode || '100644',
+                    size: headBuf.length,
+                    baseSha256: headSha,
+                    sha256: headSha,
+                    contentFile: `files/${overlaidPrev.path}`,
+                    overlaidReverted: true,
+                  });
+                } catch {
+                  // ignore if path didn't exist in HEAD
+                }
+              }
+            }
           }
 
           entries.sort((a, b) => a.path.localeCompare(b.path));
+          let patchBuf = Buffer.alloc(0);
+          if (entries.length > 0) {
+            if (skippedOverlaidCount > 0) {
+              const patchPaths = [
+                ...new Set(
+                  entries
+                    .filter((e) => !e.overlaidDeleted && !e.overlaidReverted)
+                    .flatMap((e) => [e.path, e.previousPath].filter(Boolean)),
+                ),
+              ];
+              if (patchPaths.length > 0) {
+                patchBuf = await runGitRaw(
+                  worktreePath,
+                  ['diff', '--cached', '--binary', '-M', resolvedBaseCommit, '--', ...patchPaths],
+                  { env: gitEnv, encoding: 'buffer' },
+                ).catch(() => Buffer.alloc(0));
+              }
+            } else {
+              patchBuf = await runGitRaw(
+                worktreePath,
+                ['diff', '--cached', '--binary', '-M', resolvedBaseCommit],
+                { env: gitEnv, encoding: 'buffer' },
+              ).catch(() => Buffer.alloc(0));
+            }
+          }
           const patchFile = 'changes.patch';
           writeFileSync(join(artifactDir, patchFile), patchBuf);
 
@@ -553,6 +753,9 @@ export class SwarmArtifactManager {
             patchFile,
             fileCount: entries.length,
             totalBytes,
+            ...(Array.isArray(effectiveOverlayState?.artifacts) && effectiveOverlayState.artifacts.length
+              ? { overlaidArtifacts: effectiveOverlayState.artifacts }
+              : {}),
             createdAt: now,
             entries,
           };
@@ -669,6 +872,11 @@ export class SwarmArtifactManager {
       .prepare(`SELECT * FROM swarm_artifacts ${clause} ORDER BY createdAt DESC, attempt DESC, rowid DESC LIMIT ?`)
       .all(...params, cap)
       .map(hydrateArtifactRow);
+  }
+
+  listRunArtifacts(runId, { excludeSuperseded = false, limit = 200 } = {}) {
+    if (!runId) return [];
+    return this.listArtifacts({ runId, excludeSuperseded, limit });
   }
 
   getLatestNodeArtifact(runId, nodeKey) {
@@ -1094,8 +1302,919 @@ export class SwarmArtifactManager {
       lines.push(
         'Use tool `read_swarm_artifact` with `{ nodeKey, path }` or `{ artifactId, path }` to inspect exact verified file contents.',
       );
+    } else {
+      lines.push(
+        'Predecessor verified file changes have also been overlaid into this isolated worktree (and remain inspectable under `.agent-us-handoff/` or `read_swarm_artifact`).',
+      );
     }
     return lines.join('\n');
+  }
+
+  #evaluateEntryAgainstTarget(targetRoot, artifact, entry) {
+    const target =
+      entry.mode === '120000'
+        ? resolveInsideDir(targetRoot, entry.path)
+        : resolveConfinedPath(targetRoot, entry.path);
+    const artifactFilePath =
+      entry.changeType === 'deleted'
+        ? null
+        : resolveInsideDir(join(artifact.storagePath, 'files'), entry.path).full;
+
+    if (entry.changeType === 'added') {
+      if (existsSync(target.full)) {
+        const parentBuf = readFileSync(target.full);
+        const parentSha = sha256Buffer(parentBuf);
+        if (parentSha === entry.sha256) {
+          return { kind: 'skip', skip: { path: entry.path, reason: 'already_identical', artifactId: artifact.id, nodeKey: artifact.nodeKey } };
+        }
+        return {
+          kind: 'conflict',
+          conflict: {
+            path: entry.path,
+            changeType: entry.changeType,
+            reason: 'target_exists_diverged',
+            baseSha256: null,
+            parentSha256: parentSha,
+            artifactSha256: entry.sha256,
+            parentPreserved: true,
+            artifactPreserved: true,
+            artifactFilePath,
+            nodeKeys: [artifact.nodeKey],
+            artifactIds: [artifact.id],
+          },
+        };
+      }
+      return { kind: 'plan', op: { artifactId: artifact.id, nodeKey: artifact.nodeKey, entry, target } };
+    }
+
+    if (entry.changeType === 'modified') {
+      if (!existsSync(target.full)) {
+        return {
+          kind: 'conflict',
+          conflict: {
+            path: entry.path,
+            changeType: entry.changeType,
+            reason: 'target_deleted_in_parent',
+            baseSha256: entry.baseSha256,
+            parentSha256: null,
+            artifactSha256: entry.sha256,
+            parentPreserved: true,
+            artifactPreserved: true,
+            artifactFilePath,
+            nodeKeys: [artifact.nodeKey],
+            artifactIds: [artifact.id],
+          },
+        };
+      }
+      const parentBuf = readFileSync(target.full);
+      const parentSha = sha256Buffer(parentBuf);
+      const modeMatches =
+        process.platform === 'win32' ||
+        (((statSync(target.full).mode & 0o111) !== 0) === (entry.mode === '100755'));
+      if (parentSha === entry.sha256 && modeMatches) {
+        return { kind: 'skip', skip: { path: entry.path, reason: 'already_applied', artifactId: artifact.id, nodeKey: artifact.nodeKey } };
+      }
+      if (
+        entry.baseSha256 &&
+        !matchesBaseContent(parentBuf, entry.baseSha256, Boolean(entry.binary))
+      ) {
+        return {
+          kind: 'conflict',
+          conflict: {
+            path: entry.path,
+            changeType: entry.changeType,
+            reason: 'parent_modified_concurrently',
+            baseSha256: entry.baseSha256,
+            parentSha256: parentSha,
+            artifactSha256: entry.sha256,
+            parentPreserved: true,
+            artifactPreserved: true,
+            artifactFilePath,
+            nodeKeys: [artifact.nodeKey],
+            artifactIds: [artifact.id],
+          },
+        };
+      }
+      return { kind: 'plan', op: { artifactId: artifact.id, nodeKey: artifact.nodeKey, entry, target } };
+    }
+
+    if (entry.changeType === 'deleted') {
+      if (!existsSync(target.full)) {
+        return { kind: 'skip', skip: { path: entry.path, reason: 'already_deleted', artifactId: artifact.id, nodeKey: artifact.nodeKey } };
+      }
+      const parentBuf = readFileSync(target.full);
+      const parentSha = sha256Buffer(parentBuf);
+      if (
+        entry.baseSha256 &&
+        !matchesBaseContent(parentBuf, entry.baseSha256, Boolean(entry.binary))
+      ) {
+        return {
+          kind: 'conflict',
+          conflict: {
+            path: entry.path,
+            changeType: entry.changeType,
+            reason: 'delete_vs_parent_modified',
+            baseSha256: entry.baseSha256,
+            parentSha256: parentSha,
+            artifactSha256: null,
+            parentPreserved: true,
+            artifactPreserved: true,
+            artifactFilePath: null,
+            nodeKeys: [artifact.nodeKey],
+            artifactIds: [artifact.id],
+          },
+        };
+      }
+      return { kind: 'plan', op: { artifactId: artifact.id, nodeKey: artifact.nodeKey, entry, target } };
+    }
+
+    if (entry.changeType === 'renamed') {
+      const prevTarget = resolveConfinedPath(targetRoot, entry.previousPath);
+      const prevExists = existsSync(prevTarget.full);
+      const nextExists = existsSync(target.full);
+      const caseOnlyRename = isCaseOnlyRenamePath(prevTarget.full, target.full);
+
+      if (
+        !prevExists &&
+        nextExists &&
+        sha256Buffer(readFileSync(target.full)) === entry.sha256
+      ) {
+        return { kind: 'skip', skip: { path: entry.path, reason: 'already_renamed', artifactId: artifact.id, nodeKey: artifact.nodeKey } };
+      }
+      let hasConflict = false;
+      let reason = '';
+      let parentSha = null;
+      if (prevExists) {
+        const prevBuf = readFileSync(prevTarget.full);
+        const prevSha = sha256Buffer(prevBuf);
+        if (
+          entry.baseSha256 &&
+          !matchesBaseContent(prevBuf, entry.baseSha256, Boolean(entry.binary))
+        ) {
+          hasConflict = true;
+          reason = 'rename_source_modified_concurrently';
+          parentSha = prevSha;
+        }
+      } else {
+        hasConflict = true;
+        reason = 'rename_source_missing_in_parent';
+      }
+      if (!hasConflict && !caseOnlyRename && nextExists) {
+        const nextSha = sha256Buffer(readFileSync(target.full));
+        if (nextSha !== entry.sha256) {
+          hasConflict = true;
+          reason = 'rename_target_exists_diverged';
+          parentSha = nextSha;
+        }
+      }
+      if (hasConflict) {
+        return {
+          kind: 'conflict',
+          conflict: {
+            path: entry.path,
+            previousPath: entry.previousPath,
+            changeType: entry.changeType,
+            reason,
+            baseSha256: entry.baseSha256,
+            parentSha256: parentSha,
+            artifactSha256: entry.sha256,
+            parentPreserved: true,
+            artifactPreserved: true,
+            artifactFilePath,
+            nodeKeys: [artifact.nodeKey],
+            artifactIds: [artifact.id],
+          },
+        };
+      }
+      return { kind: 'plan', op: { artifactId: artifact.id, nodeKey: artifact.nodeKey, entry, target, prevTarget, caseOnlyRename } };
+    }
+
+    return { kind: 'plan', op: { artifactId: artifact.id, nodeKey: artifact.nodeKey, entry, target } };
+  }
+
+  #applySinglePreparedOp(op, mutatedPaths = null) {
+    const { entry, target, prevTarget, caseOnlyRename, readRes } = op;
+    if (entry.changeType === 'deleted') {
+      if (existsSync(target.full)) {
+        mutatedPaths?.push(target.full);
+        unlinkSync(target.full);
+      }
+      return { path: entry.path, changeType: 'deleted', artifactId: op.artifactId, nodeKey: op.nodeKey };
+    }
+    if (caseOnlyRename && prevTarget && existsSync(prevTarget.full)) {
+      mutatedPaths?.push(prevTarget.full);
+      const tmpName = join(dirname(target.full), `.agent-us-apply-${uuid()}`);
+      renameSync(prevTarget.full, tmpName);
+      unlinkSync(tmpName);
+    }
+    mkdirSync(dirname(target.full), { recursive: true });
+    mutatedPaths?.push(target.full);
+    if (entry.mode === '120000') {
+      const linkTarget = readRes.buffer.toString('utf8');
+      try {
+        if (lstatSync(target.full)) unlinkSync(target.full);
+      } catch {
+        // ignore
+      }
+      symlinkSync(linkTarget, target.full);
+    } else {
+      writeFileSync(target.full, readRes.buffer);
+      if (entry.mode === '100755') {
+        try {
+          chmodSync(target.full, 0o755);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    if (
+      entry.changeType === 'renamed' &&
+      prevTarget &&
+      !caseOnlyRename &&
+      prevTarget.full !== target.full &&
+      existsSync(prevTarget.full)
+    ) {
+      mutatedPaths?.push(prevTarget.full);
+      unlinkSync(prevTarget.full);
+    }
+    return {
+      path: entry.path,
+      changeType: entry.changeType,
+      ...(entry.previousPath ? { previousPath: entry.previousPath } : {}),
+      sha256: entry.sha256,
+      artifactId: op.artifactId,
+      nodeKey: op.nodeKey,
+    };
+  }
+
+  #executeAtomicFilePlan(targetRoot, plan) {
+    const preparedOps = [];
+    const snapshots = new Map();
+    const captureSnapshot = (filePath) => {
+      if (!filePath || snapshots.has(filePath)) return;
+      let lst = null;
+      try {
+        lst = lstatSync(filePath);
+      } catch {
+        lst = null;
+      }
+      if (!lst) {
+        snapshots.set(filePath, { existed: false });
+      } else if (lst.isSymbolicLink()) {
+        snapshots.set(filePath, { existed: true, isSymlink: true, linkTarget: readlinkSync(filePath) });
+      } else {
+        snapshots.set(filePath, {
+          existed: true,
+          isSymlink: false,
+          content: readFileSync(filePath),
+          mode: lst.mode,
+        });
+      }
+    };
+
+    for (const op of plan) {
+      const { entry, target, prevTarget } = op;
+      captureSnapshot(target.full);
+      if (prevTarget) captureSnapshot(prevTarget.full);
+      if (entry.changeType !== 'deleted') {
+        const readRes = this.readArtifactFile(op.artifactId, entry.path);
+        if (entry.mode === '120000') {
+          validateSymlinkTargetInsideRoot(targetRoot, target.full, readRes.buffer.toString('utf8'));
+        }
+        preparedOps.push({ ...op, readRes });
+      } else {
+        preparedOps.push({ ...op, readRes: null });
+      }
+    }
+
+    const applied = [];
+    const mutatedPaths = [];
+    try {
+      for (const op of preparedOps) {
+        applied.push(this.#applySinglePreparedOp(op, mutatedPaths));
+      }
+    } catch (applyErr) {
+      const rolledBack = new Set();
+      for (let i = mutatedPaths.length - 1; i >= 0; i--) {
+        const fp = mutatedPaths[i];
+        if (rolledBack.has(fp)) continue;
+        rolledBack.add(fp);
+        const snap = snapshots.get(fp);
+        if (!snap) continue;
+        try {
+          if (!snap.existed) {
+            if (existsSync(fp)) unlinkSync(fp);
+          } else if (snap.isSymlink) {
+            try {
+              if (lstatSync(fp)) unlinkSync(fp);
+            } catch {
+              // ignore
+            }
+            symlinkSync(snap.linkTarget, fp);
+          } else {
+            mkdirSync(dirname(fp), { recursive: true });
+            writeFileSync(fp, snap.content);
+            if (process.platform !== 'win32' && snap.mode) {
+              try {
+                chmodSync(fp, snap.mode & 0o777);
+              } catch {
+                // ignore
+              }
+            }
+          }
+        } catch {
+          // continue restoring remaining files
+        }
+      }
+      throw applyErr;
+    }
+    return applied;
+  }
+
+  /**
+   * Overlays multiple verified upstream artifacts onto an isolated worktree directory
+   * BEFORE a downstream child turn executes. Verifies SHA-256 of every bundle/file,
+   * handles added/modified/deleted/renamed changes cleanly, and detects cross-branch
+   * file collisions instead of overwriting blindly.
+   */
+  applyArtifactsToWorktree(
+    artifacts,
+    worktreePath,
+    { dependenciesByNodeKey = null, saveOverlayState = true } = {},
+  ) {
+    if (!worktreePath || !existsSync(worktreePath)) {
+      throw new Fault('WORKTREE_MISSING', 404, {
+        message: `Target worktree path does not exist for overlay: ${worktreePath}`,
+      });
+    }
+    if (!Array.isArray(artifacts) || artifacts.length === 0) {
+      return { ok: true, applied: [], conflicts: [], skipped: [] };
+    }
+
+    const targetRoot = resolve(worktreePath);
+    const verifiedList = [];
+    const seenIds = new Set();
+    for (const ref of artifacts) {
+      const idOrUri = typeof ref === 'string' ? ref : (ref?.id || ref?.artifactId || ref?.uri);
+      if (!idOrUri) continue;
+      const verification = this.verifyArtifact(idOrUri);
+      if (!verification.ok) {
+        throw new Fault('ARTIFACT_VERIFICATION_FAILED', 422, {
+          message: `Cannot overlay corrupted artifact ${idOrUri}: ${verification.errors.join('; ')}`,
+          errors: verification.errors,
+        });
+      }
+      if (seenIds.has(verification.artifact.id)) continue;
+      seenIds.add(verification.artifact.id);
+      verifiedList.push(verification.artifact);
+    }
+
+    const ordered = sortArtifactsTopologically(verifiedList, dependenciesByNodeKey);
+    const touched = new Map();
+    const overlayEntries = {};
+    const applied = [];
+    const skipped = [];
+    const conflicts = [];
+
+    for (const art of ordered) {
+      for (const entry of art.files) {
+        const readRes =
+          entry.changeType !== 'deleted' ? this.readArtifactFile(art.id, entry.path) : null;
+        const target =
+          entry.mode === '120000'
+            ? resolveInsideDir(targetRoot, entry.path)
+            : resolveConfinedPath(targetRoot, entry.path);
+        const prevTarget = entry.previousPath
+          ? resolveConfinedPath(targetRoot, entry.previousPath)
+          : null;
+        if (entry.mode === '120000' && readRes) {
+          validateSymlinkTargetInsideRoot(targetRoot, target.full, readRes.buffer.toString('utf8'));
+        }
+
+        let causalOverride = false;
+        const existingTouch = touched.get(entry.path);
+        if (existingTouch) {
+          if (isIdenticalOverlayEntry(existingTouch, entry)) {
+            skipped.push({
+              path: entry.path,
+              artifactId: art.id,
+              nodeKey: art.nodeKey,
+              reason: 'already_identical_in_overlay',
+            });
+            continue;
+          }
+          if (isCausalArtifactOverride(existingTouch, art, dependenciesByNodeKey)) {
+            causalOverride = true;
+          } else {
+            conflicts.push({
+              path: entry.path,
+              reason: 'cross_branch_collision',
+              nodeKeys: [existingTouch.nodeKey, art.nodeKey],
+              artifactIds: [existingTouch.artifactId, art.id],
+              existingChangeType: existingTouch.changeType,
+              incomingChangeType: entry.changeType,
+            });
+            continue;
+          }
+        }
+
+        if (entry.previousPath && touched.has(entry.previousPath)) {
+          const prevPathTouch = touched.get(entry.previousPath);
+          if (
+            prevPathTouch.changeType === 'renamed' &&
+            prevPathTouch.path === entry.path &&
+            prevPathTouch.sha256 === entry.sha256
+          ) {
+            skipped.push({
+              path: entry.path,
+              artifactId: art.id,
+              nodeKey: art.nodeKey,
+              reason: 'already_identical_in_overlay',
+            });
+            continue;
+          }
+          if (!isCausalArtifactOverride(prevPathTouch, art, dependenciesByNodeKey)) {
+            conflicts.push({
+              path: entry.previousPath,
+              relatedPath: entry.path,
+              reason: 'cross_branch_rename_collision',
+              nodeKeys: [prevPathTouch.nodeKey, art.nodeKey],
+              artifactIds: [prevPathTouch.artifactId, art.id],
+              existingChangeType: prevPathTouch.changeType,
+              incomingChangeType: entry.changeType,
+            });
+            continue;
+          }
+          causalOverride = true;
+        }
+
+        if (!causalOverride) {
+          const evalRes = this.#evaluateEntryAgainstTarget(targetRoot, art, entry);
+          if (evalRes.kind === 'skip') {
+            skipped.push(evalRes.skip);
+            const touchRecord = {
+              path: entry.path,
+              artifactId: art.id,
+              uri: art.uri,
+              nodeKey: art.nodeKey,
+              changeType: entry.changeType,
+              sha256: entry.sha256 ?? null,
+              mode: entry.mode ?? '100644',
+              previousPath: entry.previousPath ?? null,
+              binary: Boolean(entry.binary),
+            };
+            touched.set(entry.path, touchRecord);
+            overlayEntries[entry.path] = touchRecord;
+            continue;
+          }
+          if (evalRes.kind === 'conflict') {
+            conflicts.push(evalRes.conflict);
+            continue;
+          }
+        }
+
+        const caseOnlyRename = Boolean(
+          entry.changeType === 'renamed' &&
+            prevTarget &&
+            isCaseOnlyRenamePath(prevTarget.full, target.full),
+        );
+        const appliedItem = this.#applySinglePreparedOp({
+          artifactId: art.id,
+          nodeKey: art.nodeKey,
+          entry,
+          target,
+          prevTarget,
+          caseOnlyRename,
+          readRes,
+        });
+        applied.push(appliedItem);
+
+        const touchRecord = {
+          path: entry.path,
+          artifactId: art.id,
+          uri: art.uri,
+          nodeKey: art.nodeKey,
+          changeType: entry.changeType,
+          sha256: entry.sha256 ?? null,
+          mode: entry.mode ?? '100644',
+          previousPath: entry.previousPath ?? null,
+          binary: Boolean(entry.binary),
+        };
+        if (entry.changeType === 'renamed' && entry.previousPath) {
+          touched.set(entry.previousPath, {
+            path: entry.previousPath,
+            artifactId: art.id,
+            uri: art.uri,
+            nodeKey: art.nodeKey,
+            changeType: 'deleted',
+            sha256: null,
+            mode: entry.mode ?? '100644',
+            previousPath: null,
+          });
+          delete overlayEntries[entry.previousPath];
+        }
+        touched.set(entry.path, touchRecord);
+        if (entry.overlaidDeleted || entry.overlaidReverted) {
+          delete overlayEntries[entry.path];
+        } else {
+          overlayEntries[entry.path] = touchRecord;
+        }
+      }
+    }
+
+    const overlayState = {
+      artifacts: ordered.map((a) => ({
+        artifactId: a.id,
+        uri: a.uri,
+        nodeKey: a.nodeKey,
+        bundleSha256: a.bundleSha256,
+      })),
+      entries: overlayEntries,
+    };
+
+    if (saveOverlayState && conflicts.length === 0) {
+      this.#saveOverlayState(targetRoot, overlayState);
+    }
+
+    return {
+      ok: conflicts.length === 0,
+      applied,
+      conflicts,
+      skipped,
+      overlayState,
+    };
+  }
+
+  /**
+   * Analyzes a run's active non-superseded artifacts: verifies SHA-256 digests,
+   * computes winning changedFiles (honoring causal DAG overrides while detecting
+   * cross-branch and parent-workspace conflicts), and builds a unified diff preview.
+   */
+  analyzeRunArtifacts(
+    artifacts,
+    { dependenciesByNodeKey = null, workspaceRoot = null, maxDiffBytes = 64000 } = {},
+  ) {
+    const active = (Array.isArray(artifacts) ? artifacts : []).filter(
+      (a) => a && a.status !== 'superseded',
+    );
+    const ordered = sortArtifactsTopologically(active, dependenciesByNodeKey);
+    const verificationErrors = [];
+    const verifiedArtifacts = [];
+    for (const raw of ordered) {
+      try {
+        const res = this.verifyArtifact(raw.id || raw.artifactId || raw.uri);
+        if (!res.ok) {
+          verificationErrors.push({
+            artifactId: raw.id,
+            nodeKey: raw.nodeKey,
+            errors: res.errors,
+          });
+        } else {
+          verifiedArtifacts.push(res.artifact);
+        }
+      } catch (err) {
+        verificationErrors.push({
+          artifactId: raw.id,
+          nodeKey: raw.nodeKey,
+          errors: [String(err?.message ?? err)],
+        });
+      }
+    }
+
+    const winningByPath = new Map();
+    const renamedFromBySource = new Map();
+    const conflicts = [];
+    const conflictKeySet = new Set();
+    const pushConflict = (c) => {
+      const k = `${c.path}:${c.reason}:${[...(c.nodeKeys ?? [])].sort().join(',')}`;
+      if (!conflictKeySet.has(k)) {
+        conflictKeySet.add(k);
+        conflicts.push(c);
+      }
+    };
+
+    for (const art of verifiedArtifacts) {
+      for (const entry of art.files) {
+        const prevWin = winningByPath.get(entry.path);
+        if (prevWin) {
+          if (isIdenticalOverlayEntry(prevWin.entry, entry)) {
+            continue;
+          }
+          if (isCausalArtifactOverride(prevWin, art, dependenciesByNodeKey)) {
+            if (entry.overlaidDeleted && prevWin.entry.changeType === 'added') {
+              winningByPath.delete(entry.path);
+              continue;
+            }
+            const mergedEntry =
+              prevWin.entry.changeType === 'renamed' &&
+              prevWin.entry.previousPath &&
+              entry.changeType === 'modified'
+                ? { ...entry, changeType: 'renamed', previousPath: prevWin.entry.previousPath }
+                : entry;
+            winningByPath.set(entry.path, {
+              artifactId: art.id,
+              uri: art.uri,
+              nodeKey: art.nodeKey,
+              art,
+              entry: mergedEntry,
+            });
+            continue;
+          }
+          pushConflict({
+            path: entry.path,
+            nodeKeys: [prevWin.nodeKey, art.nodeKey],
+            artifactIds: [prevWin.artifactId, art.id],
+            reason: 'cross_branch_collision',
+          });
+          continue;
+        }
+
+        if (entry.previousPath && renamedFromBySource.has(entry.previousPath)) {
+          const prevRename = renamedFromBySource.get(entry.previousPath);
+          if (
+            prevRename.entry.path !== entry.path &&
+            !isCausalArtifactOverride(prevRename, art, dependenciesByNodeKey)
+          ) {
+            pushConflict({
+              path: entry.previousPath,
+              nodeKeys: [prevRename.nodeKey, art.nodeKey],
+              artifactIds: [prevRename.artifactId, art.id],
+              reason: 'cross_branch_rename_collision',
+            });
+            continue;
+          }
+        }
+        if (entry.previousPath && winningByPath.has(entry.previousPath)) {
+          const prevSrc = winningByPath.get(entry.previousPath);
+          if (!isCausalArtifactOverride(prevSrc, art, dependenciesByNodeKey)) {
+            pushConflict({
+              path: entry.previousPath,
+              nodeKeys: [prevSrc.nodeKey, art.nodeKey],
+              artifactIds: [prevSrc.artifactId, art.id],
+              reason: 'cross_branch_rename_collision',
+            });
+            continue;
+          }
+        }
+
+        const record = {
+          artifactId: art.id,
+          uri: art.uri,
+          nodeKey: art.nodeKey,
+          art,
+          entry,
+        };
+        winningByPath.set(entry.path, record);
+        if (entry.previousPath) {
+          renamedFromBySource.set(entry.previousPath, record);
+        }
+      }
+    }
+
+    const plan = [];
+    const skipped = [];
+    const targetRoot = workspaceRoot ? resolve(workspaceRoot) : null;
+    if (targetRoot && existsSync(targetRoot)) {
+      for (const rec of winningByPath.values()) {
+        if (rec.art.status === 'applied') {
+          skipped.push({
+            path: rec.entry.path,
+            reason: 'artifact_already_applied',
+            artifactId: rec.artifactId,
+            nodeKey: rec.nodeKey,
+          });
+          continue;
+        }
+        const evalRes = this.#evaluateEntryAgainstTarget(targetRoot, rec.art, rec.entry);
+        if (evalRes.kind === 'skip') {
+          skipped.push(evalRes.skip);
+        } else if (evalRes.kind === 'conflict') {
+          pushConflict({
+            path: evalRes.conflict.path,
+            nodeKeys: evalRes.conflict.nodeKeys ?? [rec.nodeKey],
+            artifactIds: evalRes.conflict.artifactIds ?? [rec.artifactId],
+            reason: evalRes.conflict.reason,
+          });
+        } else {
+          plan.push(evalRes.op);
+        }
+      }
+    }
+
+    const changedFiles = [...winningByPath.values()].map((rec) => ({
+      path: rec.entry.path,
+      changeType: rec.entry.changeType,
+      previousPath: rec.entry.previousPath ?? null,
+      sha256: rec.entry.sha256 ?? null,
+      nodeKey: rec.nodeKey,
+      artifactId: rec.artifactId,
+      uri: rec.uri,
+      status: rec.art.status,
+    }));
+
+    const diffChunks = [];
+    let diffBytes = 0;
+    for (const art of verifiedArtifacts) {
+      if (!art.files?.length || diffBytes >= maxDiffBytes) continue;
+      const patchPath = join(art.storagePath, art.manifest?.patchFile || 'changes.patch');
+      let patchText = '';
+      if (existsSync(patchPath)) {
+        try {
+          patchText = readFileSync(patchPath, 'utf8').trim();
+        } catch {
+          patchText = '';
+        }
+      }
+      if (!patchText) {
+        patchText = art.files
+          .map((f) => `[${f.changeType}] ${f.previousPath ? `${f.previousPath} -> ` : ''}${f.path}`)
+          .join('\n');
+      }
+      const section = `=== [${art.nodeKey}] ${art.uri} ===\n${patchText}`;
+      const remaining = maxDiffBytes - diffBytes;
+      if (section.length > remaining) {
+        diffChunks.push(section.slice(0, remaining) + '\n... [truncated]');
+        diffBytes = maxDiffBytes;
+        break;
+      }
+      diffChunks.push(section);
+      diffBytes += section.length;
+    }
+
+    return {
+      verifiedArtifacts,
+      changedFiles,
+      conflicts,
+      plan,
+      skipped,
+      verificationErrors,
+      unifiedDiffPreview: diffChunks.join('\n\n'),
+    };
+  }
+
+  /**
+   * Guarded multi-artifact apply-all to parent workspace:
+   * - Fail-closed without `approved === true` or in `read-only` mode
+   * - Verifies every artifact bundle and file SHA-256 BEFORE mutating disk
+   * - Detects cross-branch and parent-workspace conflicts before mutating disk
+   * - Idempotent when artifacts are already applied
+   */
+  applyAllArtifacts(
+    artifacts,
+    {
+      workspaceRoot,
+      permissionMode = null,
+      approved = false,
+      stopOnConflict = true,
+      dependenciesByNodeKey = null,
+      runId = null,
+    } = {},
+  ) {
+    if (permissionMode === 'read-only') {
+      throw new PolicyError('POLICY_DENIED', {
+        status: 403,
+        message: 'Cannot apply artifacts to parent workspace in read-only mode',
+      });
+    }
+    if (approved !== true) {
+      throw new PolicyError('APPROVAL_REQUIRED', {
+        status: 403,
+        message: 'Applying all run artifacts requires explicit approved: true',
+      });
+    }
+    const active = (Array.isArray(artifacts) ? artifacts : []).filter(
+      (a) => a && a.status !== 'superseded',
+    );
+    if (!active.length) {
+      return {
+        ok: true,
+        status: 'no_artifacts',
+        runId,
+        appliedArtifacts: [],
+        appliedFiles: [],
+        conflicts: [],
+        errors: [],
+      };
+    }
+
+    const targetRoot = resolve(workspaceRoot || active[0].workspaceRoot);
+    const applyLockKey = process.platform === 'win32' ? targetRoot.toLowerCase() : targetRoot;
+    if (this.#activeApplies.has(applyLockKey)) {
+      throw new Fault('APPLY_IN_PROGRESS', 409, {
+        message: `Another apply operation is already in progress for ${targetRoot}`,
+        workspaceRoot: targetRoot,
+      });
+    }
+    this.#activeApplies.add(applyLockKey);
+
+    try {
+      const analysis = this.analyzeRunArtifacts(active, {
+        dependenciesByNodeKey,
+        workspaceRoot: targetRoot,
+      });
+      if (analysis.verificationErrors.length > 0) {
+        return {
+          ok: false,
+          status: 'verification_failed',
+          runId,
+          appliedArtifacts: [],
+          appliedFiles: [],
+          conflicts: analysis.conflicts,
+          errors: analysis.verificationErrors,
+        };
+      }
+      if (analysis.conflicts.length > 0) {
+        return {
+          ok: false,
+          status: 'conflict',
+          runId,
+          appliedArtifacts: [],
+          appliedFiles: [],
+          conflicts: analysis.conflicts,
+          errors: [],
+        };
+      }
+
+      if (analysis.plan.length === 0) {
+        const now = Date.now();
+        if (this.store?.db?.isOpen) {
+          this.store.tx(() => {
+            for (const art of analysis.verifiedArtifacts) {
+              if (art.status !== 'applied') {
+                this.store.db
+                  .prepare("UPDATE swarm_artifacts SET status='applied', appliedAt=COALESCE(appliedAt, ?), applyResultJson=?, updatedAt=? WHERE id=?")
+                  .run(
+                    now,
+                    JSON.stringify({ ok: true, status: 'already_applied', applied: [], skipped: analysis.skipped, conflicts: [], at: now }),
+                    now,
+                    art.id,
+                  );
+              }
+            }
+          });
+        }
+        return {
+          ok: true,
+          status: 'already_applied',
+          runId,
+          appliedArtifacts: [],
+          skippedArtifacts: analysis.verifiedArtifacts.map((a) => ({
+            artifactId: a.id,
+            uri: a.uri,
+            nodeKey: a.nodeKey,
+            status: 'already_applied',
+          })),
+          appliedFiles: [],
+          conflicts: [],
+          errors: [],
+        };
+      }
+
+      const appliedFiles = this.#executeAtomicFilePlan(targetRoot, analysis.plan);
+      const now = Date.now();
+      const appliedArtifactIds = new Set(appliedFiles.map((f) => f.artifactId));
+      const appliedArtifacts = analysis.verifiedArtifacts
+        .filter((a) => appliedArtifactIds.has(a.id) || a.status !== 'applied')
+        .map((a) => ({
+          artifactId: a.id,
+          uri: a.uri,
+          nodeKey: a.nodeKey,
+          status: 'applied',
+        }));
+
+      if (this.store?.db?.isOpen) {
+        this.store.tx(() => {
+          for (const art of analysis.verifiedArtifacts) {
+            const perArtFiles = appliedFiles.filter((f) => f.artifactId === art.id);
+            const perArtResult = {
+              ok: true,
+              status: 'applied',
+              artifactId: art.id,
+              uri: art.uri,
+              applied: perArtFiles,
+              skipped: analysis.skipped.filter((s) => s.artifactId === art.id),
+              conflicts: [],
+              at: now,
+            };
+            this.store.db
+              .prepare("UPDATE swarm_artifacts SET status='applied', appliedAt=COALESCE(appliedAt, ?), applyResultJson=?, updatedAt=? WHERE id=?")
+              .run(now, JSON.stringify(perArtResult), now, art.id);
+          }
+        });
+      }
+
+      return {
+        ok: true,
+        status: 'applied',
+        runId,
+        appliedArtifacts,
+        appliedFiles,
+        conflicts: [],
+        errors: [],
+      };
+    } finally {
+      this.#activeApplies.delete(applyLockKey);
+    }
   }
 
   /**
@@ -1169,159 +2288,10 @@ export class SwarmArtifactManager {
       const skipped = [];
 
       for (const entry of artifact.files) {
-        const target =
-          entry.mode === '120000'
-            ? resolveInsideDir(targetRoot, entry.path)
-            : resolveConfinedPath(targetRoot, entry.path);
-        const artifactFilePath =
-          entry.changeType === 'deleted'
-            ? null
-            : resolveInsideDir(join(artifact.storagePath, 'files'), entry.path).full;
-
-        if (entry.changeType === 'added') {
-          if (existsSync(target.full)) {
-            const parentBuf = readFileSync(target.full);
-            const parentSha = sha256Buffer(parentBuf);
-            if (parentSha === entry.sha256) {
-              skipped.push({ path: entry.path, reason: 'already_identical' });
-            } else {
-              conflicts.push({
-                path: entry.path,
-                changeType: entry.changeType,
-                reason: 'target_exists_diverged',
-                baseSha256: null,
-                parentSha256: parentSha,
-                artifactSha256: entry.sha256,
-                parentPreserved: true,
-                artifactPreserved: true,
-                artifactFilePath,
-              });
-            }
-          } else {
-            plan.push({ entry, target });
-          }
-        } else if (entry.changeType === 'modified') {
-          if (!existsSync(target.full)) {
-            conflicts.push({
-              path: entry.path,
-              changeType: entry.changeType,
-              reason: 'target_deleted_in_parent',
-              baseSha256: entry.baseSha256,
-              parentSha256: null,
-              artifactSha256: entry.sha256,
-              parentPreserved: true,
-              artifactPreserved: true,
-              artifactFilePath,
-            });
-          } else {
-            const parentBuf = readFileSync(target.full);
-            const parentSha = sha256Buffer(parentBuf);
-            const modeMatches =
-              process.platform === 'win32' ||
-              (((statSync(target.full).mode & 0o111) !== 0) === (entry.mode === '100755'));
-            if (parentSha === entry.sha256 && modeMatches) {
-              skipped.push({ path: entry.path, reason: 'already_applied' });
-            } else if (
-              entry.baseSha256 &&
-              !matchesBaseContent(parentBuf, entry.baseSha256, Boolean(entry.binary))
-            ) {
-              conflicts.push({
-                path: entry.path,
-                changeType: entry.changeType,
-                reason: 'parent_modified_concurrently',
-                baseSha256: entry.baseSha256,
-                parentSha256: parentSha,
-                artifactSha256: entry.sha256,
-                parentPreserved: true,
-                artifactPreserved: true,
-                artifactFilePath,
-              });
-            } else {
-              plan.push({ entry, target });
-            }
-          }
-        } else if (entry.changeType === 'deleted') {
-          if (!existsSync(target.full)) {
-            skipped.push({ path: entry.path, reason: 'already_deleted' });
-          } else {
-            const parentBuf = readFileSync(target.full);
-            const parentSha = sha256Buffer(parentBuf);
-            if (
-              entry.baseSha256 &&
-              !matchesBaseContent(parentBuf, entry.baseSha256, Boolean(entry.binary))
-            ) {
-              conflicts.push({
-                path: entry.path,
-                changeType: entry.changeType,
-                reason: 'delete_vs_parent_modified',
-                baseSha256: entry.baseSha256,
-                parentSha256: parentSha,
-                artifactSha256: null,
-                parentPreserved: true,
-                artifactPreserved: true,
-                artifactFilePath: null,
-              });
-            } else {
-              plan.push({ entry, target });
-            }
-          }
-        } else if (entry.changeType === 'renamed') {
-          const prevTarget = resolveConfinedPath(targetRoot, entry.previousPath);
-          const prevExists = existsSync(prevTarget.full);
-          const nextExists = existsSync(target.full);
-          const caseOnlyRename = isCaseOnlyRenamePath(prevTarget.full, target.full);
-
-          if (
-            !prevExists &&
-            nextExists &&
-            sha256Buffer(readFileSync(target.full)) === entry.sha256
-          ) {
-            skipped.push({ path: entry.path, reason: 'already_renamed' });
-            continue;
-          }
-          let hasConflict = false;
-          let reason = '';
-          let parentSha = null;
-          if (prevExists) {
-            const prevBuf = readFileSync(prevTarget.full);
-            const prevSha = sha256Buffer(prevBuf);
-            if (
-              entry.baseSha256 &&
-              !matchesBaseContent(prevBuf, entry.baseSha256, Boolean(entry.binary))
-            ) {
-              hasConflict = true;
-              reason = 'rename_source_modified_concurrently';
-              parentSha = prevSha;
-            }
-          } else {
-            hasConflict = true;
-            reason = 'rename_source_missing_in_parent';
-          }
-          if (!hasConflict && !caseOnlyRename && nextExists) {
-            const nextSha = sha256Buffer(readFileSync(target.full));
-            if (nextSha !== entry.sha256) {
-              hasConflict = true;
-              reason = 'rename_target_exists_diverged';
-              parentSha = nextSha;
-            }
-          }
-          if (hasConflict) {
-            conflicts.push({
-              path: entry.path,
-              previousPath: entry.previousPath,
-              changeType: entry.changeType,
-              reason,
-              baseSha256: entry.baseSha256,
-              parentSha256: parentSha,
-              artifactSha256: entry.sha256,
-              parentPreserved: true,
-              artifactPreserved: true,
-              artifactFilePath,
-            });
-          } else {
-            plan.push({ entry, target, prevTarget, caseOnlyRename });
-          }
-        }
+        const evalRes = this.#evaluateEntryAgainstTarget(targetRoot, artifact, entry);
+        if (evalRes.kind === 'skip') skipped.push(evalRes.skip);
+        else if (evalRes.kind === 'conflict') conflicts.push(evalRes.conflict);
+        else plan.push(evalRes.op);
       }
 
       if (conflicts.length > 0) {
@@ -1357,138 +2327,7 @@ export class SwarmArtifactManager {
         };
       }
 
-      // Pre-validate all payloads & snapshot existing target/prev files for atomic rollback on mid-batch I/O error
-      const preparedOps = [];
-      const snapshots = new Map();
-      const captureSnapshot = (filePath) => {
-        if (!filePath || snapshots.has(filePath)) return;
-        let lst = null;
-        try {
-          lst = lstatSync(filePath);
-        } catch {
-          lst = null;
-        }
-        if (!lst) {
-          snapshots.set(filePath, { existed: false });
-        } else if (lst.isSymbolicLink()) {
-          snapshots.set(filePath, { existed: true, isSymlink: true, linkTarget: readlinkSync(filePath) });
-        } else {
-          snapshots.set(filePath, {
-            existed: true,
-            isSymlink: false,
-            content: readFileSync(filePath),
-            mode: lst.mode,
-          });
-        }
-      };
-
-      for (const op of plan) {
-        const { entry, target, prevTarget } = op;
-        captureSnapshot(target.full);
-        if (prevTarget) captureSnapshot(prevTarget.full);
-        if (entry.changeType !== 'deleted') {
-          const readRes = this.readArtifactFile(artifact.id, entry.path);
-          if (entry.mode === '120000') {
-            validateSymlinkTargetInsideRoot(targetRoot, target.full, readRes.buffer.toString('utf8'));
-          }
-          preparedOps.push({ ...op, readRes });
-        } else {
-          preparedOps.push({ ...op, readRes: null });
-        }
-      }
-
-      const applied = [];
-      const mutatedPaths = [];
-      try {
-        for (const op of preparedOps) {
-          const { entry, target, prevTarget, caseOnlyRename, readRes } = op;
-          if (entry.changeType === 'deleted') {
-            if (existsSync(target.full)) {
-              mutatedPaths.push(target.full);
-              unlinkSync(target.full);
-            }
-            applied.push({ path: entry.path, changeType: 'deleted' });
-          } else {
-            if (caseOnlyRename && prevTarget && existsSync(prevTarget.full)) {
-              mutatedPaths.push(prevTarget.full);
-              const tmpName = join(dirname(target.full), `.agent-us-apply-${uuid()}`);
-              renameSync(prevTarget.full, tmpName);
-              unlinkSync(tmpName);
-            }
-            mkdirSync(dirname(target.full), { recursive: true });
-            mutatedPaths.push(target.full);
-            if (entry.mode === '120000') {
-              const linkTarget = readRes.buffer.toString('utf8');
-              try {
-                if (lstatSync(target.full)) unlinkSync(target.full);
-              } catch {
-                // ignore
-              }
-              symlinkSync(linkTarget, target.full);
-            } else {
-              writeFileSync(target.full, readRes.buffer);
-              if (entry.mode === '100755') {
-                try {
-                  chmodSync(target.full, 0o755);
-                } catch {
-                  // ignore
-                }
-              }
-            }
-            if (
-              entry.changeType === 'renamed' &&
-              prevTarget &&
-              !caseOnlyRename &&
-              prevTarget.full !== target.full &&
-              existsSync(prevTarget.full)
-            ) {
-              mutatedPaths.push(prevTarget.full);
-              unlinkSync(prevTarget.full);
-            }
-            applied.push({
-              path: entry.path,
-              changeType: entry.changeType,
-              ...(entry.previousPath ? { previousPath: entry.previousPath } : {}),
-              sha256: entry.sha256,
-            });
-          }
-        }
-      } catch (applyErr) {
-        // Best-effort rollback of already-mutated files in reverse order
-        const rolledBack = new Set();
-        for (let i = mutatedPaths.length - 1; i >= 0; i--) {
-          const fp = mutatedPaths[i];
-          if (rolledBack.has(fp)) continue;
-          rolledBack.add(fp);
-          const snap = snapshots.get(fp);
-          if (!snap) continue;
-          try {
-            if (!snap.existed) {
-              if (existsSync(fp)) unlinkSync(fp);
-            } else if (snap.isSymlink) {
-              try {
-                if (lstatSync(fp)) unlinkSync(fp);
-              } catch {
-                // ignore
-              }
-              symlinkSync(snap.linkTarget, fp);
-            } else {
-              mkdirSync(dirname(fp), { recursive: true });
-              writeFileSync(fp, snap.content);
-              if (process.platform !== 'win32' && snap.mode) {
-                try {
-                  chmodSync(fp, snap.mode & 0o777);
-                } catch {
-                  // ignore
-                }
-              }
-            }
-          } catch {
-            // continue restoring remaining files
-          }
-        }
-        throw applyErr;
-      }
+      const applied = this.#executeAtomicFilePlan(targetRoot, plan);
 
       const now = Date.now();
       const result = {
