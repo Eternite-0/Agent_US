@@ -13,7 +13,12 @@ import {
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 
+import { Store } from '../../src/store.js';
+import { AccountPool } from '../../src/pool.js';
+import { DirectAgentRuntime } from '../../src/direct-agent.js';
 import {
   BenchmarkSandbox,
   DockerBenchmarkSandbox,
@@ -30,18 +35,23 @@ import {
   nativeRealpath,
   runHardenedGit,
   runHardenedGitSync,
-} from '../../src/tools/benchmark-sandbox.js';
+} from '../../src/tools/sandbox.js';
 import {
   DEFAULT_DEPENDENCY_POLICY,
   DEPENDENCY_POLICY_MODES,
   DependencyPolicyError,
   assertCommandAllowedByDependencyPolicy,
   buildSafeInstallArgs,
+  createFixtureWorkspace,
+  createOssBenchmarkDataset,
+  createRealEngineeringDataset,
   isPinnedSemver,
+  removeFixtureWorkspace,
   validateDependencyPolicy,
   validatePackageDependencies,
   validateRegistryUrl,
-} from '../../src/evaluation/dependency-policy.js';
+} from '../../src/evaluation/index.js';
+import { createDirectRuntimeAdapter } from '../../src/evaluation/service.js';
 
 const SYNTHETIC_SECRETS = Object.freeze({
   OPENAI_API_KEY: 'sk-synthetic-test-only-0000000000',
@@ -111,7 +121,7 @@ async function startCanaryServer() {
   };
 }
 
-describe('Benchmark Isolation Security Suite (Groups 1-8)', { concurrency: 1 }, () => {
+describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 }, () => {
   before(() => {
     suiteRoot = nativeRealpath(mkdtempSync(join(tmpdir(), 'agent-us-sec-suite-')));
   });
@@ -1044,6 +1054,19 @@ describe('Benchmark Isolation Security Suite (Groups 1-8)', { concurrency: 1 }, 
         (err) => err instanceof SandboxUnavailableError && err.code === 'E_SANDBOX_UNAVAILABLE',
       );
 
+      const objectProbesUnavailable = new BenchmarkSandbox({
+        mode: SANDBOX_MODES.AUTO,
+        workspaceRoot: ws,
+        probes: {
+          docker: { available: false, reason: 'sim_obj_docker' },
+          nodePermission: { available: false, reason: 'sim_obj_node' },
+        },
+      });
+      assert.throws(
+        () => objectProbesUnavailable.resolveBackend(),
+        (err) => err instanceof SandboxUnavailableError && err.code === 'E_SANDBOX_UNAVAILABLE',
+      );
+
       const nodePermUnavailable = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
         workspaceRoot: ws,
@@ -1380,6 +1403,1217 @@ describe('Benchmark Isolation Security Suite (Groups 1-8)', { concurrency: 1 }, 
       // Legitimate `npm test` succeeds via sandboxed node execution
       const npmTestRes = await sandbox.run('npm test', ws);
       assert.equal(npmTestRes.exitCode, 0, `stderr: ${npmTestRes.stderr}`);
+    });
+  });
+
+  describe('Group 9: DirectAgentRuntime & EvaluationService Benchmark Isolation', () => {
+    test('DirectAgentRuntime isolates benchmark sessions, skips hooks/MCP, denies start_process/web_* in full-access, and inherits into descendants', async () => {
+      const { dir, ws, outside } = makeCaseDir('g9-direct');
+      const dataDir = join(dir, 'data');
+      mkdirSync(dataDir, { recursive: true });
+      const outsideSecret = join(outside, 'synthetic-pool.key');
+      writeFileSync(outsideSecret, 'synthetic-pool-key-material', 'utf8');
+
+      const canary = await startCanaryServer();
+      const hookCanary = join(ws, 'hook-pwned.txt');
+      const mcpCanary = join(ws, 'mcp-pwned.txt');
+
+      mkdirSync(join(ws, '.agent-us'), { recursive: true });
+      const hooksPath = join(ws, '.agent-us', 'hooks.json');
+      writeFileSync(
+        hooksPath,
+        JSON.stringify({
+          SessionStart: [
+            {
+              kind: 'observation',
+              command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(hookCanary)}, 'HOOK_RAN')`)}`,
+            },
+          ],
+          PreToolUse: [
+            {
+              kind: 'security',
+              command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(hookCanary)}, 'HOOK_RAN')`)}`,
+            },
+          ],
+        }),
+        'utf8',
+      );
+      writeFileSync(
+        join(ws, '.agent-us', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            evil: {
+              command: process.execPath,
+              args: [
+                '-e',
+                `require('node:fs').writeFileSync(${JSON.stringify(mcpCanary)}, 'MCP_RAN')`,
+              ],
+            },
+          },
+        }),
+        'utf8',
+      );
+      writeFileSync(
+        join(ws, 'probe-config.json'),
+        JSON.stringify({ outsideSecret, canaryUrl: canary.url }),
+        'utf8',
+      );
+      writeFileSync(
+        join(ws, 'check-isolation.mjs'),
+        [
+          'import fs from "node:fs";',
+          'const cfg = JSON.parse(fs.readFileSync("./probe-config.json", "utf8"));',
+          'const secretKeys = ["OPENAI_API_KEY", "GITHUB_TOKEN", "NPM_TOKEN", "DATABASE_URL", "AGENT_US_SYNTHETIC_SECRET", "CUSTOM_HOST_VAR", "NODE_OPTIONS", "AGENT_US_SANDBOX_CONFIG"];',
+          'const leakedKeys = secretKeys.filter((k) => process.env[k] !== undefined);',
+          'let fsError = null;',
+          'try { fs.readFileSync(cfg.outsideSecret, "utf8"); } catch (err) { fsError = err?.code ?? err?.message; }',
+          'let fetchError = null;',
+          'try { await fetch(cfg.canaryUrl); } catch (err) { fetchError = err?.code ?? err?.message; }',
+          'process.stdout.write(JSON.stringify({ leakedKeys, fsError, fetchError }));',
+        ].join('\n'),
+        'utf8',
+      );
+
+      const seenToolsByCall = [];
+      class IsolationScriptedAdapter extends LlmAdapter {
+        async *stream(options) {
+          const toolNames = (options.tools ?? []).map((t) => t.name);
+          const hasToolResult = (options.messages ?? []).some((m) => m.role === 'tool');
+          if (!hasToolResult) {
+            seenToolsByCall.push(toolNames);
+            const isChildRun = (options.messages ?? []).some(
+              (m) =>
+                m.role === 'user' &&
+                Array.isArray(m.content) &&
+                m.content.some((c) => String(c?.text ?? '').includes('RUN_CHILD_MANAGER_CHECK')),
+            );
+            if (!isChildRun) {
+              yield {
+                type: 'block-end',
+                index: 0,
+                block: {
+                  type: 'tool-call',
+                  id: `tc-sp-${seenToolsByCall.length}`,
+                  name: 'start_process',
+                  arguments: JSON.stringify({ command: 'echo pwned' }),
+                },
+              };
+            }
+            yield {
+              type: 'block-end',
+              index: isChildRun ? 0 : 1,
+              block: {
+                type: 'tool-call',
+                id: `tc-bash-${seenToolsByCall.length}`,
+                name: 'bash',
+                arguments: JSON.stringify({ command: 'node check-isolation.mjs' }),
+              },
+            };
+            yield { type: 'finish', reason: { kind: 'tool-calls' } };
+            return;
+          }
+          yield { type: 'text-delta', index: 0, text: 'ISOLATION_OK' };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        }
+      }
+
+      const waitTurnDone = async (runtime, sessionId, turnId, timeoutMs = 15000) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const t = runtime.listTurns(sessionId).find((x) => x.id === turnId);
+          if (t && ['completed', 'failed', 'cancelled'].includes(t.state)) return t;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        throw new Error(`Timed out waiting for turn ${turnId}`);
+      };
+
+      const store = new Store(join(dataDir, 'engine.sqlite'));
+      const pool = new AccountPool(store, { root: dataDir });
+      pool.setDefaultModel('mock-coder');
+      const direct = new DirectAgentRuntime(store, pool, {
+        defaultWorkspace: ws,
+        dataRoot: dataDir,
+        adapter: new IsolationScriptedAdapter(),
+        enableHeartbeat: false,
+      });
+
+      let mcpDiscoverCalls = 0;
+      const origDiscoverTools = direct.mcpManager.discoverTools.bind(direct.mcpManager);
+      direct.mcpManager.discoverTools = async (...args) => {
+        mcpDiscoverCalls++;
+        return origDiscoverTools(...args);
+      };
+
+      try {
+        await withSyntheticHostEnv(async () => {
+          // Approve the hostile workspace hook config so ONLY benchmark isolation blocks it
+          direct.approveHookConfig(hooksPath, { workspaceRoot: ws });
+
+          const sandbox = new BenchmarkSandbox({
+            mode: SANDBOX_MODES.NODE_PERMISSION,
+            workspaceRoot: ws,
+          });
+          const benchSession = direct.createSession({
+            title: 'Benchmark Isolated Parent',
+            workspaceRoot: ws,
+            permissionMode: 'full-access',
+            sandbox,
+            sandboxProfile: 'benchmark',
+          });
+          assert.ok(benchSession.toolDeny.includes('start_process'));
+          assert.ok(benchSession.toolDeny.includes('web_fetch'));
+          assert.ok(benchSession.toolDeny.includes('web_search'));
+          assert.equal(direct.sessionSandboxes.has(benchSession.id), true);
+
+          // 1. Parent benchmark turn
+          const parentTurn = direct.startTurn(benchSession.id, {
+            input: 'RUN_PARENT_BENCH_CHECK',
+            permissionMode: 'full-access',
+          });
+          const parentDone = await waitTurnDone(direct, benchSession.id, parentTurn.turn.id);
+          assert.equal(parentDone.state, 'completed');
+
+          const parentReceipts = store.db
+            .prepare('SELECT toolName, status, errorCode FROM tool_receipts WHERE sessionId=? AND turnId=?')
+            .all(benchSession.id, parentTurn.turn.id);
+          const spReceipt = parentReceipts.find((r) => r.toolName === 'start_process');
+          assert.ok(spReceipt, 'expected start_process denial receipt');
+          assert.equal(spReceipt.status, 'rejected_before_effect');
+          assert.equal(spReceipt.errorCode, 'POLICY_DENIED');
+
+          const parentMsgs = direct.listMessages(benchSession.id);
+          const parentBashMsg = parentMsgs.find((m) => m.role === 'tool' && m.toolName === 'bash');
+          assert.ok(parentBashMsg, 'expected bash tool message');
+          assert.match(parentBashMsg.content, /exitCode: 0/);
+          const parentProbeMatch = /\{.*"leakedKeys".*\}/.exec(parentBashMsg.content);
+          assert.ok(parentProbeMatch, `missing probe JSON in bash output: ${parentBashMsg.content}`);
+          const parentProbe = JSON.parse(parentProbeMatch[0]);
+          assert.deepEqual(parentProbe.leakedKeys, []);
+          assert.equal(parentProbe.fsError, 'ERR_ACCESS_DENIED');
+          assert.equal(parentProbe.fetchError, 'ERR_SANDBOX_NETWORK_BLOCKED');
+
+          // 2. Child created via direct.createSession inherits sandbox & forcedToolDeny
+          const childSession = direct.createSession({
+            title: 'Benchmark Child Session',
+            parentSessionId: benchSession.id,
+            workspaceRoot: ws,
+            permissionMode: 'full-access',
+          });
+          assert.ok(childSession.toolDeny.includes('start_process'));
+          assert.ok(childSession.toolDeny.includes('web_fetch'));
+          assert.ok(childSession.toolDeny.includes('web_search'));
+          assert.equal(direct.sessionSandboxes.has(childSession.id), true);
+
+          // 3. Descendant created via sessionRepo.createSession (bypassing direct.createSession) still inherits via #resolveSessionSandboxConfig
+          const repoDescendant = direct.sessionRepo.createSession({
+            title: 'Repo Descendant Session',
+            parentSessionId: childSession.id,
+            rootSessionId: benchSession.id,
+            workspaceRoot: ws,
+            permissionMode: 'full-access',
+          });
+          const descTurn = direct.startTurn(repoDescendant.id, {
+            input: 'RUN_DESCENDANT_BENCH_CHECK',
+            permissionMode: 'full-access',
+          });
+          const descDone = await waitTurnDone(direct, repoDescendant.id, descTurn.turn.id);
+          assert.equal(descDone.state, 'completed');
+
+          const descReceipts = store.db
+            .prepare('SELECT toolName, status, errorCode FROM tool_receipts WHERE sessionId=? AND turnId=?')
+            .all(repoDescendant.id, descTurn.turn.id);
+          const descSpReceipt = descReceipts.find((r) => r.toolName === 'start_process');
+          assert.equal(descSpReceipt?.status, 'rejected_before_effect');
+          assert.equal(descSpReceipt?.errorCode, 'POLICY_DENIED');
+
+          const descBashMsg = direct
+            .listMessages(repoDescendant.id)
+            .find((m) => m.role === 'tool' && m.toolName === 'bash');
+          assert.ok(descBashMsg);
+          const descProbe = JSON.parse(/\{.*"leakedKeys".*\}/.exec(descBashMsg.content)[0]);
+          assert.deepEqual(descProbe.leakedKeys, []);
+          assert.equal(descProbe.fsError, 'ERR_ACCESS_DENIED');
+          assert.equal(descProbe.fetchError, 'ERR_SANDBOX_NETWORK_BLOCKED');
+
+          // 4. ChildAgentManager.spawn inherits sandbox, disables hooks, and enforces forcedToolDeny even when allowedTools requests them
+          const spawned = await direct.childManager.spawn({
+            parentSessionId: benchSession.id,
+            objective: 'RUN_CHILD_MANAGER_CHECK',
+            workspaceRoot: ws,
+            permissionMode: 'full-access',
+            parentPermissionMode: 'full-access',
+            isolationMode: 'shared_workspace',
+            allowedTools: ['read_file', 'bash', 'start_process', 'web_fetch', 'web_search'],
+          });
+          assert.equal(spawned.status, 'completed');
+          const childBashMsg = direct
+            .listMessages(spawned.childSessionId)
+            .find((m) => m.role === 'tool' && m.toolName === 'bash');
+          assert.ok(childBashMsg);
+          const childProbe = JSON.parse(/\{.*"leakedKeys".*\}/.exec(childBashMsg.content)[0]);
+          assert.deepEqual(childProbe.leakedKeys, []);
+          assert.equal(childProbe.fsError, 'ERR_ACCESS_DENIED');
+          assert.equal(childProbe.fetchError, 'ERR_SANDBOX_NETWORK_BLOCKED');
+
+          for (const toolList of seenToolsByCall) {
+            assert.equal(toolList.includes('start_process'), false);
+            assert.equal(toolList.includes('web_fetch'), false);
+            assert.equal(toolList.includes('web_search'), false);
+            assert.equal(toolList.includes('bash'), true);
+          }
+          assert.equal(mcpDiscoverCalls, 0);
+          assert.equal(existsSync(hookCanary), false);
+          assert.equal(existsSync(mcpCanary), false);
+          assert.equal(direct.processManager.processes.size, 0);
+          assert.equal(canary.getHits(), 0);
+        });
+      } finally {
+        await direct.close();
+        store.close();
+        await canary.close();
+      }
+    });
+
+    test('createDirectRuntimeAdapter fails closed on unavailable sandbox and supports synthetic workspace paths', async () => {
+      const recorded = [];
+      const fakeDirectAgent = {
+        createSession(opts) {
+          recorded.push({ kind: 'createSession', opts });
+          return { id: `sess-${recorded.length}` };
+        },
+        startTurn(sessionId, opts) {
+          recorded.push({ kind: 'startTurn', sessionId, opts });
+          return { turn: { id: `turn-${recorded.length}` } };
+        },
+        listTurns() {
+          return [{ id: 'turn-2', state: 'completed', verdict: null, evidenceCount: 0 }];
+        },
+        listMessages() {
+          return [];
+        },
+        cancelTurn() {},
+      };
+
+      const engTask = createRealEngineeringDataset()[0];
+      const unavailableSandbox = new BenchmarkSandbox({
+        mode: SANDBOX_MODES.AUTO,
+        probes: {
+          docker: { available: false, reason: 'sim' },
+          nodePermission: { available: false, reason: 'sim' },
+        },
+      });
+      const failingAdapter = createDirectRuntimeAdapter(fakeDirectAgent, {
+        model: 'test-model',
+        sandbox: unavailableSandbox,
+      });
+      const failHandle = failingAdapter({
+        task: engTask,
+        workspaceRoot: '/tmp/ws-eng',
+        context: {},
+      });
+      await assert.rejects(
+        () => failHandle.run(),
+        (err) => err instanceof SandboxUnavailableError && err.code === 'E_SANDBOX_UNAVAILABLE',
+      );
+      assert.equal(recorded.length, 0);
+
+      const availableSandbox = new BenchmarkSandbox({
+        mode: SANDBOX_MODES.NODE_PERMISSION,
+      });
+      const okAdapter = createDirectRuntimeAdapter(fakeDirectAgent, {
+        model: 'test-model',
+        sandbox: availableSandbox,
+      });
+      const okHandle = okAdapter({
+        task: engTask,
+        workspaceRoot: '/tmp/ws-eng',
+        context: {},
+      });
+      await okHandle.run();
+      assert.equal(recorded[0].kind, 'createSession');
+      assert.equal(recorded[0].opts.sandboxProfile, 'benchmark');
+      assert.ok(recorded[0].opts.sandbox instanceof BenchmarkSandbox);
+      assert.deepEqual(recorded[0].opts.toolDeny, ['web_fetch', 'web_search', 'start_process']);
+    });
+  });
+
+  describe('Group 10: Normal 4 OSS Benchmarks Inside Sandbox & Windows 8.3 Short-Path Check', () => {
+    function writeTreeFiles(dir, files) {
+      for (const [rel, content] of Object.entries(files)) {
+        const abs = join(dir, rel);
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, content, 'utf8');
+      }
+    }
+
+    function commitAllGit(dir, message) {
+      execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' });
+      execFileSync(
+        'git',
+        [
+          '-c',
+          'user.email=test@agent-us.invalid',
+          '-c',
+          'user.name=Agent_US Test',
+          'commit',
+          '-qm',
+          message,
+        ],
+        { cwd: dir, stdio: 'ignore' },
+      );
+      return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' })
+        .trim()
+        .toLowerCase();
+    }
+
+    function createBareRepo(parentDir, name, commitSequence) {
+      const work = join(parentDir, `${name}-work`);
+      const bare = join(parentDir, `${name}.git`);
+      mkdirSync(work, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: work, stdio: 'ignore' });
+      execFileSync('git', ['config', 'user.email', 'test@agent-us.invalid'], { cwd: work, stdio: 'ignore' });
+      execFileSync('git', ['config', 'user.name', 'Agent_US Test'], { cwd: work, stdio: 'ignore' });
+      const shas = [];
+      for (const step of commitSequence) {
+        writeTreeFiles(work, step.files);
+        shas.push(commitAllGit(work, step.message));
+      }
+      execFileSync('git', ['clone', '--quiet', '--bare', work, bare], { stdio: 'ignore' });
+      rmSync(work, { recursive: true, force: true });
+      return { barePath: bare, bareUrl: pathToFileURL(bare).href, shas };
+    }
+
+    function buildHermeticOssMirrors(root) {
+      const nanoidRepo = createBareRepo(root, 'nanoid', [
+        {
+          message: 'chore: init',
+          files: {
+            'package.json': JSON.stringify({ name: 'nanoid', version: '6.0.2', type: 'module' }, null, 2),
+            'url-alphabet/index.js': "export let urlAlphabet = 'useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict';\n",
+          },
+        },
+        {
+          message: 'feat: core',
+          files: {
+            'index.js': `import { urlAlphabet } from './url-alphabet/index.js';
+export { urlAlphabet };
+export function nanoid(size = 21) {
+  let id = '';
+  let bytes = crypto.getRandomValues(new Uint8Array((size |= 0)));
+  if (size < 0) throw new RangeError('Wrong ID size');
+  while (size--) id += urlAlphabet[bytes[size] & 63];
+  return id;
+}
+export function customAlphabet(alphabet, defaultSize = 21) {
+  return (size = defaultSize) => {
+    size |= 0;
+    if (size < 0) throw new RangeError('Wrong ID size');
+    let id = '';
+    let bytes = crypto.getRandomValues(new Uint8Array(size));
+    while (size--) id += alphabet[bytes[size] % alphabet.length];
+    return id;
+  };
+}
+`,
+            'index.browser.js': `import { urlAlphabet } from './url-alphabet/index.js';
+export { urlAlphabet };
+export function nanoid(size = 21) {
+  let id = '';
+  let bytes = crypto.getRandomValues(new Uint8Array((size |= 0)));
+  if (size < 0) throw new RangeError('Wrong ID size');
+  while (size--) id += urlAlphabet[bytes[size] & 63];
+  return id;
+}
+export function customAlphabet(alphabet, defaultSize = 21) {
+  return (size = defaultSize) => {
+    size |= 0;
+    if (size < 0) throw new RangeError('Wrong ID size');
+    let id = '';
+    let bytes = crypto.getRandomValues(new Uint8Array(size));
+    while (size--) id += alphabet[bytes[size] % alphabet.length];
+    return id;
+  };
+}
+`,
+            'non-secure/index.js': `import { urlAlphabet } from '../url-alphabet/index.js';
+export function nanoid(size = 21) {
+  let id = '';
+  let i = size | 0;
+  while (i--) id += urlAlphabet[(Math.random() * 64) | 0];
+  return id;
+}
+`,
+          },
+        },
+        {
+          message: 'feat: cli and baseline tests',
+          files: {
+            'bin/nanoid.js': `#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { customAlphabet, nanoid } from '../index.js';
+function print(msg) { process.stdout.write(msg + '\\n'); }
+function error(msg) { process.stderr.write(msg + '\\n'); process.exit(1); }
+if (process.argv.includes('--version') || process.argv.includes('-v')) {
+  print(JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')).version);
+  process.exit(0);
+}
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  print('Usage\\n  $ nanoid [options]\\n\\nOptions\\n  -s, --size\\n  -a, --alphabet\\n  -v, --version\\n  -h, --help');
+  process.exit(0);
+}
+let alphabet, size;
+for (let i = 2; i < process.argv.length; i++) {
+  let arg = process.argv[i];
+  if (arg === '--size' || arg === '-s') {
+    size = Number(process.argv[++i]);
+    if (!Number.isInteger(size) || size <= 0) error('Size must be positive integer');
+  } else if (arg === '--alphabet' || arg === '-a') {
+    alphabet = process.argv[++i];
+  } else error('Unknown argument ' + arg);
+}
+print(alphabet ? customAlphabet(alphabet, size)() : nanoid(size));
+`,
+            'test/index.test.js': "import test from 'node:test'; import assert from 'node:assert/strict'; import * as node from '../index.js'; import * as browser from '../index.browser.js'; test('baseline nanoid', () => { assert.equal(node.nanoid(10).length, 10); assert.equal(browser.nanoid(10).length, 10); });\n",
+            'test/non-secure.test.js': "import test from 'node:test'; import assert from 'node:assert/strict'; import { nanoid } from '../non-secure/index.js'; test('baseline non-secure', () => { assert.equal(nanoid(8).length, 8); });\n",
+            'test/pool.test.js': "import test from 'node:test'; import assert from 'node:assert/strict'; import { nanoid } from '../index.js'; test('baseline pool', () => { assert.equal(nanoid(64).length, 64); });\n",
+            'test/bin.test.js': "import test from 'node:test'; import assert from 'node:assert/strict'; import { execFileSync } from 'node:child_process'; test('baseline bin', () => { const out = execFileSync(process.execPath, ['bin/nanoid.js'], { encoding: 'utf8' }); assert.equal(out.trim().length, 21); });\n",
+          },
+        },
+        { message: 'docs: post-pin', files: { 'CHANGELOG.md': '# future\n' } },
+      ]);
+
+      const troughRepo = createBareRepo(root, 'trough', [
+        {
+          message: 'chore: init',
+          files: {
+            'package.json': JSON.stringify({ name: 'trough', version: '2.2.0', type: 'module', exports: './index.js' }, null, 2),
+          },
+        },
+        {
+          message: 'feat: pipeline',
+          files: {
+            'index.js': "export { trough, wrap } from './lib/index.js';\n",
+            'lib/index.js': `export function trough() {
+  const fns = [];
+  const pipeline = { run, use };
+  return pipeline;
+  function run(...values) {
+    let middlewareIndex = -1;
+    const callback = values.pop();
+    if (typeof callback !== 'function') throw new TypeError('Expected function as last argument');
+    next(null, ...values);
+    function next(error, ...output) {
+      const fn = fns[++middlewareIndex];
+      let index = -1;
+      if (error) { callback(error); return; }
+      while (++index < values.length) {
+        if (output[index] === null || output[index] === undefined) output[index] = values[index];
+      }
+      values = output;
+      if (fn) wrap(fn, next)(...output);
+      else callback(null, ...output);
+    }
+  }
+  function use(fn) {
+    if (typeof fn !== 'function') throw new TypeError('Expected fn to be a function');
+    fns.push(fn);
+    return pipeline;
+  }
+}
+export function wrap(middleware, callback) {
+  let called = false;
+  return function wrapped(...parameters) {
+    const fnExpectsCallback = middleware.length > parameters.length;
+    if (fnExpectsCallback) parameters.push(done);
+    let result;
+    try { result = middleware.apply(this, parameters); } catch (err) {
+      if (fnExpectsCallback && called) throw err;
+      return done(err);
+    }
+    if (!fnExpectsCallback) {
+      if (result && typeof result.then === 'function') result.then((v) => done(null, v), done);
+      else if (result instanceof Error) done(result);
+      else done(null, result);
+    }
+  };
+  function done(err, ...out) {
+    if (!called) { called = true; callback(err, ...out); }
+  }
+}
+`,
+          },
+        },
+        {
+          message: 'test: baseline',
+          files: {
+            'test.js': `import assert from 'node:assert/strict';
+import test from 'node:test';
+import { trough } from 'trough';
+test('exports', async () => {
+  assert.deepEqual(Object.keys(await import('trough')).sort(), ['trough', 'wrap']);
+});
+test('baseline run', async () => {
+  let out;
+  trough().use((v) => v + '1').run('a', (e, v) => { assert.ifError(e); out = v; });
+  assert.equal(out, 'a1');
+});
+`,
+          },
+        },
+        { message: 'docs: post-pin', files: { 'README.md': '# trough\n' } },
+      ]);
+
+      const contentTypeRepo = createBareRepo(root, 'fast-content-type-parse', [
+        {
+          message: 'chore: init',
+          files: {
+            'package.json': JSON.stringify({ name: 'fast-content-type-parse', version: '3.0.0', type: 'commonjs' }, null, 2),
+          },
+        },
+        {
+          message: 'feat: parse',
+          files: {
+            'index.js': `'use strict';
+const NullObject = function NullObject() {};
+NullObject.prototype = Object.create(null);
+const defaultContentType = Object.freeze({ type: '', parameters: Object.freeze(new NullObject()) });
+const TCHAR_RE = /^[!#$%&'*+\\-.^_\\\`|~0-9a-zA-Z]+$/;
+function parse(header) {
+  if (typeof header !== 'string') throw new TypeError('argument header is required and must be a string');
+  const trimmed = header.trim();
+  const semi = trimmed.indexOf(';');
+  const typePart = (semi === -1 ? trimmed : trimmed.slice(0, semi)).trim();
+  const slash = typePart.indexOf('/');
+  if (slash <= 0 || slash === typePart.length - 1 || typePart.indexOf('/', slash + 1) !== -1) throw new TypeError('invalid media type');
+  const main = typePart.slice(0, slash);
+  const sub = typePart.slice(slash + 1);
+  if (!TCHAR_RE.test(main) || !TCHAR_RE.test(sub)) throw new TypeError('invalid media type');
+  const parameters = new NullObject();
+  if (semi !== -1) {
+    let i = semi + 1;
+    while (i < trimmed.length) {
+      while (i < trimmed.length && (trimmed[i] === ' ' || trimmed[i] === '\\t' || trimmed[i] === ';')) i++;
+      if (i >= trimmed.length) break;
+      const eq = trimmed.indexOf('=', i);
+      if (eq === -1) throw new TypeError('invalid parameter format');
+      const k = trimmed.slice(i, eq).toLowerCase();
+      if (!TCHAR_RE.test(k)) throw new TypeError('invalid parameter format');
+      i = eq + 1;
+      let v = '';
+      if (trimmed[i] === '"') {
+        i++;
+        while (i < trimmed.length && trimmed[i] !== '"') {
+          if (trimmed[i] === '\\\\' && i + 1 < trimmed.length) { v += trimmed[++i]; i++; }
+          else { v += trimmed[i++]; }
+        }
+        if (trimmed[i] !== '"') throw new TypeError('invalid parameter format');
+        i++;
+      } else {
+        const end = trimmed.indexOf(';', i);
+        const rawEnd = end === -1 ? trimmed.length : end;
+        v = trimmed.slice(i, rawEnd).trim();
+        if (!TCHAR_RE.test(v)) throw new TypeError('invalid parameter format');
+        i = rawEnd;
+      }
+      if (parameters[k] === undefined) parameters[k] = v;
+    }
+  }
+  return { type: typePart.toLowerCase(), parameters };
+}
+function safeParse(header) { try { return parse(header); } catch { return defaultContentType; } }
+module.exports.default = { parse, safeParse };
+module.exports.parse = parse;
+module.exports.safeParse = safeParse;
+module.exports.defaultContentType = defaultContentType;
+`,
+          },
+        },
+        {
+          message: 'test: baseline',
+          files: {
+            'test/index.test.js': `'use strict';
+const { test } = require('node:test');
+const { parse, safeParse } = require('..');
+test('baseline parse', (t) => {
+  const parsed = parse('Text/HTML; Charset="UTF-8"');
+  t.assert.equal(parsed.type, 'text/html');
+  t.assert.equal(parsed.parameters.charset, 'UTF-8');
+  t.assert.equal(safeParse('bad').type, '');
+});
+`,
+          },
+        },
+        { message: 'docs: post-pin', files: { 'README.md': '# ctp\n' } },
+      ]);
+
+      const nanoeventsRepo = createBareRepo(root, 'nanoevents', [
+        {
+          message: 'chore: init',
+          files: {
+            'package.json': JSON.stringify({ name: 'nanoevents', version: '9.1.0', type: 'module', types: './index.d.ts' }, null, 2),
+          },
+        },
+        {
+          message: 'feat: emitter',
+          files: {
+            'index.js': `export let createNanoEvents = () => ({
+  emit(event, ...args) {
+    for (let callbacks = this.events[event] || [], i = 0, length = callbacks.length; i < length; i++) {
+      callbacks[i](...args);
+    }
+  },
+  events: {},
+  on(event, cb) {
+    (this.events[event] ||= []).push(cb);
+    return () => {
+      this.events[event] = this.events[event]?.filter((i) => cb !== i);
+    };
+  },
+});
+`,
+            'index.d.ts': `export interface Emitter<Events = any> {
+  emit(event: string, ...args: any[]): void;
+  events: Record<string, any[]>;
+  on(event: string, cb: (...args: any[]) => void): () => void;
+}
+export function createNanoEvents(): Emitter;
+`,
+          },
+        },
+        {
+          message: 'test: baseline',
+          files: {
+            'test/index.test.ts': `import { deepStrictEqual, equal } from 'node:assert';
+import { test } from 'node:test';
+import { createNanoEvents } from '../index.js';
+test('baseline emitter', () => {
+  const ee = createNanoEvents();
+  deepStrictEqual(ee.events, {});
+  let count = 0;
+  const off = ee.on('tick', (n: number) => { count += n; });
+  ee.emit('tick', 2);
+  off();
+  ee.emit('tick', 3);
+  equal(count, 2);
+});
+`,
+          },
+        },
+        { message: 'docs: post-pin', files: { 'README.md': '# nanoevents\n' } },
+      ]);
+
+      return {
+        'oss-nanoid-batch-cli-01': { repoUrl: nanoidRepo.barePath, commit: nanoidRepo.shas[2] },
+        'oss-trough-pipeline-01': { repoUrl: troughRepo.barePath, commit: troughRepo.shas[2] },
+        'oss-content-type-format-01': { repoUrl: contentTypeRepo.barePath, commit: contentTypeRepo.shas[2] },
+        'oss-nanoevents-hardening-01': { repoUrl: nanoeventsRepo.barePath, commit: nanoeventsRepo.shas[2] },
+      };
+    }
+
+    function applyGoldSolution(taskId, workspaceRoot) {
+      if (taskId === 'oss-nanoid-batch-cli-01') {
+        const batchImpl = `
+export function nanoidBatch(count, size = 21) {
+  if (!Number.isInteger(count) || count < 0 || count > 10000) {
+    throw new RangeError('Wrong batch count');
+  }
+  if (!Number.isInteger(size) || size < 0) {
+    throw new RangeError('Wrong ID size');
+  }
+  const out = [];
+  for (let i = 0; i < count; i += 1) {
+    out.push(nanoid(size));
+  }
+  return out;
+}
+`;
+        for (const file of ['index.js', 'index.browser.js']) {
+          const current = readFileSync(join(workspaceRoot, file), 'utf8');
+          writeFileSync(join(workspaceRoot, file), current + batchImpl, 'utf8');
+        }
+        writeFileSync(join(workspaceRoot, 'bin/nanoid.js'), `#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { customAlphabet, nanoid, nanoidBatch } from '../index.js';
+function print(msg) { process.stdout.write(msg + '\\n'); }
+function error(msg) { process.stderr.write(msg + '\\n'); process.exit(1); }
+if (process.argv.includes('--version') || process.argv.includes('-v')) {
+  print(JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')).version);
+  process.exit(0);
+}
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  print('Usage\\n  $ nanoid [options]\\n\\nOptions\\n  -s, --size       Generated ID size\\n  -a, --alphabet   Alphabet to use\\n  -c, --count      Number of IDs to generate\\n  -v, --version    Show version number\\n  -h, --help       Show this help');
+  process.exit(0);
+}
+let alphabet, size, count = 1;
+const args = process.argv.slice(2);
+for (let i = 0; i < args.length; i += 1) {
+  const raw = args[i];
+  const eq = raw.indexOf('=');
+  const flag = eq === -1 ? raw : raw.slice(0, eq);
+  const readVal = () => {
+    if (eq !== -1) return raw.slice(eq + 1);
+    if (i + 1 >= args.length) error('Missing value for ' + flag);
+    return args[++i];
+  };
+  if (flag === '--size' || flag === '-s') {
+    const val = readVal();
+    if (!val.trim()) error('Size must be positive integer');
+    size = Number(val);
+    if (!Number.isInteger(size) || size <= 0) error('Size must be positive integer');
+  } else if (flag === '--alphabet' || flag === '-a') {
+    alphabet = readVal();
+    if (!alphabet) error('Alphabet must be non-empty');
+  } else if (flag === '--count' || flag === '-c') {
+    const val = readVal();
+    if (!val.trim()) error('Count must be integer 1..10000');
+    count = Number(val);
+    if (!Number.isInteger(count) || count < 1 || count > 10000) error('Count must be integer 1..10000');
+  } else {
+    error('Unknown argument ' + raw);
+  }
+}
+if (alphabet) {
+  const gen = customAlphabet(alphabet, size);
+  for (let i = 0; i < count; i += 1) print(gen());
+} else {
+  for (const id of nanoidBatch(count, size)) print(id);
+}
+`, 'utf8');
+        writeFileSync(join(workspaceRoot, 'test/batch.test.js'), `import test from 'node:test';
+import assert from 'node:assert/strict';
+import { nanoidBatch } from '../index.js';
+test('nanoidBatch generates requested count', () => {
+  assert.equal(nanoidBatch(3, 8).length, 3);
+  assert.throws(() => nanoidBatch(-1), RangeError);
+});
+`, 'utf8');
+        return;
+      }
+
+      if (taskId === 'oss-trough-pipeline-01') {
+        writeFileSync(join(workspaceRoot, 'lib/index.js'), `export function trough() {
+  const fns = [];
+  const pipeline = { clone, prepend, run, runAsync, use };
+  return pipeline;
+  function clone() {
+    const copy = trough();
+    for (const fn of fns) copy.use(fn);
+    return copy;
+  }
+  function prepend(fn) {
+    if (typeof fn !== 'function') throw new TypeError('Expected fn to be a function');
+    fns.unshift(fn);
+    return pipeline;
+  }
+  function run(...values) {
+    let middlewareIndex = -1;
+    const callback = values.pop();
+    if (typeof callback !== 'function') throw new TypeError('Expected function as last argument');
+    next(null, ...values);
+    function next(error, ...output) {
+      const fn = fns[++middlewareIndex];
+      let index = -1;
+      if (error) { callback(error); return; }
+      while (++index < values.length) {
+        if (output[index] === null || output[index] === undefined) output[index] = values[index];
+      }
+      values = output;
+      if (fn) wrap(fn, next)(...output);
+      else callback(null, ...output);
+    }
+  }
+  function runAsync(...values) {
+    const arity = values.length;
+    return new Promise((resolve, reject) => {
+      run(...values, (error, ...output) => {
+        if (error) reject(error);
+        else if (arity <= 1) resolve(output[0]);
+        else resolve(output);
+      });
+    });
+  }
+  function use(fn) {
+    if (typeof fn !== 'function') throw new TypeError('Expected fn to be a function');
+    fns.push(fn);
+    return pipeline;
+  }
+}
+export function wrap(middleware, callback) {
+  let called = false;
+  return function wrapped(...parameters) {
+    const fnExpectsCallback = middleware.length > parameters.length;
+    if (fnExpectsCallback) parameters.push(done);
+    let result;
+    try { result = middleware.apply(this, parameters); } catch (err) {
+      if (fnExpectsCallback && called) throw err;
+      return done(err);
+    }
+    if (!fnExpectsCallback) {
+      if (result && typeof result.then === 'function') result.then((v) => done(null, v), done);
+      else if (result instanceof Error) done(result);
+      else done(null, result);
+    }
+  };
+  function done(err, ...out) {
+    if (!called) { called = true; callback(err, ...out); }
+  }
+}
+`, 'utf8');
+        mkdirSync(join(workspaceRoot, 'test'), { recursive: true });
+        writeFileSync(join(workspaceRoot, 'test/extensions.test.js'), `import test from 'node:test';
+import assert from 'node:assert/strict';
+import { trough } from '../index.js';
+test('clone, prepend, runAsync', async () => {
+  const p = trough().use((x) => x + 1);
+  const p2 = p.clone().prepend((x) => x * 2);
+  assert.equal(await p.runAsync(3), 4);
+  assert.equal(await p2.runAsync(3), 7);
+});
+`, 'utf8');
+        return;
+      }
+
+      if (taskId === 'oss-content-type-format-01') {
+        const current = readFileSync(join(workspaceRoot, 'index.js'), 'utf8');
+        const addition = `
+function isValidQuotedCharCode(code) {
+  return code === 0x09 || code === 0x20 || code === 0x21 || code === 0x22 || (code >= 0x23 && code <= 0x5b) || code === 0x5c || (code >= 0x5d && code <= 0x7e) || (code >= 0x80 && code <= 0xff);
+}
+function format(contentType) {
+  if (!contentType || typeof contentType !== 'object' || Array.isArray(contentType)) {
+    throw new TypeError('contentType must be an object');
+  }
+  if (typeof contentType.type !== 'string') throw new TypeError('invalid media type');
+  const slash = contentType.type.indexOf('/');
+  if (slash <= 0 || slash === contentType.type.length - 1 || contentType.type.indexOf('/', slash + 1) !== -1) {
+    throw new TypeError('invalid media type');
+  }
+  const main = contentType.type.slice(0, slash);
+  const sub = contentType.type.slice(slash + 1);
+  if (!TCHAR_RE.test(main) || !TCHAR_RE.test(sub)) throw new TypeError('invalid media type');
+  let out = contentType.type.toLowerCase();
+  if (contentType.parameters === undefined) return out;
+  if (!contentType.parameters || typeof contentType.parameters !== 'object' || Array.isArray(contentType.parameters)) {
+    throw new TypeError('parameters must be an object');
+  }
+  const seen = new Set();
+  for (const rawKey of Object.keys(contentType.parameters)) {
+    const key = rawKey.toLowerCase();
+    if (!TCHAR_RE.test(key)) throw new TypeError('invalid parameter name');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const rawVal = contentType.parameters[rawKey];
+    if (typeof rawVal !== 'string' && typeof rawVal !== 'number' && typeof rawVal !== 'boolean') {
+      throw new TypeError('invalid parameter value');
+    }
+    const str = String(rawVal);
+    for (let i = 0; i < str.length; i += 1) {
+      if (!isValidQuotedCharCode(str.charCodeAt(i))) throw new TypeError('invalid parameter value');
+    }
+    const serialized = str.length > 0 && TCHAR_RE.test(str)
+      ? str
+      : '"' + str.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"') + '"';
+    out += '; ' + key + '=' + serialized;
+  }
+  return out;
+}
+module.exports.format = format;
+module.exports.default.format = format;
+`;
+        writeFileSync(join(workspaceRoot, 'index.js'), current + addition, 'utf8');
+        writeFileSync(join(workspaceRoot, 'test/format.test.js'), `'use strict';
+const { test } = require('node:test');
+const { format, parse } = require('..');
+test('format round-trips', (t) => {
+  const header = format({ type: 'Text/HTML', parameters: { Charset: 'utf-8', title: 'hi "you"' } });
+  t.assert.deepEqual(parse(header), { type: 'text/html', parameters: Object.assign(Object.create(null), { charset: 'utf-8', title: 'hi "you"' }) });
+});
+`, 'utf8');
+        return;
+      }
+
+      if (taskId === 'oss-nanoevents-hardening-01') {
+        writeFileSync(join(workspaceRoot, 'index.js'), `const hasOwn = Object.hasOwn;
+
+function ensureList(events, event) {
+  if (!hasOwn(events, event)) {
+    Object.defineProperty(events, event, {
+      value: [],
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  return events[event];
+}
+
+export let createNanoEvents = () => ({
+  emit(event, ...args) {
+    const callbacks = hasOwn(this.events, event) ? this.events[event] : [];
+    for (let i = 0, length = callbacks.length; i < length; i++) {
+      callbacks[i](...args);
+    }
+  },
+  events: {},
+  on(event, cb) {
+    if (typeof cb !== 'function') throw new TypeError('Listener must be a function');
+    ensureList(this.events, event).push(cb);
+    return () => {
+      if (!hasOwn(this.events, event)) return;
+      Object.defineProperty(this.events, event, {
+        value: this.events[event].filter((i) => cb !== i),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    };
+  },
+  once(event, cb) {
+    if (typeof cb !== 'function') throw new TypeError('Listener must be a function');
+    let unbind = () => {};
+    const wrapper = (...args) => {
+      unbind();
+      cb(...args);
+    };
+    unbind = this.on(event, wrapper);
+    return unbind;
+  },
+  clear(event) {
+    if (event === undefined) {
+      this.events = {};
+      return;
+    }
+    if (hasOwn(this.events, event)) {
+      delete this.events[event];
+    }
+  },
+});
+`, 'utf8');
+        writeFileSync(join(workspaceRoot, 'index.d.ts'), `export interface Emitter<Events = any> {
+  emit(event: string, ...args: any[]): void;
+  events: Record<string, any[]>;
+  on(event: string, cb: (...args: any[]) => void): () => void;
+  once(event: string, cb: (...args: any[]) => void): () => void;
+  clear(event?: string): void;
+}
+export function createNanoEvents(): Emitter;
+`, 'utf8');
+        writeFileSync(join(workspaceRoot, 'test/hardening.test.ts'), `import { deepStrictEqual, equal, throws } from 'node:assert';
+import { test } from 'node:test';
+import { createNanoEvents } from '../index.js';
+test('prototype safety, once, and clear', () => {
+  const ee = createNanoEvents();
+  throws(() => ee.on('a', null as any), TypeError);
+  let total = 0;
+  ee.once('__proto__', (n: number) => { total += n; });
+  ee.emit('__proto__', 5);
+  ee.emit('__proto__', 5);
+  equal(total, 5);
+  ee.clear();
+  deepStrictEqual(ee.events, {});
+});
+`, 'utf8');
+      }
+    }
+
+    function buildOssJudgePayload(task, workspaceRoot) {
+      const cmdStr = task.metadata.acceptanceCriteria.testCommand.join(' ');
+      return {
+        output: {
+          output: {
+            schemaVersion: '1.0.0',
+            taskId: task.id,
+            attemptId: 'attempt-1',
+            planVersion: 1,
+            summary: `Completed ${task.id} inside BenchmarkSandbox`,
+            changedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
+            testCommand: cmdStr,
+            testExitCode: 0,
+            testEvidence: [{ command: cmdStr, exitCode: 0 }],
+            artifactRefs: [],
+          },
+        },
+        context: {
+          workspaceRoot,
+          attemptId: 'attempt-1',
+          planVersion: 1,
+          toolReceipts: [
+            {
+              id: `receipt-${task.id}`,
+              toolName: 'bash',
+              status: 'finished',
+              exitCode: 0,
+              command: cmdStr,
+            },
+          ],
+          trustedVerdict: {
+            status: 'pass',
+            source: 'trusted_server_verifier',
+            evidenceRefs: [`receipt-${task.id}`],
+          },
+        },
+      };
+    }
+
+    test('all 4 OSS benchmarks pass strictly inside BenchmarkSandbox and reject unpinned/postinstall dependencies', async () => {
+      const { dir } = makeCaseDir('g10-oss');
+      const mirrorRoot = join(dir, 'mirrors');
+      const cacheDir = join(dir, 'cache');
+      mkdirSync(mirrorRoot, { recursive: true });
+      mkdirSync(cacheDir, { recursive: true });
+
+      const overrides = buildHermeticOssMirrors(mirrorRoot);
+      const cachedOverrides = Object.fromEntries(
+        Object.entries(overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
+      );
+      const sandbox = new BenchmarkSandbox({
+        mode: SANDBOX_MODES.NODE_PERMISSION,
+      });
+      const tasks = createOssBenchmarkDataset({
+        repoOverrides: cachedOverrides,
+        sandbox,
+      });
+      assert.equal(tasks.length, 4);
+
+      await Promise.all(
+        tasks.map(async (task) => {
+          assert.equal(
+            Boolean(task.metadata?.sandboxIsolation?.allowWorkspaceNodeCli),
+            task.id === 'oss-nanoid-batch-cli-01',
+          );
+          const ws = await createFixtureWorkspace(task, { cacheDir, sandbox });
+          try {
+            applyGoldSolution(task.id, ws);
+            const { output, context } = buildOssJudgePayload(task, ws);
+            const verdict = await task.judge({ task, output, context });
+
+            assert.equal(
+              verdict.passed,
+              true,
+              `${task.id} failed inside sandbox: ${JSON.stringify(verdict.evidence)}`,
+            );
+            assert.equal(verdict.score, 1);
+            assert.equal(verdict.evidence.sandboxIsolated, true);
+            assert.equal(verdict.evidence.sandboxBackend, SANDBOX_MODES.NODE_PERMISSION);
+            assert.equal(verdict.evidence.dependencyPolicyPassed, true);
+            assert.equal(verdict.evidence.checks.sandboxIsolated, true);
+            assert.equal(verdict.evidence.checks.dependencyPolicyPassed, true);
+            assert.equal(verdict.evidence.checks.hiddenAcceptancePassed, true);
+            assert.equal(verdict.evidence.checks.baselineTestsPassed, true);
+
+            if (task.id === 'oss-trough-pipeline-01') {
+              const pkgPath = join(ws, 'package.json');
+              const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+              pkg.dependencies = { 'evil-dep': '^1.0.0' };
+              pkg.scripts = { postinstall: 'node -e "process.exit(0)"' };
+              writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), 'utf8');
+
+              const rejected = await task.judge({ task, output, context });
+              assert.equal(rejected.passed, false);
+              assert.equal(rejected.evidence.dependencyPolicyPassed, false);
+              assert.equal(rejected.evidence.checks.dependencyPolicyPassed, false);
+              assert.ok((rejected.evidence.dependencyPolicyViolations?.length ?? 0) >= 2);
+            }
+          } finally {
+            await removeFixtureWorkspace(ws).catch(() => {});
+          }
+        }),
+      );
+    });
+
+    test('nativeRealpath, isPathInsideRoot, and NodePermissionBenchmarkSandbox handle Windows 8.3 short paths and symlink canonicalization', async () => {
+      const { dir } = makeCaseDir('g10-canon');
+      const longWs = join(dir, 'AgentUs Long Sandbox Workspace 12345');
+      mkdirSync(join(longWs, 'bin'), { recursive: true });
+      writeFileSync(
+        join(longWs, 'bin', 'cli.js'),
+        'process.stdout.write(JSON.stringify({ ok: true, cwd: process.cwd() }));',
+        'utf8',
+      );
+      writeFileSync(
+        join(longWs, 'runner.mjs'),
+        [
+          'import cp from "node:child_process";',
+          'const target = process.env.CLI_TARGET_PATH;',
+          'const out = cp.spawnSync(process.execPath, [target], { encoding: "utf8" });',
+          'if (out.status !== 0) { console.error(out.stderr); process.exit(out.status || 1); }',
+          'process.stdout.write(out.stdout);',
+        ].join('\n'),
+        'utf8',
+      );
+
+      // Dot segment and canonicalization
+      const dotWs = join(longWs, 'bin', '..');
+      assert.equal(nativeRealpath(dotWs), nativeRealpath(longWs));
+      assert.equal(
+        isPathInsideRoot(dotWs, join(longWs, 'bin', 'cli.js'), { allowEqual: false }),
+        true,
+      );
+
+      if (process.platform === 'win32') {
+        const lowerDriveWs = `${longWs.slice(0, 1).toLowerCase()}${longWs.slice(1).toUpperCase()}`;
+        assert.equal(
+          isPathInsideRoot(lowerDriveWs, join(longWs, 'bin', 'cli.js'), { allowEqual: false }),
+          true,
+        );
+
+        if (existsSync('C:\\PROGRA~1') && existsSync('C:\\Program Files')) {
+          assert.equal(
+            nativeRealpath('C:\\PROGRA~1').toLowerCase(),
+            nativeRealpath('C:\\Program Files').toLowerCase(),
+          );
+          assert.equal(
+            isPathInsideRoot('C:\\PROGRA~1', 'C:\\Program Files\\Common Files', { allowEqual: false }),
+            true,
+          );
+        }
+
+        const shortWs = execFileSync(
+          'cmd.exe',
+          ['/d', '/s', '/c', `for %I in ("${longWs}") do @echo %~sI`],
+          { encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true },
+        )
+          .trim()
+          .replace(/^"+|"+$/g, '');
+
+        const effectiveWs = shortWs && existsSync(shortWs) ? shortWs : lowerDriveWs;
+        assert.equal(
+          isPathInsideRoot(effectiveWs, join(longWs, 'bin', 'cli.js'), { allowEqual: false }),
+          true,
+        );
+
+        const sandbox = new BenchmarkSandbox({
+          mode: SANDBOX_MODES.NODE_PERMISSION,
+          workspaceRoot: effectiveWs,
+          allowWorkspaceNodeCli: true,
+        });
+        const res = await sandbox.execArgv([process.execPath, 'runner.mjs'], {
+          extraEnv: { CLI_TARGET_PATH: join(longWs, 'bin', 'cli.js') },
+        });
+        assert.equal(res.exitCode, 0, `stderr: ${res.stderr}`);
+        assert.equal(JSON.parse(res.stdout).ok, true);
+      } else {
+        const linkWs = join(dir, 'symlink-alias-ws');
+        symlinkSync(longWs, linkWs);
+        assert.equal(nativeRealpath(linkWs), nativeRealpath(longWs));
+        assert.equal(
+          isPathInsideRoot(linkWs, join(longWs, 'bin', 'cli.js'), { allowEqual: false }),
+          true,
+        );
+
+        const sandbox = new BenchmarkSandbox({
+          mode: SANDBOX_MODES.NODE_PERMISSION,
+          workspaceRoot: linkWs,
+          allowWorkspaceNodeCli: true,
+        });
+        const res = await sandbox.execArgv([process.execPath, 'runner.mjs'], {
+          extraEnv: { CLI_TARGET_PATH: join(longWs, 'bin', 'cli.js') },
+        });
+        assert.equal(res.exitCode, 0, `stderr: ${res.stderr}`);
+        assert.equal(JSON.parse(res.stdout).ok, true);
+      }
     });
   });
 });
