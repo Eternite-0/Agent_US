@@ -31,6 +31,8 @@ import {
 } from './Icons';
 import { ImageLightbox, isImagePath, toImageDataUrl, type PreviewImageItem } from './ImageLightbox';
 import { Markdown } from './Markdown';
+import type { AgentBackendClient } from '../api/client';
+import { AutonomousRunPanel } from './AutonomousRunPanel';
 
 interface InspectorDrawerProps {
   open: boolean;
@@ -40,6 +42,9 @@ interface InspectorDrawerProps {
   selectedSubagentId: string | null;
   projectName?: string;
   bundle: TaskBundle | null;
+  client: AgentBackendClient;
+  sessionId: string | null;
+  preferredRunId?: string;
   onResize: (width: number) => void;
   onChangeTab: (tab: InspectorTab) => void;
   onSelectFile: (path: string) => void;
@@ -52,6 +57,7 @@ interface InspectorDrawerProps {
 type OpenPaneTab =
   | { id: 'subagents'; kind: 'subagents'; label: string }
   | { id: 'events'; kind: 'events'; label: string }
+  | { id: 'autonomous'; kind: 'autonomous'; label: string }
   | { id: `file:${string}`; kind: 'file'; path: string; label: string };
 
 interface TreeDirNode {
@@ -143,6 +149,9 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   selectedSubagentId,
   projectName = 'Agent_US',
   bundle,
+  client,
+  sessionId,
+  preferredRunId,
   onResize,
   onChangeTab,
   onSelectFile,
@@ -225,6 +234,8 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     if (!open) return;
     if (tab === 'subagents') {
       ensureTab({ id: 'subagents', kind: 'subagents', label: '子智能体' });
+    } else if (tab === 'autonomous') {
+      ensureTab({ id: 'autonomous', kind: 'autonomous', label: '自主任务' });
     } else if (tab === 'events') {
       ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
     } else if (tab === 'diff' || tab === 'artifacts') {
@@ -340,6 +351,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
       setActiveTabId(next.id);
       if (next.kind === 'subagents') onChangeTab('subagents');
       else if (next.kind === 'events') onChangeTab('events');
+      else if (next.kind === 'autonomous') onChangeTab('autonomous');
       else if (next.kind === 'file') {
         onChangeTab('diff');
         if (next.path !== '__all__') onSelectFile(next.path);
@@ -476,6 +488,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
       data-resizing={resizing ? 'true' : undefined}
       style={{ width: open ? width : 0 }}
       aria-label="右侧工作区面板"
+      inert={!open}
     >
       {open && <div className="codex-drawer-resizer" onMouseDown={startResize} title="拖拽调整右侧工作区宽度" />}
 
@@ -497,6 +510,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     setActiveTabId(t.id);
                     if (t.kind === 'subagents') onChangeTab('subagents');
                     else if (t.kind === 'events') onChangeTab('events');
+                    else if (t.kind === 'autonomous') onChangeTab('autonomous');
                     else if (t.kind === 'file') {
                       onChangeTab('diff');
                       if (t.path !== '__all__') onSelectFile(t.path);
@@ -511,7 +525,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                 >
                   {t.kind === 'subagents' ? (
                     <IconAgent size={13} style={{ flex: 'none' }} />
-                  ) : t.kind === 'events' ? (
+                  ) : t.kind === 'events' || t.kind === 'autonomous' ? (
                     <IconHistory size={13} style={{ flex: 'none' }} />
                   ) : (
                     <IconFileDoc size={13} style={{ flex: 'none' }} />
@@ -551,6 +565,13 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     }}
                   >
                     <span>子智能体</span>
+                  </button>
+                  <button type="button" className="codex-popover-item" onClick={() => {
+                    setPlusMenuOpen(false);
+                    onChangeTab('autonomous');
+                    ensureTab({ id: 'autonomous', kind: 'autonomous', label: '自主任务' });
+                  }}>
+                    <span>自主任务</span>
                   </button>
                   <button
                     type="button"
@@ -607,7 +628,9 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
         </div>
 
         {/* Empty state if no active task */}
-        {!bundle ? (
+        {activePaneTab?.kind === 'autonomous' ? (
+          open && <AutonomousRunPanel key={sessionId ?? 'no-session'} client={client} sessionId={sessionId} preferredRunId={preferredRunId} />
+        ) : !bundle ? (
           <div
             style={{
               flex: 1,

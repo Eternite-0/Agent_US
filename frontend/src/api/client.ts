@@ -12,6 +12,8 @@ import type {
   EventEnvelope,
   EvaluationBenchmark,
   EvaluationRegressionSummary,
+  ExperienceMemoryRecord,
+  ModelCapabilityProfile,
   EvaluationRun,
   EvaluationStartInput,
   Evidence,
@@ -39,10 +41,13 @@ import type {
   SessionHistoryItem,
   SessionRecord,
   Submission,
+  SwarmArtifactFile,
   SwarmArtifactRecord,
+  SwarmMessageRecord,
   SwarmReplanRecord,
   SwarmRunRecord,
   SwarmSubmitResponse,
+  ChatHistoryMatch,
   Task,
   TaskBundle,
   TaskPlan,
@@ -66,6 +71,15 @@ export class ApiError extends Error {
   }
 }
 
+export interface ListTasksOptions {
+  projectId?: string;
+  limit?: number;
+  offset?: number;
+  archived?: boolean;
+  search?: string;
+  signal?: AbortSignal;
+}
+
 export interface AgentBackendClient {
   readonly isDemo: boolean;
   health(): Promise<{
@@ -78,11 +92,19 @@ export interface AgentBackendClient {
     gateway?: { running: boolean; port: number; endpoint: string };
   }>;
   getWorkspace?: () => Promise<{ workspaceRoot: string }>;
+  searchWorkspaceFiles?: (query: string, sessionId?: string, signal?: AbortSignal) => Promise<string[]>;
+  submitAutonomousGoal?: (input: {
+    goal: string;
+    sessionId?: string;
+    workspaceRoot?: string;
+    permissionMode: PermissionMode;
+  }) => Promise<{ runId: string; sessionId: string }>;
   setWorkspace?: (workspaceRoot: string) => Promise<{ workspaceRoot: string }>;
   listProjects(): Promise<Project[]>;
   createProject(name: string): Promise<Project>;
   renameProject(id: string, name: string, version: number): Promise<Project>;
-  listTasks(params?: { projectId?: string; limit?: number; offset?: number }): Promise<Task[]>;
+  listTasks(params?: ListTasksOptions): Promise<Task[]>;
+  setTaskArchived(id: string, archived: boolean): Promise<Task>;
   getTask(id: string): Promise<Task>;
   submitTask(submission: Submission): Promise<Task>;
   submitFollowupTurn?: (
@@ -107,10 +129,7 @@ export interface AgentBackendClient {
     sessionId: string,
     opts?: { turnId?: string; scope?: 'code' | 'conversation' | 'both' },
   ) => Promise<{ ok: boolean; restoredFiles: string[]; removedMessages: number; scope: string }>;
-  searchHistory?: (
-    query: string,
-    limit?: number,
-  ) => Promise<{ items: Array<{ sessionId: string; sessionTitle: string; role: string; snippet: string; createdAt: number }> }>;
+  searchHistory?: (query: string, limit?: number, signal?: AbortSignal) => Promise<{ items: ChatHistoryMatch[] }>;
   controlTask(
     id: string,
     action: 'pause' | 'resume' | 'cancel' | 'retry',
@@ -130,7 +149,7 @@ export interface AgentBackendClient {
   ) => Promise<Record<string, unknown>>;
   getRuntimeOverview?: () => Promise<RuntimeOverviewRecord>;
   getSessionReceipts?: (sessionId: string) => Promise<ToolReceiptRecord[]>;
-  listSwarmRuns?: (params?: { sessionId?: string; limit?: number }) => Promise<SwarmRunRecord[]>;
+  listSwarmRuns?: (params?: { sessionId?: string; limit?: number; signal?: AbortSignal }) => Promise<SwarmRunRecord[]>;
   submitSwarmRun?: (input: {
     goal: string;
     sessionId?: string;
@@ -144,20 +163,23 @@ export interface AgentBackendClient {
   }) => Promise<SwarmSubmitResponse>;
   getSwarmRun?: (id: string) => Promise<SwarmRunRecord>;
   resumeSwarmRun?: (id: string) => Promise<SwarmRunRecord>;
-  listSwarmReplans?: (id: string) => Promise<SwarmReplanRecord[]>;
+  cancelSwarmRun?: (id: string) => Promise<SwarmRunRecord>;
+  listSwarmMessages?: (runId: string, signal?: AbortSignal) => Promise<SwarmMessageRecord[]>;
+  listSwarmReplans?: (id: string, signal?: AbortSignal) => Promise<SwarmReplanRecord[]>;
   listSwarmArtifacts?: (
     runId: string,
-    params?: { nodeKey?: string; limit?: number },
+    params?: { nodeKey?: string; limit?: number; signal?: AbortSignal },
   ) => Promise<SwarmArtifactRecord[]>;
   getSwarmArtifact?: (
     runId: string,
     artifactId: string,
     path?: string,
   ) => Promise<SwarmArtifactRecord | Record<string, unknown>>;
+  readSwarmArtifactFile?: (runId: string, artifactId: string, path: string, signal?: AbortSignal) => Promise<SwarmArtifactFile>;
   verifySwarmArtifact?: (
     runId: string,
     artifactId: string,
-  ) => Promise<{ ok: boolean; artifactId: string; bundleSha256?: string; reasons?: string[] }>;
+  ) => Promise<{ ok: boolean; artifactId: string; bundleSha256?: string; errors?: string[]; checkedFiles?: number }>;
   applySwarmArtifact?: (
     runId: string,
     artifactId: string,
@@ -389,14 +411,19 @@ export interface AgentBackendClient {
     error?: string;
   }>;
   // Evaluation / Memory / Usage / Events
-  listBenchmarks?: () => Promise<EvaluationBenchmark[]>;
-  listEvaluationRuns?: (params?: { benchmarkId?: string; limit?: number }) => Promise<EvaluationRun[]>;
-  getEvaluationRun?: (id: string) => Promise<EvaluationRun>;
+  listBenchmarks?: (signal?: AbortSignal) => Promise<EvaluationBenchmark[]>;
+  listEvaluationRuns?: (params?: { benchmarkId?: string; limit?: number; signal?: AbortSignal }) => Promise<EvaluationRun[]>;
+  getEvaluationRun?: (id: string, signal?: AbortSignal) => Promise<EvaluationRun>;
   startEvaluation?: (input: EvaluationStartInput) => Promise<EvaluationRun>;
+  cancelEvaluation?: (id: string) => Promise<EvaluationRun | null>;
+  listModelCapabilities?: (signal?: AbortSignal) => Promise<ModelCapabilityProfile[]>;
+  listExperienceMemory?: (projectId: string, query: string, signal?: AbortSignal) => Promise<ExperienceMemoryRecord[]>;
+  deleteExperienceMemory?: (projectId: string, id: string) => Promise<ExperienceMemoryRecord | null>;
   getEvaluationRegression?: (params: {
     benchmarkId: string;
     baselineRunId?: string;
     candidateRunId?: string;
+    signal?: AbortSignal;
   }) => Promise<EvaluationRegressionSummary>;
   listMemory(params?: {
     projectId?: string;
@@ -624,6 +651,23 @@ export class LiveBackendClient implements AgentBackendClient {
     return data;
   }
 
+  async searchWorkspaceFiles(query: string, sessionId?: string, signal?: AbortSignal): Promise<string[]> {
+    const { items } = await this.req<{ items: string[] }>('GET', '/v1/workspace/files', {
+      query: { q: query, sessionId }, signal,
+    });
+    return items;
+  }
+
+  async submitAutonomousGoal(input: { goal: string; sessionId?: string; workspaceRoot?: string; permissionMode: PermissionMode }) {
+    try {
+      return await this.req<{ runId: string; sessionId: string }>('POST', '/v1/autonomous/runs', { body: input });
+    } catch (error) {
+      // Older servers expose the same durable Swarm through the original entry point.
+      if (!(error instanceof ApiError) || error.code !== 'HTTP_404') throw error;
+      return this.rt.submitSwarmRun(input);
+    }
+  }
+
   async setWorkspace(workspaceRoot: string) {
     const data = await this.req<{ workspaceRoot: string }>('PUT', '/v1/workspace', {
       body: { workspaceRoot },
@@ -707,6 +751,7 @@ export class LiveBackendClient implements AgentBackendClient {
       phase: typeof turn?.phase === 'string' ? turn.phase : undefined,
       evidenceCount: Number(turn?.evidenceCount ?? verdict?.evidenceCount ?? 0),
       createdAt: Number(session.createdAt ?? Date.now()),
+      archivedAt: typeof session.archivedAt === 'number' ? session.archivedAt : null,
       files: {},
       code: typeof turn?.id === 'string' ? turn.id : undefined,
       model: typeof session.model === 'string' ? session.model : undefined,
@@ -719,16 +764,29 @@ export class LiveBackendClient implements AgentBackendClient {
     };
   }
 
-  async listTasks(params?: {
-    projectId?: string;
-    limit?: number;
-    offset?: number;
-  }): Promise<Task[]> {
+  async listTasks(params?: ListTasksOptions): Promise<Task[]> {
     if (params?.projectId && params.projectId !== 'workspace') return [];
     const page = await this.req<{ items?: Record<string, unknown>[] }>('GET', '/v1/sessions', {
-      query: { limit: params?.limit ?? 200 },
+      query: {
+        limit: params?.limit ?? 200,
+        offset: params?.offset,
+        archived: params?.archived === undefined ? undefined : String(params.archived),
+        search: params?.search,
+        scope: 'chats',
+      },
+      signal: params?.signal,
     });
     return (page.items ?? []).map((session) => this.taskFromSession(session, null));
+  }
+
+  async setTaskArchived(id: string, archived: boolean): Promise<Task> {
+    const session = await this.req<Record<string, unknown>>('PATCH', `/v1/sessions/${encodeURIComponent(id)}`, {
+      body: { archived },
+    });
+    if (archived ? typeof session.archivedAt !== 'number' : session.archivedAt !== null) {
+      throw new Error('后端未保存归档状态，请确认已更新后端。');
+    }
+    return this.taskFromSession(session, null);
   }
 
   async getTask(id: string): Promise<Task> {
@@ -834,10 +892,11 @@ export class LiveBackendClient implements AgentBackendClient {
     );
   }
 
-  searchHistory(query: string, limit = 20) {
-    return this.req<{
-      items: Array<{ sessionId: string; sessionTitle: string; role: string; snippet: string; createdAt: number }>;
-    }>('GET', '/v1/history/search', { query: { q: query, limit } });
+  searchHistory(query: string, limit = 20, signal?: AbortSignal) {
+    return this.req<{ items: ChatHistoryMatch[] }>('GET', '/v1/history/search', {
+      query: { q: query, limit, scope: 'chats' },
+      signal,
+    });
   }
 
   async controlTask(
@@ -906,7 +965,7 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.rt.getSessionReceipts(sessionId);
   }
 
-  listSwarmRuns(params?: { sessionId?: string; limit?: number }) {
+  listSwarmRuns(params?: { sessionId?: string; limit?: number; signal?: AbortSignal }) {
     return this.rt.listSwarmRuns(params);
   }
 
@@ -922,16 +981,28 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.rt.resumeSwarmRun(id);
   }
 
-  listSwarmReplans(id: string) {
-    return this.rt.listSwarmReplans(id);
+  cancelSwarmRun(id: string) {
+    return this.rt.cancelSwarmRun(id);
   }
 
-  listSwarmArtifacts(runId: string, params?: { nodeKey?: string; limit?: number }) {
+  listSwarmMessages(id: string, signal?: AbortSignal) {
+    return this.rt.listSwarmMessages(id, signal);
+  }
+
+  listSwarmReplans(id: string, signal?: AbortSignal) {
+    return this.rt.listSwarmReplans(id, signal);
+  }
+
+  listSwarmArtifacts(runId: string, params?: { nodeKey?: string; limit?: number; signal?: AbortSignal }) {
     return this.rt.listSwarmArtifacts(runId, params);
   }
 
   getSwarmArtifact(runId: string, artifactId: string, path?: string) {
     return this.rt.getSwarmArtifact(runId, artifactId, path);
+  }
+
+  readSwarmArtifactFile(runId: string, artifactId: string, path: string, signal?: AbortSignal) {
+    return this.rt.readSwarmArtifactFile(runId, artifactId, path, signal);
   }
 
   verifySwarmArtifact(runId: string, artifactId: string) {
@@ -1388,25 +1459,30 @@ export class LiveBackendClient implements AgentBackendClient {
 
   // ---- Evaluation / Memory & Usage ----
 
-  async listBenchmarks(): Promise<EvaluationBenchmark[]> {
+  async listBenchmarks(signal?: AbortSignal): Promise<EvaluationBenchmark[]> {
     const data = await this.req<{ items?: EvaluationBenchmark[] } | EvaluationBenchmark[]>(
       'GET',
       '/v1/benchmarks',
+      { signal },
     );
     return Array.isArray(data) ? data : (data.items ?? []);
   }
 
-  async listEvaluationRuns(params?: { benchmarkId?: string; limit?: number }): Promise<EvaluationRun[]> {
+  async listEvaluationRuns(params?: { benchmarkId?: string; limit?: number; signal?: AbortSignal }): Promise<EvaluationRun[]> {
     const data = await this.req<{ items?: EvaluationRun[] } | EvaluationRun[]>(
       'GET',
       '/v1/evaluations',
-      { query: params },
+      { query: { benchmarkId: params?.benchmarkId, limit: params?.limit }, signal: params?.signal },
     );
     return Array.isArray(data) ? data : (data.items ?? []);
   }
 
-  getEvaluationRun(id: string): Promise<EvaluationRun> {
-    return this.req("GET", `/v1/evaluations/${encodeURIComponent(id)}`);
+  getEvaluationRun(id: string, signal?: AbortSignal): Promise<EvaluationRun> {
+    return this.req('GET', `/v1/evaluations/${encodeURIComponent(id)}`, { signal });
+  }
+
+  cancelEvaluation(id: string): Promise<EvaluationRun | null> {
+    return this.req('POST', `/v1/evaluations/${encodeURIComponent(id)}/cancel`);
   }
 
   async startEvaluation(input: EvaluationStartInput): Promise<EvaluationRun> {
@@ -1418,12 +1494,30 @@ export class LiveBackendClient implements AgentBackendClient {
     return 'run' in data ? data.run : data;
   }
 
+  async listModelCapabilities(signal?: AbortSignal): Promise<ModelCapabilityProfile[]> {
+    const { items } = await this.req<{ items: ModelCapabilityProfile[] }>('GET', '/v1/agents/capabilities', { signal });
+    return items;
+  }
+
+  async listExperienceMemory(projectId: string, query: string, signal?: AbortSignal): Promise<ExperienceMemoryRecord[]> {
+    const response = await this.req<{ items: ExperienceMemoryRecord[] }>('GET', '/v1/memory/experience', {
+      query: { projectId, query, limit: 40 }, signal,
+    });
+    return response.items;
+  }
+
+  deleteExperienceMemory(projectId: string, id: string): Promise<ExperienceMemoryRecord | null> {
+    return this.req('DELETE', `/v1/memory/experience/${encodeURIComponent(id)}`, { query: { projectId } });
+  }
+
   getEvaluationRegression(params: {
     benchmarkId: string;
     baselineRunId?: string;
     candidateRunId?: string;
+    signal?: AbortSignal;
   }): Promise<EvaluationRegressionSummary> {
-    return this.req('GET', '/v1/evaluations/regression', { query: params });
+    const { signal, ...query } = params;
+    return this.req('GET', '/v1/evaluations/regression', { query, signal });
   }
 
   async listMemory(params?: {

@@ -43,6 +43,8 @@ interface HomeViewProps {
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
   onSlashCommand: (cmd: string) => void;
+  searchMentionFiles?: (query: string, signal: AbortSignal) => Promise<string[]>;
+  onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
   onSubmitTask: (text: string, files: Record<string, string>) => Promise<void>;
   onToggleInspector: () => void;
   onOpenSettings: (section?: string) => void;
@@ -73,6 +75,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onCheckoutGitBranch,
   onInitGitRepo,
   onSlashCommand,
+  searchMentionFiles,
+  onSubmitGoal,
   onSubmitTask,
   onToggleInspector,
   onOpenSettings,
@@ -252,6 +256,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
           onCheckoutGitBranch={onCheckoutGitBranch}
           onInitGitRepo={onInitGitRepo}
           onSlashCommand={onSlashCommand}
+          searchMentionFiles={searchMentionFiles}
+          onSubmitGoal={onSubmitGoal}
           onSubmit={onSubmitTask}
         />
       </div>

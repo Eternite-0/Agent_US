@@ -35,6 +35,7 @@ import { EvidenceBadge } from './EvidenceBadge';
 import { FileChangeCard } from './FileChangeCard';
 import { ReconciliationCard } from './ReconciliationCard';
 import {
+  IconArchive,
   IconArrowDown,
   IconBookmark,
   IconCheck,
@@ -153,8 +154,12 @@ interface ThreadViewProps {
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
   onSlashCommand: (cmd: string) => void;
+  searchMentionFiles?: (query: string, signal: AbortSignal) => Promise<string[]>;
+  onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
   onSubmitFollowup: (text: string, files: Record<string, string>) => Promise<void>;
   onControlTask: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'retry') => Promise<void>;
+  archiving: boolean;
+  onToggleArchive: (task: Task) => void;
   onDecideApproval: (
     approval: Approval,
     decision: 'approve' | 'deny',
@@ -218,8 +223,12 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   onCheckoutGitBranch,
   onInitGitRepo,
   onSlashCommand,
+  searchMentionFiles,
+  onSubmitGoal,
   onSubmitFollowup,
   onControlTask,
+  archiving,
+  onToggleArchive,
   onDecideApproval,
   onOpenInspector,
   onOpenSubagent,
@@ -893,6 +902,20 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                   <span>复制任务 ID</span>
                 </span>
               </button>
+              <button
+                type="button"
+                className="codex-popover-item"
+                disabled={archiving}
+                onClick={() => {
+                  setTitleMenuOpen(false);
+                  onToggleArchive(primaryBundle.task);
+                }}
+              >
+                <span className="chat-archive-menu-label">
+                  <IconArchive size={14} />
+                  <span>{primaryBundle.task.archivedAt != null ? '恢复到聊天列表' : '归档聊天'}</span>
+                </span>
+              </button>
               <div className="codex-popover-divider" />
               <button
                 type="button"
@@ -903,6 +926,12 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                 }}
               >
                 <span>查看子智能体列表</span>
+              </button>
+              <button type="button" className="codex-popover-item" onClick={() => {
+                setTitleMenuOpen(false);
+                onOpenInspector('autonomous');
+              }}>
+                <span>查看自主任务</span>
               </button>
               <button
                 type="button"
@@ -2020,6 +2049,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
           onCheckoutGitBranch={onCheckoutGitBranch}
           onInitGitRepo={onInitGitRepo}
           onSlashCommand={onSlashCommand}
+          searchMentionFiles={searchMentionFiles}
+          onSubmitGoal={onSubmitGoal}
           onSubmit={onSubmitFollowup}
           onStop={anyLive ? () => void onControlTask(activeTask, 'pause') : undefined}
         />

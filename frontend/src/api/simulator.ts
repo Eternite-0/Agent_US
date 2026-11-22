@@ -21,7 +21,7 @@ import type {
   Worker,
 } from '../types/backend';
 import { encodeUtf8Base64 } from '../utils/diff';
-import type { AgentBackendClient } from './client';
+import type { AgentBackendClient, ListTasksOptions } from './client';
 import { ApiError } from './client';
 
 function uid(prefix: string): string {
@@ -821,10 +821,26 @@ export class SimulatorClient implements AgentBackendClient {
     return next;
   }
 
-  async listTasks(params?: { projectId?: string }): Promise<Task[]> {
+  async listTasks(params?: ListTasksOptions): Promise<Task[]> {
+    params?.signal?.throwIfAborted();
     let list = [...this.tasks.values()];
     if (params?.projectId) list = list.filter((t) => t.projectId === params.projectId);
-    return list.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    if (params?.archived !== undefined) {
+      list = list.filter((t) => (t.archivedAt != null) === params.archived);
+    }
+    const search = params?.search?.trim().toLowerCase();
+    if (search) list = list.filter((t) => t.input.toLowerCase().includes(search));
+    const sortTime = (task: Task) => (params?.archived ? task.archivedAt : task.createdAt) ?? 0;
+    list.sort((a, b) => sortTime(b) - sortTime(a) || a.id.localeCompare(b.id));
+    const offset = params?.offset ?? 0;
+    return list.slice(offset, offset + (params?.limit ?? list.length));
+  }
+
+  async setTaskArchived(id: string, archived: boolean): Promise<Task> {
+    const task = await this.getTask(id);
+    const next = { ...task, archivedAt: archived ? (task.archivedAt ?? Date.now()) : null };
+    this.tasks.set(id, next);
+    return next;
   }
 
   async getTask(id: string): Promise<Task> {

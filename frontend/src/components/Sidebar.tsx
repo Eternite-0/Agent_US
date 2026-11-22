@@ -31,7 +31,7 @@ interface SidebarProps {
   projects: Project[];
   tasks: Task[];
   pinnedIds: string[];
-  archivedIds: string[];
+  archiveBusy: ReadonlySet<string>;
   selectedProjectId: string | null;
   activeWorkers: Worker[];
   pendingApprovals: Approval[];
@@ -66,7 +66,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   projects,
   tasks,
   pinnedIds,
-  archivedIds,
+  archiveBusy,
   selectedProjectId,
   pendingApprovals,
   onResize,
@@ -163,10 +163,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const activeTaskId = view.kind === 'thread' ? view.taskId : null;
   const isHomeRail = view.kind === 'home' || view.kind === 'thread';
-  const archivedSet = new Set(archivedIds);
   const pinnedSet = new Set(pinnedIds);
 
-  const visibleTasks = tasks.filter((t) => !archivedSet.has(t.id));
+  const visibleTasks = tasks.filter((t) => t.archivedAt == null);
   const pinnedTasks = visibleTasks.filter((t) => pinnedSet.has(t.id));
 
   const tasksByProject = new Map<string, Task[]>();
@@ -227,7 +226,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         }}
         onContextMenu={(e) => openTaskContext(e, t)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') {
+          if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+            e.preventDefault();
             setPeeking(false);
             onSelectTask(t.id);
           }
@@ -258,7 +258,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             type="button"
             className="codex-sidebar-mini-btn"
             title="归档聊天"
-            aria-label="归档"
+            aria-label="归档聊天"
+            disabled={archiveBusy.has(t.id)}
             onClick={() => onArchiveTask(t.id)}
           >
             <IconArchive size={13} />
@@ -538,6 +539,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <IconCompose size={16} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
               <span className="codex-sidebar-row-text">新聊天</span>
             </button>
+            <button
+              type="button"
+              className="codex-sidebar-row chat-archive-shortcut"
+              onClick={() => {
+                setPeeking(false);
+                onOpenSettings('archived');
+              }}
+            >
+              <IconArchive size={16} />
+              <span className="codex-sidebar-row-text">已归档</span>
+            </button>
 
             {/* Scrollable Sections */}
             <div className="codex-sidebar-scroll vertical-scroll-fade-mask">
@@ -791,7 +803,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <button
                 type="button"
                 className="codex-popover-item"
-                style={{ color: 'var(--color-danger)' }}
+                disabled={archiveBusy.has(contextMenu.task.id)}
                 onClick={() => {
                   onArchiveTask(contextMenu.task.id);
                   setContextMenu(null);

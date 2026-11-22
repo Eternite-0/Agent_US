@@ -88,9 +88,20 @@ export interface TaskVerdict {
   evidenceCount?: number;
 }
 
+export interface ChatHistoryMatch {
+  seq: number;
+  sessionId: string;
+  sessionTitle: string;
+  role: string;
+  snippet: string;
+  createdAt: number;
+  archivedAt?: number | null;
+}
+
 export interface Task extends Entity {
   input: string;
   status: TaskStatus;
+  archivedAt?: number | null;
   phase?: string;
   evidenceCount?: number;
   previousStatus?: TaskStatus;
@@ -655,7 +666,7 @@ export type AppView =
 
 export type CodexMode = 'Codex' | 'Work' | 'Chat';
 
-export type InspectorTab = 'subagents' | 'diff' | 'artifacts' | 'events';
+export type InspectorTab = 'subagents' | 'diff' | 'artifacts' | 'events' | 'autonomous';
 
 export interface ToastItem {
   id: string;
@@ -709,6 +720,7 @@ export interface SwarmNodeRecord {
 }
 
 export interface SwarmArtifactFileEntry {
+  changeType?: string;
   path: string;
   status: string;
   previousPath?: string | null;
@@ -739,6 +751,25 @@ export interface SwarmArtifactRecord {
   updatedAt: number;
 }
 
+export interface SwarmArtifactFile {
+  entry: SwarmArtifactFileEntry;
+  deleted: boolean;
+  text?: string | null;
+  base64?: string | null;
+  verified: boolean;
+}
+
+export interface SwarmMessageRecord {
+  messageId: string;
+  fromAgentId: string;
+  toAgentId: string;
+  kind: string;
+  status: string;
+  artifactManifest?: { artifacts: { uri: string; sha256: string }[] };
+  planVersion?: number;
+  createdAt: number;
+}
+
 export interface SwarmRunRecord {
   id: string;
   sessionId: string;
@@ -750,6 +781,7 @@ export interface SwarmRunRecord {
   errorCode?: string | null;
   errorMessage?: string | null;
   usage: Record<string, unknown>;
+  verdict?: { verdict: string; accepted: boolean; reasons?: string[]; verificationMode?: string } | null;
   nodes: SwarmNodeRecord[];
   createdAt: number;
   updatedAt: number;
@@ -855,6 +887,7 @@ export interface EvaluationBenchmark {
   datasetVersion: string;
   taskCount: number;
   categories: string[];
+  tasks?: { id: string; title: string; category: string; difficulty: string }[];
   description?: string;
   updatedAt?: number;
 }
@@ -896,6 +929,7 @@ export interface EvaluationRun {
   createdAt: number;
   startedAt?: number;
   finishedAt?: number;
+  cancelRequestedAt?: number | null;
   score?: EvaluationScore;
   results?: EvaluationTaskResult[];
   error?: string;
@@ -908,6 +942,31 @@ export interface EvaluationStartInput {
   concurrency?: number;
   timeoutMs?: number;
   maxAttempts?: number;
+}
+
+export interface ModelCapabilityProfile {
+  id: string;
+  declared: { label: string; capabilities: Record<string, number> } | null;
+  measured: {
+    sampleCount: number;
+    confidence: number;
+    empiricalScore: number | null;
+    capabilities: Record<string, number>;
+    evaluation: { evaluationRunId: string; benchmarkVersion?: string; datasetVersion?: string };
+  } | null;
+}
+
+export interface ExperienceMemoryRecord {
+  id: string;
+  type: string;
+  key?: string;
+  content: string;
+  verified: boolean;
+  confidence: number;
+  status: string;
+  source: string;
+  sourceArtifact?: string | null;
+  verificationEvidence?: { sourceTaskId?: string; evaluationRunId?: string; verifiedAt?: number } | null;
 }
 
 export interface EvaluationRegressionSummary {

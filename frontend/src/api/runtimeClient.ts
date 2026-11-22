@@ -3,7 +3,9 @@ import type {
   ChildNotificationRecord,
   RuntimeOverviewRecord,
   ScheduleRunRecord,
+  SwarmArtifactFile,
   SwarmArtifactRecord,
+  SwarmMessageRecord,
   SwarmReplanRecord,
   SwarmRunRecord,
   SwarmSubmitResponse,
@@ -13,7 +15,7 @@ import type {
 export type ReqFn = <T>(
   method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
   path: string,
-  options?: { body?: unknown; query?: Record<string, string | number | undefined> },
+  options?: { body?: unknown; query?: Record<string, string | number | undefined>; signal?: AbortSignal },
 ) => Promise<T>;
 
 export function createRuntimeClient(req: ReqFn) {
@@ -40,9 +42,10 @@ export function createRuntimeClient(req: ReqFn) {
       });
     },
 
-    async listSwarmRuns(params?: { sessionId?: string; limit?: number }): Promise<SwarmRunRecord[]> {
+    async listSwarmRuns(params?: { sessionId?: string; limit?: number; signal?: AbortSignal }): Promise<SwarmRunRecord[]> {
       const data = await req<{ items?: SwarmRunRecord[] }>('GET', '/v1/swarm/runs', {
         query: { sessionId: params?.sessionId, limit: params?.limit },
+        signal: params?.signal,
       });
       return data.items ?? [];
     },
@@ -69,22 +72,34 @@ export function createRuntimeClient(req: ReqFn) {
       return req('POST', `/v1/swarm/runs/${encodeURIComponent(id)}/resume`);
     },
 
-    async listSwarmReplans(id: string): Promise<SwarmReplanRecord[]> {
+    cancelSwarmRun(id: string): Promise<SwarmRunRecord> {
+      return req('POST', `/v1/swarm/runs/${encodeURIComponent(id)}/cancel`);
+    },
+
+    async listSwarmMessages(runId: string, signal?: AbortSignal): Promise<SwarmMessageRecord[]> {
+      const data = await req<{ items: SwarmMessageRecord[] }>('GET', '/v1/communication/messages', {
+        query: { runId }, signal,
+      });
+      return data.items;
+    },
+
+    async listSwarmReplans(id: string, signal?: AbortSignal): Promise<SwarmReplanRecord[]> {
       const data = await req<{ items?: SwarmReplanRecord[] }>(
         'GET',
         `/v1/swarm/runs/${encodeURIComponent(id)}/replans`,
+        { signal },
       );
       return data.items ?? [];
     },
 
     async listSwarmArtifacts(
       runId: string,
-      params?: { nodeKey?: string; limit?: number },
+      params?: { nodeKey?: string; limit?: number; signal?: AbortSignal },
     ): Promise<SwarmArtifactRecord[]> {
       const data = await req<{ items?: SwarmArtifactRecord[] }>(
         'GET',
         `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts`,
-        { query: { nodeKey: params?.nodeKey, limit: params?.limit } },
+        { query: { nodeKey: params?.nodeKey, limit: params?.limit }, signal: params?.signal },
       );
       return data.items ?? [];
     },
@@ -101,10 +116,18 @@ export function createRuntimeClient(req: ReqFn) {
       );
     },
 
+    readSwarmArtifactFile(runId: string, artifactId: string, path: string, signal?: AbortSignal): Promise<SwarmArtifactFile> {
+      return req(
+        'GET',
+        `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
+        { query: { path }, signal },
+      );
+    },
+
     verifySwarmArtifact(
       runId: string,
       artifactId: string,
-    ): Promise<{ ok: boolean; artifactId: string; bundleSha256?: string; reasons?: string[] }> {
+    ): Promise<{ ok: boolean; artifactId: string; bundleSha256?: string; errors?: string[]; checkedFiles?: number }> {
       return req(
         'POST',
         `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/verify`,

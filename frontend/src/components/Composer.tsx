@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
   GitStatus,
   CodexMode,
@@ -55,6 +55,8 @@ interface ComposerProps {
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
   onSlashCommand?: (cmd: string) => void;
+  searchMentionFiles?: (query: string, signal: AbortSignal) => Promise<string[]>;
+  onSubmitGoal?: (goal: string, files: Record<string, string>) => Promise<boolean>;
   onSubmit: (text: string, files: Record<string, string>) => Promise<void> | void;
   onStop?: () => void;
 }
@@ -68,6 +70,8 @@ const EFFORT_STOPS: Array<{ id: EffortLevel; label: string }> = [
 ];
 
 const SLASH_COMMANDS = [
+  { cmd: '/goal', desc: '提交目标并启动自主任务' },
+  { cmd: '/autonomous', desc: '查看自主任务、计划和产物' },
   { cmd: '/new', desc: '返回主页开始新对话' },
   { cmd: '/plan', desc: '切换为先规划后执行' },
   { cmd: '/run', desc: '切换为直接执行' },
@@ -75,6 +79,9 @@ const SLASH_COMMANDS = [
   { cmd: '/agents', desc: '打开右侧子智能体与执行过程面板' },
   { cmd: '/events', desc: '打开实时 SSE 事件流与版本日志' },
   { cmd: '/theme', desc: '立即切换浅色 / 深色主题' },
+  { cmd: '/archive', desc: '查找和恢复已归档的聊天' },
+  { cmd: '/eval', desc: '打开评测中心与历史比较' },
+  { cmd: '/memory', desc: '查看工作区经验和持久记忆' },
   { cmd: '/settings', desc: '打开设置与后端连接配置' },
   { cmd: '/compact', desc: '立即语义压缩当前会话上下文，释放窗口预算' },
   { cmd: '/rewind', desc: '精准回退上一轮工作区文件变更与对话状态' },
@@ -108,6 +115,8 @@ export const Composer: React.FC<ComposerProps> = ({
   onCheckoutGitBranch,
   onInitGitRepo,
   onSlashCommand,
+  searchMentionFiles,
+  onSubmitGoal,
   onSubmit,
   onStop,
 }) => {
@@ -123,6 +132,11 @@ export const Composer: React.FC<ComposerProps> = ({
   const [branchError, setBranchError] = useState('');
   const [initGitBusy, setInitGitBusy] = useState(false);
   const [menuHighlight, setMenuHighlight] = useState(0);
+  const [caret, setCaret] = useState(0);
+  const [menuDismissed, setMenuDismissed] = useState(false);
+  const [searchResult, setSearchResult] = useState<{ query: string; files: string[]; failed?: boolean } | null>(null);
+  const menuId = useId();
+  const menuRef = useRef<HTMLDivElement>(null);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -174,34 +188,68 @@ ${draftInjection.text}`
     el.style.height = `${Math.min(el.scrollHeight, window.innerHeight * 0.25)}px`;
   }, [text]);
 
-  // Detect "/" slash menu or "@" file/project mention
   const slashMatches = useMemo(() => {
-    if (!text.startsWith('/') || text.includes(' ') || text.includes('\n')) return [];
-    const q = text.toLowerCase();
-    return SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q));
-  }, [text]);
+    if (menuDismissed || !/^\/[a-z]*$/i.test(text.trimStart()) || !onSlashCommand) return [];
+    const query = text.trimStart().toLowerCase();
+    return SLASH_COMMANDS.filter((item) => item.cmd.startsWith(query) && (item.cmd !== '/goal' || onSubmitGoal));
+  }, [text, menuDismissed, onSlashCommand, onSubmitGoal]);
 
-  const mentionMatch = useMemo(() => {
-    const m = text.match(/(?:^|\s)@([^\s@]*)$/);
-    if (!m) return null;
-    const q = m[1].toLowerCase();
-    const candidates = [
-      ...mentionPlugins.map((p) => ({ label: p, kind: '已安装插件' })),
-      ...mentionSkills.map((s) => ({ label: s, kind: '已启用技能' })),
-      ...Object.keys(files).map((f) => ({ label: f, kind: '已附加文件' })),
-      ...mentionFiles.map((f) => ({ label: f, kind: '工作区文件' })),
-      ...projects.map((p) => ({ label: p.name, kind: '项目' })),
-    ];
-    const unique = candidates.filter(
-      (item, idx, arr) => arr.findIndex((x) => x.label === item.label) === idx,
-    );
-    const matched = unique.filter((c) => c.label.toLowerCase().includes(q)).slice(0, 10);
-    return matched.length ? { raw: m[0], query: m[1], items: matched } : null;
-  }, [text, files, mentionFiles, mentionPlugins, mentionSkills, projects]);
+  const mentionToken = useMemo(() => {
+    if (menuDismissed || slashMatches.length) return null;
+    const left = text.slice(0, caret);
+    const match = /(?:^|\s)(@(?:"([^"\n]*)|([^\s@"]*)))$/.exec(left);
+    if (!match) return null;
+    const right = text.slice(caret);
+    const tail = match[2] !== undefined ? /^(?:[^"\n]*")/.exec(right)?.[0] : /^[^\s@"]*/.exec(right)?.[0];
+    return { start: caret - match[1].length, end: caret + (tail?.length ?? 0), query: match[2] ?? match[3] ?? '' };
+  }, [text, caret, menuDismissed, slashMatches.length]);
+  const mentionQuery = mentionToken?.query;
+  const workspaceResults = searchResult?.query === mentionQuery ? searchResult : null;
 
   useEffect(() => {
-    setMenuHighlight(0);
-  }, [slashMatches.length, mentionMatch?.query]);
+    if (!searchMentionFiles || mentionQuery === undefined) return;
+    const controller = new AbortController();
+    setSearchResult(null);
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await searchMentionFiles(mentionQuery, controller.signal);
+        if (!controller.signal.aborted) setSearchResult({ query: mentionQuery, files: result });
+      } catch {
+        if (!controller.signal.aborted) setSearchResult({ query: mentionQuery, files: [], failed: true });
+      }
+    }, 140);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [mentionQuery, searchMentionFiles]);
+
+  const mentionItems = useMemo(() => {
+    if (mentionQuery === undefined) return [];
+    const query = mentionQuery.toLowerCase().replaceAll('\\', '/');
+    const matchingFiles = searchMentionFiles ? workspaceResults?.files ?? [] : mentionFiles;
+    const candidates = [
+      ...matchingFiles.map((label) => ({ label, kind: '工作区文件' })),
+      ...Object.keys(files).map((label) => ({ label, kind: '已附加文件' })),
+      ...mentionSkills.map((label) => ({ label, kind: '技能' })),
+      ...mentionPlugins.map((label) => ({ label, kind: '插件' })),
+      ...projects.map((project) => ({ label: project.name, kind: '项目' })),
+    ];
+    const seen = new Set<string>();
+    return candidates.filter(({ label }) => {
+      if (seen.has(label) || !label.toLowerCase().includes(query)) return false;
+      seen.add(label);
+      return true;
+    }).slice(0, 12);
+  }, [mentionQuery, workspaceResults, searchMentionFiles, files, mentionFiles, mentionSkills, mentionPlugins, projects]);
+
+  const menuCount = slashMatches.length || mentionItems.length;
+  const selectedIndex = Math.min(menuHighlight, Math.max(0, menuCount - 1));
+  const menuIsOpen = Boolean(slashMatches.length || mentionToken);
+  useEffect(() => { setMenuHighlight(0); }, [text, mentionQuery, workspaceResults]);
+  useEffect(() => {
+    menuRef.current?.querySelector('[data-selected="true"]')?.scrollIntoView({ block: 'nearest' });
+  }, [selectedIndex]);
 
   const attachFileList = async (list: FileList | File[]) => {
     const arr = Array.from(list).slice(0, 12);
@@ -235,79 +283,97 @@ ${draftInjection.text}`
     setFiles(next);
   };
 
+  const placeCaret = (position: number) => {
+    setCaret(position);
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(position, position);
+    });
+  };
+
   const executeSlash = (cmd: string) => {
-    setText('');
-    if (cmd === '/clear') {
-      setFiles({});
+    setMenuDismissed(true);
+    if (cmd === '/goal') {
+      setText('/goal ');
+      placeCaret(6);
       return;
     }
-    onSlashCommand?.(cmd);
+    setText('');
+    setCaret(0);
+    if (cmd === '/clear') setFiles({});
+    else onSlashCommand?.(cmd);
   };
 
   const insertMention = (label: string) => {
-    setText((prev) => prev.replace(/@[^\s@]*$/, `@${label} `));
-    textareaRef.current?.focus();
+    if (!mentionToken) return;
+    const reference = `@${/[\s@"]/.test(label) ? JSON.stringify(label) : label}`;
+    const rest = text.slice(mentionToken.end);
+    const inserted = `${reference}${!rest || !/^\s/.test(rest) ? ' ' : ''}`;
+    const next = text.slice(0, mentionToken.start) + inserted + rest;
+    setText(next);
+    setMenuDismissed(true);
+    placeCaret(mentionToken.start + inserted.length + (/^[ \t]/.test(rest) ? 1 : 0));
   };
 
   const handleSend = async () => {
     const trimmed = text.trim();
     if (!trimmed || submitting) return;
-    if (slashMatches.length === 1 && trimmed === slashMatches[0].cmd) {
-      executeSlash(slashMatches[0].cmd);
+    if (slashMatches.length && /^\/[a-z]*$/i.test(trimmed)) {
+      const exact = slashMatches.find((item) => item.cmd === trimmed.toLowerCase());
+      executeSlash((exact ?? slashMatches[selectedIndex]).cmd);
+      return;
+    }
+    const goalCommand = /^\/goal(?:\s|$)/i.exec(trimmed);
+    if (goalCommand && onSubmitGoal) {
+      const goal = trimmed.slice(goalCommand[0].length).trim();
+      if (!goal) {
+        executeSlash('/goal');
+        return;
+      }
+      if (await onSubmitGoal(goal, files)) {
+        setText('');
+        setCaret(0);
+        setFiles({});
+        setMenuDismissed(true);
+      }
+      return;
+    }
+    const exactCommand = SLASH_COMMANDS.find((item) => item.cmd === trimmed.toLowerCase());
+    if (exactCommand && onSlashCommand) {
+      executeSlash(exactCommand.cmd);
       return;
     }
     const attached = { ...files };
     setText('');
+    setCaret(0);
     setFiles({});
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     await onSubmit(trimmed, attached);
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (slashMatches.length > 0) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setMenuHighlight((h) => (h + 1) % slashMatches.length);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setMenuHighlight((h) => (h - 1 + slashMatches.length) % slashMatches.length);
-        return;
-      }
-      if ((e.key === 'Enter' || e.key === 'Tab') && !e.nativeEvent.isComposing) {
-        e.preventDefault();
-        executeSlash(slashMatches[menuHighlight]?.cmd || slashMatches[0].cmd);
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setText('');
-        return;
-      }
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    if (menuIsOpen && event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      setMenuDismissed(true);
+      return;
     }
-
-    if (mentionMatch && mentionMatch.items.length > 0) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setMenuHighlight((h) => (h + 1) % mentionMatch.items.length);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setMenuHighlight((h) => (h - 1 + mentionMatch.items.length) % mentionMatch.items.length);
-        return;
-      }
-      if ((e.key === 'Enter' || e.key === 'Tab') && !e.nativeEvent.isComposing) {
-        e.preventDefault();
-        insertMention(mentionMatch.items[menuHighlight]?.label || mentionMatch.items[0].label);
-        return;
-      }
+    if (menuCount && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+      event.preventDefault();
+      const direction = event.key === 'ArrowDown' ? 1 : -1;
+      setMenuHighlight((selectedIndex + menuCount + direction) % menuCount);
+      return;
     }
-
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-      e.preventDefault();
-      void handleSend();
+    if (menuCount && !event.shiftKey && (event.key === 'Enter' || event.key === 'Tab')) {
+      event.preventDefault();
+      if (slashMatches.length) executeSlash(slashMatches[selectedIndex].cmd);
+      else insertMention(mentionItems[selectedIndex].label);
+      return;
+    }
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      if (!mentionToken || !searchMentionFiles || workspaceResults) void handleSend();
     }
   };
 
@@ -609,43 +675,38 @@ ${draftInjection.text}`
   return (
     <div className="codex-composer-wrap" ref={rootRef}>
       {/* Slash Command Popover */}
-      {slashMatches.length > 0 && (
-        <div className="codex-slash-menu" role="listbox" aria-label="快捷命令">
-          {slashMatches.map((item, idx) => (
-            <button
-              key={item.cmd}
-              type="button"
-              className="codex-popover-item"
-              data-selected={idx === menuHighlight ? 'true' : undefined}
-              onMouseEnter={() => setMenuHighlight(idx)}
-              onClick={() => executeSlash(item.cmd)}
-            >
-              <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 500 }}>{item.cmd}</span>
-              <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{item.desc}</span>
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* @ Mention Popover */}
-      {slashMatches.length === 0 && mentionMatch && (
-        <div className="codex-slash-menu" role="listbox" aria-label="引用文件或项目">
-          {mentionMatch.items.map((item, idx) => (
-            <button
-              key={`${item.kind}-${item.label}`}
-              type="button"
-              className="codex-popover-item"
-              data-selected={idx === menuHighlight ? 'true' : undefined}
-              onMouseEnter={() => setMenuHighlight(idx)}
-              onClick={() => insertMention(item.label)}
-            >
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-                <IconFileDoc size={14} style={{ color: 'var(--text-tertiary)' }} />
-                <span>{item.label}</span>
-              </span>
-              <span style={{ fontSize: 11.5, color: 'var(--text-tertiary)' }}>{item.kind}</span>
-            </button>
-          ))}
+      {menuIsOpen && (
+        <div className="codex-slash-menu" ref={menuRef}>
+          <div className="composer-picker-heading" aria-hidden="true">
+            {slashMatches.length ? '快捷命令' : '引用工作区文件'}
+            <span>↑ ↓ 选择 · ↵ 确认 · Esc 关闭</span>
+          </div>
+          <div id={menuId} role="listbox" aria-label={slashMatches.length ? '快捷命令' : '引用工作区文件'}>
+            {slashMatches.map((item, index) => (
+              <button key={item.cmd} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
+                aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
+                className="codex-popover-item composer-picker-row"
+                onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
+                onClick={() => executeSlash(item.cmd)}>
+                <strong>{item.cmd}</strong><small>{item.desc}</small>
+              </button>
+            ))}
+            {!slashMatches.length && mentionItems.map((item, index) => (
+              <button key={item.label} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
+                aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
+                className="codex-popover-item composer-picker-row"
+                onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
+                onClick={() => insertMention(item.label)}>
+                <IconFileDoc size={14} /><span className="composer-picker-path" title={item.label}>{item.label}</span><small>{item.kind}</small>
+              </button>
+            ))}
+          </div>
+          {mentionToken && (searchMentionFiles && (!workspaceResults || workspaceResults.failed) || !mentionItems.length) && (
+            <div className="composer-picker-state" role="status">
+              {searchMentionFiles && !workspaceResults ? '正在查找文件…'
+                : workspaceResults?.failed ? '无法加载工作区文件。' : '没有匹配的引用。'}
+            </div>
+          )}
         </div>
       )}
 
@@ -890,7 +951,14 @@ ${draftInjection.text}`
           aria-label="消息内容"
           placeholder={placeholder}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          aria-controls={menuIsOpen ? menuId : undefined}
+          aria-activedescendant={menuCount ? `${menuId}-${selectedIndex}` : undefined}
+          onChange={(event) => {
+            setText(event.target.value);
+            setCaret(event.target.selectionStart);
+            setMenuDismissed(false);
+          }}
+          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
           onKeyDown={handleKeyDown}
           onPaste={(e) => {
             if (e.clipboardData.files?.length) {

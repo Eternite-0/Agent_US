@@ -165,6 +165,7 @@ export const App: React.FC = () => {
   const [searchOpen, setSearchOpen] = useState(false);
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [preferredSwarmRun, setPreferredSwarmRun] = useState<{ sessionId: string; runId: string } | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('subagents');
   const [inspectorFile, setInspectorFile] = useState<string | null>(null);
   const [inspectorSubagentId, setInspectorSubagentId] = useState<string | null>(null);
@@ -173,7 +174,12 @@ export const App: React.FC = () => {
 
   // Sidebar Pin / Archive, Scheduled Tasks, Plugins/Skills & Multi-Turn Thread Chains (in-memory)
   const [pinnedIds, setPinnedIds] = useState<string[]>([]);
-  const [archivedIds, setArchivedIds] = useState<string[]>([]);
+  const [archiveBusy, setArchiveBusy] = useState<ReadonlySet<string>>(() => new Set());
+  const archiveRequests = useRef(new Set<string>());
+  const archiveGeneration = useRef(0);
+  const currentClient = useRef(client);
+  currentClient.current = client;
+  const [archiveRevision, setArchiveRevision] = useState(0);
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskItem[]>([]);
   const [threadChains, setThreadChains] = useState<Record<string, string[]>>({});
   const [plugins, setPlugins] = useState<MarketplacePlugin[]>(INITIAL_PLUGINS);
@@ -306,12 +312,13 @@ export const App: React.FC = () => {
     async (notifyOnFailure = false) => {
       try {
         const health = await client.health();
+        const archiveVersion = archiveGeneration.current;
         setBackendHealthy(health.ok ?? health.status === "ok");
         if (health.workspaceRoot) setWorkspaceRoot(health.workspaceRoot);
         const [projList, taskList, apprList, modelList, pHealth, memList, usgList, evList, currentGitStatus, schedList] =
           await Promise.all([
             client.listProjects(),
-            client.listTasks(),
+            client.listTasks({ archived: false }),
             client.listApprovals(),
             client.listModels(),
             client.providersHealth(),
@@ -323,7 +330,9 @@ export const App: React.FC = () => {
           ]);
 
         setProjects(projList);
-        setTasks([...taskList].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0)));
+        if (currentClient.current === client && archiveVersion === archiveGeneration.current) {
+          setTasks([...taskList].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0)));
+        }
         setApprovals(apprList);
         setModels(modelList);
         setProvidersHealth(pHealth);
@@ -994,24 +1003,82 @@ export const App: React.FC = () => {
     pushToast(exists ? '已取消置顶' : '已置顶到顶部');
   };
 
-  const handleArchiveTask = (taskId: string) => {
-    setArchivedIds((prev) => (prev.includes(taskId) ? prev : [...prev, taskId]));
-    setPinnedIds((prev) => prev.filter((id) => id !== taskId));
-    if (view.kind === 'thread' && view.taskId === taskId) {
-      navigate({ kind: 'home' });
+  const updateArchive = async (taskId: string, archived: boolean): Promise<boolean> => {
+    if (currentClient.current !== client || archiveRequests.current.has(taskId)) return false;
+    archiveRequests.current.add(taskId);
+    setArchiveBusy(new Set(archiveRequests.current.keys()));
+    try {
+      const updated = await client.setTaskArchived(taskId, archived);
+      if (currentClient.current !== client) return false;
+      archiveGeneration.current += 1;
+      setTasks((prev) => {
+        if (archived) return prev.filter((task) => task.id !== taskId);
+        const current = prev.find((task) => task.id === taskId);
+        return [{ ...(current ?? updated), archivedAt: updated.archivedAt }, ...prev.filter((task) => task.id !== taskId)]
+          .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+      });
+      setActiveBundles((prev) => prev.map((bundle) => bundle.task.id === taskId
+        ? { ...bundle, task: { ...bundle.task, archivedAt: updated.archivedAt } }
+        : bundle));
+      setArchiveRevision((prev) => prev + 1);
+      return true;
+    } catch (error) {
+      if (currentClient.current === client) {
+        pushToast(`${archived ? '归档' : '恢复'}失败：${error instanceof Error ? error.message : '连接异常'}`, 'danger');
+      }
+      return false;
+    } finally {
+      archiveRequests.current.delete(taskId);
+      setArchiveBusy(new Set(archiveRequests.current.keys()));
     }
-    pushToast('已归档该对话', 'default', {
-      label: '撤销',
-      onClick: () => {
-        setArchivedIds((prev) => prev.filter((id) => id !== taskId));
-      },
-    });
   };
 
-  const handleRestoreArchived = (taskId: string) => {
-    setArchivedIds((prev) => prev.filter((id) => id !== taskId));
-    pushToast('已恢复对话至侧边栏', 'success');
+  const handleRestoreArchived = async (taskId: string) => {
+    if (await updateArchive(taskId, false)) pushToast('已恢复聊天', 'success');
   };
+
+  const handleArchiveTask = async (taskId: string) => {
+    if (await updateArchive(taskId, true)) {
+      pushToast('已归档聊天', 'success', { label: '撤销', onClick: () => void handleRestoreArchived(taskId) });
+    }
+  };
+
+  const handleSubmitGoal = async (goal: string, files: Record<string, string>): Promise<boolean> => {
+    if (!client.submitAutonomousGoal) {
+      pushToast('当前连接不支持自主任务。', 'warning');
+      return false;
+    }
+    if (Object.keys(files).length) {
+      pushToast('自主任务支持 @工作区文件。请移除上传附件后重试。', 'warning');
+      return false;
+    }
+    setSubmitting(true);
+    try {
+      const result = await client.submitAutonomousGoal({
+        goal, permissionMode, ...(activeRootTaskId ? { sessionId: activeRootTaskId } : { workspaceRoot: workspaceRoot || undefined }),
+      });
+      if (currentClient.current !== client) return true;
+      navigate({ kind: 'thread', taskId: result.sessionId });
+      setInspectorTaskId(result.sessionId);
+      setPreferredSwarmRun(result);
+      setInspectorTab('autonomous');
+      setInspectorOpen(true);
+      if (activeRootTaskId === result.sessionId) void refreshActiveBundles(activeChainRef.current, true);
+      void refreshWorkspace(false);
+      pushToast('自主任务已启动', 'success');
+      return true;
+    } catch (error) {
+      if (currentClient.current === client) pushToast(`自主任务启动失败：${error instanceof Error ? error.message : '连接异常'}`, 'danger');
+      return false;
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const searchMentionFiles = useMemo(() => {
+    if (!client.searchWorkspaceFiles) return undefined;
+    return (query: string, signal: AbortSignal) => client.searchWorkspaceFiles!(query, activeRootTaskId ?? undefined, signal);
+  }, [client, activeRootTaskId, workspaceRoot]);
 
   const handleSlashCommand = (cmd: string) => {
     switch (cmd) {
@@ -1021,7 +1088,7 @@ export const App: React.FC = () => {
       case '/plan':
         setCodexMode('Work');
         setPermissionMode('approval');
-        pushToast('已切换为计划模式：先展示计划，再执行变更');
+        pushToast('已切换为 Work 并启用审批。输入 /goal 可启动自主规划。');
         break;
       case '/run':
         setCodexMode('Codex');
@@ -1029,6 +1096,10 @@ export const App: React.FC = () => {
         break;
       case '/diff':
         setInspectorTab('diff');
+        setInspectorOpen(true);
+        break;
+      case '/autonomous':
+        setInspectorTab('autonomous');
         setInspectorOpen(true);
         break;
       case '/agents':
@@ -1052,10 +1123,19 @@ export const App: React.FC = () => {
         break;
       case '/rewind':
         if (activeRootTaskId) {
-          void handleRewindSession(activeRootTaskId, 'both');
+          if (window.confirm('回退上一轮的对话和工作区文件变更？')) void handleRewindSession(activeRootTaskId, 'both');
         } else {
           pushToast('请先进入一个会话再执行 /rewind', 'warning');
         }
+        break;
+      case '/archive':
+        navigate({ kind: 'settings', section: 'archived' });
+        break;
+      case '/eval':
+        navigate({ kind: 'evaluations' });
+        break;
+      case '/memory':
+        navigate({ kind: 'settings', section: 'memory' });
         break;
       case '/settings':
         navigate({ kind: 'settings', section: 'general' });
@@ -1110,10 +1190,9 @@ export const App: React.FC = () => {
     [tasks, childTurnSet],
   );
 
-  const archivedTasks = useMemo(
-    () => tasks.filter((t) => archivedIds.includes(t.id)),
-    [tasks, archivedIds],
-  );
+  const archivedThread = view.kind === 'thread'
+    ? activeBundles.find((bundle) => bundle.task.id === view.taskId && bundle.task.archivedAt != null)
+    : undefined;
 
   // Known files across active bundles & tasks for Ctrl+K file search and @ mentions
   const knownFiles = useMemo(() => {
@@ -1243,7 +1322,7 @@ export const App: React.FC = () => {
           projects={projects}
           tasks={sidebarTasks}
           pinnedIds={pinnedIds}
-          archivedIds={archivedIds}
+          archiveBusy={archiveBusy}
           selectedProjectId={selectedProject?.id ?? null}
           activeWorkers={activeWorkers}
           pendingApprovals={pendingApprovals}
@@ -1315,12 +1394,23 @@ export const App: React.FC = () => {
                 onCheckoutGitBranch={handleCheckoutGitBranch}
                 onInitGitRepo={handleInitGitRepo}
                 onSlashCommand={handleSlashCommand}
+                searchMentionFiles={searchMentionFiles}
+                onSubmitGoal={handleSubmitGoal}
                 onSubmitTask={handleSubmitNewTask}
                 onToggleInspector={() => setInspectorOpen((v) => !v)}
                 onOpenSettings={(sec) => navigate({ kind: 'settings', section: sec || 'general' })}
               />
             )}
 
+            {archivedThread && (
+              <div className="chat-archive-notice">
+                <span>此聊天已归档</span>
+                <button type="button" className="chat-archive-link" disabled={archiveBusy.has(archivedThread.task.id)}
+                  onClick={() => void handleRestoreArchived(archivedThread.task.id)}>
+                  {archiveBusy.has(archivedThread.task.id) ? '正在恢复…' : '恢复到列表'}
+                </button>
+              </div>
+            )}
             {view.kind === 'thread' && (
               <ThreadView
                 key={view.taskId}
@@ -1360,8 +1450,14 @@ export const App: React.FC = () => {
                 onCheckoutGitBranch={handleCheckoutGitBranch}
                 onInitGitRepo={handleInitGitRepo}
                 onSlashCommand={handleSlashCommand}
+                searchMentionFiles={searchMentionFiles}
+                onSubmitGoal={handleSubmitGoal}
                 onSubmitFollowup={handleSubmitFollowup}
                 onControlTask={handleControlTask}
+                archiving={archiveBusy.has(view.taskId)}
+                onToggleArchive={(task) => void (task.archivedAt != null
+                  ? handleRestoreArchived(task.id)
+                  : handleArchiveTask(task.id))}
                 onDecideApproval={handleDecideApproval}
                 onOpenInspector={(tab, filePath, targetTaskId) => {
                   setInspectorTab(tab);
@@ -1520,7 +1616,7 @@ export const App: React.FC = () => {
             )}
 
             {view.kind === 'evaluations' && (
-              <EvaluationView client={client} onToast={pushToast} />
+              <EvaluationView client={client} models={models} onToast={pushToast} />
             )}
             {view.kind === 'capabilities' && (
               <CapabilitiesView
@@ -1756,7 +1852,9 @@ export const App: React.FC = () => {
                 approvals={approvals}
                 memory={memory}
                 usage={usage}
-                archivedTasks={archivedTasks}
+                archiveClient={client}
+                archiveBusy={archiveBusy}
+                archiveRevision={archiveRevision}
                 recentEvents={recentEvents}
                 onChangeSection={(sec) => navigate({ kind: 'settings', section: sec })}
                 onChangeThemeMode={setThemeMode}
@@ -1808,6 +1906,9 @@ export const App: React.FC = () => {
             selectedSubagentId={inspectorSubagentId}
             projectName={selectedProject?.name || 'Agent_US'}
             bundle={inspectorBundle}
+            client={client}
+            sessionId={activeRootTaskId}
+            preferredRunId={preferredSwarmRun?.sessionId === activeRootTaskId ? preferredSwarmRun?.runId : undefined}
             onResize={setDrawerWidth}
             onChangeTab={setInspectorTab}
             onSelectFile={setInspectorFile}
@@ -1822,7 +1923,9 @@ export const App: React.FC = () => {
       <SearchPalette
         open={searchOpen}
         projects={projects}
-        tasks={tasks.filter((t) => !archivedIds.includes(t.id))}
+        tasks={sidebarTasks}
+        historyClient={client}
+        historyRevision={archiveRevision}
         knownFiles={knownFiles}
         onClose={() => setSearchOpen(false)}
         onSelectTask={(taskId) => navigate({ kind: 'thread', taskId })}

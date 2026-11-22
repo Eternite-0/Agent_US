@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentBackendClient } from '../api/client';
 import type {
   AppearancePreset,
@@ -12,20 +12,19 @@ import type {
   ProviderAccountInput,
   ProviderPresetCatalog,
   ProvidersHealth,
-  Task,
   ThemeMode,
   UsageItem,
 } from '../types/backend';
 import {
   fmtActionCommand,
   fmtClock,
-  fmtRelative,
   fmtStatusLabel,
   fmtTokens,
   fmtUSD,
-  taskTitle,
 } from '../utils/format';
+import { ArchivedChats } from './ArchivedChats';
 import { CheckinCenterPanel } from './CheckinCenterPanel';
+import { ExperienceMemoryPanel } from './ExperienceMemoryPanel';
 import {
   IconActivity,
   IconArchive,
@@ -81,7 +80,9 @@ interface SettingsViewProps {
   approvals: Approval[];
   memory: MemoryItem[];
   usage: UsageItem[];
-  archivedTasks: Task[];
+  archiveClient: AgentBackendClient;
+  archiveBusy: ReadonlySet<string>;
+  archiveRevision: number;
   recentEvents: EventEnvelope[];
   onChangeSection: (section: string) => void;
   onChangeThemeMode: (mode: ThemeMode) => void;
@@ -106,7 +107,7 @@ const NAV_GROUPS: Array<{
   {
     group: '模型与网关',
     items: [
-      { id: 'providers', label: '账号号池', icon: <IconGlobe size={15} /> },
+      { id: 'providers', label: '账号池', icon: <IconGlobe size={15} /> },
       { id: 'models', label: '模型管理', icon: <IconCpu size={15} /> },
       { id: 'checkin', label: '签到中心', icon: <IconCheck size={15} /> },
     ],
@@ -196,7 +197,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   approvals,
   memory,
   usage,
-  archivedTasks,
+  archiveClient,
+  archiveBusy,
+  archiveRevision,
   recentEvents,
   onChangeSection,
   onChangeThemeMode,
@@ -214,6 +217,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onToast,
 }) => {
   const [navSearch, setNavSearch] = useState('');
+  const settingsNavRef = useRef<HTMLElement>(null);
   const [memoryQuery, setMemoryQuery] = useState('');
   const [memoryScope, setMemoryScope] = useState<'global' | 'workspace' | 'session'>('global');
   const [draftBaseUrl, setDraftBaseUrl] = useState(connection.baseUrl);
@@ -236,6 +240,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const validSections = new Set(NAV_GROUPS.flatMap((group) => group.items.map((item) => item.id)));
   const activeSection = validSections.has(section) ? section : 'general';
   const isWide = WIDE_SECTIONS.has(activeSection);
+  useEffect(() => {
+    const nav = settingsNavRef.current;
+    if (!nav || nav.scrollWidth <= nav.clientWidth) return;
+    nav.querySelector('[aria-current="page"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activeSection, filteredGroups]);
   const pendingApprovals = approvals.filter((a) => a.status === 'pending');
 
   const filteredMemory = useMemo(() => {
@@ -278,7 +287,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           />
         </div>
 
-        <nav className="codex-settings-nav-list" aria-label="设置分类">
+        <nav className="codex-settings-nav-list" ref={settingsNavRef} aria-label="设置分类">
           {filteredGroups.map((g) => (
             <div key={g.group} data-group={g.group} style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
               <div className="codex-settings-group-label">{g.group}</div>
@@ -288,6 +297,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   className="codex-settings-nav-item"
                   data-active={activeSection === item.id ? 'true' : undefined}
+                  aria-current={activeSection === item.id ? 'page' : undefined}
                   onClick={() => onChangeSection(item.id)}
                 >
                   <span style={{ display: 'inline-flex', color: 'var(--text-secondary)', flex: 'none' }}>
@@ -311,11 +321,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       }}
                     >
                       {pendingApprovals.length}
-                    </span>
-                  )}
-                  {item.id === 'archived' && archivedTasks.length > 0 && (
-                    <span style={{ marginLeft: 'auto', fontSize: 11.5, color: 'var(--text-tertiary)' }}>
-                      {archivedTasks.length}
                     </span>
                   )}
                 </button>
@@ -537,50 +542,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           )}
 
           {activeSection === 'archived' && (
-            <>
-              <h1 className="codex-settings-h1">已归档的聊天</h1>
-              <div className="codex-settings-card">
-                {archivedTasks.length === 0 ? (
-                  <div className="codex-settings-row">
-                    <div className="codex-settings-row-info">
-                      <span className="codex-settings-row-label">当前没有归档的聊天</span>
-                      <span className="codex-settings-row-desc">
-                        在左侧边栏悬停会话行点击归档图标，归档后的聊天会集中显示在这里。
-                      </span>
-                    </div>
-                  </div>
-                ) : (
-                  archivedTasks.map((t) => (
-                    <div key={t.id} className="codex-settings-row">
-                      <div className="codex-settings-row-info">
-                        <span className="codex-settings-row-label">{taskTitle(t.input)}</span>
-                        <span className="codex-settings-row-desc">
-                          {fmtStatusLabel(t.status)} · {fmtRelative(t.createdAt)}
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', gap: 6 }}>
-                        <button
-                          type="button"
-                          className="codex-toolbar-btn"
-                          data-variant="outline"
-                          onClick={() => onOpenTask(t.id)}
-                        >
-                          查看
-                        </button>
-                        <button
-                          type="button"
-                          className="codex-toolbar-btn"
-                          data-variant="primary"
-                          onClick={() => onRestoreArchived(t.id)}
-                        >
-                          取消归档
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </>
+            <ArchivedChats
+              client={archiveClient}
+              busy={archiveBusy}
+              revision={archiveRevision}
+              onOpen={onOpenTask}
+              onRestore={onRestoreArchived}
+            />
           )}
 
           {activeSection === 'shortcuts' && (
@@ -768,6 +736,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           {activeSection === 'memory' && (
             <>
               <h1 className="codex-settings-h1">记忆中心</h1>
+              <ExperienceMemoryPanel key={workspaceRoot} client={client} projectId={workspaceRoot} onToast={onToast} />
+              <h2 className="memory-section-title">持久记忆</h2>
               <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center' }}>
                 <select
                   className="codex-select"
