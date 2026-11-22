@@ -67,35 +67,192 @@ function durableTaskId(runId, taskId) {
   return `${String(runId)}:${String(taskId)}`;
 }
 
-function deriveMeasuredCapabilities(results = [], score = {}) {
-  const valid = results.filter((r) => r?.taskId && ['passed', 'failed', 'timeout', 'cancelled'].includes(r.status));
-  const passRate = Number(
-    score?.passRate ??
-      (valid.length
-        ? valid.filter((r) => r.status === 'passed' && r.passed === true).length / valid.length
-        : 0),
+function isFullResultPass(result) {
+  return Boolean(result && result.status === 'passed' && result.passed === true);
+}
+
+function hasEngineeringEvidence(result) {
+  const ev = result?.judge?.evidence;
+  return Boolean(
+    ev &&
+      (ev.implementationPassed !== undefined ||
+        ev.testsPassed !== undefined ||
+        ev.evidenceCompliant !== undefined),
   );
-  const rateFor = (regex) => {
+}
+
+function isResultBudgetExhausted(result) {
+  return Boolean(
+    result?.errorCode === 'STEP_BUDGET_EXHAUSTED' ||
+      result?.telemetry?.errorCode === 'STEP_BUDGET_EXHAUSTED' ||
+      /STEP_BUDGET/i.test(String(result?.error ?? result?.judge?.reason ?? '')),
+  );
+}
+
+function roundMetric4(value) {
+  return Number(Math.max(0, Math.min(1, Number(value) || 0)).toFixed(4));
+}
+
+export function deriveLayeredCapabilities(results = [], score = {}) {
+  const valid = results.filter(
+    (r) => r?.taskId && ['passed', 'failed', 'timeout', 'cancelled'].includes(r.status),
+  );
+  const fullAcceptanceRate = Number(
+    score?.passRate ?? (valid.length ? valid.filter(isFullResultPass).length / valid.length : 0),
+  );
+  const implOk = (r) => Boolean(r.judge?.evidence?.implementationPassed ?? isFullResultPass(r));
+  const testOk = (r) =>
+    Boolean(r.judge?.evidence?.testsPassed ?? r.judge?.evidence?.checks?.tests ?? isFullResultPass(r));
+  const evidenceOk = (r) => Boolean(r.judge?.evidence?.evidenceCompliant ?? isFullResultPass(r));
+
+  const implementationRate = valid.length ? valid.filter(implOk).length / valid.length : 0;
+  const testPassRate = valid.length ? valid.filter(testOk).length / valid.length : 0;
+  const evidenceComplianceRate = valid.length ? valid.filter(evidenceOk).length / valid.length : 0;
+  const engineeringScore = roundMetric4(
+    0.35 * implementationRate + 0.3 * testPassRate + 0.35 * fullAcceptanceRate,
+  );
+
+  const partialRate = (regex) => {
     const subset = valid.filter((r) => regex.test(String(r.taskId)));
-    if (!subset.length) return passRate;
-    return subset.filter((r) => r.status === 'passed' && r.passed === true).length / subset.length;
+    const pool = subset.length ? subset : valid;
+    if (!pool.length) return 0;
+    const sum = pool.reduce((acc, r) => {
+      if (isFullResultPass(r)) return acc + 1;
+      if (hasEngineeringEvidence(r)) {
+        if (implOk(r) && testOk(r)) return acc + 0.65;
+        if (implOk(r)) return acc + 0.35;
+      }
+      return acc;
+    }, 0);
+    return sum / pool.length;
   };
-  const avgLatencyMs = Number(
+
+  const analysisAuditRate = partialRate(
+    /code-generation|unfamiliar-codebase|real-security-audit|real-recovery|real-bug-fix|real-refactor|real-codebase-analysis/i,
+  );
+  const planningCompletionRate = partialRate(
+    /multi-file-refactor|long-task-recovery|multi-agent|real-refactor|real-recovery|real-multi-agent|real-multi-file-feature/i,
+  );
+  const reasoningScore = roundMetric4(0.6 * analysisAuditRate + 0.4 * planningCompletionRate);
+
+  const toolTotals = valid.reduce((s, r) => s + Number(r.telemetry?.toolReceiptCount ?? 0), 0);
+  const toolSuccesses = valid.reduce((s, r) => s + Number(r.telemetry?.toolReceiptSuccessCount ?? 0), 0);
+  const toolSuccessRate = toolTotals > 0
+    ? Math.min(1, toolSuccesses / toolTotals)
+    : valid.some(hasEngineeringEvidence)
+      ? testPassRate
+      : fullAcceptanceRate;
+  const recoveryPool = valid.filter((r) => /recovery/i.test(String(r.taskId)));
+  const recoveryRate = (recoveryPool.length ? recoveryPool : valid).length
+    ? (recoveryPool.length ? recoveryPool : valid).reduce(
+        (s, r) => s + (isFullResultPass(r) ? 1 : hasEngineeringEvidence(r) && implOk(r) ? 0.5 : 0),
+        0,
+      ) / (recoveryPool.length ? recoveryPool : valid).length
+    : 0;
+  const budgetCompletionRate = valid.length
+    ? valid.filter((r) => !isResultBudgetExhausted(r)).length / valid.length
+    : 0;
+  const timeoutFreeRate = valid.length
+    ? valid.filter((r) => r.status !== 'timeout').length / valid.length
+    : 0;
+  const executionScore = roundMetric4(
+    0.45 * toolSuccessRate + 0.25 * recoveryRate + 0.15 * budgetCompletionRate + 0.15 * timeoutFreeRate,
+  );
+
+  const meanDurationMs = Number(
     score?.meanDurationMs ??
       (valid.length ? valid.reduce((sum, r) => sum + Number(r.durationMs || 0), 0) / valid.length : 0),
   );
-  const speedBase = Math.max(0.05, Math.min(1, 1 - avgLatencyMs / 60_000));
-  const speed = Number(((passRate > 0 ? 0.2 : 0) + 0.8 * speedBase * Math.max(0.2, passRate)).toFixed(4));
-  const round4 = (v) => Number(Math.max(0, Math.min(1, Number(v) || 0)).toFixed(4));
+  const stepSamples = valid.map((r) => Number(r.telemetry?.stepUsage?.steps ?? 0)).filter((s) => s > 0);
+  const meanSteps = stepSamples.length
+    ? stepSamples.reduce((a, b) => a + b, 0) / stepSamples.length
+    : 0;
+  const tokenSamples = valid
+    .map((r) => {
+      const tu = r.telemetry?.tokenUsage;
+      if (!tu) return 0;
+      return Number(tu.totalTokens ?? Number(tu.inputTokens ?? 0) + Number(tu.outputTokens ?? 0));
+    })
+    .filter((t) => t > 0);
+  const meanTokens = tokenSamples.length
+    ? tokenSamples.reduce((a, b) => a + b, 0) / tokenSamples.length
+    : 0;
+  const latencyScore = valid.length
+    ? roundMetric4(Math.max(0.05, Math.min(1, 1 - meanDurationMs / 60_000)))
+    : 0;
+  const stepEfficiencyScore = meanSteps > 0
+    ? roundMetric4(Math.max(0.1, Math.min(1, 1 - meanSteps / 48)))
+    : roundMetric4(fullAcceptanceRate > 0 ? latencyScore : 0);
+  const efficiencyGate = fullAcceptanceRate > 0 || implementationRate > 0 ? 1 : 0.25;
+  const efficiencyScore = roundMetric4(
+    valid.length ? (0.6 * latencyScore + 0.4 * stepEfficiencyScore) * efficiencyGate : 0,
+  );
+
   return {
-    coding: round4(rateFor(/code-generation|multi-file-refactor|real-multi-file-feature|real-bug-fix|real-refactor|real-tests|real-api-compat|real-data-processing|real-recovery|real-multi-agent/i)),
-    reasoning: round4(rateFor(/code-generation|unfamiliar-codebase|real-security-audit|real-recovery|real-bug-fix|real-refactor/i)),
-    research: round4(rateFor(/unfamiliar-codebase|network-research|real-codebase-analysis|real-security-audit/i)),
-    planning: round4(rateFor(/multi-file-refactor|long-task-recovery|multi-agent|real-refactor|real-recovery|real-multi-agent/i)),
+    sampleCount: valid.length,
+    engineering: {
+      implementationRate: roundMetric4(implementationRate),
+      testPassRate: roundMetric4(testPassRate),
+      evidenceComplianceRate: roundMetric4(evidenceComplianceRate),
+      fullAcceptanceRate: roundMetric4(fullAcceptanceRate),
+      score: engineeringScore,
+    },
+    reasoning: {
+      analysisAuditRate: roundMetric4(analysisAuditRate),
+      planningCompletionRate: roundMetric4(planningCompletionRate),
+      score: reasoningScore,
+    },
+    execution: {
+      toolSuccessRate: roundMetric4(toolSuccessRate),
+      recoveryRate: roundMetric4(recoveryRate),
+      budgetCompletionRate: roundMetric4(budgetCompletionRate),
+      timeoutFreeRate: roundMetric4(timeoutFreeRate),
+      score: executionScore,
+    },
+    efficiency: {
+      meanDurationMs: Math.round(meanDurationMs),
+      meanSteps: Number(meanSteps.toFixed(2)),
+      meanTokens: Math.round(meanTokens),
+      latencyScore,
+      stepEfficiencyScore,
+      score: efficiencyScore,
+    },
+  };
+}
+
+function deriveMeasuredCapabilities(results = [], score = {}) {
+  const valid = results.filter((r) => r?.taskId && ['passed', 'failed', 'timeout', 'cancelled'].includes(r.status));
+  const layered = deriveLayeredCapabilities(results, score);
+  const partialFor = (regex) => {
+    const subset = valid.filter((r) => regex.test(String(r.taskId)));
+    const pool = subset.length ? subset : valid;
+    if (!pool.length) return 0;
+    const sum = pool.reduce((acc, r) => {
+      if (isFullResultPass(r)) return acc + 1;
+      if (hasEngineeringEvidence(r)) {
+        const impl = Boolean(r.judge?.evidence?.implementationPassed);
+        const test = Boolean(r.judge?.evidence?.testsPassed ?? r.judge?.evidence?.checks?.tests);
+        if (impl && test) return acc + 0.65;
+        if (impl) return acc + 0.35;
+      }
+      return acc;
+    }, 0);
+    return sum / pool.length;
+  };
+  const passRate = layered.engineering.fullAcceptanceRate;
+  const implRate = layered.engineering.implementationRate;
+  const activeSignal = Math.max(passRate, 0.65 * implRate);
+  const speedBase = Math.max(0.05, Math.min(1, 1 - layered.efficiency.meanDurationMs / 60_000));
+  const speed = Number(((activeSignal > 0 ? 0.2 : 0) + 0.8 * speedBase * Math.max(0.2, activeSignal)).toFixed(4));
+  return {
+    coding: roundMetric4(partialFor(/code-generation|multi-file-refactor|real-multi-file-feature|real-bug-fix|real-refactor|real-tests|real-api-compat|real-data-processing|real-recovery|real-multi-agent/i)),
+    reasoning: roundMetric4(partialFor(/code-generation|unfamiliar-codebase|real-security-audit|real-recovery|real-bug-fix|real-refactor/i)),
+    research: roundMetric4(partialFor(/unfamiliar-codebase|network-research|real-codebase-analysis|real-security-audit/i)),
+    planning: roundMetric4(partialFor(/multi-file-refactor|long-task-recovery|multi-agent|real-refactor|real-recovery|real-multi-agent/i)),
     speed,
-    contextCapacity: round4(valid.length ? 0.4 + 0.6 * passRate : 0),
+    contextCapacity: roundMetric4(valid.length ? 0.4 + 0.6 * activeSignal : 0),
     multimodal: 0,
-    toolCompatibility: round4(rateFor(/real-|multi-agent|recovery/i)),
+    toolCompatibility: roundMetric4(Math.max(layered.execution.toolSuccessRate * (activeSignal > 0 ? 1 : 0.5), partialFor(/real-|multi-agent|recovery/i))),
   };
 }
 
@@ -621,6 +778,7 @@ export class EvaluationService {
       if (finalRun.model && finalRun.status === 'completed' && mergedReport.score?.total > 0) {
         try {
           const measuredCaps = deriveMeasuredCapabilities(mergedReport.results, mergedReport.score);
+          const layered = deriveLayeredCapabilities(mergedReport.results, mergedReport.score);
           const avgLatencyMs = Math.round(Number(mergedReport.score.meanDurationMs ?? 0));
           const evidenceRefs = mergedReport.results
             .filter((result) => result?.taskId && ['passed', 'failed', 'timeout', 'cancelled'].includes(result.status))
@@ -630,12 +788,16 @@ export class EvaluationService {
               {
                 id: finalRun.model,
                 capabilities: measuredCaps,
+                layered,
                 metrics: {
                   passRate: mergedReport.score.passRate,
                   passed: mergedReport.score.passed,
                   failed: mergedReport.score.failed,
                   total: mergedReport.score.total,
                   avgLatencyMs,
+                  implementationRate: layered.engineering.implementationRate,
+                  testPassRate: layered.engineering.testPassRate,
+                  evidenceComplianceRate: layered.engineering.evidenceComplianceRate,
                 },
               },
               {

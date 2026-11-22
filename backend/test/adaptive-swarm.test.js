@@ -237,10 +237,19 @@ test('P5 AdaptiveSwarmOrchestrator executes diamond DAG concurrently with mailbo
   let active = 0;
   let peak = 0;
   let toolTriggeredSwarm = false;
+  let swarmToolCalls = 0;
 
   const adapter = new ScriptedAdapter(async function* (opts) {
     const lastUser = opts.messages.findLast((m) => m.role === 'user')?.content?.[0]?.text ?? '';
+    if (opts.messages.some((m) => m.role === 'tool')) {
+      toolTriggeredSwarm = true;
+      yield { type: 'text-delta', index: 0, text: '群体编排已通过工具执行完成。' };
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 10 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
+    }
     if (lastUser === '启动主任务并调用群体编排' && opts.tools?.some((t) => t.name === 'swarm_orchestrate')) {
+      swarmToolCalls++;
       yield {
         type: 'block-end',
         index: 0,
@@ -252,13 +261,6 @@ test('P5 AdaptiveSwarmOrchestrator executes diamond DAG concurrently with mailbo
         },
       };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
-      return;
-    }
-    if (opts.messages.some((m) => m.role === 'tool')) {
-      toolTriggeredSwarm = true;
-      yield { type: 'text-delta', index: 0, text: '群体编排已通过工具执行完成。' };
-      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 10 } };
-      yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
 
@@ -334,6 +336,7 @@ test('P5 AdaptiveSwarmOrchestrator executes diamond DAG concurrently with mailbo
     const done = await waitTurnDone(direct, s.id, turn.turn.id);
     assert.equal(done.state, 'completed');
     assert.equal(toolTriggeredSwarm, true);
+    assert.equal(swarmToolCalls, 1);
   } finally {
     await direct.close();
     store.close();

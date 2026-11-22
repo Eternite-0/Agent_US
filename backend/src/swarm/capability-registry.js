@@ -1,6 +1,8 @@
 import { CAPABILITY_DIMENSIONS } from './capabilities.js';
 
 const DEFAULT_CONFIDENCE_PRIOR = 10;
+const MIN_RANKING_SAMPLES = 5;
+const LOW_SAMPLE_BLEND_CAP = 0.25;
 
 function clamp(value, min = 0, max = 1) {
   return Math.min(max, Math.max(min, Number(value) || 0));
@@ -34,8 +36,9 @@ function freezeSnapshot(value) {
  * cannot mistake historical performance for an immutable capability claim.
  */
 export class CapabilityProfileRegistry {
-  constructor({ priorWeight = DEFAULT_CONFIDENCE_PRIOR, store = null, kind = 'capability_profiles' } = {}) {
+  constructor({ priorWeight = DEFAULT_CONFIDENCE_PRIOR, minRankingSamples = MIN_RANKING_SAMPLES, store = null, kind = 'capability_profiles' } = {}) {
     this.priorWeight = Math.max(1, Number(priorWeight) || DEFAULT_CONFIDENCE_PRIOR);
+    this.minRankingSamples = Math.max(1, Number(minRankingSamples) || MIN_RANKING_SAMPLES);
     this.store = store;
     this.kind = String(kind || 'capability_profiles');
     this.declared = new Map();
@@ -132,13 +135,19 @@ export class CapabilityProfileRegistry {
     const empirical = verifiedResults.length / sampleCount;
     const confidence = measuredConfidence({ sampleCount, confidence: undefined });
     const capabilities = normalizeVector(spec.capabilities ?? spec.vector ?? {});
+    const rankingEligible = sampleCount >= this.minRankingSamples;
+    const rankingStatus = rankingEligible ? 'eligible' : 'provisional_low_sample';
+    const layered = spec.layered ? structuredClone(spec.layered) : null;
     const measurement = {
       id,
       source: 'measured',
       sampleCount,
       confidence,
+      rankingEligible,
+      rankingStatus,
       empiricalScore: run ? Number(empirical.toFixed(4)) : (spec.empiricalScore == null ? Number(empirical.toFixed(4)) : clamp(spec.empiricalScore)),
       capabilities,
+      layered,
       metrics: { ...(spec.metrics ? structuredClone(spec.metrics) : {}), passedSamples: verifiedResults.length, failedSamples: failedResults.length },
       lastMeasuredAt: spec.lastMeasuredAt ?? Date.now(),
       evidenceRefs,
@@ -169,7 +178,16 @@ export class CapabilityProfileRegistry {
     const key = String(id);
     const declared = this.declared.get(key) ?? null;
     const measured = this.measured.get(key) ?? null;
-    const confidence = measured?.confidence ?? 0;
+    const rawConfidence = measured?.confidence ?? 0;
+    const rankingEligible = measured
+      ? (measured.rankingEligible ?? (Number(measured.sampleCount ?? 0) >= this.minRankingSamples))
+      : false;
+    const rankingStatus = measured
+      ? (measured.rankingStatus ?? (rankingEligible ? 'eligible' : 'provisional_low_sample'))
+      : 'unmeasured';
+    const confidence = measured && !rankingEligible
+      ? Math.min(rawConfidence, LOW_SAMPLE_BLEND_CAP)
+      : rawConfidence;
     const effective = {};
     for (const dimension of CAPABILITY_DIMENSIONS) {
       const d = declared?.capabilities?.[dimension] ?? 0;
@@ -183,6 +201,10 @@ export class CapabilityProfileRegistry {
       effective: {
         ...effective,
         confidence,
+        rawConfidence,
+        rankingEligible,
+        rankingStatus,
+        layered: measured?.layered ?? null,
         empiricalScore: measured?.empiricalScore ?? null,
       },
     };

@@ -107,6 +107,8 @@ export class AdaptiveModelRouter {
         priorScore,
         empiricalScore: emp ?? c.persistedCapability?.effective?.empiricalScore ?? null,
         measuredCapability: c.persistedCapability?.measured ?? null,
+        layeredCapability: c.persistedCapability?.measured?.layered ?? c.persistedCapability?.effective?.layered ?? null,
+        rankingStatus: c.persistedCapability?.effective?.rankingStatus ?? 'unmeasured',
         reviewerStats: reviewStats && reviewStats.sampleCount > 0 ? reviewStats : null,
         confidence: Math.max(conf, c.persistedCapability?.effective?.confidence ?? 0),
         sampleCount: fb?.sampleCount ?? 0,
