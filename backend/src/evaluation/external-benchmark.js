@@ -11,7 +11,7 @@ import { listWorkspaceChangedFiles, verifyWorkspacePinnedBaseline } from './fixt
 import {
   BenchmarkSandbox,
   isPathInsideRoot,
-  runHardenedGitSync,
+  runHardenedGit,
 } from '../tools/benchmark-sandbox.js';
 import { DEFAULT_DEPENDENCY_POLICY, validatePackageDependencies } from './dependency-policy.js';
 import { estimateTaskBudget } from '../planning/budget-estimator.js';
@@ -32,10 +32,10 @@ function getDefaultBenchmarkSandbox() {
   return sbx;
 }
 
-function checkFilesUnmodifiedSince(workspaceRoot, baselineCommit, protectedFiles = []) {
+async function checkFilesUnmodifiedSince(workspaceRoot, baselineCommit, protectedFiles = []) {
   if (!protectedFiles.length) return { ok: true, modified: [] };
   try {
-    const res = runHardenedGitSync(
+    const res = await runHardenedGit(
       ['diff', '--no-ext-diff', '--name-only', baselineCommit, '--', ...protectedFiles],
       { cwd: workspaceRoot, allowNetwork: false },
     );
@@ -52,32 +52,42 @@ function checkFilesUnmodifiedSince(workspaceRoot, baselineCommit, protectedFiles
   }
 }
 
-function hasRealSourceDiff(workspaceRoot, baselineCommit, sourceFiles = []) {
+async function hasRealSourceDiff(workspaceRoot, baselineCommit, sourceFiles = [], changedFiles = null) {
   if (!sourceFiles.length) return true;
-  const changed = new Set(listWorkspaceChangedFiles(workspaceRoot));
-  for (const rel of sourceFiles.map(normalizeEvidencePath)) {
+  const changed = new Set(changedFiles ?? listWorkspaceChangedFiles(workspaceRoot));
+  const normalized = sourceFiles.map(normalizeEvidencePath);
+  for (const rel of normalized) {
     if (!changed.has(rel)) return false;
-    const full = join(workspaceRoot, rel);
-    if (!existsSync(full)) return false;
-    try {
-      const lsRes = runHardenedGitSync(['ls-files', '--', rel], {
-        cwd: workspaceRoot,
-        allowNetwork: false,
-      });
-      if (lsRes.error || lsRes.exitCode !== 0) return false;
-      const tracked = lsRes.stdout.trim();
-      if (tracked) {
-        const diffRes = runHardenedGitSync(
-          ['diff', '--no-ext-diff', '--quiet', baselineCommit, '--', rel],
-          { cwd: workspaceRoot, allowNetwork: false },
-        );
-        if (diffRes.error || diffRes.exitCode !== 1) return false;
-      } else if (readFileSync(full, 'utf8').trim().length === 0) {
+    if (!existsSync(join(workspaceRoot, rel))) return false;
+  }
+  try {
+    const lsRes = await runHardenedGit(['ls-files', '-z', '--', ...normalized], {
+      cwd: workspaceRoot,
+      allowNetwork: false,
+    });
+    if (lsRes.error || lsRes.exitCode !== 0) return false;
+    const trackedSet = new Set(lsRes.stdout.split('\0').map(normalizeEvidencePath).filter(Boolean));
+    const trackedFiles = [];
+    for (const rel of normalized) {
+      if (trackedSet.has(rel)) {
+        trackedFiles.push(rel);
+      } else if (readFileSync(join(workspaceRoot, rel), 'utf8').trim().length === 0) {
         return false;
       }
-    } catch {
-      return false;
     }
+    if (trackedFiles.length > 0) {
+      const diffRes = await runHardenedGit(
+        ['diff', '--no-ext-diff', '--name-only', '-z', baselineCommit, '--', ...trackedFiles],
+        { cwd: workspaceRoot, allowNetwork: false },
+      );
+      if (diffRes.error || diffRes.exitCode !== 0) return false;
+      const diffSet = new Set(diffRes.stdout.split('\0').map(normalizeEvidencePath).filter(Boolean));
+      for (const rel of trackedFiles) {
+        if (!diffSet.has(rel)) return false;
+      }
+    }
+  } catch {
+    return false;
   }
   return true;
 }
@@ -139,50 +149,62 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
     }
 
     const historyCheck = verifyWorkspacePinnedBaseline(workspaceRoot, pinnedCommit);
-    const baselineFileCheck = checkFilesUnmodifiedSince(workspaceRoot, pinnedCommit, baselineTestFiles);
     const actualFiles = listWorkspaceChangedFiles(workspaceRoot);
-    const sourceDiffPresent = historyCheck.ok
-      ? hasRealSourceDiff(workspaceRoot, pinnedCommit, sourceFiles)
-      : false;
+    const [baselineFileCheck, sourceDiffPresent] = await Promise.all([
+      checkFilesUnmodifiedSince(workspaceRoot, pinnedCommit, baselineTestFiles),
+      historyCheck.ok
+        ? hasRealSourceDiff(workspaceRoot, pinnedCommit, sourceFiles, actualFiles)
+        : Promise.resolve(false),
+    ]);
 
-    const baselineRun = await activeSandbox.execArgv(baselineTestCommand, {
-      workspaceRoot,
-      cwd: workspaceRoot,
-      allowWorkspaceNodeCli,
-      dependencyPolicy,
-      memoryLimitMb,
-      cpuLimitSec,
-      timeoutMs,
-    });
-    const baselineTestExitCode = baselineRun.timedOut ? 124 : baselineRun.exitCode;
-
-    const actualRun = await activeSandbox.execArgv(acceptance.testCommand, {
-      workspaceRoot,
-      cwd: workspaceRoot,
-      allowWorkspaceNodeCli,
-      dependencyPolicy,
-      memoryLimitMb,
-      cpuLimitSec,
-      timeoutMs,
-    });
-    const actualTestExitCode = actualRun.timedOut ? 124 : actualRun.exitCode;
-
-    const hiddenRun = await activeSandbox.runHiddenAcceptance({
-      workspaceRoot,
-      scriptSource: hiddenAcceptanceScript,
-      allowWorkspaceNodeCli,
-      memoryLimitMb,
-      cpuLimitSec,
-      timeoutMs,
-      extraEnv: { AGENT_US_EVAL_WORKSPACE: workspaceRoot },
-    });
-    const hiddenResult = {
-      passed: Boolean(hiddenRun.passed),
-      exitCode: hiddenRun.exitCode,
-      error: hiddenRun.passed
-        ? null
-        : String(hiddenRun.stderr || hiddenRun.stdout || 'hidden acceptance test failed').slice(0, 1000),
+    let baselineTestExitCode = 1;
+    let actualTestExitCode = 1;
+    let hiddenResult = {
+      passed: false,
+      exitCode: 1,
+      error: 'skipped_due_to_integrity_or_policy_failure',
     };
+
+    if (historyCheck.ok && baselineFileCheck.ok && depCheck.ok) {
+      const [baselineRun, actualRun, hiddenRun] = await Promise.all([
+        activeSandbox.execArgv(baselineTestCommand, {
+          workspaceRoot,
+          cwd: workspaceRoot,
+          allowWorkspaceNodeCli,
+          dependencyPolicy,
+          memoryLimitMb,
+          cpuLimitSec,
+          timeoutMs,
+        }),
+        activeSandbox.execArgv(acceptance.testCommand, {
+          workspaceRoot,
+          cwd: workspaceRoot,
+          allowWorkspaceNodeCli,
+          dependencyPolicy,
+          memoryLimitMb,
+          cpuLimitSec,
+          timeoutMs,
+        }),
+        activeSandbox.runHiddenAcceptance({
+          workspaceRoot,
+          scriptSource: hiddenAcceptanceScript,
+          allowWorkspaceNodeCli,
+          memoryLimitMb,
+          cpuLimitSec,
+          timeoutMs,
+          extraEnv: { AGENT_US_EVAL_WORKSPACE: workspaceRoot },
+        }),
+      ]);
+      baselineTestExitCode = baselineRun.timedOut ? 124 : baselineRun.exitCode;
+      actualTestExitCode = actualRun.timedOut ? 124 : actualRun.exitCode;
+      hiddenResult = {
+        passed: Boolean(hiddenRun.passed),
+        exitCode: hiddenRun.exitCode,
+        error: hiddenRun.passed
+          ? null
+          : String(hiddenRun.stderr || hiddenRun.stdout || 'hidden acceptance test failed').slice(0, 1000),
+      };
+    }
     const extraChecks = extraCheck ? extraCheck({ workspaceRoot, actualFiles }) : {};
     const extraPassed = Object.values(extraChecks).every(Boolean);
 

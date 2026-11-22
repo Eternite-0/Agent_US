@@ -1,10 +1,13 @@
-import test, { after, before } from 'node:test';
+import test, { after, before, suite } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 import { Store } from '../../src/store.js';
 import {
@@ -34,31 +37,30 @@ function writeTreeFiles(dir, files) {
   }
 }
 
-function commitAll(dir, message) {
-  execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' });
-  execFileSync(
+async function commitAll(dir, message) {
+  await execFileAsync('git', ['add', '-A'], { cwd: dir });
+  await execFileAsync(
     'git',
     ['-c', 'user.email=test@agent-us.invalid', '-c', 'user.name=Agent_US Test', 'commit', '-qm', message],
-    { cwd: dir, stdio: 'ignore' },
+    { cwd: dir },
   );
-  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim().toLowerCase();
+  const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' });
+  return stdout.trim().toLowerCase();
 }
 
-function createMultiCommitBareRepo(parentDir, name, commitSequence) {
+async function createMultiCommitBareRepo(parentDir, name, commitSequence) {
   const work = join(parentDir, `${name}-work`);
   const bare = join(parentDir, `${name}.git`);
   mkdirSync(work, { recursive: true });
-  execFileSync('git', ['init', '-b', 'main'], { cwd: work, stdio: 'ignore' });
-  execFileSync('git', ['config', 'user.email', 'test@agent-us.invalid'], { cwd: work, stdio: 'ignore' });
-  execFileSync('git', ['config', 'user.name', 'Agent_US Test'], { cwd: work, stdio: 'ignore' });
+  await execFileAsync('git', ['init', '-b', 'main'], { cwd: work });
 
   const shas = [];
   for (const step of commitSequence) {
     writeTreeFiles(work, step.files);
-    shas.push(commitAll(work, step.message));
+    shas.push(await commitAll(work, step.message));
   }
 
-  execFileSync('git', ['clone', '--quiet', '--bare', work, bare], { stdio: 'ignore' });
+  await execFileAsync('git', ['clone', '--quiet', '--bare', work, bare]);
   rmSync(work, { recursive: true, force: true });
   return { barePath: bare, bareUrl: pathToFileURL(bare).href, shas };
 }
@@ -108,8 +110,9 @@ function buildTrustedContext(task, workspaceRoot) {
   };
 }
 
-function buildHermeticOssFixtures(root) {
-  const nanoidRepo = createMultiCommitBareRepo(root, 'nanoid', [
+async function buildHermeticOssFixtures(root) {
+  const [nanoidRepo, troughRepo, contentTypeRepo, nanoeventsRepo] = await Promise.all([
+    createMultiCommitBareRepo(root, 'nanoid', [
     {
       message: 'chore: initial package',
       files: {
@@ -211,9 +214,8 @@ print(alphabet ? customAlphabet(alphabet, size)() : nanoid(size));
         'CHANGELOG.md': '# Future changelog entry\n',
       },
     },
-  ]);
-
-  const troughRepo = createMultiCommitBareRepo(root, 'trough', [
+  ]),
+  createMultiCommitBareRepo(root, 'trough', [
     {
       message: 'chore: init trough',
       files: {
@@ -295,9 +297,8 @@ test('baseline run', async () => {
       message: 'docs: newer commit after pin',
       files: { 'README.md': '# trough\n' },
     },
-  ]);
-
-  const contentTypeRepo = createMultiCommitBareRepo(root, 'fast-content-type-parse', [
+  ]),
+  createMultiCommitBareRepo(root, 'fast-content-type-parse', [
     {
       message: 'chore: init package',
       files: {
@@ -381,9 +382,8 @@ test('baseline parse and safeParse', (t) => {
       message: 'docs: post-pin commit',
       files: { 'README.md': '# fast-content-type-parse\n' },
     },
-  ]);
-
-  const nanoeventsRepo = createMultiCommitBareRepo(root, 'nanoevents', [
+  ]),
+  createMultiCommitBareRepo(root, 'nanoevents', [
     {
       message: 'chore: init nanoevents',
       files: {
@@ -449,6 +449,7 @@ test('replaces events object', () => {
       message: 'docs: post-pin readme',
       files: { 'README.md': '# nanoevents\n' },
     },
+  ]),
   ]);
 
   return {
@@ -772,318 +773,351 @@ test('prototype safety, once, and clear', () => {
   }
 }
 
-test('multi-commit git repo baseline tracking diffs only against pinned commit and rejects SHA mismatch', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'agent-us-oss-git-test-'));
-  const cacheDir = join(root, 'mirror-cache');
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+suite('External OSS benchmark verification', { concurrency: 4 }, () => {
+  let sharedJudgeRoot = null;
+  let sharedJudgeFixtures = null;
 
-  const repo = createMultiCommitBareRepo(root, 'sample-lib', [
-    { message: 'c1 init', files: { 'README.md': '# v1\n', 'src/a.js': 'export const a = 1;\n' } },
-    { message: 'c2 add b', files: { 'src/b.js': 'export const b = 2;\n' } },
-    { message: 'c3 pinned baseline', files: { 'src/a.js': 'export const a = 3;\n', 'src/c.js': 'export const c = 3;\n' } },
-    { message: 'c4 future commit', files: { 'src/future.js': 'export const future = true;\n' } },
-  ]);
+  before(async () => {
+    sharedJudgeRoot = mkdtempSync(join(tmpdir(), 'agent-us-oss-judges-'));
+    sharedJudgeFixtures = await buildHermeticOssFixtures(sharedJudgeRoot);
+  });
 
-  const pinnedSha = repo.shas[2];
-  const rootSha = repo.shas[0];
-  const futureSha = repo.shas[3];
-  assert.notEqual(pinnedSha, rootSha);
-  assert.notEqual(pinnedSha, futureSha);
-
-  // Test both file:// URL and local bare path with mirror cacheDir
-  const task = {
-    id: 'oss-sample-git-test',
-    title: 'Sample Git',
-    prompt: 'Sample',
-    expected: { output: {} },
-    fixture: { repoUrl: repo.bareUrl, commit: pinnedSha },
-  };
-
-  const ws1 = await createGitRepoWorkspace(task, { cacheDir });
-  t.after(() => removeFixtureWorkspace(ws1));
-
-  assert.equal(getWorkspaceBaselineCommit(ws1), pinnedSha);
-  assert.equal(existsSync(join(ws1, 'src', 'future.js')), false, 'must checkout pinned commit, not main HEAD');
-  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: ws1, encoding: 'utf8' }).trim(), '');
-  assert.deepEqual(listWorkspaceChangedFiles(ws1), [], 'untouched multi-commit workspace must report zero changed files');
-
-  // Modify tracked file & add untracked file -> only those appear
-  writeFileSync(join(ws1, 'src', 'a.js'), 'export const a = 99;\n', 'utf8');
-  writeFileSync(join(ws1, 'src', 'added.js'), 'export const added = true;\n', 'utf8');
-  assert.deepEqual(listWorkspaceChangedFiles(ws1), ['src/a.js', 'src/added.js']);
-
-  // Commit inside workspace -> listWorkspaceChangedFiles still diffs against .git/agent-us-eval-base
-  commitAll(ws1, 'agent local commit');
-  assert.deepEqual(listWorkspaceChangedFiles(ws1), ['src/a.js', 'src/added.js']);
-  assert.equal(verifyWorkspacePinnedBaseline(ws1, pinnedSha).ok, true);
-
-  // Repeat via createFixtureWorkspace with filesystem bare path and cached mirror
-  const ws2 = await createFixtureWorkspace(
-    { ...task, fixture: { repoUrl: repo.barePath, commit: pinnedSha } },
-    { cacheDir },
-  );
-  t.after(() => removeFixtureWorkspace(ws2));
-  assert.equal(getWorkspaceBaselineCommit(ws2), pinnedSha);
-  assert.deepEqual(listWorkspaceChangedFiles(ws2), []);
-
-  // Fail closed on missing or invalid commit SHA
-  await assert.rejects(
-    () => createGitRepoWorkspace({ fixture: { repoUrl: repo.barePath, commit: '0'.repeat(40) } }),
-    /not found/i,
-  );
-  await assert.rejects(
-    () => createGitRepoWorkspace({ fixture: { repoUrl: repo.barePath, commit: 'not-a-sha' } }),
-    TypeError,
-  );
-  await assert.rejects(
-    () => createGitRepoWorkspace({ fixture: { repoUrl: '--upload-pack=evil', commit: pinnedSha } }),
-    TypeError,
-  );
-});
-
-test('createOssBenchmarkDataset exposes 4 real pinned GitHub OSS repos and strict contracts', () => {
-  assert.equal(OSS_BENCHMARK_ID, 'agent-us-oss-benchmark');
-  assert.equal(OSS_BENCHMARK_VERSION, '1.0.0');
-  assert.equal(OSS_DATASET_VERSION, '1.0.0');
-
-  const tasks = createOssBenchmarkDataset();
-  assert.equal(tasks.length, 4);
-  const slugs = new Set();
-  for (const task of tasks) {
-    assert.match(task.fixture.repoUrl, /^https:\/\/github\.com\/[^/]+\/[^/]+\.git$/);
-    assert.match(task.fixture.commit, /^[0-9a-f]{40}$/);
-    assert.ok(task.fixture.license);
-    assert.equal(task.metadata.externalNetwork, false);
-    assert.equal(task.metadata.requiresWorkspaceMutation, true);
-    assert.equal(task.metadata.requiresGitDiff, true);
-    assert.equal(typeof task.judge, 'function');
-    assert.match(task.prompt, /Engineering Evidence Manifest v1\.0\.0/);
-    slugs.add(task.fixture.repoSlug);
-  }
-  assert.equal(slugs.size, 4);
-});
-
-let sharedJudgeRoot = null;
-let sharedJudgeFixtures = null;
-
-before(() => {
-  sharedJudgeRoot = mkdtempSync(join(tmpdir(), 'agent-us-oss-judges-'));
-  sharedJudgeFixtures = buildHermeticOssFixtures(sharedJudgeRoot);
-});
-
-after(() => {
-  if (sharedJudgeRoot) {
-    try {
-      rmSync(sharedJudgeRoot, { recursive: true, force: true });
-    } catch {
-      // ignore cleanup error
+  after(() => {
+    if (sharedJudgeRoot) {
+      try {
+        rmSync(sharedJudgeRoot, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup error
+      }
+      sharedJudgeRoot = null;
+      sharedJudgeFixtures = null;
     }
-    sharedJudgeRoot = null;
-    sharedJudgeFixtures = null;
-  }
-});
+  });
 
-for (const taskId of [
-  'oss-nanoid-batch-cli-01',
-  'oss-trough-pipeline-01',
-  'oss-content-type-format-01',
-  'oss-nanoevents-hardening-01',
-]) {
-  test(`OSS judge (${taskId}): accepts compliant fix and rejects fake manifest, untouched workspace, reset history, and marker tampering`, async (t) => {
-    const cacheDir = mkdtempSync(join(tmpdir(), 'agent-us-oss-judge-cache-'));
+  test('multi-commit git repo baseline tracking diffs only against pinned commit and rejects SHA mismatch', async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-us-oss-git-test-'));
+    const cacheDir = join(root, 'mirror-cache');
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+
+    const repo = await createMultiCommitBareRepo(root, 'sample-lib', [
+      { message: 'c1 init', files: { 'README.md': '# v1\n', 'src/a.js': 'export const a = 1;\n' } },
+      { message: 'c2 add b', files: { 'src/b.js': 'export const b = 2;\n' } },
+      { message: 'c3 pinned baseline', files: { 'src/a.js': 'export const a = 3;\n', 'src/c.js': 'export const c = 3;\n' } },
+      { message: 'c4 future commit', files: { 'src/future.js': 'export const future = true;\n' } },
+    ]);
+
+    const pinnedSha = repo.shas[2];
+    const rootSha = repo.shas[0];
+    const futureSha = repo.shas[3];
+    assert.notEqual(pinnedSha, rootSha);
+    assert.notEqual(pinnedSha, futureSha);
+
+    // Test both file:// URL and local bare path with mirror cacheDir
+    const task = {
+      id: 'oss-sample-git-test',
+      title: 'Sample Git',
+      prompt: 'Sample',
+      expected: { output: {} },
+      fixture: { repoUrl: repo.bareUrl, commit: pinnedSha },
+    };
+
+    const ws1 = await createGitRepoWorkspace(task, { cacheDir });
+    t.after(() => removeFixtureWorkspace(ws1));
+
+    assert.equal(getWorkspaceBaselineCommit(ws1), pinnedSha);
+    assert.equal(existsSync(join(ws1, 'src', 'future.js')), false, 'must checkout pinned commit, not main HEAD');
+    const statusOut = await execFileAsync('git', ['status', '--porcelain'], { cwd: ws1, encoding: 'utf8' });
+    assert.equal(statusOut.stdout.trim(), '');
+    assert.deepEqual(listWorkspaceChangedFiles(ws1), [], 'untouched multi-commit workspace must report zero changed files');
+
+    // Modify tracked file & add untracked file -> only those appear
+    writeFileSync(join(ws1, 'src', 'a.js'), 'export const a = 99;\n', 'utf8');
+    writeFileSync(join(ws1, 'src', 'added.js'), 'export const added = true;\n', 'utf8');
+    assert.deepEqual(listWorkspaceChangedFiles(ws1), ['src/a.js', 'src/added.js']);
+
+    // Commit inside workspace -> listWorkspaceChangedFiles still diffs against .git/agent-us-eval-base
+    await commitAll(ws1, 'agent local commit');
+    assert.deepEqual(listWorkspaceChangedFiles(ws1), ['src/a.js', 'src/added.js']);
+    assert.equal(verifyWorkspacePinnedBaseline(ws1, pinnedSha).ok, true);
+
+    // Repeat via createFixtureWorkspace with filesystem bare path and cached mirror
+    const ws2 = await createFixtureWorkspace(
+      { ...task, fixture: { repoUrl: repo.barePath, commit: pinnedSha } },
+      { cacheDir },
+    );
+    t.after(() => removeFixtureWorkspace(ws2));
+    assert.equal(getWorkspaceBaselineCommit(ws2), pinnedSha);
+    assert.deepEqual(listWorkspaceChangedFiles(ws2), []);
+
+    // Fail closed on missing or invalid commit SHA
+    await assert.rejects(
+      () => createGitRepoWorkspace({ fixture: { repoUrl: repo.barePath, commit: '0'.repeat(40) } }),
+      /not found/i,
+    );
+    await assert.rejects(
+      () => createGitRepoWorkspace({ fixture: { repoUrl: repo.barePath, commit: 'not-a-sha' } }),
+      TypeError,
+    );
+    await assert.rejects(
+      () => createGitRepoWorkspace({ fixture: { repoUrl: '--upload-pack=evil', commit: pinnedSha } }),
+      TypeError,
+    );
+  });
+
+  test('createOssBenchmarkDataset exposes 4 real pinned GitHub OSS repos and strict contracts', () => {
+    assert.equal(OSS_BENCHMARK_ID, 'agent-us-oss-benchmark');
+    assert.equal(OSS_BENCHMARK_VERSION, '1.0.0');
+    assert.equal(OSS_DATASET_VERSION, '1.0.0');
+
+    const tasks = createOssBenchmarkDataset();
+    assert.equal(tasks.length, 4);
+    const slugs = new Set();
+    for (const task of tasks) {
+      assert.match(task.fixture.repoUrl, /^https:\/\/github\.com\/[^/]+\/[^/]+\.git$/);
+      assert.match(task.fixture.commit, /^[0-9a-f]{40}$/);
+      assert.ok(task.fixture.license);
+      assert.equal(task.metadata.externalNetwork, false);
+      assert.equal(task.metadata.requiresWorkspaceMutation, true);
+      assert.equal(task.metadata.requiresGitDiff, true);
+      assert.equal(typeof task.judge, 'function');
+      assert.match(task.prompt, /Engineering Evidence Manifest v1\.0\.0/);
+      slugs.add(task.fixture.repoSlug);
+    }
+    assert.equal(slugs.size, 4);
+  });
+
+  test('OSS judges: accept compliant fixes and reject tampering across all 4 pinned repos', { concurrency: 4 }, async (t) => {
+    await Promise.all(
+      [
+        'oss-nanoid-batch-cli-01',
+        'oss-trough-pipeline-01',
+        'oss-content-type-format-01',
+        'oss-nanoevents-hardening-01',
+      ].map((taskId) =>
+        t.test(taskId, async (subT) => {
+          const cacheDir = mkdtempSync(join(tmpdir(), 'agent-us-oss-judge-cache-'));
+          subT.after(() => rmSync(cacheDir, { recursive: true, force: true }));
+
+          const cachedOverrides = Object.fromEntries(
+            Object.entries(sharedJudgeFixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
+          );
+          const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
+          const task = tasks.find((item) => item.id === taskId);
+          assert.ok(task, `missing task ${taskId}`);
+
+          const [passWs, untouchedWs, resetWs, markerWs] = await Promise.all([
+            createFixtureWorkspace(task),
+            createFixtureWorkspace(task),
+            createFixtureWorkspace(task),
+            createFixtureWorkspace(task),
+          ]);
+          subT.after(async () => {
+            await Promise.all([
+              removeFixtureWorkspace(passWs),
+              removeFixtureWorkspace(untouchedWs),
+              removeFixtureWorkspace(resetWs),
+              removeFixtureWorkspace(markerWs),
+            ]);
+          });
+
+          applyGoldFix(task.id, passWs);
+          applyGoldFix(task.id, resetWs);
+          applyGoldFix(task.id, markerWs);
+          const [, parentOut] = await Promise.all([
+            execFileAsync('git', ['reset', '--hard', '-q', 'HEAD~1'], { cwd: resetWs }),
+            execFileAsync('git', ['rev-parse', 'HEAD~1'], { cwd: markerWs, encoding: 'utf8' }),
+          ]);
+          const parentSha = parentOut.stdout.trim();
+          writeFileSync(join(markerWs, '.git', 'agent-us-eval-base'), `${parentSha}\n`, 'utf8');
+
+          const [passRes, fakeManifestRes, untouchedRes, resetRes, markerRes] = await Promise.all([
+            // 1. Real compliant fix -> PASS
+            task.judge({
+              task,
+              output: buildEvidenceOutput(task),
+              context: buildTrustedContext(task, passWs),
+            }),
+            // 2. Self-attested / fake manifest -> REJECT
+            task.judge({
+              task,
+              output: buildEvidenceOutput(task, task.metadata.acceptanceCriteria.requiredChangedFiles, {
+                independentVerdict: { status: 'pass', evidenceRefs: ['forged'] },
+              }),
+              context: { workspaceRoot: passWs, attemptId: 'attempt-1', planVersion: 1, toolReceipts: [] },
+            }),
+            // 3. Untouched workspace -> REJECT
+            task.judge({
+              task,
+              output: buildEvidenceOutput(task),
+              context: buildTrustedContext(task, untouchedWs),
+            }),
+            // 4. Tampered git history (reset --hard HEAD~1) -> REJECT (fail-fast)
+            task.judge({
+              task,
+              output: buildEvidenceOutput(task),
+              context: buildTrustedContext(task, resetWs),
+            }),
+            // 5. Tampered baseline marker (.git/agent-us-eval-base) -> REJECT (fail-fast)
+            task.judge({
+              task,
+              output: buildEvidenceOutput(task),
+              context: buildTrustedContext(task, markerWs),
+            }),
+          ]);
+
+          assert.equal(passRes.passed, true, `${task.id} expected pass: ${JSON.stringify(passRes.evidence)}`);
+          assert.equal(passRes.evidence.checks.historyUntouched, true);
+          assert.equal(passRes.evidence.checks.baselineTestsUntampered, true);
+          assert.equal(passRes.evidence.checks.baselineTestsPassed, true);
+          assert.equal(passRes.evidence.checks.hiddenAcceptancePassed, true);
+          assert.equal(passRes.evidence.evidenceCompliant, true);
+
+          assert.equal(fakeManifestRes.passed, false);
+          assert.equal(fakeManifestRes.evidence.evidenceCompliant, false);
+          assert.equal(fakeManifestRes.evidence.manifestStatus, EVIDENCE_STATUSES.INCOMPLETE);
+
+          assert.equal(untouchedRes.passed, false);
+          assert.equal(untouchedRes.evidence.checks.changedFiles, false);
+
+          assert.equal(resetRes.passed, false);
+          assert.equal(resetRes.evidence.checks.historyUntouched, false);
+          assert.equal(resetRes.evidence.failureCategory, 'history_tampered');
+
+          assert.equal(markerRes.passed, false);
+          assert.equal(markerRes.evidence.checks.historyUntouched, false);
+        }),
+      ),
+    );
+  });
+
+  test('OSS judges reject broken implementations and weakened baseline test files', async (t) => {
+    const cacheDir = mkdtempSync(join(tmpdir(), 'agent-us-oss-judge-neg-'));
     t.after(() => rmSync(cacheDir, { recursive: true, force: true }));
 
     const cachedOverrides = Object.fromEntries(
       Object.entries(sharedJudgeFixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
     );
     const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
-    const task = tasks.find((item) => item.id === taskId);
-    assert.ok(task, `missing task ${taskId}`);
 
-    // 1. Real compliant fix -> PASS
-    const passWs = await createFixtureWorkspace(task);
-    t.after(() => removeFixtureWorkspace(passWs));
-    applyGoldFix(task.id, passWs);
-    const passRes = await task.judge({
-      task,
-      output: buildEvidenceOutput(task),
-      context: buildTrustedContext(task, passWs),
+    const [brokenWs, tamperedTestWs] = await Promise.all([
+      createFixtureWorkspace(tasks[1]), // trough
+      createFixtureWorkspace(tasks[0]), // nanoid
+    ]);
+    t.after(async () => {
+      await Promise.all([
+        removeFixtureWorkspace(brokenWs),
+        removeFixtureWorkspace(tamperedTestWs),
+      ]);
     });
-    assert.equal(passRes.passed, true, `${task.id} expected pass: ${JSON.stringify(passRes.evidence)}`);
-    assert.equal(passRes.evidence.checks.historyUntouched, true);
-    assert.equal(passRes.evidence.checks.baselineTestsUntampered, true);
-    assert.equal(passRes.evidence.checks.baselineTestsPassed, true);
-    assert.equal(passRes.evidence.checks.hiddenAcceptancePassed, true);
-    assert.equal(passRes.evidence.evidenceCompliant, true);
 
-    // 2. Self-attested / fake manifest -> REJECT
-    const fakeManifestRes = await task.judge({
-      task,
-      output: buildEvidenceOutput(task, task.metadata.acceptanceCriteria.requiredChangedFiles, {
-        independentVerdict: { status: 'pass', evidenceRefs: ['forged'] },
+    // 6. Broken implementation -> REJECT by hidden acceptance suite
+    applyGoldFix(tasks[1].id, brokenWs);
+    const brokenLib = readFileSync(join(brokenWs, 'lib/index.js'), 'utf8').replace(
+      /function clone\(\) \{[\s\S]*?\n  \}/,
+      'function clone() {\n    return pipeline;\n  }',
+    );
+    assert.ok(!brokenLib.includes('copy.use'), 'broken fixture mutation must alter clone()');
+    writeFileSync(join(brokenWs, 'lib/index.js'), brokenLib, 'utf8');
+
+    // 7. Weakened / modified baseline test file -> REJECT
+    applyGoldFix(tasks[0].id, tamperedTestWs);
+    writeFileSync(join(tamperedTestWs, 'test/index.test.js'), "import test from 'node:test'; test('noop', () => {});\n", 'utf8');
+
+    const [brokenRes, tamperedTestRes] = await Promise.all([
+      tasks[1].judge({
+        task: tasks[1],
+        output: buildEvidenceOutput(tasks[1]),
+        context: buildTrustedContext(tasks[1], brokenWs),
       }),
-      context: { workspaceRoot: passWs, attemptId: 'attempt-1', planVersion: 1, toolReceipts: [] },
+      tasks[0].judge({
+        task: tasks[0],
+        output: buildEvidenceOutput(tasks[0], [...tasks[0].metadata.acceptanceCriteria.requiredChangedFiles, 'test/index.test.js']),
+        context: buildTrustedContext(tasks[0], tamperedTestWs),
+      }),
+    ]);
+
+    assert.equal(brokenRes.passed, false, JSON.stringify(brokenRes.evidence));
+    assert.equal(brokenRes.evidence.checks.hiddenAcceptancePassed, false);
+
+    assert.equal(tamperedTestRes.passed, false);
+    assert.equal(tamperedTestRes.evidence.checks.baselineTestsUntampered, false);
+    assert.equal(tamperedTestRes.evidence.failureCategory, 'history_tampered');
+  });
+
+  test('EvaluationService registers agent-us-oss-benchmark and runs end-to-end offline with metrics', async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-us-oss-service-'));
+    const cacheDir = join(root, 'cache');
+    const store = new Store(':memory:');
+    t.after(() => {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
     });
-    assert.equal(fakeManifestRes.passed, false);
-    assert.equal(fakeManifestRes.evidence.evidenceCompliant, false);
-    assert.equal(fakeManifestRes.evidence.manifestStatus, EVIDENCE_STATUSES.INCOMPLETE);
 
-    // 3. Untouched workspace -> REJECT
-    const untouchedWs = await createFixtureWorkspace(task);
-    t.after(() => removeFixtureWorkspace(untouchedWs));
-    const untouchedRes = await task.judge({
-      task,
-      output: buildEvidenceOutput(task),
-      context: buildTrustedContext(task, untouchedWs),
+    // Default service exposes all 3 benchmarks without altering existing counts
+    const defaultService = new EvaluationService({
+      store,
+      runtimeFactory: async ({ task }) => ({ output: task.expected.output }),
     });
-    assert.equal(untouchedRes.passed, false);
-    assert.equal(untouchedRes.evidence.checks.changedFiles, false);
+    const defaultBenchmarks = defaultService.listBenchmarks();
+    assert.equal(defaultBenchmarks.find((b) => b.id === BENCHMARK_ID)?.taskCount, 30);
+    assert.equal(defaultBenchmarks.find((b) => b.id === REAL_ENGINEERING_BENCHMARK_ID)?.taskCount, 10);
+    const ossMeta = defaultBenchmarks.find((b) => b.id === OSS_BENCHMARK_ID);
+    assert.equal(ossMeta?.taskCount, 4);
+    assert.throws(
+      () => defaultService.start({ benchmarkId: OSS_BENCHMARK_ID, taskIds: ['real-bug-fix-01'] }),
+      /belong to the selected benchmark/,
+    );
 
-    // 4. Tampered git history (reset --hard HEAD~1) -> REJECT
-    const resetWs = await createFixtureWorkspace(task);
-    t.after(() => removeFixtureWorkspace(resetWs));
-    applyGoldFix(task.id, resetWs);
-    execFileSync('git', ['reset', '--hard', '-q', 'HEAD~1'], { cwd: resetWs, stdio: 'ignore' });
-    const resetRes = await task.judge({
-      task,
-      output: buildEvidenceOutput(task),
-      context: buildTrustedContext(task, resetWs),
+    // Offline hermetic end-to-end service execution across all 4 OSS tasks
+    const service = new EvaluationService({
+      store,
+      ossCacheDir: cacheDir,
+      ossRepoOverrides: sharedJudgeFixtures.overrides,
+      concurrency: 2,
+      timeoutMs: 45_000,
+      runtimeFactory: async ({ task, workspaceRoot }) => {
+        applyGoldFix(task.id, workspaceRoot);
+        const manifest = buildEvidenceOutput(task).output;
+        return {
+          output: `Completed ${task.id}.\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\``,
+          toolReceipts: buildTrustedContext(task, workspaceRoot).toolReceipts,
+          trustedVerdict: buildTrustedContext(task, workspaceRoot).trustedVerdict,
+          stepUsage: { steps: 7 },
+          tokenUsage: { inputTokens: 1200, outputTokens: 450, totalTokens: 1650 },
+        };
+      },
     });
-    assert.equal(resetRes.passed, false);
-    assert.equal(resetRes.evidence.checks.historyUntouched, false);
-    assert.equal(resetRes.evidence.failureCategory, 'history_tampered');
-
-    // 5. Tampered baseline marker (.git/agent-us-eval-base) -> REJECT
-    const markerWs = await createFixtureWorkspace(task);
-    t.after(() => removeFixtureWorkspace(markerWs));
-    applyGoldFix(task.id, markerWs);
-    const parentSha = execFileSync('git', ['rev-parse', 'HEAD~1'], { cwd: markerWs, encoding: 'utf8' }).trim();
-    writeFileSync(join(markerWs, '.git', 'agent-us-eval-base'), `${parentSha}\n`, 'utf8');
-    const markerRes = await task.judge({
-      task,
-      output: buildEvidenceOutput(task),
-      context: buildTrustedContext(task, markerWs),
+    t.after(async () => {
+      await service.close({ timeoutMs: 1_000 });
     });
-    assert.equal(markerRes.passed, false);
-    assert.equal(markerRes.evidence.checks.historyUntouched, false);
+
+    const started = service.start({ benchmarkId: OSS_BENCHMARK_ID, model: 'test-oss-model' });
+    const deadline = Date.now() + 50_000;
+    let finalRun = service.getRun(started.id);
+    while (Date.now() < deadline && ['queued', 'running'].includes(finalRun?.status)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      finalRun = service.getRun(started.id);
+    }
+
+    assert.equal(finalRun.status, 'completed', JSON.stringify(finalRun));
+    assert.equal(finalRun.score.total, 4);
+    assert.equal(finalRun.score.passed, 4, JSON.stringify(finalRun.results));
+    assert.equal(finalRun.score.passRate, 1);
+
+    const summary = summarizeBenchmarkMetrics(finalRun);
+    assert.equal(summary.total, 4);
+    assert.equal(summary.fullPassRate, 1);
+    assert.equal(summary.implementationPassRate, 1);
+    assert.equal(summary.testPassRate, 1);
+    assert.equal(summary.evidenceComplianceRate, 1);
+
+    const layered = deriveLayeredCapabilities(finalRun.results, finalRun.score);
+    assert.equal(layered.engineering.fullAcceptanceRate, 1);
+    assert.equal(layered.engineering.score, 1);
+    assert.equal(layered.execution.toolSuccessRate, 1);
+
+    // Confirm mirror cache was populated for offline reuse
+    const cachedMirrors = existsSync(cacheDir) ? readdirSync(cacheDir).length : 0;
+    assert.equal(cachedMirrors, 4);
   });
-}
-
-test('OSS judges reject broken implementations and weakened baseline test files', async (t) => {
-  const cacheDir = mkdtempSync(join(tmpdir(), 'agent-us-oss-judge-neg-'));
-  t.after(() => rmSync(cacheDir, { recursive: true, force: true }));
-
-  const cachedOverrides = Object.fromEntries(
-    Object.entries(sharedJudgeFixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
-  );
-  const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
-
-  // 6. Broken implementation -> REJECT by hidden acceptance suite
-  const brokenWs = await createFixtureWorkspace(tasks[1]); // trough
-  t.after(() => removeFixtureWorkspace(brokenWs));
-  applyGoldFix(tasks[1].id, brokenWs);
-  const brokenLib = readFileSync(join(brokenWs, 'lib/index.js'), 'utf8').replace(
-    /function clone\(\) \{[\s\S]*?\n  \}/,
-    'function clone() {\n    return pipeline;\n  }',
-  );
-  assert.ok(!brokenLib.includes('copy.use'), 'broken fixture mutation must alter clone()');
-  writeFileSync(join(brokenWs, 'lib/index.js'), brokenLib, 'utf8');
-  const brokenRes = await tasks[1].judge({
-    task: tasks[1],
-    output: buildEvidenceOutput(tasks[1]),
-    context: buildTrustedContext(tasks[1], brokenWs),
-  });
-  assert.equal(brokenRes.passed, false, JSON.stringify(brokenRes.evidence));
-  assert.equal(brokenRes.evidence.checks.hiddenAcceptancePassed, false);
-
-  // 7. Weakened / modified baseline test file -> REJECT
-  const tamperedTestWs = await createFixtureWorkspace(tasks[0]); // nanoid
-  t.after(() => removeFixtureWorkspace(tamperedTestWs));
-  applyGoldFix(tasks[0].id, tamperedTestWs);
-  writeFileSync(join(tamperedTestWs, 'test/index.test.js'), "import test from 'node:test'; test('noop', () => {});\n", 'utf8');
-  const tamperedTestRes = await tasks[0].judge({
-    task: tasks[0],
-    output: buildEvidenceOutput(tasks[0], [...tasks[0].metadata.acceptanceCriteria.requiredChangedFiles, 'test/index.test.js']),
-    context: buildTrustedContext(tasks[0], tamperedTestWs),
-  });
-  assert.equal(tamperedTestRes.passed, false);
-  assert.equal(tamperedTestRes.evidence.checks.baselineTestsUntampered, false);
-  assert.equal(tamperedTestRes.evidence.failureCategory, 'history_tampered');
-});
-
-test('EvaluationService registers agent-us-oss-benchmark and runs end-to-end offline with metrics', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'agent-us-oss-service-'));
-  const cacheDir = join(root, 'cache');
-  const store = new Store(':memory:');
-  t.after(() => {
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-
-  // Default service exposes all 3 benchmarks without altering existing counts
-  const defaultService = new EvaluationService({
-    store,
-    runtimeFactory: async ({ task }) => ({ output: task.expected.output }),
-  });
-  const defaultBenchmarks = defaultService.listBenchmarks();
-  assert.equal(defaultBenchmarks.find((b) => b.id === BENCHMARK_ID)?.taskCount, 30);
-  assert.equal(defaultBenchmarks.find((b) => b.id === REAL_ENGINEERING_BENCHMARK_ID)?.taskCount, 10);
-  const ossMeta = defaultBenchmarks.find((b) => b.id === OSS_BENCHMARK_ID);
-  assert.equal(ossMeta?.taskCount, 4);
-  assert.throws(
-    () => defaultService.start({ benchmarkId: OSS_BENCHMARK_ID, taskIds: ['real-bug-fix-01'] }),
-    /belong to the selected benchmark/,
-  );
-
-  // Offline hermetic end-to-end service execution across all 4 OSS tasks
-  const service = new EvaluationService({
-    store,
-    ossCacheDir: cacheDir,
-    ossRepoOverrides: sharedJudgeFixtures.overrides,
-    concurrency: 2,
-    timeoutMs: 45_000,
-    runtimeFactory: async ({ task, workspaceRoot }) => {
-      applyGoldFix(task.id, workspaceRoot);
-      const manifest = buildEvidenceOutput(task).output;
-      return {
-        output: `Completed ${task.id}.\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\``,
-        toolReceipts: buildTrustedContext(task, workspaceRoot).toolReceipts,
-        trustedVerdict: buildTrustedContext(task, workspaceRoot).trustedVerdict,
-        stepUsage: { steps: 7 },
-        tokenUsage: { inputTokens: 1200, outputTokens: 450, totalTokens: 1650 },
-      };
-    },
-  });
-  t.after(async () => {
-    await service.close({ timeoutMs: 1_000 });
-  });
-
-  const started = service.start({ benchmarkId: OSS_BENCHMARK_ID, model: 'test-oss-model' });
-  const deadline = Date.now() + 50_000;
-  let finalRun = service.getRun(started.id);
-  while (Date.now() < deadline && ['queued', 'running'].includes(finalRun?.status)) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    finalRun = service.getRun(started.id);
-  }
-
-  assert.equal(finalRun.status, 'completed', JSON.stringify(finalRun));
-  assert.equal(finalRun.score.total, 4);
-  assert.equal(finalRun.score.passed, 4, JSON.stringify(finalRun.results));
-  assert.equal(finalRun.score.passRate, 1);
-
-  const summary = summarizeBenchmarkMetrics(finalRun);
-  assert.equal(summary.total, 4);
-  assert.equal(summary.fullPassRate, 1);
-  assert.equal(summary.implementationPassRate, 1);
-  assert.equal(summary.testPassRate, 1);
-  assert.equal(summary.evidenceComplianceRate, 1);
-
-  const layered = deriveLayeredCapabilities(finalRun.results, finalRun.score);
-  assert.equal(layered.engineering.fullAcceptanceRate, 1);
-  assert.equal(layered.engineering.score, 1);
-  assert.equal(layered.execution.toolSuccessRate, 1);
-
-  // Confirm mirror cache was populated for offline reuse
-  const cachedMirrors = existsSync(cacheDir) ? readdirSync(cacheDir).length : 0;
-  assert.equal(cachedMirrors, 4);
 });
