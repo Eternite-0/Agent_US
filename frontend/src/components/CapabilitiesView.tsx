@@ -903,8 +903,11 @@ const pluginLogoAssets = import.meta.glob('../assets/plugins/*', {
   query: '?url',
 }) as Record<string, string>;
 
-/** Authentic local brand logos bundled with the frontend (zero external network dependency). */
+/** Plugin graphics bundled with the frontend (zero external network dependency). */
 const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
+  'office-documents': { light: '/plugin-logos/office-documents.svg', fit: 'contain' },
+  'office-pdf': { light: '/plugin-logos/office-pdf.svg', fit: 'contain' },
+  'office-spreadsheets': { light: '/plugin-logos/office-spreadsheets.svg', fit: 'contain' },
   slack: { light: '/plugin-logos/slack.png', fit: 'contain', bgLight: '#1c1c20', bgDark: '#1c1c20' },
   gmail: { light: '/plugin-logos/gmail.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#1c1c20' },
   remotion: {
