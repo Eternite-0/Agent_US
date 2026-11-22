@@ -423,6 +423,27 @@ export function allocatePlanBudgets({
         spare -= add;
       }
     }
+    if (spare > 0) {
+      const execBoostEligible = estimates.filter((item) => {
+        if (item.explicitSteps !== null) return false;
+        const normType = normalizeTaskType(item.task.taskType || 'general');
+        return ['implementation', 'tests', 'verification', 'multi-file-feature', 'bug-fix', 'refactor'].includes(
+          normType,
+        );
+      });
+      let progressed = true;
+      while (spare > 0 && progressed) {
+        progressed = false;
+        for (const item of execBoostEligible) {
+          if (spare <= 0) break;
+          if (item.allocatedSteps < 44) {
+            item.allocatedSteps += 1;
+            spare -= 1;
+            progressed = true;
+          }
+        }
+      }
+    }
     totalAllocated = estimates.reduce((s, item) => s + item.allocatedSteps, 0);
   }
   if (userMaxSteps !== null && totalAllocated > userMaxSteps) {

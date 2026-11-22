@@ -226,6 +226,39 @@ test('historical budget exhaustion metrics adapt future estimates and AgentLoop 
     assert.equal(trimmedAlloc.feasible, true);
     assert.ok(trimmedAlloc.totalAllocatedSteps <= 50, `expected <= 50, got ${trimmedAlloc.totalAllocatedSteps}`);
 
+    const generousAlloc = allocatePlanBudgets({
+      tasks: [
+        ...largePlanTasks,
+        {
+          taskKey: 'explicit-capped',
+          taskType: 'implementation',
+          dependencies: [],
+          objective: 'Small capped edit',
+          budget: { maxSteps: 10 },
+        },
+      ],
+      userBudget: { maxSteps: 260 },
+      repoContext: largeRepoCtx,
+      store,
+      model: 'mock-model',
+    });
+    assert.equal(generousAlloc.feasible, true);
+    const genMap = new Map(generousAlloc.tasks.map((t) => [t.taskKey, t.allocatedSteps]));
+    assert.ok(
+      genMap.get('impl-core') > 36 && genMap.get('impl-core') <= 44,
+      `expected impl-core in (36, 44], got ${genMap.get('impl-core')}`,
+    );
+    assert.ok(
+      genMap.get('impl-types') > 36 && genMap.get('impl-types') <= 44,
+      `expected impl-types in (36, 44], got ${genMap.get('impl-types')}`,
+    );
+    assert.ok(
+      genMap.get('review') >= 22 && genMap.get('review') <= 26,
+      `expected review kept in [22, 26], got ${genMap.get('review')}`,
+    );
+    assert.equal(genMap.get('explicit-capped'), 10);
+    assert.ok(generousAlloc.totalAllocatedSteps <= 260);
+
     const compact = toCompactRepoContext({
       structure: { totalFiles: 120 },
       project: { hasNodeModules: false, testCommands: ['npm test'] },

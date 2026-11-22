@@ -1573,8 +1573,12 @@ export class AdaptiveSwarmOrchestrator {
             ctxParts.push(`Verification Commands: ${repoCmds.join(' ; ')}`);
           }
           if (repoContext.hasNodeModules === false) {
+            const ownedHint =
+              Array.isArray(roleMetadata?.ownedPaths) && roleMetadata.ownedPaths.length > 0
+                ? ` Stay strictly focused on your assigned ownedPaths (${roleMetadata.ownedPaths.join(', ')}) and avoid broad repo sweeps.`
+                : '';
             ctxParts.push(
-              'Environment Note: local node_modules/ is not installed in this checkout; devDependency CLIs (tsc, tsd, eslint, prettier, jest, vitest) are unavailable locally — validate changes using built-in Node runtime checks (e.g., node --test <file>, node --check) or static inspection, and do not loop retrying missing devDependencies.',
+              `Environment Note: local node_modules/ is not installed in this checkout; devDependency CLIs and npm scripts that invoke them (tsc, tsd, eslint, prettier, jest, vitest, npm run check:type:*) are unavailable locally — validate changes using built-in Node runtime checks (e.g., node --test <file>, node --check) or careful static inspection, and never retry missing devDependencies or failing npm type/lint scripts.${ownedHint}`,
             );
           }
           if (ctxParts.length > 0) {

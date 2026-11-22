@@ -276,6 +276,7 @@ export class AgentLoop {
     let executedStepsThisTurn = 0;
     let stopContinuedOnce = false;
     let verificationReserveAdvised = false;
+    let finalStepAdvised = false;
     let repairedOnce = false;
     let repairRound = 0;
     let finalAssistantText = '';
@@ -333,12 +334,27 @@ export class AgentLoop {
           steps >= maxSteps - verificationReserve
         ) {
           verificationReserveAdvised = true;
+          const reserveText = execution?.evidenceContract
+            ? `[预算收尾提醒] 距离最大步数上限仅剩最后 ${verificationReserve} 步（最终验证预留）。请停止继续大范围探索，立即运行必需测试验证并在最终回复中输出完整的 Evidence Manifest v1.0.0。`
+            : `[预算收尾提醒] 距离最大步数上限仅剩最后 ${verificationReserve} 步。请停止继续大范围探索或重试失败命令，完成当前最小必要修改并直接输出最终交付总结，切勿耗尽步数。`;
           messages.push({
             role: 'user',
             content: [
               {
                 type: 'text',
-                text: `[预算收尾提醒] 距离最大步数上限仅剩最后 ${verificationReserve} 步（最终验证预留）。请停止继续大范围探索，立即运行必需测试验证并在最终回复中输出完整的 Evidence Manifest v1.0.0。`,
+                text: reserveText,
+              },
+            ],
+          });
+        }
+        if (!finalStepAdvised && maxSteps >= 12 && steps === maxSteps) {
+          finalStepAdvised = true;
+          messages.push({
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: '[最后一步收尾提醒] 这是你本节点的最后 1 步。请勿再调用任何工具，直接基于已完成的工作与已验证结果输出最终交付总结。',
               },
             ],
           });
