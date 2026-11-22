@@ -142,7 +142,13 @@ export class McpLifecycleManager {
     return tools;
   }
 
-  getStatus() {
+  getStatus(workspaceRoot) {
+    if (workspaceRoot) {
+      const workspacePrefix = `${resolve(workspaceRoot)}::`;
+      return [...this.health.entries()]
+        .filter(([key, record]) => key === `${workspacePrefix}${record.server}`)
+        .map(([, record]) => record);
+    }
     return [...this.health.values()];
   }
 

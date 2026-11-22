@@ -134,7 +134,8 @@ export function v1Routes(
       ? directAgent.getSession(q.sessionId).workspaceRoot || directAgent.getWorkspaceRoot()
       : directAgent.getWorkspaceRoot();
     if (!root) return { items: [] };
-    return { items: await searchWorkspaceFiles(root, { search: q.q, limit: q.limit }) };
+    const kind = q.kind === 'folder' || q.kind === 'all' ? q.kind : 'file';
+    return { items: await searchWorkspaceFiles(root, { search: q.q, limit: q.limit, kind }) };
   });
 
   app.put('/v1/workspace', async (req) => {

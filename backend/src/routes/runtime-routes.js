@@ -21,6 +21,24 @@ export function registerRuntimeRoutes(
     };
   });
 
+  app.get('/v1/runtime/mcp/status', {
+    schema: { querystring: {
+      type: 'object',
+      properties: { sessionId: { type: 'string', minLength: 1, maxLength: 128 } },
+    } },
+  }, async (req, reply) => {
+    if (!directAgent?.mcpManager?.getStatus) {
+      return reply.code(501).send({ error: 'MCP_STATUS_UNAVAILABLE' });
+    }
+    const fallbackRoot = directAgent.getWorkspaceRoot();
+    const { sessionId } = req.query;
+    const root = sessionId ? directAgent.getSession(sessionId).workspaceRoot || fallbackRoot : fallbackRoot;
+    const items = root ? directAgent.mcpManager.getStatus(root).map(({ server, status, toolCount, lastCheckedAt }) => ({
+      server, status, toolCount, lastCheckedAt,
+    })) : [];
+    return { items };
+  });
+
   app.get('/v1/observability/metrics', async (req) => {
     const q = req.query ?? {};
     const windowHours = q.windowHours !== undefined ? Number(q.windowHours) : 24;

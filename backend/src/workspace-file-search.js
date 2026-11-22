@@ -12,7 +12,7 @@ function isOutside(root, path) {
   return isAbsolute(fromRoot) || fromRoot === '..' || fromRoot.startsWith(`..${sep}`);
 }
 
-export async function searchWorkspaceFiles(workspaceRoot, { search = '', limit = 20 } = {}) {
+export async function searchWorkspaceFiles(workspaceRoot, { search = '', limit = 20, kind = 'file' } = {}) {
   const workspace = resolve(workspaceRoot);
   if (PROTECTED_ROOTS.some((root) => !isOutside(root, workspace))) return [];
   const root = await realpath(workspace);
@@ -33,13 +33,14 @@ export async function searchWorkspaceFiles(workspaceRoot, { search = '', limit =
         const name = entry.name;
         if (isHidden(name) || /[\u0000-\u001f\u007f]/u.test(name)) continue;
         const fullPath = join(canonical, name);
-        if (entry.isDirectory()) {
-          if (directories.length < 400 && !OMIT_DIRECTORIES.has(name.toLowerCase())) directories.push(fullPath);
-          continue;
-        }
-        if (!entry.isFile() || isSensitive(name)) continue;
         const path = relative(root, fullPath).split(sep).join('/');
-        if (path.toLowerCase().includes(query)) matches.push(path);
+        if (entry.isDirectory()) {
+          if (OMIT_DIRECTORIES.has(name.toLowerCase())) continue;
+          if (directories.length < 400) directories.push(fullPath);
+          if (kind !== 'file' && path.toLowerCase().includes(query)) matches.push(`${path}/`);
+        } else if (kind !== 'folder' && entry.isFile() && !isSensitive(name) && path.toLowerCase().includes(query)) {
+          matches.push(path);
+        }
       }
     } catch (error) {
       if (!['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(error.code)) throw error;

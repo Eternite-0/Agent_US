@@ -123,6 +123,11 @@ test('workspace mention results are scoped to the session and exclude protected 
     assert.deepEqual(await find('docs\\project'), ['docs/Project Notes.md']);
     assert.deepEqual(await find('check'), ['.github/workflows/check.yml']);
     assert.deepEqual(await find('../'), []);
+    const folders = async (query, kind = 'folder') => (await runtime.request('GET', `/v1/workspace/files?sessionId=scoped&kind=${kind}&q=${encodeURIComponent(query)}`)).items;
+    assert.deepEqual(await folders('docs'), ['docs/']);
+    assert.deepEqual(await folders('docs', 'all'), ['docs/', 'docs/Project Notes.md']);
+    assert.deepEqual(await folders('upstream'), []);
+    assert.deepEqual(await folders('var'), []);
     await runtime.request('GET', '/v1/workspace/files?sessionId=missing', undefined, 404);
   } finally {
     try { await runtime.close(); } finally { rmDirSafe(dir); }
