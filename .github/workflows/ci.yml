@@ -142,8 +142,14 @@ jobs:
           foreach ($testFile in $tests) {
             Write-Host "::group::$testFile"
             $logFile = Join-Path ([System.IO.Path]::GetTempPath()) ("agent-us-ci-" + [guid]::NewGuid().ToString('N') + '.log')
-            & node --test --test-concurrency=4 --test-timeout=60000 $testFile *> $logFile
-            $code = $LASTEXITCODE
+            $prevNativePref = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+            try {
+              & node --test --test-concurrency=4 --test-timeout=60000 $testFile *> $logFile
+              $code = $LASTEXITCODE
+            } finally {
+              $PSNativeCommandUseErrorActionPreference = $prevNativePref
+            }
             Get-Content -LiteralPath $logFile
             if ($code -ne 0) {
               $failed = $true

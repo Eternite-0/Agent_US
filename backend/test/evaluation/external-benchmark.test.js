@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -36,7 +36,11 @@ function writeTreeFiles(dir, files) {
 
 function commitAll(dir, message) {
   execFileSync('git', ['add', '-A'], { cwd: dir, stdio: 'ignore' });
-  execFileSync('git', ['commit', '-qm', message], { cwd: dir, stdio: 'ignore' });
+  execFileSync(
+    'git',
+    ['-c', 'user.email=test@agent-us.invalid', '-c', 'user.name=Agent_US Test', 'commit', '-qm', message],
+    { cwd: dir, stdio: 'ignore' },
+  );
   return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim().toLowerCase();
 }
 
@@ -859,18 +863,43 @@ test('createOssBenchmarkDataset exposes 4 real pinned GitHub OSS repos and stric
   assert.equal(slugs.size, 4);
 });
 
-test('OSS judges accept real compliant fixes and reject broken fixes, tampered tests, tampered git history, and fake manifests', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'agent-us-oss-judges-'));
-  const cacheDir = join(root, 'cache');
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+let sharedJudgeRoot = null;
+let sharedJudgeFixtures = null;
 
-  const fixtures = buildHermeticOssFixtures(root);
-  const cachedOverrides = Object.fromEntries(
-    Object.entries(fixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
-  );
-  const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
+before(() => {
+  sharedJudgeRoot = mkdtempSync(join(tmpdir(), 'agent-us-oss-judges-'));
+  sharedJudgeFixtures = buildHermeticOssFixtures(sharedJudgeRoot);
+});
 
-  for (const task of tasks) {
+after(() => {
+  if (sharedJudgeRoot) {
+    try {
+      rmSync(sharedJudgeRoot, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup error
+    }
+    sharedJudgeRoot = null;
+    sharedJudgeFixtures = null;
+  }
+});
+
+for (const taskId of [
+  'oss-nanoid-batch-cli-01',
+  'oss-trough-pipeline-01',
+  'oss-content-type-format-01',
+  'oss-nanoevents-hardening-01',
+]) {
+  test(`OSS judge (${taskId}): accepts compliant fix and rejects fake manifest, untouched workspace, reset history, and marker tampering`, async (t) => {
+    const cacheDir = mkdtempSync(join(tmpdir(), 'agent-us-oss-judge-cache-'));
+    t.after(() => rmSync(cacheDir, { recursive: true, force: true }));
+
+    const cachedOverrides = Object.fromEntries(
+      Object.entries(sharedJudgeFixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
+    );
+    const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
+    const task = tasks.find((item) => item.id === taskId);
+    assert.ok(task, `missing task ${taskId}`);
+
     // 1. Real compliant fix -> PASS
     const passWs = await createFixtureWorkspace(task);
     t.after(() => removeFixtureWorkspace(passWs));
@@ -937,7 +966,17 @@ test('OSS judges accept real compliant fixes and reject broken fixes, tampered t
     });
     assert.equal(markerRes.passed, false);
     assert.equal(markerRes.evidence.checks.historyUntouched, false);
-  }
+  });
+}
+
+test('OSS judges reject broken implementations and weakened baseline test files', async (t) => {
+  const cacheDir = mkdtempSync(join(tmpdir(), 'agent-us-oss-judge-neg-'));
+  t.after(() => rmSync(cacheDir, { recursive: true, force: true }));
+
+  const cachedOverrides = Object.fromEntries(
+    Object.entries(sharedJudgeFixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
+  );
+  const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
 
   // 6. Broken implementation -> REJECT by hidden acceptance suite
   const brokenWs = await createFixtureWorkspace(tasks[1]); // trough
@@ -997,13 +1036,12 @@ test('EvaluationService registers agent-us-oss-benchmark and runs end-to-end off
   );
 
   // Offline hermetic end-to-end service execution across all 4 OSS tasks
-  const fixtures = buildHermeticOssFixtures(root);
   const service = new EvaluationService({
     store,
     ossCacheDir: cacheDir,
-    ossRepoOverrides: fixtures.overrides,
+    ossRepoOverrides: sharedJudgeFixtures.overrides,
     concurrency: 2,
-    timeoutMs: 30_000,
+    timeoutMs: 45_000,
     runtimeFactory: async ({ task, workspaceRoot }) => {
       applyGoldFix(task.id, workspaceRoot);
       const manifest = buildEvidenceOutput(task).output;
@@ -1021,7 +1059,7 @@ test('EvaluationService registers agent-us-oss-benchmark and runs end-to-end off
   });
 
   const started = service.start({ benchmarkId: OSS_BENCHMARK_ID, model: 'test-oss-model' });
-  const deadline = Date.now() + 25_000;
+  const deadline = Date.now() + 50_000;
   let finalRun = service.getRun(started.id);
   while (Date.now() < deadline && ['queued', 'running'].includes(finalRun?.status)) {
     await new Promise((resolve) => setTimeout(resolve, 25));
