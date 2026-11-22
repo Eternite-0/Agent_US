@@ -322,6 +322,93 @@ export class ExperienceMemoryService {
     return rowToMemory(this.db.prepare('SELECT * FROM experience_memory WHERE id=?').get(id));
   }
 
+  extractExecutionCandidates({
+    projectId = this.projectId,
+    source = 'direct_turn',
+    sourceTaskId = null,
+    sessionId = null,
+    turnId = null,
+    runId = null,
+    goal = '',
+    summary = '',
+    verdict = null,
+    evidenceCount = 0,
+    artifactUris = [],
+    isSynthetic = false,
+  } = {}) {
+    if (!projectId || isSynthetic) return [];
+    const resolvedProject = assertProject(projectId);
+    const scopeType = runId ? 'swarm_run' : 'direct_turn';
+    const scopeId = cleanText(runId || turnId || sourceTaskId || '', 200) || null;
+    const cleanUris = [...new Set((Array.isArray(artifactUris) ? artifactUris : []).map((u) => cleanText(u, 500)).filter(Boolean))].slice(0, 20);
+    const traceMeta = {
+      sourceTaskId: sourceTaskId ? cleanText(sourceTaskId, 200) : null,
+      sessionId: sessionId ? cleanText(sessionId, 200) : null,
+      turnId: turnId ? cleanText(turnId, 200) : null,
+      runId: runId ? cleanText(runId, 200) : null,
+      artifactUris: cleanUris,
+      evidenceCount: Math.max(0, Number(evidenceCount || 0)),
+      verdictStatus: verdict?.verdict ? cleanText(verdict.verdict, 64) : null,
+    };
+
+    const lines = String(summary ?? '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const taggedCandidates = [];
+    for (const line of lines) {
+      const match = line.match(/^\[(fact|preference|lesson|decision|constraint)\]\s*(.+)$/i);
+      if (!match) continue;
+      const type = match[1].toLowerCase();
+      const body = cleanText(match[2], 1200);
+      if (!body) continue;
+      taggedCandidates.push({
+        projectId: resolvedProject,
+        type,
+        key: `${type}-${hashText(normalizeText(body)).slice(0, 12)}`,
+        content: body,
+        tags: [source, 'candidate', ...(cleanUris.length ? ['artifact-backed'] : [])],
+        confidence: 0.6,
+        scopeType,
+        scopeId,
+        metadata: traceMeta,
+      });
+    }
+    if (taggedCandidates.length > 0) return taggedCandidates;
+
+    const hasEvidence = (verdict?.accepted === true && Number(evidenceCount) > 0) || cleanUris.length > 0;
+    const cleanGoal = cleanText(goal, 280);
+    const cleanSummary = cleanText(summary, 500);
+    if (!hasEvidence || (!cleanGoal && !cleanSummary)) return [];
+
+    const content = cleanGoal && cleanSummary
+      ? `[${cleanText(source, 40)}] Goal: ${cleanGoal} -> Outcome: ${cleanSummary}`
+      : cleanSummary || cleanGoal;
+    return [
+      {
+        projectId: resolvedProject,
+        type: 'lesson',
+        key: `exec-${hashText(normalizeText(cleanGoal || cleanSummary)).slice(0, 12)}`,
+        content,
+        tags: [source, 'candidate', ...(cleanUris.length ? ['artifact-backed'] : [])],
+        confidence: 0.6,
+        scopeType,
+        scopeId,
+        metadata: traceMeta,
+      },
+    ];
+  }
+
+  recordExecutionCandidates(execution = {}) {
+    if (!execution?.projectId || execution?.isSynthetic) return [];
+    const candidates = this.extractExecutionCandidates(execution);
+    if (!candidates.length) return [];
+    return this.remember(candidates, {
+      projectId: execution.projectId,
+      source: execution.source || 'execution',
+    });
+  }
+
   remember(input, options = {}) {
     const projectId = assertProject(options.projectId ?? this.projectId);
     const extracted = this.extract(input, { projectId, source: options.source ?? 'conversation' });
@@ -329,12 +416,55 @@ export class ExperienceMemoryService {
     return this.persist(this.dedupe(normalized, { projectId }), { projectId });
   }
 
+  #readPersistedRunProject(persistedRun, evaluationRunId) {
+    if (!persistedRun || typeof persistedRun !== "object") return null;
+    if (persistedRun.projectId != null) return cleanText(persistedRun.projectId, 200) || null;
+    if (persistedRun.evaluationProjectId != null) return cleanText(persistedRun.evaluationProjectId, 200) || null;
+    try {
+      const row = this.store?.db?.prepare?.("SELECT projectId, body FROM records WHERE kind = ? AND id = ?")
+        ?.get("evaluation_runs", evaluationRunId);
+      if (!row) return null;
+      if (row.projectId != null) return cleanText(row.projectId, 200) || null;
+      const body = parseJson(row.body, null);
+      const bodyProject = body?.evaluationProjectId ?? body?.projectId ?? null;
+      return bodyProject != null ? cleanText(bodyProject, 200) || null : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #assertTrustedEvaluationRun(trusted) {
+    if (typeof this.store?.get !== "function") return;
+    let persistedRun = null;
+    try {
+      persistedRun = this.store.get("evaluation_runs", trusted.evaluationRunId);
+    } catch {
+      persistedRun = null;
+    }
+    const persistedProject = this.#readPersistedRunProject(persistedRun, trusted.evaluationRunId);
+    const matchedPassingTask = !Array.isArray(persistedRun?.results)
+      ? false
+      : persistedRun.results.some(
+          (result) =>
+            String(result?.taskId ?? "") === trusted.sourceTaskId &&
+            result?.status === "passed" &&
+            result?.passed === true,
+        );
+    if (
+      !persistedRun ||
+      persistedRun.status !== "completed" ||
+      persistedRun.synthetic !== true ||
+      !persistedProject ||
+      assertProject(persistedProject) !== trusted.project ||
+      !matchedPassingTask
+    ) {
+      throw new TypeError("trusted verification requires a completed evaluation run in the same project");
+    }
+  }
+
   rememberVerified(input, { projectId = this.projectId, source = 'server-verification', verificationEvidence, sourceArtifact = null } = {}) {
     const trusted = assertTrustedEvidence({ projectId, evidence: verificationEvidence });
-    const persistedRun = this.store?.get?.('evaluation_runs', trusted.evaluationRunId);
-    if (typeof this.store?.get === 'function' && (!persistedRun || persistedRun.status !== 'completed' || persistedRun.synthetic !== true || persistedRun.projectId !== trusted.project)) {
-      throw new TypeError('trusted verification requires a completed evaluation run in the same project');
-    }
+    this.#assertTrustedEvaluationRun(trusted);
     const project = trusted.project;
     const normalizedEvidence = sanitizeMetadata({
       ...verificationEvidence,
@@ -357,10 +487,7 @@ export class ExperienceMemoryService {
   verifyWithEvidence({ projectId = this.projectId, id: memoryId, evidence, sourceArtifact = null, sourceTaskId = null, evaluationRunId = null, authority = null, now = nowValue(this.clock) } = {}) {
     if (authority !== this.#verificationAuthority) throw new TypeError('trusted verification context is required');
     const trusted = assertTrustedEvidence({ projectId, evidence, sourceTaskId, evaluationRunId });
-    const persistedRun = this.store?.get?.('evaluation_runs', trusted.evaluationRunId);
-    if (typeof this.store?.get === 'function' && (!persistedRun || persistedRun.status !== 'completed' || persistedRun.synthetic !== true || persistedRun.projectId !== trusted.project)) {
-      throw new TypeError('trusted verification requires a completed evaluation run in the same project');
-    }
+    this.#assertTrustedEvaluationRun(trusted);
     const project = trusted.project;
     const normalizedEvidence = sanitizeMetadata({
       ...evidence,

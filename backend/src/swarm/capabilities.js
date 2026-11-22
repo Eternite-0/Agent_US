@@ -22,7 +22,7 @@ const BASE_CAPABILITIES = Object.freeze({
   implementation: {
     id: 'implementation',
     label: '工程实现与增量修改',
-    defaultMaxSteps: 14,
+    defaultMaxSteps: 20,
     readOnly: false,
     weights: { coding: 1.0, reasoning: 0.7, research: 0.4, planning: 0.4, speed: 0.5, contextCapacity: 0.6, multimodal: 0.1, toolCompatibility: 1.0 },
     toolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob'],
@@ -188,12 +188,14 @@ export class ModelCapabilityRegistry {
 
     const def = this.pool?.getDefaultModel?.();
     if (def && !this.entries.has(def)) {
+      const anyHealthyAccount =
+        allAccounts.length === 0 || [...accountByPreset.values()].some(Boolean);
       this.entries.set(
         def,
         scoreModelCapabilities(def, {
           preset: 'pool',
           profile: { contextWindow: this.pool.getModelContextWindow?.(def) ?? 128000 },
-          healthy: true,
+          healthy: anyHealthyAccount,
         }),
       );
     }

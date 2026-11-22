@@ -1,8 +1,25 @@
+import { resolve } from 'node:path';
 import { Fault } from '../store.js';
 import { validatePlan } from '../planning/validator.js';
 import { AdaptivePlanner } from '../planning/planner.js';
 import { AdaptiveReplanner } from '../planning/replanner.js';
 import { CommunicationValidationError, CommunicationStateError } from '../communication/envelope.js';
+import { classifyTrafficSource } from '../observability/trace.js';
+import { intersectPolicies } from '../tools/policy.js';
+
+function sameWorkspacePath(a, b) {
+  if (!a || !b) return false;
+  const ra = resolve(String(a));
+  const rb = resolve(String(b));
+  return process.platform === 'win32' ? ra.toLowerCase() === rb.toLowerCase() : ra === rb;
+}
+
+function normalizeSessionPermissionMode(mode) {
+  const m = String(mode || 'auto-safe').trim();
+  if (m === 'readonly' || m === 'read-only') return 'read-only';
+  if (m === 'full' || m === 'full-access') return 'full-access';
+  return m;
+}
 
 function fail(code, status = 400, message = code) {
   throw new Fault(code, status, { message });
@@ -91,21 +108,87 @@ export function registerIntelligenceRoutes(app, {
   app.post('/v1/plans/validate', async (req) => {
     try { return planner.validate(req.body?.plan ?? req.body ?? {}); } catch (error) { throw asRouteError(error); }
   });
+  app.post('/v1/autonomous/runs', async (req, reply) => {
+    if (!directAgent?.submitAutonomousGoal) fail('SWARM_UNAVAILABLE', 503);
+    try {
+      const body = req.body ?? {};
+      const goal = String(body.goal ?? '').trim();
+      if (!goal) fail('EMPTY_GOAL', 400, 'Autonomous goal is required');
+      if (body.sessionId && body.workspaceRoot) {
+        const session = directAgent.getSession(String(body.sessionId));
+        if (session?.workspaceRoot && !sameWorkspacePath(body.workspaceRoot, session.workspaceRoot)) {
+          fail('WORKSPACE_MISMATCH', 403, 'Requested workspaceRoot does not match session workspaceRoot');
+        }
+      }
+      const traffic = classifyTrafficSource(req.headers);
+      const wait = body.wait === true || req.query?.wait === 'true';
+      const result = await directAgent.submitAutonomousGoal({
+        goal,
+        sessionId: body.sessionId ?? null,
+        workspaceRoot: body.workspaceRoot ?? null,
+        permissionMode: body.permissionMode ?? null,
+        maxConcurrency: body.maxConcurrency ?? 3,
+        budget: body.budget ?? {},
+        maxReplans: body.maxReplans ?? 2,
+        maxNodes: body.maxNodes ?? 6,
+        workspaceSummary: body.workspaceSummary ?? '',
+        wait,
+        trafficSource: traffic.trafficSource,
+        isSynthetic: traffic.isSynthetic ? 1 : 0,
+      });
+      return reply.code(wait ? 201 : 202).send(result);
+    } catch (error) { throw asRouteError(error); }
+  });
   app.post('/v1/plans/execute', async (req, reply) => {
     if (!directAgent?.submitPlannedSwarmRun) fail('SWARM_UNAVAILABLE', 503);
     try {
-      const plan = planner.validate(req.body?.plan ?? req.body ?? {});
+      const body = req.body ?? {};
+      if (!body.plan && !Array.isArray(body.tasks) && body.goal && directAgent?.submitAutonomousGoal) {
+        const traffic = classifyTrafficSource(req.headers);
+        const wait = body.wait === true || req.query?.wait === 'true';
+        const result = await directAgent.submitAutonomousGoal({
+          goal: body.goal,
+          sessionId: body.sessionId ?? null,
+          workspaceRoot: body.workspaceRoot ?? null,
+          permissionMode: body.permissionMode ?? null,
+          maxConcurrency: body.maxConcurrency ?? 3,
+          budget: body.budget ?? {},
+          maxReplans: body.maxReplans ?? 2,
+          wait,
+          trafficSource: traffic.trafficSource,
+          isSynthetic: traffic.isSynthetic ? 1 : 0,
+        });
+        return reply.code(wait ? 201 : 202).send(result);
+      }
+      const plan = planner.validate(body.plan ?? body);
+      const session = body.sessionId
+        ? directAgent.getSession(String(body.sessionId))
+        : directAgent.createSession({
+            title: `[Swarm Plan] ${String(plan.goal ?? '').slice(0, 60)}`,
+            workspaceRoot: body.workspaceRoot ?? null,
+            permissionMode: normalizeSessionPermissionMode(body.permissionMode ?? plan.permissionMode ?? 'auto-safe'),
+          });
+      if (body.sessionId && body.workspaceRoot && session?.workspaceRoot && !sameWorkspacePath(body.workspaceRoot, session.workspaceRoot)) {
+        fail('WORKSPACE_MISMATCH', 403, 'Requested workspaceRoot does not match session workspaceRoot');
+      }
+      const parentPermissionMode = body.permissionMode
+        ? intersectPolicies(
+            { permissionMode: session.permissionMode || 'auto-safe' },
+            { permissionMode: String(body.permissionMode) },
+          ).permissionMode
+        : session.permissionMode || plan.permissionMode || 'auto-safe';
+      const traffic = classifyTrafficSource(req.headers);
       const result = directAgent.submitPlannedSwarmRun({
         plan,
-        sessionId: req.body?.sessionId ?? null,
-        rootTurnId: req.body?.rootTurnId ?? null,
-        workspaceRoot: req.body?.workspaceRoot ?? null,
-        parentPermissionMode: req.body?.permissionMode ?? plan.permissionMode,
-        maxConcurrency: req.body?.maxConcurrency ?? 3,
-        budget: req.body?.budget ?? plan.budget,
-        maxReplans: req.body?.maxReplans ?? 2,
-        trafficSource: 'production',
-        isSynthetic: 0,
+        sessionId: session.id,
+        rootTurnId: body.rootTurnId ?? null,
+        workspaceRoot: session.workspaceRoot || body.workspaceRoot || directAgent.getWorkspaceRoot?.(),
+        parentPermissionMode,
+        maxConcurrency: body.maxConcurrency ?? 3,
+        budget: body.budget ?? plan.budget,
+        maxReplans: body.maxReplans ?? 2,
+        trafficSource: traffic.trafficSource,
+        isSynthetic: traffic.isSynthetic ? 1 : 0,
       });
       return reply.code(202).send(result);
     } catch (error) { throw asRouteError(error); }
