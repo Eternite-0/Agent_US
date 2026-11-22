@@ -7,6 +7,7 @@ import {
   getWorkerActivityLabel,
   getWorkerDisplayName as resolveWorkerName,
   getWorkerDisplayRole,
+  subtaskTitle,
 } from '../utils/worker';
 import { ActivityBlock } from './ActivityBlock';
 import { subagentOverview, workerStatusLabels } from '../utils/subagentProgress';
@@ -497,9 +498,9 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     () => new Map((bundle?.assignments ?? []).map((a) => [a.id, a])),
     [bundle?.assignments],
   );
-  const getWorkerDisplayName = (w: Worker) => {
+  const getTaskLabel = (w: Worker) => {
     const asgn = w.assignmentId ? assignmentById.get(w.assignmentId) : undefined;
-    return resolveWorkerName(w, { assignment: asgn });
+    return subtaskTitle(asgn?.objective, resolveWorkerName(w, { assignment: asgn }));
   };
 
   const { tasks, history } = useMemo(() => subagentOverview(bundle?.workers ?? []), [bundle?.workers]);
@@ -511,8 +512,10 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     ? tasks.find(worker => worker.id === selectedSubagentId) ?? history.find(worker => worker.id === selectedSubagentId)
     : null;
 
+  const focusedAssignment = focusedSubagent?.assignmentId ? assignmentById.get(focusedSubagent.assignmentId) : undefined;
+
   function renderWorkerRow(worker: Worker) {
-    const name = getWorkerDisplayName(worker);
+    const name = getTaskLabel(worker);
     return (
       <button key={worker.id} type="button" className="codex-subagent-list-row" data-worker-id={worker.id}
         data-status={worker.status} onClick={() => onSelectSubagent(worker.id)}>
@@ -732,7 +735,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                       whiteSpace: 'nowrap',
                     }}
                   >
-                    {getWorkerDisplayName(focusedSubagent)}
+                    {getTaskLabel(focusedSubagent)}
                   </span>
                 </div>
                 <span className="subagent-detail-status"><WorkerStatusMark status={focusedSubagent.status} />{workerStatusLabels[focusedSubagent.status] ?? workerStatusLabels.unknown}
@@ -740,6 +743,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
               </div>
 
               <div className="codex-subagent-panel">
+                {focusedAssignment?.objective && <p className="subagent-objective">{focusedAssignment.objective}</p>}
                 <div className="subagent-detail-meta">
                   {[getWorkerDisplayRole(focusedSubagent), focusedSubagent.model,
                     focusedSubagent.attempt > 1 && `第 ${focusedSubagent.attempt} 次尝试`].filter(Boolean).join(' · ')}
@@ -781,7 +785,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                         events={wEvents}
                         durationMs={wRunning ? undefined : 1000 * 60 * 1 + 42000}
                         isLive={wRunning}
-                        liveText={getWorkerActivityLabel(focusedSubagent) || `正在运行 ${getWorkerDisplayName(focusedSubagent)}…`}
+                        liveText={getWorkerActivityLabel(focusedSubagent) || `正在运行 ${getTaskLabel(focusedSubagent)}…`}
                         finalProseTexts={finalBlocks.map((b) => b.text)}
                         defaultOpen
                         subagentMode

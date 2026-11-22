@@ -3718,6 +3718,7 @@ button:disabled {
 .subagent-detail-meta, .subagent-detail-status { color: var(--text-secondary); font-size: 12px; }
 .subagent-detail-meta { overflow-wrap: anywhere; }
 .subagent-detail-meta:empty { display: none; }
+.subagent-objective { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .subagent-detail-status { flex: none; }
 .codex-subagent-list-row > svg { flex: none; color: var(--text-secondary); }
 .subagent-row-meta, .subagent-detail-status { display: inline-flex; align-items: center; gap: 5px; }

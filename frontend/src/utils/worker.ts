@@ -124,6 +124,11 @@ export function getWorkerDisplayName(
   );
 }
 
+/** Keep list titles to one line; the complete objective is available in details. */
+export function subtaskTitle(objective: string | undefined, fallback: string): string {
+  return objective?.trim().split(/\r?\n/, 1)[0] || fallback;
+}
+
 /** Presentation role label for a Worker (prefers router-provided `workerRole`). */
 export function getWorkerDisplayRole(
   worker?: Worker | null,

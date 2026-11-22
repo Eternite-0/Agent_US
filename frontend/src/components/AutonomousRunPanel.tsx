@@ -6,6 +6,7 @@ import type {
 } from '../types/backend';
 
 import { WorkerStatusMark } from './WorkerStatusMark';
+import { subtaskTitle } from '../utils/worker';
 import { swarmWorkerStatus } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
 import { IconActivity, IconArchive, IconBranch, IconCheck, IconChevronRight, IconCircleClose, IconDagNodes, IconDownload, IconFileDoc, IconHistory, IconPlay, IconRefresh, IconShieldCheck, IconStopSquare } from './Icons';
@@ -287,11 +288,12 @@ function NodeList({ label, nodes }: { label: string; nodes: SwarmRunRecord['node
         <details>
           <summary className="codex-subagent-list-row swarm-row">
             <RowContents icon={<AgentAvatar role={node.agentProfileId} size={18} />}
-              title={node.nodeKey} detail={[node.agentProfileId, node.model].filter(Boolean).join(' · ')}
+              title={subtaskTitle(node.objective, node.nodeKey)} detail={[node.agentProfileId, node.model].filter(Boolean).join(' · ')}
               end={<span className="swarm-status"><WorkerStatusMark status={node.status === 'superseded' ? 'cancelled' : swarmWorkerStatus(node.status)} />{status(node.status)}</span>} expandable />
           </summary>
           <div className="swarm-row-detail">
             <p>{node.objective}</p>
+            <small>节点 <code>{node.nodeKey}</code></small>
             {node.provider && <p><small>提供商 · {node.provider}</small></p>}
             {node.dependencies.length > 0 && <div className="swarm-dependencies">
               <IconBranch size={13} aria-hidden="true" /><small>依赖</small>

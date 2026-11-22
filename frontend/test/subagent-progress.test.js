@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { subtaskTitle } from '../src/utils/worker.ts';
 import { subagentGroups, subagentOverview, swarmWorkerStatus } from '../src/utils/subagentProgress.ts';
 
 test('only an explicit completed node maps to a finished worker', () => {
@@ -50,4 +51,20 @@ test('compact overview counts only latest assignments and retains previous attem
     assert.deepEqual(history.map(worker => worker.id).sort(), ['infra', 'old']);
     assert.equal(history.find(worker => worker.id === 'infra').status, 'done');
   }
+});
+
+test('subtask rows follow assignment count even when all assignments share the same capability', () => {
+  for (const count of [0, 1, 2, 7]) {
+    const workers = Array.from({ length: count }, (_, i) => ({
+      id: `w${i}`, assignmentId: `task${i}`, workerRole: 'implementation', status: 'waiting', attempt: 1, version: 1,
+    }));
+    assert.deepEqual(subagentOverview(workers).tasks.map(worker => worker.assignmentId), workers.map(worker => worker.assignmentId));
+  }
+});
+
+test('subtask labels use the actual objective and keep legacy names when the objective is absent', () => {
+  assert.equal(subtaskTitle('  修复空查询时的分页\r\n保留现有 API。', 'implementation'), '修复空查询时的分页');
+  assert.equal(subtaskTitle('补齐索引迁移测试', 'implementation'), '补齐索引迁移测试');
+  assert.equal(subtaskTitle('  ', 'index-search'), 'index-search');
+  assert.equal(subtaskTitle(undefined, '文档校对'), '文档校对');
 });
