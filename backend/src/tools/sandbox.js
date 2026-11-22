@@ -1075,3 +1075,22 @@ export class GitWorktreeIsolator {
     );
   }
 }
+
+export {
+  BenchmarkSandbox,
+  DockerBenchmarkSandbox,
+  NodePermissionBenchmarkSandbox,
+  SANDBOX_MODES,
+  STRICT_ENV_ALLOWLIST_BASE,
+  SandboxPolicyError,
+  SandboxUnavailableError,
+  assertNoSymlinkEscape,
+  buildGitAllowlistEnv,
+  buildStrictSandboxEnv,
+  getHardenedGitArgs,
+  isPathInsideRoot,
+  nativeRealpath,
+  runHardenedGit,
+  runHardenedGitSync,
+} from './benchmark-sandbox.js';
+
