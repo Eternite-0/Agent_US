@@ -10,6 +10,7 @@ import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { EvidenceVerifier } from '../src/governance/verifier.js';
+import { buildRepairNote } from '../src/verifier.js';
 import { ScheduledTaskRunner } from '../src/governance/scheduler.js';
 import { ControlPlane } from '../src/governance/control-plane.js';
 import { api } from '../src/api.js';
@@ -372,6 +373,64 @@ test('P6 EvidenceVerifier tolerates explicitly cleaned temporary files while kee
     assert.equal(reorderedRes.accepted, false);
     assert.ok(reorderedRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
   } finally {
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  }
+});
+
+test('P6 AccountPool.getModelMaxOutput and DirectAgentRuntime honor model output capacity and concise truncation repair hints', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-p6-maxout-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-p6-maxout-work-'));
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.setDefaultModel('deepseek-v4.1-flash');
+
+  const seenMaxTokens = [];
+  const adapter = new ScriptedAdapter([
+    async function* (options) {
+      seenMaxTokens.push(options.maxTokens);
+      yield { type: 'text-delta', index: 0, text: 'Done.' };
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+    async function* (options) {
+      seenMaxTokens.push(options.maxTokens);
+      yield { type: 'text-delta', index: 0, text: 'Capped.' };
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  ]);
+
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+
+  try {
+    assert.equal(pool.getModelMaxOutput('deepseek-v4.1-flash'), 32768);
+
+    const sDefault = direct.createSession({ title: 'default maxOutput', model: 'deepseek-v4.1-flash' });
+    const t1 = direct.startTurn(sDefault.id, { input: 'hello' });
+    await waitTurnDone(direct, sDefault.id, t1.turn.id);
+    assert.equal(seenMaxTokens[0], 16384);
+
+    const sCapped = direct.createSession({
+      title: 'capped maxOutput',
+      model: 'deepseek-v4.1-flash',
+      budget: { maxOutputTokens: 2048 },
+    });
+    const t2 = direct.startTurn(sCapped.id, { input: 'hello capped' });
+    await waitTurnDone(direct, sCapped.id, t2.turn.id);
+    assert.equal(seenMaxTokens[1], 2048);
+
+    const note = buildRepairNote({ verdict: 'fail', reasons: ['output_truncated'] });
+    assert.match(note, /split large file writes/i);
+    assert.match(note, /concise/i);
+  } finally {
+    await direct.close();
     store.close();
     rmDirSafe(dataDir);
     rmDirSafe(workDir);

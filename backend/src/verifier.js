@@ -17,7 +17,7 @@ const REASON_TEXT = {
   tool_call_as_text: () =>
     'a tool call was written as plain text instead of invoking the tool',
   output_truncated: () =>
-    'the last assistant reply was cut off at the output token limit',
+    'the last assistant reply was cut off at the output token limit; split large file writes into smaller write_file/edit_file tool calls and keep prose concise before emitting the final JSON evidence manifest',
   repeated_write: (ctx) =>
     `the same mutating tool call${ctx.repeatedTool ? ` (${ctx.repeatedTool})` : ''} was repeated consecutively without progress`,
   no_progress: () =>

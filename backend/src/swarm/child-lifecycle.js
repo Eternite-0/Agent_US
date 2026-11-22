@@ -916,7 +916,10 @@ export class ChildAgentManager {
               maxOutputTokens:
                 normalizeBudgetLimit(effectiveBudget.maxOutputTokens) !== null
                   ? normalizeBudgetLimit(effectiveBudget.maxOutputTokens)
-                  : 8192,
+                  : Math.min(
+                      16384,
+                      Math.max(8192, Number(this.pool?.getModelMaxOutput?.(resolvedModel) || 16384)),
+                    ),
               ...(normalizeBudgetLimit(effectiveBudget.maxTokens) !== null
                 ? { maxTokens: normalizeBudgetLimit(effectiveBudget.maxTokens) }
                 : {}),

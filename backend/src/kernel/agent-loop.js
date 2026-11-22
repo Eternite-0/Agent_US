@@ -267,7 +267,7 @@ export class AgentLoop {
     const deadlineAt = explicitMaxDuration !== null ? Date.now() + explicitMaxDuration : null;
     const maxTotalTokens = normalizeBudgetLimit(budget.maxTokens);
     const explicitMaxOutput = normalizeBudgetLimit(budget.maxOutputTokens);
-    const baseMaxOutputTokens = explicitMaxOutput !== null ? explicitMaxOutput : 4096;
+    const baseMaxOutputTokens = explicitMaxOutput !== null ? explicitMaxOutput : 8192;
     const verificationReserve = normalizeBudgetLimit(budget.finalVerificationReserve) ?? 0;
     const verifierEvents = [];
     const argStrikes = new Map();

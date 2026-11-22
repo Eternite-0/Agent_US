@@ -1557,6 +1557,10 @@ export class DirectAgentRuntime {
 
       const livePolicy = this.#getLiveSessionPolicy(sessionId);
       contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
+      const defaultMaxOutputTokens = Math.min(
+        16384,
+        Math.max(4096, Number(this.pool.getModelMaxOutput?.(effectiveModel) || 16384)),
+      );
       const loopResult = await this.kernel.executeTurn({
         sessionId,
         turnId,
@@ -1597,7 +1601,7 @@ export class DirectAgentRuntime {
           ...(sessionBudget?.maxTotalTokens !== undefined && sessionBudget?.maxTokens === undefined
             ? { maxTokens: sessionBudget.maxTotalTokens }
             : {}),
-          maxOutputTokens: sessionBudget?.maxOutputTokens ?? 4096,
+          maxOutputTokens: sessionBudget?.maxOutputTokens ?? defaultMaxOutputTokens,
         },
         budgetLedger: directBudgetLedger,
         budgetContext: directBudgetContext,

@@ -387,8 +387,8 @@ export class DynamicTaskPlanner {
           scope: BUDGET_SCOPES.PLANNING,
           sessionId,
           estimatedInputTokens: estimateRequestInputTokens({ messages }),
-          requestedMaxOutputTokens: 4096,
-          defaultMaxOutputTokens: 4096,
+          requestedMaxOutputTokens: 8192,
+          defaultMaxOutputTokens: 8192,
           leaseGuard,
         });
       }
@@ -399,7 +399,7 @@ export class DynamicTaskPlanner {
           provider: 'pool',
           model: picked,
           messages,
-          maxTokens: reservation?.constrainedMaxOutputTokens ?? 4096,
+          maxTokens: reservation?.constrainedMaxOutputTokens ?? 8192,
           signal,
         })) {
           if (chunk.type === 'text-delta') txt += chunk.text;

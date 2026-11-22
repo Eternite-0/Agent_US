@@ -142,8 +142,8 @@ export class DynamicReplanner {
         sessionId: run.sessionId ?? null,
         attempt: Number(failedNode?.attempts ?? 1),
         estimatedInputTokens,
-        requestedMaxOutputTokens: 512,
-        defaultMaxOutputTokens: 512,
+        requestedMaxOutputTokens: 2048,
+        defaultMaxOutputTokens: 2048,
         leaseGuard,
       });
     }
@@ -155,7 +155,7 @@ export class DynamicReplanner {
         provider: 'pool',
         model: picked,
         messages,
-        maxTokens: reservation?.constrainedMaxOutputTokens ?? 512,
+        maxTokens: reservation?.constrainedMaxOutputTokens ?? 2048,
         signal,
       })) {
         if (chunk.type === 'text-delta' && chunk.text) text += chunk.text;

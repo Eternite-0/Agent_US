@@ -2236,6 +2236,27 @@ export class AccountPool {
     return inferModelProfile(target).contextWindow;
   }
 
+  getModelMaxOutput(modelName) {
+    const target = String(modelName || this.getDefaultModel() || '').trim();
+    if (!target) return 16384;
+    const direct = this.store.db
+      .prepare(
+        'SELECT maxOutput FROM pool_models WHERE upstreamModel=? AND enabled=1 ORDER BY maxOutput DESC LIMIT 1',
+      )
+      .get(target);
+    if (direct?.maxOutput) return Number(direct.maxOutput);
+    const mapped = this.store.db
+      .prepare(
+        `SELECT pm.maxOutput FROM model_mappings mm
+         JOIN pool_models pm ON pm.upstreamModel = mm.targetModel
+         WHERE mm.alias=? AND mm.enabled=1 AND pm.enabled=1
+         ORDER BY mm.priority ASC LIMIT 1`,
+      )
+      .get(target);
+    if (mapped?.maxOutput) return Number(mapped.maxOutput);
+    return inferModelProfile(target).maxOutput ?? 16384;
+  }
+
   // Unified catalog consumed by frontend /v1/models, DirectAgent, and OpenAI clients
   getActiveCatalog() {
     const pool = this.listPoolModels({ status: 'enabled', visibility: 'visible' });
