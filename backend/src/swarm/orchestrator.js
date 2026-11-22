@@ -43,6 +43,12 @@ import {
 import { validatePlan } from '../planning/validator.js';
 import { intersectPolicies } from '../tools/policy.js';
 import { TeamOptimizer } from './team-optimizer.js';
+import {
+  MAX_REVIEWER_FORMAT_RETRIES,
+  buildReviewerFormatRepairPrompt,
+  buildReviewerPromptConstraints,
+  validateReviewerExecution,
+} from './reviewer.js';
 
 function normalizePlannerPermission(mode) {
   const m = String(mode || 'auto-safe').trim();
@@ -1475,6 +1481,7 @@ export class AdaptiveSwarmOrchestrator {
             fullObjective,
             '[独立 Reviewer 执行约束]',
             '你是独立 Reviewer。不得把前置 Agent 的自然语言结论当作事实；必须使用 read_swarm_artifact 检查提供的持久化产物，并依据下面的 durable receipt/verdict/evidence 清单形成审查结论。Reviewer 只读，不得修改工作区。',
+            buildReviewerPromptConstraints(reviewerEvidence),
             '[Durable evidence manifest]',
             JSON.stringify(reviewerEvidence),
           ].join('\n\n');
@@ -1576,10 +1583,133 @@ export class AdaptiveSwarmOrchestrator {
           });
         }
 
+        let finalChildResult = childRes;
+        const parsedNodeBudget = parseJsonSafe(node.budgetJson, {});
+        const strictReviewerRequired = Boolean(
+          node.taskType === 'review' &&
+          reviewerEvidence &&
+          (
+            (parsedNodeBudget?.reviewerMetadata?.autoMaterialized === true &&
+              childRes.childSessionId &&
+              childRes.childTurnId) ||
+            parsedNodeBudget?.strictReviewerSchema === true ||
+            run.budget?.strictReviewerSchema === true
+          ),
+        );
+        let reviewerValidation = null;
+        let reviewerFormatRetriesUsed = 0;
+        let trackedReviewerResult = childRes;
+        if (strictReviewerRequired) {
+          const trackedTurnIds = new Set([childRes.childTurnId].filter(Boolean));
+          const readReviewerReceipts = () => {
+            if (!childRes.childSessionId || !this.store?.db?.isOpen) return [];
+            const ids = [...trackedTurnIds];
+            if (ids.length > 0) {
+              return this.store.db
+                .prepare(
+                  `SELECT id, sessionId, turnId, callId, toolName, status, exitCode, outputDigest, errorCode, createdAt, updatedAt
+                   FROM tool_receipts
+                   WHERE sessionId=? AND turnId IN (${ids.map(() => '?').join(',')})
+                   ORDER BY createdAt ASC`,
+                )
+                .all(childRes.childSessionId, ...ids);
+            }
+            return this.store.db
+              .prepare(
+                `SELECT id, sessionId, turnId, callId, toolName, status, exitCode, outputDigest, errorCode, createdAt, updatedAt
+                 FROM tool_receipts
+                 WHERE sessionId=?
+                 ORDER BY createdAt ASC`,
+              )
+              .all(childRes.childSessionId);
+          };
+
+          const originalRawText = String(childRes.text ?? '');
+          let receipts = readReviewerReceipts();
+          reviewerValidation = validateReviewerExecution({
+            rawText: originalRawText,
+            reviewerEvidence,
+            toolReceipts: receipts,
+            originalRawText: null,
+          });
+
+          while (
+            !reviewerValidation.valid &&
+            reviewerValidation.code === 'REVIEWER_OUTPUT_MALFORMED' &&
+            reviewerFormatRetriesUsed < MAX_REVIEWER_FORMAT_RETRIES &&
+            typeof this.childManager?.resume === 'function' &&
+            childRes.childSessionId
+          ) {
+            reviewerFormatRetriesUsed++;
+            const repairPrompt = buildReviewerFormatRepairPrompt({
+              originalRawText,
+              errors: reviewerValidation.errors,
+              reviewerEvidence,
+            });
+            const repaired = await this.childManager.resume(childRes.childSessionId, {
+              objective: repairPrompt,
+              model: node.model,
+              maxSteps: 1,
+              signal: combinedSignal,
+              runId: run.id,
+              nodeId: node.id,
+              nodeKey: node.nodeKey,
+              budgetLedger: this.budgetLedger,
+              budgetScope: BUDGET_SCOPES.REVIEW_VERIFICATION,
+              leaseGuard: nodeGuard,
+              permissionMode: 'read-only',
+              allowedTools: Array.isArray(node.toolAllow) ? node.toolAllow : undefined,
+            });
+            if (repaired?.childTurnId) trackedTurnIds.add(repaired.childTurnId);
+            trackedReviewerResult = {
+              ...repaired,
+              text: String(repaired?.text ?? ''),
+              childSessionId: repaired?.childSessionId || childRes.childSessionId,
+              childTurnId: repaired?.childTurnId || childRes.childTurnId,
+              usage: {
+                inputTokens:
+                  Number(trackedReviewerResult?.usage?.inputTokens ?? 0) +
+                  Number(repaired?.usage?.inputTokens ?? 0),
+                outputTokens:
+                  Number(trackedReviewerResult?.usage?.outputTokens ?? 0) +
+                  Number(repaired?.usage?.outputTokens ?? 0),
+              },
+              steps:
+                Number(trackedReviewerResult?.steps ?? 0) +
+                Number(repaired?.steps ?? 0),
+            };
+            receipts = readReviewerReceipts();
+            reviewerValidation = validateReviewerExecution({
+              rawText: trackedReviewerResult.text,
+              reviewerEvidence,
+              toolReceipts: receipts,
+              originalRawText,
+            });
+          }
+
+          if (!reviewerValidation.valid) {
+            throw new RuntimeError(reviewerValidation.code || 'REVIEWER_OUTPUT_MALFORMED', {
+              message: `Reviewer node ${node.nodeKey} failed validation (${reviewerValidation.code}): ${reviewerValidation.errors.join('; ')}`,
+              usage: trackedReviewerResult?.usage ?? childRes.usage,
+              detail: {
+                reviewerValidation,
+                formatRetriesUsed: reviewerFormatRetriesUsed,
+                verdict: { accepted: false, verdict: 'fail' },
+              },
+            });
+          }
+
+          finalChildResult = {
+            ...trackedReviewerResult,
+            text: reviewerValidation.rawJsonText || trackedReviewerResult.text,
+            verifiedPass: reviewerValidation.status === 'pass',
+          };
+        }
+
         const uris = [
           ...new Set([
-            ...(childRes.artifact?.uri ? [childRes.artifact.uri] : []),
-            ...extractArtifactUris(childRes.text),
+            ...(finalChildResult.artifact?.uri ? [finalChildResult.artifact.uri] : []),
+            ...extractArtifactUris(finalChildResult.text),
           ]),
         ];
 
@@ -1643,11 +1773,34 @@ export class AdaptiveSwarmOrchestrator {
                 overageTokens: Number(ledgerRow.overageTokens ?? 0),
               }
             : {
-                inputTokens: Number(curUsage.inputTokens ?? 0) + Number(childRes.usage?.inputTokens ?? 0),
-                outputTokens: Number(curUsage.outputTokens ?? 0) + Number(childRes.usage?.outputTokens ?? 0),
-                steps: Number(curUsage.steps ?? 0) + Number(childRes.steps ?? 0),
+                inputTokens: Number(curUsage.inputTokens ?? 0) + Number(finalChildResult.usage?.inputTokens ?? 0),
+                outputTokens: Number(curUsage.outputTokens ?? 0) + Number(finalChildResult.usage?.outputTokens ?? 0),
+                steps: Number(curUsage.steps ?? 0) + Number(finalChildResult.steps ?? 0),
                 completedNodes: Number(curUsage.completedNodes ?? 0) + 1,
               };
+          const parsedCurBudget = parseJsonSafe(curNode.budgetJson, {});
+          const baseBudgetObj =
+            parsedCurBudget && typeof parsedCurBudget === 'object' && !Array.isArray(parsedCurBudget)
+              ? parsedCurBudget
+              : {};
+          const mergedBudgetJson = reviewerValidation?.valid
+            ? JSON.stringify({
+                ...baseBudgetObj,
+                reviewerVerdict: {
+                  schemaVersion: reviewerValidation.verdict.schemaVersion,
+                  status: reviewerValidation.status,
+                  summary: reviewerValidation.verdict.summary,
+                  evidenceDigest: reviewerValidation.evidenceDigest,
+                  checkedArtifacts: reviewerValidation.verdict.checkedArtifacts,
+                  evidenceRefs: reviewerValidation.verdict.evidenceRefs,
+                  findings: reviewerValidation.verdict.findings,
+                  formatRetriesUsed: reviewerFormatRetriesUsed,
+                  readArtifactCount: reviewerValidation.readArtifactCount,
+                  reviewerModel: node.model,
+                  validatedAt: now,
+                },
+              })
+            : curNode.budgetJson;
           this.store.db
             .prepare('UPDATE swarm_runs SET usageJson=?, updatedAt=? WHERE id=? AND status=?')
             .run(JSON.stringify(nextUsage), now, runId, curRun.status);
@@ -1656,16 +1809,18 @@ export class AdaptiveSwarmOrchestrator {
               `UPDATE swarm_nodes
                SET status=?, childSessionId=?, childTurnId=?, resultText=?,
                    artifactUrisJson=?, latestArtifactId=COALESCE(?, latestArtifactId),
+                   budgetJson=?,
                    activeFence=NULL, activeJobId=NULL, updatedAt=?
                WHERE id=? AND status='running'`,
             )
             .run(
               SWARM_NODE_STATES.COMPLETED,
-              childRes.childSessionId,
-              childRes.childTurnId,
-              childRes.text,
+              finalChildResult.childSessionId,
+              finalChildResult.childTurnId,
+              finalChildResult.text,
               JSON.stringify(uris),
-              childRes.artifact?.id ?? null,
+              finalChildResult.artifact?.id ?? null,
+              mergedBudgetJson,
               now,
               node.id,
             );
@@ -1698,12 +1853,12 @@ export class AdaptiveSwarmOrchestrator {
 
         safeIsolateSideEffect(() => {
           const receiptStats =
-            childRes.childSessionId && childRes.childTurnId && this.store?.db?.isOpen
+            finalChildResult.childSessionId && finalChildResult.childTurnId && this.store?.db?.isOpen
               ? this.store.db
                   .prepare(
                     "SELECT COUNT(*) AS total, SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS ok FROM tool_receipts WHERE sessionId=? AND turnId=?",
                   )
-                  .get(childRes.childSessionId, childRes.childTurnId)
+                  .get(finalChildResult.childSessionId, finalChildResult.childTurnId)
               : null;
           this.modelFeedback?.record?.({
             model: node.model,
@@ -1712,10 +1867,10 @@ export class AdaptiveSwarmOrchestrator {
             success: true,
             toolTotal: Number(receiptStats?.total ?? 0),
             toolSuccess: Number(receiptStats?.ok ?? 0),
-            verifiedPass: childRes.verifiedPass ?? null,
+            verifiedPass: finalChildResult.verifiedPass ?? null,
             latencyMs: Date.now() - startedAt,
-            inputTokens: childRes.usage?.inputTokens ?? 0,
-            outputTokens: childRes.usage?.outputTokens ?? 0,
+            inputTokens: finalChildResult.usage?.inputTokens ?? 0,
+            outputTokens: finalChildResult.usage?.outputTokens ?? 0,
             recovered: Boolean(job.reclaimedFromCrash || job.attempts > 1),
             trafficSource: run.trafficSource || 'production',
             isSynthetic: run.isSynthetic ? 1 : 0,
@@ -1824,7 +1979,8 @@ export class AdaptiveSwarmOrchestrator {
                   )
                   .get(freshNode.childSessionId, freshNode.childTurnId)
               : null;
-          const isVerificationFailure = errorCode === 'VERIFICATION_FAILED';
+          const isVerificationFailure =
+            errorCode === 'VERIFICATION_FAILED' || errorCode.startsWith('REVIEWER_');
           const failureKind = classifyFailureKind(err, {
             isVerificationFailure,
             hasToolFailure: Number(receiptStats?.failed ?? 0) > 0,
@@ -1849,7 +2005,7 @@ export class AdaptiveSwarmOrchestrator {
         });
 
         let replanOut = { replanned: false };
-        if (this.replanner) {
+        if (this.replanner && !errorCode.startsWith('REVIEWER_')) {
           try {
             replanOut = await this.replanner.replan({
               run: freshRun,
@@ -1976,6 +2132,41 @@ export class AdaptiveSwarmOrchestrator {
             workspaceRoot: run.workspaceRoot,
           })
         : { verdict: 'pass', accepted: true, reasons: [] };
+
+      const reviewerVerdicts = activeNodes
+        .filter((n) => n.taskType === 'review')
+        .map((n) => {
+          const budgetObj = parseJsonSafe(n.budgetJson, {});
+          return budgetObj?.reviewerVerdict
+            ? { nodeKey: n.nodeKey, nodeStatus: n.status, ...budgetObj.reviewerVerdict }
+            : null;
+        })
+        .filter(Boolean);
+
+      if (verdict && reviewerVerdicts.length > 0) {
+        verdict.reviewerVerdicts = reviewerVerdicts;
+        const rejectedReviews = reviewerVerdicts.filter(
+          (rv) => rv.status === 'fail' || rv.status === 'needs_revision',
+        );
+        if (rejectedReviews.length > 0) {
+          verdict.accepted = false;
+          verdict.verdict = 'fail';
+          verdict.reasons = [
+            ...new Set([
+              ...(Array.isArray(verdict.reasons) ? verdict.reasons : []),
+              'independent_reviewer_rejected',
+            ]),
+          ];
+        } else if (reviewerVerdicts.every((rv) => rv.status === 'pass')) {
+          verdict.independentReviewerVerdict = {
+            status: 'pass',
+            source: 'independent_reviewer',
+            reviewerModels: [...new Set(reviewerVerdicts.map((rv) => rv.reviewerModel).filter(Boolean))],
+            evidenceRefs: [...new Set(reviewerVerdicts.flatMap((rv) => rv.evidenceRefs ?? []))],
+            evidenceDigests: reviewerVerdicts.map((rv) => rv.evidenceDigest).filter(Boolean),
+          };
+        }
+      }
 
       const outcome = resolveSwarmOutcome({
         nodes: run.nodes,
@@ -2321,14 +2512,40 @@ export class AdaptiveSwarmOrchestrator {
   #prepareNodeSpecs(rawNodes, budget) {
     const plannedNodes = this.planner.normalizeNodes(rawNodes);
     this.planner.validateDag(plannedNodes);
+    const nonReviewSelections = new Map();
+    for (const n of plannedNodes) {
+      if (n.taskType === 'review') continue;
+      nonReviewSelections.set(
+        n.nodeKey,
+        this.router.select({
+          taskType: n.taskType,
+          objective: n.objective,
+          requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
+          budget: n.budget ?? budget,
+        }),
+      );
+    }
+    const workerModels = [...new Set([...nonReviewSelections.values()].map((s) => s?.model).filter(Boolean))];
+    const highRiskRun = plannedNodes.some(
+      (n) =>
+        n.isolatedWorktree ||
+        n.isolationMode === 'worktree' ||
+        n.taskType === 'verification' ||
+        /security|audit|review/i.test(String(n.objective ?? '')),
+    );
     return plannedNodes.map((n) => ({
       spec: n,
-      selection: this.router.select({
-        taskType: n.taskType,
-        objective: n.objective,
-        requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
-        budget: n.budget ?? budget,
-      }),
+      selection:
+        nonReviewSelections.get(n.nodeKey) ??
+        this.router.select({
+          taskType: n.taskType,
+          objective: n.objective,
+          requiredTools: Array.isArray(n.toolAllow) ? n.toolAllow : null,
+          budget: n.budget ?? budget,
+          ...(n.taskType === 'review' && highRiskRun && workerModels.length > 0
+            ? { excludeModels: workerModels }
+            : {}),
+        }),
     }));
   }
 

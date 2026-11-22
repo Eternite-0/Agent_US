@@ -88,6 +88,20 @@ export class ModelFeedbackTracker {
     return true;
   }
 
+  getReviewerStats(model, { windowDays = 30, includeSynthetic = false } = {}) {
+    if (!model || !this.store?.db?.isOpen) {
+      return this.#emptyStats();
+    }
+    const cutoff = Date.now() - Math.max(1, Number(windowDays || 30)) * 86_400_000;
+    const synthClause = includeSynthetic ? '' : ' AND isSynthetic = 0';
+    const rows = this.store.db
+      .prepare(
+        `SELECT * FROM model_feedback WHERE model=? AND taskType='review' AND createdAt>=?${synthClause} ORDER BY createdAt DESC LIMIT 200`,
+      )
+      .all(model, cutoff);
+    return this.#summarizeRows(rows);
+  }
+
   getStats(model, { taskType = null, windowDays = 30, includeSynthetic = false } = {}) {
     if (!model || !this.store?.db?.isOpen) {
       return this.#emptyStats();
@@ -108,7 +122,10 @@ export class ModelFeedbackTracker {
         )
         .all(model, cutoff);
     }
+    return this.#summarizeRows(rows);
+  }
 
+  #summarizeRows(rows) {
     const n = rows.length;
     if (!n) return this.#emptyStats();
 

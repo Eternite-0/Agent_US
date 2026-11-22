@@ -21,6 +21,7 @@ export class AdaptiveModelRouter {
     minContext = 0,
     budget = {},
     preferredModel = null,
+    excludeModels = [],
     readOnly = undefined,
     maxSteps = undefined,
   } = {}) {
@@ -59,6 +60,8 @@ export class AdaptiveModelRouter {
     if (requiresVision) weights.multimodal = 2.0;
     if (minContext >= 120000) weights.contextCapacity = 1.2;
 
+    const excludedSet = new Set(Array.isArray(excludeModels) ? excludeModels.map(String).filter(Boolean) : []);
+    const hasNonExcludedHealthy = candidates.some((item) => item.healthy !== false && !excludedSet.has(item.model));
     const evaluated = [];
     let best = null;
 
@@ -69,6 +72,7 @@ export class AdaptiveModelRouter {
         : baseCandidate;
       let penalty = 0;
       if (!c.healthy) penalty += 3.0;
+      if (hasNonExcludedHealthy && excludedSet.has(c.model)) penalty += 1.5;
       if (requiresVision && !c.capabilities.multimodal) penalty += 5.0;
       if (requiredTools?.length && c.capabilities.toolCompatibility < 0.5) penalty += 4.0;
       if (minContext > 0 && c.contextWindow < minContext) penalty += 2.5;
@@ -84,7 +88,9 @@ export class AdaptiveModelRouter {
         totalWeight += w;
       }
       const priorScore = Number((totalWeight > 0 ? rawScore / totalWeight : 0.5).toFixed(4));
-      const fb = this.feedbackTracker?.getStats?.(c.model, { taskType }) ?? null;
+      const reviewStats = taskType === 'review' ? (this.feedbackTracker?.getReviewerStats?.(c.model) ?? null) : null;
+      const generalStats = this.feedbackTracker?.getStats?.(c.model, { taskType }) ?? null;
+      const fb = reviewStats && reviewStats.sampleCount > 0 ? reviewStats : generalStats;
       const conf = fb?.sampleCount > 0 ? fb.confidence : 0;
       const emp = fb?.empiricalScore ?? null;
       const blended = emp !== null ? (1 - conf) * priorScore + conf * emp : priorScore;
@@ -101,6 +107,7 @@ export class AdaptiveModelRouter {
         priorScore,
         empiricalScore: emp ?? c.persistedCapability?.effective?.empiricalScore ?? null,
         measuredCapability: c.persistedCapability?.measured ?? null,
+        reviewerStats: reviewStats && reviewStats.sampleCount > 0 ? reviewStats : null,
         confidence: Math.max(conf, c.persistedCapability?.effective?.confidence ?? 0),
         sampleCount: fb?.sampleCount ?? 0,
         metrics: fb?.metrics ?? c.persistedCapability?.measured?.metrics ?? null,

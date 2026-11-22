@@ -112,17 +112,25 @@ export class TeamOptimizer {
     }
 
     const memberCount = Math.min(this.teamSize, limit, Math.max(1, workstreams));
-    const reviewer = reviewerAvailable && available.length > 1
+    const requiredWorkerCount = Math.min(this.teamSize, maxC, Math.max(1, workstreams));
+    const explicitReviewer = reviewerAvailable && available.length > 1
       ? (available.find((candidate) =>
           candidate.role === 'reviewer' || candidate.role === 'review' || /review|verify|audit/i.test(candidate.id),
         ) ?? null)
       : null;
+    const primaryModel = single.model ?? single.id;
+    const distinctHighRiskReviewer = !explicitReviewer &&
+      reviewerAvailable &&
+      highRisk &&
+      (task.requireDistinctReviewerModel === true ? available.length > 1 : available.length >= requiredWorkerCount + 1)
+      ? (available.find((candidate) => (candidate.model ?? candidate.id) !== primaryModel) ?? null)
+      : null;
+    const reviewer = explicitReviewer ?? distinctHighRiskReviewer;
     const workerPool = reviewer ? available.filter((candidate) => candidate.id !== reviewer.id) : available;
     const members = workerPool.slice(0, memberCount);
     const teamCost = members.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (reviewer ? this.reviewerCost : 0);
     const budgetAllowsTeam = teamCost <= maxBudget;
-    const requiredWorkerCount = Math.min(this.teamSize, maxC, Math.max(1, workstreams));
     const mode =
       teamWanted &&
       members.length >= requiredWorkerCount &&
