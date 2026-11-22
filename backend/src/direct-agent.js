@@ -37,7 +37,8 @@ import {
 } from './workspace-tools.js';
 import { McpHub } from './mcp-client.js';
 import { ToolDispatcher } from './tools/dispatcher.js';
-import { ToolPermissionPolicy } from './tools/policy.js';
+import { ToolPermissionPolicy, intersectPolicies } from './tools/policy.js';
+import { validatePlan } from './planning/validator.js';
 import { HookTrustManager } from './tools/hook-trust.js';
 import { GitWorktreeIsolator, HostSandboxAdapter } from './tools/sandbox.js';
 import { McpLifecycleManager } from './tools/mcp-lifecycle.js';
@@ -283,6 +284,7 @@ export class DirectAgentRuntime {
       hookTrust: this.hookTrust,
       dataRoot: this.dataRoot,
       approvalManager: this.approvalManager,
+      communication: this.mailbox.bus,
       getLivePolicy: (sessionId) => this.#getLiveSessionPolicy(sessionId),
       requestApproval: (request) => this.approvalManager.requestApproval(request),
       getDefaultModel: () => this.pool.getDefaultModel(),
@@ -397,7 +399,10 @@ export class DirectAgentRuntime {
   attachIntelligenceServices(intelligence) {
     if (intelligence !== null && (typeof intelligence !== 'object' || !intelligence)) throw new TypeError('intelligence must be an object or null');
     this.intelligence = intelligence;
-    if (intelligence?.memory) this.contextAssembler.experienceMemoryService = intelligence.memory;
+    if (intelligence?.memory) {
+      this.contextAssembler.experienceMemoryService = intelligence.memory;
+      this.swarmOrchestrator.experienceMemory = intelligence.memory;
+    }
     if (intelligence?.communication) this.mailbox.setCommunicationBus?.(intelligence.communication);
     if (intelligence?.communication) this.childManager.communication = intelligence.communication;
     if (intelligence?.capabilityRegistry) {
@@ -413,6 +418,117 @@ export class DirectAgentRuntime {
   submitPlannedSwarmRun(options = {}) {
     if (!this.intelligence?.planner) throw new Fault('INTELLIGENCE_UNAVAILABLE', 503);
     return this.swarmOrchestrator.submitPlannedRun(options);
+  }
+
+  /**
+   * Explicit production autonomous execution entry:
+   * decomposes an explicit goal through DynamicTaskPlanner, validates a structured
+   * AdaptivePlanner DAG + permission ceiling + budget, and dispatches through Swarm.
+   * Ordinary startTurn() direct chats remain unaffected.
+   */
+  async submitAutonomousGoal({
+    goal,
+    sessionId = null,
+    workspaceRoot = null,
+    permissionMode = null,
+    maxConcurrency = 3,
+    budget = {},
+    maxReplans = 2,
+    maxNodes = 6,
+    workspaceSummary = '',
+    wait = false,
+    trafficSource = 'production',
+    isSynthetic = 0,
+    signal = undefined,
+  } = {}) {
+    const cleanGoal = String(goal ?? '').trim();
+    if (!cleanGoal) throw new Fault('EMPTY_GOAL', 400, { message: 'Autonomous goal is required' });
+
+    const session = sessionId
+      ? this.getSession(String(sessionId))
+      : this.createSession({
+          title: `[Autonomous] ${cleanGoal.slice(0, 60)}`,
+          workspaceRoot: workspaceRoot ?? null,
+          permissionMode: permissionMode ?? 'auto-safe',
+          trafficSource,
+          isSynthetic: Boolean(isSynthetic),
+        });
+
+    const effectivePerm = permissionMode
+      ? intersectPolicies(
+          { permissionMode: session.permissionMode || 'auto-safe' },
+          { permissionMode: String(permissionMode) },
+        ).permissionMode
+      : session.permissionMode || 'auto-safe';
+    const effectiveWorkspace = session.workspaceRoot || workspaceRoot || this.getWorkspaceRoot();
+
+    const toPlannerPerm = (mode) => {
+      const m = String(mode || 'auto-safe').trim();
+      if (m === 'readonly' || m === 'read-only' || m === 'approval') return 'readonly';
+      if (m === 'full' || m === 'full-access') return 'full';
+      return 'auto-safe';
+    };
+    const pickPlannerBudget = (raw = {}) => {
+      const out = {};
+      for (const k of ['maxInputTokens', 'maxOutputTokens', 'maxSteps', 'maxTotalTokens', 'maxCostUsd']) {
+        if (raw?.[k] !== undefined && Number.isFinite(Number(raw[k]))) out[k] = Number(raw[k]);
+      }
+      return out;
+    };
+
+    const planPerm = toPlannerPerm(effectivePerm);
+    const decomposed = await this.swarmPlanner.decompose({
+      goal: cleanGoal,
+      workspaceSummary,
+      maxNodes,
+      model: session.model || null,
+      signal,
+    });
+    const draftPlan = {
+      planVersion: 1,
+      goal: cleanGoal,
+      permissionMode: planPerm,
+      budget: pickPlannerBudget(budget),
+      tasks: decomposed.map((node) => ({
+        taskKey: node.nodeKey,
+        objective: node.objective,
+        acceptance: node.acceptance,
+        taskType: node.taskType || 'research',
+        dependencies: Array.isArray(node.dependencies) ? node.dependencies : [],
+        permissionMode:
+          node.taskType === 'review' || node.taskType === 'research' ? 'readonly' : planPerm,
+        toolAllow: Array.isArray(node.toolAllow) ? node.toolAllow : null,
+        budget: pickPlannerBudget(node.budget),
+        sideEffects: [],
+        metadata: {
+          priority: Number(node.priority ?? 0),
+          isolatedWorktree: Boolean(node.isolatedWorktree),
+          ...(node.isolationMode ? { isolationMode: node.isolationMode } : {}),
+          allowIsolationFallback: Boolean(node.allowIsolationFallback),
+        },
+      })),
+    };
+    const validatedPlan = this.intelligence?.planner
+      ? validatePlan(this.intelligence.planner.validate(draftPlan), { permissionCeiling: planPerm })
+      : validatePlan(draftPlan, { permissionCeiling: planPerm });
+
+    const submitted = this.swarmOrchestrator.submitPlannedRun({
+      plan: validatedPlan,
+      sessionId: session.id,
+      workspaceRoot: effectiveWorkspace,
+      parentPermissionMode: effectivePerm,
+      maxConcurrency,
+      budget: budget ?? validatedPlan.budget,
+      maxReplans,
+      trafficSource,
+      isSynthetic,
+    });
+
+    if (wait) {
+      const settled = await this.swarmOrchestrator.waitForRun(submitted.runId, { signal });
+      return { ...settled, sessionId: session.id, plan: validatedPlan };
+    }
+    return { ...submitted, plan: validatedPlan };
   }
 
   /** Wait for a turn row to become terminal after cancellation or timeout. */
@@ -1718,7 +1834,24 @@ export class DirectAgentRuntime {
               isSynthetic,
             }),
           );
-          if (isRecovery) {
+          if (!isSynthetic && this.intelligence?.memory?.recordExecutionCandidates) {
+          safeIsolateSideEffect(() =>
+            this.intelligence.memory.recordExecutionCandidates({
+              projectId: currentSession.projectId ?? workspaceRoot,
+              source: 'direct_turn',
+              sourceTaskId: turnId,
+              sessionId,
+              turnId,
+              goal: input,
+              summary: finalAssistantText,
+              verdict: finalVerdict,
+              evidenceCount: Number(evidenceCount || 0),
+              isSynthetic: Boolean(isSynthetic),
+            }),
+          );
+        }
+
+        if (isRecovery) {
             safeIsolateSideEffect(() =>
               this.metrics?.record('recovery_attempt', {
                 sessionId,
@@ -1873,6 +2006,23 @@ export class DirectAgentRuntime {
             isSynthetic,
           }),
         );
+
+        if (!isSynthetic && this.intelligence?.memory?.recordExecutionCandidates) {
+          safeIsolateSideEffect(() =>
+            this.intelligence.memory.recordExecutionCandidates({
+              projectId: currentSession.projectId ?? workspaceRoot,
+              source: 'direct_turn',
+              sourceTaskId: turnId,
+              sessionId,
+              turnId,
+              goal: input,
+              summary: finalAssistantText,
+              verdict: finalVerdict,
+              evidenceCount: Number(evidenceCount || 0),
+              isSynthetic: Boolean(isSynthetic),
+            }),
+          );
+        }
 
         if (isRecovery) {
           safeIsolateSideEffect(() =>

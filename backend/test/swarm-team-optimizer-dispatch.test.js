@@ -440,3 +440,163 @@ test('single-node dispatch keeps the optimizer-selected model/provider instead o
   }
 });
 
+test('single-model candidate pool still dispatches parallel ready nodes concurrently when budget allows', async () => {
+  const store = new Store(':memory:');
+  const queue = createQueue();
+  const sessionId = 'session-single-model-parallel';
+  createSession(store, sessionId);
+  const candidates = [
+    {
+      id: 'only-model',
+      model: 'only-model',
+      provider: 'only-provider',
+      healthy: true,
+      capabilities: { coding: 0.9, reasoning: 0.85 },
+      historyScore: 0.8,
+      estimatedTokens: 100,
+    },
+  ];
+  const orchestrator = new AdaptiveSwarmOrchestrator({
+    store,
+    jobQueue: queue,
+    planner: createPlanner(),
+    router: createRouter(candidates),
+    teamOptimizer: new TeamOptimizer({ teamSize: 2, defaultMaxConcurrency: 2 }),
+    budgetLedger: createBudgetLedger(),
+  });
+  const handlers = new Map();
+  orchestrator.registerOnWorker({ registerHandler: (kind, handler) => handlers.set(kind, handler) });
+
+  try {
+    const submitted = orchestrator.submitRun({
+      sessionId,
+      goal: 'dispatch two parallel branches on a single available model',
+      maxConcurrency: 2,
+      nodes: [
+        { nodeKey: 'branch-a', taskType: 'implementation', objective: 'work A' },
+        { nodeKey: 'branch-b', taskType: 'implementation', objective: 'work B' },
+      ],
+    });
+    const dependencyJob = queue.jobs.find((job) => job.kind === SWARM_JOB_KINDS.DEPENDENCY_RESOLVE);
+    await handlers.get(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE)(dependencyJob, {});
+    const run = orchestrator.getRun(submitted.runId);
+    assert.deepEqual(
+      run.nodes.map((node) => node.status),
+      ['queued', 'queued'],
+      'both independent branches must dispatch concurrently when budget allows',
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('tight token budget downgrade throttles parallel dispatch to one node at a time', async () => {
+  const store = new Store(':memory:');
+  const queue = createQueue();
+  const sessionId = 'session-budget-throttle';
+  createSession(store, sessionId);
+  const candidates = [
+    { id: 'worker-a', model: 'worker-a', provider: 'p-a', healthy: true, capabilities: { coding: 0.9 }, estimatedTokens: 100 },
+    { id: 'worker-b', model: 'worker-b', provider: 'p-b', healthy: true, capabilities: { coding: 0.85 }, estimatedTokens: 100 },
+  ];
+  const orchestrator = new AdaptiveSwarmOrchestrator({
+    store,
+    jobQueue: queue,
+    planner: createPlanner(),
+    router: createRouter(candidates),
+    teamOptimizer: new TeamOptimizer({ teamSize: 2, defaultMaxConcurrency: 2 }),
+    budgetLedger: createBudgetLedger(),
+  });
+  const handlers = new Map();
+  orchestrator.registerOnWorker({ registerHandler: (kind, handler) => handlers.set(kind, handler) });
+
+  try {
+    const submitted = orchestrator.submitRun({
+      sessionId,
+      goal: 'throttle team when token budget only covers one worker',
+      maxConcurrency: 2,
+      budget: { maxTotalTokens: 120 },
+      nodes: [
+        { nodeKey: 'branch-a', taskType: 'implementation', objective: 'work A' },
+        { nodeKey: 'branch-b', taskType: 'implementation', objective: 'work B' },
+      ],
+    });
+    const dependencyJob = queue.jobs.find((job) => job.kind === SWARM_JOB_KINDS.DEPENDENCY_RESOLVE);
+    await handlers.get(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE)(dependencyJob, {});
+    const statuses = orchestrator.getRun(submitted.runId).nodes.map((node) => node.status).sort();
+    assert.deepEqual(statuses, ['queued', 'ready']);
+  } finally {
+    store.close();
+  }
+});
+
+test('auto-materialized reviewer remains ready across repeated resolve passes when an upstream worker failed', async () => {
+  const store = new Store(':memory:');
+  const queue = createQueue();
+  const sessionId = 'session-reviewer-stay-ready';
+  createSession(store, sessionId);
+  const candidates = [
+    { id: 'worker-a', model: 'worker-a', provider: 'p-a', healthy: true, capabilities: { coding: 0.95 }, estimatedTokens: 10 },
+    { id: 'worker-b', model: 'worker-b', provider: 'p-b', healthy: true, capabilities: { coding: 0.9 }, estimatedTokens: 10 },
+    { id: 'reviewer-model', model: 'reviewer-model', provider: 'p-r', role: 'reviewer', healthy: true, capabilities: { reasoning: 0.98, research: 0.98 }, estimatedTokens: 10 },
+  ];
+  const orchestrator = new AdaptiveSwarmOrchestrator({
+    store,
+    jobQueue: queue,
+    planner: createPlanner(),
+    router: createRouter(candidates),
+    teamOptimizer: new TeamOptimizer({ teamSize: 2, defaultMaxConcurrency: 2 }),
+    budgetLedger: createBudgetLedger(),
+  });
+  const handlers = new Map();
+  orchestrator.registerOnWorker({ registerHandler: (kind, handler) => handlers.set(kind, handler) });
+
+  try {
+    const submitted = orchestrator.submitRun({
+      sessionId,
+      goal: 'keep auto reviewer ready even if one upstream worker failed',
+      maxConcurrency: 2,
+      nodes: [
+        { nodeKey: 'implementation-a', taskType: 'verification', objective: 'worker A', priority: 10 },
+        { nodeKey: 'implementation-b', taskType: 'verification', objective: 'worker B', priority: 10 },
+        { nodeKey: 'other-worker', taskType: 'research', objective: 'independent busy worker', priority: 1 },
+      ],
+    });
+    const dependencyJob = queue.jobs.find((job) => job.kind === SWARM_JOB_KINDS.DEPENDENCY_RESOLVE);
+    await handlers.get(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE)(dependencyJob, {});
+    const run = orchestrator.getRun(submitted.runId);
+    const reviewer = run.nodes.find((node) => node.taskType === 'review');
+    const workerA = run.nodes.find((node) => node.nodeKey === 'implementation-a');
+    const workerB = run.nodes.find((node) => node.nodeKey === 'implementation-b');
+    const otherWorker = run.nodes.find((node) => node.nodeKey === 'other-worker');
+
+    store.db.prepare("UPDATE swarm_nodes SET status='failed', errorCode='WORKER_FAILED' WHERE id=?").run(workerA.id);
+    store.db.prepare("UPDATE swarm_nodes SET status='completed', resultText='ok' WHERE id=?").run(workerB.id);
+    // Simulate reviewer already READY while dispatch slots are 0 (other-worker running with maxConcurrency=1)
+    store.db.prepare("UPDATE swarm_nodes SET status='ready' WHERE id=?").run(reviewer.id);
+    store.db.prepare("UPDATE swarm_runs SET strategyJson=? WHERE id=?").run(
+      JSON.stringify({ maxConcurrency: 1, maxReplans: 2 }),
+      submitted.runId,
+    );
+    store.db.prepare("UPDATE swarm_nodes SET status='running' WHERE id=?").run(otherWorker.id);
+
+    await handlers.get(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE)({
+      ...dependencyJob,
+      id: 'resolve-keep-ready-while-busy',
+      payload: { ...dependencyJob.payload, epoch: 8 },
+    }, {});
+    // Must stay READY rather than being demoted back to PENDING when workerA failed!
+    assert.equal(orchestrator.getRun(submitted.runId).nodes.find((n) => n.id === reviewer.id).status, 'ready');
+
+    store.db.prepare("UPDATE swarm_nodes SET status='completed', resultText='ok' WHERE id=?").run(otherWorker.id);
+    await handlers.get(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE)({
+      ...dependencyJob,
+      id: 'resolve-keep-ready',
+      payload: { ...dependencyJob.payload, epoch: 9 },
+    }, {});
+    assert.equal(orchestrator.getRun(submitted.runId).nodes.find((n) => n.id === reviewer.id).status, 'queued');
+  } finally {
+    store.close();
+  }
+});
+

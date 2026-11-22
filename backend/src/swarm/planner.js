@@ -13,22 +13,86 @@ function parseJsonSafe(str, fallback) {
   }
 }
 
-function extractJsonBlock(text) {
-  const raw = String(text ?? '').trim();
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced ? fenced[1].trim() : raw;
-  const start = candidate.indexOf('{');
-  const arrStart = candidate.indexOf('[');
-  if (start === -1 && arrStart === -1) return null;
+function tryParseJson(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
   try {
-    return JSON.parse(
-      start !== -1 && (arrStart === -1 || start < arrStart)
-        ? candidate.slice(start)
-        : candidate.slice(arrStart),
-    );
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' ? parsed : null;
   } catch {
     return null;
   }
+}
+
+function scanBalancedJson(text) {
+  const src = String(text ?? '');
+  const parsed = [];
+  for (let i = 0; i < src.length; i += 1) {
+    const open = src[i];
+    if (open !== '{' && open !== '[') continue;
+    const close = open === '{' ? '}' : ']';
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let j = i; j < src.length; j += 1) {
+      const ch = src[j];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === open) depth += 1;
+      else if (ch === close) {
+        depth -= 1;
+        if (depth === 0) {
+          const obj = tryParseJson(src.slice(i, j + 1));
+          if (obj) {
+            parsed.push(obj);
+            i = j;
+          }
+          break;
+        }
+      }
+    }
+  }
+  return parsed;
+}
+
+function extractJsonBlock(text) {
+  const raw = String(text ?? '').trim();
+  const direct = tryParseJson(raw);
+  if (direct) return direct;
+  const fencedMatches = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
+  for (let i = fencedMatches.length - 1; i >= 0; i -= 1) {
+    const parsed = tryParseJson(fencedMatches[i][1]);
+    if (parsed) return parsed;
+    const scanned = scanBalancedJson(fencedMatches[i][1]);
+    if (scanned.length) return scanned[scanned.length - 1];
+  }
+  const scanned = scanBalancedJson(raw);
+  return scanned.length ? scanned[scanned.length - 1] : null;
+}
+
+function sanitizeNodeKey(raw, idx, seen) {
+  let base = String(raw || `node-${idx + 1}`)
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!base || !/^[A-Za-z0-9]/.test(base)) {
+    base = `n-${base || idx + 1}`;
+  }
+  base = base.slice(0, 64);
+  let unique = base;
+  let suffix = 2;
+  while (seen.has(unique)) {
+    const tag = `-${suffix++}`;
+    unique = `${base.slice(0, 64 - tag.length)}${tag}`;
+  }
+  seen.add(unique);
+  return unique;
 }
 
 /**
@@ -94,19 +158,34 @@ export class DynamicTaskPlanner {
   }
 
   normalizeNodes(rawNodes) {
-    return rawNodes.map((n, idx) => ({
-      nodeKey: String(n.nodeKey || n.key || `node-${idx + 1}`).slice(0, 64),
-      objective: String(n.objective || '').trim() || `Subtask ${idx + 1}`,
-      acceptance: String(n.acceptance || 'Provide concrete verified output'),
-      taskType: String(n.taskType || 'research'),
-      dependencies: Array.isArray(n.dependencies) ? n.dependencies.map(String) : [],
-      toolCategories: Array.isArray(n.toolCategories) ? n.toolCategories : [],
-      toolAllow: Array.isArray(n.toolAllow) ? n.toolAllow : null,
-      isolatedWorktree: Boolean(n.isolatedWorktree),
-      isolationMode: n.isolationMode ? String(n.isolationMode) : null,
-      allowIsolationFallback: Boolean(n.allowIsolationFallback),
-      priority: Number(n.priority ?? 0),
-      budget: n.budget && typeof n.budget === 'object' ? { ...n.budget } : {},
+    const seen = new Set();
+    const keyMap = new Map();
+    const firstPass = rawNodes.map((n, idx) => {
+      const rawKey = String(n.nodeKey || n.key || `node-${idx + 1}`).trim();
+      const nodeKey = sanitizeNodeKey(rawKey, idx, seen);
+      if (rawKey && !keyMap.has(rawKey)) keyMap.set(rawKey, nodeKey);
+      return {
+        nodeKey,
+        objective: String(n.objective || '').trim() || `Subtask ${idx + 1}`,
+        acceptance: String(n.acceptance || 'Provide concrete verified output'),
+        taskType: String(n.taskType || 'research'),
+        dependencies: Array.isArray(n.dependencies) ? n.dependencies.map(String) : [],
+        toolCategories: Array.isArray(n.toolCategories) ? n.toolCategories : [],
+        toolAllow: Array.isArray(n.toolAllow) ? n.toolAllow : null,
+        permissionMode: n.permissionMode ? String(n.permissionMode) : null,
+        isolatedWorktree: Boolean(n.isolatedWorktree),
+        isolationMode: n.isolationMode ? String(n.isolationMode) : null,
+        allowIsolationFallback: Boolean(n.allowIsolationFallback),
+        priority: Number(n.priority ?? 0),
+        budget: n.budget && typeof n.budget === 'object' ? { ...n.budget } : {},
+      };
+    });
+    return firstPass.map((node) => ({
+      ...node,
+      dependencies: node.dependencies.map((dep) => {
+        const trimmed = String(dep).trim();
+        return keyMap.get(trimmed) ?? trimmed;
+      }),
     }));
   }
 
@@ -137,8 +216,9 @@ export class DynamicTaskPlanner {
               type: 'text',
               text:
                 'Decompose the engineering goal into an acyclic JSON DAG: ' +
-                '{"nodes":[{"nodeKey":"research","taskType":"research","objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":false,"priority":10}]}. ' +
-                `Keep <= ${maxNodes} nodes. Return JSON only.`,
+                '{"nodes":[{"nodeKey":"branch-a","taskType":"implementation","objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":true,"priority":20}]}. ' +
+                'For independent parallel branches that modify files, set dependencies to [] (or their shared prerequisite) and isolatedWorktree:true so they run concurrently. Include a read-only "review" node when review is requested. ' +
+                `Use alphanumeric nodeKey matching ^[A-Za-z0-9][A-Za-z0-9._-]*$. Keep <= ${maxNodes} nodes. Return JSON only.`,
             },
           ],
         },
@@ -159,8 +239,8 @@ export class DynamicTaskPlanner {
           scope: BUDGET_SCOPES.PLANNING,
           sessionId,
           estimatedInputTokens: estimateRequestInputTokens({ messages }),
-          requestedMaxOutputTokens: 1200,
-          defaultMaxOutputTokens: 1200,
+          requestedMaxOutputTokens: 4096,
+          defaultMaxOutputTokens: 4096,
           leaseGuard,
         });
       }
@@ -171,7 +251,7 @@ export class DynamicTaskPlanner {
           provider: 'pool',
           model: picked,
           messages,
-          maxTokens: reservation?.constrainedMaxOutputTokens ?? 1200,
+          maxTokens: reservation?.constrainedMaxOutputTokens ?? 4096,
           signal,
         })) {
           if (chunk.type === 'text-delta') txt += chunk.text;

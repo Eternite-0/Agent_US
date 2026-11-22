@@ -60,6 +60,7 @@ export class ChildAgentManager {
     requestApproval = null,
     approvalManager = null,
     communication = null,
+    onBeforeCommunicationAck = null,
   }) {
     this.store = store;
     this.kernel = kernel;
@@ -77,6 +78,7 @@ export class ChildAgentManager {
     this.requestApproval = requestApproval;
     this.approvalManager = approvalManager;
     this.communication = communication;
+    this.onBeforeCommunicationAck = onBeforeCommunicationAck;
     this.getDefaultModel = getDefaultModel;
     this.activeChildren = new Map(); // childSessionId -> { controller, parentSessionId, paused, shuttingDown, model }
     this.shuttingDown = false;
@@ -738,6 +740,17 @@ export class ChildAgentManager {
             }
           });
 
+          if (claimedCommunicationMessage?.messageId && typeof this.onBeforeCommunicationAck === 'function') {
+            await this.onBeforeCommunicationAck({
+              runId,
+              nodeId,
+              nodeKey,
+              childSessionId,
+              childTurnId: turnId,
+              message: claimedCommunicationMessage,
+            });
+          }
+
           if (claimedCommunicationMessage?.messageId && this.communication?.ack) {
             const communicationAgentId = claimedCommunicationMessage.toAgentId || nodeKey || childSessionId;
             await this.communication.ack(claimedCommunicationMessage.messageId, communicationAgentId, claimedCommunicationMessage.deliveryToken);
@@ -775,6 +788,8 @@ export class ChildAgentManager {
             workspaceRoot: effectiveRoot,
             mode: 'direct',
             permissionMode: effectivePolicy.permissionMode,
+            projectId: session.projectId ?? workspaceRoot ?? effectiveRoot,
+            memoryQuery: String(objective ?? '').slice(0, 1000),
           });
           if (session.agentProfile?.startsWith('fork:') && profile?.staticSystemInstruction) {
             assembled.messages.splice(
@@ -850,7 +865,7 @@ export class ChildAgentManager {
               maxOutputTokens:
                 normalizeBudgetLimit(effectiveBudget.maxOutputTokens) !== null
                   ? normalizeBudgetLimit(effectiveBudget.maxOutputTokens)
-                  : 2048,
+                  : 8192,
               ...(normalizeBudgetLimit(effectiveBudget.maxTokens) !== null
                 ? { maxTokens: normalizeBudgetLimit(effectiveBudget.maxTokens) }
                 : {}),

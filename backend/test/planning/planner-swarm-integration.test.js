@@ -74,3 +74,78 @@ test('Adaptive Planner plan is validated and mapped into the durable Swarm run',
     rmDirSafe(workspaceRoot);
   }
 });
+
+test('DynamicTaskPlanner parses fenced/trailing JSON with reasoning headroom and normalizes nodeKeys for taskSchema', async () => {
+  const { DynamicTaskPlanner } = await import('../../src/swarm/planner.js');
+  const { taskSchema } = await import('../../src/planning/schemas.js');
+
+  let seenMaxTokens = null;
+  class PlannerTestAdapter extends LlmAdapter {
+    async *stream(opts) {
+      seenMaxTokens = opts.maxTokens;
+      const payload = {
+        nodes: [
+          {
+            nodeKey: 'Branch A (Frontmatter)',
+            taskType: 'implementation',
+            objective: 'Implement frontmatter parser',
+            acceptance: 'src/frontmatter.js works',
+            dependencies: [],
+            isolatedWorktree: true,
+            priority: 20,
+          },
+          {
+            nodeKey: 'Branch B (Wikilinks)',
+            taskType: 'implementation',
+            objective: 'Implement wikilinks parser',
+            acceptance: 'src/wikilinks.js works',
+            dependencies: [],
+            isolatedWorktree: true,
+            priority: 20,
+          },
+          {
+            nodeKey: '_review',
+            taskType: 'review',
+            objective: 'Review artifacts read-only',
+            acceptance: 'Review complete',
+            dependencies: ['Branch A (Frontmatter)', 'Branch B (Wikilinks)'],
+            permissionMode: 'readonly',
+            priority: 5,
+          },
+        ],
+      };
+      yield {
+        type: 'text-delta',
+        index: 0,
+        text: `Here is the DAG:\n\`\`\`json\n${JSON.stringify(payload)}\n\`\`\`\nAll dependencies are acyclic.`,
+      };
+      yield { type: 'usage', usage: { inputTokens: 50, outputTokens: 120 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+
+  const planner = new DynamicTaskPlanner({ adapter: new PlannerTestAdapter() });
+  const nodes = await planner.decompose({
+    goal: 'Build parallel markdown modules with review',
+    model: 'reasoning-model',
+    maxNodes: 6,
+  });
+
+  assert.ok(seenMaxTokens >= 4096, `expected maxTokens >= 4096, got ${seenMaxTokens}`);
+  assert.equal(nodes.length, 3);
+  assert.equal(nodes[0].isolatedWorktree, true);
+  assert.equal(nodes[1].isolatedWorktree, true);
+  assert.equal(nodes[2].dependencies.length, 2);
+  assert.deepEqual(nodes[2].dependencies, [nodes[0].nodeKey, nodes[1].nodeKey]);
+  for (const node of nodes) {
+    const parsed = taskSchema.safeParse({
+      taskKey: node.nodeKey,
+      objective: node.objective,
+      acceptance: node.acceptance,
+      taskType: node.taskType,
+      dependencies: node.dependencies,
+      permissionMode: node.permissionMode === 'readonly' ? 'readonly' : 'auto-safe',
+    });
+    assert.equal(parsed.success, true, `taskSchema should accept normalized nodeKey ${node.nodeKey}`);
+  }
+});

@@ -91,13 +91,12 @@ export class TeamOptimizer {
     const teamWanted = !simple && (teamRequested || workstreams > 1 || highRisk);
     const maxBudget = numeric(
       budget.maxCost ??
-        budget.maxCostUsd ??
         budget.maxTokens ??
         budget.maxTotalTokens ??
         budgetSnapshot?.remainingCost ??
         budgetSnapshot?.remainingTokens ??
         budgetSnapshot?.remaining ??
-        Infinity,
+        (budget.maxCostUsd === 0 ? 0 : Infinity),
       Infinity,
     );
     const single = available[0] ?? null;
@@ -108,6 +107,7 @@ export class TeamOptimizer {
         mode: 'single', members: [], reviewer: null, estimatedCost: 0, estimatedSteps: 0,
         rationale: 'no healthy candidate is available', evidencePolicy: evidencePolicy(),
         replacementPolicy: 'replace only after preserving evidence',
+        budgetDowngraded: false, parallelBudgetAllowed: true,
       };
     }
 
@@ -130,6 +130,10 @@ export class TeamOptimizer {
       maxC > 1
         ? 'team'
         : 'single';
+    const parallelSlots = Math.min(maxC, Math.max(1, workstreams));
+    const parallelSingleCost = singleCost * parallelSlots;
+    const budgetDowngraded = Boolean(teamWanted && !budgetAllowsTeam);
+    const parallelBudgetAllowed = mode === 'team' ? budgetAllowsTeam : parallelSingleCost <= maxBudget;
     const selected = mode === 'team' ? members : [single];
     const estimatedCost = selected.reduce((sum, member) => sum + estimateCost(member, task), 0)
       + (mode === 'team' && reviewer && !selected.some((member) => member.id === reviewer.id) ? this.reviewerCost : 0);
@@ -162,6 +166,8 @@ export class TeamOptimizer {
         : teamWanted && !budgetAllowsTeam
           ? 'team request downgraded because the available budget is insufficient'
           : 'single agent is sufficient for this task shape',
+      budgetDowngraded,
+      parallelBudgetAllowed,
       evidencePolicy: evidencePolicy(),
       replacementPolicy: 'replace only after preserving node identity, artifacts, receipts, and verifier evidence',
     };

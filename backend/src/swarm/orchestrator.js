@@ -41,7 +41,33 @@ import {
   recoverInterruptedSwarmRuns,
 } from './recovery-helpers.js';
 import { validatePlan } from '../planning/validator.js';
+import { intersectPolicies } from '../tools/policy.js';
 import { TeamOptimizer } from './team-optimizer.js';
+
+function normalizePlannerPermission(mode) {
+  const m = String(mode || 'auto-safe').trim();
+  if (m === 'readonly' || m === 'read-only' || m === 'approval') return 'readonly';
+  if (m === 'full' || m === 'full-access') return 'full';
+  return 'auto-safe';
+}
+
+function normalizeRuntimePermission(mode) {
+  const m = String(mode || 'auto-safe').trim();
+  if (m === 'readonly' || m === 'read-only') return 'read-only';
+  if (m === 'full' || m === 'full-access') return 'full-access';
+  return m;
+}
+
+function buildPlannerBudget(budget = {}) {
+  if (!budget || typeof budget !== 'object') return {};
+  const out = {};
+  for (const key of ['maxInputTokens', 'maxOutputTokens', 'maxSteps', 'maxTotalTokens', 'maxCostUsd']) {
+    if (budget[key] !== undefined && Number.isFinite(Number(budget[key]))) {
+      out[key] = Number(budget[key]);
+    }
+  }
+  return out;
+}
 
 /**
  * Layer 6 Durable Job-Driven AdaptiveSwarmOrchestrator:
@@ -67,6 +93,8 @@ export class AdaptiveSwarmOrchestrator {
     metrics = null,
     teamOptimizer = null,
     capabilityRegistry = null,
+    experienceMemory = null,
+    communicationVisibilityTimeoutMs = 30_000,
   }) {
     this.store = store;
     this.jobQueue = jobQueue;
@@ -84,6 +112,8 @@ export class AdaptiveSwarmOrchestrator {
     this.metrics = metrics;
     this.teamOptimizer = teamOptimizer ?? new TeamOptimizer({});
     this.capabilityRegistry = capabilityRegistry;
+    this.experienceMemory = experienceMemory;
+    this.communicationVisibilityTimeoutMs = Math.max(50, Number(communicationVisibilityTimeoutMs || 30_000));
     this.budgetLedger = budgetLedger ?? (store ? new TaskTreeBudgetLedger(store) : null);
     if (this.replanner && !this.replanner.budgetLedger) {
       this.replanner.budgetLedger = this.budgetLedger;
@@ -281,7 +311,14 @@ export class AdaptiveSwarmOrchestrator {
     trafficSource = 'production',
     isSynthetic = 0,
   } = {}) {
-    const validated = validatePlan(plan, { permissionCeiling: parentPermissionMode });
+    const parentRuntimePerm = normalizeRuntimePermission(parentPermissionMode);
+    const validated = validatePlan(plan, {
+      permissionCeiling: normalizePlannerPermission(parentRuntimePerm),
+    });
+    const effectiveRunPerm = intersectPolicies(
+      { permissionMode: parentRuntimePerm },
+      { permissionMode: normalizeRuntimePermission(validated.permissionMode) },
+    ).permissionMode;
     const nodes = validated.tasks.map((task) => ({
       nodeKey: task.taskKey,
       objective: task.objective,
@@ -291,8 +328,14 @@ export class AdaptiveSwarmOrchestrator {
           : `${task.acceptance.description} (required evidence: ${task.acceptance.requiredEvidence.join(', ')})`,
       taskType: task.taskType,
       dependencies: task.dependencies,
+      permissionMode: normalizeRuntimePermission(task.permissionMode),
       toolAllow: task.toolAllow,
       budget: task.budget,
+      isolatedWorktree: Boolean(task.metadata?.isolatedWorktree),
+      isolationMode:
+        task.metadata?.isolationMode ??
+        (task.metadata?.isolatedWorktree ? 'worktree' : null),
+      allowIsolationFallback: Boolean(task.metadata?.allowIsolationFallback),
       priority: Number.isFinite(Number(task.metadata?.priority)) ? Number(task.metadata.priority) : 0,
     }));
     return this.submitRun({
@@ -300,7 +343,7 @@ export class AdaptiveSwarmOrchestrator {
       rootTurnId,
       goal: validated.goal,
       workspaceRoot,
-      parentPermissionMode: validated.permissionMode,
+      parentPermissionMode: effectiveRunPerm,
       maxConcurrency,
       budget: budget ?? validated.budget,
       nodes,
@@ -614,6 +657,7 @@ export class AdaptiveSwarmOrchestrator {
       }
 
       let routedSpecs = null;
+      let validatedPlan = null;
       if (run.nodes.length === 0) {
         this.budgetLedger?.ensureLedger({
           treeId: runId,
@@ -665,6 +709,34 @@ export class AdaptiveSwarmOrchestrator {
         }
         assertLeaseInTx(leaseGuard, { runId });
         this.planner.validateDag(planned);
+        const planPermission = normalizePlannerPermission(run.permissionMode || 'auto-safe');
+        validatedPlan = validatePlan(
+          {
+            planVersion: Number(run.planVersion || 1),
+            goal: String(goal || run.goal || '').trim() || 'Autonomous goal',
+            permissionMode: planPermission,
+            budget: buildPlannerBudget(run.budget),
+            tasks: planned.map((n) => ({
+              taskKey: n.nodeKey,
+              objective: n.objective,
+              acceptance: n.acceptance,
+              taskType: n.taskType || 'research',
+              dependencies: Array.isArray(n.dependencies) ? n.dependencies : [],
+              permissionMode:
+                n.taskType === 'review' || n.taskType === 'research' ? 'readonly' : planPermission,
+              toolAllow: Array.isArray(n.toolAllow) ? n.toolAllow : null,
+              budget: buildPlannerBudget(n.budget),
+              sideEffects: [],
+              metadata: {
+                priority: Number(n.priority ?? 0),
+                isolatedWorktree: Boolean(n.isolatedWorktree),
+                ...(n.isolationMode ? { isolationMode: n.isolationMode } : {}),
+                allowIsolationFallback: Boolean(n.allowIsolationFallback),
+              },
+            })),
+          },
+          { permissionCeiling: planPermission },
+        );
         routedSpecs = this.#prepareNodeSpecs(planned, run.budget);
       }
 
@@ -673,6 +745,12 @@ export class AdaptiveSwarmOrchestrator {
         const fresh = this.getRun(runId);
         if (!fresh || isTerminalRunState(fresh.status)) {
           return { shouldResolve: false, effectivePlanVersion: fresh?.planVersion || 1 };
+        }
+        if (validatedPlan && !fresh.plan) {
+          const nextStrategy = { ...(fresh.strategy ?? {}), plan: validatedPlan };
+          this.store.db
+            .prepare('UPDATE swarm_runs SET strategyJson=?, updatedAt=? WHERE id=?')
+            .run(JSON.stringify(nextStrategy), Date.now(), runId);
         }
         if (routedSpecs && fresh.nodes.length === 0) {
           this.#insertNodes(
@@ -830,7 +908,7 @@ export class AdaptiveSwarmOrchestrator {
               leaseGuard,
             });
             if (upd.changed) postEvents.push(upd);
-          } else if (n.status === SWARM_NODE_STATES.READY && !allDepsCompleted) {
+          } else if (n.status === SWARM_NODE_STATES.READY && !dependenciesReady) {
             const upd = transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.PENDING, {
               emitEvent: false,
               leaseGuard,
@@ -892,12 +970,15 @@ export class AdaptiveSwarmOrchestrator {
             team,
             picked,
             candidates,
+            budgetSnapshot,
             now: Date.now(),
           });
           if (reviewerNode) postEvents.push({ ...reviewerNode, runId, changed: true });
-          const dispatchCount = team.mode === 'team'
-            ? picked.length
-            : Math.min(1, picked.length);
+          const dispatchCount =
+            team.mode === 'team' ||
+            (picked.length > 1 && !team.budgetDowngraded && team.parallelBudgetAllowed !== false)
+              ? picked.length
+              : Math.min(1, picked.length);
           const queuedKeys = [];
           for (const [index, n] of picked.slice(0, dispatchCount).entries()) {
             const selectedMember = team.members?.[index] ?? team.members?.[0];
@@ -1159,6 +1240,23 @@ export class AdaptiveSwarmOrchestrator {
             }
           }
           if (node.isolationMode !== 'worktree' || !this.artifactManager || verifiedArt) {
+            if (typeof this.mailbox?.receive === 'function' && typeof this.mailbox?.ack === 'function') {
+              const pendingClaim = await this.mailbox.receive(node.nodeKey, {
+                runId,
+                visibilityTimeoutMs: this.communicationVisibilityTimeoutMs,
+              });
+              if (pendingClaim?.messageId) {
+                const agentId = pendingClaim.toAgentId || node.nodeKey;
+                if (pendingClaim.deliveryBinding?.childTurnId === node.childTurnId) {
+                  await this.mailbox.ack(pendingClaim.messageId, agentId, pendingClaim.deliveryToken);
+                } else {
+                  await this.mailbox.retry?.(pendingClaim.messageId, agentId, {
+                    delayMs: 0,
+                    deliveryToken: pendingClaim.deliveryToken,
+                  });
+                }
+              }
+            }
             const lastMsg = this.store.db
               .prepare(
                 "SELECT content FROM direct_messages WHERE turnId=? AND role='assistant' ORDER BY seq DESC LIMIT 1",
@@ -1186,6 +1284,8 @@ export class AdaptiveSwarmOrchestrator {
             if (converged.changed) {
               this.budgetLedger?.syncRunUsage?.(runId, { incrementCompletedNodes: 1 });
             }
+            const convergedRow = this.store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(node.id) ?? node;
+            await this.#publishHandoffsAndDrainInbox(convergedRow, runId, uris);
             enqueueSwarmJob(
               this.jobQueue,
               SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
@@ -1265,12 +1365,101 @@ export class AdaptiveSwarmOrchestrator {
             ? this.mailbox.peekInbox(node.nodeKey, { runId })
             : [];
         const claimedMessage = typeof this.mailbox?.receive === 'function'
-          ? await this.mailbox.receive(node.nodeKey, { runId, visibilityTimeoutMs: 30_000 })
+          ? await this.mailbox.receive(node.nodeKey, {
+              runId,
+              visibilityTimeoutMs: this.communicationVisibilityTimeoutMs,
+            })
           : null;
+        const existingBinding = claimedMessage?.deliveryBinding ?? null;
+        const bindingMatchesNode =
+          existingBinding &&
+          existingBinding.runId === run.id &&
+          (existingBinding.nodeId == null || existingBinding.nodeId === node.id);
+        const effectiveChildSessionId =
+          node.childSessionId || (bindingMatchesNode ? existingBinding.childSessionId : null);
+        const effectiveChildTurnId =
+          node.childTurnId || (bindingMatchesNode ? existingBinding.childTurnId : null);
+
+        if (!node.childTurnId && effectiveChildTurnId) {
+          const boundTurn = this.store.db
+            .prepare('SELECT id, state FROM direct_turns WHERE id=?')
+            .get(effectiveChildTurnId);
+          if (boundTurn?.state === 'completed') {
+            let verifiedArt = null;
+            if (node.isolationMode === 'worktree' && this.artifactManager) {
+              const candidate = node.latestArtifactId
+                ? this.artifactManager.getArtifact(node.latestArtifactId)
+                : this.artifactManager.getLatestNodeArtifact(runId, node.nodeKey);
+              if (candidate && this.artifactManager.verifyArtifact(candidate.id).ok) {
+                verifiedArt = candidate;
+              }
+            }
+            if (node.isolationMode !== 'worktree' || !this.artifactManager || verifiedArt) {
+              if (claimedMessage?.messageId && this.mailbox?.ack) {
+                await this.mailbox.ack(
+                  claimedMessage.messageId,
+                  claimedMessage.toAgentId || node.nodeKey,
+                  claimedMessage.deliveryToken,
+                );
+              }
+              const lastMsg = this.store.db
+                .prepare(
+                  "SELECT content FROM direct_messages WHERE turnId=? AND role='assistant' ORDER BY seq DESC LIMIT 1",
+                )
+                .get(effectiveChildTurnId);
+              const resultText = node.resultText || lastMsg?.content || '';
+              const uris = [
+                ...new Set([
+                  ...(verifiedArt?.uri ? [verifiedArt.uri] : []),
+                  ...extractArtifactUris(resultText),
+                ]),
+              ];
+              const converged = transitionSwarmNode(this.store, this.eventRouter, node.id, SWARM_NODE_STATES.COMPLETED, {
+                sessionId: run.sessionId,
+                rootTurnId: run.rootTurnId,
+                leaseGuard: nodeGuard,
+                patch: {
+                  childSessionId: effectiveChildSessionId,
+                  childTurnId: effectiveChildTurnId,
+                  resultText,
+                  artifactUrisJson: JSON.stringify(uris),
+                  latestArtifactId: verifiedArt?.id ?? node.latestArtifactId ?? null,
+                  activeFence: null,
+                  activeJobId: null,
+                },
+              });
+              if (converged.changed) {
+                this.budgetLedger?.syncRunUsage?.(runId, { incrementCompletedNodes: 1 });
+              }
+              const convergedRow = this.store.db.prepare('SELECT * FROM swarm_nodes WHERE id=?').get(node.id) ?? node;
+              await this.#publishHandoffsAndDrainInbox(convergedRow, runId, uris);
+              enqueueSwarmJob(
+                this.jobQueue,
+                SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
+                {
+                  runId,
+                  sessionId: run.sessionId,
+                  planVersion: run.planVersion || 1,
+                  epoch: Date.now(),
+                },
+                { idempotencyKey: `swarm:resolve:${runId}:${node.nodeKey}:converged:${uuid().slice(0, 8)}` },
+              );
+              return;
+            }
+          }
+        }
+
+        const alreadyBoundToTurn = Boolean(
+          existingBinding?.childTurnId &&
+          effectiveChildTurnId &&
+          existingBinding.childTurnId === effectiveChildTurnId,
+        );
         const ackMailboxIds = peekedInbox.map((m) => m.id);
         const inboxMsgs = [
           ...peekedInbox.map((m) => `[协同消息来自 ${m.fromAgentId}]: ${JSON.stringify(m.payload)}`),
-          ...(claimedMessage ? [`[统一协同消息来自 ${claimedMessage.fromAgentId}]: ${JSON.stringify(claimedMessage.payload)}`] : []),
+          ...(claimedMessage && !alreadyBoundToTurn
+            ? [`[统一协同消息来自 ${claimedMessage.fromAgentId}]: ${JSON.stringify(claimedMessage.payload)}`]
+            : []),
         ];
         let fullObjective = [...depResults, ...inboxMsgs, node.objective].join('\n\n');
         const reviewerEvidence = this.#buildReviewerEvidenceContext({ run, node, byKey });
@@ -1284,7 +1473,7 @@ export class AdaptiveSwarmOrchestrator {
           ].join('\n\n');
         }
 
-        const cp = node.childTurnId ? this.checkpointStore?.loadLatest?.(node.childTurnId) : null;
+        const cp = effectiveChildTurnId ? this.checkpointStore?.loadLatest?.(effectiveChildTurnId) : null;
         const treeSnap = this.budgetLedger?.ensureLedger({
           treeId: runId,
           rootSessionId: run.sessionId,
@@ -1329,8 +1518,8 @@ export class AdaptiveSwarmOrchestrator {
           claimedCommunicationMessage: claimedMessage,
           budgetLedger: this.budgetLedger,
           budgetScope,
-          existingChildSessionId: node.childSessionId || null,
-          resumeTurnId: node.childTurnId || null,
+          existingChildSessionId: effectiveChildSessionId,
+          resumeTurnId: effectiveChildTurnId,
           initialStep: cp?.step ?? 0,
           leaseGuard: nodeGuard,
           signal: combinedSignal,
@@ -1523,6 +1712,8 @@ export class AdaptiveSwarmOrchestrator {
             isSynthetic: run.isSynthetic ? 1 : 0,
           });
         });
+
+        await this.#publishHandoffsAndDrainInbox(committedNode, runId, uris);
 
         enqueueSwarmJob(
           this.jobQueue,
@@ -1819,6 +2010,28 @@ export class AdaptiveSwarmOrchestrator {
 
       const settled = this.getRun(runId);
       if (didTransition) {
+        if (finalStatus === SWARM_RUN_STATES.COMPLETED && this.experienceMemory && !run.isSynthetic) {
+          const artifactUris = [
+            ...new Set(activeNodes.flatMap((n) => (Array.isArray(n.artifactUris) ? n.artifactUris : []))),
+          ];
+          const projectId = run.workspaceRoot || run.sessionId;
+          safeIsolateSideEffect(() =>
+            this.experienceMemory.recordExecutionCandidates({
+              projectId,
+              source: 'swarm_run',
+              sourceTaskId: runId,
+              sessionId: run.sessionId,
+              turnId: run.rootTurnId,
+              runId,
+              goal: run.goal,
+              summary,
+              verdict: outcome.verdict,
+              evidenceCount: Number(outcome.verdict?.evidenceCount ?? 0),
+              artifactUris,
+              isSynthetic: Boolean(run.isSynthetic),
+            }),
+          );
+        }
         try {
           this.eventRouter?.emitPersisted({
             sessionId: run.sessionId,
@@ -1842,7 +2055,7 @@ export class AdaptiveSwarmOrchestrator {
     });
   }
 
-  #materializeReviewerNode({ run, team, picked, candidates, now }) {
+  #materializeReviewerNode({ run, team, picked, candidates, budgetSnapshot = null, now }) {
     if (!run || team?.mode !== 'team' || !team.reviewer?.required || !Array.isArray(picked) || picked.length === 0) {
       return null;
     }
@@ -1852,6 +2065,24 @@ export class AdaptiveSwarmOrchestrator {
       sourceNodeKeys.length === 0 ||
       picked.some((node) => parseJsonSafe(node.budgetJson, {})?.reviewerMetadata?.autoMaterialized === true)
     ) {
+      return null;
+    }
+
+    if (
+      budgetSnapshot &&
+      budgetSnapshot.remainingSteps !== null &&
+      budgetSnapshot.remainingSteps <= picked.length
+    ) {
+      return null;
+    }
+
+    const existingPlannedReview = (run.nodes ?? []).find(
+      (n) =>
+        n.taskType === 'review' &&
+        Array.isArray(n.dependencies) &&
+        sourceNodeKeys.every((key) => n.dependencies.includes(key)),
+    );
+    if (existingPlannedReview) {
       return null;
     }
 
@@ -1957,9 +2188,12 @@ export class AdaptiveSwarmOrchestrator {
     if (!node || node.taskType !== 'review') return null;
     const budget = parseJsonSafe(node.budgetJson, {});
     const metadata = budget?.reviewerMetadata;
-    const sourceNodeKeys = Array.isArray(metadata?.sourceNodeKeys)
-      ? [...new Set(metadata.sourceNodeKeys.map(String))]
-      : [];
+    const rawSourceKeys = Array.isArray(metadata?.sourceNodeKeys) && metadata.sourceNodeKeys.length > 0
+      ? metadata.sourceNodeKeys
+      : Array.isArray(node.dependencies)
+        ? node.dependencies
+        : [];
+    const sourceNodeKeys = [...new Set(rawSourceKeys.map(String).filter(Boolean))];
     if (sourceNodeKeys.length === 0) return null;
 
     const sourceNodes = sourceNodeKeys.map((key) => byKey.get(key)).filter(Boolean);
@@ -2097,12 +2331,27 @@ export class AdaptiveSwarmOrchestrator {
         allowIsolationFallback, planVersion, status, priority, budgetJson, createdAt, updatedAt
       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`,
     );
+    const parentRuntimePerm = normalizeRuntimePermission(parentPermissionMode || 'auto-safe');
     for (const { spec, selection } of routedSpecs) {
       // Never widen an explicit empty allowlist (`[]`) by injecting `read_swarm_artifact`.
       const defaultToolAllow =
         Array.isArray(selection.profile.toolAllow) && selection.profile.toolAllow.length > 0
           ? [...new Set([...selection.profile.toolAllow, 'read_swarm_artifact'])]
           : selection.profile.toolAllow;
+      const requestedPerm =
+        spec.taskType === 'review'
+          ? 'read-only'
+          : spec.permissionMode
+            ? normalizeRuntimePermission(spec.permissionMode)
+            : parentRuntimePerm;
+      const effectiveNodePerm = intersectPolicies(
+        { permissionMode: parentRuntimePerm },
+        { permissionMode: requestedPerm },
+      ).permissionMode;
+      const isolationMode =
+        spec.taskType === 'review'
+          ? 'shared_readonly'
+          : spec.isolationMode || (spec.isolatedWorktree ? 'worktree' : 'shared_readonly');
       ins.run(
         uuid(),
         runId,
@@ -2116,9 +2365,9 @@ export class AdaptiveSwarmOrchestrator {
         spec.toolAllow !== null && spec.toolAllow !== undefined
           ? JSON.stringify(spec.toolAllow)
           : JSON.stringify(defaultToolAllow),
-        parentPermissionMode,
+        effectiveNodePerm,
         spec.taskType || 'research',
-        spec.isolationMode || 'shared_readonly',
+        isolationMode,
         spec.allowIsolationFallback ? 1 : 0,
         planVersion,
         spec.priority,
@@ -2126,6 +2375,68 @@ export class AdaptiveSwarmOrchestrator {
         now,
         now,
       );
+    }
+  }
+
+  async #publishHandoffsAndDrainInbox(committedNode, runId, uris = []) {
+    if (!committedNode) return;
+    if (typeof this.mailbox?.receive === 'function' && typeof this.mailbox?.ack === 'function') {
+      try {
+        for (let i = 0; i < 16; i += 1) {
+          const extra = await this.mailbox.receive(committedNode.nodeKey, {
+            runId,
+            visibilityTimeoutMs: this.communicationVisibilityTimeoutMs,
+          });
+          if (!extra?.messageId) break;
+          if (extra.kind === 'handoff') {
+            await this.mailbox.ack(
+              extra.messageId,
+              extra.toAgentId || committedNode.nodeKey,
+              extra.deliveryToken,
+            );
+          } else {
+            await this.mailbox.retry?.(
+              extra.messageId,
+              extra.toAgentId || committedNode.nodeKey,
+              { delayMs: 0 },
+            );
+            break;
+          }
+        }
+      } catch {
+        // best-effort post-completion handoff drain
+      }
+    }
+
+    if (typeof this.mailbox?.send === 'function' && this.store?.db?.isOpen) {
+      try {
+        const candidates = this.store.db
+          .prepare('SELECT id, nodeKey, status, dependenciesJson FROM swarm_nodes WHERE runId=?')
+          .all(runId);
+        for (const downstream of candidates) {
+          if (isTerminalNodeState(downstream.status)) continue;
+          const deps = parseJsonSafe(downstream.dependenciesJson, []);
+          if (!Array.isArray(deps) || !deps.includes(committedNode.nodeKey)) continue;
+          await this.mailbox.send({
+            conversationId: `swarm:${runId}`,
+            runId,
+            fromAgentId: committedNode.nodeKey,
+            toAgentId: downstream.nodeKey,
+            kind: 'handoff',
+            idempotencyKey: `swarm:handoff:${runId}:v${Number(committedNode.planVersion || 1)}:${committedNode.nodeKey}:${downstream.nodeKey}`,
+            payload: {
+              fromNodeKey: committedNode.nodeKey,
+              toNodeKey: downstream.nodeKey,
+              status: 'completed',
+              artifactId: committedNode.latestArtifactId ?? null,
+              artifactUris: uris,
+              summary: String(committedNode.resultText || '').slice(0, 800),
+            },
+          });
+        }
+      } catch {
+        // non-fatal handoff publication
+      }
     }
   }
 
