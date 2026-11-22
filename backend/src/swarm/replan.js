@@ -434,7 +434,11 @@ export class DynamicReplanner {
             ? Math.max(1, Math.floor(snapForSplit.remainingSteps / subNodes.length))
             : null;
           for (const sub of subNodes) {
-            const sel = this.router.select({ taskType: sub.taskType, objective: sub.objective });
+            const sel = this.router.select({
+              taskType: sub.taskType,
+              objective: sub.objective,
+              ...(runKnownFailedModels.size > 0 ? { excludeModels: [...runKnownFailedModels] } : {}),
+            });
             const subBudget = { ...baseNodeBudget };
             if (splitBudgetCap !== null) {
               subBudget.maxSteps = subBudget.maxSteps != null

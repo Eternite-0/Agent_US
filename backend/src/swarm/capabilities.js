@@ -188,16 +188,20 @@ export class ModelCapabilityRegistry {
 
     const def = this.pool?.getDefaultModel?.();
     if (def && !this.entries.has(def)) {
-      const anyHealthyAccount =
-        allAccounts.length === 0 || [...accountByPreset.values()].some(Boolean);
-      this.entries.set(
-        def,
-        scoreModelCapabilities(def, {
-          preset: 'pool',
-          profile: { contextWindow: this.pool.getModelContextWindow?.(def) ?? 128000 },
-          healthy: anyHealthyAccount,
-        }),
-      );
+      const hasRoute =
+        typeof this.pool?.resolveRoutes === 'function' && allAccounts.length > 0
+          ? this.pool.resolveRoutes(def).length > 0
+          : allAccounts.length === 0 || [...accountByPreset.values()].some(Boolean);
+      if (hasRoute || this.entries.size === 0) {
+        this.entries.set(
+          def,
+          scoreModelCapabilities(def, {
+            preset: 'pool',
+            profile: { contextWindow: this.pool.getModelContextWindow?.(def) ?? 128000 },
+            healthy: hasRoute,
+          }),
+        );
+      }
     }
 
     return [...this.entries.values()];

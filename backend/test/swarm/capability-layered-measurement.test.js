@@ -195,3 +195,43 @@ test('CapabilityProfileRegistry enforces evaluation binding and low-sample confi
   assert.equal(fullEffective.effective.rankingStatus, 'eligible');
   assert.equal(fullEffective.measured.layered.engineering.fullAcceptanceRate, 1);
 });
+
+test('ModelCapabilityRegistry does not mark a disabled default model healthy when other active models exist', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-us-disabled-def-'));
+  const store = new Store(join(dir, 'engine.sqlite'));
+  try {
+    const pool = new AccountPool(store, { root: dir });
+    const canary = pool.createAccount({
+      preset: 'deepseek',
+      label: 'Canary',
+      endpoint: 'https://api.example.invalid/v1',
+      credential: 'sk-test-canary',
+      models: ['canary-model'],
+    });
+    pool.createAccount({
+      preset: 'custom-openai',
+      label: 'Backup',
+      endpoint: 'https://api.example.invalid/v1',
+      credential: 'sk-test-backup',
+      models: ['backup-model'],
+    });
+    pool.setDefaultModel('canary-model');
+    pool.updateAccount(canary.id, { enabled: false });
+
+    const modelRegistry = new ModelCapabilityRegistry(pool);
+    const entries = modelRegistry.syncFromPool();
+    assert.equal(entries.some((e) => e.model === 'canary-model' && e.healthy === true), false);
+    assert.equal(entries.some((e) => e.model === 'backup-model' && e.healthy === true), true);
+
+    const router = new AdaptiveModelRouter({
+      modelRegistry,
+      agentRegistry: new AgentCapabilityRegistry(),
+      pool,
+    });
+    const picked = router.select({ taskType: 'research', objective: 'inspect files' });
+    assert.equal(picked.model, 'backup-model');
+  } finally {
+    store.close();
+    rmSafe(dir);
+  }
+});
