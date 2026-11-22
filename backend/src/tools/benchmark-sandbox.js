@@ -888,13 +888,16 @@ export class DockerBenchmarkSandbox {
 
   probe() {
     if (this._probeCache) return this._probeCache;
-    const nodeCacheKey = normalizeForComparison(this.nodeExecPath);
-    if (this.probes == null && DEFAULT_NODE_PERMISSION_PROBE_CACHE.has(nodeCacheKey)) {
-      this._probeCache = DEFAULT_NODE_PERMISSION_PROBE_CACHE.get(nodeCacheKey);
-      return this._probeCache;
-    }
     if (this.probes == null && DEFAULT_DOCKER_PROBE_CACHE.has(this.image)) {
       this._probeCache = DEFAULT_DOCKER_PROBE_CACHE.get(this.image);
+      return this._probeCache;
+    }
+
+    if (this.probes && ('available' in this.probes || 'supported' in this.probes)) {
+      this._probeCache = {
+        ...normalizeProbeOutcome(this.probes, 'docker_probe_failed'),
+        image: this.image,
+      };
       return this._probeCache;
     }
 
@@ -1325,6 +1328,16 @@ export class NodePermissionBenchmarkSandbox {
     const nodeCacheKey = normalizeForComparison(this.nodeExecPath);
     if (this.probes == null && DEFAULT_NODE_PERMISSION_PROBE_CACHE.has(nodeCacheKey)) {
       this._probeCache = DEFAULT_NODE_PERMISSION_PROBE_CACHE.get(nodeCacheKey);
+      return this._probeCache;
+    }
+
+    if (this.probes && ('available' in this.probes || 'supported' in this.probes)) {
+      const res = normalizeProbeOutcome(this.probes, 'node_permission_unavailable');
+      this._probeCache = {
+        available: res.available,
+        reason: res.reason,
+        prlimitAvailable: false,
+      };
       return this._probeCache;
     }
 
@@ -1861,49 +1874,44 @@ function validateReadOnlyGitArgv(gitArgs) {
   }
 }
 
+function coerceBackendProbes(val) {
+  if (val === undefined) return null;
+  if (typeof val === 'function') return { isAvailable: val };
+  if (typeof val === 'boolean') return { isAvailable: () => val };
+  if (val && typeof val === 'object') {
+    if ('available' in val || 'supported' in val) {
+      return { isAvailable: () => val };
+    }
+    return { ...val };
+  }
+  return null;
+}
+
+function coerceSubProbe(val) {
+  if (typeof val === 'function') return val;
+  if (val && typeof val === 'object' && ('available' in val || 'supported' in val)) {
+    return () => val;
+  }
+  return () => Boolean(val);
+}
+
 function mergeShorthandProbes(probes) {
   if (!probes || typeof probes !== 'object') {
     return { dockerProbes: null, nodeProbes: null };
   }
-  let dockerProbes = null;
-  if (probes.docker !== undefined) {
-    if (typeof probes.docker === 'function') {
-      dockerProbes = { isAvailable: probes.docker };
-    } else if (typeof probes.docker === 'boolean') {
-      const val = probes.docker;
-      dockerProbes = { isAvailable: () => val };
-    } else if (probes.docker && typeof probes.docker === 'object') {
-      dockerProbes = { ...probes.docker };
-    }
-  }
+  const dockerProbes = coerceBackendProbes(probes.docker);
+  let nodeProbes = coerceBackendProbes(probes.nodePermission);
 
-  let nodeProbes = null;
-  if (probes.nodePermission !== undefined) {
-    if (typeof probes.nodePermission === 'function') {
-      nodeProbes = { isAvailable: probes.nodePermission };
-    } else if (typeof probes.nodePermission === 'boolean') {
-      const val = probes.nodePermission;
-      nodeProbes = { isAvailable: () => val };
-    } else if (probes.nodePermission && typeof probes.nodePermission === 'object') {
-      nodeProbes = { ...probes.nodePermission };
-    }
-  }
   if (probes.permission !== undefined) {
     nodeProbes = {
       ...(nodeProbes || {}),
-      permission:
-        typeof probes.permission === 'function'
-          ? probes.permission
-          : () => Boolean(probes.permission),
+      permission: coerceSubProbe(probes.permission),
     };
   }
   if (probes.prlimit !== undefined) {
     nodeProbes = {
       ...(nodeProbes || {}),
-      prlimit:
-        typeof probes.prlimit === 'function'
-          ? probes.prlimit
-          : () => Boolean(probes.prlimit),
+      prlimit: coerceSubProbe(probes.prlimit),
     };
   }
   return { dockerProbes, nodeProbes };
