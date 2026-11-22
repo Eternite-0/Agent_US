@@ -103,21 +103,47 @@ flowchart TB
 ## Autonomous Software Engineering Workflow
 
 ```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+    nodeSpacing: 20
+    rankSpacing: 24
+    wrappingWidth: 220
+---
 flowchart TB
-    GOAL["User Goal"] --> PLAN["Repository Intelligence → Adaptive Planner<br/>→ Plan Validation"]
-    PLAN --> TEAM["Capability Routing → Dynamic Team Formation"]
-    TEAM --> SWARM["Adaptive Swarm → Parallel Execution"]
-    SWARM --> HANDOFF["Agent Communication · Artifact Handoff"]
-    HANDOFF --> TEST["Testing → Independent Review<br/>→ Evidence Verification"]
-    TEST --> DELIVERY["Delivery"]
-    DELIVERY -.验收结果与经验候选.-> LEARN["Evaluation & Experience Memory"]
-    LEARN -.能力与经验反馈.-> TEAM
-    TEST -.有限重规划.-> PLAN
-    SWARM -.中断或结果未知.-> RECOVERY["Checkpoint Recovery<br/>必要时人工核对"]
-    RECOVERY --> SWARM
-    SWARM -.受控操作.-> APPROVAL["Human Approval"]
-    APPROVAL -->|放行后继续| SWARM
+    accTitle: 自主软件工程流程
+    accDescr: 从用户目标、仓库分析与规划到动态组队，再并行执行、验证并交付。
+
+    subgraph PREP["规划与组队"]
+        direction LR
+        GOAL("<b>用户目标</b><br/>仓库分析") --> PLAN("<b>自适应规划</b><br/>DAG 与计划校验") --> TEAM("<b>动态组队</b><br/>能力与模型路由")
+    end
+
+    subgraph RUN["执行与交付"]
+        direction LR
+        BUILD("<b>Swarm 并行执行</b><br/>Agent 通信与产物交接") --> VERIFY("<b>独立验证</b><br/>测试 · Reviewer · 证据") --> SHIP("<b>交付</b><br/>代码与 Artifact")
+    end
+
+    PREP --> RUN
+
+    classDef planning fill:#eff6ff,stroke:#93b4e8,color:#152f53;
+    classDef execution fill:#ecfdf5,stroke:#7cbca6,color:#143b32;
+    classDef delivery fill:#d1fae5,stroke:#48a688,color:#103d31;
+    class GOAL,PLAN,TEAM planning;
+    class BUILD,VERIFY execution;
+    class SHIP delivery;
+    style PREP fill:transparent,stroke:#94a3b8
+    style RUN fill:transparent,stroke:#94a3b8
+    linkStyle default stroke:#64748b,stroke-width:1.5px
 ```
+
+| 反馈 | 下一步 |
+| --- | --- |
+| 工具调用需要审批 | 放行后继续执行 |
+| 进程中断或副作用结果未知 | 从 Checkpoint 恢复，必要时先人工核对 |
+| 测试、审查或证据检查未通过 | 在预算内重规划，再执行与验证 |
+| 交付后的评测与验证经验 | 为后续任务提供能力画像与经验参考 |
 
 - 通过 `POST /v1/autonomous/runs` 提交目标和工作区信息，运行时生成并验证 DAG。普通会话继续走 `/v1/sessions/:id/turns`。
 - Agent 数量由任务复杂度、独立工作流、能力画像、成本和验证要求共同决定。
