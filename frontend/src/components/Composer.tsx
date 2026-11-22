@@ -9,6 +9,7 @@ import type {
   Project,
 } from '../types/backend';
 import { commandGroups, findSlashCommand, matchesSlashCommand, type CommandAvailability, type MentionExtension, type SlashCommand } from './slashCommands';
+import { ComposerDialog, SketchDialog } from './ComposerDialog';
 import { encodeUtf8Base64 } from '../utils/diff';
 import { isImagePath, toImageDataUrl } from './ImageLightbox';
 import {
@@ -22,6 +23,8 @@ import {
   IconDagNodes,
   IconClose,
   IconFileDoc,
+  IconFileEdit,
+  IconImageInspect,
   IconFolder,
   IconHand,
   IconLaptop,
@@ -122,6 +125,9 @@ export const Composer: React.FC<ComposerProps> = ({
   const [initGitBusy, setInitGitBusy] = useState(false);
   const [menuHighlight, setMenuHighlight] = useState<number | null>(null);
   const [commandError, setCommandError] = useState('');
+  const [dialog, setDialog] = useState<'sketch' | 'files' | 'review' | null>(null);
+  const [reviewBranch, setReviewBranch] = useState('');
+  const canCaptureWindow = Boolean(window.codexDesktop?.captureWindow);
   const [caret, setCaret] = useState(0);
   const [addContextOpen, setAddContextOpen] = useState(false);
   const [menuDismissed, setMenuDismissed] = useState(false);
@@ -174,6 +180,7 @@ ${draftInjection.text}`
     if (cmd === '/goal' && !onSubmitGoal) return '当前连接未提供自主任务';
     if ((isRunning || submitting) && ['/goal', '/compact', '/rewind'].includes(cmd)) return '请等待当前对话执行结束';
     if (cmd === '/stop' && (!isRunning || !onStop)) return '当前没有运行中的对话任务';
+    if (cmd === '/review' && !gitStatus?.available) return '当前工作区不是 Git 仓库';
     if (cmd === '/branch' && !gitStatus?.available) return '当前项目没有 Git 状态';
     if (cmd === '/folder' && !searchMentionFiles) return '当前连接未提供工作区文件夹搜索';
     if (cmd === '/file' && !searchMentionFiles && !mentionFiles.length) return '当前连接未提供工作区文件搜索';
@@ -200,7 +207,7 @@ ${draftInjection.text}`
   const mentionQuery = mentionToken?.query;
   const scope = mentionToken?.scope;
   const entryKind: WorkspaceEntryKind = scope === 'file' || scope === 'folder' ? scope : 'all';
-  const canSearchFiles = Boolean(mentionToken && scope !== 'skill' && scope !== 'plugin');
+  const canSearchFiles = Boolean(mentionToken && (scope === 'file' || scope === 'folder' || (!scope && mentionQuery)));
   const workspaceResults = searchResult?.query === mentionQuery && searchResult?.kind === entryKind ? searchResult : null;
 
   useEffect(() => {
@@ -221,7 +228,7 @@ ${draftInjection.text}`
     };
   }, [mentionQuery, searchMentionFiles, canSearchFiles, entryKind]);
 
-  type MentionItem = { id: string; label: string; description?: string; icon: typeof IconFileDoc; iconUrl?: string; kind?: 'skill' | 'plugin'; action?: 'attach' | 'goal' | 'plan' | 'file' | 'folder' | 'plugins' | 'skills' };
+  type MentionItem = { id: string; label: string; description?: string; icon: typeof IconFileDoc; iconUrl?: string; color?: string; kind?: 'skill' | 'plugin'; disabled?: boolean; action?: 'files' | 'snapshot' | 'sketch' | 'goal' | 'plan' | 'plugin-details' | 'plugins' | 'skills' };
   const mentionGroups = useMemo<Array<{ label: string; items: MentionItem[] }>>(() => {
     if (!mentionToken) return [];
     const query = mentionToken.query.toLowerCase().replaceAll('\\', '/');
@@ -230,20 +237,21 @@ ${draftInjection.text}`
     const workFiles = searchMentionFiles ? workspaceResults?.files ?? [] : mentionFiles;
     const choices: Array<{ label: string; items: MentionItem[] }> = [];
     const addActions: MentionItem[] = [
-      { id: 'file', label: '工作区文件', description: '搜索并引用项目中的文件', icon: IconFileDoc, action: 'file' },
-      { id: 'folder', label: '工作区文件夹', description: '引用项目中的目录', icon: IconFolder, action: 'folder' },
-      { id: 'attach', label: '上传文件', description: '从设备选择附件', icon: IconPlus, action: 'attach' },
-      { id: 'goal', label: '目标', description: '将草稿设为自主任务的目标', icon: IconSparkle, action: 'goal' },
-      { id: 'plan', label: '计划模式', description: '先规划，再按审批执行', icon: IconDagNodes, action: 'plan' },
+      { id: 'files', label: '文件和文件夹', icon: IconFolder, action: 'files' },
+      { id: 'snapshot', label: '附加应用快照', description: canCaptureWindow ? '截取当前 Agent_US 窗口' : '在桌面版可用', icon: IconImageInspect, action: 'snapshot', disabled: !canCaptureWindow },
+      { id: 'goal', label: '目标', description: onSubmitGoal ? '设置要持续追求的目标' : '当前连接未提供自主任务', icon: IconSparkle, action: 'goal', disabled: !onSubmitGoal },
+      { id: 'plan', label: '计划模式', description: codexMode === 'Work' ? '退出计划模式' : '先制定计划，再审批执行', icon: IconDagNodes, action: 'plan', disabled: !onSlashCommand },
+      { id: 'sketch', label: '绘图', description: '绘制草图并附加到消息', icon: IconFileEdit, action: 'sketch' },
     ];
-    if (!mentionToken.scope) choices.push({ label: '添加', items: addActions.filter((item) => item.action !== 'goal' || onSubmitGoal) });
-    if (!mentionToken.scope || mentionToken.scope === 'plugin') choices.push({ label: '插件', items: mentionPlugins.map(({ id, name, description, iconUrl }) => (
-      { id, label: name, description, icon: IconPuzzle, iconUrl, kind: 'plugin' }
+    if (!mentionToken.scope) choices.push({ label: '添加', items: addActions });
+    if (!mentionToken.scope || mentionToken.scope === 'plugin') choices.push({ label: '插件', items: mentionPlugins.map(({ id, name, description, iconUrl, color, installed }) => (
+      { id, label: name, description: installed === false ? `${description} · 待安装` : description,
+        icon: color ? IconFileDoc : IconPuzzle, iconUrl, color, kind: 'plugin', action: installed === false ? 'plugin-details' : undefined }
     )) });
     if (!mentionToken.scope || mentionToken.scope === 'skill') choices.push({ label: '技能', items: mentionSkills.map(({ id, name, description }) => (
       { id, label: name, description, icon: IconSkillsNode, kind: 'skill' }
     )) });
-    if (!query && !mentionPlugins.length && (!mentionToken.scope || mentionToken.scope === 'plugin')) {
+    if (!query && (!mentionToken.scope || mentionToken.scope === 'plugin')) {
       choices.find(({ label }) => label === '插件')?.items.push({ id: 'manage-plugins', label: '浏览插件', icon: IconPuzzle, action: 'plugins' });
     }
     if (!query && !mentionSkills.length && (!mentionToken.scope || mentionToken.scope === 'skill')) {
@@ -257,7 +265,7 @@ ${draftInjection.text}`
       })) });
     }
     return choices.map(({ label, items }) => ({ label, items: items.filter(matches).slice(0, 20) })).filter(({ items }) => items.length);
-  }, [mentionToken, files, mentionFiles, mentionPlugins, mentionSkills, canSearchFiles, entryKind, workspaceResults, searchMentionFiles, onSubmitGoal]);
+  }, [mentionToken, files, mentionFiles, mentionPlugins, mentionSkills, canSearchFiles, entryKind, workspaceResults, searchMentionFiles, onSubmitGoal, canCaptureWindow, codexMode, onSlashCommand]);
   const mentionItems = mentionGroups.flatMap(({ items }) => items);
 
   const menuCount = slashMatches.length || mentionItems.length;
@@ -297,7 +305,7 @@ ${draftInjection.text}`
   const attachFileList = async (list: FileList | File[]) => {
     const arr = Array.from(list).slice(0, 12);
     if (!arr.length) return;
-    const next = { ...files };
+    const next: Record<string, string> = {};
     for (const f of arr) {
       try {
         const isImg = f.type.startsWith('image/') || isImagePath(f.name);
@@ -320,10 +328,10 @@ ${draftInjection.text}`
           next[safeName] = encodeUtf8Base64(content.slice(0, 60000));
         }
       } catch {
-        // skip unreadable file
+        setCommandError(`无法读取附件 ${f.name}`);
       }
     }
-    setFiles(next);
+    setFiles((previous) => ({ ...previous, ...next }));
   };
 
   const placeCaret = (position: number) => {
@@ -344,7 +352,7 @@ ${draftInjection.text}`
     setCommandError('');
     setAddContextOpen(false);
     const { cmd } = command;
-    const insertion = cmd === '/goal' ? '/goal ' : cmd === '/file' ? '@file:' : cmd === '/folder' ? '@folder:' : cmd === '/help' ? '/' : cmd === '/review' ? '请审查当前工作区未提交的变更，按严重程度列出问题，并给出文件和行号。' : '';
+    const insertion = cmd === '/goal' ? '/goal ' : cmd === '/file' ? '@file:' : cmd === '/folder' ? '@folder:' : cmd === '/help' ? '/' : '';
     setMenuDismissed(Boolean(insertion === '/goal '));
     setText(insertion);
     setCaret(insertion.length);
@@ -358,6 +366,11 @@ ${draftInjection.text}`
       setPopover(command.popover);
     } else if (cmd === '/attach') {
       fileInputRef.current?.click();
+    } else if (cmd === '/review') {
+      setReviewBranch('');
+      setDialog('review');
+    } else if (cmd === '/sketch') {
+      setDialog('sketch');
     } else if (cmd === '/clear') {
       setFiles({});
     } else if (cmd === '/stop') {
@@ -368,25 +381,30 @@ ${draftInjection.text}`
   };
 
   const insertMention = (item: (typeof mentionItems)[number]) => {
-    if (!mentionToken) return;
+    if (!mentionToken || item.disabled) return;
+    setCommandError('');
     const before = text.slice(0, mentionToken.start);
     const rest = text.slice(mentionToken.end);
     setAddContextOpen(false);
     setMenuDismissed(true);
-    if (item.action === 'file' || item.action === 'folder') {
-      const query = `@${item.action}:`;
-      setText(before + query + rest);
-      setMenuDismissed(false);
-      placeCaret(before.length + query.length);
-    } else if (item.action === 'goal') {
+    if (item.action === 'goal') {
       const next = `/goal ${(before + rest).trim().replace(/^\/goal\s+/i, '')}`;
       setText(next);
       placeCaret(next.length);
     } else if (item.action) {
       setText(before + rest);
       placeCaret(before.length);
-      if (item.action === 'attach') fileInputRef.current?.click();
-      else {
+      if (item.action === 'files') setDialog('files');
+      else if (item.action === 'sketch') setDialog('sketch');
+      else if (item.action === 'plugin-details') {
+        onSlashCommand?.({ cmd: '/plugins', desc: '', icon: IconPuzzle, view: { kind: 'capabilities', pluginId: item.id } });
+      }
+      else if (item.action === 'snapshot') {
+        void window.codexDesktop?.captureWindow?.().then((image) => {
+          if (image) setFiles((previous) => ({ ...previous, [`snapshot-${Date.now()}.png`]: image }));
+          else setCommandError('当前窗口无法截取快照。');
+        }).catch(() => setCommandError('无法截取当前应用窗口。'));
+      } else {
         const command = findSlashCommand('/' + item.action);
         if (command) onSlashCommand?.(command);
       }
@@ -398,6 +416,30 @@ ${draftInjection.text}`
     }
   };
 
+  const closeDialog = () => {
+    setDialog(null);
+    placeCaret(caret);
+  };
+
+  const openWorkspacePicker = (scope: 'file' | 'folder') => {
+    const token = `@${scope}:`;
+    const start = caret > 0 && !/\s/.test(text[caret - 1]) ? ` ${token}` : token;
+    setText(text.slice(0, caret) + start + text.slice(caret));
+    setMenuDismissed(false);
+    setDialog(null);
+    placeCaret(caret + start.length);
+  };
+
+  const applyReview = () => {
+    const scope = reviewBranch
+      ? `请对比当前工作区与本地 Git 分支 ${JSON.stringify(reviewBranch)} 的差异。`
+      : '请审查当前工作区的未提交变更，包括暂存区与工作区。';
+    const draft = `${scope} 按严重程度列出发现，给出文件与行号。仅执行审查，请勿改动文件。`;
+    setText(draft);
+    setDialog(null);
+    placeCaret(draft.length);
+  };
+
   const handleSend = async () => {
     const trimmed = text.trim();
     if (!trimmed || submitting) return;
@@ -407,7 +449,7 @@ ${draftInjection.text}`
     }
     const [word] = trimmed.split(/\s/, 1);
     const command = onSlashCommand ? findSlashCommand(word) : undefined;
-    if (command) {
+    if (command && !(command.cmd === '/plan' && trimmed.length > word.length)) {
       const blocked = commandBlock(command);
       if (blocked) {
         setCommandError(blocked);
@@ -433,7 +475,8 @@ ${draftInjection.text}`
     setCaret(0);
     setFiles({});
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    await onSubmit(trimmed, attached);
+    const input = codexMode === 'Work' && !/^\/plan\s/.test(trimmed) ? `/plan ${trimmed}` : trimmed;
+    await onSubmit(input, attached);
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -766,40 +809,46 @@ ${draftInjection.text}`
         <div className="codex-slash-menu" ref={menuRef}>
           <div className="composer-picker-heading" aria-hidden="true">
             {slashQuery !== null ? '快捷命令' : '添加上下文'}
-            <span>↑ ↓ 选择 · ↵ 确认 · Esc 关闭</span>
+            <span className="composer-picker-keys"><kbd>↑</kbd><kbd>↓</kbd><kbd>↵</kbd><kbd>Esc</kbd></span>
           </div>
           <div id={menuId} className="composer-picker-options" role="listbox" aria-label={slashQuery !== null ? '快捷命令' : '添加上下文'}>
             {slashGroups.map(({ label, commands }) => (
-              <div key={label} role="group" aria-label={label} className="composer-command-group">
-                <div className="composer-command-label" aria-hidden="true">{label}</div>
+              <div key={label} role="group" aria-label={label || '常用命令'} className="composer-command-group">
+                {label && <div className="composer-command-label" aria-hidden="true">{label}</div>}
                 {commands.map((item) => {
                   const index = slashMatches.indexOf(item);
                   const blocked = commandBlock(item);
                   return <button key={item.cmd} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
-                    aria-disabled={Boolean(blocked)} aria-selected={index === selectedIndex}
+                    aria-label={`${item.cmd} ${item.title ?? ''} ${blocked || item.desc}`} aria-disabled={Boolean(blocked)} aria-selected={index === selectedIndex}
                     data-selected={index === selectedIndex ? 'true' : undefined}
                     className="codex-popover-item composer-picker-row composer-command-row"
                     onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
                     onClick={() => executeSlash(item)}>
                     <item.icon size={15} aria-hidden="true" />
-                    <span className="composer-command-text"><strong>{item.cmd}</strong><small>{blocked || item.desc}</small></span>
+                    <span className="composer-command-text">
+                      <strong>{item.title ?? item.cmd}</strong>
+                      <small>{blocked || (item.cmd === '/effort' ? effortMeta.label : item.cmd === '/model' ? displayModel : item.desc)}</small>
+                    </span>
+                    {item.title && <small className="composer-command-alias" aria-hidden="true">{item.cmd}</small>}
+                    {(item.opensOptions || item.popover) && <IconChevronRight size={13} aria-hidden="true" />}
                   </button>;
                 })}
               </div>
             ))}
             {mentionGroups.map(({ label, items }) => (
               <div key={label} role="group" aria-label={label} className="composer-command-group">
-                <div className="composer-command-label" aria-hidden="true">{label}</div>
+                {label !== '添加' && <div className="composer-command-label" aria-hidden="true">{label}</div>}
                 {items.map((item) => {
                   const index = mentionItems.indexOf(item);
                   return <button key={item.id} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
                     aria-label={item.description ? `${item.label} ${item.description}` : item.label}
-                    aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
+                    aria-disabled={item.disabled || undefined} aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
                     className="codex-popover-item composer-picker-row composer-command-row"
                     onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
                     onClick={() => insertMention(item)}>
-                    {item.iconUrl ? <img className="composer-plugin-icon" src={item.iconUrl} alt="" /> : <item.icon size={15} aria-hidden="true" />}
+                    {item.iconUrl ? <img className="composer-plugin-icon" src={item.iconUrl} alt="" /> : <item.icon size={15} aria-hidden="true" style={item.color ? { color: item.color } : undefined} />}
                     <span className="composer-command-text"><strong title={item.label}>{item.label}</strong>{item.description && <small title={item.description}>{item.description}</small>}</span>
+                    {item.action === 'files' && <IconChevronRight size={13} aria-hidden="true" />}
                   </button>;
                 })}
               </div>
@@ -810,167 +859,6 @@ ${draftInjection.text}`
           {canSearchFiles && workspaceResults?.failed && <div className="composer-picker-state" role="status">工作区文件搜索失败。</div>}
           {mentionToken && !mentionItems.length && (!canSearchFiles || !searchMentionFiles || workspaceResults && !workspaceResults.failed) &&
             <div className="composer-picker-state">没有匹配的{mentionToken.scope === 'file' ? '文件' : '引用'}。</div>}
-        </div>
-      )}
-
-      {/* Stacked Context Tray (1:1 with User Screenshots 1 & 2) */}
-      {showHomeTray && (
-        <div className="codex-composer-tray">
-          <div
-            className="codex-project-pill-wrap"
-            data-open={popover === 'project' ? 'true' : undefined}
-          >
-            <div className="codex-pill-tooltip">更改此聊天的项目</div>
-            <div
-              role="button"
-              tabIndex={0}
-              className="codex-project-pill"
-              data-open={popover === 'project' ? 'true' : undefined}
-              data-has-project={selectedProject ? 'true' : undefined}
-              onClick={() => {
-                setProjectSearch('');
-                setPopover((p) => (p === 'project' ? null : 'project'));
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  setProjectSearch('');
-                  setPopover((p) => (p === 'project' ? null : 'project'));
-                }
-              }}
-            >
-              <span className="codex-project-icon-slot">
-                <span className="codex-project-icon-folder">
-                  <IconFolder size={14} />
-                </span>
-                {selectedProject && (
-                  <button
-                    type="button"
-                    className="codex-project-clear-btn"
-                    aria-label="不在项目中工作"
-                    title="移除项目"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectProject(null);
-                      setPopover(null);
-                    }}
-                  >
-                    <IconCircleClose size={14} />
-                  </button>
-                )}
-              </span>
-              <span>{selectedProject?.name || '选择项目'}</span>
-            </div>
-
-            {popover === 'project' && (
-              <div
-                className="codex-popover codex-project-popover"
-                data-side="top"
-                style={{ left: 0 }}
-              >
-                <div className="codex-project-popover-search">
-                  <IconSearch size={14} style={{ flex: 'none' }} />
-                  <input
-                    autoFocus
-                    placeholder="搜索项目"
-                    value={projectSearch}
-                    onChange={(e) => setProjectSearch(e.target.value)}
-                  />
-                </div>
-                <div className="codex-project-popover-list">
-                  {filteredProjects.map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      className="codex-popover-item"
-                      data-selected={selectedProject?.id === p.id ? 'true' : undefined}
-                      onClick={() => {
-                        onSelectProject(p.id);
-                        setPopover(null);
-                      }}
-                    >
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                        <IconFolder size={14} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {p.name}
-                        </span>
-                      </span>
-                      {selectedProject?.id === p.id && <IconCheck size={14} />}
-                    </button>
-                  ))}
-                  {!filteredProjects.length && (
-                    <div
-                      style={{
-                        padding: '10px 10px',
-                        fontSize: 12.5,
-                        color: 'var(--text-tertiary)',
-                        textAlign: 'center',
-                      }}
-                    >
-                      未找到匹配项目
-                    </div>
-                  )}
-                </div>
-                <div className="codex-project-popover-footer">
-                  {onOpenCreateProject && (
-                    <button
-                      type="button"
-                      className="codex-popover-item"
-                      onClick={() => {
-                        setPopover(null);
-                        onOpenCreateProject();
-                      }}
-                    >
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                        <IconPlus size={14} />
-                        <span>新建项目</span>
-                      </span>
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="codex-popover-item"
-                    style={{ color: 'var(--text-secondary)' }}
-                    onClick={() => {
-                      onSelectProject(null);
-                      setPopover(null);
-                    }}
-                  >
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                      <IconClose size={14} />
-                      <span>不在项目中工作</span>
-                    </span>
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {hasGitRepo && (
-            <div style={{ position: 'relative' }}>
-              <button
-                type="button"
-                className="codex-tray-item"
-                onClick={() => setPopover((p) => (p === 'env' ? null : 'env'))}
-              >
-                <IconLaptop size={14} />
-                <span>本地</span>
-              </button>
-
-              {popover === 'env' && (
-                <div className="codex-popover" data-side="top" style={{ left: 0, width: 268, padding: 10 }}>
-                  <div style={{ fontSize: 12.5, fontWeight: 500, marginBottom: 6 }}>
-                    Worker 隔离容器
-                  </div>
-                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: '18px' }}>
-                    每次写入/命令调用均在独立无网络 Docker 容器（<code>--network=none</code>、非 root、私有 tmpfs）中执行，并记录不可变退出码与 Diff 证据。
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {renderBranchBadge(false)}
         </div>
       )}
 
@@ -997,6 +885,167 @@ ${draftInjection.text}`
       >
         {dragging && <div className="codex-drop-overlay">松开即可附加文件到工作区</div>}
 
+        {/* Workspace context controls */}
+        {showHomeTray && (
+          <div className="codex-composer-tray">
+            <div
+              className="codex-project-pill-wrap"
+              data-open={popover === 'project' ? 'true' : undefined}
+            >
+              <div className="codex-pill-tooltip">更改此聊天的项目</div>
+              <div
+                role="button"
+                tabIndex={0}
+                className="codex-project-pill"
+                data-open={popover === 'project' ? 'true' : undefined}
+                data-has-project={selectedProject ? 'true' : undefined}
+                onClick={() => {
+                  setProjectSearch('');
+                  setPopover((p) => (p === 'project' ? null : 'project'));
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setProjectSearch('');
+                    setPopover((p) => (p === 'project' ? null : 'project'));
+                  }
+                }}
+              >
+                <span className="codex-project-icon-slot">
+                  <span className="codex-project-icon-folder">
+                    <IconFolder size={14} />
+                  </span>
+                  {selectedProject && (
+                    <button
+                      type="button"
+                      className="codex-project-clear-btn"
+                      aria-label="不在项目中工作"
+                      title="移除项目"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectProject(null);
+                        setPopover(null);
+                      }}
+                    >
+                      <IconCircleClose size={14} />
+                    </button>
+                  )}
+                </span>
+                <span>{selectedProject?.name || '选择项目'}</span>
+              </div>
+
+              {popover === 'project' && (
+                <div
+                  className="codex-popover codex-project-popover"
+                  data-side="top"
+                  style={{ left: 0 }}
+                >
+                  <div className="codex-project-popover-search">
+                    <IconSearch size={14} style={{ flex: 'none' }} />
+                    <input
+                      autoFocus
+                      placeholder="搜索项目"
+                      value={projectSearch}
+                      onChange={(e) => setProjectSearch(e.target.value)}
+                    />
+                  </div>
+                  <div className="codex-project-popover-list">
+                    {filteredProjects.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        className="codex-popover-item"
+                        data-selected={selectedProject?.id === p.id ? 'true' : undefined}
+                        onClick={() => {
+                          onSelectProject(p.id);
+                          setPopover(null);
+                        }}
+                      >
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                          <IconFolder size={14} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {p.name}
+                          </span>
+                        </span>
+                        {selectedProject?.id === p.id && <IconCheck size={14} />}
+                      </button>
+                    ))}
+                    {!filteredProjects.length && (
+                      <div
+                        style={{
+                          padding: '10px 10px',
+                          fontSize: 12.5,
+                          color: 'var(--text-tertiary)',
+                          textAlign: 'center',
+                        }}
+                      >
+                        未找到匹配项目
+                      </div>
+                    )}
+                  </div>
+                  <div className="codex-project-popover-footer">
+                    {onOpenCreateProject && (
+                      <button
+                        type="button"
+                        className="codex-popover-item"
+                        onClick={() => {
+                          setPopover(null);
+                          onOpenCreateProject();
+                        }}
+                      >
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                          <IconPlus size={14} />
+                          <span>新建项目</span>
+                        </span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="codex-popover-item"
+                      style={{ color: 'var(--text-secondary)' }}
+                      onClick={() => {
+                        onSelectProject(null);
+                        setPopover(null);
+                      }}
+                    >
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        <IconClose size={14} />
+                        <span>不在项目中工作</span>
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {hasGitRepo && (
+              <div style={{ position: 'relative' }}>
+                <button
+                  type="button"
+                  className="codex-tray-item"
+                  onClick={() => setPopover((p) => (p === 'env' ? null : 'env'))}
+                >
+                  <IconLaptop size={14} />
+                  <span>本地</span>
+                </button>
+
+                {popover === 'env' && (
+                  <div className="codex-popover" data-side="top" style={{ left: 0, width: 268, padding: 10 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 500, marginBottom: 6 }}>
+                      Worker 隔离容器
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: '18px' }}>
+                      每次写入/命令调用均在独立无网络 Docker 容器（<code>--network=none</code>、非 root、私有 tmpfs）中执行，并记录不可变退出码与 Diff 证据。
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {renderBranchBadge(false)}
+          </div>
+        )}
+
         <input
           ref={fileInputRef}
           type="file"
@@ -1013,18 +1062,12 @@ ${draftInjection.text}`
             {attachedKeys.map((name) => {
               const imgUrl = isImagePath(name) ? toImageDataUrl(name, files[name]) : null;
               return (
-                <span key={name} className="codex-attach-chip">
+                <span key={name} className="codex-attach-chip" data-image={imgUrl ? 'true' : undefined}>
                   {imgUrl ? (
                     <img
                       src={imgUrl}
                       alt={name}
-                      style={{
-                        width: 18,
-                        height: 18,
-                        borderRadius: 4,
-                        objectFit: 'cover',
-                        flex: 'none',
-                      }}
+                      className="composer-image-preview"
                     />
                   ) : (
                     <IconFileDoc size={13} style={{ color: 'var(--text-tertiary)' }} />
@@ -1095,6 +1138,13 @@ ${draftInjection.text}`
               <IconPlus size={16} />
             </button>
 
+            {codexMode === 'Work' && onSlashCommand && (
+              <button type="button" className="codex-composer-pill composer-active-plan" aria-label="关闭计划模式"
+                title="关闭计划模式" aria-pressed="true" onClick={() => {
+                  const command = findSlashCommand('/plan');
+                  if (command) onSlashCommand(command);
+                }}><IconDagNodes size={14} /><span>计划模式</span></button>
+            )}
             <div style={{ position: 'relative' }}>
               <button
                 type="button"
@@ -1406,6 +1456,33 @@ ${draftInjection.text}`
           </div>
         </div>
       </div>
+      {dialog === 'sketch' && <SketchDialog onClose={closeDialog} onAttach={(image) => {
+        void attachFileList([new File([image], `sketch-${Date.now()}.png`, { type: 'image/png' })]);
+        closeDialog();
+      }} />}
+      {dialog === 'files' && <ComposerDialog title="文件和文件夹" onClose={closeDialog}>
+        <button type="button" className="composer-dialog-option" onClick={() => {
+          closeDialog();
+          fileInputRef.current?.click();
+        }}><IconPlus />从设备上传文件</button>
+        <button type="button" className="composer-dialog-option" disabled={!searchMentionFiles && !mentionFiles.length}
+          onClick={() => openWorkspacePicker('file')}><IconFileDoc />引用工作区文件</button>
+        <button type="button" className="composer-dialog-option" disabled={!searchMentionFiles}
+          onClick={() => openWorkspacePicker('folder')}><IconFolder />引用工作区文件夹</button>
+      </ComposerDialog>}
+      {dialog === 'review' && <ComposerDialog title="代码审查" onClose={closeDialog}>
+        <label className="composer-dialog-field">审查范围
+          <select className="codex-select" value={reviewBranch} onChange={(event) => setReviewBranch(event.currentTarget.value)}>
+            <option value="">未提交的变更</option>
+            {gitStatus?.branches?.filter((branch) => branch !== gitStatus.branch).map((branch) => (
+              <option key={branch} value={branch}>与 {branch} 对比</option>
+            ))}
+          </select>
+        </label>
+        <div className="composer-dialog-actions">
+          <button type="button" className="codex-toolbar-btn" data-variant="primary" onClick={applyReview}>填入审查请求</button>
+        </div>
+      </ComposerDialog>}
     </div>
   );
 };

@@ -6,6 +6,7 @@ export interface CodexDesktopBridge {
   close: () => Promise<void>;
   isMaximized: () => Promise<boolean>;
   onMaximizedChange: (cb: (maximized: boolean) => void) => () => void;
+  captureWindow?: () => Promise<string | null>;
   pickDirectory: () => Promise<{ path: string; name: string } | null>;
 }
 

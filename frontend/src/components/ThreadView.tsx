@@ -269,6 +269,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   const [selectionOverlay, setSelectionOverlay] = useState<SelectionOverlay | null>(null);
 
   // Composer draft injection (Quote-to-Reply or Edit & Resend)
+  const [companionVisible, setCompanionVisible] = useState(true);
   const [draftInjection, setDraftInjection] = useState<{
     id: number;
     text: string;
@@ -1099,7 +1100,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       )}
 
       {/* Floating Top-Right "Agent" Companion Card (1:1 with User Screenshots 1 & 2, shown when right split pane is closed) */}
-      {!inspectorOpen && (
+      {!inspectorOpen && companionVisible && (
         <AgentCompanionCard
           workers={allWorkers}
           diffs={allDiffs}
@@ -2052,7 +2053,12 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
           onRefreshGitStatus={onRefreshGitStatus}
           onCheckoutGitBranch={onCheckoutGitBranch}
           onInitGitRepo={onInitGitRepo}
-          onSlashCommand={onSlashCommand}
+          onSlashCommand={(command) => {
+            if (command.cmd === '/companion') {
+              if (inspectorOpen) onToggleInspector();
+              setCompanionVisible(inspectorOpen || !companionVisible);
+            } else onSlashCommand(command);
+          }}
           commandAvailability={commandAvailability}
           searchMentionFiles={searchMentionFiles}
           onSubmitGoal={onSubmitGoal}

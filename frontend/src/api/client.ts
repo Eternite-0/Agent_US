@@ -106,6 +106,7 @@ export interface AgentBackendClient {
   createProject(name: string): Promise<Project>;
   renameProject(id: string, name: string, version: number): Promise<Project>;
   listTasks(params?: ListTasksOptions): Promise<Task[]>;
+  forkTask?: (id: string, workspaceMode: 'same-workspace' | 'new-worktree') => Promise<Task>;
   setTaskArchived(id: string, archived: boolean): Promise<Task>;
   getTask(id: string): Promise<Task>;
   submitTask(submission: Submission): Promise<Task>;
@@ -233,9 +234,9 @@ export interface AgentBackendClient {
   listModels(): Promise<ModelSpec[]>;
   listProviders(): Promise<ProviderDirectory>;
   providersHealth(): Promise<ProvidersHealth>;
-  getGitStatus?: () => Promise<GitStatus>;
-  checkoutGitBranch?: (branch: string, create?: boolean) => Promise<GitStatus>;
-  initGitRepo?: (initialBranch?: string) => Promise<GitStatus>;
+  getGitStatus?: (sessionId?: string) => Promise<GitStatus>;
+  checkoutGitBranch?: (branch: string, create?: boolean, sessionId?: string) => Promise<GitStatus>;
+  initGitRepo?: (initialBranch?: string, sessionId?: string) => Promise<GitStatus>;
   // Account Pool
   providerPresets?: () => Promise<ProviderPresetCatalog>;
   listAccounts?: (params?: {
@@ -792,6 +793,13 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.taskFromSession(session, null);
   }
 
+  async forkTask(id: string, workspaceMode: 'same-workspace' | 'new-worktree'): Promise<Task> {
+    const session = await this.req<Record<string, unknown>>('POST', `/v1/sessions/${encodeURIComponent(id)}/fork`, {
+      body: { workspaceMode },
+    });
+    return this.taskFromSession(session, null);
+  }
+
   async getTask(id: string): Promise<Task> {
     const [session, turns] = await Promise.all([
       this.req<Record<string, unknown>>('GET', `/v1/sessions/${encodeURIComponent(id)}`),
@@ -1117,16 +1125,16 @@ export class LiveBackendClient implements AgentBackendClient {
     return { routerReady: data.routerReady, items: data.items ?? [], providers: data.providers };
   }
 
-  getGitStatus(): Promise<GitStatus> {
-    return this.req('GET', '/v1/git/status');
+  getGitStatus(sessionId?: string): Promise<GitStatus> {
+    return this.req('GET', '/v1/git/status', { query: { sessionId } });
   }
 
-  checkoutGitBranch(branch: string, create = false): Promise<GitStatus> {
-    return this.req('POST', '/v1/git/checkout', { body: { branch, create } });
+  checkoutGitBranch(branch: string, create = false, sessionId?: string): Promise<GitStatus> {
+    return this.req('POST', '/v1/git/checkout', { body: { branch, create, sessionId } });
   }
 
-  initGitRepo(initialBranch = 'main'): Promise<GitStatus> {
-    return this.req('POST', '/v1/git/init', { body: { initialBranch } });
+  initGitRepo(initialBranch = 'main', sessionId?: string): Promise<GitStatus> {
+    return this.req('POST', '/v1/git/init', { body: { initialBranch, sessionId } });
   }
 
   // ---- Account Pool ----

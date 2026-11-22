@@ -10,6 +10,7 @@ import {
   type MarketplacePlugin,
   type MarketplaceSkill,
 } from './components/CapabilitiesView';
+import { ComposerDialog } from './components/ComposerDialog';
 import { CreateProjectModal } from './components/CreateProjectModal';
 import { EvaluationView } from './components/EvaluationView';
 import { McpStatusPanel } from './components/McpStatusPanel';
@@ -61,6 +62,8 @@ function parseHash(): AppView {
   const threadMatch = hash.match(/^\/t\/([^/?]+)/);
   if (threadMatch) return { kind: 'thread', taskId: decodeURIComponent(threadMatch[1]) };
   if (hash.startsWith('/tasks')) return { kind: 'tasks' };
+  const pluginMatch = hash.match(/^\/capabilities\/plugins\/([a-zA-Z0-9_-]+)$/);
+  if (pluginMatch) return { kind: 'capabilities', pluginId: pluginMatch[1] };
   const capabilitySection = hash.match(/^\/capabilities(?:\/(mcp|skills))?$/)?.[1];
   if (hash.startsWith('/capabilities')) return { kind: 'capabilities', section: capabilitySection === 'mcp' || capabilitySection === 'skills' ? capabilitySection : undefined };
   if (hash.startsWith('/evaluations')) return { kind: 'evaluations' };
@@ -78,6 +81,7 @@ function viewToHash(v: AppView): string {
     case 'tasks':
       return '#/tasks';
     case 'capabilities':
+      if (v.pluginId) return `#/capabilities/plugins/${encodeURIComponent(v.pluginId)}`;
       return v.section ? `#/capabilities/${v.section}` : '#/capabilities';
     case 'evaluations':
       return '#/evaluations';
@@ -111,6 +115,7 @@ export const App: React.FC = () => {
     index: 0,
   }));
   const view = nav.stack[nav.index] ?? { kind: 'home' };
+  const gitSessionId = view.kind === 'thread' ? view.taskId : undefined;
 
   const navigate = useCallback((next: AppView) => {
     setNav((prev) => {
@@ -196,6 +201,10 @@ export const App: React.FC = () => {
   const [installedPluginIds, setInstalledPluginIds] = useState<string[]>([]);
   const [pluginTokens, setPluginTokens] = useState<Record<string, string>>({});
   const [skills, setSkills] = useState<MarketplaceSkill[]>(INITIAL_SKILLS);
+  const [forkSource, setForkSource] = useState<string | null>(null);
+  const [forkPending, setForkPending] = useState(false);
+  const [feedbackDraft, setFeedbackDraft] = useState<string | null>(null);
+  const sideProject = new URLSearchParams(window.location.search).get('side-project');
   const [homeDraft, setHomeDraft] = useState<{
     id: number;
     text: string;
@@ -203,7 +212,7 @@ export const App: React.FC = () => {
   } | null>(null);
 
   // Composer preferences
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(sideProject?.startsWith('project:') ? sideProject.slice(8) : null);
   const [workedOutsideProject, setWorkedOutsideProject] = useState(false);
   const [selectedModel, setSelectedModel] = useState('');
   const [effort, setEffort] = useState<EffortLevel>('xhigh');
@@ -211,7 +220,8 @@ export const App: React.FC = () => {
   const [workspaceRoot, setWorkspaceRoot] = useState('');
   const [liveStreams, setLiveStreams] = useState<Record<string, { text: string; reasoning: string }>>({});
   const [liveToolOutputs, setLiveToolOutputs] = useState<Record<string, { callId: string; name: string; text: string }>>({});
-  const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
+  const [gitState, setGitState] = useState<{ sessionId?: string; status: GitStatus } | null>(null);
+  const gitStatus = gitState?.sessionId === gitSessionId ? gitState?.status ?? null : null;
 
   // Domain Data
   const [projects, setProjects] = useState<Project[]>([]);
@@ -322,7 +332,7 @@ export const App: React.FC = () => {
         const archiveVersion = archiveGeneration.current;
         setBackendHealthy(health.ok ?? health.status === "ok");
         if (health.workspaceRoot) setWorkspaceRoot(health.workspaceRoot);
-        const [projList, taskList, apprList, modelList, pHealth, memList, usgList, evList, currentGitStatus, schedList] =
+        const [projList, taskList, apprList, modelList, pHealth, memList, usgList, evList, schedList] =
           await Promise.all([
             client.listProjects(),
             client.listTasks({ archived: false }),
@@ -332,7 +342,6 @@ export const App: React.FC = () => {
             client.listMemory(),
             client.listUsage(),
             client.listEvents({ after: 0 }).catch(() => [] as EventEnvelope[]),
-            client.getGitStatus?.().catch(() => null) ?? Promise.resolve(null),
             client.listSchedules?.().catch(() => null) ?? Promise.resolve(null),
           ]);
 
@@ -343,7 +352,6 @@ export const App: React.FC = () => {
         setApprovals(apprList);
         setModels(modelList);
         setProvidersHealth(pHealth);
-        setGitStatus(currentGitStatus);
         setMemory(memList);
         setUsage(usgList);
         if (schedList) {
@@ -385,12 +393,16 @@ export const App: React.FC = () => {
   const handleRefreshGitStatus = useCallback(async () => {
     if (!client.getGitStatus) return;
     try {
-      const next = await client.getGitStatus();
-      setGitStatus(next);
+      const next = await client.getGitStatus(gitSessionId);
+      setGitState({ sessionId: gitSessionId, status: next });
     } catch {
       // Keep previous status silently on transient poll error
     }
-  }, [client]);
+  }, [client, gitSessionId]);
+
+  useEffect(() => {
+    void handleRefreshGitStatus();
+  }, [handleRefreshGitStatus, workspaceRoot]);
 
   const handleCheckoutGitBranch = useCallback(
     async (branch: string, create = false) => {
@@ -398,14 +410,14 @@ export const App: React.FC = () => {
         pushToast('当前连接暂不支持切换 Git 分支', 'warning');
         throw new Error('当前连接暂不支持切换 Git 分支');
       }
-      const next = await client.checkoutGitBranch(branch, create);
-      setGitStatus(next);
+      const next = await client.checkoutGitBranch(branch, create, gitSessionId);
+      setGitState({ sessionId: gitSessionId, status: next });
       pushToast(
         create ? `已创建并检出分支 ${next.branch || branch}` : `已切换到分支 ${next.branch || branch}`,
         'success',
       );
     },
-    [client, pushToast],
+    [client, gitSessionId, pushToast],
   );
 
   const handleInitGitRepo = useCallback(async () => {
@@ -414,14 +426,14 @@ export const App: React.FC = () => {
       return;
     }
     try {
-      const next = await client.initGitRepo('main');
-      setGitStatus(next);
+      const next = await client.initGitRepo('main', gitSessionId);
+      setGitState({ sessionId: gitSessionId, status: next });
       pushToast(`已创建 Git 存储库（当前分支：${next.branch || 'main'}）`, 'success');
     } catch (err) {
       const msg = err instanceof Error ? err.message : '创建 Git 存储库失败';
       pushToast(msg, 'danger');
     }
-  }, [client, pushToast]);
+  }, [client, gitSessionId, pushToast]);
 
   const refreshProviderAccounts = useCallback(async () => {
     if (connection.mode === 'demo' || !client.providerPresets || !client.listAccounts) {
@@ -800,7 +812,8 @@ export const App: React.FC = () => {
   const handleSubmitNewTask = async (text: string, files: Record<string, string>) => {
     setSubmitting(true);
     try {
-      let projectId = selectedProjectId;
+      const sideSource = sideProject?.startsWith('session:') ? await client.getTask(sideProject.slice(8)) : null;
+      let projectId = sideSource?.projectId ?? selectedProjectId;
       if (!projectId) {
         const created = await client.createProject('Agent_US Workspace');
         setProjects((prev) => [...prev, created]);
@@ -815,7 +828,7 @@ export const App: React.FC = () => {
         idempotencyKey: randomIdempotencyKey(),
         ...(selectedModel ? { model: selectedModel } : {}),
         permissionMode,
-        ...(workspaceRoot ? { workspaceRoot } : {}),
+        workspaceRoot: sideSource?.workspaceRoot || workspaceRoot || undefined,
         ...(Object.keys(files).length ? { files } : {}),
       });
 
@@ -837,7 +850,7 @@ export const App: React.FC = () => {
     setSubmitting(true);
     try {
       const currentRoot = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
-      if (currentRoot?.status === 'running' && client.steerSession && Object.keys(files).length === 0) {
+      if (currentRoot?.status === 'running' && client.steerSession && !text.startsWith('/plan ') && Object.keys(files).length === 0) {
         const steered = await client.steerSession(activeRootTaskId, text);
         if (steered.steered) {
           pushToast('已实时注入纠偏指令，Agent 将在下一步生效', 'success');
@@ -1098,6 +1111,8 @@ export const App: React.FC = () => {
     '/swarm': swarmBlock,
     '/messages': swarmBlock ?? (!client.listSwarmMessages ? '当前连接未提供协作消息' : undefined),
     '/artifacts': swarmBlock ?? (!client.listSwarmArtifacts ? '当前连接未提供自主任务产物' : undefined),
+    '/fork': !client.forkTask ? '当前连接未提供聊天分支' : slashTask?.status === 'running' ? '请等待当前聊天执行结束' : undefined,
+    '/side': sideProject !== null ? '请从主窗口开启侧边聊天' : undefined,
     '/compact': !client.compactSession ? '当前连接未提供上下文压缩' : undefined,
     '/rewind': !client.rewindSession ? '当前连接未提供会话回退' : undefined,
     '/archive-chat': archiveBlock ?? (slashTask?.archivedAt != null ? '此会话已归档' : undefined),
@@ -1128,10 +1143,30 @@ export const App: React.FC = () => {
       case '/new-project':
         setCreateProjectOpen(true);
         break;
+      case '/side': {
+        const target = new URL(window.location.href);
+        target.hash = '';
+        target.search = '';
+        const context = activeRootTaskId ? `session:${activeRootTaskId}` : `project:${selectedProjectId ?? ''}`;
+        target.searchParams.set('side-project', context);
+        window.open(target, '_blank', 'popup,noopener,width=700,height=750');
+        break;
+      }
+      case '/fork':
+        if (activeRootTaskId) setForkSource(activeRootTaskId);
+        break;
+      case '/feedback':
+        setFeedbackDraft('');
+        break;
       case '/plan':
-        setCodexMode('Work');
-        setPermissionMode('approval');
-        pushToast('已切换为 Work 并启用审批。输入 /goal 可启动自主规划。');
+        if (codexMode === 'Work') {
+          setCodexMode('Codex');
+          pushToast('已退出计划模式');
+        } else {
+          setCodexMode('Work');
+          setPermissionMode('approval');
+          pushToast('已开启计划模式');
+        }
         break;
       case '/run':
         setCodexMode('Codex');
@@ -1172,6 +1207,35 @@ export const App: React.FC = () => {
         })();
         break;
     }
+  };
+
+  const createChatFork = async (workspaceMode: 'same-workspace' | 'new-worktree') => {
+    if (!forkSource || !client.forkTask || forkPending) return;
+    setForkPending(true);
+    try {
+      const task = await client.forkTask(forkSource, workspaceMode);
+      setTasks((previous) => [task, ...previous.filter((entry) => entry.id !== task.id)]);
+      setPermissionMode('approval');
+      setForkSource(null);
+      navigate({ kind: 'thread', taskId: task.id });
+      pushToast('已创建聊天分支', 'success');
+    } catch (error) {
+      pushToast(`创建聊天分支失败：${error instanceof Error ? error.message : '未知错误'}`, 'danger');
+    } finally {
+      setForkPending(false);
+    }
+  };
+
+  const exportFeedback = () => {
+    if (!feedbackDraft?.trim()) return;
+    const blob = new Blob([`# Agent_US 聊天反馈\n\n${feedbackDraft.trim()}\n`], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'agent-us-feedback.md';
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setFeedbackDraft(null);
   };
 
   const handleSearchMemory = useCallback(async (query: string, scope: 'global' | 'workspace' | 'session') => {
@@ -1255,8 +1319,15 @@ export const App: React.FC = () => {
   const mentionPlugins = useMemo(
     () =>
       plugins
-        .filter((p) => installedPluginIds.includes(p.id))
-        .map((plugin) => ({ id: plugin.id, name: plugin.name, description: plugin.description, iconUrl: getBundledPluginIcon(plugin, resolvedTheme) })),
+        .filter((plugin) => installedPluginIds.includes(plugin.id) || plugin.id.startsWith('office-'))
+        .map((plugin) => ({
+          id: plugin.id,
+          name: plugin.name,
+          description: plugin.description,
+          iconUrl: getBundledPluginIcon(plugin, resolvedTheme),
+          color: plugin.id.startsWith('office-') ? plugin.brandColor : undefined,
+          installed: installedPluginIds.includes(plugin.id),
+        })),
     [plugins, installedPluginIds, resolvedTheme],
   );
 
@@ -1656,6 +1727,7 @@ export const App: React.FC = () => {
               <CapabilitiesView
                 key={view.section ?? 'plugins'}
                 initialTab={view.section === 'skills' ? 'skills' : 'plugins'}
+                initialPluginId={view.pluginId}
                 theme={resolvedTheme}
                 catalogSource={catalogSource}
                 plugins={plugins}
@@ -1667,41 +1739,20 @@ export const App: React.FC = () => {
                 onSearchRemotePlugins={(q) => void handleSearchRemotePlugins(q)}
                 onRefreshCatalog={(sync) => loadExtensionCatalog(Boolean(sync))}
                 onToggleInstallPlugin={async (plugin) => {
-                  const exists = installedPluginIds.includes(plugin.id);
-                  if (exists) {
-                    setInstalledPluginIds((prev) => prev.filter((id) => id !== plugin.id));
-                    try {
-                      await fetch('/api/extensions/plugins/uninstall', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ id: plugin.id }),
-                      });
-                    } catch {
-                      // ignore static fallback
-                    }
-                    pushToast(`已卸载插件 ${plugin.name}`);
-                  } else {
-                    setPlugins((prev) =>
-                      prev.some((p) => p.id === plugin.id) ? prev : [plugin, ...prev],
-                    );
-                    setInstalledPluginIds((prev) => [plugin.id, ...prev.filter((x) => x !== plugin.id)]);
-                    let suffix = '';
-                    try {
-                      const res = await fetch('/api/extensions/plugins/install', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ plugin }),
-                      });
-                      if (res.ok) {
-                        const info = (await res.json()) as { fetchedFromGithub?: boolean };
-                        if (info.fetchedFromGithub) {
-                          suffix = '（已从 GitHub 拉取最新技能包）';
-                        }
-                      }
-                    } catch {
-                      // ignore static fallback
-                    }
-                    pushToast(`已安装插件 ${plugin.name}${suffix}`, 'success');
+                  const installed = installedPluginIds.includes(plugin.id);
+                  try {
+                    const response = await fetch(`/api/extensions/plugins/${installed ? 'uninstall' : 'install'}`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(installed ? { id: plugin.id } : { plugin }),
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const result = await response.json() as { installedPluginIds: string[]; fetchedFromGithub?: boolean };
+                    setInstalledPluginIds(result.installedPluginIds);
+                    if (!installed) setPlugins((prev) => prev.some((p) => p.id === plugin.id) ? prev : [plugin, ...prev]);
+                    pushToast(`${installed ? '已卸载' : '已安装'}插件 ${plugin.name}`, 'success');
+                  } catch (error) {
+                    pushToast(`插件操作失败：${error instanceof Error ? error.message : '未知错误'}`, 'danger');
                   }
                 }}
                 onSavePluginConfig={async (plugin, endpoint, token) => {
@@ -1989,6 +2040,24 @@ export const App: React.FC = () => {
         onCreate={handleCreateProject}
       />
 
+      {forkSource && <ComposerDialog title="创建聊天分支" onClose={() => { if (!forkPending) setForkSource(null); }}>
+        <p className="composer-dialog-note">继承近期对话文本。已有工具执行、附件和文件变更记录留在原聊天。</p>
+        <button type="button" className="composer-dialog-option" disabled={forkPending}
+          onClick={() => void createChatFork('same-workspace')}>在当前工作区创建</button>
+        <button type="button" className="composer-dialog-option" disabled={forkPending || !gitStatus?.available}
+          onClick={() => void createChatFork('new-worktree')}>从已提交版本创建 Git 工作树</button>
+        {forkPending && <p className="composer-dialog-note" role="status">正在创建聊天分支…</p>}
+      </ComposerDialog>}
+      {feedbackDraft !== null && <ComposerDialog title="聊天反馈" onClose={() => setFeedbackDraft(null)}>
+        <p className="composer-dialog-note">导出本地 Markdown。仅包含你填写的反馈。</p>
+        <label className="composer-dialog-field">反馈内容
+          <textarea value={feedbackDraft} maxLength={4000} onChange={(event) => setFeedbackDraft(event.currentTarget.value)} />
+        </label>
+        <div className="composer-dialog-actions">
+          <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={!feedbackDraft.trim()}
+            onClick={exportFeedback}>导出反馈</button>
+        </div>
+      </ComposerDialog>}
       <ToastHost toasts={toasts} />
     </div>
   );

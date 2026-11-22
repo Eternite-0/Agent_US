@@ -1,7 +1,7 @@
 import type { AppView, InspectorTab } from '../types/backend';
 import {
-  IconActivity, IconAgent, IconArchive, IconBranch, IconCompose, IconCopy, IconCpu,
-  IconDagNodes, IconDatabase, IconDiffBox, IconFileDoc, IconFolder, IconFolderPlus,
+  IconActivity, IconAgent, IconArchive, IconBranch, IconColumns, IconCompose, IconCopy, IconCpu,
+  IconDagNodes, IconDatabase, IconDiffBox, IconFileDoc, IconFileEdit, IconFolder, IconFolderPlus,
   IconGlobe, IconHistory, IconKeyboard, IconPin, IconPlay, IconPlus, IconPuzzle,
   IconRailClock, IconReset, IconSearch, IconSettingsGear, IconShieldCheck, IconSparkle,
   IconStopSquare, IconSun, IconTerminal, IconUndo,
@@ -9,12 +9,14 @@ import {
 
 export type SwarmSection = 'plan' | 'messages' | 'artifacts';
 export type CommandPopover = 'project' | 'branch' | 'permission' | 'effort' | 'models';
-export type MentionExtension = { id: string; name: string; description: string; iconUrl?: string };
+export type MentionExtension = { id: string; name: string; description: string; iconUrl?: string; color?: string; installed?: boolean };
 export type CommandAvailability = Readonly<Record<string, string | undefined>>;
 
 export interface SlashCommand {
   cmd: string;
   desc: string;
+  title?: string;
+  opensOptions?: boolean;
   aliases?: string[];
   icon: typeof IconSearch;
   view?: AppView;
@@ -27,13 +29,23 @@ export interface SlashCommand {
 const settings = (section: string): AppView => ({ kind: 'settings', section });
 
 export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> = [
+  { label: '', commands: [
+    { cmd: '/mcp', title: 'MCP', desc: '查看当前工作区的 MCP 服务状态', icon: IconTerminal, view: { kind: 'capabilities', section: 'mcp' }, opensOptions: true },
+    { cmd: '/review', title: '代码审查', desc: '审查未提交的变更，或与本地分支比较', icon: IconShieldCheck, opensOptions: true },
+    { cmd: '/side', title: '侧边聊天', desc: '在独立窗口开启同一项目的新聊天', icon: IconColumns, aliases: ['side-chat', '侧边'] },
+    { cmd: '/fork', title: '创建聊天分支', desc: '从这段对话创建分支', icon: IconBranch, threadOnly: true, opensOptions: true, aliases: ['聊天分支'] },
+    { cmd: '/compact', title: '压缩', desc: '压缩当前会话的上下文', icon: IconDatabase, threadOnly: true },
+    { cmd: '/feedback', title: '反馈', desc: '撰写并导出这段聊天的反馈', icon: IconFileEdit, aliases: ['反馈'] },
+    { cmd: '/archive-chat', title: '归档', desc: '归档当前聊天', icon: IconArchive, threadOnly: true },
+    { cmd: '/effort', title: '推理', desc: '调整推理强度', icon: IconCpu, popover: 'effort' },
+    { cmd: '/new', title: '新聊天', desc: '在同一工作区开启空白聊天', icon: IconCompose, view: { kind: 'home' } },
+    { cmd: '/companion', title: '智能伙伴', desc: '显示或收起当前会话的智能伙伴', icon: IconAgent, threadOnly: true, aliases: ['agent-card', '智能伙伴'] },
+    { cmd: '/model', title: '模型', desc: '选择当前对话的模型', icon: IconCpu, popover: 'models' },
+  ] },
   { label: '会话', commands: [
-    { cmd: '/new', desc: '开始新对话', icon: IconCompose, view: { kind: 'home' } },
     { cmd: '/search', desc: '搜索全部聊天和工作区', icon: IconSearch, aliases: ['history', '历史'] },
-    { cmd: '/compact', desc: '压缩当前会话的上下文', icon: IconDatabase, threadOnly: true },
     { cmd: '/rewind', desc: '回退上一轮对话和文件变更', icon: IconUndo, threadOnly: true },
     { cmd: '/pin', desc: '置顶或取消置顶当前聊天', icon: IconPin, threadOnly: true },
-    { cmd: '/archive-chat', desc: '归档当前聊天', icon: IconArchive, threadOnly: true },
     { cmd: '/restore', desc: '恢复当前归档聊天', icon: IconHistory, threadOnly: true },
     { cmd: '/archive', desc: '查找和恢复已归档的聊天', icon: IconArchive, view: settings('archived') },
     { cmd: '/copy-link', desc: '复制当前聊天链接', icon: IconCopy, threadOnly: true },
@@ -45,7 +57,7 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
     { cmd: '/messages', desc: '查看 Swarm 协作消息', icon: IconActivity, inspector: 'autonomous', swarmSection: 'messages', aliases: ['swarm-messages'] },
     { cmd: '/artifacts', desc: '查看 Swarm 文件产物', icon: IconArchive, inspector: 'autonomous', swarmSection: 'artifacts', aliases: ['swarm-artifacts'] },
     { cmd: '/agents', desc: '查看子智能体和运行详情', icon: IconAgent, inspector: 'subagents', aliases: ['dag', 'subagents'] },
-    { cmd: '/plan', desc: '切换为 Work 规划与审批模式', icon: IconDagNodes },
+    { cmd: '/plan', title: '计划模式', desc: '切换计划模式', icon: IconDagNodes },
     { cmd: '/run', desc: '切换为 Codex 执行模式', icon: IconPlay },
     { cmd: '/chat', desc: '切换为 Chat 对话模式', icon: IconCompose },
     { cmd: '/stop', desc: '暂停当前正在执行的对话任务', aliases: ['pause'], icon: IconStopSquare, threadOnly: true },
@@ -56,20 +68,17 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
   { label: '工作区', commands: [
     { cmd: '/project', desc: '选择工作区项目', icon: IconFolder, popover: 'project' },
     { cmd: '/new-project', desc: '新建工作区项目', icon: IconFolderPlus },
-    { cmd: '/review', desc: '准备审查未提交变更的请求', icon: IconShieldCheck },
     { cmd: '/diff', desc: '查看当前会话的文件变更', icon: IconDiffBox, inspector: 'diff', threadOnly: true },
     { cmd: '/branch', desc: '查看和切换 Git 分支', icon: IconBranch, popover: 'branch', aliases: ['git'] },
+    { cmd: '/sketch', title: '绘图', desc: '绘制草图并附加到消息', icon: IconFileEdit, aliases: ['draw', '绘图'] },
     { cmd: '/attach', desc: '打开本地文件选择器', icon: IconPlus, aliases: ['upload'] },
     { cmd: '/folder', desc: '搜索并引用工作区文件夹', icon: IconFolder },
     { cmd: '/file', desc: '搜索并引用工作区文件', icon: IconFileDoc, aliases: ['mention'] },
     { cmd: '/plugins', desc: '打开插件管理', icon: IconPuzzle, view: { kind: 'capabilities' }, aliases: ['capabilities'] },
-    { cmd: '/mcp', desc: '查看当前工作区的 MCP 服务状态', icon: IconTerminal, view: { kind: 'capabilities', section: 'mcp' } },
     { cmd: '/memory', desc: '查看工作区经验和持久记忆', icon: IconDatabase, view: settings('memory') },
     { cmd: '/skills', desc: '打开技能管理', icon: IconPuzzle, view: { kind: 'capabilities', section: 'skills' }, aliases: ['skill'] },
   ] },
   { label: '模型与设置', commands: [
-    { cmd: '/model', desc: '选择当前对话的模型', icon: IconCpu, popover: 'models' },
-    { cmd: '/effort', desc: '调整推理强度', icon: IconCpu, popover: 'effort' },
     { cmd: '/permissions', desc: '查看执行权限选项', icon: IconShieldCheck, popover: 'permission' },
     { cmd: '/models', desc: '打开模型管理', icon: IconCpu, view: settings('models') },
     { cmd: '/providers', desc: '查看和管理模型账号池', icon: IconGlobe, view: settings('providers') },
@@ -95,6 +104,6 @@ export function findSlashCommand(input: string) {
 }
 
 export function matchesSlashCommand(command: SlashCommand, query: string) {
-  return command.cmd.includes(query) || command.desc.toLowerCase().includes(query.slice(1)) ||
+  return command.cmd.includes(query) || command.title?.toLowerCase().includes(query.slice(1)) || command.desc.toLowerCase().includes(query.slice(1)) ||
     command.aliases?.some((alias) => alias.includes(query.slice(1)));
 }

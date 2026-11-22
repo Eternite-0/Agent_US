@@ -1191,6 +1191,7 @@ const PluginTileGraphic: React.FC<{
 
 interface CapabilitiesViewProps {
   initialTab?: 'plugins' | 'skills';
+  initialPluginId?: string;
   theme: 'light' | 'dark';
   catalogSource: LocalCatalogSourceInfo | null;
   plugins: MarketplacePlugin[];
@@ -1216,6 +1217,7 @@ interface CapabilitiesViewProps {
 
 export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
   initialTab = 'plugins',
+  initialPluginId,
   theme,
   catalogSource,
   plugins,
@@ -1252,6 +1254,16 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
 
   // Modals
   const [selectedPlugin, setSelectedPlugin] = useState<MarketplacePlugin | null>(null);
+  const openedPlugin = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!initialPluginId || openedPlugin.current === initialPluginId) return;
+    const plugin = plugins.find(({ id }) => id === initialPluginId);
+    if (!plugin) return;
+    openedPlugin.current = initialPluginId;
+    setSelectedPlugin(plugin);
+    setEditEndpoint(plugin.endpoint);
+    setEditToken(pluginTokens[plugin.id] ?? '');
+  }, [initialPluginId, plugins, pluginTokens]);
   const [editEndpoint, setEditEndpoint] = useState('');
   const [editToken, setEditToken] = useState('');
 
@@ -2196,7 +2208,8 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
               </div>
             )}
 
-            {/* MCP Endpoint / Token Inputs (token strictly in-memory) */}
+            {/* Configure only plugins with a remote or local MCP endpoint. */}
+            {selectedPlugin.transport !== 'Built-in · Skills' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <label style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
                 <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -2225,6 +2238,7 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
               </label>
             </div>
 
+            )}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 18 }}>
               {installedPluginSet.has(selectedPlugin.id) ? (
                 <button
@@ -2259,8 +2273,9 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
                   type="button"
                   className="codex-toolbar-btn"
                   data-variant="primary"
+                  hidden={selectedPlugin.transport === 'Built-in · Skills' && installedPluginSet.has(selectedPlugin.id)}
                   onClick={() => {
-                    void onSavePluginConfig(selectedPlugin, editEndpoint.trim(), editToken);
+                    if (selectedPlugin.transport !== 'Built-in · Skills') void onSavePluginConfig(selectedPlugin, editEndpoint.trim(), editToken);
                     if (!installedPluginSet.has(selectedPlugin.id)) {
                       void onToggleInstallPlugin(selectedPlugin);
                     }

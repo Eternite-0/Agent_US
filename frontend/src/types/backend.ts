@@ -660,7 +660,7 @@ export type AppView =
   | { kind: 'home' }
   | { kind: 'thread'; taskId: string; focusWorkerId?: string }
   | { kind: 'tasks' }
-  | { kind: 'capabilities'; section?: 'skills' | 'mcp'; sessionId?: string }
+  | { kind: 'capabilities'; section?: 'skills' | 'mcp'; sessionId?: string; pluginId?: string }
   | { kind: 'evaluations' }
   | { kind: 'settings'; section: string };
 
