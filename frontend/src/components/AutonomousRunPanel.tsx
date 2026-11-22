@@ -1,16 +1,36 @@
 import type { ReactNode } from 'react';
-import { useEffect, useState } from 'react';
-import type { AgentBackendClient } from '../api/client';
+import { useCallback, useEffect, useState } from 'react';
+import {
+  type AgentBackendClient,
+  collectSwarmReviewerVerdicts,
+  extractSwarmTelemetry,
+  formatSwarmApplyAllFeedback,
+  getSwarmDeliveryApplyState,
+  isUnsupportedSwarmEndpointError,
+} from '../api/client';
 import type {
-  SwarmArtifactFile, SwarmArtifactRecord, SwarmMessageRecord, SwarmReplanRecord, SwarmRunRecord,
+  SwarmArtifactFile,
+  SwarmArtifactRecord,
+  SwarmDeliveryRecord,
+  SwarmMessageRecord,
+  SwarmReplanRecord,
+  SwarmReviewerVerdict,
+  SwarmRunRecord,
 } from '../types/backend';
 
 import { WorkerStatusMark } from './WorkerStatusMark';
+import { fmtTokens } from '../utils/format';
 import { subtaskTitle } from '../utils/worker';
 import { swarmWorkerStatus } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
-import { IconActivity, IconArchive, IconBranch, IconCheck, IconChevronRight, IconCircleClose, IconDagNodes, IconDownload, IconFileDoc, IconHistory, IconPlay, IconRefresh, IconShieldCheck, IconStopSquare } from './Icons';
+import {
+  IconActivity, IconArchive, IconBranch, IconCheck, IconChevronRight, IconCircleClose, IconDagNodes,
+  IconDiffBox, IconDownload, IconFileDoc, IconHistory, IconPlay, IconRefresh, IconShieldAlert,
+  IconShieldCheck, IconStopSquare, IconTerminal,
+} from './Icons';
 import type { SwarmSection } from './slashCommands';
+
+type PanelSection = SwarmSection | 'delivery';
 
 const labels: Record<string, string> = {
   pending: '待处理', planning: '规划中', ready: '可执行', queued: '排队中', running: '执行中',
@@ -19,6 +39,9 @@ const labels: Record<string, string> = {
   stored: '已保存', archived: '已归档', applied: '已应用', superseded: '已替换',
   delivered: '已投递', claimed: '处理中', acked: '已确认', expired: '已过期', dead_letter: '死信',
   added: '新增', modified: '修改', deleted: '删除', renamed: '重命名',
+  pass: '通过', passed: '通过', fail: '未通过', needs_revision: '需修订', approved: '已批准',
+  rejected: '已拒绝', conflict: '冲突', skipped: '已跳过', error: '错误',
+  critical: '严重', high: '高', medium: '中', low: '低', warning: '警告', info: '提示',
 };
 const messageLabels: Record<string, string> = {
   task_assignment: '分配任务', task_update: '更新任务', task_completed: '完成任务', task_failed: '任务失败',
@@ -38,15 +61,16 @@ function Button({ children, ...props }: React.ComponentProps<'button'>) {
   return <button type="button" className="codex-toolbar-btn" data-variant="outline" {...props}>{children}</button>;
 }
 
-const sections = {
+const sections: Record<PanelSection, { label: string; icon: typeof IconDagNodes }> = {
   plan: { label: '计划和节点', icon: IconDagNodes },
   messages: { label: '协作消息', icon: IconActivity },
   artifacts: { label: '产物', icon: IconArchive },
+  delivery: { label: '交付审查', icon: IconDiffBox },
 };
 const runningStatuses = new Set(['running', 'planning', 'verifying', 'aggregating', 'reconciling']);
-const doneStatuses = new Set(['completed', 'applied', 'acked', 'stored', 'delivered']);
-const errorStatuses = new Set(['failed', 'dead_letter']);
-const warnStatuses = new Set(['parked', 'interrupted', 'expired']);
+const doneStatuses = new Set(['completed', 'applied', 'acked', 'stored', 'delivered', 'pass', 'passed', 'approved']);
+const errorStatuses = new Set(['failed', 'dead_letter', 'fail', 'error', 'rejected']);
+const warnStatuses = new Set(['parked', 'interrupted', 'expired', 'needs_revision', 'warning', 'conflict', 'partial']);
 const terminalNodeStatuses = new Set(['completed', 'failed', 'cancelled', 'superseded']);
 
 function RunStatus({ value }: { value: string }) {
@@ -139,16 +163,79 @@ export function AutonomousRunPanel({ client, sessionId, preferredRunId, sectionR
   </section>;
 }
 
+interface DeliveryState {
+  data?: SwarmDeliveryRecord;
+  loading: boolean;
+  error: string;
+  unsupported: boolean;
+}
+
 function RunDetail({ run, client, revision, onRefresh, sectionRequest }: {
   run: SwarmRunRecord; client: AgentBackendClient; revision: number; onRefresh: () => void; sectionRequest?: { section: SwarmSection };
 }) {
-  const [tab, setTab] = useState<{ request?: { section: SwarmSection }; section: SwarmSection }>();
-  const section = tab && tab.request === sectionRequest ? tab.section : sectionRequest?.section ?? 'plan';
+  const [tab, setTab] = useState<{ request?: { section: SwarmSection }; section: PanelSection }>();
+  const section: PanelSection = tab && tab.request === sectionRequest ? tab.section : sectionRequest?.section ?? 'plan';
   const [feedback, setFeedback] = useState<{ text: string; failed?: boolean }>();
   const [pending, setPending] = useState(false);
   const [updated, setUpdated] = useState<SwarmRunRecord>();
+  const [deliveryRevision, setDeliveryRevision] = useState(0);
+  const [unsupportedTarget, setUnsupportedTarget] = useState<{ client: AgentBackendClient; key: string }>();
+  const [deliveryState, setDeliveryState] = useState<DeliveryState>({
+    loading: Boolean(client.getSwarmDelivery),
+    error: '',
+    unsupported: !client.getSwarmDelivery,
+  });
   const current = updated && updated.updatedAt >= run.updatedAt ? updated : run;
+  const active = isActive(current);
   const completed = current.nodes.filter((node) => node.status === 'completed').length;
+  const runRevisionKey = `${current.id}:${revision}`;
+  const reloadDelivery = useCallback(() => setDeliveryRevision((value) => value + 1), []);
+
+  useEffect(() => {
+    const fetchDelivery = client.getSwarmDelivery;
+    if (!fetchDelivery) {
+      setDeliveryState({ loading: false, error: '', unsupported: true });
+      return;
+    }
+    if (unsupportedTarget?.client === client && unsupportedTarget.key === runRevisionKey) {
+      setDeliveryState((prev) => ({ ...prev, loading: false, error: '', unsupported: true }));
+      return;
+    }
+    const controller = new AbortController();
+    const { signal } = controller;
+    let timer: number | undefined;
+    setDeliveryState((prev) => ({ ...prev, loading: !prev.data, error: '', unsupported: false }));
+    async function load() {
+      try {
+        const next = await fetchDelivery!.call(client, current.id, signal);
+        if (signal.aborted) return;
+        setDeliveryState({ data: next, loading: false, error: '', unsupported: false });
+        if (section === 'delivery' && active) {
+          timer = window.setTimeout(() => void load(), 4000);
+        }
+      } catch (failure) {
+        if (signal.aborted) return;
+        if (isUnsupportedSwarmEndpointError(failure)) {
+          setUnsupportedTarget({ client, key: runRevisionKey });
+          setDeliveryState({ loading: false, error: '', unsupported: true });
+          return;
+        }
+        setDeliveryState((prev) => ({ ...prev, loading: false, error: errorText(failure), unsupported: false }));
+        if (section === 'delivery' && active) {
+          timer = window.setTimeout(() => void load(), 4000);
+        }
+      }
+    }
+    void load();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [client, current.id, current.updatedAt, section, active, revision, deliveryRevision, unsupportedTarget, runRevisionKey]);
+
+  const telemetry = extractSwarmTelemetry(current, deliveryState.data);
+  const effectiveVerdict = current.verdict ?? deliveryState.data?.verdict ?? null;
+  const reviewerVerdicts = collectSwarmReviewerVerdicts(current, deliveryState.data);
 
   async function change(action: 'cancel' | 'resume') {
     if (pending) return;
@@ -179,31 +266,210 @@ function RunDetail({ run, client, revision, onRefresh, sectionRequest }: {
         <progress aria-label="节点完成进度" value={completed} max={current.nodes.length} />
         <small>{completed}/{current.nodes.length} 节点完成</small>
       </div>}
-      {current.verdict ? <details className="autonomous-verdict">
+      {telemetry.hasTelemetry && <div className="swarm-dependencies" aria-label="执行遥测">
+        {telemetry.steps !== undefined && <small>步骤 <code>{telemetry.steps}</code></small>}
+        {telemetry.totalTokens !== undefined && <small title={
+          telemetry.inputTokens !== undefined || telemetry.outputTokens !== undefined
+            ? `输入 ${telemetry.inputTokens ?? 0} · 输出 ${telemetry.outputTokens ?? 0}`
+            : undefined
+        }>Token <code>{fmtTokens(telemetry.totalTokens)}</code></small>}
+        {telemetry.replanCount !== undefined && <small>重规划 <code>{telemetry.replanCount}</code></small>}
+        {telemetry.branch && <small title={telemetry.headSha ?? undefined}>
+          <IconBranch size={12} aria-hidden="true" /> 分支 <code>{telemetry.branch}{telemetry.headSha ? ` @ ${telemetry.headSha.slice(0, 7)}` : ''}</code>
+        </small>}
+        {telemetry.testCommands.length > 0 && <small>测试 {telemetry.testCommands.map((cmd) => <code key={cmd}>{cmd}</code>)}</small>}
+      </div>}
+      {(effectiveVerdict || reviewerVerdicts.length > 0) ? <details className="autonomous-verdict">
         <summary className="codex-subagent-list-row swarm-row">
-          <RowContents icon={current.verdict.accepted ? <IconShieldCheck size={15} /> : <IconCircleClose size={15} />}
-            title={current.verdict.accepted ? '验收通过' : '验收未通过'} detail={current.verdict.verificationMode} expandable />
+          <RowContents
+            icon={effectiveVerdict ? (effectiveVerdict.accepted ? <IconShieldCheck size={15} /> : <IconCircleClose size={15} />) : <IconShieldCheck size={15} />}
+            title={effectiveVerdict ? (effectiveVerdict.accepted ? '验收通过' : '验收未通过') : '独立审查记录'}
+            detail={effectiveVerdict?.verificationMode || (reviewerVerdicts.length ? `${reviewerVerdicts.length} 项独立审查` : undefined)}
+            expandable
+          />
         </summary>
         <div className="swarm-row-detail">
-          {current.verdict.reasons?.length ? <ul>{current.verdict.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul> : <p>未记录验收说明。</p>}
+          {effectiveVerdict?.reasons?.length ? <ul>{effectiveVerdict.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>
+            : !reviewerVerdicts.length && <p>未记录验收说明。</p>}
+          <ReviewerVerdictList verdicts={reviewerVerdicts} />
         </div>
-      </details> : !isActive(current) && <p><small>无验收记录</small></p>}
+      </details> : !active && <p><small>无验收记录</small></p>}
       {current.errorCode && <p className="autonomous-error">{current.errorMessage || current.errorCode}</p>}
       <div className="autonomous-toolbar">
-        {isActive(current) && client.cancelSwarmRun && <Button onClick={() => void change('cancel')} disabled={pending}><IconStopSquare size={11} />取消任务</Button>}
+        {active && client.cancelSwarmRun && <Button onClick={() => void change('cancel')} disabled={pending}><IconStopSquare size={11} />取消任务</Button>}
         {current.status === 'failed' && client.resumeSwarmRun && <Button onClick={() => void change('resume')} disabled={pending}><IconPlay size={13} />恢复执行</Button>}
       </div>
       {feedback && <p role={feedback.failed ? 'alert' : 'status'} className={feedback.failed ? 'autonomous-error' : undefined}>{feedback.text}</p>}
     </header>
     <nav className="autonomous-sections" aria-label="执行详情">
-      {(Object.keys(sections) as SwarmSection[]).map((key) => {
+      {(Object.keys(sections) as PanelSection[]).map((key) => {
         const { icon: Icon, label } = sections[key];
         return <button type="button" className="swarm-section-tab" key={key} aria-pressed={section === key}
           onClick={() => setTab({ request: sectionRequest, section: key })}><Icon size={14} aria-hidden="true" />{label}</button>;
       })}
     </nav>
-    <RunSection key={section} client={client} run={current} section={section} revision={revision} onRefresh={onRefresh} />
+    {section === 'delivery'
+      ? <DeliveryReviewSection client={client} run={current} state={deliveryState} onRefresh={onRefresh} onReloadDelivery={reloadDelivery} />
+      : <RunSection key={section} client={client} run={current} section={section} revision={revision} onRefresh={onRefresh} />}
   </>;
+}
+
+function ReviewerVerdictList({ verdicts }: { verdicts: SwarmReviewerVerdict[] }) {
+  if (!verdicts.length) return null;
+  return <div aria-label="独立审查结果">
+    <p><small>独立审查 · {verdicts.length}</small></p>
+    <ul className="autonomous-list">
+      {verdicts.map((rv, index) => <li key={`${rv.nodeKey}-${index}`}>
+        <div className="swarm-run-meta">
+          <span><strong>{rv.nodeKey}</strong>{rv.reviewerModel ? <small> · {rv.reviewerModel}</small> : null}</span>
+          <RunStatus value={rv.status} />
+        </div>
+        {rv.summary && <p>{rv.summary}</p>}
+        {(rv.checkedArtifacts?.length || rv.evidenceRefs?.length) ? <div className="swarm-dependencies">
+          {rv.checkedArtifacts?.length ? <small>核验产物 <code>{rv.checkedArtifacts.length}</code></small> : null}
+          {rv.evidenceRefs?.length ? <small>证据引用 <code>{rv.evidenceRefs.length}</code></small> : null}
+        </div> : null}
+        {rv.findings && rv.findings.length > 0 && <ul aria-label={`${rv.nodeKey} 审查发现`}>
+          {rv.findings.map((finding, fIdx) => <li key={fIdx}>
+            <code>{status(finding.severity)}</code> {finding.message}
+            {finding.evidenceRef && <> <code>{finding.evidenceRef}</code></>}
+          </li>)}
+        </ul>}
+      </li>)}
+    </ul>
+  </div>;
+}
+
+function DeliveryReviewSection({ client, run, state, onRefresh, onReloadDelivery }: {
+  client: AgentBackendClient;
+  run: SwarmRunRecord;
+  state: DeliveryState;
+  onRefresh: () => void;
+  onReloadDelivery: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{ text: string; failed?: boolean }>();
+
+  if (!client.getSwarmDelivery) {
+    return <div className="autonomous-section"><p>当前连接未提供交付审查接口。</p></div>;
+  }
+  if (state.unsupported) {
+    return <div className="autonomous-section"><PanelState>当前后端暂不支持交付审查，请查看「产物」标签页。</PanelState></div>;
+  }
+  if (state.error && !state.data) {
+    return <div className="autonomous-section"><p className="autonomous-error" role="alert">交付审查加载失败。{state.error}</p></div>;
+  }
+  if (!state.data) {
+    return <div className="autonomous-section"><p role="status">正在加载…</p></div>;
+  }
+
+  const delivery = state.data;
+  const applyState = getSwarmDeliveryApplyState(delivery);
+  const changedFiles = delivery.changedFiles ?? [];
+  const testResults = delivery.testResults ?? [];
+  const reviewerVerdicts = collectSwarmReviewerVerdicts(run, delivery);
+  const diffPreview = delivery.unifiedDiffPreview ?? '';
+
+  async function handleApplyAll() {
+    if (busy || !client.applyAllSwarmArtifacts || !applyState.canApplyAll) return;
+    if (!window.confirm(`确认将 ${applyState.unappliedCount} 个已验产物（涉及 ${changedFiles.length} 个文件）应用到父工作区？`)) {
+      return;
+    }
+    setBusy(true);
+    setFeedback(undefined);
+    try {
+      const result = await client.applyAllSwarmArtifacts(run.id, { approved: true });
+      const nextFeedback = formatSwarmApplyAllFeedback(result, applyState.unappliedCount);
+      setFeedback(nextFeedback);
+      onReloadDelivery();
+      if (!nextFeedback.failed) onRefresh();
+    } catch (error) {
+      setFeedback({ text: errorText(error), failed: true });
+      onReloadDelivery();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <div className="autonomous-section">
+    {state.error && <p className="autonomous-error" role="alert">交付审查刷新失败。{state.error}</p>}
+    <div className="autonomous-toolbar">
+      {applyState.canApplyAll && client.applyAllSwarmArtifacts && <>
+        <Button onClick={() => void handleApplyAll()} disabled={busy}>
+          <IconCheck size={14} aria-hidden="true" />应用全部已验产物
+        </Button>
+        <small>待应用 {applyState.unappliedCount} 个产物</small>
+      </>}
+      {applyState.allApplied && <small role="status">所有已验产物均已应用到父工作区。</small>}
+    </div>
+    {feedback && <p role={feedback.failed ? 'alert' : 'status'} className={feedback.failed ? 'autonomous-error' : undefined}>{feedback.text}</p>}
+
+    {applyState.hasConflicts && <section aria-label="文件冲突警告">
+      <h3 className="codex-subagent-section-head swarm-section-heading autonomous-error">
+        <IconShieldAlert size={14} aria-hidden="true" />文件冲突警告 · {applyState.conflicts.length}
+      </h3>
+      <ul className="autonomous-list" role="alert">
+        {applyState.conflicts.map((conflict, index) => <li key={`${conflict.path}-${index}`} className="swarm-row-detail">
+          <p className="autonomous-error"><code>{conflict.path}</code> · {conflict.reason}</p>
+          {conflict.nodeKeys.length > 0 && <div className="swarm-dependencies">
+            <small>涉及节点</small>
+            {conflict.nodeKeys.map((key) => <code key={key}>{key}</code>)}
+          </div>}
+        </li>)}
+      </ul>
+    </section>}
+
+    <h3 className="codex-subagent-section-head swarm-section-heading">
+      <IconFileDoc size={14} aria-hidden="true" />变更文件 · {changedFiles.length}
+    </h3>
+    {changedFiles.length > 0 ? <ul className="autonomous-list" aria-label="变更文件">
+      {changedFiles.map((file, index) => <li key={`${file.artifactId}-${file.path}-${index}`} className="swarm-row-detail">
+        <div className="swarm-run-meta">
+          <span>
+            <code>{status(file.changeType || 'modified')}</code>{' '}
+            <code>{file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}</code>
+          </span>
+          <small>{file.nodeKey}{file.sha256 ? ` · ${file.sha256.slice(0, 8)}` : ''}</small>
+        </div>
+      </li>)}
+    </ul> : <p><small>暂无变更文件。</small></p>}
+
+    <h3 className="codex-subagent-section-head swarm-section-heading">
+      <IconShieldCheck size={14} aria-hidden="true" />测试与验证结果 · {testResults.length}
+    </h3>
+    {testResults.length > 0 ? <ul className="autonomous-list" aria-label="测试与验证结果">
+      {testResults.map((result, index) => <li key={`${result.nodeKey}-${index}`}>
+        <details>
+          <summary className="codex-subagent-list-row swarm-row">
+            <RowContents
+              icon={<IconTerminal size={15} />}
+              title={result.command || result.nodeKey}
+              detail={[result.nodeKey, result.exitCode != null ? `exit ${result.exitCode}` : ''].filter(Boolean).join(' · ')}
+              end={<RunStatus value={result.status} />}
+              expandable
+            />
+          </summary>
+          <div className="swarm-row-detail">
+            <p>{result.summary || '无输出摘要。'}</p>
+          </div>
+        </details>
+      </li>)}
+    </ul> : <p><small>暂无测试执行记录。</small></p>}
+
+    {reviewerVerdicts.length > 0 && <>
+      <h3 className="codex-subagent-section-head swarm-section-heading">
+        <IconShieldCheck size={14} aria-hidden="true" />独立审查 · {reviewerVerdicts.length}
+      </h3>
+      <ReviewerVerdictList verdicts={reviewerVerdicts} />
+    </>}
+
+    <h3 className="codex-subagent-section-head swarm-section-heading">
+      <IconDiffBox size={14} aria-hidden="true" />统一 Diff 预览
+    </h3>
+    {diffPreview ? <div className="autonomous-preview">
+      <pre>{diffPreview.slice(0, 60000)}{diffPreview.length > 60000 && '\n…（预览已截断）'}</pre>
+    </div> : <p><small>暂无统一 Diff 预览。</small></p>}
+  </div>;
 }
 
 type SectionData = SwarmArtifactRecord[] | SwarmMessageRecord[] | SwarmReplanRecord[];

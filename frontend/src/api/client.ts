@@ -1,4 +1,4 @@
-import { swarmWorkerStatus } from '../utils/subagentProgress';
+import { swarmWorkerStatus } from '../utils/subagentProgress.ts';
 import type {
   AccountBalance,
   Approval,
@@ -42,10 +42,14 @@ import type {
   SessionHistoryItem,
   SessionRecord,
   Submission,
+  SwarmApplyAllResult,
   SwarmArtifactFile,
   SwarmArtifactRecord,
+  SwarmDeliveryRecord,
   SwarmMessageRecord,
   SwarmReplanRecord,
+  SwarmRepoContext,
+  SwarmReviewerVerdict,
   McpServerStatus,
   WorkspaceEntryKind,
   SwarmRunRecord,
@@ -58,8 +62,8 @@ import type {
   UsageItem,
   Worker,
 } from '../types/backend';
-import { createRuntimeClient } from './runtimeClient';
-import { normalizeLegacyWorkerRole, resolveWorkerIdFromPayload } from '../utils/worker';
+import { createRuntimeClient } from './runtimeClient.ts';
+import { normalizeLegacyWorkerRole, resolveWorkerIdFromPayload } from '../utils/worker.ts';
 
 export class ApiError extends Error {
   status: number;
@@ -190,6 +194,11 @@ export interface AgentBackendClient {
     artifactId: string,
     input?: { permissionMode?: string; approved?: boolean; targetWorkspaceRoot?: string },
   ) => Promise<Record<string, unknown>>;
+  getSwarmDelivery?: (id: string, signal?: AbortSignal) => Promise<SwarmDeliveryRecord>;
+  applyAllSwarmArtifacts?: (
+    runId: string,
+    input: { approved: boolean; stopOnConflict?: boolean; permissionMode?: string },
+  ) => Promise<SwarmApplyAllResult>;
   listSessionNotifications?: (sessionId: string, unreadOnly?: boolean) => Promise<ChildNotificationRecord[]>;
   listSchedules?: () => Promise<BackendScheduleRecord[]>;
   createSchedule?: (input: {
@@ -623,9 +632,17 @@ export class LiveBackendClient implements AgentBackendClient {
       try {
         const data = (await response.json()) as {
           error?: { code?: string; message?: string; requestId?: string };
+          message?: unknown;
+          errors?: unknown[];
         };
         code = data.error?.code ?? code;
-        message = data.error?.message;
+        message =
+          data.error?.message ??
+          (typeof data.message === 'string' && data.message.trim()
+            ? data.message
+            : Array.isArray(data.errors) && data.errors.length
+              ? data.errors.map(String).join('；')
+              : undefined);
         requestId = data.error?.requestId;
       } catch {
         /* non-JSON response */
@@ -1033,6 +1050,24 @@ export class LiveBackendClient implements AgentBackendClient {
     input?: { permissionMode?: string; approved?: boolean; targetWorkspaceRoot?: string },
   ) {
     return this.rt.applySwarmArtifact(runId, artifactId, input);
+  }
+
+  async getSwarmDelivery(id: string, signal?: AbortSignal): Promise<SwarmDeliveryRecord> {
+    const raw = await this.req<Partial<SwarmDeliveryRecord>>(
+      'GET',
+      `/v1/swarm/runs/${encodeURIComponent(id)}/delivery`,
+      { signal },
+    );
+    return normalizeSwarmDelivery(raw, id);
+  }
+
+  applyAllSwarmArtifacts(
+    runId: string,
+    input: { approved: boolean; stopOnConflict?: boolean; permissionMode?: string },
+  ): Promise<SwarmApplyAllResult> {
+    return this.req('POST', `/v1/swarm/runs/${encodeURIComponent(runId)}/artifacts/apply-all`, {
+      body: input,
+    });
   }
 
   listSessionNotifications(sessionId: string, unreadOnly = false) {
@@ -1936,4 +1971,218 @@ export class LiveBackendClient implements AgentBackendClient {
       controller?.abort();
     };
   }
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : undefined;
+}
+
+function maxFiniteNumber(first: unknown, second: unknown): number | undefined {
+  const a = finiteNumber(first);
+  const b = finiteNumber(second);
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.max(a, b);
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+export function normalizeSwarmRepoContext(raw: unknown): SwarmRepoContext | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const branch = typeof record.branch === 'string' && record.branch.trim() ? record.branch.trim() : null;
+  const headSha = typeof record.headSha === 'string' && record.headSha.trim() ? record.headSha.trim() : null;
+  const summaryText = typeof record.summaryText === 'string' && record.summaryText.trim() ? record.summaryText.trim() : null;
+  const testCommands = stringList(record.testCommands);
+  const buildCommands = stringList(record.buildCommands);
+  const entryPoints = stringList(record.entryPoints);
+  const relevantFiles = stringList(record.relevantFiles);
+  if (!branch && !headSha && !summaryText && !testCommands.length && !buildCommands.length && !entryPoints.length && !relevantFiles.length) {
+    return null;
+  }
+  return {
+    branch,
+    headSha,
+    testCommands,
+    buildCommands,
+    entryPoints,
+    relevantFiles,
+    summaryText,
+  };
+}
+
+export function normalizeSwarmDelivery(
+  raw: Partial<SwarmDeliveryRecord> | null | undefined,
+  fallbackRunId = '',
+): SwarmDeliveryRecord {
+  const record = raw && typeof raw === 'object' ? raw : {};
+  return {
+    runId: String(record.runId ?? fallbackRunId),
+    status: String(record.status ?? 'unknown'),
+    goal: String(record.goal ?? ''),
+    planVersion: finiteNumber(record.planVersion),
+    repoContext: normalizeSwarmRepoContext(record.repoContext),
+    changedFiles: Array.isArray(record.changedFiles) ? record.changedFiles : [],
+    conflicts: Array.isArray(record.conflicts) ? record.conflicts : [],
+    unifiedDiffPreview: typeof record.unifiedDiffPreview === 'string' ? record.unifiedDiffPreview : '',
+    testResults: Array.isArray(record.testResults) ? record.testResults : [],
+    reviewerVerdicts: Array.isArray(record.reviewerVerdicts) ? record.reviewerVerdicts : [],
+    verdict: record.verdict ?? null,
+    usage: record.usage && typeof record.usage === 'object' ? record.usage : {},
+    artifacts: Array.isArray(record.artifacts) ? record.artifacts : [],
+  };
+}
+
+export function getSwarmDeliveryApplyState(delivery: SwarmDeliveryRecord | null | undefined) {
+  const conflicts = Array.isArray(delivery?.conflicts) ? delivery.conflicts : [];
+  const artifacts = Array.isArray(delivery?.artifacts) ? delivery.artifacts : [];
+  const unappliedArtifacts = artifacts.filter((artifact) => {
+    if (!artifact || typeof artifact !== 'object') return false;
+    if (artifact.appliedAt) return false;
+    if (artifact.status === 'applied' || artifact.status === 'superseded' || artifact.status === 'archived') {
+      return false;
+    }
+    const fileCount = finiteNumber(artifact.fileCount);
+    const hasFilesArray = Array.isArray(artifact.files) && artifact.files.length > 0;
+    return fileCount === undefined || fileCount > 0 || hasFilesArray;
+  });
+  const hasConflicts = conflicts.length > 0;
+  const unappliedCount = unappliedArtifacts.length;
+  return {
+    conflicts,
+    artifacts,
+    unappliedArtifacts,
+    unappliedCount,
+    hasConflicts,
+    canApplyAll: !hasConflicts && unappliedCount > 0,
+    allApplied: !hasConflicts && artifacts.length > 0 && unappliedCount === 0,
+  };
+}
+
+export interface SwarmTelemetrySummary {
+  steps?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  completedNodes?: number;
+  replanCount?: number;
+  branch: string | null;
+  headSha: string | null;
+  testCommands: string[];
+  entryPoints: string[];
+  relevantFiles: string[];
+  hasTelemetry: boolean;
+}
+
+export function extractSwarmTelemetry(
+  run: Partial<SwarmRunRecord> | null | undefined,
+  delivery?: Partial<SwarmDeliveryRecord> | null,
+): SwarmTelemetrySummary {
+  const runUsage = (run?.usage && typeof run.usage === 'object' ? run.usage : {}) as Record<string, unknown>;
+  const delUsage = (delivery?.usage && typeof delivery.usage === 'object' ? delivery.usage : {}) as Record<string, unknown>;
+  const steps = maxFiniteNumber(runUsage.steps, delUsage.steps);
+  const inputTokens = maxFiniteNumber(runUsage.inputTokens, delUsage.inputTokens);
+  const outputTokens = maxFiniteNumber(runUsage.outputTokens, delUsage.outputTokens);
+  const explicitTotal = maxFiniteNumber(runUsage.totalTokens, delUsage.totalTokens);
+  const totalTokens =
+    explicitTotal ??
+    (inputTokens !== undefined || outputTokens !== undefined
+      ? (inputTokens ?? 0) + (outputTokens ?? 0)
+      : undefined);
+  const completedNodes = maxFiniteNumber(runUsage.completedNodes, delUsage.completedNodes);
+  const replanCount = maxFiniteNumber(
+    run?.replanCount ?? runUsage.replanCount,
+    delUsage.replanCount,
+  );
+  const strategyRepo =
+    run?.strategy && typeof run.strategy === 'object'
+      ? (run.strategy as Record<string, unknown>).repoContext
+      : undefined;
+  const repoContext =
+    normalizeSwarmRepoContext(run?.repoContext) ??
+    normalizeSwarmRepoContext(delivery?.repoContext) ??
+    normalizeSwarmRepoContext(strategyRepo);
+  const branch = repoContext?.branch ?? null;
+  const headSha = repoContext?.headSha ?? null;
+  const testCommands = repoContext?.testCommands ?? [];
+  const entryPoints = repoContext?.entryPoints ?? [];
+  const relevantFiles = repoContext?.relevantFiles ?? [];
+  const hasTelemetry =
+    steps !== undefined ||
+    totalTokens !== undefined ||
+    replanCount !== undefined ||
+    Boolean(branch) ||
+    testCommands.length > 0;
+  return {
+    steps,
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    completedNodes,
+    replanCount,
+    branch,
+    headSha,
+    testCommands,
+    entryPoints,
+    relevantFiles,
+    hasTelemetry,
+  };
+}
+
+export function collectSwarmReviewerVerdicts(
+  run: Partial<SwarmRunRecord> | null | undefined,
+  delivery?: Partial<SwarmDeliveryRecord> | null,
+): SwarmReviewerVerdict[] {
+  const fromRun = run?.verdict?.reviewerVerdicts;
+  const fromDelivery = delivery?.reviewerVerdicts ?? delivery?.verdict?.reviewerVerdicts;
+  const list = Array.isArray(fromRun) && fromRun.length > 0 ? fromRun : Array.isArray(fromDelivery) ? fromDelivery : [];
+  return list.filter((item): item is SwarmReviewerVerdict => Boolean(item && typeof item === 'object'));
+}
+
+export function isUnsupportedSwarmEndpointError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  if (error.status === 405 || error.status === 501) return true;
+  if (error.status === 404 && error.code !== 'SWARM_RUN_NOT_FOUND') return true;
+  return false;
+}
+
+export function formatSwarmApplyAllFeedback(
+  result: SwarmApplyAllResult,
+  fallbackAppliedCount = 0,
+): { text: string; failed: boolean } {
+  const conflictsCount = Array.isArray(result.conflicts) ? result.conflicts.length : 0;
+  const errors = Array.isArray(result.errors) ? result.errors.map(String).filter(Boolean) : [];
+  if (!result.ok || conflictsCount > 0 || errors.length > 0 || result.status === 'conflict') {
+    const details = [
+      conflictsCount > 0 ? `检测到 ${conflictsCount} 处文件冲突` : '',
+      errors.length > 0 ? errors.join('；') : '',
+    ].filter(Boolean).join('：');
+    return {
+      text: details || '批量应用产物未完成，请先处理冲突或未校验项。',
+      failed: true,
+    };
+  }
+  const appliedCount = Array.isArray(result.appliedArtifacts) ? result.appliedArtifacts.length : fallbackAppliedCount;
+  const filesCount = Array.isArray(result.appliedFiles) ? result.appliedFiles.length : 0;
+  return {
+    text: filesCount > 0
+      ? `已将 ${appliedCount} 个产物（${filesCount} 个文件）应用到父工作区。`
+      : `已将 ${appliedCount} 个产物应用到父工作区。`,
+    failed: false,
+  };
 }

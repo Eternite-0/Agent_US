@@ -714,6 +714,8 @@ export interface SwarmNodeRecord {
   runId: string;
   nodeKey: string;
   agentProfileId: string;
+  taskType?: string;
+  roleTitle?: string | null;
   childSessionId?: string | null;
   model?: string | null;
   provider?: string | null;
@@ -780,6 +782,111 @@ export interface SwarmMessageRecord {
   createdAt: number;
 }
 
+export interface SwarmRepoContext {
+  branch?: string | null;
+  headSha?: string | null;
+  testCommands?: string[];
+  buildCommands?: string[];
+  entryPoints?: string[];
+  relevantFiles?: string[];
+  summaryText?: string | null;
+}
+
+export interface SwarmReviewerFinding {
+  severity: string;
+  message: string;
+  evidenceRef?: string;
+}
+
+export interface SwarmReviewerVerdict {
+  nodeKey: string;
+  nodeStatus?: string;
+  status: string;
+  summary?: string;
+  reviewerModel?: string;
+  checkedArtifacts?: string[];
+  evidenceRefs?: string[];
+  findings?: SwarmReviewerFinding[];
+  validatedAt?: number;
+}
+
+export interface SwarmUsageSummary {
+  steps?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  completedNodes?: number;
+  replanCount?: number;
+  reservedSteps?: number;
+  reservedTokens?: number;
+}
+
+export interface SwarmRunVerdict {
+  verdict: string;
+  accepted: boolean;
+  reasons?: string[];
+  verificationMode?: string;
+  evidenceCount?: number;
+  reviewerVerdicts?: SwarmReviewerVerdict[];
+  independentReviewerVerdict?: {
+    status: string;
+    source?: string;
+    reviewerModels?: string[];
+    evidenceRefs?: string[];
+    evidenceDigests?: string[];
+  };
+}
+
+export interface SwarmDeliveryChangedFile {
+  path: string;
+  changeType: string;
+  previousPath?: string | null;
+  sha256?: string | null;
+  nodeKey: string;
+  artifactId: string;
+  uri: string;
+}
+
+export interface SwarmDeliveryConflict {
+  path: string;
+  nodeKeys: string[];
+  reason: string;
+}
+
+export interface SwarmDeliveryTestResult {
+  nodeKey: string;
+  command?: string;
+  exitCode?: number | null;
+  status: string;
+  summary?: string;
+}
+
+export interface SwarmDeliveryRecord {
+  runId: string;
+  status: string;
+  goal: string;
+  planVersion?: number;
+  repoContext?: SwarmRepoContext | null;
+  changedFiles?: SwarmDeliveryChangedFile[];
+  conflicts?: SwarmDeliveryConflict[];
+  unifiedDiffPreview?: string;
+  testResults?: SwarmDeliveryTestResult[];
+  reviewerVerdicts?: SwarmReviewerVerdict[];
+  verdict?: SwarmRunVerdict | null;
+  usage?: SwarmUsageSummary & Record<string, unknown>;
+  artifacts?: SwarmArtifactRecord[];
+}
+
+export interface SwarmApplyAllResult {
+  ok: boolean;
+  status: string;
+  runId: string;
+  appliedArtifacts?: unknown[];
+  appliedFiles?: unknown[];
+  conflicts?: unknown[];
+  errors?: unknown[];
+}
+
 export interface SwarmRunRecord {
   id: string;
   sessionId: string;
@@ -790,8 +897,10 @@ export interface SwarmRunRecord {
   replanCount?: number;
   errorCode?: string | null;
   errorMessage?: string | null;
-  usage: Record<string, unknown>;
-  verdict?: { verdict: string; accepted: boolean; reasons?: string[]; verificationMode?: string } | null;
+  repoContext?: SwarmRepoContext | null;
+  strategy?: Record<string, unknown>;
+  usage: SwarmUsageSummary & Record<string, unknown>;
+  verdict?: SwarmRunVerdict | null;
   nodes: SwarmNodeRecord[];
   createdAt: number;
   updatedAt: number;
