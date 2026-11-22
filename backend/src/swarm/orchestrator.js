@@ -2626,7 +2626,23 @@ export class AdaptiveSwarmOrchestrator {
       : Array.isArray(node.dependencies)
         ? node.dependencies
         : [];
-    const sourceNodeKeys = [...new Set(rawSourceKeys.map(String).filter(Boolean))];
+    const visited = new Set();
+    const sourceNodeKeys = [];
+    const visit = (key, isDirect = false) => {
+      const k = String(key || '').trim();
+      if (!k || visited.has(k)) return;
+      const target = byKey.get(k);
+      if (!target) return;
+      if (!isDirect && target.status === SWARM_NODE_STATES.SUPERSEDED) return;
+      visited.add(k);
+      if (Array.isArray(target.dependencies)) {
+        for (const dep of target.dependencies) {
+          visit(dep, false);
+        }
+      }
+      sourceNodeKeys.push(k);
+    };
+    for (const k of rawSourceKeys) visit(k, true);
     if (sourceNodeKeys.length === 0) return null;
 
     const sourceNodes = sourceNodeKeys.map((key) => byKey.get(key)).filter(Boolean);
@@ -2672,10 +2688,11 @@ export class AdaptiveSwarmOrchestrator {
                   outputDigest, errorCode, createdAt, updatedAt
            FROM tool_receipts
            WHERE turnId IN (${childTurnIds.map(() => '?').join(',')})${sessionClause}
-           ORDER BY createdAt ASC
-           LIMIT 200`,
+           ORDER BY createdAt DESC
+           LIMIT 500`,
         )
-        .all(...childTurnIds, ...childSessionIds);
+        .all(...childTurnIds, ...childSessionIds)
+        .reverse();
     } else if (childSessionIds.length > 0) {
       receiptRows = this.store.db
         .prepare(
@@ -2683,10 +2700,11 @@ export class AdaptiveSwarmOrchestrator {
                   outputDigest, errorCode, createdAt, updatedAt
            FROM tool_receipts
            WHERE sessionId IN (${childSessionIds.map(() => '?').join(',')})
-           ORDER BY createdAt ASC
-           LIMIT 200`,
+           ORDER BY createdAt DESC
+           LIMIT 500`,
         )
-        .all(...childSessionIds);
+        .all(...childSessionIds)
+        .reverse();
     }
 
     const verdictRows = childTurnIds.length

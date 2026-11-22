@@ -471,3 +471,167 @@ test('High-risk reviewer routing selects a distinct healthy model and tracks rev
     store.close();
   }
 });
+
+test('Swarm reviewer accepts transitive upstream artifacts in 3-hop DAG while blocking fabricated URIs', async (t) => {
+  // 1. Valid transitive ancestor artifact reference passes
+  let transitiveManifest = null;
+  const { direct: directOk } = createTwoModelEnv(async function* (opts) {
+    const messages = opts.messages ?? [];
+    const userText = messages.findLast((m) => m.role === 'user')?.content?.[0]?.text ?? '';
+    const lastRole = messages.at(-1)?.role;
+
+    if (userText.includes('[Durable evidence manifest]')) {
+      const manifestMatch = /\[Durable evidence manifest\]\s*\n+([\s\S]+)$/.exec(userText);
+      transitiveManifest = manifestMatch ? JSON.parse(manifestMatch[1].trim()) : { artifacts: [] };
+      const implArt = transitiveManifest.artifacts?.find((a) => a.nodeKey === 'impl');
+      if (lastRole !== 'tool' && implArt) {
+        yield {
+          type: 'block-end',
+          index: 0,
+          block: {
+            type: 'tool-call',
+            id: 'tc-rev-trans',
+            name: 'read_swarm_artifact',
+            arguments: JSON.stringify({ uri: implArt.uri, path: 'src/trans.js' }),
+          },
+        };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      const digest = computeReviewerEvidenceDigest(transitiveManifest);
+      yield {
+        type: 'text-delta',
+        index: 0,
+        text: JSON.stringify({
+          schemaVersion: REVIEWER_SCHEMA_VERSION,
+          verdict: 'pass',
+          summary: 'Verified transitive impl artifact across verification hop',
+          evidenceDigest: digest,
+          checkedArtifacts: implArt ? [implArt.uri] : [],
+          evidenceRefs: [],
+          findings: [],
+        }),
+      };
+      yield { type: 'usage', usage: { inputTokens: 15, outputTokens: 12 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
+    }
+
+    if (userText.includes('WORK_IMPL') && lastRole !== 'tool') {
+      yield {
+        type: 'block-end',
+        index: 0,
+        block: {
+          type: 'tool-call',
+          id: 'tc-w-trans',
+          name: 'write_file',
+          arguments: JSON.stringify({ path: 'src/trans.js', content: 'export const trans = 42;\n' }),
+        },
+      };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+
+    yield { type: 'text-delta', index: 0, text: 'node ok' };
+    yield { type: 'usage', usage: { inputTokens: 8, outputTokens: 5 } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  }, t);
+
+  const sOk = directOk.createSession({ permissionMode: 'auto-safe' });
+  const okRun = await directOk.swarmOrchestrator.startRun({
+    sessionId: sOk.id,
+    goal: '3-hop transitive reviewer artifact verification',
+    maxConcurrency: 2,
+    budget: { strictReviewerSchema: true },
+    nodes: [
+      { nodeKey: 'impl', taskType: 'implementation', objective: 'WORK_IMPL', dependencies: [], isolationMode: 'worktree', priority: 20 },
+      { nodeKey: 'verify', taskType: 'verification', objective: 'VERIFY_ONLY', dependencies: ['impl'], isolationMode: 'worktree', priority: 10 },
+      { nodeKey: 'review', taskType: 'review', objective: 'REVIEW_TRANSITIVE', dependencies: ['verify'], permissionMode: 'read-only', priority: 5 },
+    ],
+  });
+  assert.equal(okRun.status, 'completed', `Unexpected run status: ${okRun.errorMessage}`);
+  const implArt = transitiveManifest?.artifacts?.find((a) => a.nodeKey === 'impl');
+  assert.ok(implArt, 'Expected transitive impl artifact inside reviewer evidence manifest');
+  const revNode = okRun.nodes.find((n) => n.nodeKey === 'review');
+  const revBudget = JSON.parse(revNode.budgetJson);
+  assert.equal(revBudget.reviewerVerdict.status, 'pass');
+  assert.ok(revBudget.reviewerVerdict.checkedArtifacts.includes(implArt.uri));
+
+  // 2. Fabricated URI still triggers REVIEWER_EVIDENCE_TAMPERED
+  const { direct: directBad } = createTwoModelEnv(async function* (opts) {
+    const messages = opts.messages ?? [];
+    const userText = messages.findLast((m) => m.role === 'user')?.content?.[0]?.text ?? '';
+    const lastRole = messages.at(-1)?.role;
+
+    if (userText.includes('[Durable evidence manifest]')) {
+      const manifestMatch = /\[Durable evidence manifest\]\s*\n+([\s\S]+)$/.exec(userText);
+      const manifest = manifestMatch ? JSON.parse(manifestMatch[1].trim()) : { artifacts: [] };
+      const implArt2 = manifest.artifacts?.find((a) => a.nodeKey === 'impl');
+      if (lastRole !== 'tool' && implArt2) {
+        yield {
+          type: 'block-end',
+          index: 0,
+          block: {
+            type: 'tool-call',
+            id: 'tc-rev-bad',
+            name: 'read_swarm_artifact',
+            arguments: JSON.stringify({ uri: implArt2.uri, path: 'src/trans.js' }),
+          },
+        };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      const digest = computeReviewerEvidenceDigest(manifest);
+      yield {
+        type: 'text-delta',
+        index: 0,
+        text: JSON.stringify({
+          schemaVersion: REVIEWER_SCHEMA_VERSION,
+          verdict: 'pass',
+          summary: 'Citing fabricated artifact URI',
+          evidenceDigest: digest,
+          checkedArtifacts: ['swarm-artifact://fabricated/nonexistent-id'],
+          evidenceRefs: [],
+          findings: [],
+        }),
+      };
+      yield { type: 'usage', usage: { inputTokens: 15, outputTokens: 12 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
+    }
+
+    if (userText.includes('WORK_IMPL') && lastRole !== 'tool') {
+      yield {
+        type: 'block-end',
+        index: 0,
+        block: {
+          type: 'tool-call',
+          id: 'tc-w-bad',
+          name: 'write_file',
+          arguments: JSON.stringify({ path: 'src/trans.js', content: 'export const trans = 42;\n' }),
+        },
+      };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+
+    yield { type: 'text-delta', index: 0, text: 'node ok' };
+    yield { type: 'usage', usage: { inputTokens: 8, outputTokens: 5 } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  }, t);
+
+  const sBad = directBad.createSession({ permissionMode: 'auto-safe' });
+  const badRun = await directBad.swarmOrchestrator.startRun({
+    sessionId: sBad.id,
+    goal: '3-hop fabricated reviewer artifact rejection',
+    maxConcurrency: 2,
+    budget: { strictReviewerSchema: true },
+    nodes: [
+      { nodeKey: 'impl', taskType: 'implementation', objective: 'WORK_IMPL', dependencies: [], isolationMode: 'worktree', priority: 20 },
+      { nodeKey: 'verify', taskType: 'verification', objective: 'VERIFY_ONLY', dependencies: ['impl'], isolationMode: 'worktree', priority: 10 },
+      { nodeKey: 'review', taskType: 'review', objective: 'REVIEW_FABRICATED', dependencies: ['verify'], permissionMode: 'read-only', priority: 5 },
+    ],
+  });
+  assert.equal(badRun.status, 'failed');
+  assert.equal(badRun.errorCode, 'REVIEWER_EVIDENCE_TAMPERED');
+});
