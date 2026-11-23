@@ -258,11 +258,14 @@ export async function loadAndProbeWorktreeArm(worktreeRoot) {
         { role: 'tool', toolCallId: 'r1', content: [{ type: 'text', text: longBody }] },
         { role: 'assistant', content: [{ type: 'tool-call', id: 'r2', name: 'read_file', arguments: JSON.stringify({ path: 'src/a.js' }) }] },
         { role: 'tool', toolCallId: 'r2', content: [{ type: 'text', text: longBody }] },
-        { role: 'assistant', content: [{ type: 'text', text: 'Recent step' }] },
-        { role: 'user', content: [{ type: 'text', text: 'Continue' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Recent step ' + 'x'.repeat(300) }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'Continue ' + 'y'.repeat(300) }] },
       ];
-      const res = contextMod.compactTwoStage(msgs, { softLimitTokens: 200, hardLimitTokens: 500, keepRecent: 2 });
-      const compactedText = JSON.stringify(res?.messages ?? []);
+      const res = await contextMod.compactTwoStage(
+        { messages: msgs },
+        { contextWindow: 2200, reserveTokens: 256, keepRecentTokens: 120 },
+      );
+      const compactedText = JSON.stringify(res?.options?.messages ?? []);
       capabilities.smartCompactionReadDedup = /superseded read_file/i.test(compactedText);
     }
   } catch {
@@ -290,8 +293,20 @@ export async function loadAndProbeWorktreeArm(worktreeRoot) {
 
   capabilities.experienceDistillation =
     typeof memoryMod.ExperienceMemoryService?.prototype?.distillTurnExperience === 'function';
-  capabilities.richCompactionAnchor =
-    typeof compactionMod.MultiStageCompactor?.prototype?.extractTaskStateAnchor === 'function';
+  try {
+    if (typeof compactionMod.MultiStageCompactor === 'function') {
+      const anchorProbe = new compactionMod.MultiStageCompactor({ store: null });
+      const anchor = anchorProbe.extractTaskStateAnchor(null);
+      capabilities.richCompactionAnchor = Boolean(
+        anchor &&
+          typeof anchor === 'object' &&
+          'verificationLedger' in anchor &&
+          'falsifiedAttempts' in anchor,
+      );
+    }
+  } catch {
+    capabilities.richCompactionAnchor = false;
+  }
 
   return {
     root,
@@ -478,6 +493,70 @@ class DeterministicProbeAdapter extends LlmAdapter {
   }
 }
 
+export function recordArmExperienceMemory({
+  store,
+  memory,
+  task,
+  armName,
+  rep,
+  workspaceRoot,
+  verdict,
+  reasoningMetrics = null,
+  toolReceipts = [],
+  modifiedFiles = [],
+  passed = false,
+  reason = '',
+  now = Date.now(),
+}) {
+  if (typeof memory.distillTurnExperience === 'function') {
+    const evaluationRunId = `eval-${armName}-${rep}-${task.id}`;
+    if (passed && typeof store?.add === 'function') {
+      store.add(
+        'evaluation_runs',
+        {
+          id: evaluationRunId,
+          benchmarkId: AUTONOMOUS_REASONING_BENCHMARK_ID,
+          benchmarkVersion: VERSION,
+          status: 'completed',
+          projectId: task.id,
+          evaluationProjectId: task.id,
+          synthetic: true,
+          score: { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 },
+          results: [{ taskId: task.id, status: 'passed', passed: true }],
+          createdAt: now,
+          finishedAt: Date.now(),
+        },
+        null,
+        null,
+        evaluationRunId,
+      );
+    }
+    const distilled = memory.distillTurnExperience({
+      projectId: task.id,
+      input: task.objective,
+      workspaceRoot,
+      verdict,
+      reasoningMetrics,
+      toolReceipts,
+      modifiedFiles,
+      evaluationEvidence: passed
+        ? {
+            sourceTaskId: task.id,
+            evaluationRunId,
+            projectId: task.id,
+            score: { total: 1, passed: 1 },
+          }
+        : null,
+    });
+    return Array.isArray(distilled) ? distilled.length > 0 : Boolean(distilled);
+  }
+  const items = memory.extract(`[lesson] ${task.id}: ${passed ? 'passed' : reason}`, {
+    projectId: task.id,
+    source: 'deterministic_probe',
+  });
+  return items.length > 0;
+}
+
 async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeSandbox }) {
   const started = performance.now();
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-ar-det-${armName}-`));
@@ -524,15 +603,22 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
           .run(sessionId, turnId, i % 2 === 0 ? 'user' : 'assistant', i === 0 ? task.prompt : `Step ${i} verification note`, now + i);
       }
       const compacted = await compactor.compactSession(sessionId, { keepRecent: 2 });
-      const twoStage = compactTwoStage(
-        [
-          { role: 'user', content: [{ type: 'text', text: task.prompt }] },
-          { role: 'assistant', content: [{ type: 'text', text: 'Tracing constraints' }] },
-          { role: 'user', content: [{ type: 'text', text: 'Proceed' }] },
-        ],
-        { keepRecent: 1 },
+      const twoStage = await compactTwoStage(
+        {
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: task.objective }] },
+            { role: 'assistant', content: [{ type: 'tool-call', id: 'probe-bash-1', name: 'bash', arguments: '{"command":"node --test"}' }] },
+            { role: 'tool', toolCallId: 'probe-bash-1', content: [{ type: 'text', text: 'LOG_LINE\n'.repeat(1200) }] },
+            { role: 'user', content: [{ type: 'text', text: 'Proceed with verification ' + 'E'.repeat(900) }] },
+          ],
+        },
+        { contextWindow: 3000, reserveTokens: 512, keepRecentTokens: 200 },
       );
-      compactionProbe = { compacted: Boolean(compacted?.compacted), stage: twoStage?.stage ?? 'none' };
+      compactionProbe = {
+        compacted: Boolean(compacted?.compacted),
+        stage: twoStage?.stage ?? 'none',
+        twoStageCompacted: Boolean(twoStage?.compacted),
+      };
     }
 
     // Exercise AdaptiveReplanner on recovery/multi-agent tasks
@@ -659,28 +745,21 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
 
     // Exercise ExperienceMemoryService distillation/fallback
     const memory = new ExperienceMemoryService({ store, projectId: task.id });
-    let memoryRecorded = false;
-    if (typeof memory.distillTurnExperience === 'function') {
-      const distilled = memory.distillTurnExperience({
-        projectId: task.id,
-        input: task.objective,
-        workspaceRoot,
-        verdict: loopResult.verdict,
-        reasoningMetrics: loopResult.reasoningMetrics ?? null,
-        toolReceipts: enrichedReceipts,
-        modifiedFiles: judgment.evidence.actualChangedFiles,
-        evaluationEvidence: judgment.passed
-          ? { sourceTaskId: task.id, evaluationRunId: `eval-${armName}-${rep}`, projectId: task.id, score: { total: 1, passed: 1 } }
-          : null,
-      });
-      memoryRecorded = Boolean(distilled);
-    } else {
-      const items = memory.extract(`[lesson] ${task.id}: ${judgment.passed ? 'passed' : judgment.reason}`, {
-        projectId: task.id,
-        source: 'deterministic_probe',
-      });
-      memoryRecorded = items.length > 0;
-    }
+    const memoryRecorded = recordArmExperienceMemory({
+      store,
+      memory,
+      task,
+      armName,
+      rep,
+      workspaceRoot,
+      verdict: loopResult.verdict,
+      reasoningMetrics: loopResult.reasoningMetrics ?? null,
+      toolReceipts: enrichedReceipts,
+      modifiedFiles: judgment.evidence.actualChangedFiles,
+      passed: Boolean(judgment.passed),
+      reason: judgment.reason,
+      now,
+    });
 
     const durationMs = Math.round(performance.now() - started);
     const rm = loopResult.reasoningMetrics ?? {};

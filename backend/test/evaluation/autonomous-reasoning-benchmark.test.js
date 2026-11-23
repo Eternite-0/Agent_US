@@ -39,8 +39,12 @@ import {
 import {
   loadAndProbeWorktreeArm,
   parseCliArgs,
+  recordArmExperienceMemory,
   runAutonomousReasoningBenchmark,
 } from '../../scripts/benchmark-autonomous-reasoning.mjs';
+import { Store } from '../../src/store.js';
+import { compactTwoStage } from '../../src/context.js';
+import { ExperienceMemoryService } from '../../src/memory/service.js';
 
 function buildTrustedContext(task, workspaceRoot, sandbox = null) {
   return {
@@ -553,8 +557,79 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     assert.equal(typeof probed.capabilities.executionReasoningTracker, 'boolean');
     assert.equal(typeof probed.capabilities.postEditStaleVerifier, 'boolean');
     assert.equal(typeof probed.capabilities.smartCompactionReadDedup, 'boolean');
+    assert.equal(typeof probed.capabilities.richCompactionAnchor, 'boolean');
     assert.equal(typeof probed.capabilities.degenerateReplanGuard, 'boolean');
     assert.equal(typeof probed.capabilities.experienceDistillation, 'boolean');
+
+    // Regression: compactTwoStage is async and expects { messages } returning { options: { messages }, stage }
+    const compacted = await compactTwoStage(
+      {
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'Inspect constraints carefully' }] },
+          { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'bash', arguments: '{"command":"node --test"}' }] },
+          { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'LOG_LINE\n'.repeat(1200) }] },
+          { role: 'user', content: [{ type: 'text', text: 'Finish ' + 'C'.repeat(900) }] },
+        ],
+      },
+      { contextWindow: 3000, reserveTokens: 512, keepRecentTokens: 200 },
+    );
+    assert.equal(compacted.compacted, true);
+    assert.notEqual(compacted.stage, 'none');
+    assert.ok(Array.isArray(compacted.options?.messages));
+
+    // Regression: recordArmExperienceMemory seeds evaluation_runs (synthetic: true, status: 'completed')
+    // before calling distillTurnExperience when available, and falls back cleanly on baseline.
+    const memDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-mem-'));
+    const memStore = new Store(join(memDir, 'mem.sqlite'));
+    try {
+      const task = AUTONOMOUS_REASONING_DATASET[0];
+      const baselineMem = new ExperienceMemoryService({ store: memStore, projectId: task.id });
+      if (typeof baselineMem.distillTurnExperience !== 'function') {
+        assert.equal(
+          recordArmExperienceMemory({
+            store: memStore,
+            memory: baselineMem,
+            task,
+            armName: 'baseline',
+            rep: 0,
+            workspaceRoot: memDir,
+            verdict: { verdict: 'pass', accepted: true },
+            passed: true,
+          }),
+          true,
+        );
+      }
+      const strictCandidateMem = {
+        distillTurnExperience({ projectId, evaluationEvidence }) {
+          assert.ok(evaluationEvidence?.evaluationRunId);
+          const run = memStore.get('evaluation_runs', evaluationEvidence.evaluationRunId);
+          assert.ok(run, 'evaluation_runs row must be seeded prior to distillTurnExperience');
+          assert.equal(run.status, 'completed');
+          assert.equal(run.synthetic, true);
+          assert.equal(run.projectId ?? run.evaluationProjectId, projectId);
+          assert.ok(
+            run.results.some((r) => r.taskId === evaluationEvidence.sourceTaskId && r.status === 'passed' && r.passed === true),
+          );
+          return [{ id: 'distilled-1', verified: true }];
+        },
+      };
+      assert.equal(
+        recordArmExperienceMemory({
+          store: memStore,
+          memory: strictCandidateMem,
+          task,
+          armName: 'candidate',
+          rep: 0,
+          workspaceRoot: memDir,
+          verdict: { verdict: 'pass', accepted: true },
+          passed: true,
+        }),
+        true,
+      );
+    } finally {
+      memStore.close();
+      rmSync(memDir, { recursive: true, force: true });
+    }
 
     const outDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-cli-out-'));
     const outPath = join(outDir, 'results.jsonl');
@@ -575,8 +650,12 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       assert.equal(summary.baseline.metrics.totalTrials, 2);
       assert.equal(summary.candidate.metrics.totalTrials, 2);
       assert.equal(summary.baseline.metrics.trials.length, 2);
-      const lines = readFileSync(outPath, 'utf8').trim().split(/\r?\n/);
+      const lines = readFileSync(outPath, 'utf8').trim().split(/\r?\n/).map((l) => JSON.parse(l));
       assert.equal(lines.length, 4);
+      const ar01Trial = lines.find((r) => r.taskId === 'ar-01-unfamiliar-codebase');
+      assert.equal(ar01Trial?.compactionProbe?.twoStageCompacted, true);
+      assert.notEqual(ar01Trial?.compactionProbe?.stage, 'none');
+      assert.equal(ar01Trial?.memoryRecorded, true);
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }
