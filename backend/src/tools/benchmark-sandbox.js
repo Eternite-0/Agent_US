@@ -1503,6 +1503,10 @@ export class DockerBenchmarkSandbox {
         onTimeoutOrAbort: forceRmContainer,
       });
 
+      if (result.timedOut || result.exitCode !== 0) {
+        forceRmContainer();
+      }
+
       if (process.platform !== 'win32' && !workspaceReadOnly) {
         syncWritableStageBackPosix(containerWorkSource, canonicalWs);
       }

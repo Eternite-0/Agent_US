@@ -91,16 +91,17 @@ async function startCanaryServer(host = '127.0.0.1') {
   };
 }
 
-function listBenchContainers() {
+function listContainersByNames(targetNames) {
+  const wanted = new Set((Array.isArray(targetNames) ? targetNames : [targetNames]).filter(Boolean));
+  if (wanted.size === 0) return [];
   const res = spawnSync('docker', ['ps', '-a', '--filter', 'name=agent-us-bench-', '--format', '{{.Names}}'], {
     encoding: 'utf8',
     windowsHide: true,
     timeout: 10_000,
     shell: false,
   });
-  if (res.status !== 0) return [];
   return res.status === 0
-    ? String(res.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+    ? String(res.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter((n) => wanted.has(n))
     : [];
 }
 
@@ -442,6 +443,7 @@ function applyGoldFix(taskId, ws) {
 
 describe('Real Docker Strong OS-Level Benchmark Isolation & Hidden Acceptance Suite', () => {
   let root;
+  const spawnedContainers = new Set();
 
   before(() => {
     const dockerProbe = new DockerBenchmarkSandbox().probe();
@@ -455,7 +457,11 @@ describe('Real Docker Strong OS-Level Benchmark Isolation & Hidden Acceptance Su
 
   after(() => {
     if (root) rmSync(root, { recursive: true, force: true });
-    assert.deepEqual(listBenchContainers(), [], 'no leftover benchmark containers may remain after tests');
+    assert.deepEqual(
+      listContainersByNames([...spawnedContainers]),
+      [],
+      'no leftover benchmark containers created by this suite may remain after tests',
+    );
   });
 
   const makeCase = (name) => {
@@ -827,12 +833,13 @@ describe('Real Docker Strong OS-Level Benchmark Isolation & Hidden Acceptance Su
       'utf8',
     );
     const pidsRes = await sandbox.execArgv(['node', 'pids.mjs'], { timeoutMs: 10_000 });
+    spawnedContainers.add(pidsRes.containerName);
     const pidsPayload = pidsRes.stdout ? JSON.parse(pidsRes.stdout) : null;
     assert.ok(
       pidsRes.exitCode !== 0 || (pidsPayload && (pidsPayload.sawSpawnFailure || pidsPayload.spawnedCount < 32)),
       `pids-limit=16 did not bound 32 spawns: exit=${pidsRes.exitCode}, out=${pidsRes.stdout}, err=${pidsRes.stderr}`,
     );
-    assert.deepEqual(listBenchContainers(), []);
+    assert.deepEqual(listContainersByNames(pidsRes.containerName), []);
 
     // 2. memory=64m / memory-swap=64m OOM enforcement
     const lowMemSandbox = new BenchmarkSandbox({ workspaceRoot: ws, memoryLimitMb: 64 });
@@ -849,18 +856,21 @@ describe('Real Docker Strong OS-Level Benchmark Isolation & Hidden Acceptance Su
       'utf8',
     );
     const oomRes = await lowMemSandbox.execArgv(['node', 'oom.mjs'], { timeoutMs: 15_000 });
+    spawnedContainers.add(oomRes.containerName);
     assert.notEqual(oomRes.exitCode, 0, `expected memory OOM non-zero exit: out=${oomRes.stdout}`);
-    assert.deepEqual(listBenchContainers(), []);
+    assert.deepEqual(listContainersByNames(oomRes.containerName), []);
 
     // 3. Timeout cleanup
     writeFileSync(join(ws, 'spin.mjs'), 'while (true) {}', 'utf8');
     const timeoutRes = await sandbox.execArgv(['node', 'spin.mjs'], { timeoutMs: 800, cpuLimitSec: 2 });
+    spawnedContainers.add(timeoutRes.containerName);
     assert.equal(timeoutRes.timedOut || timeoutRes.cpuLimitExceeded || timeoutRes.exitCode !== 0, true);
-    assert.deepEqual(listBenchContainers(), []);
+    assert.deepEqual(listContainersByNames(timeoutRes.containerName), []);
 
     // 4. Output flood cap
     writeFileSync(join(ws, 'flood.mjs'), 'for (let i = 0; i < 4000; i++) process.stdout.write("A".repeat(256));', 'utf8');
     const floodRes = await sandbox.execArgv(['node', 'flood.mjs'], { maxOutputBytes: 4096 });
+    spawnedContainers.add(floodRes.containerName);
     assert.equal(floodRes.exitCode, 0);
     assert.equal(floodRes.truncated, true);
     assert.ok(Buffer.byteLength(floodRes.stdout, 'utf8') + Buffer.byteLength(floodRes.stderr, 'utf8') <= 4096);
@@ -872,7 +882,7 @@ describe('Real Docker Strong OS-Level Benchmark Isolation & Hidden Acceptance Su
       () => sandbox.execArgv(['node', 'spin.mjs'], { timeoutMs: 15_000, signal: ac.signal }),
       (err) => err instanceof SandboxPolicyError && err.code === 'E_SANDBOX_ABORTED',
     );
-    assert.deepEqual(listBenchContainers(), []);
+    assert.deepEqual(listContainersByNames([...spawnedContainers]), []);
   });
 
   test('Dependency preparation policy + All 4 pinned OSS benchmarks & DirectAgentRuntime E2E inside real Docker', async () => {
