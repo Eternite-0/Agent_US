@@ -39,3 +39,18 @@ test('refactor judge distinguishes behavior-preserving extraction from duplicate
 test('reproduction tasks start with actually failing public tests',t=>{
   for(const spec of tasks.filter(x=>x.initialFailure))assert.equal(fixture(t,spec).public().status,1);
 });
+
+test('four new repositories reject missing/incorrect artifacts and accept reference outputs', async t => {
+  const { capabilityTasks } = await import('../scripts/fixtures/capability-tasks.mjs');
+  const answers = [JSON.stringify({name:'relay-api',replicas:3,tag:'r28',readiness:'/ready/live'}),
+    JSON.stringify({table:'ledger',columns:['org','slot'],predicate:'retired = 0'}),
+    String.raw`export const permalink=(b,p)=>b.replace(/\/+$/,'')+'/'+p.replace(/^\/+/, '');`,
+    'export const decode=(b,o)=>b[o]+256*b[o+1];'];
+  assert.equal(capabilityTasks.length,answers.length);
+  for(const [i,spec] of capabilityTasks.entries()) {
+    const f=fixture(t,spec);assert.equal(f.hidden().status,1,spec.id);
+    if(spec.test)assert.equal(f.public().status,1,spec.id);
+    f.put(spec.writable[0],answers[i]);assert.equal(f.hidden().status,0,spec.id);
+    if(spec.test)assert.equal(f.public().status,0,spec.id);
+  }
+});

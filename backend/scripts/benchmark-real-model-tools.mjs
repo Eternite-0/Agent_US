@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { tasks, workspaceFiles, judgeScript, fixtureDigest } from './fixtures/real-model-tasks.mjs';
+import { tasks as originalTasks, workspaceFiles, judgeScript, fixtureDigest } from './fixtures/real-model-tasks.mjs';
 import { parseCodexPatch } from '../src/patch-and-diagnostics.js';
 import { redactSecrets } from '../src/envelope.js';
 
-const BEFORE='ef4454748ca7a2e0a6a587390921e3164c2c911d';
-const AFTER='539e86451f7f2e0feef1e358f9bae38d3f1bf26e';
+const capability=process.env.TI_BENCH_SUITE==='2.3.7';
+const tasks=capability?[...originalTasks,...(await import('./fixtures/capability-tasks.mjs')).capabilityTasks]:originalTasks;
+const BEFORE=capability?'3ea6b57c6d2889c775d3ccda28d2f165e7300682':'ef4454748ca7a2e0a6a587390921e3164c2c911d';
+const AFTER=capability?'1672ea151703f04aa7c6bfcf7273ea1ad5d5b028':'539e86451f7f2e0feef1e358f9bae38d3f1bf26e';
 const key=process.env.TI_BENCH_KEY;
 delete process.env.TI_BENCH_KEY;
 const requestedModel=process.env.TI_BENCH_MODEL ?? 'cn:deepseek-v4.1-flash';
@@ -128,7 +130,7 @@ async function run(t,arm,rep,position){
   pool.createAccount({preset:'workbuddy',label:'paired benchmark',credential:key,protocol:'openai',endpoint:endpoint.href,models:[requestedModel]});
   pool.setDefaultModel(requestedModel);
   const direct=new DirectAgentRuntime(store,pool,{dataRoot:state,defaultWorkspace:ws,staticMcp:t.mcp?{inventory:[process.execPath,script,t.mcp]}:{}});
-  const effects=[]; const events=[]; const wire={records:[],pending:[]}; let unsub;
+  const effects=[]; const arrived=new Map(); const events=[]; const wire={records:[],pending:[]}; let unsub;
   let start=performance.now();
   try {
     const permitted=[...tools,...(t.requiredMcp??[])]; if(!t.test)permitted.splice(permitted.indexOf('bash'),1);
@@ -136,6 +138,7 @@ async function run(t,arm,rep,position){
     let activeWrite=null;
     unsub=direct.subscribe(session.id,evt=>{
       if (['tool/call','tool/result','approval/requested','verifier/repair','verifier/verdict'].includes(evt.type))events.push(evt);
+      if (capability && evt.type==='tool/result') arrived.set(evt.data.callId, Math.max(0,Math.round(performance.now()-start)));
       if (evt.type==='tool/call') {
         const item={id:evt.data.callId,paths:[]}; effects.push(item);
         activeWrite=['edit_file','write_file','apply_patch'].includes(evt.data.name)?item:null;
@@ -168,7 +171,8 @@ async function run(t,arm,rep,position){
       step++; for(const c of parsed(m.toolCalls)??[]) {
         const a=parsed(c.arguments), rec=receipts.find(r=>r.callId===c.id), result=pick('tool/result',c.id), effect=effects.find(e=>e.id===c.id);
         const actionPurpose=m.content?.trim().slice(0,600)||null;
-        calls.push({step,id:c.id,name:c.name,args:a,publicPurpose:actionPurpose,purposeSource:actionPurpose?'same_step_public_assistant_text':'not_emitted',fit:Boolean(checkArgs(t,c.name,a)),
+        const noMatch=/未搜索到匹配|未找到匹配|^(?:路径|目录)不存在:/.test(result?.output??'') && ['glob','grep'].includes(c.name);
+        calls.push({...(capability?{resultAtMs:arrived.get(c.id)??null,noMatch}:{}),step,id:c.id,name:c.name,args:a,publicPurpose:actionPurpose,purposeSource:actionPurpose?'same_step_public_assistant_text':'not_emitted',fit:Boolean(checkArgs(t,c.name,a)),
           status:rec?.status??(result?(result.isError?'failed':'finished'):'no_result'),exitCode:rec?.exitCode??null,errorCode:rec?.errorCode??null,durationMs:rec?.durationMs??result?.durationMs??null,
           effect:{writtenPaths:effect?.paths??[],receiptDigest:rec?.outputDigest??null,resultReportedError:result?.isError??null,approved:Boolean(rec?.approvalId)},
           modelVisibleStatus:result?.isError===true?'error':result?.isError===false?'success':'not_observed'});

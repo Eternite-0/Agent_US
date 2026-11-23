@@ -47,3 +47,31 @@ test('a fabricated call omitted from the catalog is still denied before executio
   const [r] = await new ToolDispatcher({policy:p}).dispatchBatch({tools:[impl],toolCalls:[{id:'fabricated',name:'bash',arguments:'{"command":"pwd"}'}],allowTools:[],permissionMode:'full-access'});
   assert.ok(r.isError); assert.equal(ran,false);
 });
+
+test('direct session reprojects the next request after mid-stream tightening; stale write gets a denial receipt',async()=>{
+  const {mkdtempSync,mkdirSync,rmSync,existsSync}=await import('node:fs');
+  const {tmpdir}=await import('node:os'); const {join}=await import('node:path');
+  const {Store}=await import('../src/store.js'); const {AccountPool}=await import('../src/pool.js');
+  const {DirectAgentRuntime}=await import('../src/direct-agent.js');
+  const tmp=mkdtempSync(join(tmpdir(),'selection-live-'));const ws=join(tmp,'workspace');mkdirSync(ws);
+  const store=new Store(join(tmp,'test.sqlite')); const pool=new AccountPool(store,{root:tmp});
+  pool.setDefaultModel('fixture');const catalogs=[];let direct,session;
+  const adapter={async *stream({tools}){
+    catalogs.push(tools.map(t=>t.name));
+    if(catalogs.length===1){
+      direct.updateSession(session.id,{permissionMode:'read-only'});
+      yield {type:'block-end',index:0,block:{type:'tool-call',id:'stale-write',name:'write_file',arguments:'{"path":"unexpected.txt","content":"not authorized"}'}};
+      yield {type:'finish',reason:{kind:'tool-calls'}};
+    }else {yield {type:'text-delta',index:0,text:'No write performed.'};yield {type:'finish',reason:{kind:'stop'}};}
+  }};
+  try {
+    direct=new DirectAgentRuntime(store,pool,{adapter,dataRoot:tmp,defaultWorkspace:ws});
+    session=direct.createSession({model:'fixture',permissionMode:'approval',toolAllow:['write_file','glob','bash']});
+    const id=direct.startTurn(session.id,{input:'Inspect available workspace actions.'}).turn.id;
+    const until=Date.now()+5000;while(Date.now()<until&&!['completed','failed','cancelled'].includes(direct.listTurns(session.id).find(t=>t.id===id)?.state))await new Promise(r=>setTimeout(r,20));
+    assert.equal(direct.listTurns(session.id).find(t=>t.id===id).state,'completed');
+    assert.deepEqual(catalogs[0].sort(),['bash','glob','write_file']);assert.deepEqual(catalogs[1].sort(),['bash','glob']);
+    const receipt=store.db.prepare('SELECT status,errorCode FROM tool_receipts WHERE turnId=? AND callId=?').get(id,'stale-write');
+    assert.equal(receipt?.status,'rejected_before_effect');assert.equal(receipt?.errorCode,'POLICY_DENIED');assert.equal(existsSync(join(ws,'unexpected.txt')),false);
+  }finally{await direct?.close();store.close();rmSync(tmp,{recursive:true,force:true});}
+});
