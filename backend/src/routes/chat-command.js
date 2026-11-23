@@ -119,12 +119,18 @@ export function handleChatCommand(runtime, sessionId, body, traffic) {
       const { permissionMode } = intersectPolicies(session, {
         permissionMode: body.permissionMode ?? session.permissionMode,
       });
+      const budget = commandBudget(session, body.budget);
+      // A cancelled Direct turn leaves its session cancelled. Reopen the
+      // root for this new run before its durable jobs become visible.
+      store.db
+        .prepare("UPDATE direct_sessions SET state='idle' WHERE id=? AND state='cancelled'")
+        .run(sessionId);
       ({ run } = orchestrator.submitRun({
         sessionId,
         goal: task,
         workspaceRoot: session.workspaceRoot || runtime.getWorkspaceRoot(),
         parentPermissionMode: permissionMode,
-        budget: commandBudget(session, body.budget),
+        budget,
         maxConcurrency: 8,
         ...traffic,
       }));

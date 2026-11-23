@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
@@ -129,18 +130,24 @@ test('chat ingress persists, deduplicates and scopes a planning run; stale stop 
   }
 });
 
-test('slash goals run the durable planner and launch one or multiple real child sessions', async () => {
+test('after cancelling an active Direct turn, slash goals in the same session launch real child sessions', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'explicit-swarm-worker-'));
   const workspace = mkdtempSync(join(tmpdir(), 'explicit-workspace-'));
   const store = new Store(join(dir, 'state.db'));
   const pool = new AccountPool(store, { root: dir });
   pool.setDefaultModel('scripted');
+  const directInput = '开始一个随后会取消的普通任务';
+  const directStarted = Promise.withResolvers();
   const adapter = {
-    async *stream({ messages }) {
+    async *stream({ messages, signal }) {
       const system =
         messages.find((m) => m.role === 'system')?.content?.[0]?.text ?? '';
       const input =
         messages.findLast((m) => m.role === 'user')?.content?.[0]?.text ?? '';
+      if (input === directInput) {
+        directStarted.resolve(true);
+        await delay(10_000, undefined, { signal });
+      }
       let text = 'Completed the requested inspection.';
       if (system.includes('Decompose the engineering goal')) {
         const keys = input.includes('两个独立模块')
@@ -177,22 +184,43 @@ test('slash goals run the durable planner and launch one or multiple real child 
     const session = direct.createSession({ workspaceRoot: workspace });
     const events = [];
     const unsub = direct.subscribe(session.id, (e) => events.push(e));
+    const submit = (input, opts = {}) =>
+      app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${session.id}/turns`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { input, ...opts },
+      });
+    const plain = await submit(directInput);
+    assert.equal(plain.statusCode, 200, plain.body);
+    const { turn } = plain.json();
+    assert.equal(await Promise.race([directStarted.promise, delay(5_000, false, { ref: false })]), true);
+    const busy = await submit('/swarm 不应启动');
+    assert.equal(busy.statusCode, 409, busy.body);
+    const cancelled = await app.inject({
+      method: 'POST',
+      url: `/v1/turns/${turn.id}/cancel`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(cancelled.statusCode, 200, cancelled.body);
+    assert.equal(cancelled.json().state, 'cancelled');
+    assert.equal(direct.getSession(session.id).state, 'cancelled');
+    for (const control of ['/swarm', '/swarm status', '/swarm stop']) {
+      assert.equal((await submit(control)).statusCode, 200);
+      assert.equal(direct.getSession(session.id).state, 'cancelled');
+    }
+    const invalid = await submit('/swarm 不能放宽预算', { budget: { maxSteps: -1 } });
+    assert.equal(invalid.statusCode, 400, invalid.body);
+    assert.equal(direct.getSession(session.id).state, 'cancelled');
     for (const [goal, count] of [
       ['解释一个函数', 1],
       ['分析两个独立模块后汇总', 3],
     ]) {
-      const submit = (input) =>
-        app.inject({
-          method: 'POST',
-          url: `/v1/sessions/${session.id}/turns`,
-          headers: { authorization: `Bearer ${token}` },
-          payload: { input },
-        });
       const start = await submit(`/swarm ${goal}`);
       assert.equal(start.statusCode, 200, start.body);
       const { runId } = start.json();
       await direct.swarmOrchestrator.waitForRun(runId, {
-        signal: AbortSignal.timeout(18000),
+        timeoutMs: 18_000,
       });
       const { run, ledger } = (await submit('/swarm status')).json();
       assert.equal(run.status, 'completed', run.errorMessage);
@@ -211,6 +239,7 @@ test('slash goals run the durable planner and launch one or multiple real child 
       assert.ok(ledger.usedSteps > 0);
       assert.ok(events.some((e) => e.data?.runId === run.id));
     }
+    assert.equal(store.db.prepare('SELECT state FROM direct_turns WHERE id=?').get(turn.id).state, 'cancelled');
     unsub();
   } finally {
     await direct.close();

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync, symlinkSync, linkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -53,6 +54,59 @@ test('shared cursor serializes consumers, finishes wide and deep directories, is
   const refreshed = await a.advance({ refresh: true });
   assert.equal(findRepositorySymbols(refreshed, 'tailSymbol').length, 0);
   assert.equal(findRepositorySymbols(refreshed, 'replacement').length, 1);
+});
+
+test('shared index refreshes Git metadata after staging, committing and switching branches without restarting the scan', async (t) => {
+  const a = fixture(t);
+  const git = (...args) => execFileSync('git', args, {
+    cwd: a.root, windowsHide: true, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  git('init', '-b', 'main');
+  git('config', 'user.name', 'Test User');
+  git('config', 'user.email', 'test@example.com');
+  a.put('a.js', 'export const first = 1;');
+  a.put('b.js', 'export const second = 2;');
+  git('add', '.');
+  git('commit', '-m', 'Initial files');
+  const first = await a.advance({ maxFiles: 1 });
+  assert.deepEqual(first.index, { batchFiles: 1, complete: false, indexedFiles: 1 });
+  assert.equal(first.git.dirty, false);
+
+  // Change only Git's index for a file visited on an earlier page.
+  git('rm', '--cached', 'a.js');
+  const staged = await a.advance();
+  assert.deepEqual(staged.index, { batchFiles: 1, complete: true, indexedFiles: 2 });
+  assert.equal(staged.git.dirty, true);
+  git('add', 'a.js');
+  assert.equal((await a.advance()).git.dirty, false);
+
+  a.put('a.js', 'export const updated = 3;');
+  git('add', 'a.js');
+  assert.equal((await a.advance()).git.dirty, true);
+  git('commit', '-m', 'Update first file');
+  const committedSha = git('rev-parse', 'HEAD');
+  const committed = await a.advance();
+  assert.deepEqual(committed.index, { batchFiles: 0, complete: true, indexedFiles: 2 });
+  assert.deepEqual(committed.git, {
+    isGitRepo: true, branch: 'main', headSha: committedSha, dirty: false,
+    recentCommits: ['Update first file', 'Initial files'],
+  });
+
+  // A new branch may point at the same SHA. Then switch between branches
+  // whose commit histories differ but whose workspace files are identical.
+  git('switch', '-c', 'topic');
+  const sameHead = await a.advance();
+  assert.equal(sameHead.git.branch, 'topic');
+  assert.equal(sameHead.git.headSha, committedSha);
+  git('commit', '--allow-empty', '-m', 'Topic marker');
+  const topic = await a.advance();
+  assert.equal(topic.git.headSha, git('rev-parse', 'HEAD'));
+  assert.equal(topic.git.recentCommits[0], 'Topic marker');
+  git('switch', 'main');
+  const back = await a.advance();
+  assert.deepEqual(back.git, committed.git);
+  assert.deepEqual(back.index, committed.index);
+  assert.equal(findRepositorySymbols(back, 'updated').length, 1);
 });
 
 test('symbol search, forward and reverse calls, alias resolution, recursion, methods and linked tests', async (t) => {

@@ -13,7 +13,7 @@
 [![React](https://img.shields.io/badge/React-19%20%2B%20TypeScript-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
 [![Fastify](https://img.shields.io/badge/Fastify-5%20%2B%20SQLite%20WAL-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
 
-[下载 Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest) · [系统架构](#系统架构) · [自主开发流程](#autonomous-software-engineering-workflow) · [核心能力](#核心能力) · [界面预览](#界面预览) · [本地开发](#本地开发与构建) · [配套文档](#配套文档)
+[下载 Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest) · [Swarm 命令](#swarm-命令) · [系统架构](#系统架构) · [自主开发流程](#autonomous-software-engineering-workflow) · [核心能力](#核心能力) · [界面预览](#界面预览) · [本地开发](#本地开发与构建) · [配套文档](#配套文档)
 
 </div>
 
@@ -38,6 +38,21 @@ Agent_US 是一套 **Local-First Autonomous Agent Framework**。它将 **Agent R
 
 ---
 
+## Swarm 命令
+
+在 **Web 或桌面端的聊天输入框**发送以下命令，不是在终端运行。普通消息默认走 Direct 对话；只有显式发送 `/swarm <任务>` 才会从聊天启动 Swarm。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/swarm 检查前后端的测试覆盖并汇总缺口` | 在当前根会话提交一个新的 Swarm Run，后台分析仓库、生成并校验计划，再调度子 Agent。任务可以写成多行。 |
+| `/swarm status` | 查询当前会话的 Swarm Run；优先显示未结束的运行，否则显示最近一次运行。 |
+| `/swarm stop` | 停止当前会话未结束的 Swarm Run，不会取消普通 Direct turn。 |
+| `/swarm` | 查看命令帮助，不启动任务。 |
+
+命令不支持附件。启动时沿用会话工作区，不能通过命令放宽会话权限或预算。同一会话有未结束的 Direct turn 或 Swarm Run 时，不能再启动一个 Swarm；结束或取消 Direct turn 后，可在原会话中发送 `/swarm <任务>`。运行进度、计划、子任务与交付可在「自主任务」面板查看。
+
+---
+
 ## 系统架构
 
 七层按职责划分。实线表示请求、调用或持久化，虚线表示评测与记忆的读写关系。
@@ -55,14 +70,15 @@ flowchart TB
         CLIENT["React 19 · Electron 35 Desktop Host<br/>REST API · SSE Streaming · Typed SDK · External Clients"]
     end
     subgraph L2["2 · Control Plane"]
-        API["API Gateway /v1 · Event Router · Scheduler<br/>Session / Task / Workspace Managers · Approval Center"]
+        API["API Gateway /v1 · Chat Command Routing · Event Router<br/>Session / Workspace Managers · Approval Center"]
         MODEL["AccountPool · Model Router<br/>Gateway Proxy · 兼容协议"]
     end
     subgraph L3["3 · Agent Runtime Kernel"]
         KERNEL["Agent Loop · Turn Manager · Inference Engine<br/>Tool Dispatcher · State Machine · Cancellation Manager<br/>Context Manager · Evidence Verification"]
     end
     subgraph L4["4 · Adaptive Intelligence"]
-        INTEL["Repository Intelligence · Adaptive Planner · Plan Validator<br/>Capability Registry · Dynamic Team Optimizer<br/>Agent Communication · Experience Memory · Evaluation Engine"]
+        INTEL["Adaptive Planner · Plan Validator · Capability Registry<br/>Dynamic Team Optimizer · Agent Communication<br/>Experience Memory · Evaluation Engine"]
+        INDEX["Repository Intelligence · 共享渐进索引"]
     end
     subgraph L5["5 · Execution & Orchestration"]
         SWARM["Adaptive Swarm Orchestrator · Child Agent Lifecycle<br/>DAG Scheduler · Dynamic Replanner · Artifact Manager<br/>Independent Reviewer · Result Aggregation"]
@@ -80,20 +96,23 @@ flowchart TB
 
     CLIENT <-->|REST / SSE| API
     CLIENT -->|模型兼容端点| MODEL
-    API -->|交互 turn| KERNEL
-    API -->|自治目标| INTEL
+    API -->|普通消息 · Direct turn| KERNEL
+    API -->|显式 /swarm 命令| SWARM
+    API -->|自治目标 API| INTEL
     MODEL <-->|AccountPool 推理| KERNEL
     MODEL --> PROVIDERS
     INTEL <-->|计划、能力与执行反馈| SWARM
     KERNEL <-->|运行子 turn| SWARM
     KERNEL -->|工具调用| TOOLING
+    TOOLING -->|inspect_repository| INDEX
+    SWARM -->|规划时分析仓库| INDEX
     TOOLING -->|MCP 与扩展| INTEGRATIONS
     KERNEL <--> DURABLE
     SWARM <--> DURABLE
     INTEL -.评测与记忆读写.-> DURABLE
 ```
 
-- `DirectAgentRuntime` 是主要执行编排入口，内部装配 `AgentRuntimeKernel`、上下文、工具、Durable、Swarm 和治理组件。
+- [`DirectAgentRuntime`](backend/src/direct-agent.js) 装配 `AgentRuntimeKernel`、上下文、工具、Durable、Swarm 和治理组件。普通消息在父会话里运行 Direct turn；聊天入口的 [`handleChatCommand`](backend/src/routes/chat-command.js) 在创建 Direct turn 前识别 `/swarm`，提交独立的 Swarm Run。Swarm 由持久化队列驱动，子 Agent 在子会话里沿用同一套推理与工具运行时。
 - `GatewayProxy` 负责协议兼容和模型请求转发。Agent Loop 的推理使用 AccountPool，外部模型客户端的协议转换由 GatewayProxy 处理。
 - `Evaluation`、`Memory` 和 `Planner` 通过服务、事件和持久化状态互相反馈。评测由独立入口调度，经验检索按上下文和任务需要执行。
 - `Control Plane` 的 `/v1` 路由是当前主 API 面。旧 `/api/v1/*` DAG 路由仍挂载于 [`routes.js`](backend/src/routes.js) 和 [`engine.js`](backend/src/engine.js)，仅用于 legacy / compatibility。
@@ -145,7 +164,7 @@ flowchart TB
 | 测试、审查或证据检查未通过 | 在预算内重规划，再执行与验证 |
 | 交付后的评测与验证经验 | 为后续任务提供能力画像与经验参考 |
 
-- 通过 `POST /v1/autonomous/runs` 提交目标和工作区信息，运行时生成并验证 DAG。普通会话继续走 `/v1/sessions/:id/turns`。
+- 聊天中用 `/swarm <任务>` 启动此流程：聊天入口返回 `runId`，后台再规划和执行。程序化调用可通过 `POST /v1/autonomous/runs` 提交目标和工作区信息；普通聊天不自动进入该流程。
 - Agent 数量由任务复杂度、独立工作流、能力画像、成本和验证要求共同决定。
 - 可并行的子 Agent 使用独立 worktree 或受控共享路径执行。
 - 失败可以触发有预算上限的 `repair_and_reverify` 或其他有限重规划。
@@ -161,7 +180,7 @@ flowchart TB
 
 ### 1. Autonomous Repository Intelligence
 
-[`analyzeRepository()`](backend/src/repo-intelligence.js) 和只读工具 `inspect_repository` 会识别代码文件、测试文件、入口、语言、调用关系、Git 状态、依赖准备情况和敏感路径。扫描默认限制为 120 个文件，以控制首次分析开销。更大的仓库可以按任务焦点多次深入。
+[`analyzeRepository()`](backend/src/repo-intelligence.js) 为 `inspect_repository` 只读工具和 Swarm 规划提供代码、测试、入口、符号、调用关系、依赖与 Git 信息。两者对同一实际工作区路径共用进程内渐进索引，默认每次最多扫描 120 个新文件；后续调用可继续推进，已扫描内容变化时会重建快照。Git 分支、HEAD、近期提交以及**已索引路径**的脏状态每次都会重新读取，提交或切分支不需要手动刷新文件索引。
 
 ### 2. Adaptive Planning
 
@@ -327,7 +346,7 @@ Electron Host 管理本地后端与同源通信。Windows x64 安装版和便携
 ```powershell
 Set-Location D:\Agent_US\backend
 npm run check
-node --test test/repo-intelligence.test.js test/swarm/autonomous-generalization.test.js
+node --test test/explicit-swarm-command.test.js test/repo-progressive-index.test.js test/repo-intelligence.test.js test/swarm/autonomous-generalization.test.js
 
 Set-Location D:\Agent_US\frontend
 npx tsc --noEmit

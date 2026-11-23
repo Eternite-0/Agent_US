@@ -1988,7 +1988,7 @@ async function analyzePage(absRoot, realRoot, index, { issueText = '', maxBytes 
   if (refresh || await indexChanged(realRoot, index.stamps)) {
     await index.walker.return();
     // Keep the queue shared by concurrent callers; only replace scan state.
-    Object.assign(index, createIndex(realRoot), { tail: index.tail, git: null });
+    Object.assign(index, createIndex(realRoot), { tail: index.tail });
   }
   let visitedDirs = 0;
   const page = [];
@@ -2009,11 +2009,9 @@ async function analyzePage(absRoot, realRoot, index, { issueText = '', maxBytes 
     const records = await Promise.all(batch.map(path => indexFile(realRoot, path, index.stamps)));
     batch.forEach((path, n) => index.records.set(path, records[n]));
   }
-  if (!index.git) index.git = await collectGitMetadata(realRoot, page);
-  else if (index.git.isGitRepo && !index.git.dirty && page.length && await hasSafeGitDirectory(realRoot)) {
-    index.git.dirty = await scannedFilesDirty(realRoot, page).catch(() => index.git.dirty);
-  }
-  const git = { ...index.git, recentCommits: [...index.git.recentCommits] };
+  // Git refs and staging can change without touching workspace files. Keep
+  // the scan cursor, but refresh Git metadata for all indexed paths.
+  const git = await collectGitMetadata(realRoot, [...index.records.keys()]);
   const scan = { files: Array.from(index.records.keys(), rel => ({ rel })), allDirs: [...index.dirs], topLevelDirs: index.dirs.filter(d => !d.includes('/')) };
 
   const sourceFiles = [];
