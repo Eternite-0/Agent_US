@@ -165,7 +165,36 @@ export function verifyTurn({ events = [], text = '', node = null, execution = nu
   };
 }
 
-export function buildRepairNote(result) {
+export function buildRepairNote(result, { reasoningState = result?.reasoningState ?? null } = {}) {
+  const isEvidenceOnlyFailure =
+    Array.isArray(result?.reasons) &&
+    result.reasons.length > 0 &&
+    result.reasons.every((r) => String(r).startsWith('EVIDENCE_INCOMPLETE:'));
+  const latestVerification = reasoningState?.verifications?.at(-1) ?? null;
+  const verifiedAfterLastMutation = Boolean(
+    latestVerification?.passed === true && !reasoningState?.hasUnverifiedMutationsAfterLastPass,
+  );
+  if (isEvidenceOnlyFailure && verifiedAfterLastMutation) {
+    const mutatedList =
+      Array.isArray(reasoningState?.filesMutated) && reasoningState.filesMutated.length > 0
+        ? reasoningState.filesMutated
+        : Array.isArray(result?.actualChangedFiles)
+          ? result.actualChangedFiles
+          : [];
+    const lines = [
+      `Code edits and verification have ALREADY PASSED (verified command: \`${latestVerification.command}\`, mutated files: ${mutatedList.length ? mutatedList.join(', ') : '(none)'}).`,
+      ...result.reasons.map((r) => `- ${r}`),
+      ...(Array.isArray(result.missingFields) && result.missingFields.length > 0
+        ? [`Missing or incomplete evidence fields: ${result.missingFields.join(', ')}.`]
+        : []),
+      ...(Array.isArray(result.actualChangedFiles) && result.actualChangedFiles.length > 0
+        ? [`Actual modified workspace files: ${JSON.stringify(result.actualChangedFiles)}.`]
+        : []),
+      'Do NOT invoke any more tools (no bash, read_file, edit_file, or write_file). Immediately output ONLY the concise JSON evidence manifest block matching schemaVersion "1.0.0".',
+    ];
+    return lines.join('\n');
+  }
+
   const lines = (result.reasons ?? []).map((reason) => {
     const [code] = reason.split(':', 2);
     const explain = REASON_TEXT[code];

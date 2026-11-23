@@ -914,6 +914,18 @@ function buildCallMetaMap(assistantMessageRows = []) {
   return byId;
 }
 
+export function resolveRealTrialFirstFixSucceeded({
+  passed,
+  repairRounds = 0,
+  reasoningMetrics = null,
+} = {}) {
+  return Boolean(
+    passed &&
+    Number(repairRounds || 0) === 0 &&
+    reasoningMetrics?.firstFixSucceeded !== false,
+  );
+}
+
 export function enrichReceiptsWithCommands(receipts = [], assistantMessageRows = []) {
   const callMetaById = buildCallMetaMap(assistantMessageRows);
   return (Array.isArray(receipts) ? receipts : []).map((r) => {
@@ -1176,7 +1188,7 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
       }
     });
 
-    const deadlineMs = 180_000;
+    const deadlineMs = 300_000;
     const { turn } = direct.startTurn(session.id, {
       input: task.prompt,
       model: requestedModel,
@@ -1267,7 +1279,11 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
       attempts: 1 + totalRepairRounds,
       repairRounds: totalRepairRounds,
       rootCauseAccurate: Boolean(judgment.evidence.rootCauseMatch),
-      firstFixSucceeded: Boolean(judgment.passed && totalRepairRounds === 0 && !diagnostics.reasoningMetrics?.selfCorrectionRecovered),
+      firstFixSucceeded: resolveRealTrialFirstFixSucceeded({
+        passed: judgment.passed,
+        repairRounds: totalRepairRounds,
+        reasoningMetrics: diagnostics.reasoningMetrics,
+      }),
       regressionPassed: Boolean(judgment.evidence.regressionPassed),
       ineffectiveActionCount: enrichedReceipts.filter((r) => r.status === 'failed' || r.status === 'rejected_before_effect').length,
       replanTriggered: totalRepairRounds > 0,

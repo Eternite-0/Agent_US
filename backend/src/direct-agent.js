@@ -2428,10 +2428,30 @@ export class DirectAgentRuntime {
       const message = String(classified?.detail?.message ?? classified?.message ?? err);
       const nextState = isCancelled ? 'cancelled' : 'failed';
 
+      const catchReasoningMetrics = err?.reasoningMetrics ?? classified?.reasoningMetrics ?? null;
       const currentTurn = this.store.db
         .prepare('SELECT state, phase, step FROM direct_turns WHERE id=?')
         .get(turnId);
       if (!currentTurn || ['completed', 'failed', 'cancelled'].includes(currentTurn.state)) {
+        if (isCancelled && currentTurn?.state === 'cancelled' && catchReasoningMetrics) {
+          try {
+            this.store.tx(() => {
+              const evRow = this.store.db
+                .prepare("SELECT id, data FROM direct_events WHERE turnId=? AND type='turn/cancelled' ORDER BY seq DESC LIMIT 1")
+                .get(turnId);
+              if (!evRow) return;
+              const evData = JSON.parse(evRow.data || '{}');
+              if (!evData.reasoningMetrics) {
+                evData.reasoningMetrics = catchReasoningMetrics;
+                this.store.db
+                  .prepare('UPDATE direct_events SET data=? WHERE id=?')
+                  .run(JSON.stringify(evData), evRow.id);
+              }
+            });
+          } catch {
+            // Best-effort enrichment when turn was already marked cancelled before catch settled.
+          }
+        }
         return;
       }
 
@@ -2440,7 +2460,6 @@ export class DirectAgentRuntime {
       }
 
       const totalTokens = totalIn + totalOut;
-      const catchReasoningMetrics = err?.reasoningMetrics ?? classified?.reasoningMetrics ?? null;
       let outbox = null;
       try {
         outbox = this.store.tx(() => {
@@ -2511,7 +2530,19 @@ export class DirectAgentRuntime {
             turnId,
             type: isCancelled ? RUNTIME_EVENTS.TURN_CANCELLED : RUNTIME_EVENTS.TURN_FAILED,
             data: isCancelled
-              ? { turnId, sessionId, model: effectiveModel, provider: actualProvider, inputTokens: totalIn, outputTokens: totalOut, cacheReadTokens: totalCacheRead, cacheWriteTokens: totalCacheWrite, cacheEligibleInputTokens: totalCacheEligible, durationMs }
+              ? {
+                  turnId,
+                  sessionId,
+                  model: effectiveModel,
+                  provider: actualProvider,
+                  inputTokens: totalIn,
+                  outputTokens: totalOut,
+                  cacheReadTokens: totalCacheRead,
+                  cacheWriteTokens: totalCacheWrite,
+                  cacheEligibleInputTokens: totalCacheEligible,
+                  durationMs,
+                  ...(catchReasoningMetrics ? { reasoningMetrics: catchReasoningMetrics } : {}),
+                }
               : {
                   turnId,
                   sessionId,

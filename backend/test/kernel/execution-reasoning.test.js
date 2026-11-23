@@ -848,3 +848,275 @@ test('AgentLoop repairs UNRESOLVED_VERIFICATION_FAILURE without pass-claim wordi
   assert.equal(exactRes.reasoningMetrics.thrashWarned, true);
   assert.ok(exactRes.reasoningMetrics.stuckDetections.some((d) => d.pattern === 'exact_repeat'));
 });
+
+test('ExecutionReasoningTracker separates policy/approval rejections, emits POLICY_BLOCK_LOOP steering, and preserves clean firstFixSucceeded/selfCorrectionRecovered', () => {
+  // 1. Varied policy rejections (>= 2) do not pollute falsifiedAttempts/errorFingerprints or flip firstFixSucceeded
+  const tracker = new ExecutionReasoningTracker();
+  const b1 = tracker.recordToolResult({
+    tc: tc('pb-1', 'bash', { command: 'ls -la' }),
+    output: '[APPROVAL_DENIED] command requires approval',
+    isError: true,
+    receipt: { status: 'rejected_before_effect', errorCode: 'APPROVAL_DENIED' },
+    step: 1,
+  });
+  const b2 = tracker.recordToolResult({
+    tc: tc('pb-2', 'bash', { command: 'git status' }),
+    output: '[POLICY_DENIED] command blocked',
+    isError: true,
+    receipt: { status: 'rejected_before_effect', errorCode: 'POLICY_DENIED' },
+    step: 2,
+  });
+  assert.equal(b1.trigger, null);
+  assert.equal(b2.trigger?.pattern, STUCK_PATTERNS.POLICY_BLOCK_LOOP);
+  assert.equal(b2.trigger?.nonFatal, true);
+  const steer = tracker.buildDiagnosticSteeringMessage(b2.trigger);
+  assert.match(steer, /\[策略拦截纠偏提示\]/);
+  assert.match(steer, /glob \/ grep \/ read_file/);
+
+  assert.equal(tracker.ineffectiveActionCount, 2);
+  assert.equal(tracker._policyBlockCount, 2);
+  assert.equal(tracker._nonReproFailureCount, 0);
+  assert.equal(tracker.falsifiedAttempts.length, 0);
+  assert.equal(tracker.errorFingerprints.length, 0);
+  assert.equal(tracker.verifications.length, 0);
+
+  // Even a blocked test command before execution must NOT count as a verification failure
+  tracker.recordToolResult({
+    tc: tc('pb-3', 'bash', { command: 'node --test test/app.test.js' }),
+    output: '[APPROVAL_DENIED] blocked before execution',
+    isError: true,
+    receipt: { status: 'rejected_before_effect', errorCode: 'APPROVAL_DENIED' },
+    step: 3,
+  });
+  assert.equal(tracker.verifications.length, 0);
+  assert.equal(tracker._nonReproFailureCount, 0);
+
+  // Model pivots to read_file -> edit_file -> approved test passes on first edit (ar-06 pattern)
+  tracker.recordToolResult({ tc: tc('r1', 'read_file', { path: 'src/app.js' }), output: 'code', step: 4 });
+  tracker.recordToolResult({
+    tc: tc('e1', 'edit_file', { path: 'src/app.js', target: 'bad', replacement: 'good' }),
+    output: 'ok',
+    step: 5,
+  });
+  tracker.recordToolResult({
+    tc: tc('v1', 'bash', { command: 'node --test test/app.test.js' }),
+    output: 'pass 1',
+    isError: false,
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 6,
+  });
+
+  const cleanMetrics = tracker.getMetrics({ finalOutcomePassed: true, stopReason: 'completed' });
+  assert.equal(cleanMetrics.firstFixSucceeded, true);
+  assert.equal(cleanMetrics.selfCorrectionRecovered, false);
+  assert.equal(cleanMetrics.thrashWarned, false);
+  assert.equal(cleanMetrics.policyBlockCount, 3);
+  assert.equal(cleanMetrics.ineffectiveActionCount, 3);
+
+  // 2. Unverified/failed outcome (ar-01 pattern) must NEVER report selfCorrectionRecovered=true
+  const failedTracker = new ExecutionReasoningTracker();
+  failedTracker.recordToolResult({
+    tc: tc('fb-1', 'bash', { command: 'ls' }),
+    output: '[APPROVAL_DENIED]',
+    isError: true,
+    receipt: { status: 'rejected_before_effect', errorCode: 'APPROVAL_DENIED' },
+    step: 1,
+  });
+  failedTracker.recordRepairRound({ step: 2 });
+  const failedMetrics = failedTracker.getMetrics({ finalOutcomePassed: false, stopReason: 'completed' });
+  assert.equal(failedMetrics.selfCorrectionRecovered, false);
+});
+
+test('AgentLoop steers varied POLICY_BLOCK_LOOP without fatal break, injects token-reserve wrap-up, and emits fast manifest-only repair note', async (t) => {
+  const { workDir, store } = createTempEnv(t);
+  writeFileSync(join(workDir, 'calc.js'), 'export const add = (a, b) => a - b;\n', 'utf8');
+
+  // 1. Varied policy rejections warn via POLICY_BLOCK_LOOP cleanly and let turn finish
+  let policyStep = 0;
+  let sawPolicyPivot = false;
+  let sawTokenWrapUp = false;
+  const seenSystemPrompts = [];
+  const policyKernel = new AgentRuntimeKernel({
+    store,
+    adapter: {
+      async *stream({ messages }) {
+        policyStep += 1;
+        if (messages[0]?.role === 'system') {
+          seenSystemPrompts.push(messages[0]?.content?.[0]?.text ?? '');
+        }
+        const userText = messages
+          .filter((m) => m.role === 'user')
+          .flatMap((m) => m.content ?? [])
+          .map((b) => b.text ?? '')
+          .join('\n');
+
+        if (policyStep === 1) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-p1', name: 'bash', arguments: JSON.stringify({ command: 'node -e "1"' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 6000, outputTokens: 1000 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (policyStep === 2) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-p2', name: 'bash', arguments: JSON.stringify({ command: 'git status && git diff' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 6000, outputTokens: 1000 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (policyStep === 3) {
+          assert.match(userText, /\[策略拦截纠偏提示\]/);
+          sawPolicyPivot = true;
+          // Even a 3rd DIFFERENT blocked bash command must not fatal circuit-break
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-p3', name: 'bash', arguments: JSON.stringify({ command: 'node tools/gen-handoff.mjs' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 6000, outputTokens: 1000 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (policyStep === 4) {
+          // Steps >= 4 and remaining tokens (40k - 21k = 19k <= 24k) injects [预算收尾提醒]
+          assert.match(userText, /\[预算收尾提醒\]/);
+          sawTokenWrapUp = true;
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-r1', name: 'read_file', arguments: JSON.stringify({ path: 'calc.js' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 200 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+
+        const wrapUpCount = (userText.match(/\[预算收尾提醒\]/g) || []).length;
+        assert.equal(wrapUpCount, 1, 'token-reserve wrap-up advisory must be injected only once');
+        yield { type: 'text-delta', text: 'Completed after pivoting to read_file.' };
+        yield { type: 'usage', usage: { inputTokens: 500, outputTokens: 100 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    },
+    toolDispatcher: new ToolDispatcher({}),
+  });
+  t.after(() => policyKernel.close());
+
+  const staticSysPrompt = 'STATIC_SYS_PROMPT_ROUND3';
+  const policyRes = await policyKernel.executeTurn({
+    sessionId: 'sess-policy-steer',
+    turnId: 'turn-policy-steer',
+    profile: { id: 'default', defaultMaxSteps: 10, streamDeltas: false, emitAssistantMessage: false, emitToolEvents: false, persistTurn: false },
+    input: 'Inspect calc.js safely',
+    model: 'mock',
+    workspaceRoot: workDir,
+    permissionMode: 'auto-safe',
+    requestApproval: async () => ({ allowed: false }),
+    budget: { maxSteps: 10, maxTokens: 40_000 },
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: staticSysPrompt }] },
+      { role: 'user', content: [{ type: 'text', text: 'Inspect calc.js safely' }] },
+    ],
+    tools: createWorkspaceTools({ workspaceRoot: workDir, store, permissionMode: 'auto-safe' }),
+  });
+
+  assert.equal(policyRes.status, 'completed');
+  assert.equal(sawPolicyPivot, true);
+  assert.equal(sawTokenWrapUp, true);
+  assert.equal(policyRes.reasoningMetrics.policyBlockCount, 3);
+  assert.equal(policyRes.reasoningMetrics.circuitBroken, false);
+  assert.ok(seenSystemPrompts.every((p) => p === staticSysPrompt), 'static system prompt must remain byte-identical');
+
+  // 2. Identical blocked bash call repeated >= 3 times after POLICY_BLOCK_LOOP warning STILL circuit-breaks via exact_repeat
+  const repeatKernel = new AgentRuntimeKernel({
+    store,
+    adapter: {
+      async *stream() {
+        yield {
+          type: 'block-end',
+          block: { type: 'tool-call', id: `tc-rep-${Math.random().toString(36).slice(2, 6)}`, name: 'bash', arguments: JSON.stringify({ command: 'node -e "1"' }) },
+        };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      },
+    },
+    toolDispatcher: new ToolDispatcher({}),
+  });
+  t.after(() => repeatKernel.close());
+
+  const repeatRes = await repeatKernel.executeTurn({
+    sessionId: 'sess-policy-exact-break',
+    turnId: 'turn-policy-exact-break',
+    profile: { id: 'default', defaultMaxSteps: 8, streamDeltas: false, emitAssistantMessage: false, emitToolEvents: false, persistTurn: false },
+    input: 'List files',
+    model: 'mock',
+    workspaceRoot: workDir,
+    permissionMode: 'auto-safe',
+    requestApproval: async () => ({ allowed: false }),
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'List files' }] }],
+    tools: createWorkspaceTools({ workspaceRoot: workDir, store, permissionMode: 'auto-safe' }),
+  });
+  assert.equal(repeatRes.status, 'failed');
+  assert.equal(repeatRes.stopReason, 'thrashing_circuit_break');
+
+  // 3. Fast manifest-only repair note when EVIDENCE_INCOMPLETE occurs AFTER edits + passing verification
+  const fastTracker = new ExecutionReasoningTracker({ workspaceRoot: workDir });
+  fastTracker.recordToolResult({
+    tc: tc('fe1', 'edit_file', { path: 'calc.js', target: 'a - b', replacement: 'a + b' }),
+    output: 'ok',
+    step: 1,
+  });
+  fastTracker.recordToolResult({
+    tc: tc('fv1', 'bash', { command: 'node --test test/calc.test.js' }),
+    output: 'pass 1',
+    isError: false,
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 2,
+  });
+  const engine = new DecisionEngine({
+    verifier: () => ({
+      verdict: 'fail',
+      accepted: false,
+      status: 'EVIDENCE_INCOMPLETE',
+      reasons: ['EVIDENCE_INCOMPLETE: missing=evidenceManifest'],
+      missingFields: ['evidenceManifest'],
+      actualChangedFiles: ['calc.js'],
+    }),
+  });
+  const idleDecision = await engine.shouldContinueOnIdle({
+    input: 'Fix calc',
+    stepText: 'Done!',
+    steps: 3,
+    maxSteps: 10,
+    stopContinuedOnce: false,
+    repairedOnce: false,
+    repairRound: 0,
+    verifierEvents: [],
+    execution: { evidenceContract: { taskId: 't1' } },
+    reasoningState: fastTracker.getState(),
+  });
+  assert.equal(idleDecision.action, 'repair');
+  assert.match(idleDecision.note, /ALREADY PASSED/i);
+  assert.match(idleDecision.note, /node --test test\/calc\.test\.js/);
+  assert.match(idleDecision.note, /calc\.js/);
+  assert.match(idleDecision.note, /Do NOT invoke any more tools/i);
+  assert.match(idleDecision.note, /schemaVersion "1\.0\.0"/);
+
+  // Normal repair note remains untouched when there is an unverified mutation or non-evidence reason
+  const fallbackNote = buildRepairNote(
+    {
+      verdict: 'fail',
+      status: 'EVIDENCE_INCOMPLETE',
+      reasons: ['EVIDENCE_INCOMPLETE: missing=evidenceManifest'],
+    },
+    {
+      reasoningState: {
+        filesMutated: ['calc.js'],
+        verifications: [{ command: 'node --test test/calc.test.js', passed: true }],
+        hasUnverifiedMutationsAfterLastPass: true,
+      },
+    },
+  );
+  assert.match(fallbackNote, /Keep any work you have already verified/);
+});

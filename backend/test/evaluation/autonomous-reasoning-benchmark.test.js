@@ -42,11 +42,13 @@ import {
   loadAndProbeWorktreeArm,
   parseCliArgs,
   recordArmExperienceMemory,
+  resolveRealTrialFirstFixSucceeded,
   runAutonomousReasoningBenchmark,
 } from '../../scripts/benchmark-autonomous-reasoning.mjs';
 import { Store } from '../../src/store.js';
 import { compactTwoStage } from '../../src/context.js';
 import { ExperienceMemoryService } from '../../src/memory/service.js';
+import { ExecutionReasoningTracker } from '../../src/kernel/execution-reasoning.js';
 
 function buildTrustedContext(task, workspaceRoot, sandbox = null) {
   return {
@@ -975,5 +977,72 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       if (store) store.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  test('resolveRealTrialFirstFixSucceeded scores ar-06 policy-blocked clean fix accurately without false-negative penalty', () => {
+    const tracker = new ExecutionReasoningTracker();
+    tracker.recordToolResult({
+      tc: { id: 'p1', name: 'bash', arguments: JSON.stringify({ command: 'node -e "1"' }) },
+      output: '[APPROVAL_DENIED]',
+      isError: true,
+      receipt: { status: 'rejected_before_effect', errorCode: 'APPROVAL_DENIED' },
+      step: 1,
+    });
+    tracker.recordToolResult({
+      tc: { id: 'v0', name: 'bash', arguments: JSON.stringify({ command: 'node --test' }) },
+      output: 'AssertionError: 1 !== 2',
+      isError: true,
+      receipt: { status: 'failed', exitCode: 1 },
+      step: 2,
+    });
+    tracker.recordToolResult({
+      tc: { id: 'e1', name: 'edit_file', arguments: JSON.stringify({ path: 'src/fix.js', target: 'a', replacement: 'b' }) },
+      output: 'ok',
+      step: 3,
+    });
+    tracker.recordToolResult({
+      tc: { id: 'v1', name: 'bash', arguments: JSON.stringify({ command: 'node --test' }) },
+      output: 'pass 1',
+      isError: false,
+      receipt: { status: 'finished', exitCode: 0 },
+      step: 4,
+    });
+
+    const ar06Metrics = tracker.getMetrics({ finalOutcomePassed: true, stopReason: 'completed' });
+    assert.equal(ar06Metrics.firstFixSucceeded, true);
+    assert.equal(ar06Metrics.selfCorrectionRecovered, false);
+
+    assert.equal(
+      resolveRealTrialFirstFixSucceeded({ passed: true, repairRounds: 0, reasoningMetrics: ar06Metrics }),
+      true,
+    );
+    assert.equal(
+      resolveRealTrialFirstFixSucceeded({ passed: true, repairRounds: 0, reasoningMetrics: null }),
+      true,
+    );
+    assert.equal(
+      resolveRealTrialFirstFixSucceeded({
+        passed: true,
+        repairRounds: 0,
+        reasoningMetrics: { firstFixSucceeded: false, selfCorrectionRecovered: true },
+      }),
+      false,
+    );
+    assert.equal(
+      resolveRealTrialFirstFixSucceeded({
+        passed: true,
+        repairRounds: 1,
+        reasoningMetrics: { firstFixSucceeded: true },
+      }),
+      false,
+    );
+    assert.equal(
+      resolveRealTrialFirstFixSucceeded({
+        passed: false,
+        repairRounds: 0,
+        reasoningMetrics: { firstFixSucceeded: true },
+      }),
+      false,
+    );
   });
 });

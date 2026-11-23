@@ -7,6 +7,7 @@ import { RUNTIME_EVENTS } from './events.js';
 import {
   ExecutionReasoningTracker,
   MUTATING_FILE_TOOLS,
+  STUCK_PATTERNS,
 } from './execution-reasoning.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
 import { resolveTurnOutcome } from './verdict.js';
@@ -104,7 +105,7 @@ export class DecisionEngine {
             note: !node && !execution?.evidenceContract &&
               verdict.reasons?.length === 1 && verdict.reasons[0].startsWith('FABRICATED_PASS_CLAIM:')
               ? `[验证未通过] ${verdict.reasons[0]}\n完成后用自然语言如实汇报执行过的验证和结果。`
-              : buildRepairNote(verdict),
+              : buildRepairNote(verdict, { reasoningState }),
           };
         }
         return { action: 'fail', verdict };
@@ -318,10 +319,12 @@ export class AgentLoop {
     let executedStepsThisTurn = 0;
     let stopContinuedOnce = false;
     let verificationReserveAdvised = false;
+    let budgetReserveAdvised = false;
     let finalStepAdvised = false;
     let repairedOnce = false;
     let repairRound = 0;
     let monologueWarned = false;
+    let policyBlockWarned = false;
     let finalAssistantText = '';
     let finalVerdict = null;
     let stopReason = 'completed';
@@ -370,6 +373,7 @@ export class AgentLoop {
 
         steps++;
         sm.transition(TURN_PHASES.CHECKPOINT, { step: steps, persist: profile?.persistTurn !== false });
+        let advisedReserveThisStep = false;
         if (
           !verificationReserveAdvised &&
           verificationReserve > 0 &&
@@ -377,6 +381,7 @@ export class AgentLoop {
           steps >= maxSteps - verificationReserve
         ) {
           verificationReserveAdvised = true;
+          advisedReserveThisStep = true;
           const reserveText = execution?.evidenceContract
             ? `[预算收尾提醒] 距离最大步数上限仅剩最后 ${verificationReserve} 步（最终验证预留）。请停止继续大范围探索，立即运行必需测试验证并在最终回复中输出完整的 Evidence Manifest v1.0.0。`
             : `[预算收尾提醒] 距离最大步数上限仅剩最后 ${verificationReserve} 步。请停止继续大范围探索或重试失败命令，完成当前最小必要修改并直接输出最终交付总结，切勿耗尽步数。`;
@@ -386,6 +391,33 @@ export class AgentLoop {
               {
                 type: 'text',
                 text: reserveText,
+              },
+            ],
+          });
+        }
+        const tokenReserveThreshold =
+          maxTotalTokens !== null ? Math.max(24000, Math.floor(maxTotalTokens * 0.16)) : null;
+        const remainingTokens =
+          maxTotalTokens !== null ? maxTotalTokens - (tm.totalIn + tm.totalOut) : null;
+        const remainingDurationMs = deadlineAt !== null ? deadlineAt - Date.now() : null;
+        if (
+          !budgetReserveAdvised &&
+          !advisedReserveThisStep &&
+          steps >= 4 &&
+          ((tokenReserveThreshold !== null && remainingTokens <= tokenReserveThreshold) ||
+            (remainingDurationMs !== null && remainingDurationMs <= 35000))
+        ) {
+          budgetReserveAdvised = true;
+          const hasUnverifiedMutations = reasoningTracker.hasUnverifiedMutationsAfterLastPass;
+          const budgetWrapUpText = execution?.evidenceContract
+            ? `[预算收尾提醒] 当前预算余量已低于安全阈值（剩余约 ${remainingTokens ?? '未知'} tokens / ${remainingDurationMs !== null ? `${Math.max(0, Math.round(remainingDurationMs / 1000))}s` : '无时间限制'}）。请立即停止可选的文件探索、额外 bash 检查或辅助脚本，${hasUnverifiedMutations ? '仅运行一次必需测试以验证已修改文件后' : '勿再执行额外工具调用，'}立即输出简洁总结与完整的 Evidence Manifest v1.0.0 JSON。`
+            : `[预算收尾提醒] 当前 Token 或时间预算余量已低于安全阈值。请停止可选的文件探索与额外 bash 检查，${hasUnverifiedMutations ? '仅在必要时运行一次关键验证后' : ''}立即输出简洁的最终交付总结，切勿耗尽预算。`;
+          messages.push({
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: budgetWrapUpText,
               },
             ],
           });
@@ -922,7 +954,40 @@ export class AgentLoop {
         });
 
         if (detectedThrashing) {
-          if (!tm.thrashWarned) {
+          if (batchTrigger?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
+            if (!policyBlockWarned) {
+              policyBlockWarned = true;
+              const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(batchTrigger);
+              this.eventRouter.emitPersisted({
+                sessionId,
+                turnId,
+                type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
+                data: {
+                  step: steps,
+                  pattern: batchTrigger.pattern,
+                  fingerprint: batchTrigger.fingerprint ?? null,
+                  falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
+                },
+                audit: false,
+              });
+              messages.push({
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: steeringText,
+                  },
+                ],
+              });
+            }
+          } else if (
+            !tm.thrashWarned &&
+            !(
+              policyBlockWarned &&
+              batchTrigger?.pattern === STUCK_PATTERNS.EXACT_REPEAT &&
+              batchTrigger?.isPolicyRejection
+            )
+          ) {
             tm.thrashWarned = true;
             const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(batchTrigger);
             this.eventRouter.emitPersisted({
@@ -1040,27 +1105,34 @@ export class AgentLoop {
       };
     } catch (err) {
       const classified = classifyError(err);
-      classified.usage = {
+      const catchUsage = {
         inputTokens: tm.totalIn,
         outputTokens: tm.totalOut,
         cacheReadTokens: tm.totalCacheRead,
         cacheWriteTokens: tm.totalCacheWrite,
         cacheEligibleInputTokens: tm.totalCacheEligible,
       };
+      const catchMetrics = reasoningTracker.getMetrics({
+        finalOutcomePassed: false,
+        stopReason: classified.code || err?.code || 'aborted',
+      });
+      if (err && typeof err === 'object') {
+        err.reasoningMetrics = catchMetrics;
+      }
+      classified.usage = catchUsage;
       classified.steps = steps;
       classified.route = lastRoute;
-      classified.reasoningMetrics = reasoningTracker.getMetrics({
-        finalOutcomePassed: false,
-        stopReason: classified.code,
-      });
+      classified.reasoningMetrics = catchMetrics;
       // Fix D6: On LEASE_LOST (or if lease was already lost before error), exit cleanly without corrupting turn phase
       if (isLeaseLostError(classified) || !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
-        throw isLeaseLostError(classified)
+        const leaseErr = isLeaseLostError(classified)
           ? classified
           : new RecoveryError('LEASE_LOST', {
               message: `Lease lost during turn ${turnId}`,
               cause: err,
             });
+        leaseErr.reasoningMetrics = catchMetrics;
+        throw leaseErr;
       }
       if (isShutdownAbort(signal, err) || isShutdownAbort(signal, classified)) {
         classified.isShutdown = true;

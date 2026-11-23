@@ -424,3 +424,72 @@ test('glue: ExecutionReasoningTracker.getState() preserves v.signature, a.target
   assert.deepEqual(persisted.taskState.falsifiedAttempts[0].editedFiles, ['src/tax.js']);
   assert.ok(persisted.taskState.falsifiedAttempts[0].target.includes(a0.target));
 });
+
+test('glue: DirectAgent catch path persists reasoningMetrics on TURN_CANCELLED event', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-cancel-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-cancel-work-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  writeFileSync(join(workDir, 'src', 'cancel-me.js'), 'export const x = 1;\n', 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.setDefaultModel('glue-cancel-model');
+
+  let stepCall = 0;
+  const adapter = new ScriptedAdapter(async function* () {
+    stepCall += 1;
+    if (stepCall === 1) {
+      yield {
+        type: 'block-end',
+        block: {
+          type: 'tool-call',
+          id: 'tc-cancel-w1',
+          name: 'write_file',
+          arguments: JSON.stringify({ path: 'src/cancel-me.js', content: 'export const x = 2;\n' }),
+        },
+      };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    throw Object.assign(new Error('Request aborted by upstream cancellation'), { name: 'AbortError' });
+  });
+
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+
+  t.after(async () => {
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const session = direct.createSession({ workspaceRoot: workDir, permissionMode: 'full-access' });
+  const observedCancelEvents = [];
+  const unsub = direct.subscribe(session.id, (evt) => {
+    if (evt.type === 'turn/cancelled') observedCancelEvents.push(evt.data);
+  });
+  t.after(() => unsub());
+
+  const { turn } = direct.startTurn(session.id, {
+    input: 'Edit src/cancel-me.js',
+    model: 'glue-cancel-model',
+  });
+
+  const terminal = await direct.waitForTurnTerminal(turn.id, { timeoutMs: 5000 });
+  assert.equal(terminal.state, 'cancelled');
+
+  const cancelEv = store.db
+    .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/cancelled' ORDER BY seq DESC LIMIT 1")
+    .get(turn.id);
+  assert.ok(cancelEv, 'expected turn/cancelled event row in direct_events');
+  const parsed = JSON.parse(cancelEv.data);
+  assert.ok(parsed.reasoningMetrics, 'turn/cancelled event must include reasoningMetrics');
+  assert.deepEqual(parsed.reasoningMetrics.filesMutated, ['src/cancel-me.js']);
+  assert.equal(parsed.reasoningMetrics.selfCorrectionRecovered, false);
+  assert.ok(observedCancelEvents[0]?.reasoningMetrics, 'live SSE turn/cancelled event must include reasoningMetrics');
+});

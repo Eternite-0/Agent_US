@@ -9,6 +9,7 @@ export const STUCK_PATTERNS = Object.freeze({
   SAME_ERROR_STREAK: 'same_error_streak',
   EDIT_TEST_FAIL_LOOP: 'edit_test_fail_loop',
   ASSISTANT_MONOLOGUE: 'assistant_monologue',
+  POLICY_BLOCK_LOOP: 'policy_block_loop',
 });
 
 export const READ_TOOLS = Object.freeze(
@@ -408,6 +409,8 @@ export class ExecutionReasoningTracker {
     this._warnedPatterns = new Set();
     this._repairRounds = 0;
     this._nonReproFailureCount = 0;
+    this._policyBlockCount = 0;
+    this._consecutivePolicyBlocks = 0;
     this.ineffectiveActionCount = 0;
   }
 
@@ -486,10 +489,16 @@ export class ExecutionReasoningTracker {
     const parsedArgs = args ?? safeParseToolArgs(tc?.arguments);
     const status = receipt?.status ?? (isError ? 'failed' : 'finished');
     const exitCode = receipt?.exitCode ?? parseExitCodeFromOutput(output);
+    const trimmedOut = String(output ?? '').trim();
+    const isPolicyRejection =
+      status === 'rejected_before_effect' ||
+      receipt?.errorCode === 'APPROVAL_DENIED' ||
+      receipt?.errorCode === 'POLICY_DENIED' ||
+      /^(?:安全策略拦截：|用户拒绝了\s+.+\s+操作$|审批(?:超时|已被撤销)，拒绝执行\s+|\[(?:APPROVAL_DENIED|POLICY_DENIED)\])/.test(trimmedOut);
     const effectiveIsError =
       Boolean(isError) ||
+      isPolicyRejection ||
       status === 'failed' ||
-      status === 'rejected_before_effect' ||
       (typeof exitCode === 'number' && exitCode !== 0);
 
     // Reset identical-idle assistant tracker when an actual tool runs
@@ -502,9 +511,16 @@ export class ExecutionReasoningTracker {
       return { trigger: null, fingerprint: null, verification: null, mutatedFiles: [], readFiles: [] };
     }
 
+    if (isPolicyRejection) {
+      this._policyBlockCount += 1;
+      this._consecutivePolicyBlocks += 1;
+    } else {
+      this._consecutivePolicyBlocks = 0;
+    }
+
     const argsSig = computeCanonicalSignature(toolName, parsedArgs);
     let fingerprint = null;
-    if (effectiveIsError) {
+    if (effectiveIsError && !isPolicyRejection) {
       fingerprint = extractFailureFingerprint({
         toolName,
         args: parsedArgs,
@@ -583,7 +599,7 @@ export class ExecutionReasoningTracker {
     const isVerifCmd = isBashLike && isVerificationCommand(cmd);
     const isTestFailHint = isBashLike && effectiveIsError && TEST_BIN_FAIL_RE.test(cmd);
 
-    if (isVerifCmd) {
+    if (isVerifCmd && !isPolicyRejection) {
       const passed = status === 'finished' && !effectiveIsError;
       verificationRecord = {
         step,
@@ -608,15 +624,17 @@ export class ExecutionReasoningTracker {
       } else {
         this.#recordVerificationFailure();
       }
-    } else if (isTestFailHint) {
+    } else if (isTestFailHint && !isPolicyRejection) {
       this.#recordVerificationFailure();
+    } else if (isPolicyRejection) {
+      this.ineffectiveActionCount += 1;
     } else if (effectiveIsError) {
       this.ineffectiveActionCount += 1;
       this._nonReproFailureCount += 1;
     }
 
-    // 4. Record falsified attempt when an action fails (or an edit fails verification)
-    if (effectiveIsError && fingerprint) {
+    // 4. Record falsified attempt when an action fails (excluding pre-effect policy rejections)
+    if (effectiveIsError && !isPolicyRejection && fingerprint) {
       const priorEdit = this._lastEditPendingVerification;
       const hypothesisSummary =
         (isVerifCmd || isTestFailHint) && priorEdit
@@ -638,20 +656,27 @@ export class ExecutionReasoningTracker {
       }
     }
 
-    // 5. Update error streak
-    if (effectiveIsError && fingerprint) {
+    // 5. Update error streak (excluding pre-effect policy rejections)
+    if (effectiveIsError && !isPolicyRejection && fingerprint) {
       if (this._consecutiveErrorStreak.signature === fingerprint.signature) {
         this._consecutiveErrorStreak.count += 1;
       } else {
         this._consecutiveErrorStreak = { signature: fingerprint.signature, count: 1 };
       }
-    } else if (!READ_TOOLS.has(toolName) && !MUTATING_FILE_TOOLS.has(toolName)) {
+    } else if (!effectiveIsError && !READ_TOOLS.has(toolName) && !MUTATING_FILE_TOOLS.has(toolName)) {
       // Non-error, non-read, non-edit command broke the streak if it wasn't a read/edit inspection
       this._consecutiveErrorStreak = { signature: null, count: 0 };
     }
 
     // 6. Update action history for exact_repeat and ping_pong
-    const actionKey = `${toolName}:${argsSig}:${effectiveIsError ? `err:${fingerprint?.signature ?? '1'}` : 'ok'}`;
+    const policyCode = isPolicyRejection ? (receipt?.errorCode ?? status ?? 'rejected') : null;
+    const actionKey = `${toolName}:${argsSig}:${
+      isPolicyRejection
+        ? `policy:${policyCode}`
+        : effectiveIsError
+          ? `err:${fingerprint?.signature ?? '1'}`
+          : 'ok'
+    }`;
     this._actionHistory.push({
       seq,
       step,
@@ -659,6 +684,7 @@ export class ExecutionReasoningTracker {
       argsSig,
       actionKey,
       isError: effectiveIsError,
+      isPolicyRejection,
       isMutation: mutatedFiles.length > 0,
       fingerprint,
     });
@@ -667,7 +693,9 @@ export class ExecutionReasoningTracker {
     }
 
     if (effectiveIsError) {
-      const exactKey = `${toolName}:${argsSig}:${fingerprint?.signature ?? 'err'}`;
+      const exactKey = `${toolName}:${argsSig}:${
+        isPolicyRejection ? `policy:${policyCode}` : (fingerprint?.signature ?? 'err')
+      }`;
       if (this._consecutiveExactFailedStreak.key === exactKey) {
         this._consecutiveExactFailedStreak.count += 1;
       } else {
@@ -683,6 +711,7 @@ export class ExecutionReasoningTracker {
       seq,
       fingerprint,
       effectiveIsError,
+      isPolicyRejection,
     });
 
     return {
@@ -734,7 +763,7 @@ export class ExecutionReasoningTracker {
     this.errorFingerprints.push(entry);
   }
 
-  #evaluateStuckPatterns({ step, seq, fingerprint, effectiveIsError }) {
+  #evaluateStuckPatterns({ step, seq, fingerprint, effectiveIsError, isPolicyRejection = false }) {
     let detected = null;
 
     // Pattern 1: Exact repeat (>= 3 identical tool + args + error calls in recent window or consecutive)
@@ -750,6 +779,7 @@ export class ExecutionReasoningTracker {
           seq,
           signature: fingerprint?.signature ?? last?.actionKey ?? 'exact_repeat',
           summary: `Repeated identical failing call ${last?.toolName} (>= 3 times)`,
+          ...(isPolicyRejection ? { isPolicyRejection: true } : {}),
         };
       }
     }
@@ -783,7 +813,7 @@ export class ExecutionReasoningTracker {
     }
 
     // Pattern 4: Normalized same-error-signature streak (>= 3 even when args vary)
-    if (!detected && effectiveIsError && this._consecutiveErrorStreak.count >= 3) {
+    if (!detected && effectiveIsError && !isPolicyRejection && this._consecutiveErrorStreak.count >= 3) {
       detected = {
         pattern: STUCK_PATTERNS.SAME_ERROR_STREAK,
         step,
@@ -793,15 +823,30 @@ export class ExecutionReasoningTracker {
       };
     }
 
+    // Pattern 5: Policy/approval rejection loop (>= 2 policy blocks in a turn; non-fatal steering only)
+    if (!detected && isPolicyRejection && (this._policyBlockCount >= 2 || this._consecutivePolicyBlocks >= 2)) {
+      detected = {
+        pattern: STUCK_PATTERNS.POLICY_BLOCK_LOOP,
+        step,
+        seq,
+        signature: `policy_block:${this._policyBlockCount}`,
+        summary: `${this._policyBlockCount} tool calls blocked by sandbox/approval policy before execution (consecutive=${this._consecutivePolicyBlocks})`,
+        nonFatal: true,
+      };
+    }
+
     if (!detected) return null;
 
-    const alreadyWarned = this._warnedPatterns.size > 0;
+    const isPolicyPattern = detected.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP;
+    const alreadyWarned = isPolicyPattern
+      ? this._warnedPatterns.has(STUCK_PATTERNS.POLICY_BLOCK_LOOP)
+      : [...this._warnedPatterns].some((p) => p !== STUCK_PATTERNS.POLICY_BLOCK_LOOP);
     this._warnedPatterns.add(detected.pattern);
 
     const fullDetection = {
       ...detected,
-      fingerprint: fingerprint ?? this.errorFingerprints.at(-1) ?? null,
-      falsifiedAttempts: this.falsifiedAttempts.slice(-5),
+      fingerprint: isPolicyPattern ? null : (fingerprint ?? this.errorFingerprints.at(-1) ?? null),
+      falsifiedAttempts: isPolicyPattern ? [] : this.falsifiedAttempts.slice(-5),
       warningIssued: !alreadyWarned,
     };
     this.stuckDetections.push(fullDetection);
@@ -814,6 +859,14 @@ export class ExecutionReasoningTracker {
    */
   buildDiagnosticSteeringMessage(detection = null) {
     const active = detection ?? this.stuckDetections.at(-1) ?? null;
+    if (active?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
+      return [
+        `[策略拦截纠偏提示] 检测到多次工具调用在执行前被策略/审批拦截 (${active.summary || 'APPROVAL_DENIED / POLICY_DENIED'})，请立即停止尝试被禁止的 bash 命令（如 ls、git、node -e 等）。`,
+        '1. 目录浏览、文件检索和代码读取请直接使用内置工具 glob / grep / read_file，切勿通过 bash 执行辅助探测脚本。',
+        '2. 代码修改请直接使用 write_file / edit_file / apply_patch，并仅在需要验证时运行题目允许的精确测试命令。',
+      ].join('\n');
+    }
+
     const fp = active?.fingerprint ?? this.errorFingerprints.at(-1) ?? null;
     const falsified = (active?.falsifiedAttempts?.length
       ? active.falsifiedAttempts
@@ -858,6 +911,7 @@ export class ExecutionReasoningTracker {
       reproducedFailureBeforeEdit: this._reproducedFailureBeforeEdit,
       hasUnverifiedMutationsAfterLastPass: this.hasUnverifiedMutationsAfterLastPass,
       ineffectiveActionCount: this.ineffectiveActionCount,
+      policyBlockCount: this._policyBlockCount,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],
       errorFingerprints: this.errorFingerprints.map((fp) => ({ ...fp })),
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
@@ -872,32 +926,41 @@ export class ExecutionReasoningTracker {
         ? []
         : this.verifications.filter((v) => v.seq > this._firstMutationSeq);
     const latestVerification = this.verifications.at(-1) ?? null;
+    const executionStuckDetections = this.stuckDetections.filter(
+      (d) => d.pattern !== STUCK_PATTERNS.POLICY_BLOCK_LOOP,
+    );
 
     let firstFixSucceeded = null;
     if (postEditVerifications.length > 0) {
       firstFixSucceeded =
         postEditVerifications[0].passed === true &&
         !postEditVerifications.some((v) => !v.passed) &&
-        this.stuckDetections.length === 0 &&
+        executionStuckDetections.length === 0 &&
         this._repairRounds === 0;
-    } else if (this.filesMutated.length > 0 && this.stuckDetections.length > 0) {
+    } else if (this.filesMutated.length > 0 && executionStuckDetections.length > 0) {
       firstFixSucceeded = false;
     }
 
     const hadSetback =
       postEditVerifications.some((v) => !v.passed) ||
-      this.stuckDetections.length > 0 ||
+      executionStuckDetections.length > 0 ||
       this._repairRounds > 0 ||
       this._nonReproFailureCount > 0;
 
     const endedGreen =
       stopReason !== 'thrashing_circuit_break' &&
       stopReason !== 'max_steps' &&
+      stopReason !== 'verification_failed' &&
+      stopReason !== 'TOKEN_BUDGET' &&
+      stopReason !== 'TASK_DEADLINE' &&
       (finalOutcomePassed !== null
         ? Boolean(finalOutcomePassed)
         : Boolean(latestVerification?.passed && !this.hasUnverifiedMutationsAfterLastPass));
 
-    const selfCorrectionRecovered = Boolean(hadSetback && endedGreen);
+    let selfCorrectionRecovered = Boolean(hadSetback && endedGreen);
+    if (firstFixSucceeded === true) {
+      selfCorrectionRecovered = false;
+    }
 
     return {
       filesRead: [...this.filesRead],
@@ -906,6 +969,7 @@ export class ExecutionReasoningTracker {
       reproducedFailureBeforeEdit: this._reproducedFailureBeforeEdit,
       hasUnverifiedMutationsAfterLastPass: this.hasUnverifiedMutationsAfterLastPass,
       ineffectiveActionCount: this.ineffectiveActionCount,
+      policyBlockCount: this._policyBlockCount,
       firstFixSucceeded,
       selfCorrectionRecovered,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],
@@ -920,7 +984,7 @@ export class ExecutionReasoningTracker {
         warningIssued: d.warningIssued,
       })),
       repairRounds: this._repairRounds,
-      thrashWarned: this._warnedPatterns.size > 0,
+      thrashWarned: [...this._warnedPatterns].some((p) => p !== STUCK_PATTERNS.POLICY_BLOCK_LOOP),
       circuitBroken: stopReason === 'thrashing_circuit_break',
       latestVerificationPassed: latestVerification ? latestVerification.passed : null,
     };
