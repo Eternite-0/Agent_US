@@ -18,6 +18,11 @@ import { EvaluationService, REAL_ENGINEERING_BENCHMARK_ID } from '../../src/eval
 import { Store } from '../../src/store.js';
 import { AccountPool } from '../../src/pool.js';
 import { DirectAgentRuntime } from '../../src/direct-agent.js';
+import { DockerBenchmarkSandbox, SANDBOX_MODES } from '../../src/tools/benchmark-sandbox.js';
+
+const TEST_SANDBOX_OPTIONS = new DockerBenchmarkSandbox().isAvailable()
+  ? { mode: SANDBOX_MODES.STRONG }
+  : { mode: SANDBOX_MODES.NODE_PERMISSION, allowProcessHardeningOnly: true };
 
 class ScriptedAdapter extends LlmAdapter {
   constructor(handler) {
@@ -32,7 +37,7 @@ class ScriptedAdapter extends LlmAdapter {
 }
 
 test('evidence contract rejects model self-attested independentVerdict and missing bindings', async () => {
-  const task = createRealEngineeringDataset().find((t) => t.id === 'real-bug-fix-01');
+  const task = createRealEngineeringDataset({ sandboxOptions: TEST_SANDBOX_OPTIONS }).find((t) => t.id === 'real-bug-fix-01');
   const workspaceRoot = await createFixtureWorkspace(task);
   try {
     const fixedCode = 'export function slugify(value) { return String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""); }\n';
@@ -195,7 +200,7 @@ test('DirectAgent pre-finalization verification catches EVIDENCE_INCOMPLETE and 
   });
 
   try {
-    const evalService = new EvaluationService({ store, directAgent: direct, concurrency: 1, timeoutMs: 20_000 });
+    const evalService = new EvaluationService({ store, directAgent: direct, concurrency: 1, timeoutMs: 20_000, sandboxOptions: TEST_SANDBOX_OPTIONS });
     const started = evalService.start({ benchmarkId: REAL_ENGINEERING_BENCHMARK_ID, taskIds: ['real-bug-fix-01'], model: 'mock-eng' });
     const deadline = Date.now() + 25_000;
     while (Date.now() < deadline && ['queued', 'running'].includes(evalService.getRun(started.id)?.status)) {

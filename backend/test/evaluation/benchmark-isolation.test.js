@@ -24,6 +24,7 @@ import {
   DockerBenchmarkSandbox,
   NodePermissionBenchmarkSandbox,
   SANDBOX_MODES,
+  SANDBOX_TIERS,
   STRICT_ENV_ALLOWLIST_BASE,
   SandboxPolicyError,
   SandboxUnavailableError,
@@ -177,6 +178,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
       await withSyntheticHostEnv(async () => {
         const sandbox = new BenchmarkSandbox({
           mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
           workspaceRoot: ws,
         });
         const res = await sandbox.execArgv([process.execPath, 'env-probe.mjs'], {
@@ -350,6 +352,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
       });
       const res = await sandbox.execArgv([process.execPath, 'fs-escape.mjs'], {
@@ -391,6 +394,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
       });
 
@@ -593,6 +597,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
         const sandbox = new BenchmarkSandbox({
           mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
           workspaceRoot: ws,
         });
         const res = await sandbox.execArgv([process.execPath, 'net-exfil.mjs'], {
@@ -694,6 +699,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
         allowWorkspaceNodeCli: false,
       });
@@ -843,6 +849,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
         await withSyntheticHostEnv(async () => {
           const sandbox = new BenchmarkSandbox({
             mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
             workspaceRoot: ws,
             allowWorkspaceNodeCli: true,
           });
@@ -899,6 +906,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
       });
       const started = Date.now();
@@ -930,6 +938,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
       });
 
@@ -969,6 +978,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
       const capBytes = 4096;
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
         maxOutputBytes: capBytes,
       });
@@ -1067,8 +1077,32 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
         (err) => err instanceof SandboxUnavailableError && err.code === 'E_SANDBOX_UNAVAILABLE',
       );
 
+      const nodePermWithoutOptIn = new BenchmarkSandbox({
+        mode: SANDBOX_MODES.NODE_PERMISSION,
+        workspaceRoot: ws,
+        probes: { nodePermission: () => ({ available: true, reason: 'sim' }) },
+      });
+      assert.throws(
+        () => nodePermWithoutOptIn.resolveBackend(),
+        (err) => err instanceof SandboxUnavailableError && err.code === 'E_SANDBOX_UNAVAILABLE',
+      );
+
+      for (const strongMode of [SANDBOX_MODES.STRONG, SANDBOX_MODES.DOCKER, SANDBOX_MODES.AUTO]) {
+        const noSilentDowngrade = new BenchmarkSandbox({
+          mode: strongMode,
+          workspaceRoot: ws,
+          probes: { docker: { available: false, reason: 'sim_no_docker' }, nodePermission: true },
+        });
+        assert.throws(
+          () => noSilentDowngrade.resolveBackend(),
+          (err) => err instanceof SandboxUnavailableError && err.code === 'E_SANDBOX_UNAVAILABLE',
+          `${strongMode} must not silently downgrade to node-permission`,
+        );
+      }
+
       const nodePermUnavailable = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
         probes: { nodePermission: () => ({ available: false, reason: 'sim' }) },
       });
@@ -1108,6 +1142,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
         '--init',
         '--pull=never',
         '--network=none',
+        '--ipc=none',
         '--read-only',
         '--cap-drop=ALL',
         '--security-opt=no-new-privileges',
@@ -1193,6 +1228,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
       await withSyntheticHostEnv(async () => {
         const sandbox = new BenchmarkSandbox({
           mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
           workspaceRoot: ws,
         });
         const res = await sandbox.runHiddenAcceptance({
@@ -1202,6 +1238,9 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
         });
 
         assert.equal(res.passed, true, `stdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+        assert.equal(res.verified, true);
+        assert.equal(res.strongOsIsolation, false);
+        assert.equal(res.isolationTier, SANDBOX_TIERS.PROCESS_HARDENING_ONLY);
         assert.equal(res.exitCode, 0);
         assert.equal(readFileSync(indexPath, 'utf8'), originalIndexSource);
         assert.equal(existsSync(join(ws, 'dropped.txt')), false);
@@ -1384,6 +1423,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
         workspaceRoot: ws,
       });
 
@@ -1551,6 +1591,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
           const sandbox = new BenchmarkSandbox({
             mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
             workspaceRoot: ws,
           });
           const benchSession = direct.createSession({
@@ -1719,6 +1760,7 @@ describe('Benchmark Isolation Security Suite (Groups 1-10)', { concurrency: 1 },
 
       const availableSandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
       });
       const okAdapter = createDirectRuntimeAdapter(fakeDirectAgent, {
         model: 'test-model',
@@ -2470,6 +2512,7 @@ test('prototype safety, once, and clear', () => {
       );
       const sandbox = new BenchmarkSandbox({
         mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
       });
       const tasks = createOssBenchmarkDataset({
         repoOverrides: cachedOverrides,
@@ -2497,6 +2540,8 @@ test('prototype safety, once, and clear', () => {
             assert.equal(verdict.score, 1);
             assert.equal(verdict.evidence.sandboxIsolated, true);
             assert.equal(verdict.evidence.sandboxBackend, SANDBOX_MODES.NODE_PERMISSION);
+            assert.equal(verdict.evidence.strongOsIsolation, false);
+            assert.equal(verdict.evidence.isolationTier, SANDBOX_TIERS.PROCESS_HARDENING_ONLY);
             assert.equal(verdict.evidence.dependencyPolicyPassed, true);
             assert.equal(verdict.evidence.checks.sandboxIsolated, true);
             assert.equal(verdict.evidence.checks.dependencyPolicyPassed, true);
@@ -2586,6 +2631,7 @@ test('prototype safety, once, and clear', () => {
 
         const sandbox = new BenchmarkSandbox({
           mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
           workspaceRoot: effectiveWs,
           allowWorkspaceNodeCli: true,
         });
@@ -2605,6 +2651,7 @@ test('prototype safety, once, and clear', () => {
 
         const sandbox = new BenchmarkSandbox({
           mode: SANDBOX_MODES.NODE_PERMISSION,
+        allowProcessHardeningOnly: true,
           workspaceRoot: linkWs,
           allowWorkspaceNodeCli: true,
         });

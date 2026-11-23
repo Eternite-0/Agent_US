@@ -679,6 +679,7 @@ export class DirectAgentRuntime {
     if (inside) return baseSandbox;
     return new BenchmarkSandbox({
       mode: baseSandbox.mode,
+      allowProcessHardeningOnly: baseSandbox.allowProcessHardeningOnly,
       workspaceRoot,
       dependencyPolicy: baseSandbox.dependencyPolicy,
       dockerSandbox: baseSandbox.dockerSandbox,

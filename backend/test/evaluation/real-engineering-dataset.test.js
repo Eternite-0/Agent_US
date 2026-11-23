@@ -4,6 +4,12 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { createRealEngineeringDataset, REAL_ENGINEERING_DATASET } from '../../src/evaluation/dataset.js';
 import { createFixtureWorkspace, removeFixtureWorkspace } from '../../src/evaluation/fixtures.js';
+import { DockerBenchmarkSandbox, SANDBOX_MODES } from '../../src/tools/benchmark-sandbox.js';
+
+const TEST_SANDBOX_OPTIONS = new DockerBenchmarkSandbox().isAvailable()
+  ? { mode: SANDBOX_MODES.STRONG }
+  : { mode: SANDBOX_MODES.NODE_PERMISSION, allowProcessHardeningOnly: true };
+const createTestDataset = () => createRealEngineeringDataset({ sandboxOptions: TEST_SANDBOX_OPTIONS });
 
 const evidenceFor = (task, { attemptId = 'attempt-1', planVersion = 1 } = {}) => ({
   output: {
@@ -76,7 +82,7 @@ test('real engineering dataset has ten stable task-specific definitions', () => 
 });
 
 test('task-specific judges reject an untouched workspace and incomplete evidence', async () => {
-  const task = createRealEngineeringDataset()[0];
+  const task = createTestDataset()[0];
   await withTask(task, async (workspaceRoot) => {
     const judgment = await task.judge({ task, output: evidenceFor(task), context: trustedContextFor(task, workspaceRoot) });
     assert.equal(judgment.passed, false);
@@ -86,7 +92,7 @@ test('task-specific judges reject an untouched workspace and incomplete evidence
 });
 
 test('feature judge requires the requested implementation and documentation, not only a diff', async () => {
-  const task = createRealEngineeringDataset()[0];
+  const task = createTestDataset()[0];
   await withTask(task, async (workspaceRoot) => {
     const fs = await import('node:fs/promises');
     await fs.writeFile(`${workspaceRoot}/src/catalog.js`, "export function formatProduct(product) { return `${product.name}: ${product.priceCents}`; }\nexport function summarizeCatalog(items) { return { count: items.length, totalCents: items.reduce((sum, item) => sum + item.priceCents, 0), labels: items.map((item) => item.name) }; }\n");
@@ -98,7 +104,7 @@ test('feature judge requires the requested implementation and documentation, not
 });
 
 test('all ten judges accept their deterministic gold solutions and reject altered evidence', async () => {
-  const tasks = createRealEngineeringDataset();
+  const tasks = createTestDataset();
   const solutions = {
     'real-multi-file-feature-01': {
       'src/catalog.js': "export function formatProduct(product) { return `${product.name}: ${product.priceCents}`; }\nexport function summarizeCatalog(items) { return { count: items.length, totalCents: items.reduce((sum, item) => sum + item.priceCents, 0), labels: items.map((item) => item.name) }; }\n",
@@ -182,7 +188,7 @@ test('real engineering dataset parses fenced json and trailing json without fabr
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-us-eval-fenced-'));
   try {
-    const tasks = createRealEngineeringDataset();
+    const tasks = createTestDataset();
     const target = tasks.find((item) => item.id === 'real-bug-fix-01');
     assert.ok(target);
     const repo = path.join(tmpRoot, 'repo');

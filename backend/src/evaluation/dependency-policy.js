@@ -579,3 +579,47 @@ export function buildSafeInstallArgs(policy = DEFAULT_DEPENDENCY_POLICY) {
   }
   return args;
 }
+
+/**
+ * Controlled dependency preparation & verification stage.
+ * Validates exact pinned versions, trusted HTTPS registries, and lockfile presence,
+ * and stages/verifies offline installation args without leaking host tokens or enabling
+ * lifecycle scripts. During benchmark test execution, network remains disabled.
+ */
+export function prepareDependencies({
+  packageJson,
+  lockfilePresent = false,
+  cacheDir = null,
+  policy = DEFAULT_DEPENDENCY_POLICY,
+} = {}) {
+  const effective = validateDependencyPolicy(policy);
+  if (!packageJson || typeof packageJson !== 'object' || Array.isArray(packageJson)) {
+    throw new DependencyPolicyError('prepareDependencies requires parsed package.json object');
+  }
+  const depValidation = validatePackageDependencies(packageJson, effective);
+  if (!depValidation.ok) {
+    throw new DependencyPolicyError(
+      depValidation.violations.map((v) => v.message).join('; '),
+      { violations: depValidation.violations },
+    );
+  }
+  if (effective.requireLockfileIntegrity && depValidation.dependencyCount > 0 && !lockfilePresent) {
+    throw new DependencyPolicyError(
+      'Lockfile is required under requireLockfileIntegrity policy when dependencies are present',
+      { dependencyCount: depValidation.dependencyCount },
+    );
+  }
+  const installArgs = buildSafeInstallArgs(effective);
+  if (cacheDir) {
+    installArgs.push(`--cache=${String(cacheDir)}`);
+  }
+  return {
+    ok: true,
+    mode: effective.mode,
+    networkRequired: effective.allowNetworkInstall && depValidation.dependencyCount > 0,
+    dependencyCount: depValidation.dependencyCount,
+    trustedRegistries: [...effective.trustedRegistries],
+    installArgs,
+    postInstallNetworkEnabled: false,
+  };
+}

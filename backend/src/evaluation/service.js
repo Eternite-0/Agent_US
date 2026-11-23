@@ -359,6 +359,7 @@ function resolveTaskSandbox({
     }
     return new BenchmarkSandbox({
       mode: baseSandbox.mode,
+      allowProcessHardeningOnly: baseSandbox.allowProcessHardeningOnly,
       workspaceRoot: workspaceRoot ?? baseSandbox.workspaceRoot ?? null,
       dependencyPolicy: task?.metadata?.dependencyPolicy ?? baseSandbox.dependencyPolicy,
       dockerSandbox: baseSandbox.dockerSandbox,
