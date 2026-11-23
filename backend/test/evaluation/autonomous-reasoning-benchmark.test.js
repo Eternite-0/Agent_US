@@ -37,6 +37,8 @@ import {
   runHardenedGitSync,
 } from '../../src/tools/benchmark-sandbox.js';
 import {
+  authorizeRealBenchmarkApproval,
+  enrichReceiptsWithCommands,
   loadAndProbeWorktreeArm,
   parseCliArgs,
   recordArmExperienceMemory,
@@ -672,5 +674,249 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }
+  });
+
+  test('real-mode helpers: enrichReceiptsWithCommands maps assistant toolCalls and authorizeRealBenchmarkApproval enforces patch/bash boundaries', () => {
+    const receipts = [
+      { id: 'rec-1', callId: 'call-w', toolName: 'write_file', status: 'finished', exitCode: null },
+      { id: 'rec-2', callId: 'call-b1', toolName: 'bash', status: 'finished', exitCode: 0 },
+      { id: 'rec-3', callId: 'call-b2', toolName: 'bash', status: 'failed', exitCode: 1 },
+      { id: 'rec-4', callId: 'call-missing', toolName: 'bash', status: 'finished', exitCode: 0 },
+    ];
+    const assistantRows = [
+      {
+        toolCalls: JSON.stringify([
+          { id: 'call-w', name: 'write_file', arguments: JSON.stringify({ path: 'src/app.js', content: 'ok' }) },
+          { id: 'call-b1', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/checkout.test.js test/root-cause.test.js' }) },
+        ]),
+      },
+      { toolCalls: '{malformed json' },
+      {
+        toolCalls: [
+          { id: 'call-b2', name: 'bash', arguments: { command: 'npm test' } },
+        ],
+      },
+    ];
+    const enriched = enrichReceiptsWithCommands(receipts, assistantRows);
+    assert.equal(enriched[0].command, '');
+    assert.equal(enriched[1].command, 'node --test test/checkout.test.js test/root-cause.test.js');
+    assert.equal(enriched[2].command, 'npm test');
+    assert.equal(enriched[3].command, '');
+
+    const allowedTestCommands = new Set(['node --test test/checkout.test.js test/root-cause.test.js']);
+    const protectedSet = new Set(['test/checkout.test.js', 'CONSTRAINTS.md', 'src/index.js']);
+
+    // write_file / edit_file checks
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'write_file',
+        args: { path: './src\\pricing\\tax.js' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      true,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'edit_file',
+        args: { path: './test/checkout.test.js' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'write_file',
+        args: { path: '../outside.js' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'write_file',
+        args: { path: '.' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+
+    // apply_patch checks
+    const safePatch = [
+      '*** Begin Patch',
+      '*** Update File: src/pricing/tax.js',
+      '@@',
+      '-return 0;',
+      '+return 1;',
+      '*** Add File: test/root-cause.test.js',
+      '+export const ok = true;',
+      '*** End Patch',
+    ].join('\n');
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'apply_patch',
+        args: { patch: safePatch },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      true,
+    );
+
+    const protectedPatch = [
+      '*** Begin Patch',
+      '*** Update File: ./CONSTRAINTS.md',
+      '@@',
+      '-old',
+      '+new',
+      '*** End Patch',
+    ].join('\n');
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'apply_patch',
+        args: { patch: protectedPatch },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+
+    const deletePatch = [
+      '*** Begin Patch',
+      '*** Delete File: src/pricing/tax.js',
+      '*** End Patch',
+    ].join('\n');
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'apply_patch',
+        args: { patch: deletePatch },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+
+    const movePatch = [
+      '*** Begin Patch',
+      '*** Update File: src/pricing/tax.js',
+      '*** Move to: src/pricing/tax2.js',
+      '@@',
+      '-a',
+      '+b',
+      '*** End Patch',
+    ].join('\n');
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'apply_patch',
+        args: { patch: movePatch },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+
+    const traversalPatch = [
+      '*** Begin Patch',
+      '*** Add File: ../escape.js',
+      '+evil',
+      '*** End Patch',
+    ].join('\n');
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'apply_patch',
+        args: { patch: traversalPatch },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+
+    // bash checks
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node --test test/root-cause.test.js' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      true,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'npm test' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      true,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node --test && echo pwn' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node --test $(whoami)' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node --test test/a.test.js > out.txt' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node --test --eval "process.exit(0)"' },
+        allowedTestCommands,
+        protectedSet,
+      }),
+      false,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node bin/policy-cli.js --format json --strict' },
+        allowedTestCommands,
+        protectedSet,
+        allowWorkspaceNodeCli: false,
+      }),
+      false,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node bin/policy-cli.js --format json --strict' },
+        allowedTestCommands,
+        protectedSet,
+        allowWorkspaceNodeCli: true,
+      }),
+      true,
+    );
+    assert.equal(
+      authorizeRealBenchmarkApproval({
+        toolName: 'bash',
+        args: { command: 'node src/cli/audit.js --input entries.json' },
+        allowedTestCommands,
+        protectedSet,
+        allowWorkspaceNodeCli: true,
+      }),
+      true,
+    );
   });
 });

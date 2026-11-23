@@ -26,7 +26,9 @@ import {
   instantiateAutonomousReasoningWorkspace,
 } from '../src/evaluation/autonomous-reasoning-benchmark.js';
 import { removeFixtureWorkspace } from '../src/evaluation/fixtures.js';
+import { parseCodexPatch } from '../src/patch-and-diagnostics.js';
 import { BenchmarkSandbox, SANDBOX_MODES, runHardenedGitSync } from '../src/tools/benchmark-sandbox.js';
+import { scanCommandSyntax } from '../src/tools/command-analyzer.js';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(SCRIPT_DIR, '..', '..');
@@ -825,6 +827,230 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
   }
 }
 
+function parseJsonField(raw, fallback = null) {
+  if (raw == null || raw === '') return fallback;
+  if (typeof raw === 'object') return raw;
+  try {
+    return JSON.parse(String(raw));
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeRelativeRepoPath(rawPath) {
+  if (typeof rawPath !== 'string') return null;
+  if (rawPath.includes('\0')) return null;
+  let trimmed = rawPath.trim();
+  if (!trimmed) return null;
+  if (/^[A-Za-z]:/.test(trimmed) || trimmed.startsWith('/') || trimmed.startsWith('\\')) {
+    return null;
+  }
+  trimmed = trimmed.replaceAll('\\', '/');
+  while (trimmed.startsWith('./')) trimmed = trimmed.slice(2);
+  trimmed = trimmed.replace(/\/{2,}/g, '/');
+  if (!trimmed || trimmed === '.') return null;
+  const parts = [];
+  for (const seg of trimmed.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') return null;
+    parts.push(seg);
+  }
+  return parts.length ? parts.join('/') : null;
+}
+
+function buildSafeArgsSummary(toolName, args) {
+  if (!args || typeof args !== 'object') return '';
+  let raw = '';
+  if (toolName === 'bash') {
+    raw = String(args.command ?? '');
+  } else if (['write_file', 'edit_file', 'read_file'].includes(toolName)) {
+    raw = String(args.path ?? args.filePath ?? '');
+  } else if (toolName === 'apply_patch') {
+    const patchText = String(args.patch ?? args.patchText ?? args.input ?? '');
+    try {
+      const hunks = parseCodexPatch(patchText);
+      raw = `patch: ${hunks.map((h) => h.path).filter(Boolean).join(', ')}`;
+    } catch {
+      raw = 'patch: invalid';
+    }
+  } else {
+    try {
+      raw = JSON.stringify(args);
+    } catch {
+      raw = '';
+    }
+  }
+  return redactSecrets(raw).replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+
+function buildCallMetaMap(assistantMessageRows = []) {
+  const byId = new Map();
+  for (const row of Array.isArray(assistantMessageRows) ? assistantMessageRows : []) {
+    const calls = parseJsonField(row?.toolCalls ?? row, null);
+    if (!Array.isArray(calls)) continue;
+    for (const tc of calls) {
+      if (!tc?.id) continue;
+      const args = parseJsonField(tc.arguments, {});
+      const name = String(tc.name ?? '');
+      const command = typeof args?.command === 'string' ? args.command.trim() : '';
+      byId.set(String(tc.id), {
+        name,
+        command,
+        argsSummary: buildSafeArgsSummary(name, args),
+      });
+    }
+  }
+  return byId;
+}
+
+export function enrichReceiptsWithCommands(receipts = [], assistantMessageRows = []) {
+  const callMetaById = buildCallMetaMap(assistantMessageRows);
+  return (Array.isArray(receipts) ? receipts : []).map((r) => {
+    const meta = r?.callId ? callMetaById.get(String(r.callId)) : null;
+    return {
+      ...r,
+      command: (typeof r?.command === 'string' && r.command.trim()) ? r.command : (meta?.command ?? ''),
+    };
+  });
+}
+
+export function authorizeRealBenchmarkApproval({
+  toolName,
+  args = {},
+  allowedTestCommands = new Set(),
+  protectedSet = new Set(),
+  allowWorkspaceNodeCli = false,
+} = {}) {
+  const tool = String(toolName ?? '').trim();
+  const normProtected = new Set();
+  for (const p of protectedSet ?? []) {
+    const norm = normalizeRelativeRepoPath(String(p ?? ''));
+    if (norm) normProtected.add(norm);
+  }
+
+  if (tool === 'write_file' || tool === 'edit_file') {
+    const normPath = normalizeRelativeRepoPath(args?.path ?? args?.filePath ?? '');
+    return Boolean(normPath) && !normProtected.has(normPath);
+  }
+
+  if (tool === 'apply_patch') {
+    const patchText =
+      typeof args?.patch === 'string'
+        ? args.patch
+        : typeof args?.patchText === 'string'
+          ? args.patchText
+          : typeof args?.input === 'string'
+            ? args.input
+            : '';
+    if (!patchText) return false;
+    let hunks;
+    try {
+      hunks = parseCodexPatch(patchText);
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(hunks) || hunks.length === 0) return false;
+    for (const hunk of hunks) {
+      if (!hunk || hunk.type === 'delete' || hunk.moveTo) return false;
+      const normPath = normalizeRelativeRepoPath(hunk.path ?? '');
+      if (!normPath || normProtected.has(normPath)) return false;
+    }
+    return true;
+  }
+
+  if (tool === 'bash') {
+    const cmd = String(args?.command ?? '').trim();
+    if (!cmd) return false;
+    if (/[;&|><`\r\n$]/.test(cmd)) return false;
+    const { tokens, hasCompound, hasSubstitution, unbalancedQuotes } = scanCommandSyntax(cmd);
+    if (hasCompound || hasSubstitution || unbalancedQuotes || !tokens.length) return false;
+    if (tokens.some((tok) => tok === '..' || tok.includes('../') || tok.includes('..\\') || tok.startsWith('/'))) {
+      return false;
+    }
+
+    const allowedSet = new Set();
+    for (const c of allowedTestCommands ?? []) {
+      const normalized = String(c ?? '').replace(/\s+/g, ' ').trim();
+      if (normalized) allowedSet.add(normalized);
+    }
+    const collapsed = tokens.join(' ');
+    if (allowedSet.has(cmd) || allowedSet.has(collapsed)) return true;
+    if (cmd === 'node --test' || cmd === 'npm test' || cmd === 'npm run test') return true;
+    if (
+      /^node\s+--test(?:\s+[A-Za-z0-9._\/-]+)+$/.test(cmd) &&
+      !tokens.slice(2).some((tok) => tok.startsWith('-'))
+    ) {
+      return true;
+    }
+    if (
+      allowWorkspaceNodeCli === true &&
+      /^node\s+(?:bin|src)\/[A-Za-z0-9._\/-]+(?:\s+[A-Za-z0-9._:\/=-]+)*$/.test(cmd)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], assistantMessageRows = [], benchKey = '') {
+  const callMetaById = buildCallMetaMap(assistantMessageRows);
+  const stepByCallId = new Map();
+  let reasoningMetrics = null;
+  const thrashingWarnings = [];
+  let repairRounds = 0;
+  let turnErrorCode = null;
+
+  for (const ev of Array.isArray(eventRows) ? eventRows : []) {
+    const type = String(ev?.type ?? '');
+    const data = parseJsonField(ev?.data, null);
+    if (!data || typeof data !== 'object') continue;
+
+    if (type === 'tool/call' && data.callId && data.step != null) {
+      stepByCallId.set(String(data.callId), Number(data.step));
+    } else if (type === 'loop/thrashing_warning') {
+      thrashingWarnings.push(safeRedactValue(data, benchKey));
+    } else if (type === 'verifier/repair') {
+      repairRounds += 1;
+    } else if (type === 'turn/completed' || type === 'turn/failed') {
+      if (data.reasoningMetrics && typeof data.reasoningMetrics === 'object') {
+        reasoningMetrics = safeRedactValue(data.reasoningMetrics, benchKey);
+      }
+      if (type === 'turn/failed' && data.code) {
+        turnErrorCode = String(data.code);
+      }
+    }
+  }
+
+  const toolCallTrace = (Array.isArray(receipts) ? receipts : []).map((r, idx) => {
+    const callId = r?.callId ? String(r.callId) : null;
+    const meta = callId ? callMetaById.get(callId) : null;
+    const rawArgsSummary = meta?.argsSummary || (r?.command ? redactSecrets(String(r.command)).slice(0, 160) : '');
+    return {
+      step: callId && stepByCallId.has(callId) ? stepByCallId.get(callId) : idx + 1,
+      callId,
+      name: String(r?.toolName ?? meta?.name ?? ''),
+      status: String(r?.status ?? 'unknown'),
+      exitCode: r?.exitCode ?? null,
+      errorCode: r?.errorCode ?? null,
+      argsSummary: safeRedactValue(rawArgsSummary, benchKey),
+    };
+  });
+
+  if (reasoningMetrics && Number.isFinite(Number(reasoningMetrics.repairRounds))) {
+    repairRounds = Math.max(repairRounds, Number(reasoningMetrics.repairRounds));
+  }
+
+  return {
+    reasoningMetrics,
+    thrashingWarnings,
+    repairRounds,
+    turnErrorCode,
+    toolCallTrace,
+  };
+}
+
 async function runRealArmTrial({ task, armName, armRuntime, rep, position, benchKey, endpoint, requestedModel, judgeSandbox }) {
   const started = performance.now();
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-ar-real-${armName}-`));
@@ -848,16 +1074,18 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     dataRoot: stateDir,
     defaultWorkspace: workspaceRoot,
   });
+  const allowWorkspaceNodeCli = Boolean(task.metadata?.sandboxIsolation?.allowWorkspaceNodeCli);
   const sessionSandbox = new ArmSandbox({
     ...buildSandboxOptions(judgeSandbox.mode),
     workspaceRoot,
-    allowWorkspaceNodeCli: Boolean(task.metadata?.sandboxIsolation?.allowWorkspaceNodeCli),
+    allowWorkspaceNodeCli,
     timeoutMs: 30_000,
     cpuLimitSec: 20,
     memoryLimitMb: 512,
   });
 
   const wireRecords = [];
+  const pendingWirePromises = [];
   const repairEvents = [];
   let unsub = null;
   const originalFetch = globalThis.fetch;
@@ -866,21 +1094,26 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     if (url.origin !== endpoint.origin || !url.pathname.endsWith('/chat/completions')) {
       return originalFetch(input, init);
     }
-    const rec = { http: null, ms: null, inputTokens: 0, outputTokens: 0 };
+    const rec = { http: null, ms: null, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
     const t0 = performance.now();
     wireRecords.push(rec);
     const res = await originalFetch(input, init);
     rec.http = res.status;
-    res.clone().text().then((body) => {
-      for (const line of body.split('\n')) {
+    const wirePromise = res.clone().text().then((body) => {
+      for (const line of body.split(/\r?\n/)) {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') continue;
         try {
           const parsed = JSON.parse(payload);
           if (parsed.usage) {
-            rec.inputTokens = Number(parsed.usage.prompt_tokens ?? 0);
-            rec.outputTokens = Number(parsed.usage.completion_tokens ?? 0);
+            const u = parsed.usage;
+            rec.inputTokens = Number(u.prompt_tokens ?? u.input_tokens ?? rec.inputTokens ?? 0);
+            rec.outputTokens = Number(u.completion_tokens ?? u.output_tokens ?? rec.outputTokens ?? 0);
+            const cr = u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens;
+            const cw = u.cache_creation_input_tokens ?? u.prompt_tokens_details?.cache_creation_tokens;
+            if (cr != null && Number.isFinite(Number(cr))) rec.cacheReadTokens = Number(cr);
+            if (cw != null && Number.isFinite(Number(cw))) rec.cacheWriteTokens = Number(cw);
           }
         } catch {
           // ignore non-json SSE lines
@@ -889,6 +1122,7 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     }).catch(() => {}).finally(() => {
       rec.ms = Math.round(performance.now() - t0);
     });
+    pendingWirePromises.push(wirePromise);
     return res;
   };
 
@@ -897,7 +1131,7 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
       workspaceRoot,
       model: requestedModel,
       permissionMode: 'auto-safe',
-      budget: { maxSteps: task.resourceBudget?.maxSteps ?? 20, maxOutputTokens: 4096, maxTotalTokens: 110_000 },
+      budget: { maxSteps: task.resourceBudget?.maxSteps ?? 20, maxOutputTokens: 8192, maxTotalTokens: 160_000 },
       sandbox: sessionSandbox,
       disableWorkspaceHooks: true,
       disableWorkspaceMcp: true,
@@ -911,23 +1145,27 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     const protectedSet = new Set([
       ...(task.fixture.baselineTestFiles ?? []),
       ...(task.id === 'ar-10-long-horizon-delivery' ? ['CONSTRAINTS.md'] : []),
+      ...(task.id === 'ar-07-multi-stage-dev' ? ['SPEC.md'] : []),
+      ...(task.id === 'ar-01-unfamiliar-codebase'
+        ? Object.keys(task.fixture.files ?? {}).filter((p) => p.startsWith('src/'))
+        : []),
     ]);
     unsub = direct.subscribe(session.id, (evt) => {
       if (evt.type === 'verifier/repair') repairEvents.push(evt.data);
       if (evt.type === 'approval/requested') {
         const a = evt.data;
-        let allow = false;
-        if (a.tool === 'bash') {
-          allow = allowedTestCommands.has(String(a.arguments?.command ?? '').trim());
-        } else if (['write_file', 'edit_file'].includes(a.tool)) {
-          const p = String(a.arguments?.path ?? '').replaceAll('\\', '/').replace(/^\.\//, '');
-          allow = Boolean(p) && !protectedSet.has(p);
-        }
+        const allow = authorizeRealBenchmarkApproval({
+          toolName: a.tool,
+          args: a.arguments,
+          allowedTestCommands,
+          protectedSet,
+          allowWorkspaceNodeCli,
+        });
         queueMicrotask(() => direct.decideApproval(a.approvalId, { decision: allow ? 'allow' : 'deny', scope: 'once', reason: 'Frozen AR benchmark policy' }));
       }
     });
 
-    const deadlineMs = 110_000;
+    const deadlineMs = 180_000;
     const { turn } = direct.startTurn(session.id, {
       input: task.prompt,
       model: requestedModel,
@@ -952,14 +1190,27 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     if (timedOut) {
       direct.cancelTurn(turn.id);
       await direct.waitForTurnTerminal(turn.id, { timeoutMs: 5000 }).catch(() => {});
+      row = direct.listTurns(session.id).find((r) => r.id === turn.id) ?? row;
     }
+
+    await Promise.race([Promise.allSettled(pendingWirePromises), delay(2000)]);
 
     const assistantMsgs = store.db
       .prepare("SELECT content FROM direct_messages WHERE turnId=? AND role='assistant' ORDER BY seq DESC LIMIT 1")
       .get(turn.id);
+    const assistantMessageRows = store.db
+      .prepare("SELECT toolCalls FROM direct_messages WHERE turnId=? AND role='assistant' AND toolCalls IS NOT NULL ORDER BY seq ASC")
+      .all(turn.id);
     const receipts = store.db
       .prepare('SELECT id, callId, toolName, status, exitCode, errorCode FROM tool_receipts WHERE turnId=? ORDER BY rowid')
       .all(turn.id);
+    const enrichedReceipts = enrichReceiptsWithCommands(receipts, assistantMessageRows);
+    const eventRows = store.db
+      .prepare('SELECT type, data FROM direct_events WHERE turnId=? ORDER BY seq ASC')
+      .all(turn.id);
+    const diagnostics = extractTurnDiagnosticsFromEvents(eventRows, enrichedReceipts, assistantMessageRows, benchKey);
+    const totalRepairRounds = Math.max(repairEvents.length, diagnostics.repairRounds);
+    const turnErrorCode = diagnostics.turnErrorCode ?? row?.errorCode ?? (timedOut ? 'TURN_DEADLINE_EXCEEDED' : null);
 
     const judgment = await task.judge({
       task,
@@ -969,20 +1220,27 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
         sandbox: judgeSandbox,
         attemptId: 'attempt-1',
         planVersion: 1,
-        toolReceipts: receipts,
+        toolReceipts: enrichedReceipts,
         trustedVerdict: row?.state === 'completed'
-          ? { status: 'pass', source: 'trusted_server_verifier', evidenceRefs: receipts.map((r) => r.id) }
+          ? { status: 'pass', source: 'trusted_server_verifier', evidenceRefs: enrichedReceipts.map((r) => r.id) }
           : null,
         trialMeta: {
           status: timedOut ? 'timeout' : row?.state === 'completed' ? 'passed' : 'failed',
-          errorCode: row?.errorCode ?? null,
+          errorCode: turnErrorCode,
         },
       },
     });
 
-    const inputTokens = wireRecords.reduce((s, r) => s + r.inputTokens, 0);
-    const outputTokens = wireRecords.reduce((s, r) => s + r.outputTokens, 0);
+    let inputTokens = wireRecords.reduce((s, r) => s + r.inputTokens, 0);
+    let outputTokens = wireRecords.reduce((s, r) => s + r.outputTokens, 0);
+    const cacheReadTokens = wireRecords.reduce((s, r) => s + r.cacheReadTokens, 0);
+    const cacheWriteTokens = wireRecords.reduce((s, r) => s + r.cacheWriteTokens, 0);
+    if (inputTokens === 0 && outputTokens === 0 && row) {
+      inputTokens = Number(row.inputTokens ?? 0);
+      outputTokens = Number(row.outputTokens ?? 0);
+    }
     const durationMs = Math.round(performance.now() - started);
+    const assistantExcerpt = safeRedactValue(String(assistantMsgs?.content ?? '').slice(0, 600), benchKey);
 
     return {
       taskId: task.id,
@@ -993,21 +1251,33 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
       position,
       passed: Boolean(judgment.passed && !timedOut),
       status: timedOut ? 'timeout' : judgment.passed ? 'passed' : 'failed',
-      attempts: 1 + repairEvents.length,
-      repairRounds: repairEvents.length,
+      turnState: row?.state ?? null,
+      turnErrorCode,
+      attempts: 1 + totalRepairRounds,
+      repairRounds: totalRepairRounds,
       rootCauseAccurate: Boolean(judgment.evidence.rootCauseMatch),
-      firstFixSucceeded: Boolean(judgment.passed && repairEvents.length === 0),
+      firstFixSucceeded: Boolean(judgment.passed && totalRepairRounds === 0 && !diagnostics.reasoningMetrics?.selfCorrectionRecovered),
       regressionPassed: Boolean(judgment.evidence.regressionPassed),
-      ineffectiveActionCount: receipts.filter((r) => r.status === 'failed' || r.status === 'rejected_before_effect').length,
-      replanTriggered: repairEvents.length > 0,
-      replanSucceeded: repairEvents.length > 0 && judgment.passed,
+      ineffectiveActionCount: enrichedReceipts.filter((r) => r.status === 'failed' || r.status === 'rejected_before_effect').length,
+      replanTriggered: totalRepairRounds > 0,
+      replanSucceeded: totalRepairRounds > 0 && judgment.passed,
       isRecoveryTask: Boolean(task.metadata.recoveryRequirements),
       recoverySucceeded: Boolean(task.metadata.recoveryRequirements && judgment.passed),
-      tokenUsage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      tokenUsage: {
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
+        ...(cacheWriteTokens > 0 ? { cacheWriteTokens } : {}),
+      },
       tokenCost: inputTokens + outputTokens,
       durationMs,
       failureCategory: timedOut ? 'timeout' : judgment.evidence.failureCategory,
       failureAttribution: judgment.evidence.failureAttribution,
+      toolCallTrace: diagnostics.toolCallTrace,
+      thrashingWarnings: diagnostics.thrashingWarnings,
+      reasoningMetrics: diagnostics.reasoningMetrics,
+      assistantExcerpt,
       judge: judgment,
     };
   } finally {
