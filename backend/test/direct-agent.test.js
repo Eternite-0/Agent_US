@@ -178,6 +178,11 @@ test('DirectAgent handles direct multi-turn chat, real workspace tools, and inte
       'line1\nhello Claude Code\nline3\n',
     );
 
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM swarm_runs').get().n, 0);
+    for (const call of scripted.calls) {
+      assert.ok(!call.tools?.some(t => ['spawn_subagent', 'swarm_orchestrate'].includes(t.name)));
+    }
+
     // Verify ledger integrity remains 100% valid
     assert.equal(store.verifyIntegrity({ full: true }).ok, true);
 

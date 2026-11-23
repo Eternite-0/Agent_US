@@ -11,7 +11,6 @@ import type {
 } from '../types/backend';
 import { Composer } from './Composer';
 import {
-  CodexCloudMark,
   IconCheck,
   IconClose,
   IconFolder,
@@ -127,25 +126,23 @@ export const HomeView: React.FC<HomeViewProps> = ({
       </div>
 
       <div className="codex-home-hero">
-        <div className="codex-hero-mark">
-          <CodexCloudMark size={56} />
-        </div>
-
         {codexMode === 'Chat' ? (
-          <h1 className="codex-hero-title">今天想一起解决什么问题？</h1>
+          <h1 className="codex-hero-title">新对话</h1>
         ) : (
           <h1 className="codex-hero-title">
-            <span>你想让我们在</span>
+            <span>{selectedProject ? '在' : '新对话 ·'}</span>
             <span style={{ position: 'relative', display: 'inline-block' }} ref={pickerRef}>
               <button
                 type="button"
                 className="codex-hero-project-btn"
+                aria-expanded={pickerOpen}
+                title={selectedProject?.name}
                 onClick={() => {
                   setProjectSearch('');
                   setPickerOpen((v) => !v);
                 }}
               >
-                {selectedProject?.name || '选择项目'}
+                <span className="codex-hero-project-name">{selectedProject?.name || '选择项目'}</span>
               </button>
 
               {pickerOpen && (
@@ -219,19 +216,18 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 </div>
               )}
             </span>
-            <span>{codexMode === 'Work' ? '中协作完成什么？' : '中构建什么？'}</span>
+            {selectedProject && <span>{codexMode === 'Work' ? '中开始协作' : '中开始对话'}</span>}
           </h1>
         )}
 
         {isLiveBackend && !routerReady && (
           <button
             type="button"
-            className="codex-status-chip"
-            style={{ marginTop: 18, cursor: 'pointer' }}
+            className="codex-home-status"
             onClick={() => onOpenSettings('providers')}
           >
             <span className="codex-status-dot" data-tone="warn" />
-            <span>已连接真实后端 · 尚未配置模型密钥（任务将持久化入队等待）</span>
+            <span>配置模型以开始对话</span>
           </button>
         )}
       </div>

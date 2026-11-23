@@ -587,7 +587,7 @@ button:disabled {
   padding: 6px;
   border-radius: var(--workspace-popover-radius);
   border: 1px solid var(--border-default);
-  background: var(--workspace-picker-surface);
+  background: var(--bg-surface-elevated);
   box-shadow: var(--workspace-picker-shadow);
   animation: codex-enter-popover-up 0.14s var(--ease-enter-snappy);
 }
@@ -928,24 +928,16 @@ button:disabled {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  padding: 0 24px 64px;
+  justify-content: flex-end;
+  padding: 0 24px 24px;
   text-align: center;
-}
-
-.codex-hero-mark {
-  width: 56px;
-  height: 56px;
-  color: color-mix(in srgb, var(--text-default) 32%, transparent);
-  margin-bottom: 18px;
-  animation: codex-fade-in 0.35s var(--ease-out);
 }
 
 .codex-hero-title {
   margin: 0;
-  font-size: 27px;
-  line-height: 36px;
-  font-weight: 500;
+  font-size: clamp(19px, 2.5vw, 24px);
+  line-height: 1.4;
+  font-weight: 550;
   letter-spacing: -0.015em;
   color: var(--text-default);
   display: inline-flex;
@@ -960,12 +952,20 @@ button:disabled {
   align-items: center;
   font: inherit;
   color: var(--text-default);
-  border-bottom: 1.5px dotted color-mix(in srgb, var(--text-default) 45%, transparent);
-  padding: 0 2px 1px;
+  border-bottom: 1px solid var(--border-strong);
+  padding: 0 2px;
   border-radius: 4px 4px 0 0;
+  max-width: min(240px, 60vw);
   transition:
     background-color var(--duration-basic) var(--ease-out),
     border-color var(--duration-basic) var(--ease-out);
+}
+
+.codex-hero-project-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .codex-hero-project-btn:hover {
@@ -973,10 +973,26 @@ button:disabled {
   border-bottom-color: var(--text-default);
 }
 
+.codex-home-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.codex-home-status:hover {
+  color: var(--text-default);
+  background: var(--bg-ghost-hover);
+}
+
 .codex-home-composer-slot {
   flex: none;
   width: 100%;
-  padding: 0 24px 20px;
+  padding: 0 24px clamp(20px, calc((100dvh - 560px) * 0.6), 220px);
 }
 
 /* ============================================================================
@@ -1207,8 +1223,8 @@ button:disabled {
   z-index: 80;
   background: var(--bg-surface-elevated);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-lg);
+  border-radius: var(--workspace-popover-radius);
+  box-shadow: var(--workspace-picker-shadow);
   padding: 5px;
   min-width: 200px;
   animation: codex-enter-popover 0.15s var(--ease-enter-snappy);
@@ -1570,12 +1586,7 @@ button:disabled {
   right: 0;
   bottom: 0;
   padding: 20px 24px 18px;
-  background: linear-gradient(
-    to bottom,
-    var(--composer-backdrop-top) 0%,
-    var(--composer-backdrop-bottom) 38%,
-    var(--bg-surface) 100%
-  );
+  background: linear-gradient(transparent, var(--bg-surface) 20px);
   pointer-events: none;
   z-index: 22;
 }
@@ -3468,7 +3479,7 @@ button:disabled {
   border-radius: 14px;
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--workspace-picker-shadow);
   padding: 10px 10px 12px;
   display: flex;
   flex-direction: column;
@@ -4252,7 +4263,7 @@ button:disabled {
 }
 
 .codex-thread-composer-dock {
-  padding: 12px 18px 12px;
+  padding: 20px 18px 14px;
 }
 
 .codex-scroll-bottom-btn {
@@ -4707,8 +4718,7 @@ button:disabled {
   position: fixed;
   inset: 0;
   z-index: 260;
-  background: rgba(10, 10, 12, 0.84);
-  backdrop-filter: blur(8px);
+  background: rgba(10, 10, 12, 0.9);
   display: flex;
   flex-direction: column;
   animation: codex-fade-in 0.14s var(--ease-out);
@@ -4939,85 +4949,30 @@ button:disabled {
  * ========================================================================== */
 
 :root {
-  --workspace-composer-radius: 23px;
-  --workspace-popover-radius: 18px;
-  --workspace-row-radius: 10px;
-  --workspace-picker-surface: linear-gradient(var(--bg-surface-elevated), var(--bg-surface-elevated)) var(--bg-surface);
-  --workspace-picker-shadow: 0 12px 28px -14px rgba(15, 23, 42, 0.26), var(--shadow-sm);
-  --workspace-composer-shadow: 0 4px 16px -9px rgba(15, 23, 42, 0.16);
-  --workspace-selection: color-mix(in srgb, var(--color-accent-soft) 45%, var(--bg-selected));
+  --workspace-composer-radius: 18px;
+  --workspace-popover-radius: 14px;
+  --workspace-row-radius: 8px;
+  --workspace-picker-shadow: 0 6px 18px -5px rgb(0 0 0 / 14%);
+  --workspace-selection: var(--bg-selected);
 }
 
 [data-theme="dark"] {
   --text-tertiary: rgba(252, 252, 252, 0.54);
-  --workspace-picker-surface: var(--bg-surface-elevated);
-  --workspace-picker-shadow: 0 10px 28px -12px rgba(0, 0, 0, 0.65);
-  --workspace-composer-shadow: 0 6px 20px -12px rgba(0, 0, 0, 0.64);
+  --workspace-picker-shadow: 0 6px 18px -5px rgb(0 0 0 / 50%);
 }
 
 [data-theme="dark"][data-appearance-preset="codex"] {
-  --bg-chrome: #181c21;
-  --bg-surface: #13161a;
-  --bg-surface-elevated: #24282d;
-  --bg-composer: #2a2e34;
-  --bg-user-message: #22272e;
-  --composer-backdrop-top: transparent;
-  --composer-backdrop-bottom: color-mix(in srgb, var(--bg-surface) 94%, transparent);
+  --bg-chrome: #1b1b1a;
+  --bg-surface: #161615;
+  --bg-surface-elevated: #292928;
+  --bg-composer: #232322;
+  --bg-user-message: #252524;
 }
 
 ::selection {
   background: color-mix(in srgb, var(--color-accent) 22%, transparent);
 }
 
-/* ---- Home hero ---------------------------------------------------------- */
-.codex-home-hero {
-  padding-bottom: 72px;
-}
-
-.codex-hero-mark {
-  width: 52px;
-  height: 52px;
-  margin-bottom: 20px;
-  color: color-mix(in srgb, var(--text-default) 28%, transparent);
-  animation: codex-hero-rise 0.5s var(--ease-enter-snappy) both;
-}
-
-.codex-hero-title {
-  font-size: 26px;
-  line-height: 34px;
-  font-weight: 520;
-  letter-spacing: -0.02em;
-  animation: codex-hero-rise 0.55s var(--ease-enter-snappy) 0.04s both;
-}
-
-.codex-hero-project-btn {
-  border-bottom-width: 1.5px;
-  border-bottom-style: dashed;
-  border-bottom-color: color-mix(in srgb, var(--text-default) 30%, transparent);
-  padding: 0 3px 1px;
-  margin: 0 -1px;
-}
-
-.codex-hero-project-btn:hover {
-  border-bottom-style: solid;
-  border-bottom-color: color-mix(in srgb, var(--text-default) 70%, transparent);
-}
-
-.codex-home-composer-slot {
-  padding-bottom: 22px;
-  animation: codex-hero-rise 0.55s var(--ease-enter-snappy) 0.08s both;
-}
-
-@keyframes codex-hero-rise {
-  0% {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
 
 /* Composer context controls share the input surface. */
 .codex-composer-tray {
@@ -5082,9 +5037,9 @@ button:disabled {
 .codex-composer-card {
   border-radius: var(--workspace-composer-radius);
   border-color: var(--border-default);
-  box-shadow: var(--workspace-composer-shadow);
+  box-shadow: none;
   padding: 12px 10px 8px 12px;
-  transition: border-color var(--duration-moderate) var(--ease-out);
+  transition: border-color var(--duration-basic) var(--ease-out);
 }
 
 .codex-composer-card:hover {
@@ -5092,8 +5047,8 @@ button:disabled {
 }
 
 .codex-composer-card:focus-within {
-  border-color: color-mix(in srgb, var(--text-default) 23%, transparent);
-  box-shadow: var(--workspace-composer-shadow);
+  border-color: color-mix(in srgb, var(--text-default) 24%, transparent);
+  box-shadow: none;
 }
 
 /* The rounded card carries focus; never draw a square ring on the raw textarea. */
@@ -5261,21 +5216,9 @@ button:disabled {
   transition: opacity var(--duration-moderate) var(--ease-out);
 }
 
-/* Composer dock: softer, taller fade so content dissolves rather than cuts. */
-.codex-thread-composer-dock {
-  padding: 28px 18px 14px;
-  background: linear-gradient(
-    to bottom,
-    var(--composer-backdrop-top) 0%,
-    var(--composer-backdrop-bottom) 46%,
-    var(--bg-surface) 100%
-  );
-}
-
 .codex-scroll-bottom-btn {
   bottom: 104px;
-  backdrop-filter: blur(8px);
-  background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
+  box-shadow: var(--shadow-sm);
 }
 
 /* Turn minimap: quieter until hovered. */
@@ -5292,13 +5235,6 @@ button:disabled {
   opacity: 1;
 }
 
-/* ---- Floating Agent card: never cover the conversation ------------------- */
-.codex-agent-card {
-  border-color: var(--border-default);
-  box-shadow: var(--composer-highlight), var(--shadow-md);
-  backdrop-filter: blur(14px) saturate(1.2);
-  background: color-mix(in srgb, var(--bg-surface-elevated) 92%, transparent);
-}
 
 /* Collapse toggle lives on the card edge and only appears on hover. */
 .codex-agent-collapse {
@@ -5486,11 +5422,6 @@ button:focus-visible {
 }
 
 /* ---- Popovers, code blocks, activity rows & approval cards --------------- */
-.codex-popover {
-  background: color-mix(in srgb, var(--bg-surface-elevated) 96%, transparent);
-  backdrop-filter: blur(16px) saturate(1.15);
-  box-shadow: var(--composer-highlight), var(--shadow-lg);
-}
 
 .codex-effort-thumb {
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
@@ -5501,10 +5432,6 @@ button:focus-visible {
 
 .codex-effort-track:hover .codex-effort-thumb {
   transform: translate(-50%, -50%) scale(1.06);
-}
-
-.codex-code-block {
-  box-shadow: var(--composer-highlight);
 }
 
 .codex-code-header {
@@ -5541,10 +5468,6 @@ button:focus-visible {
 
 .codex-event-row-duration {
   font-variant-numeric: tabular-nums;
-}
-
-.codex-approval-card {
-  box-shadow: var(--composer-highlight), var(--shadow-sm);
 }
 
 /* Sidebar titles: fade fully to transparent slightly before the right edge
@@ -5971,8 +5894,6 @@ button:focus-visible {
   overflow-y: auto;
   padding: 24px;
   background: rgba(10, 10, 10, 0.48);
-  -webkit-backdrop-filter: blur(3px);
-  backdrop-filter: blur(3px);
 }
 
 .codex-body[data-capabilities-view="true"] .codex-modal {
@@ -6268,18 +6189,10 @@ button:focus-visible {
   border-bottom: 1px solid var(--border-subtle);
   color: var(--text-secondary);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
 }
-.composer-picker-keys { display: inline-flex; gap: 3px; }
-.composer-picker-keys kbd {
-  min-width: 17px;
-  padding: 0 4px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-xs);
-  background: var(--bg-ghost-hover-soft);
-  font: 400 10px/15px var(--font-sans);
-  text-align: center;
-}
+.composer-picker-keys { display: inline-flex; gap: 6px; color: var(--text-tertiary); }
+.composer-picker-keys kbd { font: 400 11px/16px var(--font-sans); }
 .composer-picker-options {
   min-height: 0;
   overflow-y: auto;
@@ -6288,11 +6201,11 @@ button:focus-visible {
   scrollbar-color: var(--border-strong) transparent;
 }
 .composer-picker-row { gap: 9px; border-radius: var(--workspace-row-radius); }
-.composer-picker-row strong { font: 550 13px var(--font-sans); }
+.composer-picker-row strong { font: 500 13px var(--font-sans); }
 .composer-picker-row > svg { flex: none; color: var(--text-secondary); }
 .composer-picker-row small { color: var(--text-secondary); font-size: 12px; }
 .composer-picker-row[data-selected='true'] { background: var(--workspace-selection); }
-.composer-picker-row[data-selected='true'] > svg:first-child { color: var(--color-text-accent); }
+.composer-picker-row[data-selected='true'] > svg:first-child { color: var(--text-default); }
 .composer-picker-row .composer-command-alias { margin-inline-start: auto; font: 400 10.5px var(--font-mono); white-space: nowrap; }
 .composer-picker-row:not([data-selected='true']) .composer-command-alias { visibility: hidden; }
 .composer-command-group + .composer-command-group { margin-top: 6px; }
@@ -6435,7 +6348,7 @@ button:focus-visible {
   padding: 14px;
   border: 1px solid var(--border-default);
   border-radius: var(--workspace-popover-radius);
-  background: var(--workspace-picker-surface);
+  background: var(--bg-surface-elevated);
   color: var(--text-default);
   box-shadow: var(--shadow-modal);
 }

@@ -1,3 +1,4 @@
+import { isSwarmCommand, swarmAttachmentError } from '../utils/swarmCommand';
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
   GitStatus,
@@ -302,9 +303,11 @@ ${draftInjection.text}`
     };
   }, [popover, menuIsOpen]);
 
+  const pendingFileReads = useRef(0);
   const attachFileList = async (list: FileList | File[]) => {
     const arr = Array.from(list).slice(0, 12);
     if (!arr.length) return;
+    pendingFileReads.current++;
     const next: Record<string, string> = {};
     for (const f of arr) {
       try {
@@ -331,6 +334,7 @@ ${draftInjection.text}`
         setCommandError(`无法读取附件 ${f.name}`);
       }
     }
+    pendingFileReads.current--;
     setFiles((previous) => ({ ...previous, ...next }));
   };
 
@@ -352,7 +356,7 @@ ${draftInjection.text}`
     setCommandError('');
     setAddContextOpen(false);
     const { cmd } = command;
-    const insertion = cmd === '/goal' ? '/goal ' : cmd === '/file' ? '@file:' : cmd === '/folder' ? '@folder:' : cmd === '/help' ? '/' : '';
+    const insertion = cmd === '/swarm' ? '/swarm ' : cmd === '/goal' ? '/goal ' : cmd === '/file' ? '@file:' : cmd === '/folder' ? '@folder:' : cmd === '/help' ? '/' : '';
     setMenuDismissed(Boolean(insertion === '/goal '));
     setText(insertion);
     setCaret(insertion.length);
@@ -443,13 +447,19 @@ ${draftInjection.text}`
   const handleSend = async () => {
     const trimmed = text.trim();
     if (!trimmed || submitting) return;
-    if (slashQuery !== null) {
-      if (slashMatches.length) executeSlash(slashMatches[selectedIndex]);
+    const swarm = isSwarmCommand(trimmed);
+    const blocked = swarm && ((pendingFileReads.current > 0 ? '请等待附件读取完成。' : swarmAttachmentError(trimmed, files)) || commandAvailability?.['/swarm']);
+    if (blocked) {
+      setCommandError(blocked);
+      return;
+    }
+    if (!swarm && slashQuery !== null && slashMatches.length) {
+      executeSlash(slashMatches[selectedIndex]);
       return;
     }
     const [word] = trimmed.split(/\s/, 1);
     const command = onSlashCommand ? findSlashCommand(word) : undefined;
-    if (command && !(command.cmd === '/plan' && trimmed.length > word.length)) {
+    if (!swarm && command && !(command.cmd === '/plan' && trimmed.length > word.length)) {
       const blocked = commandBlock(command);
       if (blocked) {
         setCommandError(blocked);
@@ -470,12 +480,13 @@ ${draftInjection.text}`
       }
       return;
     }
+    setCommandError('');
     const attached = { ...files };
     setText('');
     setCaret(0);
     setFiles({});
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    const input = codexMode === 'Work' && !/^\/plan\s/.test(trimmed) ? `/plan ${trimmed}` : trimmed;
+    const input = !swarm && codexMode === 'Work' && !/^\/plan\s/.test(trimmed) ? `/plan ${trimmed}` : trimmed;
     await onSubmit(input, attached);
   };
 
@@ -496,8 +507,10 @@ ${draftInjection.text}`
     }
     if (menuCount && !event.shiftKey && (event.key === 'Enter' || event.key === 'Tab')) {
       event.preventDefault();
-      if (slashMatches.length) executeSlash(slashMatches[selectedIndex]);
-      else insertMention(mentionItems[selectedIndex]);
+      if (slashMatches.length) {
+        if (event.key === 'Enter' && slashMatches[selectedIndex].cmd === '/swarm' && isSwarmCommand(text)) void handleSend();
+        else executeSlash(slashMatches[selectedIndex]);
+      } else insertMention(mentionItems[selectedIndex]);
       return;
     }
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -794,13 +807,6 @@ ${draftInjection.text}`
     );
   };
 
-  const placeholder =
-    variant === 'home'
-      ? codexMode === 'Chat'
-        ? '随心输入'
-        : '随心输入'
-      : `和 ${codexMode} 一起工作`;
-
   return (
     <div className="codex-composer-wrap" ref={rootRef}>
       {commandError && <p className="composer-command-error" role="status">{commandError}</p>}
@@ -1080,6 +1086,7 @@ ${draftInjection.text}`
                       const copy = { ...files };
                       delete copy[name];
                       setFiles(copy);
+                      setCommandError('');
                     }}
                   >
                     <IconClose size={12} />
@@ -1095,7 +1102,7 @@ ${draftInjection.text}`
           className="codex-composer-textarea"
           rows={1}
           aria-label="消息内容"
-          placeholder={placeholder}
+          placeholder="输入消息"
           value={text}
           aria-controls={menuIsOpen ? menuId : undefined}
           aria-activedescendant={menuCount ? `${menuId}-${selectedIndex}` : undefined}
@@ -1445,8 +1452,8 @@ ${draftInjection.text}`
               <button
                 type="button"
                 className="codex-send-btn"
-                aria-label={isRunning ? '实时注入纠偏指令' : '发送消息'}
-                title={isRunning ? 'Agent 运行中：发送实时纠偏指令 (Steer)' : '发送消息'}
+                aria-label={isSwarmCommand(text) ? '发送 Swarm 命令' : isRunning ? '实时注入纠偏指令' : '发送消息'}
+                title={isSwarmCommand(text) ? '发送 Swarm 命令' : isRunning ? 'Agent 运行中：发送实时纠偏指令 (Steer)' : '发送消息'}
                 disabled={!text.trim() || submitting}
                 onClick={() => void handleSend()}
               >

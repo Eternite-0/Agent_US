@@ -37,6 +37,8 @@ Agent_US 2.3 以 `DirectAgentRuntime` 组装交互会话和自治执行，普通
 - 文件操作校验工作区边界。终端、网络与 MCP 受对应策略和主机适配器约束，Git worktree 隔离工作区改动。隔离能力取决于实际 profile 与宿主环境。见 [Sandbox](../src/tools/sandbox.js)、[SSRF Guard](../src/tools/ssrf-guard.js) 和 [MCP 生命周期](../src/tools/mcp-lifecycle.js)。
 - 工作区 Hook 需要信任校验。`PreToolUse` 的参数转换经过后续策略检查，工具收据和结构化审计可供复核。见 [Hook Trust](../src/tools/hook-trust.js)、[Agent Context](../src/agent-context.js) 和 [Audit](../src/governance/audit.js)。
 
+`BenchmarkSandbox` 和依赖策略在 `c7c3558` 之后作为独立工具加入。当前 `EvaluationService` 与 `DirectAgentRuntime` 调用链尚未使用它们。见 [Benchmark Sandbox](../src/tools/benchmark-sandbox.js) 和 [Dependency Policy](../src/evaluation/dependency-policy.js)。
+
 ## Durable Runtime 与状态机
 
 Turn 在 `checkpoint`、`inference`、`tools` 和适用的 `compacting`、`verifying` 等阶段推进。等待或结果未知可进入 `parked` 或 `reconciling`，终态为 `completed`、`failed` 或 `cancelled`。Swarm 节点维护独立状态机，下面保留其主要路径。完整转换以 [Turn State Machine](../src/kernel/state-machine.js) 和 [Swarm State Machine](../src/swarm/node-state-machine.js) 为准。

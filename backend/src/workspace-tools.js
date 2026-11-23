@@ -108,6 +108,8 @@ function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback 
         .string()
         .optional()
         .describe('可选：限定分析的工作区内子目录路径，或待排查的问题关键词/模块路径'),
+      symbol: z.string().max(240).optional().describe('检索符号名称并列出已解析的调用方、被调用方和相关代码位置'),
+      refresh: z.boolean().optional().describe('文件修改后从头刷新索引快照'),
       includeGraph: z
         .boolean()
         .optional()
@@ -118,7 +120,7 @@ function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback 
         .min(1)
         .max(500)
         .optional()
-        .describe('最多扫描的工作区文件数上限（默认 120）'),
+        .describe('每次继续索引的文件数量（默认 120）'),
     }),
     async execute(args = {}, ctx) {
       await guardFallback('inspect_repository', args, ctx);
@@ -150,6 +152,9 @@ function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback 
       const includeGraph = args.includeGraph !== false;
       const maxFiles = args.maxFiles ? Number(args.maxFiles) : 120;
       const analysis = await analyzeRepository(targetRoot, {
+        progressive: true,
+        refresh: args.refresh === true,
+        symbol: args.symbol ?? '',
         issueText,
         maxFiles,
       });

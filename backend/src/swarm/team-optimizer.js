@@ -97,18 +97,13 @@ export class TeamOptimizer {
     const highRisk = task.artifactRisk === 'high' || task.requiresIndependentVerification === true;
     const teamRequested = task.mode === 'team' || task.preferTeam === true;
     const teamWanted = !simple && (teamRequested || workstreams > 1 || highRisk);
-    const maxBudget = numeric(
-      budget.maxCost ??
-        budget.maxTokens ??
-        budget.maxTotalTokens ??
-        budgetSnapshot?.remainingCost ??
-        budgetSnapshot?.remainingTokens ??
-        budgetSnapshot?.remaining ??
-        (budget.maxCostUsd === 0 ? 0 : Infinity),
-      Infinity,
-    );
+    const limitOf = (...values) => Math.min(Infinity, ...values.filter((v) => v != null).map(Number).filter(Number.isFinite));
+    const costLimit = limitOf(budget.maxCost, budgetSnapshot?.remainingCost, budget.maxCostUsd === 0 ? 0 : null);
+    const tokenLimit = limitOf(budget.maxTokens, budget.maxTotalTokens, budgetSnapshot?.remainingTokens, budgetSnapshot?.remaining);
+    const stepLimit = limitOf(budget.maxSteps, budget.maxTotalSteps, budgetSnapshot?.remainingSteps);
+    const tokens = (c) => Math.max(0, numeric(c.estimatedTokens ?? task.estimatedTokens, 1000));
+    const steps = (c) => Math.max(1, numeric(c.estimatedSteps ?? task.estimatedSteps, 1));
     const single = available[0] ?? null;
-    const singleCost = single ? estimateCost(single, task) : Infinity;
 
     if (!single) {
       return {
@@ -116,7 +111,7 @@ export class TeamOptimizer {
         recommendedTeamSize: 0,
         rationale: 'no healthy candidate is available', evidencePolicy: evidencePolicy(),
         replacementPolicy: 'replace only after preserving evidence',
-        budgetDowngraded: false, parallelBudgetAllowed: true,
+        budgetDowngraded: false, parallelBudgetAllowed: false,
       };
     }
 
@@ -154,39 +149,19 @@ export class TeamOptimizer {
     };
 
     let members = selectWorkers(targetWorkerCount);
-    const calcCost = (slice) =>
-      slice.reduce((sum, member) => sum + estimateCost(member, task), 0)
-      + (reviewer ? this.reviewerCost : 0);
-
-    let teamCost = calcCost(members);
+    const fits = (workers, review = null) => {
+      const all = review ? [...workers, review] : workers;
+      return all.reduce((sum, c) => sum + tokens(c), 0) <= tokenLimit
+        && all.reduce((sum, c) => sum + steps(c), 0) <= stepLimit
+        && all.reduce((sum, c) => sum + estimateCost(c, task), review ? this.reviewerCost : 0) <= costLimit;
+    };
     let budgetScaledFrom = null;
-    const maxStepsAvail = numeric(
-      budgetSnapshot?.remainingSteps ??
-        budget.maxSteps ??
-        Infinity,
-      Infinity,
-    );
-    if (teamWanted && !this.hasExplicitTeamSize && members.length > 2 && Number.isFinite(maxStepsAvail) && maxStepsAvail < members.length && maxStepsAvail >= 2) {
-      const stepCap = Math.max(2, Math.floor(maxStepsAvail));
-      budgetScaledFrom = members.length;
-      members = selectWorkers(stepCap);
-      teamCost = calcCost(members);
+    while (teamWanted && members.length > 2 && !fits(members, reviewer)) {
+      budgetScaledFrom ??= members.length;
+      members = members.slice(0, -1);
     }
-    if (teamWanted && teamCost > maxBudget && !this.hasExplicitTeamSize && members.length > 2) {
-      for (let k = members.length - 1; k >= 2; k--) {
-        const candidateSlice = selectWorkers(k);
-        const candidateCost = calcCost(candidateSlice);
-        if (candidateCost <= maxBudget) {
-          if (budgetScaledFrom === null) budgetScaledFrom = members.length;
-          members = candidateSlice;
-          teamCost = candidateCost;
-          break;
-        }
-      }
-    }
-
     const minTeamMembersRequired = budgetScaledFrom !== null ? 2 : requiredWorkerCount;
-    const budgetAllowsTeam = teamCost <= maxBudget && maxStepsAvail >= 2;
+    const budgetAllowsTeam = fits(members, reviewer);
     const mode =
       teamWanted &&
       members.length >= minTeamMembersRequired &&
@@ -194,13 +169,12 @@ export class TeamOptimizer {
       maxC > 1
         ? 'team'
         : 'single';
-    const parallelSlots = Math.min(maxC, Math.max(1, workstreams));
-    const parallelSingleCost = singleCost * parallelSlots;
+    const parallelSlots = Math.min(effectiveTeamCap, maxC, workstreams);
     const budgetDowngraded = Boolean(teamWanted && !budgetAllowsTeam);
-    const parallelBudgetAllowed = mode === 'team' ? budgetAllowsTeam : parallelSingleCost <= maxBudget;
+    const parallelBudgetAllowed = mode === 'team' ? budgetAllowsTeam : fits(Array.from({ length: parallelSlots }, () => single));
     const selected = mode === 'team' ? members : [single];
     const estimatedCost = selected.reduce((sum, member) => sum + estimateCost(member, task), 0)
-      + (mode === 'team' && reviewer && !selected.some((member) => member.id === reviewer.id) ? this.reviewerCost : 0);
+      + (mode === 'team' && reviewer && !selected.some((member) => member.id === reviewer.id) ? this.reviewerCost + estimateCost(reviewer, task) : 0);
     const roleHints = Array.isArray(task.workstreamRoles)
       ? task.workstreamRoles
       : Array.isArray(task.roles)
@@ -237,14 +211,15 @@ export class TeamOptimizer {
           }
         : null,
       estimatedCost,
-      estimatedSteps: selected.reduce((sum, member) => sum + numeric(member.estimatedSteps ?? task.estimatedSteps ?? 1, 1), 0),
+      estimatedSteps: selected.reduce((sum, member) => sum + steps(member), mode === 'team' && reviewer ? steps(reviewer) : 0),
+      parallelSlots,
       rationale: mode === 'team'
         ? budgetScaledFrom !== null
           ? `team scaled dynamically from ${budgetScaledFrom} to ${selected.length} workers to fit remaining budget`
           : `team of ${selected.length} selected for ${workstreams} independent workstreams/risk; budget and concurrency allow it`
         : teamWanted && !budgetAllowsTeam
           ? 'team request downgraded because the available budget is insufficient'
-          : 'single agent is sufficient for this task shape',
+          : teamWanted ? 'one worker selected within the available candidate and concurrency limits' : 'one workstream covers this task without coordination overhead',
       budgetDowngraded,
       parallelBudgetAllowed,
       evidencePolicy: evidencePolicy(),

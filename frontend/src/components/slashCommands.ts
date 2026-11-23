@@ -53,7 +53,8 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
   ] },
   { label: '执行', commands: [
     { cmd: '/goal', desc: '输入目标并启动自主任务', icon: IconSparkle, aliases: ['目标'] },
-    { cmd: '/swarm', desc: '查看自主任务的执行计划', icon: IconDagNodes, inspector: 'autonomous', swarmSection: 'plan', aliases: ['autonomous', 'swarm-plan'] },
+    { cmd: '/swarm', desc: '输入目标启动任务，status 查看状态，stop 停止，留空查看用法', icon: IconAgentTeam },
+    { cmd: '/swarm-plan', desc: '查看自主任务的执行计划', icon: IconDagNodes, inspector: 'autonomous', swarmSection: 'plan', aliases: ['autonomous'] },
     { cmd: '/messages', desc: '查看 Swarm 协作消息', icon: IconActivity, inspector: 'autonomous', swarmSection: 'messages', aliases: ['swarm-messages'] },
     { cmd: '/artifacts', desc: '查看 Swarm 文件产物', icon: IconArchive, inspector: 'autonomous', swarmSection: 'artifacts', aliases: ['swarm-artifacts'] },
     { cmd: '/agents', desc: '查看子智能体和运行详情', icon: IconAgentTeam, inspector: 'subagents', aliases: ['dag', 'subagents'] },

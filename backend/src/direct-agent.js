@@ -1092,6 +1092,13 @@ export class DirectAgentRuntime {
         }
       }
 
+      if (clientTurnId && this.store.db.prepare('SELECT 1 FROM swarm_command_receipts WHERE sessionId=? AND clientTurnId=?').get(sessionId, clientTurnId)) {
+        throw new Fault('IDEMPOTENCY_CONFLICT', 409);
+      }
+      const activeSwarm = this.store.db.prepare(`SELECT r.id FROM swarm_runs r WHERE r.sessionId=?
+        AND r.status NOT IN ('completed','failed','cancelled') AND EXISTS
+        (SELECT 1 FROM swarm_command_receipts c WHERE c.sessionId=r.sessionId AND c.runId=r.id) LIMIT 1`).get(sessionId);
+      if (activeSwarm) throw new Fault('SWARM_ALREADY_ACTIVE', 409, { runId: activeSwarm.id });
       // Reject concurrent startTurn on an active session (even when a fresh clientTurnId is supplied!)
       const activeMemTurnId = this.activeSessionTurn.get(sessionId) ?? null;
       const activeDbTurn = this.store.db
@@ -1299,6 +1306,9 @@ export class DirectAgentRuntime {
   }
 
   cancelTurn(turnId) {
+    const row = this.store.db.prepare('SELECT * FROM direct_turns WHERE id=?').get(turnId);
+    if (!row) throw new Fault('TURN_NOT_FOUND', 404);
+    if (!['running', 'reconciling', 'parked'].includes(row.state)) return row;
     this.recoveryWorker.cancelJobByTurn(turnId);
     this.kernel.cancellation.cancel(turnId, 'user_cancelled');
     const active = this.activeTurns.get(turnId);
@@ -1309,8 +1319,6 @@ export class DirectAgentRuntime {
         this.activeSessionTurn.delete(active.sessionId);
       }
     }
-    const row = this.store.db.prepare('SELECT * FROM direct_turns WHERE id=?').get(turnId);
-    if (!row) throw new Fault('TURN_NOT_FOUND', 404);
     this.childManager?.cancelDescendants?.(row.sessionId);
 
     // Cancel any active Swarm runs and swarm_* jobs belonging to this session
@@ -1387,77 +1395,6 @@ export class DirectAgentRuntime {
       }
     }
     return this.store.db.prepare('SELECT * FROM direct_turns WHERE id=?').get(turnId);
-  }
-
-  async #runSubagentQuery({
-    sessionId,
-    turnId,
-    objective,
-    role,
-    mode = 'spawn',
-    resumeSessionId = null,
-    workspaceRoot,
-    permissionMode = 'auto-safe',
-    model,
-    maxSteps = 6,
-    isolatedWorktree = false,
-    signal,
-  }) {
-    if (resumeSessionId) {
-      const resumed = await this.childManager.resume(resumeSessionId, {
-        callerSessionId: sessionId,
-        objective,
-        model,
-        maxSteps,
-        signal,
-      });
-      return resumed.text;
-    }
-
-    const selection = this.adaptiveRouter.select({
-      taskType: role || 'research',
-      objective,
-      preferredModel: model,
-      maxSteps,
-    });
-    const childPerm = isolatedWorktree ? 'auto-safe' : 'read-only';
-    const allowedTools = isolatedWorktree
-      ? ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob']
-      : selection.profile.toolAllow;
-
-    if (mode === 'fork') {
-      const forked = await this.childManager.fork({
-        parentSessionId: sessionId,
-        parentTurnId: turnId,
-        objective,
-        profile: selection.profile,
-        model: selection.model || model,
-        permissionMode: childPerm,
-        parentPermissionMode: permissionMode,
-        allowedTools,
-        budget: { maxSteps },
-        workspaceRoot,
-        isolatedWorktree,
-        signal,
-      });
-      return forked.text;
-    }
-
-    const spawned = await this.childManager.spawn({
-      parentSessionId: sessionId,
-      parentTurnId: turnId,
-      objective,
-      profile: selection.profile,
-      model: selection.model || model,
-      permissionMode: childPerm,
-      parentPermissionMode: permissionMode,
-      allowedTools,
-      budget: { maxSteps },
-      workspaceRoot,
-      isolatedWorktree,
-      signal,
-    });
-    return spawned.text;
   }
 
   async #runTurnLoop({
@@ -1617,29 +1554,6 @@ export class DirectAgentRuntime {
             });
           });
           this.eventRouter.fanoutPersisted(planEv);
-        },
-        runSubagent: (opts) =>
-          this.#runSubagentQuery({
-            sessionId,
-            turnId,
-            ...opts,
-            workspaceRoot,
-            permissionMode: this.#getLiveSessionPolicy(sessionId)?.permissionMode || effectivePermissionMode,
-            model: effectiveModel,
-            signal,
-          }),
-        orchestrateSwarm: async ({ goal, maxConcurrency = 3 }) => {
-          const out = await this.swarmOrchestrator.startRun({
-            sessionId,
-            rootTurnId: turnId,
-            goal,
-            workspaceRoot,
-            parentPermissionMode:
-              this.#getLiveSessionPolicy(sessionId)?.permissionMode || effectivePermissionMode,
-            maxConcurrency,
-            signal,
-          });
-          return out.summary;
         },
         sendAgentMessage: ({ toAgentId, kind = 'note', message, operationId = null }) => {
           if (this.intelligence?.communication) {

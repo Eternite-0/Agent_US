@@ -331,12 +331,12 @@ test('P5 AdaptiveSwarmOrchestrator executes diamond DAG concurrently with mailbo
     assert.equal(step2.status, 'cancelled');
     assert.equal(step2.errorCode, 'BUDGET_EXCEEDED');
 
-    // End-to-end tool call via `swarm_orchestrate` inside DirectAgentRuntime
+    // A plain-text request for orchestration stays in the direct runtime.
     const turn = direct.startTurn(s.id, { input: '启动主任务并调用群体编排' });
     const done = await waitTurnDone(direct, s.id, turn.turn.id);
     assert.equal(done.state, 'completed');
-    assert.equal(toolTriggeredSwarm, true);
-    assert.equal(swarmToolCalls, 1);
+    assert.equal(toolTriggeredSwarm, false);
+    assert.equal(swarmToolCalls, 0);
   } finally {
     await direct.close();
     store.close();

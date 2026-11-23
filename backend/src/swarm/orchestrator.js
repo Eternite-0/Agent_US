@@ -43,6 +43,7 @@ import {
 import { validatePlan } from '../planning/validator.js';
 import { intersectPolicies } from '../tools/policy.js';
 import { analyzeWorkspaceRepository, toCompactRepoContext } from './planner.js';
+import { remainingRunMs } from './run-deadline.js';
 import { TeamOptimizer } from './team-optimizer.js';
 import {
   MAX_REVIEWER_FORMAT_RETRIES,
@@ -129,6 +130,7 @@ export class AdaptiveSwarmOrchestrator {
     if (this.childManager && !this.childManager.budgetLedger) {
       this.childManager.budgetLedger = this.budgetLedger;
     }
+    this.deadlineTimers = new Map();
     this.waiters = new Map(); // runId -> Set<fn>
     this.activeControllers = new Map(); // runId -> AbortController
   }
@@ -174,24 +176,15 @@ export class AdaptiveSwarmOrchestrator {
 
   registerOnWorker(recoveryWorker) {
     if (!recoveryWorker?.registerHandler) return;
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.PLAN, (job, ctx) =>
-      this.#handlePlan(job, ctx),
-    );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE, (job, ctx) =>
-      this.#handleDependencyResolve(job, ctx),
-    );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.DISPATCH, (job, ctx) =>
-      this.#handleDispatch(job, ctx),
-    );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.NODE_EXECUTE, (job, ctx) =>
-      this.#handleNodeExecute(job, ctx),
-    );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.AGGREGATE, (job, ctx) =>
-      this.#handleAggregate(job, ctx),
-    );
-    recoveryWorker.registerHandler(SWARM_JOB_KINDS.VERIFY, (job, ctx) =>
-      this.#handleVerify(job, ctx),
-    );
+    const register = (kind, handle) => recoveryWorker.registerHandler(kind, (job, ctx) => {
+      if (this.#armRunDeadline(job.payload.runId)) return handle.call(this, job, ctx);
+    });
+    register(SWARM_JOB_KINDS.PLAN, this.#handlePlan);
+    register(SWARM_JOB_KINDS.DEPENDENCY_RESOLVE, this.#handleDependencyResolve);
+    register(SWARM_JOB_KINDS.DISPATCH, this.#handleDispatch);
+    register(SWARM_JOB_KINDS.NODE_EXECUTE, this.#handleNodeExecute);
+    register(SWARM_JOB_KINDS.AGGREGATE, this.#handleAggregate);
+    register(SWARM_JOB_KINDS.VERIFY, this.#handleVerify);
   }
 
   submitRun({
@@ -288,6 +281,10 @@ export class AdaptiveSwarmOrchestrator {
       // best-effort event emit after committed run
     }
 
+    if (!this.#armRunDeadline(runId)) {
+      const run = this.getRun(runId);
+      return { runId, sessionId, status: run.status, run };
+    }
     if (hasExplicitNodes) {
       enqueueSwarmJob(this.jobQueue, SWARM_JOB_KINDS.DEPENDENCY_RESOLVE, {
         runId,
@@ -300,7 +297,7 @@ export class AdaptiveSwarmOrchestrator {
         runId,
         sessionId,
         goal,
-        planVersion: 1,
+        planVersion: initialPlanVersion,
       });
     }
 
@@ -429,6 +426,7 @@ export class AdaptiveSwarmOrchestrator {
       }
       set.add(onSettled);
       signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) return onAbort();
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           cleanup();
@@ -515,6 +513,7 @@ export class AdaptiveSwarmOrchestrator {
     });
 
     if (!didResume) return run;
+    if (!this.#armRunDeadline(runId)) return this.getRun(runId);
 
     for (const upd of postEvents) {
       try {
@@ -550,7 +549,7 @@ export class AdaptiveSwarmOrchestrator {
     return this.getRun(runId);
   }
 
-  cancelRun(runId) {
+  cancelRun(runId, { deadlineExpired = false } = {}) {
     if (!this.#dbOpen()) return null;
     const preRun = this.getRun(runId);
     if (!preRun) return null;
@@ -559,7 +558,7 @@ export class AdaptiveSwarmOrchestrator {
     const cancelledNodes = [];
     const { transitionedToCancelled, childSessionIds } = this.store.tx(() => {
       const curRun = this.getRun(runId);
-      if (!curRun) return { transitionedToCancelled: false, childSessionIds: [] };
+      if (!curRun || isTerminalRunState(curRun.status)) return { transitionedToCancelled: false, childSessionIds: [] };
 
       this.store.db
         .prepare(
@@ -570,30 +569,38 @@ export class AdaptiveSwarmOrchestrator {
 
       const childIds = [];
       for (const n of curRun.nodes) {
-        if (n.childSessionId) childIds.push(n.childSessionId);
         if (!isTerminalNodeState(n.status)) {
+          if (n.childSessionId) childIds.push(n.childSessionId);
           const upd = transitionSwarmNode(this.store, null, n.id, SWARM_NODE_STATES.CANCELLED, {
             emitEvent: false,
-            patch: { activeFence: null, activeJobId: null, errorCode: n.errorCode || 'NODE_CANCELLED' },
+            patch: { activeFence: null, activeJobId: null, errorCode: deadlineExpired ? 'BUDGET_DURATION_EXCEEDED' : n.errorCode || 'NODE_CANCELLED' },
           });
           if (upd.changed) cancelledNodes.push(upd);
         }
       }
 
+      // Persist before post-commit abort delivery so recovery sees the same terminal state.
+      for (const id of childIds) this.childManager?.persistTreeCancellationInTx?.(id, now);
+      this.budgetLedger?.reconcileAfterRestart?.({ treeId: runId, reason: 'RUN_CANCELLED' });
       let didCancelRun = false;
       if (!isTerminalRunState(curRun.status)) {
         const updRun = transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.CANCELLED, {
-          patch: { currentPhase: 'cancelled', finishedAt: now },
+          patch: {
+            currentPhase: 'cancelled', finishedAt: now,
+            ...(deadlineExpired ? { errorCode: 'BUDGET_DURATION_EXCEEDED', errorMessage: 'Run wall-clock budget expired' } : {}),
+          },
         });
         didCancelRun = Boolean(updRun.changed);
       }
       return { transitionedToCancelled: didCancelRun, childSessionIds: childIds };
     });
 
-    this.activeControllers.get(runId)?.abort('swarm_cancelled');
-    for (const cid of childSessionIds) {
-      this.childManager?.cancel?.(cid);
-    }
+    this.store.afterCommit(() => {
+      if (!transitionedToCancelled) return;
+      this.activeControllers.get(runId)?.abort('swarm_cancelled');
+      for (const cid of childSessionIds) this.childManager?.abortChildTree?.(cid);
+      this.#notifyWaiters(this.getRun(runId));
+    });
 
     for (const upd of cancelledNodes) {
       try {
@@ -630,11 +637,15 @@ export class AdaptiveSwarmOrchestrator {
         // best-effort event emit
       }
     }
-    this.#notifyWaiters(finalRun);
     return finalRun;
   }
 
   recoverInterruptedRuns() {
+    if (this.#dbOpen()) {
+      for (const row of this.store.db.prepare("SELECT id FROM swarm_runs WHERE status NOT IN ('failed','completed','cancelled')").all()) {
+        this.#armRunDeadline(row.id);
+      }
+    }
     return recoverInterruptedSwarmRuns({
       store: this.store,
       jobQueue: this.jobQueue,
@@ -658,6 +669,8 @@ export class AdaptiveSwarmOrchestrator {
   }
 
   closeAll() {
+    for (const timer of this.deadlineTimers.values()) clearTimeout(timer);
+    this.deadlineTimers.clear();
     for (const ctrl of this.activeControllers.values()) {
       ctrl.abort('shutdown');
     }
@@ -692,6 +705,8 @@ export class AdaptiveSwarmOrchestrator {
       let validatedPlan = null;
       let compactRepoContext = run.strategy?.repoContext ?? null;
       if (run.nodes.length === 0) {
+        const runSignal = this.#getRunController(runId).signal;
+        signal = signal ? AbortSignal.any([signal, runSignal]) : runSignal;
         this.budgetLedger?.ensureLedger({
           treeId: runId,
           rootSessionId: run.sessionId,
@@ -711,6 +726,7 @@ export class AdaptiveSwarmOrchestrator {
         }
         let planned;
         try {
+          signal.throwIfAborted();
           planned = await this.planner.decompose({
             goal: goal || run.goal,
             workspaceRoot: run.workspaceRoot,
@@ -754,6 +770,7 @@ export class AdaptiveSwarmOrchestrator {
           throw err;
         }
         assertLeaseInTx(leaseGuard, { runId });
+        signal.throwIfAborted();
         if (!compactRepoContext && planned?.repoContext) {
           compactRepoContext = toCompactRepoContext(planned.repoContext);
         }
@@ -788,7 +805,10 @@ export class AdaptiveSwarmOrchestrator {
                 ...(n.budgetEstimate ? { budgetBreakdown: n.budgetEstimate } : {}),
               },
             })),
-            ...(compactRepoContext ? { metadata: { repoContext: compactRepoContext } } : {}),
+            metadata: {
+              ...(compactRepoContext ? { repoContext: compactRepoContext } : {}),
+              ...(planned.length === 1 ? { teamRationale: planned.teamRationale || 'One workstream covers the objective and its acceptance check.' } : {}),
+            },
           },
           { permissionCeiling: planPermission },
         );
@@ -985,7 +1005,10 @@ export class AdaptiveSwarmOrchestrator {
         const liveSnap = this.budgetLedger?.getSnapshot(runId);
         const stepSlots =
           liveSnap && liveSnap.remainingSteps !== null ? liveSnap.remainingSteps : maxConc;
-        const dispatchSlots = Math.max(0, Math.min(maxConc - inFlight, stepSlots));
+        // A queued child has not reserved its first inference yet. Do not spend
+        // the same finite budget on another wave during a duplicate resolve.
+        const bounded = liveSnap?.remainingTokens != null || liveSnap?.remainingSteps != null || run.budget?.maxCost != null;
+        const dispatchSlots = bounded && inFlight ? 0 : Math.max(0, Math.min(maxConc - inFlight, stepSlots));
         const picked = readyNodes.slice(0, dispatchSlots);
 
         if (picked.length > 0) {
@@ -1000,7 +1023,7 @@ export class AdaptiveSwarmOrchestrator {
                 }
               : candidate;
           });
-          const budgetSnapshot = this.budgetLedger?.getSnapshot(runId) ?? null;
+          const budgetSnapshot = liveSnap ?? null;
           const taskRequirements = picked.reduce((acc, node) => {
             const parsed = parseJsonSafe(node.budgetJson, {});
             const required = parsed.requiredCapabilities ?? parsed.capabilityWeights ?? {};
@@ -1031,22 +1054,23 @@ export class AdaptiveSwarmOrchestrator {
             maxConcurrency: Math.min(maxConc, picked.length),
             reviewerAvailable: picked.some((n) => n.taskType === 'verification' || n.isolationMode === 'worktree' || n.taskType === 'review'),
           });
+          const dispatchCount = team.mode === 'team'
+            ? team.members.length
+            : team.parallelBudgetAllowed !== false && !team.budgetDowngraded
+              ? team.parallelSlots ?? picked.length
+              : 1;
+          const batch = picked.slice(0, dispatchCount);
           const reviewerNode = this.#materializeReviewerNode({
             run,
             team,
-            picked,
+            picked: batch,
             candidates,
             budgetSnapshot,
             now: Date.now(),
           });
           if (reviewerNode) postEvents.push({ ...reviewerNode, runId, changed: true });
-          const dispatchCount =
-            team.mode === 'team' ||
-            (picked.length > 1 && !team.budgetDowngraded && team.parallelBudgetAllowed !== false)
-              ? picked.length
-              : Math.min(1, picked.length);
           const queuedKeys = [];
-          for (const [index, n] of picked.slice(0, dispatchCount).entries()) {
+          for (const [index, n] of batch.entries()) {
             const selectedMember = team.members?.[index] ?? team.members?.[0];
             const nodeBudget = parseJsonSafe(n.budgetJson, {});
             const isMaterializedReviewer = nodeBudget?.reviewerMetadata?.autoMaterialized === true;
@@ -1595,7 +1619,7 @@ export class AdaptiveSwarmOrchestrator {
           trafficSource: run.trafficSource || 'production',
           isSynthetic: run.isSynthetic ? 1 : 0,
         });
-        const effectiveNodeBudget = computeEffectiveNodeBudget(node.budget, treeSnap, run.budget);
+        const effectiveNodeBudget = computeEffectiveNodeBudget(node.budget, treeSnap, { ...run.budget, maxDurationMs: remainingRunMs(run) });
         const budgetScope = ['review', 'verification'].includes(node.taskType)
           ? BUDGET_SCOPES.REVIEW_VERIFICATION
           : BUDGET_SCOPES.NODE_EXECUTION;
@@ -3002,6 +3026,29 @@ export class AdaptiveSwarmOrchestrator {
     return set;
   }
 
+  #armRunDeadline(runId) {
+    if (!this.#dbOpen()) return false;
+    const row = this.store.db.prepare(
+      "SELECT status, createdAt, json_extract(budgetJson, '$.maxDurationMs') AS maxDurationMs FROM swarm_runs WHERE id=?",
+    ).get(runId);
+    if (!row || isTerminalRunState(row.status)) return false;
+    const remaining = remainingRunMs(row);
+    if (remaining === null) return true;
+    if (remaining === 0) {
+      this.cancelRun(runId, { deadlineExpired: true });
+      return false;
+    }
+    if (!this.deadlineTimers.has(runId)) {
+      const timer = setTimeout(() => {
+        this.deadlineTimers.delete(runId);
+        this.#armRunDeadline(runId);
+      }, Math.min(remaining, 2 ** 31 - 1));
+      timer.unref?.();
+      this.deadlineTimers.set(runId, timer);
+    }
+    return true;
+  }
+
   #getRunController(runId) {
     let ctrl = this.activeControllers.get(runId);
     if (!ctrl || ctrl.signal.aborted) {
@@ -3018,6 +3065,7 @@ export class AdaptiveSwarmOrchestrator {
       runId: run.id,
       status: run.status,
       summary: buildSwarmSummary(activeNodes),
+      teamRationale: run.strategy?.plan?.metadata?.teamRationale ?? null,
       nodes: run.nodes,
       usage: run.usage,
       verdict: run.verdict,
@@ -3030,6 +3078,8 @@ export class AdaptiveSwarmOrchestrator {
   }
 
   #notifyWaiters(run) {
+    clearTimeout(this.deadlineTimers.get(run.id));
+    this.deadlineTimers.delete(run.id);
     this.activeControllers.delete(run.id);
     const set = this.waiters.get(run.id);
     if (!set) return;

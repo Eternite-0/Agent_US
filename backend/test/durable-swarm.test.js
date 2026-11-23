@@ -106,6 +106,7 @@ test('Durable Swarm: real SIGKILL crash recovery on 10-node DAG skips completed,
   mkdirSync(markerDir, { recursive: true });
 
   const workerScript = join(dir, 'crash-swarm-child.mjs');
+  const commandMod = new URL('../src/routes/chat-command.js', import.meta.url).href;
   const storeMod = pathToFileURL(join(process.cwd(), 'src', 'store.js')).href;
   const poolMod = pathToFileURL(join(process.cwd(), 'src', 'pool.js')).href;
   const agentMod = pathToFileURL(join(process.cwd(), 'src', 'direct-agent.js')).href;
@@ -118,6 +119,7 @@ import { join } from 'node:path';
 import { Store } from ${JSON.stringify(storeMod)};
 import { AccountPool } from ${JSON.stringify(poolMod)};
 import { DirectAgentRuntime } from ${JSON.stringify(agentMod)};
+import { handleChatCommand } from ${JSON.stringify(commandMod)};
 
 const [dbPath, workDir, markerDir, logPath] = process.argv.slice(2);
 const store = new Store(dbPath);
@@ -166,6 +168,19 @@ const direct = new DirectAgentRuntime(store, pool, {
 });
 
 const parent = direct.createSession({ title: 'SIGKILL Parent', workspaceRoot: workDir });
+const explicitSession = direct.createSession({ title: 'SIGKILL slash command', workspaceRoot: workDir });
+const explicitInput = '/swarm Inspect NODE_TAG:slash';
+// Submit in the same tick as runtime creation. Hold planner I/O until the kill.
+const originalStream = adapter.stream;
+adapter.stream = async function* (options) {
+  if (options.messages.some(m => m.role === 'system' && m.content[0]?.text?.includes('Decompose the engineering goal'))) {
+    writeFileSync(join(markerDir, 'slash-planner-ready.flag'), '', 'utf8');
+    await new Promise(() => {});
+    return;
+  }
+  yield* originalStream.call(this, options);
+};
+const explicit = handleChatCommand(direct, explicitSession.id, { input: explicitInput, clientTurnId: 'slash-once' }, {});
 
 // Cancelled run that must NEVER revive after SIGKILL
 const cancelled = direct.swarmOrchestrator.submitRun({
@@ -195,7 +210,7 @@ const active = direct.swarmOrchestrator.submitRun({
   ],
 });
 
-writeFileSync(join(markerDir, 'ids.json'), JSON.stringify({ runId: active.runId, cancelledId: cancelled.runId, parentId: parent.id }), 'utf8');
+writeFileSync(join(markerDir, 'ids.json'), JSON.stringify({ runId: active.runId, cancelledId: cancelled.runId, parentId: parent.id, explicitSessionId: explicitSession.id, explicitRunId: explicit.runId }), 'utf8');
 const keep = setInterval(() => {}, 1000);
 setTimeout(() => { clearInterval(keep); process.exit(1); }, 25000);
 `,
@@ -212,14 +227,15 @@ setTimeout(() => { clearInterval(keep); process.exit(1); }, 25000);
       () =>
         existsSync(join(markerDir, 'ids.json')) &&
         existsSync(join(markerDir, 'r1-ready.flag')) &&
-        existsSync(join(markerDir, 'r2-ready.flag')),
+        existsSync(join(markerDir, 'r2-ready.flag')) &&
+        existsSync(join(markerDir, 'slash-planner-ready.flag')),
       15000,
     );
     await delay(100);
     child.kill('SIGKILL');
     await new Promise((res) => child.once('exit', res));
 
-    const { runId, cancelledId, parentId } = JSON.parse(readFileSync(join(markerDir, 'ids.json'), 'utf8'));
+    const { runId, cancelledId, parentId, explicitSessionId, explicitRunId } = JSON.parse(readFileSync(join(markerDir, 'ids.json'), 'utf8'));
 
     // Reboot on same SQLite DB
     const store = new Store(dbPath);
@@ -228,6 +244,14 @@ setTimeout(() => { clearInterval(keep); process.exit(1); }, 25000);
 
     const postCalls = [];
     const postAdapter = new ScriptedAdapter(async function* (opts) {
+      if (opts.messages.some(m => m.role === 'system' && m.content[0]?.text?.includes('Decompose the engineering goal'))) {
+        yield { type: 'text-delta', index: 0, text: JSON.stringify({ nodes: [
+          { nodeKey: 'slash', taskType: 'research', objective: 'Inspect NODE_TAG:slash', acceptance: 'Summarize the file', dependencies: [] },
+        ] }) };
+        yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 15 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
       const userText = opts.messages.findLast((m) => m.role === 'user')?.content?.[0]?.text ?? '';
       const mTag = /NODE_TAG:([a-z0-9]+)/i.exec(userText);
       const tag = mTag ? mTag[1] : 'unknown';
@@ -274,6 +298,14 @@ setTimeout(() => { clearInterval(keep); process.exit(1); }, 25000);
       const cancelCheck = direct.swarmOrchestrator.getRun(cancelledId);
       assert.equal(cancelCheck.status, 'cancelled');
       assert.equal(postCalls.filter((c) => c.tag === 'never_run').length, 0);
+      const { handleChatCommand } = await import(commandMod);
+      const replay = handleChatCommand(direct, explicitSessionId, { input: '/swarm Inspect NODE_TAG:slash', clientTurnId: 'slash-once' }, {});
+      assert.equal(replay.runId, explicitRunId);
+      const recovered = await direct.swarmOrchestrator.waitForRun(explicitRunId, { timeoutMs: 12000 });
+      assert.equal(recovered.status, 'completed');
+      assert.equal(recovered.nodes.length, 1);
+      assert.equal(handleChatCommand(direct, explicitSessionId, { input: '/swarm status' }, {}).run.status, 'completed');
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM swarm_runs WHERE sessionId=?').get(explicitSessionId).n, 1);
       const children = direct.sessionRepo.listChildSessions(parentId);
       assert.ok(children.length >= 10);
     } finally {

@@ -1,8 +1,11 @@
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { opendir, readFile, realpath, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { constants, existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
+import { lstat, open, opendir, realpath } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { extractRepositorySymbols, linkRepositoryCalls, findRepositorySymbols, traceRepositoryCalls } from './repo-symbols.js';
+export { findRepositorySymbols, traceRepositoryCalls };
 import { promisify } from 'node:util';
 import { redactSecrets, sanitize } from './envelope.js';
 import {
@@ -17,17 +20,10 @@ const execFileAsync = promisify(execFile);
 const nativeRealpathSync = (p) =>
   typeof realpathSync.native === 'function' ? realpathSync.native(p) : realpathSync(p);
 
-const PROTECTED_ROOTS = ['../../upstream/', '../var/'].map((rel) => {
-  const abs = resolve(fileURLToPath(new URL(rel, import.meta.url)));
-  try {
-    return nativeRealpathSync(abs);
-  } catch {
-    return abs;
-  }
-});
+const PROTECTED_ROOTS = ['../../upstream/', '../var/'].map((rel) => resolve(fileURLToPath(new URL(rel, import.meta.url))));
 
 const ALWAYS_SKIP_DIRS = new Set([
-  '.git',
+  '.git', '.ssh', '.aws', '.azure', '.gnupg', '.kube', '.config',
   '.agent-us',
   'node_modules',
   'dist',
@@ -50,7 +46,7 @@ const ALWAYS_SKIP_DIRS = new Set([
   'out',
 ]);
 
-const SENSITIVE_FILE_EXT_RE = /\.(?:pem|key|pfx|p12|crt|der|sqlite(?:3)?|sqlite-wal|sqlite-shm)$/i;
+const SENSITIVE_FILE_EXT_RE = /\.(?:pem|key|pfx|p12|crt|der|jks|keystore|(?:db|sqlite3?)(?:-wal|-shm|-journal)?)$/i;
 const SENSITIVE_BASENAMES = new Set(['.npmrc', '.pypirc', '.netrc', 'id_rsa', 'id_ed25519']);
 
 const CODE_EXTENSIONS = new Map([
@@ -106,9 +102,15 @@ function isOutsideRoot(root, candidate) {
   return isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`) || rel.startsWith('../');
 }
 
+function protectedRootPath(path, { gitMetadata = false } = {}) {
+  const parts = toPosix(path).split('/').filter(Boolean).map(normalizeProtectedSegment);
+  return PROTECTED_ROOTS.some((pr) => !isOutsideRoot(pr, path)) || parts.some((part, i) =>
+    part && !(gitMetadata && part === '.git') && (isSecretFileName(part) || ['.git', 'upstream', '.aws', '.ssh', '.gnupg', '.kube', '.azure', '.agent-us', '.config'].includes(part) || (part === 'var' && parts[i - 1] === 'backend')));
+}
+
 function assertSafeWorkspaceRoot(workspaceRoot) {
   const abs = resolve(String(workspaceRoot || '.'));
-  if (PROTECTED_ROOTS.some((pr) => !isOutsideRoot(pr, abs))) {
+  if (protectedRootPath(abs)) {
     throw new Error(`Access to protected directory is prohibited: ${abs}`);
   }
   if (!existsSync(abs)) {
@@ -119,7 +121,7 @@ function assertSafeWorkspaceRoot(workspaceRoot) {
     throw new Error(`Workspace root is not a directory: ${abs}`);
   }
   const real = nativeRealpathSync(abs);
-  if (PROTECTED_ROOTS.some((pr) => !isOutsideRoot(pr, real))) {
+  if (protectedRootPath(real)) {
     throw new Error(`Access to protected directory is prohibited: ${real}`);
   }
   return { absRoot: abs, realRoot: real };
@@ -133,13 +135,14 @@ function isSecretFileName(name) {
     return true;
   }
   if (/^\.env(?:$|[._-])/i.test(norm)) return true;
+  if (/^(?:id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|(?:credentials?|secrets?|service[-_]?account)(?:[._-].*)?)$/i.test(norm)) return true;
   if (SENSITIVE_FILE_EXT_RE.test(norm)) return true;
   return false;
 }
 
 function isAlwaysSkippedDir(name) {
   const norm = normalizeProtectedSegment(name);
-  return ALWAYS_SKIP_DIRS.has(norm) || PROTECTED_BASENAMES.has(norm) || /^\.env(?:$|[._-])/i.test(norm);
+  return ALWAYS_SKIP_DIRS.has(norm) || isSecretFileName(name);
 }
 
 function isProbablyBinary(buf) {
@@ -328,125 +331,45 @@ function buildTreeLines(files, dirs, maxLines = 80) {
   return lines;
 }
 
-async function scanWorkspace(realRoot, { maxFiles }) {
-  const canonicalRoot = await realpath(realRoot);
-  const files = [];
-  const allDirs = [];
-  const topLevelDirs = [];
-  const rulesByDir = new Map([['', []]]);
-  const queue = [{ dir: canonicalRoot, rel: '', depth: 0 }];
-  const maxDirs = Math.max(250, maxFiles * 4);
-  let visitedDirs = 0;
+const MANIFEST_NAMES = new Set(['package.json', 'pyproject.toml', 'requirements.txt',
+  'requirements-dev.txt', 'dev-requirements.txt', 'Cargo.toml', 'go.mod']);
 
-  while (queue.length > 0 && files.length < maxFiles && visitedDirs < maxDirs) {
-    const current = queue.shift();
-    visitedDirs += 1;
-
-    let canonicalDir;
+// Suspend between siblings as well as directories. The iterator never holds an open
+// directory handle across requests and empty directory trees also consume a budget.
+async function* walkWorkspace(root, stamps) {
+  const queue = [{ rel: '', rules: [] }];
+  for (let i = 0; i < queue.length; i++) {
+    const { rel, rules } = queue[i];
+    queue[i] = null;
+    const dir = join(root, rel);
+    let entries = [];
     try {
-      canonicalDir = await realpath(current.dir);
-    } catch {
-      continue;
+      const dirStamp = await fingerprint(dir, 'directory');
+      if (!dirStamp || await realpath(dir) !== dir) continue;
+      stamps.set(rel, { type: 'directory', stamp: dirStamp });
+      for await (const entry of await opendir(dir)) entries.push(entry);
+    } catch { continue; }
+    let local = rules;
+    if (entries.some(e => e.name === '.gitignore')) {
+      const ignore = posix.join(rel, '.gitignore');
+      const stamp = await fingerprint(join(root, ignore), 'file');
+      if (!stamp) continue;
+      const text = await safeReadUtf8(root, ignore, { whole: true });
+      stamps.set(ignore, fileStamp(stamp, text, true));
+      if (text === null) continue; // An unreadable ignore policy cannot authorize indexing.
+      local = rules.concat(parseGitignoreContent(text, rel));
     }
-    if (isOutsideRoot(canonicalRoot, canonicalDir) || canonicalDir !== current.dir) continue;
-
-    let entries;
-    try {
-      const dirHandle = await opendir(canonicalDir);
-      entries = [];
-      for await (const ent of dirHandle) {
-        entries.push(ent);
-      }
-    } catch {
-      continue;
-    }
-
-    // Inherit parent gitignore rules + local .gitignore
-    const parentRules = rulesByDir.get(current.rel) ?? [];
-    let localRules = parentRules;
-    const hasGitignore = entries.some(
-      (e) => e.name === '.gitignore' && e.isFile() && !e.isSymbolicLink(),
-    );
-    if (hasGitignore) {
-      try {
-        const giFull = join(canonicalDir, '.gitignore');
-        const giLstat = lstatSync(giFull);
-        if (!giLstat.isSymbolicLink() && giLstat.size <= 128 * 1024) {
-          const giText = await readFile(giFull, 'utf8');
-          const parsed = parseGitignoreContent(giText, current.rel);
-          if (parsed.length) localRules = [...parentRules, ...parsed];
-        }
-      } catch {
-        // Ignore unreadable .gitignore
-      }
-    }
-
-    const MANIFEST_NAMES = new Set([
-      'package.json',
-      'pyproject.toml',
-      'requirements.txt',
-      'requirements-dev.txt',
-      'dev-requirements.txt',
-      'Cargo.toml',
-      'go.mod',
-      'tsconfig.json',
-      'pnpm-workspace.yaml',
-    ]);
-    entries.sort((a, b) => {
-      const am = MANIFEST_NAMES.has(a.name) ? 0 : 1;
-      const bm = MANIFEST_NAMES.has(b.name) ? 0 : 1;
-      return am - bm || a.name.localeCompare(b.name);
-    });
-
-    const childDirs = [];
-    const childFiles = [];
-
-    for (const ent of entries) {
-      const name = ent.name;
-      if (!name || /[\u0000-\u001f\u007f]/u.test(name)) continue;
-      if (ent.isSymbolicLink()) continue;
-
-      const rel = current.rel ? `${current.rel}/${name}` : name;
-      const full = join(canonicalDir, name);
-
-      if (ent.isDirectory()) {
-        if (isAlwaysSkippedDir(name)) continue;
-        if (isIgnoredByRules(rel, true, localRules)) continue;
-        // Double-check symlink/junction via lstat
-        try {
-          if (lstatSync(full).isSymbolicLink()) continue;
-        } catch {
-          continue;
-        }
-        childDirs.push({ dir: full, rel, name, depth: current.depth + 1 });
-      } else if (ent.isFile()) {
-        if (isSecretFileName(name)) continue;
-        if (name === '.gitignore') continue;
-        if (isIgnoredByRules(rel, false, localRules)) continue;
-        childFiles.push({ full, rel, name });
-      }
-    }
-
-    for (const f of childFiles) {
-      if (files.length >= maxFiles) break;
-      files.push(f);
-    }
-
-    for (const d of childDirs) {
-      if (current.depth === 0) topLevelDirs.push(d.name);
-      allDirs.push(d.rel);
-      rulesByDir.set(d.rel, localRules);
-      if (queue.length + visitedDirs < maxDirs) {
-        queue.push({ dir: d.dir, rel: d.rel, depth: d.depth });
-      }
+    entries.sort((a, b) => Number(MANIFEST_NAMES.has(b.name)) - Number(MANIFEST_NAMES.has(a.name)) || a.name.localeCompare(b.name));
+    yield { dir: rel };
+    for (const entry of entries) {
+      const name = entry.name;
+      if (/[\\:\u0000-\u001f\u007f]/u.test(name) || entry.isSymbolicLink() || isAlwaysSkippedDir(name)) continue;
+      const path = posix.join(rel, name);
+      if (isIgnoredByRules(path, entry.isDirectory(), local)) continue;
+      if (entry.isDirectory()) queue.push({ rel: path, rules: local });
+      else if (entry.isFile() && name !== '.gitignore') yield { file: path };
     }
   }
-
-  return {
-    files,
-    topLevelDirs: topLevelDirs.sort((a, b) => a.localeCompare(b)),
-    allDirs,
-  };
 }
 
 // ---- Git Metadata ----
@@ -458,10 +381,65 @@ async function runGit(cwd, args) {
     timeout: 4000,
     env: buildGitAllowlistEnv({ allowNetwork: false }),
   });
-  return stdout.trim();
+  return stdout.trimEnd();
 }
 
-async function collectGitMetadata(realRoot) {
+// Inspect Git's index and cached diff only. A porcelain status walks untracked
+// directories independently of the repository scanner's exclusions.
+async function scannedFilesDirty(root, paths) {
+  for (let i = 0; i < paths.length;) {
+    const chunk = [];
+    let length = 0;
+    while (i < paths.length && length < 12000) {
+      chunk.push(paths[i]);
+      length += paths[i++].length + 4;
+    }
+    const args = ['--literal-pathspecs'];
+    const debug = await runGit(root, [...args, 'ls-files', '--cached', '--debug', '-z', '--', ...chunk]);
+    const tracked = new Map();
+    for (const m of debug.matchAll(/([^\0]+)\0  ctime: [^\n]+\n  mtime: (\d+):(\d+)\n[^\n]*\n[^\n]*\n  size: (\d+)\s+flags: [^\n]+\n?/g)) {
+      tracked.set(m[1], { mtime: BigInt(m[2]) * 1000000000n + BigInt(m[3]), size: BigInt(m[4]) });
+    }
+    for (const path of chunk) {
+      const cached = tracked.get(path);
+      if (!cached) return true;
+      const full = join(root, path);
+      if (await realpath(full) !== full) continue;
+      const st = lstatSync(full, { bigint: true });
+      if (st.size !== cached.size || st.mtimeNs !== cached.mtime) return true;
+    }
+    if (await runGit(root, [...args, 'diff', '--cached', '--name-only', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', '--', ...chunk])) return true;
+  }
+  return false;
+}
+
+// Git can discover a parent checkout or follow a worktree's gitdir/commondir
+// pointers independently of the walker. Validate those roots before launching it.
+async function hasSafeGitDirectory(root) {
+  for (let dir = root;; dir = dirname(dir)) {
+    const marker = join(dir, '.git');
+    const st = lstatSync(marker, { throwIfNoEntry: false });
+    if (st) {
+      if (st.isSymbolicLink()) return false;
+      let gitDir = marker;
+      if (st.isFile()) {
+        const pointer = await safeReadUtf8(dir, '.git', { whole: true });
+        const target = /^gitdir: ([^\r\n]+)\s*$/.exec(pointer ?? '')?.[1];
+        if (!target) return false;
+        gitDir = resolve(dir, target);
+      } else if (!st.isDirectory()) return false;
+      const safe = async path => !protectedRootPath(path, { gitMetadata: true }) &&
+        !protectedRootPath(await realpath(path), { gitMetadata: true });
+      if (!await safe(gitDir)) return false;
+      const common = lstatSync(join(gitDir, 'commondir'), { throwIfNoEntry: false });
+      if (!common) return true;
+      const pointer = await safeReadUtf8(gitDir, 'commondir', { whole: true });
+      return Boolean(pointer?.trim()) && safe(resolve(gitDir, pointer.trim()));
+    }
+    if (dirname(dir) === dir) return false;
+  }
+}
+async function collectGitMetadata(realRoot, paths) {
   const fallback = {
     isGitRepo: false,
     branch: null,
@@ -471,6 +449,7 @@ async function collectGitMetadata(realRoot) {
   };
 
   try {
+    if (!await hasSafeGitDirectory(realRoot)) return fallback;
     const inside = await runGit(realRoot, ['rev-parse', '--is-inside-work-tree']);
     if (inside !== 'true') return fallback;
   } catch {
@@ -482,7 +461,7 @@ async function collectGitMetadata(realRoot) {
       runGit(realRoot, ['rev-parse', '--abbrev-ref', 'HEAD']),
     ),
     runGit(realRoot, ['rev-parse', 'HEAD']),
-    runGit(realRoot, ['status', '--porcelain']),
+    scannedFilesDirty(realRoot, paths),
     runGit(realRoot, ['log', '-n', '8', '--pretty=format:%s']),
   ]);
 
@@ -727,47 +706,28 @@ function extractPackageJsonExports(exportsField, pkgDirRel, out = []) {
   return out;
 }
 
-function resolveWorkspacePatterns(realRoot, patterns, existingFileSet) {
-  const discovered = [];
-  for (const rawPat of patterns) {
-    const pat = toPosix(String(rawPat ?? '')).replace(/^\/+|\/+$/g, '');
-    if (!pat || pat.startsWith('!')) continue;
-    const rxText = pat
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\\\*\\\*/g, '.*')
-      .replace(/\\\*/g, '[^/]+');
-    const rx = new RegExp(`^${rxText}/package\\.json$`);
-    for (const f of existingFileSet) {
-      if (rx.test(f)) discovered.push(f);
-    }
-    // Also probe exact directory directly in case maxFiles cut off deep workspace manifests
-    if (!pat.includes('*')) {
-      const relPkg = `${pat}/package.json`;
-      if (!existingFileSet.has(relPkg) && existsSync(join(realRoot, relPkg))) {
-        discovered.push(relPkg);
-      }
-    }
-  }
-  return [...new Set(discovered)];
-}
-
-async function safeReadUtf8(fullPath, maxBytes = MAX_READ_BYTES_PER_FILE) {
+async function safeReadUtf8(root, rel, { whole = false } = {}) {
+  const full = join(root, rel);
+  let handle;
   try {
-    const lst = lstatSync(fullPath);
-    if (lst.isSymbolicLink() || !lst.isFile()) return null;
-    const st = await stat(fullPath);
-    if (st.size > maxBytes * 4) {
-      // Read bounded slice for oversized files
-      const buf = await readFile(fullPath);
-      if (isProbablyBinary(buf)) return null;
-      return buf.subarray(0, maxBytes).toString('utf8');
+    if (isOutsideRoot(root, full) || await realpath(full) !== full) return null;
+    const before = lstatSync(full, { bigint: true });
+    if (!before.isFile() || before.nlink !== 1n) return null;
+    handle = await open(full, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const st = await handle.stat({ bigint: true });
+    if (!st.isFile() || st.nlink !== 1n || st.ino !== before.ino || st.dev !== before.dev || await realpath(full) !== full) return null;
+    if (whole && st.size > MAX_READ_BYTES_PER_FILE) return null;
+    const buffer = Buffer.alloc(Math.min(Number(st.size), MAX_READ_BYTES_PER_FILE));
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
     }
-    const buf = await readFile(fullPath);
-    if (isProbablyBinary(buf)) return null;
-    return buf.toString('utf8');
-  } catch {
-    return null;
-  }
+    const bytes = buffer.subarray(0, offset);
+    return isProbablyBinary(bytes) ? null : bytes.toString('utf8');
+  } catch { return null; }
+  finally { await handle?.close(); }
 }
 
 function classifyPackageScripts(scripts, pm, { prefixDir = '' } = {}) {
@@ -805,7 +765,7 @@ function classifyPackageScripts(scripts, pm, { prefixDir = '' } = {}) {
   return { testCommands, buildCommands, lintCommands };
 }
 
-async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles }) {
+function analyzeProjectManifests(realRoot, records, files, { sourceFiles, testFiles }) {
   const fileSet = new Set(files.map((f) => f.rel));
   const manifests = [];
   const scripts = {};
@@ -820,7 +780,7 @@ async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles
   let goModuleName = null;
 
   // Detect lockfiles / packageManager at root
-  const hasFile = (rel) => fileSet.has(rel) || existsSync(join(realRoot, rel));
+  const hasFile = (rel) => fileSet.has(rel);
 
   if (hasFile('pnpm-lock.yaml') || hasFile('pnpm-workspace.yaml')) packageManager = 'pnpm';
   else if (hasFile('yarn.lock')) packageManager = 'yarn';
@@ -846,7 +806,7 @@ async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles
   // Read root package.json first if it exists
   const pkgJsonPaths = manifestCandidates.filter((r) => basename(r) === 'package.json');
   const rootPkgRaw = fileSet.has('package.json')
-    ? await safeReadUtf8(join(realRoot, 'package.json'))
+    ? records.get('package.json')?.manifest
     : null;
   let rootPkg = null;
   if (rootPkgRaw !== null) {
@@ -894,22 +854,12 @@ async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles
     }
     extractPackageJsonExports(rootPkg.exports, '', declaredEntries);
 
-    const wsRaw = Array.isArray(rootPkg.workspaces)
-      ? rootPkg.workspaces
-      : Array.isArray(rootPkg.workspaces?.packages)
-        ? rootPkg.workspaces.packages
-        : [];
-    if (wsRaw.length) {
-      for (const wsPkg of resolveWorkspacePatterns(realRoot, wsRaw, fileSet)) {
-        if (!pkgJsonPaths.includes(wsPkg)) pkgJsonPaths.push(wsPkg);
-      }
-    }
   }
 
   // Sub-package package.json files (workspaces or nested packages like backend/frontend)
   for (const rel of pkgJsonPaths) {
     if (rel === 'package.json') continue;
-    const raw = await safeReadUtf8(join(realRoot, rel));
+    const raw = records.get(rel)?.manifest;
     if (!raw) continue;
     let pkg;
     try {
@@ -950,7 +900,7 @@ async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles
   // Python manifests
   let pyInfo = null;
   for (const rel of manifestCandidates.filter((r) => basename(r) === 'pyproject.toml')) {
-    const raw = await safeReadUtf8(join(realRoot, rel));
+    const raw = records.get(rel)?.manifest;
     if (!raw) continue;
     manifests.push(rel);
     const parsed = parsePyprojectToml(raw);
@@ -968,7 +918,7 @@ async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles
   for (const rel of manifestCandidates.filter((r) =>
     ['requirements.txt', 'requirements-dev.txt', 'dev-requirements.txt'].includes(basename(r)),
   )) {
-    const raw = await safeReadUtf8(join(realRoot, rel));
+    const raw = records.get(rel)?.manifest;
     if (!raw) continue;
     manifests.push(rel);
     const deps = parseRequirementsTxt(raw);
@@ -979,7 +929,7 @@ async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles
 
   // Rust manifests
   for (const rel of manifestCandidates.filter((r) => basename(r) === 'Cargo.toml')) {
-    const raw = await safeReadUtf8(join(realRoot, rel));
+    const raw = records.get(rel)?.manifest;
     if (!raw) continue;
     manifests.push(rel);
     const parsed = parseCargoToml(raw);
@@ -996,7 +946,7 @@ async function analyzeProjectManifests(realRoot, files, { sourceFiles, testFiles
 
   // Go manifests
   for (const rel of manifestCandidates.filter((r) => basename(r) === 'go.mod')) {
-    const raw = await safeReadUtf8(join(realRoot, rel));
+    const raw = records.get(rel)?.manifest;
     if (!raw) continue;
     manifests.push(rel);
     const parsed = parseGoMod(raw);
@@ -1510,7 +1460,7 @@ function resolveModuleImport(fromRel, item, { fileSet, goModuleName, filesByDir 
   return null;
 }
 
-async function buildCallGraph(realRoot, files, { sourceFiles, testFiles, entryPointSet, goModuleName }) {
+function buildCallGraph(records, files, { sourceFiles, testFiles, entryPointSet, goModuleName }) {
   const fileSet = new Set(files.map((f) => f.rel));
   const filesByDir = new Map();
   for (const rel of fileSet) {
@@ -1520,30 +1470,6 @@ async function buildCallGraph(realRoot, files, { sourceFiles, testFiles, entryPo
   }
 
   const codeFiles = [...new Set([...sourceFiles, ...testFiles])];
-  const parsedByPath = new Map();
-  const textByPath = new Map();
-
-  // Bounded batch read + parse
-  const BATCH_SIZE = 16;
-  for (let i = 0; i < codeFiles.length; i += BATCH_SIZE) {
-    const batch = codeFiles.slice(i, i + BATCH_SIZE);
-    await Promise.all(
-      batch.map(async (rel) => {
-        const text = await safeReadUtf8(join(realRoot, rel));
-        if (text === null) return;
-        textByPath.set(rel, text);
-        const ext = posix.extname(rel).toLowerCase();
-        let parsed;
-        if (JS_TS_EXTENSIONS.has(ext)) parsed = parseJsTsFile(text);
-        else if (ext === '.py' || ext === '.pyw') parsed = parsePythonFile(text);
-        else if (ext === '.go') parsed = parseGoFile(text);
-        else if (ext === '.rs') parsed = parseRustFile(text);
-        else parsed = { imports: [], exports: [] };
-        parsedByPath.set(rel, parsed);
-      }),
-    );
-  }
-
   const edgeMap = new Map();
   const inboundCounts = new Map();
   const outboundCounts = new Map();
@@ -1551,7 +1477,7 @@ async function buildCallGraph(realRoot, files, { sourceFiles, testFiles, entryPo
   const externalImportsByFile = new Map();
 
   for (const rel of codeFiles) {
-    const parsed = parsedByPath.get(rel);
+    const parsed = records.get(rel)?.parsed;
     if (!parsed) continue;
     const resolvedTargets = new Set();
     const externalSpecs = new Set();
@@ -1591,13 +1517,13 @@ async function buildCallGraph(realRoot, files, { sourceFiles, testFiles, entryPo
   }
 
   const modules = codeFiles.map((rel) => {
-    const parsed = parsedByPath.get(rel) ?? { exports: [] };
+    const parsed = records.get(rel)?.parsed ?? { exports: [] };
     return {
       path: rel,
       language: CODE_EXTENSIONS.get(posix.extname(rel).toLowerCase()) || 'unknown',
       isEntryPoint: entryPointSet.has(rel),
       isTest: isTestFilePath(rel),
-      exports: parsed.exports,
+      exports: [...parsed.exports],
       imports: resolvedImportsByFile.get(rel) ?? [],
       externalImports: externalImportsByFile.get(rel) ?? [],
       inboundCount: inboundCounts.get(rel) ?? 0,
@@ -1612,7 +1538,7 @@ async function buildCallGraph(realRoot, files, { sourceFiles, testFiles, entryPo
       a.path.localeCompare(b.path),
   );
 
-  return { edges, modules, textByPath };
+  return { edges, modules };
 }
 
 // ---- Issue Relevance Ranking & Linked Test Discovery ----
@@ -1687,7 +1613,7 @@ function findLinkedTests(modules, edges) {
   return linkedBySource;
 }
 
-function rankRelevantFiles({ issueText, modules, edges, textByPath }) {
+function rankRelevantFiles({ issueText, modules, edges, records }) {
   const { pathHints, terms } = tokenizeIssueText(issueText);
   const hasIssueQuery = pathHints.length > 0 || terms.length > 0;
   const linkedBySource = findLinkedTests(modules, edges);
@@ -1739,12 +1665,12 @@ function rankRelevantFiles({ issueText, modules, edges, textByPath }) {
         }
       }
 
-      const content = textByPath.get(mod.path);
+      const content = records.get(mod.path)?.keywords;
       if (content) {
-        const lowerContent = content.toLowerCase();
+
         let contentHits = 0;
         for (const term of terms) {
-          if (term.length >= 3 && lowerContent.includes(term)) {
+          if (term.length >= 3 && content.has(term)) {
             contentHits += 1;
             if (contentHits <= 3) addReason(mod.path, `content:${term}`);
           }
@@ -1842,9 +1768,10 @@ export function formatRepositorySummary(
     `- Languages: ${(project.languages ?? []).join(', ') || 'unknown'} | PackageManager: ${project.packageManager || 'none'}`,
     `- Manifests: ${(project.manifests ?? []).join(', ') || 'none'}`,
   ];
+  if (analysis?.index) headerLines.push(`- Index: ${analysis.index.complete ? 'complete' : 'partial'} (${analysis.index.indexedFiles} files)`);
   if (git.isGitRepo) {
     const shaShort = git.headSha ? String(git.headSha).slice(0, 10) : 'unborn';
-    headerLines.push(`- Git: branch=${sanitize(git.branch || 'detached')} head=${shaShort} dirty=${Boolean(git.dirty)}`);
+    headerLines.push(`- Git: branch=${sanitize(git.branch || 'detached')} head=${shaShort} dirty(indexed paths)=${Boolean(git.dirty)}`);
     if (Array.isArray(git.recentCommits) && git.recentCommits.length) {
       headerLines.push(`- Recent Commits: ${git.recentCommits.slice(0, 4).map((c) => sanitize(redactSecrets(c))).join(' | ')}`);
     }
@@ -1852,6 +1779,19 @@ export function formatRepositorySummary(
     headerLines.push('- Git: not a git repository');
   }
   blocks.push(headerLines.join('\n'));
+
+  const context = analysis?.relatedContext;
+  if (includeGraph && context?.symbols.length) {
+    const names = new Map(callGraph.symbols.map(s => [s.id, s.name]));
+    const lines = context.symbols.slice(0, 8).map(s => `- ${s.name} (${s.path}:${s.line})`);
+    for (const call of context.calls.slice(0, 10)) lines.push(`- ${names.get(call.from)} -> ${names.get(call.to)} (${call.from} calls at line ${call.line})`);
+    if (context.tests.length) lines.push('- Linked tests: ' + context.tests.slice(0, 6).join(', '));
+    blocks.push(['## Related Symbols and Calls', ...lines].join('\n'));
+  }
+  if (context?.snippets?.length) {
+    blocks.push(['## Related Code (repository excerpts)', ...context.snippets.map((snippet) =>
+      `${snippet.path}:${snippet.startLine}-${snippet.endLine}\n${snippet.text}`)].join('\n'));
+  }
 
   // 2. Commands
   const cmdLines = ['## Commands'];
@@ -1955,18 +1895,126 @@ export function formatRepositorySummary(
  * Analyzes repository structure, git state, project manifests/commands, static call graph,
  * and issue-ranked file relevance within strict sandbox and byte/file bounds.
  */
-export async function analyzeRepository(
-  workspaceRoot,
-  { issueText = '', maxBytes = DEFAULT_MAX_BYTES, maxFiles = DEFAULT_MAX_FILES } = {},
-) {
+const sharedIndexes = new Map();
+
+async function fingerprint(path, type) {
+  try {
+    const st = await lstat(path, { bigint: true });
+    if (type === 'directory' ? !st.isDirectory() : !st.isFile() || st.nlink !== 1n) return null;
+    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+  } catch { return null; }
+}
+
+function contentDigest(text) {
+  return text === null ? null : createHash('sha256').update(text).digest('hex');
+}
+
+// Recent writes can share an inode timestamp on coarse filesystems, even when
+// lstat exposes nanoseconds. Keep a bounded-prefix digest for such files only.
+function fileStamp(stamp, text, whole) {
+  const modifiedMs = Number(BigInt(stamp.split(':').at(-2)) / 1000000n);
+  const recent = Date.now() - modifiedMs < 2000;
+  return { type: 'file', stamp, ...(recent ? { digest: contentDigest(text), whole } : {}) };
+}
+
+// Directory entries precede descendants in the stamp map. Verify ancestors first
+// so a replaced directory cannot redirect validation into a junction or symlink.
+async function indexChanged(root, stamps) {
+  const files = [];
+  for (const [path, entry] of stamps) {
+    if (entry.type === 'file') {
+      files.push({ path, entry });
+    } else if (await fingerprint(join(root, path), entry.type) !== entry.stamp) {
+      return true;
+    }
+  }
+  for (let i = 0; i < files.length; i += 32) {
+    const changed = await Promise.all(files.slice(i, i + 32).map(async ({ path, entry }) => {
+      if (await fingerprint(join(root, path), 'file') !== entry.stamp) return true;
+      if (!Object.hasOwn(entry, 'digest')) return false;
+      return contentDigest(await safeReadUtf8(root, path, { whole: entry.whole })) !== entry.digest;
+    }));
+    if (changed.includes(true)) return true;
+  }
+  return false;
+}
+
+function createIndex(root) {
+  const stamps = new Map();
+  return { walker: walkWorkspace(root, stamps), stamps, records: new Map(), dirs: [], complete: false, tail: Promise.resolve() };
+}
+
+async function indexFile(root, path, stamps) {
+  const ext = posix.extname(path).toLowerCase();
+  const language = CODE_EXTENSIONS.get(ext);
+  const manifest = MANIFEST_NAMES.has(posix.basename(path));
+  if (!language && !manifest) return {};
+  const text = await safeReadUtf8(root, path, { whole: manifest });
+  stamps.set(path, fileStamp(stamps.get(path).stamp, text, manifest));
+  if (text === null) return {};
+  if (manifest) return { manifest: text };
+  const parsed = JS_TS_EXTENSIONS.has(ext) ? parseJsTsFile(text)
+    : language === 'python' ? parsePythonFile(text)
+    : language === 'go' ? parseGoFile(text)
+    : language === 'rust' ? parseRustFile(text) : { exports: [], imports: [] };
+  const keywords = new Set();
+  for (const m of text.matchAll(/[\p{L}\p{N}_$]{2,80}/gu)) {
+    keywords.add(m[0].toLowerCase());
+    if (keywords.size >= 2048) break;
+  }
+  return { parsed, keywords, ...extractRepositorySymbols(path, language, text) };
+}
+
+/** maxFiles is a per-request I/O budget. Opt into a shared, process-local scan
+ * with progressive:true; refresh:true replaces the snapshot after edits.
+ * Existing one-shot callers always see fresh bounded results. */
+export async function analyzeRepository(workspaceRoot, options = {}) {
   const { absRoot, realRoot } = assertSafeWorkspaceRoot(workspaceRoot);
+  let index = options.progressive && sharedIndexes.get(realRoot);
+  if (!index) index = createIndex(realRoot);
+  if (options.progressive) {
+    sharedIndexes.delete(realRoot);
+    sharedIndexes.set(realRoot, index);
+    if (sharedIndexes.size > 8) sharedIndexes.delete(sharedIndexes.keys().next().value);
+  }
+  const result = index.tail.then(() => analyzePage(absRoot, realRoot, index, options));
+  index.tail = result.then(() => {}, () => {});
+  return result;
+}
+
+async function analyzePage(absRoot, realRoot, index, { issueText = '', maxBytes = DEFAULT_MAX_BYTES, maxFiles = DEFAULT_MAX_FILES, symbol = '', refresh = false }) {
   const boundedFiles = Math.max(1, Math.min(2000, Math.trunc(Number(maxFiles) || DEFAULT_MAX_FILES)));
   const boundedBytes = Math.max(256, Math.trunc(Number(maxBytes) || DEFAULT_MAX_BYTES));
-
-  const [git, scan] = await Promise.all([
-    collectGitMetadata(realRoot),
-    scanWorkspace(realRoot, { maxFiles: boundedFiles }),
-  ]);
+  if (refresh || await indexChanged(realRoot, index.stamps)) {
+    await index.walker.return();
+    // Keep the queue shared by concurrent callers; only replace scan state.
+    Object.assign(index, createIndex(realRoot), { tail: index.tail, git: null });
+  }
+  let visitedDirs = 0;
+  const page = [];
+  while (!index.complete && page.length < boundedFiles && visitedDirs < Math.max(250, boundedFiles * 4)) {
+    const { done, value } = await index.walker.next();
+    if (done) { index.complete = true; break; }
+    if (value.file) {
+      const full = join(realRoot, value.file);
+      const stamp = await fingerprint(full, 'file');
+      if (!stamp) continue;
+      index.stamps.set(value.file, { type: 'file', stamp });
+      page.push(value.file);
+    }
+    else { visitedDirs++; if (value.dir) index.dirs.push(value.dir); }
+  }
+  for (let i = 0; i < page.length; i += 16) {
+    const batch = page.slice(i, i + 16);
+    const records = await Promise.all(batch.map(path => indexFile(realRoot, path, index.stamps)));
+    batch.forEach((path, n) => index.records.set(path, records[n]));
+  }
+  if (!index.git) index.git = await collectGitMetadata(realRoot, page);
+  else if (index.git.isGitRepo && !index.git.dirty && page.length && await hasSafeGitDirectory(realRoot)) {
+    index.git.dirty = await scannedFilesDirty(realRoot, page).catch(() => index.git.dirty);
+  }
+  const git = { ...index.git, recentCommits: [...index.git.recentCommits] };
+  const scan = { files: Array.from(index.records.keys(), rel => ({ rel })), allDirs: [...index.dirs], topLevelDirs: index.dirs.filter(d => !d.includes('/')) };
 
   const sourceFiles = [];
   const testFiles = [];
@@ -1977,19 +2025,19 @@ export async function analyzeRepository(
     else sourceFiles.push(f.rel);
   }
 
-  const { project, declaredEntries, goModuleName } = await analyzeProjectManifests(
-    realRoot,
+  const { project, declaredEntries, goModuleName } = analyzeProjectManifests(
+    realRoot, index.records,
     scan.files,
     { sourceFiles, testFiles },
   );
   project.hasNodeModules = project.manifests?.includes('package.json')
-    ? existsSync(join(realRoot, 'node_modules'))
+    ? Boolean(lstatSync(join(realRoot, 'node_modules'), { throwIfNoEntry: false })?.isDirectory())
     : null;
 
   const fileSet = new Set(scan.files.map((f) => f.rel));
   const entrySet = new Set();
   for (const decl of declaredEntries) {
-    if (fileSet.has(decl) || existsSync(join(realRoot, decl))) {
+    if (fileSet.has(decl)) {
       if (!isSecretFileName(posix.basename(decl))) entrySet.add(decl);
     }
   }
@@ -2011,7 +2059,7 @@ export async function analyzeRepository(
     ),
   };
 
-  const { edges, modules, textByPath } = await buildCallGraph(realRoot, scan.files, {
+  const { edges, modules } = buildCallGraph(index.records, scan.files, {
     sourceFiles,
     testFiles,
     entryPointSet: entrySet,
@@ -2022,18 +2070,20 @@ export async function analyzeRepository(
     issueText,
     modules,
     edges,
-    textByPath,
+    records: index.records,
   });
 
   const callGraph = {
     edges,
     modules,
     relevantFiles,
+    ...linkRepositoryCalls(index.records, (path, spec) => resolveJsTsSpecifier(path, spec, fileSet)),
   };
 
   const analysis = {
     analyzedAt: new Date().toISOString(),
     workspaceRoot: absRoot,
+    index: { complete: index.complete, indexedFiles: index.records.size, batchFiles: page.length },
     git,
     project,
     structure,
@@ -2041,10 +2091,72 @@ export async function analyzeRepository(
     summaryText: '',
   };
 
+  analysis.relatedContext = getRelatedRepositoryContext(analysis, symbol || issueText, { exactSymbol: symbol });
+  analysis.relatedContext.snippets = await extractRelatedSnippets(realRoot, analysis.relatedContext.symbols);
   analysis.summaryText = formatRepositorySummary(analysis, {
     maxBytes: Math.min(DEFAULT_SUMMARY_MAX_BYTES, boundedBytes),
     includeGraph: true,
   });
 
   return analysis;
+}
+
+// Read only a few matched definitions using the same confined reader as the index.
+async function extractRelatedSnippets(root, symbols) {
+  const files = new Map();
+  const snippets = [];
+  for (const { path, line } of symbols.slice(0, 3)) {
+    if (!files.has(path)) {
+      const text = await safeReadUtf8(root, path);
+      files.set(path, text?.split(/\r?\n/u) ?? []);
+    }
+    const lines = files.get(path);
+    if (line > lines.length) continue;
+    const startLine = Math.max(1, line - 2);
+    const endLine = Math.min(lines.length, line + 4);
+    const text = lines.slice(startLine - 1, endLine)
+      .map((source, index) => `${startLine + index} | ${utf8Truncate(sanitize(redactSecrets(source)), 180)}`)
+      .join('\n');
+    snippets.push({ path, startLine, endLine, text });
+  }
+  return snippets;
+}
+
+/** Bounded evidence for a prompt: definitions, reachable calls and linked tests. */
+export function getRelatedRepositoryContext(analysis, query, { exactSymbol = '' } = {}) {
+  const words = String(query ?? '').match(/[\w$]+/g)?.slice(0, 40) ?? [];
+  const names = new Set(words.map(w => w.toLowerCase()));
+  const { modules, edges } = analysis.callGraph;
+  const hints = new Set([String(query ?? '').trim().toLowerCase(), ...tokenizeIssueText(query).pathHints]);
+  const anchors = new Set(modules.filter(m => hints.has(m.path.toLowerCase())).map(m => m.path));
+  const symbols = exactSymbol
+    ? findRepositorySymbols(analysis, exactSymbol)
+    : (analysis.callGraph.symbols ?? []).filter(s => anchors.has(s.path) || s.id === query || names.has(s.name.toLowerCase())).slice(0, 20);
+  const ids = new Set(symbols.map(s => s.id));
+  const directCalls = (analysis.callGraph?.calls ?? []).filter(e => ids.has(e.from) || ids.has(e.to));
+  const tracedCalls = new Set();
+  for (const symbol of symbols.slice(0, exactSymbol ? 3 : 0)) {
+    for (const direction of ['callers', 'callees']) {
+      const { edges } = traceRepositoryCalls(analysis, symbol.id, { direction, limit: 20 });
+      for (const edge of edges) tracedCalls.add(edge);
+    }
+  }
+  const callsByLocation = new Map();
+  for (const edge of [...directCalls, ...tracedCalls]) {
+    const key = JSON.stringify([edge.from, edge.to, edge.line, edge.column]);
+    if (!callsByLocation.has(key)) callsByLocation.set(key, edge);
+    if (callsByLocation.size === 40) break;
+  }
+  const calls = [...callsByLocation.values()];
+  const linked = findLinkedTests(modules, edges);
+  const files = new Set([...anchors, ...symbols.map(s => s.path)]);
+  for (const e of calls) for (const id of [e.from, e.to]) files.add(id.slice(0, id.lastIndexOf('#')));
+  for (const e of edges) {
+    if (files.size >= 40) break;
+    if (anchors.has(e.from)) files.add(e.to);
+    if (anchors.has(e.to)) files.add(e.from);
+  }
+  const tests = new Set();
+  for (const p of files) for (const test of linked.get(p) ?? []) tests.add(test);
+  return { symbols, calls, files: [...files].slice(0, 40), tests: [...tests].slice(0, 20) };
 }

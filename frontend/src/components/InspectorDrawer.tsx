@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { InspectorTab, Task, TaskBundle, Worker } from '../types/backend';
+import type { Approval, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
 import { aggregateFileChanges, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
 import { fmtClock, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
 import {
@@ -52,6 +52,9 @@ interface InspectorDrawerProps {
   client: AgentBackendClient;
   sessionId: string | null;
   preferredRunId?: string;
+  swarmReceipt?: SwarmCommandReceipt;
+  swarmEventSeq?: number;
+  swarmApprovals?: Approval[];
   tabRequest?: number;
   swarmSectionRequest?: { section: SwarmSection };
   onResize: (width: number) => void;
@@ -161,6 +164,9 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   client,
   sessionId,
   preferredRunId,
+  swarmReceipt,
+  swarmEventSeq,
+  swarmApprovals,
   tabRequest,
   swarmSectionRequest,
   onResize,
@@ -687,7 +693,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
         {/* Empty state if no active task */}
         {activePaneTab?.kind === 'autonomous' ? (
-          open && <AutonomousRunPanel key={sessionId ?? 'no-session'} client={client} sessionId={sessionId} preferredRunId={preferredRunId} sectionRequest={swarmSectionRequest} />
+          open && <AutonomousRunPanel key={sessionId ?? 'no-session'} client={client} sessionId={sessionId} preferredRunId={preferredRunId} receipt={swarmReceipt} eventSeq={swarmEventSeq} approvals={swarmApprovals} sectionRequest={swarmSectionRequest} />
         ) : !bundle ? (
           <div
             style={{

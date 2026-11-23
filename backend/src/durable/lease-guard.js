@@ -1,3 +1,4 @@
+import { remainingRunMs } from '../swarm/run-deadline.js';
 import { hostname as osHostname } from 'node:os';
 import { id as uuid } from '../store.js';
 import { RecoveryError } from '../kernel/errors.js';
@@ -284,7 +285,10 @@ export function assertJobOwnershipInTx(
 
   const effectiveRunId = runId ?? job.taskId ?? null;
   if (effectiveRunId) {
-    const run = store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(effectiveRunId);
+    const run = store.db.prepare("SELECT status, createdAt, json_extract(budgetJson, '$.maxDurationMs') AS maxDurationMs FROM swarm_runs WHERE id=?").get(effectiveRunId);
+    if (remainingRunMs(run, now) === 0) {
+      throw new RecoveryError('LEASE_LOST', { message: 'Swarm deadline elapsed', detail: { jobId, runId: effectiveRunId } });
+    }
     if (run && TERMINAL_RUN_STATES.has(run.status)) {
       throw new RecoveryError('LEASE_LOST', {
         message: `Swarm run ${effectiveRunId} already reached terminal state ${run.status}`,

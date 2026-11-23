@@ -56,6 +56,7 @@ const REQUIRED_V7_TABLES = Object.freeze([
   'runtime_jobs',
   'tool_receipts',
   'swarm_runs',
+  'swarm_command_receipts',
   'swarm_nodes',
   'agent_messages',
   'context_compactions',
@@ -206,6 +207,7 @@ export class Store {
   #wakeListeners = new Set();
   #wakePending = false;
   #savepointSeq = 0;
+  #commitCallbacks = [];
   constructor(path) {
     this.dbPath = path;
     this.db = new DatabaseSync(path);
@@ -339,6 +341,7 @@ export class Store {
         CREATE INDEX IF NOT EXISTS tool_receipts_status ON tool_receipts(status);
         CREATE TABLE IF NOT EXISTS swarm_runs(id TEXT PRIMARY KEY, sessionId TEXT NOT NULL, rootTurnId TEXT, goal TEXT NOT NULL, status TEXT NOT NULL, strategyJson TEXT NOT NULL, budgetJson TEXT NOT NULL, usageJson TEXT NOT NULL DEFAULT '{}', verdictJson TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS swarm_runs_session ON swarm_runs(sessionId, createdAt);
+        CREATE TABLE IF NOT EXISTS swarm_command_receipts(sessionId TEXT NOT NULL REFERENCES direct_sessions(id) ON DELETE CASCADE, clientTurnId TEXT NOT NULL, input TEXT NOT NULL, runId TEXT REFERENCES swarm_runs(id) ON DELETE SET NULL, PRIMARY KEY(sessionId, clientTurnId));
         CREATE TABLE IF NOT EXISTS swarm_nodes(id TEXT PRIMARY KEY, runId TEXT NOT NULL REFERENCES swarm_runs(id) ON DELETE CASCADE, nodeKey TEXT NOT NULL, parentNodeId TEXT, agentProfileId TEXT NOT NULL, childSessionId TEXT, model TEXT, provider TEXT, objective TEXT NOT NULL, acceptance TEXT NOT NULL, dependenciesJson TEXT NOT NULL DEFAULT '[]', toolAllowJson TEXT, permissionMode TEXT NOT NULL DEFAULT 'auto-safe', worktreePath TEXT, status TEXT NOT NULL DEFAULT 'pending', priority INTEGER NOT NULL DEFAULT 0, budgetJson TEXT NOT NULL DEFAULT '{}', resultText TEXT, artifactUrisJson TEXT NOT NULL DEFAULT '[]', errorCode TEXT, errorMessage TEXT, attempts INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, UNIQUE(runId, nodeKey));
         CREATE INDEX IF NOT EXISTS swarm_nodes_run ON swarm_nodes(runId, status);
         CREATE TABLE IF NOT EXISTS agent_messages(id TEXT PRIMARY KEY, runId TEXT, fromAgentId TEXT NOT NULL, toAgentId TEXT NOT NULL, kind TEXT NOT NULL, payloadJson TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', createdAt INTEGER NOT NULL, deliveredAt INTEGER);
@@ -1134,10 +1137,15 @@ export class Store {
       }
     });
   }
+  afterCommit(fn) {
+    if (this.db.isTransaction) this.#commitCallbacks.push(fn);
+    else fn();
+  }
   tx(fn) {
     if (this.db.isTransaction) {
       const sp = `sp_${++this.#savepointSeq}`;
       const prevWakePending = this.#wakePending;
+      const prevCallbackCount = this.#commitCallbacks.length;
       this.db.exec(`SAVEPOINT ${sp}`);
       try {
         const result = fn();
@@ -1148,6 +1156,7 @@ export class Store {
         return result;
       } catch (error) {
         this.#wakePending = prevWakePending;
+        this.#commitCallbacks.length = prevCallbackCount;
         if (this.db.isTransaction) {
           try {
             this.db.exec(`ROLLBACK TO SAVEPOINT ${sp}; RELEASE SAVEPOINT ${sp};`);
@@ -1163,6 +1172,10 @@ export class Store {
       const result = fn();
       if (result instanceof Promise) throw Error('async transaction');
       this.db.exec('COMMIT');
+      const callbacks = this.#commitCallbacks.splice(0);
+      for (const callback of callbacks) {
+        try { callback(); } catch { /* A committed transaction cannot be rolled back. */ }
+      }
       if (this.#wakePending) {
         this.#wakePending = false;
         this.notifyJobWake();
@@ -1170,6 +1183,7 @@ export class Store {
       return result;
     } catch (error) {
       this.#wakePending = false;
+      this.#commitCallbacks.length = 0;
       if (this.db.isTransaction) {
         try {
           this.db.exec('ROLLBACK');

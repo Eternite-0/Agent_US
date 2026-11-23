@@ -49,11 +49,13 @@ import type {
   ProvidersHealth,
   Task,
   TaskBundle,
+  SwarmCommandReceipt,
   ThemeMode,
   ToastItem,
   UsageItem,
   WorkspaceEntryKind,
 } from './types/backend';
+import { isSwarmCommand } from './utils/swarmCommand';
 import { randomIdempotencyKey } from './utils/format';
 import { BUILTIN_PROVIDER_PRESETS, mergeProviderPresetCatalog } from './data/providerPresets';
 
@@ -188,7 +190,7 @@ export const App: React.FC = () => {
   const [searchOpen, setSearchOpen] = useState(false);
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [preferredSwarmRun, setPreferredSwarmRun] = useState<{ sessionId: string; runId: string } | null>(null);
+  const [preferredSwarmRun, setPreferredSwarmRun] = useState<{ sessionId: string; runId: string | null; receipt?: SwarmCommandReceipt; client: AgentBackendClient } | null>(null);
   const [swarmSectionRequest, setSwarmSectionRequest] = useState<{ section: SwarmSection }>();
   const [inspectorRequest, setInspectorRequest] = useState(0);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('subagents');
@@ -822,6 +824,15 @@ export const App: React.FC = () => {
     }
   };
 
+  const showSwarmReceipt = (receipt: SwarmCommandReceipt & { id: string }) => {
+    setPreferredSwarmRun({ client, sessionId: receipt.id, runId: receipt.runId, receipt });
+    setInspectorTaskId(receipt.id);
+    setSwarmSectionRequest({ section: 'plan' });
+    setInspectorRequest((value) => value + 1);
+    setInspectorTab('autonomous');
+    setInspectorOpen(true);
+  };
+
   const handleSubmitNewTask = async (text: string, files: Record<string, string>) => {
     setSubmitting(true);
     try {
@@ -845,7 +856,13 @@ export const App: React.FC = () => {
         ...(Object.keys(files).length ? { files } : {}),
       });
 
-      setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
+      if (currentClient.current !== client) return;
+      if ('mode' in task) {
+        showSwarmReceipt(task);
+        void refreshWorkspace(false);
+      } else {
+        setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
+      }
       navigate({ kind: 'thread', taskId: task.id });
     } catch (e) {
       pushToast(`提交任务失败：${e instanceof Error ? e.message : '未知错误'}`, 'danger');
@@ -863,7 +880,7 @@ export const App: React.FC = () => {
     setSubmitting(true);
     try {
       const currentRoot = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
-      if (currentRoot?.status === 'running' && client.steerSession && !text.startsWith('/plan ') && Object.keys(files).length === 0) {
+      if (currentRoot?.status === 'running' && client.steerSession && !isSwarmCommand(text) && !text.startsWith('/plan ') && Object.keys(files).length === 0) {
         const steered = await client.steerSession(activeRootTaskId, text);
         if (steered.steered) {
           pushToast('已实时注入纠偏指令，Agent 将在下一步生效', 'success');
@@ -878,7 +895,9 @@ export const App: React.FC = () => {
           effort,
           clientTurnId: randomIdempotencyKey(),
         });
-        setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+        if (currentClient.current !== client || activeChainRef.current[0] !== activeRootTaskId) return;
+        if ('mode' in updated) showSwarmReceipt(updated);
+        else setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
         await refreshActiveBundles([activeRootTaskId], true);
         return;
       }
@@ -902,6 +921,12 @@ export const App: React.FC = () => {
         ...(Object.keys(files).length ? { files } : {}),
       });
 
+      if ('mode' in nextTask) {
+        showSwarmReceipt(nextTask);
+        navigate({ kind: 'thread', taskId: nextTask.id });
+        void refreshWorkspace(false);
+        return;
+      }
       setTasks((prev) => [nextTask, ...prev.filter((t) => t.id !== nextTask.id)]);
       setThreadChains((prev) => ({
         ...prev,
@@ -1093,7 +1118,7 @@ export const App: React.FC = () => {
       if (currentClient.current !== client) return true;
       navigate({ kind: 'thread', taskId: result.sessionId });
       setInspectorTaskId(result.sessionId);
-      setPreferredSwarmRun(result);
+      setPreferredSwarmRun({ ...result, client });
       setSwarmSectionRequest({ section: 'plan' });
       setInspectorRequest((value) => value + 1);
       setInspectorTab('autonomous');
@@ -1118,10 +1143,16 @@ export const App: React.FC = () => {
   const slashTask = activeBundles.find(({ task }) => task.id === activeRootTaskId)?.task
     ?? tasks.find(({ id }) => id === activeRootTaskId);
   const archiveBlock = !slashTask ? '会话尚未加载' : archiveBusy.has(slashTask.id) ? '正在更新归档状态' : undefined;
+  const sessionSwarm = preferredSwarmRun?.client === client && preferredSwarmRun.sessionId === activeRootTaskId ? preferredSwarmRun : null;
+  const swarmEventSeq = recentEvents.findLast((event) =>
+    activeRootTaskId && event.type.startsWith('swarm/') &&
+    (event.taskId === activeRootTaskId || event.payload?.sessionId === activeRootTaskId),
+  )?.seq ?? 0;
   const swarmBlock = !client.listSwarmRuns ? '当前连接未提供自主任务' : undefined;
   const commandAvailability: CommandAvailability = {
     '/goal': !client.submitAutonomousGoal ? '当前连接未提供自主任务' : undefined,
-    '/swarm': swarmBlock,
+    '/swarm': client.isDemo ? '演示连接不支持 Swarm 命令' : undefined,
+    '/swarm-plan': swarmBlock,
     '/messages': swarmBlock ?? (!client.listSwarmMessages ? '当前连接未提供协作消息' : undefined),
     '/artifacts': swarmBlock ?? (!client.listSwarmArtifacts ? '当前连接未提供自主任务产物' : undefined),
     '/fork': !client.forkTask ? '当前连接未提供聊天分支' : slashTask?.status === 'running' ? '请等待当前聊天执行结束' : undefined,
@@ -1528,6 +1559,14 @@ export const App: React.FC = () => {
             {view.kind === 'thread' && (
               <ThreadView
                 key={view.taskId}
+                onOpenSwarmRun={(sessionId, runId) => {
+                  setPreferredSwarmRun({ client, sessionId, runId });
+                  setInspectorTaskId(sessionId);
+                  setSwarmSectionRequest({ section: 'plan' });
+                  setInspectorRequest((value) => value + 1);
+                  setInspectorTab('autonomous');
+                  setInspectorOpen(true);
+                }}
                 bundles={activeBundles.filter((b) => activeChainIds.includes(b.task.id))}
                 loading={
                   bundleLoading ||
@@ -1716,7 +1755,8 @@ export const App: React.FC = () => {
                     permissionMode,
                     ...(workspaceRoot ? { workspaceRoot } : {}),
                   });
-                  setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
+                  if ('mode' in task) showSwarmReceipt(task);
+                  else setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
                   setScheduledTasks((prev) =>
                     prev.map((s) =>
                       s.id === item.id
@@ -2011,7 +2051,10 @@ export const App: React.FC = () => {
             bundle={inspectorBundle}
             client={client}
             sessionId={activeRootTaskId}
-            preferredRunId={preferredSwarmRun?.sessionId === activeRootTaskId ? preferredSwarmRun?.runId : undefined}
+            preferredRunId={sessionSwarm?.runId ?? undefined}
+            swarmReceipt={sessionSwarm?.receipt}
+            swarmEventSeq={swarmEventSeq}
+            swarmApprovals={approvals}
             onResize={setDrawerWidth}
             onChangeTab={setInspectorTab}
             onSelectFile={setInspectorFile}

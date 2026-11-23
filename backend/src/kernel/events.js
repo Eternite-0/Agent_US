@@ -172,7 +172,9 @@ export class EventRouter {
     const ev = this.store?.db
       ? this.store.tx(() => this.insertPersistedInTx(opts))
       : this.insertPersistedInTx(opts);
-    return this.fanoutPersisted(ev);
+    if (this.store?.afterCommit) this.store.afterCommit(() => this.fanoutPersisted(ev));
+    else this.fanoutPersisted(ev);
+    return ev;
   }
 
   emitEphemeral({ sessionId, turnId = null, type, data = {} }) {

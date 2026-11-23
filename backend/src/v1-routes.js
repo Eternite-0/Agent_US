@@ -1,3 +1,4 @@
+import { handleChatCommand } from './routes/chat-command.js';
 import { searchWorkspaceFiles } from './workspace-file-search.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -209,6 +210,8 @@ export function v1Routes(
       trafficSource: trace.trafficSource || 'production',
       isSynthetic: Boolean(trace.isSynthetic),
     };
+    const command = handleChatCommand(directAgent, req.params.id, body, traffic);
+    if (command) return command;
     return directAgent.startTurn(req.params.id, {
       input: body.input,
       clientTurnId: body.clientTurnId,
@@ -223,7 +226,9 @@ export function v1Routes(
 
   app.post('/v1/sessions/:id/steer', async (req) => {
     const body = req.body ?? {};
-    return directAgent.steerSession(req.params.id, body.input ?? body.text ?? '');
+    const input = body.input ?? body.text ?? '';
+    const command = handleChatCommand(directAgent, req.params.id, { ...body, input }, {});
+    return command ?? directAgent.steerSession(req.params.id, input);
   });
 
   app.post('/v1/sessions/:id/compact', async (req) =>

@@ -861,8 +861,19 @@ export interface SwarmDeliveryTestResult {
   summary?: string;
 }
 
+export interface SwarmBudgetSnapshot {
+  treeId?: string;
+  updatedAt?: number;
+  reservedSteps?: number;
+  remainingSteps?: number | null;
+  reservedTokens?: number;
+  remainingTokens?: number | null;
+}
+
 export interface SwarmDeliveryRecord {
   runId: string;
+  teamRationale?: string | null;
+  budgetLedger?: SwarmBudgetSnapshot | null;
   status: string;
   goal: string;
   planVersion?: number;
@@ -889,6 +900,7 @@ export interface SwarmApplyAllResult {
 
 export interface SwarmRunRecord {
   id: string;
+  plan?: { metadata?: { teamRationale?: string | null } | null } | null;
   sessionId: string;
   goal: string;
   status: string;
@@ -904,6 +916,15 @@ export interface SwarmRunRecord {
   nodes: SwarmNodeRecord[];
   createdAt: number;
   updatedAt: number;
+}
+
+export interface SwarmCommandReceipt {
+  mode: 'swarm';
+  ledger?: SwarmBudgetSnapshot | null;
+  action: 'start' | 'status' | 'stop' | 'help';
+  runId: string | null;
+  run: SwarmRunRecord | null;
+  message: string;
 }
 
 export interface SwarmSubmitResponse {

@@ -473,7 +473,12 @@ export class ChildAgentManager {
           runId,
           nodeKey,
         };
-        this.activeChildren.set(childSessionId, state);
+        const assertActive = () => {
+          if (combinedSignal.aborted) throw new CancellationError('CHILD_ABORTED', {
+            message: String(combinedSignal.reason || 'Child execution aborted'),
+          });
+          this.#assertAncestorsActive(childSessionId);
+        };
 
         const requestedMode =
           isolationMode ||
@@ -526,68 +531,6 @@ export class ChildAgentManager {
         let explicitCancel = false;
         let shuttingDownTurn = false;
 
-        if (requestedMode === ISOLATION_MODES.WORKTREE) {
-          if (!this.worktreeIsolator) {
-            if (!allowIsolationFallback) {
-              this.activeChildren.delete(childSessionId);
-              throw new Fault('WORKTREE_ISOLATION_FAILED', 500, {
-                message: 'Worktree isolator unavailable and fallback disabled',
-              });
-            }
-            effectivePolicy = intersectPolicies(effectivePolicy, {
-              permissionMode: 'read-only',
-              denyTools: ['write_file', 'edit_file', 'apply_patch', 'bash', 'start_process', 'kill_process'],
-            });
-          } else {
-            try {
-              wt = await this.worktreeIsolator.acquire(workspaceRoot, {
-                ownerId: childSessionId,
-                workerId: workerId ?? leaseGuard?.workerId ?? null,
-                sessionId: childSessionId,
-                runId,
-                nodeKey,
-                jobId: leaseGuard?.jobId ?? null,
-                fence: leaseGuard?.fence ?? null,
-                attempt,
-                rehydrateExisting: Boolean(runId && nodeKey),
-                leaseGuard: baseLeaseGuard,
-              });
-              effectiveRoot = wt.path;
-              isIsolated = true;
-            } catch (wtErr) {
-              if (isLeaseLostError(wtErr)) {
-                this.activeChildren.delete(childSessionId);
-                throw wtErr;
-              }
-              if (!allowIsolationFallback) {
-                this.activeChildren.delete(childSessionId);
-                throw new Fault('WORKTREE_ISOLATION_FAILED', 500, {
-                  message: `Worktree isolation failed (fail-closed, no implicit fallback): ${String(wtErr?.message ?? wtErr)}`,
-                });
-              }
-              effectivePolicy = intersectPolicies(effectivePolicy, {
-                permissionMode: 'read-only',
-                denyTools: ['write_file', 'edit_file', 'apply_patch', 'bash', 'start_process', 'kill_process'],
-              });
-            }
-          }
-        } else if (requestedMode === ISOLATION_MODES.SHARED_READONLY) {
-          effectivePolicy = intersectPolicies(effectivePolicy, { permissionMode: 'read-only' });
-        }
-
-        const sandboxConfig = this.resolveSessionSandbox?.(childSessionId) ?? null;
-        if (sandboxConfig?.forcedToolDeny?.length) {
-          effectivePolicy = {
-            ...effectivePolicy,
-            denyTools: [
-              ...new Set([
-                ...(effectivePolicy.denyTools ?? []),
-                ...sandboxConfig.forcedToolDeny,
-              ]),
-            ],
-          };
-        }
-
         const turnLeaseGuard =
           baseLeaseGuard?.withContext?.({
             sessionId: childSessionId,
@@ -595,36 +538,101 @@ export class ChildAgentManager {
             runId,
             nodeId,
           }) ?? baseLeaseGuard;
-        const explicitMaxSteps = normalizeBudgetLimit(effectiveBudget.maxSteps);
-        const maxSteps =
-          explicitMaxSteps !== null
-            ? Math.min(40, explicitMaxSteps)
-            : Math.min(20, Math.max(1, Number(profile?.defaultMaxSteps ?? 8)));
         const resolvedModel = model || this.getDefaultModel();
-
+        this.activeChildren.set(childSessionId, state);
         try {
-          this.eventRouter?.emitPersisted({
-            sessionId: parentSessionId,
-            turnId: parentTurnId,
-            type: RUNTIME_EVENTS.SUBAGENT_STARTED,
-            data: {
-              subagentId: subId,
-              childSessionId,
-              childTurnId: turnId,
-              role: profile?.name || profile?.id || 'worker',
-              model: resolvedModel,
-              objective,
-              isolationMode: requestedMode,
-              isolatedWorktree: isIsolated,
-              rehydratedWorktree: Boolean(wt?.rehydrated || rehydrateFromArtifactId),
-            },
-            audit: false,
-          });
-        } catch {
-          // non-fatal event emit
-        }
+          assertActive();
+          assertLeaseInTx(baseLeaseGuard);
+          if (requestedMode === ISOLATION_MODES.WORKTREE) {
+            if (!this.worktreeIsolator) {
+              if (!allowIsolationFallback) {
+                throw new Fault('WORKTREE_ISOLATION_FAILED', 500, {
+                  message: 'Worktree isolator unavailable and fallback disabled',
+                });
+              }
+              effectivePolicy = intersectPolicies(effectivePolicy, {
+                permissionMode: 'read-only',
+                denyTools: ['write_file', 'edit_file', 'apply_patch', 'bash', 'start_process', 'kill_process'],
+              });
+            } else {
+              try {
+                wt = await this.worktreeIsolator.acquire(workspaceRoot, {
+                  ownerId: childSessionId,
+                  workerId: workerId ?? leaseGuard?.workerId ?? null,
+                  sessionId: childSessionId,
+                  runId,
+                  nodeKey,
+                  jobId: leaseGuard?.jobId ?? null,
+                  fence: leaseGuard?.fence ?? null,
+                  attempt,
+                  rehydrateExisting: Boolean(runId && nodeKey),
+                  leaseGuard: baseLeaseGuard,
+                });
+                effectiveRoot = wt.path;
+                isIsolated = true;
+              } catch (wtErr) {
+                assertActive();
+                if (isLeaseLostError(wtErr)) {
+                  throw wtErr;
+                }
+                if (!allowIsolationFallback) {
+                  throw new Fault('WORKTREE_ISOLATION_FAILED', 500, {
+                    message: `Worktree isolation failed (fail-closed, no implicit fallback): ${String(wtErr?.message ?? wtErr)}`,
+                  });
+                }
+                effectivePolicy = intersectPolicies(effectivePolicy, {
+                  permissionMode: 'read-only',
+                  denyTools: ['write_file', 'edit_file', 'apply_patch', 'bash', 'start_process', 'kill_process'],
+                });
+              }
+            }
+          } else if (requestedMode === ISOLATION_MODES.SHARED_READONLY) {
+            effectivePolicy = intersectPolicies(effectivePolicy, { permissionMode: 'read-only' });
+          }
 
-        try {
+          assertActive();
+          assertLeaseInTx(baseLeaseGuard);
+          const sandboxConfig = this.resolveSessionSandbox?.(childSessionId) ?? null;
+          if (sandboxConfig?.forcedToolDeny?.length) {
+            effectivePolicy = {
+              ...effectivePolicy,
+              denyTools: [
+                ...new Set([
+                  ...(effectivePolicy.denyTools ?? []),
+                  ...sandboxConfig.forcedToolDeny,
+                ]),
+              ],
+            };
+          }
+
+          const explicitMaxSteps = normalizeBudgetLimit(effectiveBudget.maxSteps);
+          const maxSteps =
+            explicitMaxSteps !== null
+              ? Math.min(40, explicitMaxSteps)
+              : Math.min(20, Math.max(1, Number(profile?.defaultMaxSteps ?? 8)));
+
+          try {
+            this.eventRouter?.emitPersisted({
+              sessionId: parentSessionId,
+              turnId: parentTurnId,
+              type: RUNTIME_EVENTS.SUBAGENT_STARTED,
+              data: {
+                subagentId: subId,
+                childSessionId,
+                childTurnId: turnId,
+                role: profile?.name || profile?.id || 'worker',
+                model: resolvedModel,
+                objective,
+                isolationMode: requestedMode,
+                isolatedWorktree: isIsolated,
+                rehydratedWorktree: Boolean(wt?.rehydrated || rehydrateFromArtifactId),
+              },
+              audit: false,
+            });
+          } catch {
+            // non-fatal event emit
+          }
+
           // Overlay verified predecessor artifacts onto isolated worktree BEFORE child execution
           if (
             isIsolated &&
@@ -814,11 +822,15 @@ export class ChildAgentManager {
             });
           }
 
+          assertActive();
+          assertLeaseInTx(turnLeaseGuard);
           if (claimedCommunicationMessage?.messageId && this.communication?.ack) {
             const communicationAgentId = claimedCommunicationMessage.toAgentId || nodeKey || childSessionId;
             await this.communication.ack(claimedCommunicationMessage.messageId, communicationAgentId, claimedCommunicationMessage.deliveryToken);
           }
 
+          assertActive();
+          assertLeaseInTx(turnLeaseGuard);
           const session = this.sessionRepo.getSession(childSessionId);
           const nonce = this.sessionRepo.ensureSessionNonce(childSessionId);
           const extraTools =
@@ -1029,6 +1041,8 @@ export class ChildAgentManager {
 
           // Fix C1/C5/C10: Persist & register isolated worktree artifacts BEFORE marking completed!
           const diffSummary = wt ? await wt.diffSummary() : '';
+          if (!state.paused) assertActive();
+          assertLeaseInTx(turnLeaseGuard);
           if (isIsolated && wt && !state.paused && this.artifactManager && runId && nodeKey) {
             archivedArtifact = await this.artifactManager.archiveWorktree({
               runId,
@@ -1077,7 +1091,7 @@ export class ChildAgentManager {
           const committed = this.store.tx(() => {
             assertLeaseInTx(turnLeaseGuard);
             if (!state.paused) {
-              this.#assertAncestorsActive(childSessionId);
+              assertActive();
             }
             const turnRes = this.store.db
               .prepare(
@@ -1286,11 +1300,18 @@ export class ChildAgentManager {
           }
           throw err;
         } finally {
-          this.activeChildren.delete(childSessionId);
+          if (this.activeChildren.get(childSessionId) === state) this.activeChildren.delete(childSessionId);
           if (wt) {
-            if (leaseLost) {
+            const currentHandle = this.worktreeIsolator?.active?.get(wt.leaseId);
+            // User cancellation fences the job as well. Its original handle can
+            // preserve dirty files or remove a clean tree once the run is terminal.
+            const cancelledOwner = leaseLost && currentHandle === wt && runId && this.store?.db?.isOpen &&
+              this.store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(runId)?.status === 'cancelled';
+            if ((leaseLost && !cancelledOwner) || (currentHandle && currentHandle !== wt)) {
               // Stale worker MUST NOT touch disk when lease was lost; detach handle only
-              this.worktreeIsolator?.active?.delete?.(wt.leaseId);
+              if (this.worktreeIsolator?.active?.get(wt.leaseId) === wt) {
+                this.worktreeIsolator.active.delete(wt.leaseId);
+              }
             } else {
               // P1-3: Isolate worktree cleanup errors so cleanup failure NEVER masks a committed turn completion!
               try {
@@ -1298,7 +1319,7 @@ export class ChildAgentManager {
                   archivedArtifactId: archivedArtifact?.id ?? null,
                   forceDiscard: explicitCancel || overlayFailedDiscard,
                   preserveDirty: !overlayFailedDiscard,
-                  leaseGuard: explicitCancel || shuttingDownTurn ? null : baseLeaseGuard,
+                  leaseGuard: explicitCancel || shuttingDownTurn || cancelledOwner ? null : baseLeaseGuard,
                 });
               } catch {
                 // preserved worktree or cleanup error is already tracked in worktree_leases; do not crash caller
@@ -1384,9 +1405,11 @@ export class ChildAgentManager {
     const resolvedTrafficSource = trafficSource || parentSess?.trafficSource || 'production';
     const resolvedIsSynthetic =
       isSynthetic !== undefined ? (isSynthetic ? 1 : 0) : parentSess?.isSynthetic ? 1 : 0;
-    const child = existingChild
-      ? existingChild
-      : this.sessionRepo.createSession({
+    const child = this.store.tx(() => {
+      signal?.throwIfAborted();
+      this.#assertAncestorsActive(parentSessionId);
+      assertLeaseInTx(leaseGuard, { runId, nodeId });
+      const session = existingChild ?? this.sessionRepo.createSession({
           title: `子任务: ${String(objective).slice(0, 60)}`,
           model: resolvedModel,
           workspaceRoot: workspaceRoot || parentSess?.workspaceRoot,
@@ -1402,6 +1425,12 @@ export class ChildAgentManager {
           toolAllow: effectivePolicy.allowTools,
           toolDeny: effectivePolicy.denyTools,
         });
+      // Bind before asynchronous worktree acquisition so cancellation and restart can find the child.
+      if (runId && nodeId) this.store.db.prepare(
+        'UPDATE swarm_nodes SET childSessionId=?, updatedAt=? WHERE id=? AND runId=?',
+      ).run(session.id, Date.now(), nodeId, runId);
+      return session;
+    });
 
     return this.#runChildTurn({
       parentSessionId,
@@ -1460,6 +1489,7 @@ export class ChildAgentManager {
     signal = undefined,
   }) {
     this.#assertAncestorsActive(parentSessionId);
+    signal?.throwIfAborted();
     const depth = this.#computeDepth(parentSessionId);
     if (depth >= MAX_FORK_DEPTH) {
       throw new Fault('RECURSIVE_FORK_BLOCKED', 400, {
@@ -1634,6 +1664,35 @@ export class ChildAgentManager {
     return this.pause(childSessionId);
   }
 
+  persistCancellationInTx(childSessionId, now, { preserveTerminal = false } = {}) {
+    this.store.db.prepare(
+      `UPDATE direct_sessions SET state='cancelled', updatedAt=? WHERE id=?
+       ${preserveTerminal ? "AND state NOT IN ('completed','failed','cancelled')" : ''}`,
+    ).run(now, childSessionId);
+    this.store.db.prepare(
+      "UPDATE direct_turns SET state='cancelled', phase='cancelled', activeFence=NULL, finishedAt=? WHERE sessionId=? AND state IN ('running','reconciling','parked','paused')",
+    ).run(now, childSessionId);
+    this.jobQueue?.cancelBySession?.(childSessionId);
+  }
+
+  persistTreeCancellationInTx(childSessionId, now) {
+    this.persistCancellationInTx(childSessionId, now, { preserveTerminal: true });
+    for (const nested of this.sessionRepo.listChildSessions(childSessionId)) {
+      this.persistTreeCancellationInTx(nested.id, now);
+    }
+  }
+
+  abortChildTree(childSessionId) {
+    const active = this.activeChildren.get(childSessionId);
+    if (active) {
+      active.paused = false;
+      active.controller.abort('cancelled');
+    }
+    for (const nested of this.sessionRepo.listChildSessions(childSessionId)) {
+      this.abortChildTree(nested.id);
+    }
+  }
+
   cancel(childSessionId) {
     const active = this.activeChildren.get(childSessionId);
     if (active) {
@@ -1642,17 +1701,7 @@ export class ChildAgentManager {
     }
     if (this.store?.db?.isOpen) {
       const now = Date.now();
-      this.store.tx(() => {
-        this.store.db
-          .prepare("UPDATE direct_sessions SET state='cancelled', updatedAt=? WHERE id=?")
-          .run(now, childSessionId);
-        this.store.db
-          .prepare(
-            "UPDATE direct_turns SET state='cancelled', phase='cancelled', finishedAt=? WHERE sessionId=? AND state IN ('running','reconciling','parked','paused')",
-          )
-          .run(now, childSessionId);
-      });
-      this.jobQueue?.cancelBySession?.(childSessionId);
+      this.store.tx(() => this.persistCancellationInTx(childSessionId, now));
     }
     for (const nested of this.sessionRepo.listChildSessions(childSessionId)) {
       this.cancel(nested.id);

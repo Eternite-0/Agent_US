@@ -228,6 +228,7 @@ flowchart TB
 
 - 确定性测试使用 `ScriptedAdapter`、故障注入或参考解验证状态机、预算、迁移、产物冲突与证据门禁。报告中的离线负对照为 `0/1`，如预期被拒绝，单独计入离线结果。
 - 外部 Benchmark 的四个样本不足以推断通用成功率。大型仓库需按子目录进一步扫描。缺少目标仓库依赖时，`tsc`、`tsd` 等外置工具链需在具备依赖的环境中补验。
+- Benchmark Sandbox 和依赖策略已提供独立实现，当前 `EvaluationService` 与自治入口尚未接入该路径。见 [后端架构](backend/docs/architecture.md#工具与审批边界)。
 - [前端 simulator](frontend/src/api/simulator.ts) 提供演示数据。实际执行、审批与交付结果由 `/v1` 后端返回。
 
 ---

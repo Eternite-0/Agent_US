@@ -1,3 +1,4 @@
+import { swarmAttachmentError } from '../utils/swarmCommand.ts';
 import { swarmWorkerStatus } from '../utils/subagentProgress.ts';
 import type {
   AccountBalance,
@@ -54,6 +55,7 @@ import type {
   WorkspaceEntryKind,
   SwarmRunRecord,
   SwarmSubmitResponse,
+  SwarmCommandReceipt,
   ChatHistoryMatch,
   Task,
   TaskBundle,
@@ -87,6 +89,10 @@ export interface ListTasksOptions {
   signal?: AbortSignal;
 }
 
+// id always names the chat session, even when the server returned a command receipt.
+export type SubmittedTurn = Task | (SwarmCommandReceipt & { id: string });
+type TurnResponse = SwarmCommandReceipt | { mode?: 'direct'; turn?: Record<string, unknown>; session?: Record<string, unknown> };
+
 export interface AgentBackendClient {
   readonly isDemo: boolean;
   health(): Promise<{
@@ -114,7 +120,7 @@ export interface AgentBackendClient {
   forkTask?: (id: string, workspaceMode: 'same-workspace' | 'new-worktree') => Promise<Task>;
   setTaskArchived(id: string, archived: boolean): Promise<Task>;
   getTask(id: string): Promise<Task>;
-  submitTask(submission: Submission): Promise<Task>;
+  submitTask(submission: Submission): Promise<SubmittedTurn>;
   submitFollowupTurn?: (
     sessionId: string,
     input: string,
@@ -125,7 +131,7 @@ export interface AgentBackendClient {
       files?: Record<string, string>;
       clientTurnId?: string;
     },
-  ) => Promise<Task>;
+  ) => Promise<SubmittedTurn>;
   steerSession?: (
     sessionId: string,
     input: string,
@@ -838,7 +844,9 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.taskFromSession(session, turns.items?.[0] ?? null);
   }
 
-  async submitTask(submission: Submission): Promise<Task> {
+  async submitTask(submission: Submission): Promise<SubmittedTurn> {
+    const blocked = swarmAttachmentError(submission.input, submission.files);
+    if (blocked) throw new Error(blocked);
     let model = submission.model || this.defaultModel;
     if (!model) {
       const catalog = await this.req<NexusModelsResponse>('GET', '/v1/models');
@@ -853,7 +861,7 @@ export class LiveBackendClient implements AgentBackendClient {
         ...(submission.workspaceRoot ? { workspaceRoot: submission.workspaceRoot } : {}),
       },
     });
-    const turnRes = await this.req<{ turn?: Record<string, unknown> }>(
+    const turnRes = await this.req<TurnResponse>(
       'POST',
       `/v1/sessions/${encodeURIComponent(String(session.id))}/turns`,
       {
@@ -870,6 +878,7 @@ export class LiveBackendClient implements AgentBackendClient {
         },
       },
     );
+    if (turnRes.mode === 'swarm') return { ...turnRes, id: String(session.id) };
     return this.taskFromSession(session, turnRes.turn ?? null);
   }
 
@@ -883,11 +892,10 @@ export class LiveBackendClient implements AgentBackendClient {
       files?: Record<string, string>;
       clientTurnId?: string;
     },
-  ): Promise<Task> {
-    const turnRes = await this.req<{
-      turn?: Record<string, unknown>;
-      session?: Record<string, unknown>;
-    }>('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/turns`, {
+  ): Promise<SubmittedTurn> {
+    const blocked = swarmAttachmentError(input, opts?.files);
+    if (blocked) throw new Error(blocked);
+    const turnRes = await this.req<TurnResponse>('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/turns`, {
       body: {
         input,
         clientTurnId: opts?.clientTurnId ?? `turn-${Date.now()}`,
@@ -897,6 +905,7 @@ export class LiveBackendClient implements AgentBackendClient {
         ...(opts?.files && Object.keys(opts.files).length ? { files: opts.files } : {}),
       },
     });
+    if (turnRes.mode === 'swarm') return { ...turnRes, id: sessionId };
     return this.taskFromSession(
       turnRes.session ?? { id: sessionId, title: input },
       turnRes.turn ?? null,
@@ -2041,6 +2050,8 @@ export function normalizeSwarmDelivery(
   const record = raw && typeof raw === 'object' ? raw : {};
   return {
     runId: String(record.runId ?? fallbackRunId),
+    teamRationale: typeof record.teamRationale === 'string' ? record.teamRationale.trim() : undefined,
+    budgetLedger: record.budgetLedger ?? null,
     status: String(record.status ?? 'unknown'),
     goal: String(record.goal ?? ''),
     planVersion: finiteNumber(record.planVersion),

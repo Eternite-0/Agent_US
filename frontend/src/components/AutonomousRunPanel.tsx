@@ -9,6 +9,7 @@ import {
   isUnsupportedSwarmEndpointError,
 } from '../api/client';
 import type {
+  Approval,
   SwarmArtifactFile,
   SwarmArtifactRecord,
   SwarmDeliveryRecord,
@@ -16,6 +17,8 @@ import type {
   SwarmReplanRecord,
   SwarmReviewerVerdict,
   SwarmRunRecord,
+  SwarmBudgetSnapshot,
+  SwarmCommandReceipt,
 } from '../types/backend';
 
 import { WorkerStatusMark } from './WorkerStatusMark';
@@ -56,6 +59,11 @@ const isActive = (run: SwarmRunRecord) => !['completed', 'failed', 'cancelled'].
 const errorText = (error: unknown) => error instanceof Error ? error.message : '请求失败，请重试。';
 const when = (ms: number) => new Date(ms).toLocaleString();
 const limit = 30;
+
+function budgetValue(value: number | null | undefined): string {
+  if (value === null) return '未设上限';
+  return typeof value === 'number' && Number.isFinite(value) ? value.toLocaleString('zh-CN') : '未提供';
+}
 
 function Button({ children, ...props }: React.ComponentProps<'button'>) {
   return <button type="button" className="codex-toolbar-btn" data-variant="outline" {...props}>{children}</button>;
@@ -101,21 +109,31 @@ interface RunPanelProps {
   client: AgentBackendClient;
   sessionId: string | null;
   preferredRunId?: string;
+  receipt?: SwarmCommandReceipt;
+  eventSeq?: number;
+  approvals?: Approval[];
   sectionRequest?: { section: SwarmSection };
 }
 
-export function AutonomousRunPanel({ client, sessionId, preferredRunId, sectionRequest }: RunPanelProps) {
+export function AutonomousRunPanel({ client, sessionId, preferredRunId, receipt, eventSeq, approvals = [], sectionRequest }: RunPanelProps) {
   const list = client.listSwarmRuns;
   const [runs, setRuns] = useState<SwarmRunRecord[]>([]);
-  const [selectedId, setSelectedId] = useState('');
+  const [selectedId, setSelectedId] = useState(preferredRunId ?? '');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [revision, setRevision] = useState(0);
   const refresh = () => setRevision((value) => value + 1);
 
   useEffect(() => {
-    if (preferredRunId) setSelectedId(preferredRunId);
-  }, [preferredRunId]);
+    if (!eventSeq) return;
+    // Coalesce bursts of node and message events into one durable refresh.
+    const timer = window.setTimeout(() => setRevision((value) => value + 1), 150);
+    return () => window.clearTimeout(timer);
+  }, [eventSeq]);
+
+  useEffect(() => {
+    setSelectedId(preferredRunId ?? '');
+  }, [preferredRunId, receipt]);
 
   useEffect(() => {
     if (!list || !sessionId) return;
@@ -129,7 +147,8 @@ export function AutonomousRunPanel({ client, sessionId, preferredRunId, sectionR
         if (signal.aborted) return;
         setRuns(next);
         setError('');
-        if (!next.some(isActive)) return;
+        const awaitingList = receipt?.run && isActive(receipt.run) && !next.some((run) => run.id === receipt.runId);
+        if (!next.some(isActive) && !awaitingList) return;
       } catch (failure) {
         if (signal.aborted) return;
         setError(errorText(failure));
@@ -143,23 +162,31 @@ export function AutonomousRunPanel({ client, sessionId, preferredRunId, sectionR
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [client, list, sessionId, revision, preferredRunId]);
+  }, [client, list, sessionId, revision, preferredRunId, receipt]);
 
-  if (!sessionId) return <div className="autonomous-panel"><PanelState>打开会话后可查看自主任务。输入 <code>/goal 目标</code> 可启动新任务。</PanelState></div>;
-  if (!list) return <div className="autonomous-panel"><PanelState>当前连接未提供自主任务服务。</PanelState></div>;
-  const selected = runs.find((run) => run.id === selectedId) ?? runs[0];
+  if (!sessionId) return <div className="autonomous-panel"><PanelState>打开会话后可查看自主任务。输入 <code>/swarm 目标</code> 可启动新任务。</PanelState></div>;
+  if (!list && !receipt) return <div className="autonomous-panel"><PanelState>当前连接未提供自主任务服务。</PanelState></div>;
+  const snapshot = receipt?.run;
+  const listed = snapshot && runs.find((run) => run.id === snapshot.id);
+  const options = snapshot && (!listed || listed.updatedAt < snapshot.updatedAt)
+    ? [snapshot, ...runs.filter((run) => run.id !== snapshot.id)] : runs;
+  const selected = options.find((run) => run.id === selectedId) ?? (receipt ? undefined : options[0]);
   return <section className="autonomous-panel" aria-label="自主任务执行">
+    {receipt && <p role="status">命令回执 · {receipt.message}</p>}
     <div className="autonomous-toolbar swarm-run-selector">
       <IconDagNodes size={16} aria-hidden="true" />
-      {runs.length > 0 && <select className="codex-select" aria-label="选择自主任务" value={selected?.id ?? ''} onChange={(event) => setSelectedId(event.target.value)}>
-        {runs.map((run) => <option key={run.id} value={run.id}>{status(run.status)} · {run.goal.slice(0, 100)}</option>)}
+      {options.length > 0 && <select className="codex-select" aria-label="选择自主任务" value={selected?.id ?? ''} onChange={(event) => setSelectedId(event.target.value)}>
+        {!selected && <option value="" disabled>选择历史任务</option>}
+        {options.map((run) => <option key={run.id} value={run.id}>{status(run.status)} · {run.goal.slice(0, 100)}</option>)}
       </select>}
-      <Button onClick={refresh} disabled={loading} aria-label="刷新自主任务" title="刷新自主任务"><IconRefresh size={15} /></Button>
+      {list && <Button onClick={refresh} disabled={loading} aria-label="刷新自主任务" title="刷新自主任务"><IconRefresh size={15} /></Button>}
+
     </div>
     {error && <p className="autonomous-error" role="alert">加载自主任务失败。{error}</p>}
-    {loading && <p role="status">正在加载自主任务…</p>}
-    {!loading && !error && !selected && <PanelState>此会话暂无自主任务。输入 <code>/goal 目标</code> 开始。</PanelState>}
-    {selected && <RunDetail key={selected.id} run={selected} client={client} sectionRequest={sectionRequest} revision={revision} onRefresh={refresh} />}
+    {list && loading && <p role="status">正在加载自主任务…</p>}
+    {!receipt && !loading && !error && !selected && <PanelState>此会话暂无自主任务。输入 <code>/swarm 目标</code> 开始。</PanelState>}
+    {selected && <RunDetail key={selected.id} run={selected} client={client} approvals={approvals} sectionRequest={sectionRequest} revision={revision} onRefresh={refresh}
+      receiptLedger={receipt?.runId === selected.id ? receipt.ledger : undefined} />}
   </section>;
 }
 
@@ -170,8 +197,9 @@ interface DeliveryState {
   unsupported: boolean;
 }
 
-function RunDetail({ run, client, revision, onRefresh, sectionRequest }: {
-  run: SwarmRunRecord; client: AgentBackendClient; revision: number; onRefresh: () => void; sectionRequest?: { section: SwarmSection };
+function RunDetail({ run, client, approvals, revision, onRefresh, sectionRequest, receiptLedger }: {
+  run: SwarmRunRecord; client: AgentBackendClient; approvals: Approval[]; revision: number; onRefresh: () => void; sectionRequest?: { section: SwarmSection };
+  receiptLedger?: SwarmBudgetSnapshot | null;
 }) {
   const [tab, setTab] = useState<{ request?: { section: SwarmSection }; section: PanelSection }>();
   const section: PanelSection = tab && tab.request === sectionRequest ? tab.section : sectionRequest?.section ?? 'plan';
@@ -188,6 +216,10 @@ function RunDetail({ run, client, revision, onRefresh, sectionRequest }: {
   const current = updated && updated.updatedAt >= run.updatedAt ? updated : run;
   const active = isActive(current);
   const completed = current.nodes.filter((node) => node.status === 'completed').length;
+  const nodesBySession = new Map(current.nodes.flatMap((node) => node.childSessionId ? [[node.childSessionId, node] as const] : []));
+  const pendingApprovals = approvals.filter((approval) =>
+    approval.status === 'pending' && approval.taskId && nodesBySession.has(approval.taskId),
+  );
   const runRevisionKey = `${current.id}:${revision}`;
   const reloadDelivery = useCallback(() => setDeliveryRevision((value) => value + 1), []);
 
@@ -234,6 +266,14 @@ function RunDetail({ run, client, revision, onRefresh, sectionRequest }: {
   }, [client, current.id, current.updatedAt, section, active, revision, deliveryRevision, unsupportedTarget, runRevisionKey]);
 
   const telemetry = extractSwarmTelemetry(current, deliveryState.data);
+  const delivery = deliveryState.data?.runId === current.id ? deliveryState.data : undefined;
+  const planReason = current.plan?.metadata?.teamRationale;
+  const deliveryReason = delivery?.planVersion === undefined || current.planVersion === undefined || delivery.planVersion >= current.planVersion
+    ? delivery?.teamRationale : undefined;
+  const teamRationale = deliveryReason || (typeof planReason === 'string' && planReason.trim());
+  const ledger = [delivery?.budgetLedger, receiptLedger]
+    .filter((snapshot): snapshot is SwarmBudgetSnapshot => Boolean(snapshot && (!snapshot.treeId || snapshot.treeId === current.id)))
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0];
   const effectiveVerdict = current.verdict ?? deliveryState.data?.verdict ?? null;
   const reviewerVerdicts = collectSwarmReviewerVerdicts(current, deliveryState.data);
 
@@ -259,9 +299,15 @@ function RunDetail({ run, client, revision, onRefresh, sectionRequest }: {
     <header className="autonomous-summary">
       <div className="swarm-run-meta">
         <RunStatus value={current.status} />
-        <span className="swarm-plan-version"><IconBranch size={13} aria-hidden="true" />计划 v{current.planVersion ?? 1}</span>
+        {current.planVersion != null && <span className="swarm-plan-version"><IconBranch size={13} aria-hidden="true" />计划 v{current.planVersion}</span>}
       </div>
       <h2>{current.goal}</h2>
+      {teamRationale && <p><strong>单成员原因</strong> · {teamRationale}</p>}
+      {ledger ? <div className="swarm-dependencies" aria-label="预算快照">
+        <small>步骤预留 <code>{budgetValue(ledger.reservedSteps)}</code> · 剩余 <code>{budgetValue(ledger.remainingSteps)}</code></small>
+        <small>Token 预留 <code>{budgetValue(ledger.reservedTokens)}</code> · 剩余 <code>{budgetValue(ledger.remainingTokens)}</code></small>
+        {ledger.updatedAt != null && <small>预算更新于 {when(ledger.updatedAt)}</small>}
+      </div> : <p><small>暂无预算快照</small></p>}
       {current.nodes.length > 0 && <div className="swarm-progress">
         <progress aria-label="节点完成进度" value={completed} max={current.nodes.length} />
         <small>{completed}/{current.nodes.length} 节点完成</small>
@@ -294,6 +340,14 @@ function RunDetail({ run, client, revision, onRefresh, sectionRequest }: {
           <ReviewerVerdictList verdicts={reviewerVerdicts} />
         </div>
       </details> : !active && <p><small>无验收记录</small></p>}
+      {pendingApprovals.length > 0 && <div aria-label="Swarm 待审批">
+        <a href="#/settings/approvals">处理 {pendingApprovals.length} 条待审批操作</a>
+        <ul>
+          {pendingApprovals.map((approval) => <li key={approval.id}>
+            {nodesBySession.get(approval.taskId!)?.nodeKey} · {approval.kind === 'reconciliation' ? '结果核对' : approval.tool}
+          </li>)}
+        </ul>
+      </div>}
       {current.errorCode && <p className="autonomous-error">{current.errorMessage || current.errorCode}</p>}
       <div className="autonomous-toolbar">
         {active && client.cancelSwarmRun && <Button onClick={() => void change('cancel')} disabled={pending}><IconStopSquare size={11} />取消任务</Button>}

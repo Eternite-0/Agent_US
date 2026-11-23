@@ -26,7 +26,7 @@ export async function analyzeWorkspaceRepository(
   try {
     const mod = await loadRepoIntelligence();
     if (typeof mod?.analyzeRepository !== 'function') return null;
-    return await mod.analyzeRepository(workspaceRoot, { issueText, maxBytes, maxFiles });
+    return await mod.analyzeRepository(workspaceRoot, { issueText, maxBytes, maxFiles, progressive: true });
   } catch {
     return null;
   }
@@ -336,12 +336,14 @@ export class DynamicTaskPlanner {
         detail: { treeId, scope: BUDGET_SCOPES.PLANNING },
       });
     }
+    signal?.throwIfAborted();
     const effectiveAnalysis =
       repoContext && typeof repoContext === 'object'
         ? repoContext
         : workspaceRoot
           ? await analyzeWorkspaceRepository(workspaceRoot, { issueText: goal, maxBytes: 12000 })
           : null;
+    signal?.throwIfAborted();
     const effectiveSummary = formatRepoContextForPlanner(effectiveAnalysis, workspaceSummary);
     const compactRepoContext = toCompactRepoContext(effectiveAnalysis);
 
@@ -367,6 +369,7 @@ export class DynamicTaskPlanner {
               text:
                 'Decompose the engineering goal into an acyclic JSON DAG: ' +
                 '{"nodes":[{"nodeKey":"branch-a","taskType":"implementation","roleTitle":"API Specialist","focus":"...","ownedPaths":["src/api.js"],"objective":"...","acceptance":"...","dependencies":[],"isolatedWorktree":true,"priority":20}]}. ' +
+                'For one straightforward task with a single acceptance check, use one worker and explain why in a top-level teamRationale string. ' +
                 'Ground every node in the repository intelligence (entryPoints, relevantFiles, callGraph, discoveredTestCommands, discoveredBuildCommands). ' +
                 'When independent modules/files can be built or fixed concurrently, emit multiple parallel "implementation" nodes with disjoint ownedPaths, specialized roleTitle/focus, shared or empty dependencies, and isolatedWorktree:true (no fixed team size limit; scale appropriately within maxNodes). ' +
                 'Any test-authoring node whose tests import or execute newly added runtime APIs MUST list the corresponding implementation node(s) in dependencies so its isolated worktree receives those changes via artifact overlay (while independent modules like core code and TypeScript typings stay parallel). ' +
@@ -413,6 +416,7 @@ export class DynamicTaskPlanner {
             usage.outputTokens += Number(chunk.usage.outputTokens ?? 0);
           }
         }
+        signal?.throwIfAborted();
         if (reservation?.reservationId) {
           budgetLedger.settleReservation(reservation.reservationId, {
             status: 'settled',
@@ -427,14 +431,13 @@ export class DynamicTaskPlanner {
         if (Array.isArray(rawList) && rawList.length > 0 && rawList.every((x) => x?.objective)) {
           const normalized = this.normalizeNodes(rawList.slice(0, maxNodes));
           this.validateDag(normalized);
-          return attachRepoContext(
-      this.#applyAdaptiveBudgets(normalized, {
-        budget,
-        store,
-        model: picked,
-        repoContext: compactRepoContext,
-      }),
-    );
+          const nodes = attachRepoContext(this.#applyAdaptiveBudgets(normalized, {
+            budget, store, model: picked, repoContext: compactRepoContext,
+          }));
+          if (nodes.length === 1 && typeof parsed.teamRationale === 'string') {
+            nodes.teamRationale = parsed.teamRationale.trim().slice(0, 500);
+          }
+          return nodes;
         }
       } catch (err) {
         if (reservation?.reservationId) {
@@ -445,22 +448,25 @@ export class DynamicTaskPlanner {
               actualInputTokens: usage.inputTokens,
               actualOutputTokens: usage.outputTokens,
               errorCode: err?.code || 'PLANNING_FAILED',
-              leaseGuard: err?.code === 'LEASE_LOST' ? null : leaseGuard,
+              leaseGuard,
             });
           } catch {
             // do not mask LEASE_LOST or primary error
           }
         }
-        if (err?.code === 'LEASE_LOST' || err instanceof BudgetError || err?.category === 'budget') {
+        signal?.throwIfAborted();
+        if (err?.category === 'cancellation' || err?.code === 'LEASE_LOST' || err instanceof BudgetError || err?.category === 'budget') {
           throw err;
         }
         // Fall through to deterministic heuristic decomposition
       }
     }
 
-    const isMutating = /implement|edit|write|fix|refactor|create|实现|重构|修改|新增|修复/i.test(
-      goal,
-    );
+    const readOnly = /(?:只读|不要改动|do not (?:modify|edit)|read[- ]only)/i.test(goal);
+    const isMutating = !readOnly && /\b(?:implement|edit|write|fix|refactor|create|add|append|update|replace|rename|remove|delete|change|set)\b|实现|重构|修改|新增|修复|添加|追加|更新|替换|改为|改成|重命名|删除|写入|新建|创建|补充/i.test(goal);
+    const singleFileEdit = isMutating && /(?:\b[\w.-]+\.(?:md|txt|json|ya?ml|toml)\b|README\b)/i.test(goal)
+      && !/\band\b|同时|并且|多个|集成|重构|refactor|migrat/i.test(goal)
+      && (String(goal).match(/\b[\w.-]+\.(?:md|txt|json|ya?ml|toml)\b/gi) ?? []).length <= 1;
     const testHint = compactRepoContext?.testCommands?.length
       ? `（优先运行已发现命令：${compactRepoContext.testCommands.join(' ; ')}）`
       : '';
@@ -521,7 +527,15 @@ export class DynamicTaskPlanner {
             priority: 5,
           },
         ];
-    const normalized = this.normalizeNodes(fallback);
+    // A narrow location lookup has one independently checkable deliverable.
+    const lookup = !isMutating && /^(?:where (?:is|are)\b|locate\b|在哪|查找.{0,20}位置)/i.test(String(goal).trim())
+      && !/\band\b|review|audit|compare|比较|审查|并且/i.test(goal);
+    const nodes = singleFileEdit ? [{
+      nodeKey: 'edit', taskType: 'implementation', objective: goal,
+      acceptance: 'Verify the requested edit against the resulting file and report the change.',
+      isolatedWorktree: true, allowIsolationFallback: false, dependencies: [],
+    }] : lookup ? fallback.slice(0, 1) : fallback;
+    const normalized = this.normalizeNodes(nodes);
     this.validateDag(normalized);
     return attachRepoContext(
       this.#applyAdaptiveBudgets(normalized, {

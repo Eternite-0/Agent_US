@@ -1,3 +1,4 @@
+import { groupDirectMessages } from '../utils/directMessages';
 import type { CommandAvailability, MentionExtension, SlashCommand } from './slashCommands';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
@@ -125,6 +126,7 @@ function extractConciseClosing(raw: string): { shortText: string; isTruncated: b
 
 interface ThreadViewProps {
   bundles: TaskBundle[];
+  onOpenSwarmRun?: (sessionId: string, runId: string) => void;
   loading: boolean;
   focusWorkerId?: string;
   liveStreams?: Record<string, { text: string; reasoning: string }>;
@@ -195,6 +197,7 @@ interface SelectionOverlay {
 
 export const ThreadView: React.FC<ThreadViewProps> = ({
   bundles,
+  onOpenSwarmRun,
   loading,
   focusWorkerId,
   liveStreams = {},
@@ -364,52 +367,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
 
       const isDirectSession = sessions[0]?.assignmentId === 'direct';
       const liveStream = liveStreams[task.id] ?? null;
-      const directExchanges: Array<{
-        key: string;
-        userText: string;
-        assistantTexts: Array<{ id: string; text: string; reasoning?: string }>;
-        tools: Array<{ id: string; name: string; output?: string; isError?: boolean }>;
-      }> = [];
-      if (isDirectSession) {
-        const items = histories[task.id] ?? [];
-        for (const item of items) {
-          if (item.type === 'user/message') {
-            directExchanges.push({
-              key: `${task.id}-ex-${item.cursor}`,
-              userText: item.text ?? '',
-              assistantTexts: [],
-              tools: [],
-            });
-          } else {
-            const cur =
-              directExchanges.at(-1) ??
-              (() => {
-                const fallback = {
-                  key: `${task.id}-ex-0`,
-                  userText: task.input,
-                  assistantTexts: [] as Array<{ id: string; text: string; reasoning?: string }>,
-                  tools: [] as Array<{ id: string; name: string; output?: string; isError?: boolean }>,
-                };
-                directExchanges.push(fallback);
-                return fallback;
-              })();
-            if (item.type === 'assistant/message' && (item.text?.trim() || item.reasoning?.trim())) {
-              cur.assistantTexts.push({
-                id: `${task.id}-m-${item.cursor}`,
-                text: item.text ?? '',
-                reasoning: item.reasoning,
-              });
-            } else if (item.type === 'tool/result') {
-              cur.tools.push({
-                id: item.callId || `${task.id}-t-${item.cursor}`,
-                name: item.name || 'tool',
-                output: item.text,
-                isError: Boolean(item.meta?.isError),
-              });
-            }
-          }
-        }
-      }
+      const directExchanges = groupDirectMessages(task.id, task.input, isDirectSession ? histories[task.id] ?? [] : []);
 
       const assistantBlocks: Array<{ id: string; title?: string; text: string }> = [];
       // Only show the final assistant prose once the turn completes (or when scoped to a worker),
@@ -1285,7 +1243,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
               const exchanges =
                 directExchanges.length > 0
                   ? directExchanges
-                  : [{ key: `${tid}-init`, userText: task.input, assistantTexts: [], tools: [] }];
+                  : [{ key: `${tid}-init`, userText: task.input, command: false, swarmRunId: undefined, assistantTexts: [], tools: [] }];
+              const liveExchangeIndex = exchanges.findLastIndex((exchange) => !exchange.command);
               return (
                 <React.Fragment key={tid}>
                   {showDateSep && <div className="codex-date-sep">{dateLabel}</div>}
@@ -1320,8 +1279,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       );
                     })()}
                     {exchanges.map((ex, exIdx) => {
-                      const isLastExchange = exIdx === exchanges.length - 1;
-                      const showLiveStream = isLastExchange && isLive && Boolean(liveStream?.text || liveStream?.reasoning);
+                      const showLiveStream = exIdx === liveExchangeIndex && isLive && Boolean(liveStream?.text || liveStream?.reasoning);
                       return (
                         <div key={ex.key} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                           {ex.userText && (
@@ -1329,6 +1287,14 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                               <div className="codex-user-bubble">
                                 <div className="codex-user-bubble-text">{ex.userText}</div>
                               </div>
+                            </div>
+                          )}
+
+                          {ex.swarmRunId && onOpenSwarmRun && (
+                            <div className="codex-assistant-turn">
+                              <button type="button" className="codex-select" onClick={() => onOpenSwarmRun(tid, ex.swarmRunId!)}>
+                                <IconAgentTeam size={14} aria-hidden="true" /> 查看 Swarm 进度
+                              </button>
                             </div>
                           )}
 

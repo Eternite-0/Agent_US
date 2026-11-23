@@ -152,6 +152,12 @@ export class DurableJobQueue {
         }
       }
       const now = Date.now();
+      // A post-commit swarm event can synchronously cancel the run before a
+      // handler enqueues its successor. Serialize admission with cancellation.
+      if (taskId && kind.startsWith('swarm_')) {
+        const run = this.store.db.prepare('SELECT status FROM swarm_runs WHERE id=?').get(taskId);
+        if (run && ['completed', 'failed', 'cancelled'].includes(run.status)) return null;
+      }
       const jobId = uuid();
       this.store.db
         .prepare(
@@ -183,7 +189,8 @@ export class DurableJobQueue {
         deduplicated: false,
       };
     });
-    if (job?.deduplicated) {
+    if (!job) return null;
+    if (job.deduplicated) {
       this.metrics?.record?.('job_idem_dedup', {
         jobId: job.id,
         sessionId: job.sessionId ?? sessionId,
