@@ -10,6 +10,10 @@ import {
   STUCK_PATTERNS,
 } from './execution-reasoning.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
+import {
+  evaluateContractReadiness,
+  extractTaskContract,
+} from './contract-reasoning.js';
 import { resolveTurnOutcome } from './verdict.js';
 import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
 import {
@@ -49,6 +53,7 @@ export class DecisionEngine {
     turnId = null,
     workspaceRoot = null,
     reasoningState = null,
+    contractReadiness = null,
     signal,
   }) {
     if (
@@ -105,7 +110,7 @@ export class DecisionEngine {
             note: !node && !execution?.evidenceContract &&
               verdict.reasons?.length === 1 && verdict.reasons[0].startsWith('FABRICATED_PASS_CLAIM:')
               ? `[验证未通过] ${verdict.reasons[0]}\n完成后用自然语言如实汇报执行过的验证和结果。`
-              : buildRepairNote(verdict, { reasoningState }),
+              : buildRepairNote(verdict, { reasoningState, contractReadiness }),
           };
         }
         return { action: 'fail', verdict };
@@ -313,7 +318,29 @@ export class AgentLoop {
     const verificationReserve = normalizeBudgetLimit(budget.finalVerificationReserve) ?? 0;
     const verifierEvents = [];
     const argStrikes = new Map();
-    const reasoningTracker = new ExecutionReasoningTracker({ workspaceRoot });
+    const reasoningTracker = new ExecutionReasoningTracker({
+      workspaceRoot,
+      baselineTestFiles: execution?.baselineTestFiles ?? node?.baselineTestFiles ?? null,
+    });
+    let taskContract = null;
+    let lastContractFilesReadCount = -1;
+    let lastContractReadiness = null;
+    const refreshContractReadiness = () => {
+      if (!workspaceRoot) return null;
+      const filesRead = reasoningTracker.filesRead;
+      if (!taskContract || filesRead.length !== lastContractFilesReadCount) {
+        taskContract = extractTaskContract({ prompt: input, workspaceRoot, filesRead });
+        lastContractFilesReadCount = filesRead.length;
+      }
+      lastContractReadiness = evaluateContractReadiness({
+        contract: taskContract,
+        reasoningState: reasoningTracker.getState(),
+        workspaceRoot,
+        verifierEvents,
+      });
+      reasoningTracker.updateContractEvaluation(lastContractReadiness);
+      return lastContractReadiness;
+    };
 
     let steps = Number(initialStep || 0);
     let executedStepsThisTurn = 0;
@@ -326,6 +353,9 @@ export class AgentLoop {
     let repairRound = 0;
     let monologueWarned = false;
     let policyBlockWarned = false;
+    const nonFatalPatternsWarned = new Set();
+    let contractPreEditWarned = false;
+    let contractCompletionChecked = false;
     let finalAssistantText = '';
     let finalVerdict = null;
     let stopReason = 'completed';
@@ -412,10 +442,15 @@ export class AgentLoop {
                 tools: getModelTools ? getModelTools() : tools,
               })
             : 0;
+        const finalManifestReserve = currentStepEstimatedIn + 1800;
         const estTurnCost = Math.max(4000, currentStepEstimatedIn + 1500);
         const approxTurnsLeft =
           remainingTokens !== null ? Math.max(0, Math.floor(remainingTokens / estTurnCost)) : null;
         const hasUnverifiedMutations = reasoningTracker.hasUnverifiedMutationsAfterLastPass;
+        const tier2Threshold = Math.max(
+          Math.floor(currentStepEstimatedIn * 2.15) + 1500,
+          currentStepEstimatedIn + finalManifestReserve,
+        );
 
         if (
           !budgetFinalCallAdvised &&
@@ -424,7 +459,7 @@ export class AgentLoop {
           steps >= 4 &&
           !advisedReserveThisStep &&
           remainingTokens > currentStepEstimatedIn &&
-          remainingTokens <= Math.floor(currentStepEstimatedIn * 2.15) + 1500
+          remainingTokens <= tier2Threshold
         ) {
           budgetFinalCallAdvised = true;
           budgetReserveAdvised = true;
@@ -577,8 +612,28 @@ export class AgentLoop {
           if (!emergency?.stage || emergency.stage === 'none') {
             return false;
           }
-          const nextOpts = emergency.options;
-          const nextEstimated = estimateRequestInputTokens(nextOpts);
+          let nextOpts = emergency.options;
+          let nextEstimated = estimateRequestInputTokens(nextOpts);
+          if (nextEstimated >= budgetRemaining && budgetRemaining > 2000) {
+            try {
+              const tight = await compactTwoStage(requestOptions, {
+                contextWindow: Math.max(1024, budgetRemaining - 1800),
+                reserveTokens: 256,
+                keepRecentTokens: 512,
+                summarize: null,
+              });
+              if (tight?.stage && tight.stage !== 'none') {
+                const tightEst = estimateRequestInputTokens(tight.options);
+                if (tightEst < nextEstimated) {
+                  emergency = tight;
+                  nextOpts = tight.options;
+                  nextEstimated = tightEst;
+                }
+              }
+            } catch {
+              // ignore fallback prune failure
+            }
+          }
           if (nextEstimated >= estimatedInputTokens) {
             return false;
           }
@@ -848,6 +903,7 @@ export class AgentLoop {
           });
 
           sm.transition(TURN_PHASES.VERIFYING, { step: steps, persist: profile?.persistTurn !== false });
+          refreshContractReadiness();
           const decision = await this.decisionEngine.shouldContinueOnIdle({
             input,
             stepText: stepResult.text,
@@ -863,6 +919,7 @@ export class AgentLoop {
             turnId,
             workspaceRoot,
             reasoningState: reasoningTracker.getState(),
+            contractReadiness: lastContractReadiness,
             signal,
           });
 
@@ -949,6 +1006,37 @@ export class AgentLoop {
             stopReason = 'verification_failed';
             idleDecisionAction = 'fail';
             break;
+          }
+          if (
+            hadToolCalls &&
+            !contractCompletionChecked &&
+            steps < maxSteps &&
+            !budgetReserveAdvised &&
+            !budgetFinalCallAdvised &&
+            (remainingTokens === null || remainingTokens > finalManifestReserve + estTurnCost) &&
+            lastContractReadiness?.evaluated &&
+            !lastContractReadiness.ready
+          ) {
+            const actionableGaps = lastContractReadiness.gaps.filter(
+              (g) =>
+                g.kind === 'forbidden_mutation' ||
+                g.kind === 'invalid_json' ||
+                g.kind === 'missing_exports' ||
+                (g.kind === 'missing_deliverables' && reasoningTracker.filesMutated.length > 0),
+            );
+            if (actionableGaps.length > 0) {
+              contractCompletionChecked = true;
+              messages.push({
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: `${lastContractReadiness.checklistText}\n请仅补齐上述明确缺失的契约交付项并确认验证通过后输出最终回复。`,
+                  },
+                ],
+              });
+              continue;
+            }
           }
           if (decision.verdict) {
             finalVerdict = decision.verdict;
@@ -1075,10 +1163,31 @@ export class AgentLoop {
           },
         });
 
+        refreshContractReadiness();
+        if (
+          !contractPreEditWarned &&
+          !budgetReserveAdvised &&
+          !budgetFinalCallAdvised &&
+          (remainingTokens === null || remainingTokens > finalManifestReserve + estTurnCost) &&
+          lastContractReadiness?.preEditWarningText
+        ) {
+          contractPreEditWarned = true;
+          messages.push({
+            role: 'user',
+            content: [{ type: 'text', text: lastContractReadiness.preEditWarningText }],
+          });
+        }
+
         if (detectedThrashing) {
-          if (batchTrigger?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
-            if (!policyBlockWarned) {
-              policyBlockWarned = true;
+          const isNonFatalPattern =
+            batchTrigger?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP ||
+            batchTrigger?.pattern === STUCK_PATTERNS.SELF_TEST_CALIBRATION;
+          if (isNonFatalPattern) {
+            if (!nonFatalPatternsWarned.has(batchTrigger.pattern)) {
+              nonFatalPatternsWarned.add(batchTrigger.pattern);
+              if (batchTrigger.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
+                policyBlockWarned = true;
+              }
               const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(batchTrigger);
               this.eventRouter.emitPersisted({
                 sessionId,
@@ -1094,12 +1203,7 @@ export class AgentLoop {
               });
               messages.push({
                 role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: steeringText,
-                  },
-                ],
+                content: [{ type: 'text', text: steeringText }],
               });
             }
           } else if (

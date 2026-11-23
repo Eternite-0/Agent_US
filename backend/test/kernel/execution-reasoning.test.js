@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmDirSafe } from '../fixtures.js';
@@ -12,8 +12,13 @@ import { DecisionEngine } from '../../src/kernel/agent-loop.js';
 import {
   ExecutionReasoningTracker,
   STUCK_PATTERNS,
+  classifyMutationPath,
   extractFailureFingerprint,
 } from '../../src/kernel/execution-reasoning.js';
+import {
+  evaluateContractReadiness,
+  extractTaskContract,
+} from '../../src/kernel/contract-reasoning.js';
 import { EvidenceVerifier } from '../../src/governance/verifier.js';
 import { buildRepairNote, decideRepair } from '../../src/verifier.js';
 import { ToolDispatcher } from '../../src/tools/dispatcher.js';
@@ -1355,4 +1360,280 @@ test('AgentLoop triggers early ~26%/38k budget wrap-up with telemetry, saves nea
       }),
     (err) => err instanceof BudgetError && err.code === 'TOKEN_BUDGET' && err.reasoningMetrics?.budgetReserveAdvised === false,
   );
+});
+
+test('Wave 2: doc-only post-pass exemption (ar-05 SECURITY.md) avoids STALE_VERIFICATION_AFTER_EDIT loop', (t) => {
+  const { workDir, store } = createTempEnv(t);
+  writeFileSync(join(workDir, 'src-fix.js'), 'export const safe = true;\n', 'utf8');
+  writeFileSync(join(workDir, 'SECURITY.md'), '# Security\ninitial\n', 'utf8');
+
+  assert.equal(classifyMutationPath('SECURITY.md'), 'doc');
+  assert.equal(classifyMutationPath('docs/notes.txt'), 'doc');
+  assert.equal(classifyMutationPath('LICENSE'), 'doc');
+  assert.equal(classifyMutationPath('.gitignore'), 'doc');
+  assert.equal(classifyMutationPath('src/app.js'), 'src');
+  assert.equal(
+    classifyMutationPath('test/baseline.test.js', { baselineTestFiles: ['test/baseline.test.js'] }),
+    'baseline_test',
+  );
+  assert.equal(
+    classifyMutationPath('test/recovery.test.js', { baselineTestFiles: ['test/baseline.test.js'] }),
+    'self_test',
+  );
+
+  const tracker = new ExecutionReasoningTracker({ workspaceRoot: workDir });
+  tracker.recordToolResult({
+    tc: { id: 'e1', name: 'edit_file', arguments: JSON.stringify({ path: 'src-fix.js', target: 'true', replacement: 'true' }) },
+    output: 'edited src-fix.js',
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 1,
+  });
+  assert.equal(tracker.hasUnverifiedMutationsAfterLastPass, true);
+
+  tracker.recordToolResult({
+    tc: { id: 'v1', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/sec.test.js' }) },
+    output: 'pass 4\nfail 0',
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 2,
+  });
+  assert.equal(tracker.hasUnverifiedMutationsAfterLastPass, false);
+
+  tracker.recordToolResult({
+    tc: { id: 'd1', name: 'write_file', arguments: JSON.stringify({ path: 'SECURITY.md', content: '# Updated Security Policy\n' }) },
+    output: 'wrote SECURITY.md',
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 3,
+  });
+  assert.equal(tracker.hasUnverifiedMutationsAfterLastPass, false);
+  const state = tracker.getState();
+  assert.deepEqual(state.mutationBreakdown.doc, ['SECURITY.md']);
+  assert.deepEqual(state.mutationBreakdown.src, ['src-fix.js']);
+  assert.equal(state.mutationBreakdown.postPassDocOnly, true);
+
+  const verifier = new EvidenceVerifier({ store });
+  const verdict = verifier.verify({
+    workspaceRoot: workDir,
+    text: 'All security fixes verified.',
+    reasoningState: state,
+    events: [
+      { type: 'tool/call', data: { callId: 'e1', name: 'edit_file', arguments: { path: 'src-fix.js' } } },
+      { type: 'tool/result', data: { callId: 'e1', name: 'edit_file', isError: false, receipt: { callId: 'e1', toolName: 'edit_file', status: 'finished', exitCode: 0 } } },
+      { type: 'tool/call', data: { callId: 'v1', name: 'bash', arguments: { command: 'node --test test/sec.test.js' } } },
+      { type: 'tool/result', data: { callId: 'v1', name: 'bash', isError: false, receipt: { callId: 'v1', toolName: 'bash', status: 'finished', exitCode: 0 } } },
+      { type: 'tool/call', data: { callId: 'd1', name: 'write_file', arguments: { path: 'SECURITY.md' } } },
+      { type: 'tool/result', data: { callId: 'd1', name: 'write_file', isError: false, receipt: { callId: 'd1', toolName: 'write_file', status: 'finished', exitCode: 0 } } },
+    ],
+  });
+  assert.equal(verdict.accepted, true);
+  assert.equal(verdict.checks.staleVerificationAfterEdit, false);
+  assert.deepEqual(verdict.checks.mutatedFilesAfterVerification, []);
+  assert.deepEqual(verdict.checks.mutatedDocFilesAfterVerification, ['SECURITY.md']);
+});
+
+test('Wave 2: self-authored test calibration tolerance (ar-08) steers cleanly before eventual safety break', async (t) => {
+  const { workDir, store } = createTempEnv(t);
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  mkdirSync(join(workDir, 'test'), { recursive: true });
+  writeFileSync(join(workDir, 'src', 'checkpoint.js'), 'export function loadCheckpoint() { return null; }\n', 'utf8');
+  writeFileSync(join(workDir, 'test', 'baseline.test.js'), "import test from 'node:test'; test('base', () => {});\n", 'utf8');
+
+  let stepCall = 0;
+  let sawCalibrationSteer = false;
+  const kernel = new AgentRuntimeKernel({
+    store,
+    adapter: {
+      async *stream({ messages }) {
+        stepCall += 1;
+        const userText = messages
+          .filter((m) => m.role === 'user')
+          .flatMap((m) => m.content ?? [])
+          .map((b) => b.text ?? '')
+          .join('\n');
+
+        if (stepCall === 1) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-w2-src', name: 'edit_file', arguments: JSON.stringify({ path: 'src/checkpoint.js', target: 'return null;', replacement: 'return null;' }) },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 2) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-w2-base', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/baseline.test.js' }) },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 3 || stepCall === 5) {
+          yield {
+            type: 'block-end',
+            block: {
+              type: 'tool-call',
+              id: `tc-w2-st-${stepCall}`,
+              name: 'write_file',
+              arguments: JSON.stringify({ path: 'test/recovery.test.js', content: `// attempt ${stepCall}\nassert.deepEqual([], null);\n` }),
+            },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 4 || stepCall === 6) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: `tc-w2-run-${stepCall}`, name: 'bash', arguments: JSON.stringify({ command: 'node --test test/recovery.test.js' }) },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 7) {
+          assert.match(userText, /\[自建测试校准提示\]/);
+          sawCalibrationSteer = true;
+          yield {
+            type: 'block-end',
+            block: {
+              type: 'tool-call',
+              id: 'tc-w2-st-fix',
+              name: 'write_file',
+              arguments: JSON.stringify({ path: 'test/recovery.test.js', content: '// calibrated\nassert.equal(loadCheckpoint(), null);\n' }),
+            },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 8) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-w2-run-pass', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/recovery.test.js' }) },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        yield { type: 'text-delta', text: 'Calibrated self-authored test and passed.' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    },
+    toolDispatcher: new ToolDispatcher({}),
+  });
+  t.after(() => kernel.close());
+
+  let selfTestFailMode = true;
+  const tools = createWorkspaceTools({
+    workspaceRoot: workDir,
+    store,
+    permissionMode: 'full-access',
+    sandbox: {
+      async run(command) {
+        const cmd = String(command ?? '');
+        if (cmd.includes('baseline.test.js')) return { exitCode: 0, stdout: 'pass 1\nfail 0', stderr: '' };
+        if (selfTestFailMode && stepCall <= 6) {
+          return { exitCode: 1, stdout: '', stderr: 'AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ []\n- null\n    at test/recovery.test.js:2:1' };
+        }
+        return { exitCode: 0, stdout: 'pass 1\nfail 0', stderr: '' };
+      },
+    },
+  });
+
+  const res = await kernel.executeTurn({
+    sessionId: 'sess-w2-ar08',
+    turnId: 'turn-w2-ar08',
+    profile: { id: 'default', defaultMaxSteps: 12, streamDeltas: false, emitAssistantMessage: false, emitToolEvents: false, persistTurn: false },
+    input: 'Fix src/checkpoint.js and add test/recovery.test.js without modifying test/baseline.test.js',
+    model: 'mock',
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'STATIC_SYS_W2' }] },
+      { role: 'user', content: [{ type: 'text', text: 'Fix src/checkpoint.js and add test/recovery.test.js' }] },
+    ],
+    tools,
+  });
+
+  assert.equal(res.status, 'completed');
+  assert.equal(sawCalibrationSteer, true);
+  assert.equal(res.reasoningMetrics.thrashWarned, false);
+  assert.equal(res.reasoningMetrics.circuitBroken, false);
+  assert.ok(res.reasoningMetrics.stuckDetections.some((d) => d.pattern === STUCK_PATTERNS.SELF_TEST_CALIBRATION));
+});
+
+test('Wave 2: ContractReasoningEngine extracts constraints, checks readiness, and Root-Cause Ledger records disappearance', (t) => {
+  const { workDir } = createTempEnv(t);
+  mkdirSync(join(workDir, 'src', 'modules'), { recursive: true });
+  mkdirSync(join(workDir, 'handoff'), { recursive: true });
+  writeFileSync(join(workDir, 'package.json'), JSON.stringify({ name: 'demo', type: 'module', scripts: { test: 'node --test' } }), 'utf8');
+  writeFileSync(join(workDir, 'src', 'modules', 'tokenizer.js'), 'export function wrongName() { return []; }\n', 'utf8');
+  writeFileSync(join(workDir, 'handoff', 'artifacts.json'), '{bad json', 'utf8');
+
+  const prompt = [
+    'Implement `tokenize(expr)` in src/modules/tokenizer.js, emit `handoff/artifacts.json` (`schemaVersion`, `artifacts`) and `handoff/digest.txt` without modifying `test/collab-baseline.test.js`.',
+    'Support division by zero checks and run `node --test test/collab.test.js`.',
+  ].join('\n');
+
+  const contract = extractTaskContract({
+    prompt,
+    workspaceRoot: workDir,
+    filesRead: ['package.json', 'src/modules/tokenizer.js'],
+  });
+  assert.equal(contract.packageMeta?.type, 'module');
+  assert.ok(contract.requiredFiles.includes('src/modules/tokenizer.js'));
+  assert.ok(contract.requiredFiles.includes('handoff/artifacts.json'));
+  assert.ok(contract.requiredFiles.includes('handoff/digest.txt'));
+  assert.ok(contract.forbiddenMutations.includes('test/collab-baseline.test.js'));
+  assert.ok(contract.expectedCommands.includes('node --test test/collab.test.js'));
+  assert.ok(contract.requestedSymbols.some((s) => s.name === 'tokenize' && s.fileHint === 'src/modules/tokenizer.js'));
+  assert.ok(contract.edgeCaseKeywords.includes('division_by_zero'));
+
+  const readiness = evaluateContractReadiness({
+    contract,
+    workspaceRoot: workDir,
+    verifierEvents: [{ type: 'tool/result', data: {} }],
+    reasoningState: {
+      filesRead: ['package.json', 'src/modules/tokenizer.js'],
+      filesMutated: ['src/modules/tokenizer.js', 'test/collab-baseline.test.js'],
+      hasUnverifiedMutationsAfterLastPass: false,
+    },
+  });
+  assert.equal(readiness.ready, false);
+  assert.ok(readiness.missingDeliverables.includes('handoff/digest.txt'));
+  assert.ok(readiness.invalidJsonFiles.includes('handoff/artifacts.json'));
+  assert.ok(readiness.missingExportedSymbols.includes('src/modules/tokenizer.js#tokenize'));
+  assert.ok(readiness.forbiddenViolations.includes('test/collab-baseline.test.js'));
+  assert.match(readiness.checklistText, /\[契约与根因核对\]/);
+
+  // Root-Cause Verification ledger: pre-edit failure disappears after code edit + green pass
+  const tracker = new ExecutionReasoningTracker({ workspaceRoot: workDir });
+  tracker.recordToolResult({
+    tc: { id: 'r1', name: 'read_file', arguments: JSON.stringify({ path: 'src/modules/tokenizer.js' }) },
+    output: 'export function wrongName() {}',
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 1,
+  });
+  tracker.recordToolResult({
+    tc: { id: 'f1', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/collab.test.js' }) },
+    output: 'TypeError: tokenize is not a function at test/collab.test.js:4:3',
+    isError: true,
+    receipt: { status: 'failed', exitCode: 1 },
+    step: 2,
+  });
+  assert.equal(tracker.getState().rootCauseVerified, false);
+  assert.equal(tracker.getState().reproductionEvidence.length, 1);
+  assert.ok(tracker.getState().rootCauseLedger.symptom);
+
+  tracker.recordToolResult({
+    tc: { id: 'm1', name: 'write_file', arguments: JSON.stringify({ path: 'src/modules/tokenizer.js', content: 'export function tokenize() { return []; }' }) },
+    output: 'wrote file',
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 3,
+  });
+  tracker.recordToolResult({
+    tc: { id: 'p1', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/collab.test.js' }) },
+    output: 'pass 1\nfail 0',
+    receipt: { status: 'finished', exitCode: 0 },
+    step: 4,
+  });
+  const metrics = tracker.getMetrics();
+  assert.equal(metrics.rootCauseVerifiedAfterEdit, true);
+  assert.equal(metrics.rootCauseVerified, true);
+  assert.deepEqual(metrics.rootCauseLedger.resolvedSignatures, metrics.rootCauseLedger.preEditFailureSignatures);
 });

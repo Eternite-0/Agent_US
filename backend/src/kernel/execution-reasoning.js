@@ -1,4 +1,5 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import { existsSync, readdirSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { sha256Hex } from '../integrity.js';
 import { computeArgsDigest } from '../tools/dispatcher.js';
 import { scanCommandSyntax } from '../tools/command-analyzer.js';
@@ -8,6 +9,7 @@ export const STUCK_PATTERNS = Object.freeze({
   PING_PONG: 'ping_pong',
   SAME_ERROR_STREAK: 'same_error_streak',
   EDIT_TEST_FAIL_LOOP: 'edit_test_fail_loop',
+  SELF_TEST_CALIBRATION: 'self_test_calibration',
   ASSISTANT_MONOLOGUE: 'assistant_monologue',
   POLICY_BLOCK_LOOP: 'policy_block_loop',
 });
@@ -16,6 +18,8 @@ export const READ_TOOLS = Object.freeze(
   new Set([
     'read_file',
     'read_blob',
+    'expand_context',
+    'compute_file_digest',
     'grep',
     'glob',
     'inspect_repository',
@@ -360,14 +364,84 @@ function normalizeAssistantMonologueText(text) {
     .trim();
 }
 
+const DOC_MUTATION_PATH_RE = /(?:^|\/)(?:[^/]+\.(?:md|txt)|license(?:\.[^/]*)?|\.gitignore)$/i;
+const TEST_MUTATION_PATH_RE =
+  /(?:^|\/)(?:tests?|__tests__)\/|\/?[^/]+\.(?:test|spec)\.[cm]?[jt]sx?$/i;
+
+/**
+ * Classifies a normalized workspace path into `doc`, `baseline_test`, `self_test`, or `src`.
+ */
+export function classifyMutationPath(
+  rawPath,
+  { workspaceRoot = null, baselineTestFiles = [], selfAuthoredTestFiles = [] } = {},
+) {
+  const norm = normalizeReasoningPath(rawPath, workspaceRoot) ?? String(rawPath ?? '').replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!norm) return 'src';
+  if (DOC_MUTATION_PATH_RE.test(norm)) return 'doc';
+  if (TEST_MUTATION_PATH_RE.test(norm)) {
+    const baselineSet =
+      baselineTestFiles instanceof Set ? baselineTestFiles : new Set(baselineTestFiles);
+    const selfSet =
+      selfAuthoredTestFiles instanceof Set ? selfAuthoredTestFiles : new Set(selfAuthoredTestFiles);
+    if (selfSet.has(norm)) return 'self_test';
+    if (baselineSet.has(norm)) return 'baseline_test';
+    return 'self_test';
+  }
+  return 'src';
+}
+
+function collectExistingTestPaths(workspaceRoot, maxEntries = 200) {
+  const found = new Set();
+  if (!workspaceRoot) return found;
+  const root = resolve(String(workspaceRoot));
+  if (!existsSync(root)) return found;
+  const skipDirs = new Set(['node_modules', '.git', 'upstream', 'var', 'dist', 'build', '.next']);
+  const stack = [''];
+  let visited = 0;
+  while (stack.length > 0 && visited < maxEntries) {
+    const relDir = stack.pop();
+    const absDir = relDir ? join(root, relDir) : root;
+    let entries;
+    try {
+      entries = readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (visited >= maxEntries) break;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (skipDirs.has(entry.name)) continue;
+        stack.push(relDir ? `${relDir}/${entry.name}` : entry.name);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      visited += 1;
+      const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+      if (TEST_MUTATION_PATH_RE.test(rel)) {
+        found.add(rel);
+      }
+    }
+  }
+  return found;
+}
+
 /**
  * Tracks execution reasoning state, multi-pattern stuck detection, normalized failure
  * fingerprints, falsified-attempt ledger, and live mutation-vs-verification evidence.
  */
 export class ExecutionReasoningTracker {
-  constructor({ workspaceRoot = null } = {}) {
+  constructor({ workspaceRoot = null, baselineTestFiles = null } = {}) {
     this.workspaceRoot = workspaceRoot;
     this.seq = 0;
+    this._baselineTestFilesSet = Array.isArray(baselineTestFiles)
+      ? new Set(
+          baselineTestFiles
+            .map((p) => normalizeReasoningPath(p, workspaceRoot))
+            .filter(Boolean),
+        )
+      : collectExistingTestPaths(workspaceRoot);
+    this._selfAuthoredTestFiles = new Set();
 
     // Live mutation-vs-verification ledger
     this.filesRead = [];
@@ -376,15 +450,42 @@ export class ExecutionReasoningTracker {
     this._allReadSignatures = new Set();
     this.filesMutated = [];
     this._filesMutatedSet = new Set();
+    this._mutatedSrcSet = new Set();
+    this._mutatedDocSet = new Set();
+    this._mutatedSelfTestSet = new Set();
+    this._mutatedBaselineTestSet = new Set();
     this.rootCauseFilesReadBeforeEdit = [];
     this.verifications = [];
 
     this._firstMutationSeq = -1;
+    this._firstCodeMutationSeq = -1;
     this._lastMutationSeq = -1;
+    this._lastCodeMutationSeq = -1;
     this._lastPassingVerificationSeq = -1;
     this._lastEditPendingVerification = null;
     this._reproducedFailureBeforeEdit = false;
     this._sawPreEditReproFailure = false;
+    this._rootCauseVerifiedAfterEdit = false;
+
+    this.reproductionEvidence = [];
+    this.rootCauseLedger = {
+      symptom: null,
+      directCause: null,
+      rootCause: null,
+      preEditFailureSignatures: [],
+      resolvedSignatures: [],
+      hypotheses: [],
+    };
+    this._contractComplianceSignals = {
+      evaluated: false,
+      ready: true,
+      gapCount: 0,
+      missingDeliverables: [],
+      invalidJsonFiles: [],
+      missingExportedSymbols: [],
+      forbiddenViolations: [],
+      missingContractReads: [],
+    };
 
     // Failure & falsified attempt tracking
     this.errorFingerprints = [];
@@ -392,7 +493,10 @@ export class ExecutionReasoningTracker {
     this.falsifiedAttempts = [];
     this._consecutiveErrorStreak = { signature: null, count: 0 };
     this._editTestFailCycles = 0;
+    this._selfTestEditCycles = 0;
     this._hasPendingEditInCycle = false;
+    this._pendingCycleEditCategories = new Set();
+    this._baselineTestFailedInCycle = false;
 
     // Action history for exact_repeat and ping_pong
     this._actionHistory = [];
@@ -418,7 +522,34 @@ export class ExecutionReasoningTracker {
   }
 
   get hasUnverifiedMutationsAfterLastPass() {
-    return this._lastMutationSeq > this._lastPassingVerificationSeq;
+    return this._lastCodeMutationSeq > this._lastPassingVerificationSeq;
+  }
+
+  updateContractEvaluation(evalResult = null) {
+    if (!evalResult || typeof evalResult !== 'object') return;
+    this._contractComplianceSignals = {
+      evaluated: Boolean(evalResult.evaluated),
+      ready: evalResult.ready ?? true,
+      gapCount: Array.isArray(evalResult.gaps) ? evalResult.gaps.length : 0,
+      missingDeliverables: [...(evalResult.missingDeliverables ?? [])],
+      invalidJsonFiles: [...(evalResult.invalidJsonFiles ?? [])],
+      missingExportedSymbols: [...(evalResult.missingExportedSymbols ?? [])],
+      forbiddenViolations: [...(evalResult.forbiddenViolations ?? [])],
+      missingContractReads: [...(evalResult.missingContractReads ?? [])],
+    };
+  }
+
+  #buildMutationBreakdown() {
+    return {
+      src: [...this._mutatedSrcSet],
+      doc: [...this._mutatedDocSet],
+      selfTest: [...this._mutatedSelfTestSet],
+      baselineTest: [...this._mutatedBaselineTestSet],
+      postPassDocOnly:
+        this._lastPassingVerificationSeq > -1 &&
+        this._lastMutationSeq > this._lastPassingVerificationSeq &&
+        this._lastCodeMutationSeq <= this._lastPassingVerificationSeq,
+    };
   }
 
   markBudgetReserveAdvised() {
@@ -573,7 +704,7 @@ export class ExecutionReasoningTracker {
             this.filesRead.push(normPath);
             isNewInspectionPivot = true;
           }
-          if (this._firstMutationSeq === -1 && !this.rootCauseFilesReadBeforeEdit.includes(normPath)) {
+          if (this._firstCodeMutationSeq === -1 && !this.rootCauseFilesReadBeforeEdit.includes(normPath)) {
             this.rootCauseFilesReadBeforeEdit.push(normPath);
           }
         }
@@ -581,10 +712,18 @@ export class ExecutionReasoningTracker {
 
       if (isNewInspectionPivot) {
         this._editTestFailCycles = 0;
+        this._selfTestEditCycles = 0;
       }
     }
 
-    // 2. Track file mutations
+    if (!effectiveIsError && toolName === 'update_plan' && Array.isArray(parsedArgs.hypotheses)) {
+      this.rootCauseLedger.hypotheses = parsedArgs.hypotheses
+        .slice(-10)
+        .map((h) => (typeof h === 'string' ? h : String(h?.statement ?? h?.title ?? '')))
+        .filter(Boolean);
+    }
+
+    // 2. Track file mutations (classified into src / doc / self_test / baseline_test)
     let mutatedFiles = [];
     if (!effectiveIsError && MUTATING_FILE_TOOLS.has(toolName)) {
       mutatedFiles = extractMutatedFilesFromToolCall(toolName, parsedArgs, this.workspaceRoot);
@@ -592,19 +731,46 @@ export class ExecutionReasoningTracker {
         this._firstMutationSeq = seq;
       }
       this._lastMutationSeq = seq;
-      this._hasPendingEditInCycle = true;
       this._readSignaturesSinceMutation.clear();
-      this._lastEditPendingVerification = {
-        step,
-        seq,
-        toolName,
-        files: [...mutatedFiles],
-      };
+
+      let touchesNonDoc = false;
       for (const f of mutatedFiles) {
         if (!this._filesMutatedSet.has(f)) {
           this._filesMutatedSet.add(f);
           this.filesMutated.push(f);
+          if (TEST_MUTATION_PATH_RE.test(f) && !this._baselineTestFilesSet.has(f)) {
+            this._selfAuthoredTestFiles.add(f);
+          }
         }
+        const kind = classifyMutationPath(f, {
+          workspaceRoot: this.workspaceRoot,
+          baselineTestFiles: this._baselineTestFilesSet,
+          selfAuthoredTestFiles: this._selfAuthoredTestFiles,
+        });
+        if (kind === 'doc') this._mutatedDocSet.add(f);
+        else if (kind === 'self_test') this._mutatedSelfTestSet.add(f);
+        else if (kind === 'baseline_test') this._mutatedBaselineTestSet.add(f);
+        else this._mutatedSrcSet.add(f);
+
+        if (kind !== 'doc') {
+          touchesNonDoc = true;
+          this._pendingCycleEditCategories.add(kind);
+        }
+      }
+
+      if (touchesNonDoc) {
+        if (this._firstCodeMutationSeq === -1) {
+          this._firstCodeMutationSeq = seq;
+        }
+        this._lastCodeMutationSeq = seq;
+        this._hasPendingEditInCycle = true;
+        this._rootCauseVerifiedAfterEdit = false;
+        this._lastEditPendingVerification = {
+          step,
+          seq,
+          toolName,
+          files: [...mutatedFiles],
+        };
       }
     }
 
@@ -635,13 +801,25 @@ export class ExecutionReasoningTracker {
         this._lastPassingVerificationSeq = seq;
         this._consecutiveErrorStreak = { signature: null, count: 0 };
         this._editTestFailCycles = 0;
+        this._selfTestEditCycles = 0;
         this._hasPendingEditInCycle = false;
+        this._pendingCycleEditCategories.clear();
+        this._baselineTestFailedInCycle = false;
         this._lastEditPendingVerification = null;
+        if (this._reproducedFailureBeforeEdit && this._firstCodeMutationSeq > -1 && seq > this._firstCodeMutationSeq) {
+          this._rootCauseVerifiedAfterEdit = true;
+          this.rootCauseLedger.resolvedSignatures = [...this.rootCauseLedger.preEditFailureSignatures];
+          this.rootCauseLedger.rootCause = {
+            suspectedFiles: [...this.rootCauseFilesReadBeforeEdit],
+            verifiedCommand: cmd,
+            resolvedPreEditFailures: this.rootCauseLedger.resolvedSignatures.length,
+          };
+        }
       } else {
-        this.#recordVerificationFailure();
+        this.#recordVerificationFailure({ fingerprint, command: cmd, step, seq });
       }
     } else if (isTestFailHint && !isPolicyRejection) {
-      this.#recordVerificationFailure();
+      this.#recordVerificationFailure({ fingerprint, command: cmd, step, seq });
     } else if (isPolicyRejection) {
       this.ineffectiveActionCount += 1;
     } else if (effectiveIsError) {
@@ -739,9 +917,29 @@ export class ExecutionReasoningTracker {
     };
   }
 
-  #recordVerificationFailure() {
-    if (this._firstMutationSeq === -1) {
+  #recordVerificationFailure({ fingerprint = null, command = '', step = 0, seq = 0 } = {}) {
+    if (this._firstCodeMutationSeq === -1) {
       this._reproducedFailureBeforeEdit = true;
+      this.reproductionEvidence.push({
+        step,
+        seq,
+        command,
+        signature: fingerprint?.signature ?? null,
+        location: fingerprint?.location ?? null,
+        errorType: fingerprint?.errorType ?? null,
+        excerpt: fingerprint?.assertionExcerpt ?? '',
+      });
+      if (!this.rootCauseLedger.symptom && (fingerprint?.assertionExcerpt || fingerprint?.summary)) {
+        this.rootCauseLedger.symptom = fingerprint.assertionExcerpt || fingerprint.summary;
+      }
+      if (!this.rootCauseLedger.directCause && (fingerprint?.location || fingerprint?.errorType)) {
+        this.rootCauseLedger.directCause = [fingerprint.errorType, fingerprint.location]
+          .filter(Boolean)
+          .join(' @ ');
+      }
+      if (fingerprint?.signature && !this.rootCauseLedger.preEditFailureSignatures.includes(fingerprint.signature)) {
+        this.rootCauseLedger.preEditFailureSignatures.push(fingerprint.signature);
+      }
       if (!this._sawPreEditReproFailure) {
         this._sawPreEditReproFailure = true;
       } else {
@@ -750,12 +948,34 @@ export class ExecutionReasoningTracker {
         this._nonReproFailureCount += 1;
       }
     } else {
+      this._rootCauseVerifiedAfterEdit = false;
       this.ineffectiveActionCount += 1;
       this._nonReproFailureCount += 1;
     }
+
+    const locFile = fingerprint?.location ? String(fingerprint.location).split(':')[0] : null;
+    const hitBaselineTest = Boolean(
+      (locFile && this._baselineTestFilesSet.has(locFile)) ||
+        [...this._baselineTestFilesSet].some(
+          (bf) => command.includes(bf) && (!this._selfAuthoredTestFiles.size || ![...this._selfAuthoredTestFiles].some((sf) => command.includes(sf))),
+        ),
+    );
+    if (hitBaselineTest) {
+      this._baselineTestFailedInCycle = true;
+    }
+
     if (this._hasPendingEditInCycle) {
-      this._editTestFailCycles += 1;
+      const onlySelfTestsEdited =
+        this._pendingCycleEditCategories.size > 0 &&
+        [...this._pendingCycleEditCategories].every((c) => c === 'self_test');
+      if (onlySelfTestsEdited && !this._baselineTestFailedInCycle) {
+        this._selfTestEditCycles += 1;
+      } else {
+        this._selfTestEditCycles = 0;
+        this._editTestFailCycles += 1;
+      }
       this._hasPendingEditInCycle = false;
+      this._pendingCycleEditCategories.clear();
     }
   }
 
@@ -817,19 +1037,30 @@ export class ExecutionReasoningTracker {
       }
     }
 
-    // Pattern 3: Edit -> test-fail loop (>= 2 cycles without new read/hypothesis pivot)
-    if (!detected && this._editTestFailCycles >= 2) {
+    // Pattern 3: Edit -> test-fail loop (>= 2 cycles on src, or >= 4 after self-test calibration tolerance)
+    if (!detected && this._selfTestEditCycles >= 2 && this._selfTestEditCycles < 4) {
+      detected = {
+        pattern: STUCK_PATTERNS.SELF_TEST_CALIBRATION,
+        step,
+        seq,
+        signature: `self_test_calibration:${fingerprint?.signature ?? this._selfTestEditCycles}`,
+        summary: `${this._selfTestEditCycles} consecutive self-authored test edits failed verification while source files and baseline tests remained clean`,
+        nonFatal: true,
+      };
+    } else if (!detected && (this._editTestFailCycles >= 2 || this._selfTestEditCycles >= 4)) {
+      const cycles = Math.max(this._editTestFailCycles, this._selfTestEditCycles);
       detected = {
         pattern: STUCK_PATTERNS.EDIT_TEST_FAIL_LOOP,
         step,
         seq,
         signature: fingerprint?.signature ?? 'edit_test_fail_loop',
-        summary: `${this._editTestFailCycles} consecutive edit -> test-failure cycles without reading new source/root-cause files`,
+        summary: `${cycles} consecutive edit -> test-failure cycles without reading new source/root-cause files`,
       };
     }
 
-    // Pattern 4: Normalized same-error-signature streak (>= 3 even when args vary)
-    if (!detected && effectiveIsError && !isPolicyRejection && this._consecutiveErrorStreak.count >= 3) {
+    // Pattern 4: Normalized same-error-signature streak (>= 3 even when args vary; deferred to >= 4 during self-test calibration)
+    const streakThreshold = this._selfTestEditCycles >= 1 && this._selfTestEditCycles < 4 ? 4 : 3;
+    if (!detected && effectiveIsError && !isPolicyRejection && this._consecutiveErrorStreak.count >= streakThreshold) {
       detected = {
         pattern: STUCK_PATTERNS.SAME_ERROR_STREAK,
         step,
@@ -853,10 +1084,16 @@ export class ExecutionReasoningTracker {
 
     if (!detected) return null;
 
+    const isNonFatalPattern =
+      detected.nonFatal === true ||
+      detected.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP ||
+      detected.pattern === STUCK_PATTERNS.SELF_TEST_CALIBRATION;
     const isPolicyPattern = detected.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP;
-    const alreadyWarned = isPolicyPattern
-      ? this._warnedPatterns.has(STUCK_PATTERNS.POLICY_BLOCK_LOOP)
-      : [...this._warnedPatterns].some((p) => p !== STUCK_PATTERNS.POLICY_BLOCK_LOOP);
+    const alreadyWarned = isNonFatalPattern
+      ? this._warnedPatterns.has(detected.pattern)
+      : [...this._warnedPatterns].some(
+          (p) => p !== STUCK_PATTERNS.POLICY_BLOCK_LOOP && p !== STUCK_PATTERNS.SELF_TEST_CALIBRATION,
+        );
     this._warnedPatterns.add(detected.pattern);
 
     const fullDetection = {
@@ -878,8 +1115,17 @@ export class ExecutionReasoningTracker {
     if (active?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
       return [
         `[策略拦截纠偏提示] 检测到多次工具调用在执行前被策略/审批拦截 (${active.summary || 'APPROVAL_DENIED / POLICY_DENIED'})，请立即停止尝试被禁止的 bash 命令（如 ls、git、node -e 等）。`,
-        '1. 目录浏览、文件检索和代码读取请直接使用内置工具 glob / grep / read_file，切勿通过 bash 执行辅助探测脚本。',
+        '1. 目录浏览、文件检索和代码读取请直接使用内置工具 glob / grep / read_file（计算文件哈希请用 compute_file_digest），切勿通过 bash 执行辅助探测脚本。',
         '2. 代码修改请直接使用 write_file / edit_file / apply_patch，并仅在需要验证时运行题目允许的精确测试命令。',
+      ].join('\n');
+    }
+    if (active?.pattern === STUCK_PATTERNS.SELF_TEST_CALIBRATION) {
+      const fp = active?.fingerprint ?? this.errorFingerprints.at(-1) ?? null;
+      return [
+        `[自建测试校准提示] 检测到连续仅修改自建测试文件且源码与基线测试保持稳定 (${active.summary})。`,
+        ...(fp ? [`当前失败摘要: ${fp.summary}`] : []),
+        '1. 请勿反复盲目重写新建测试，立即使用 read_file 核对目标源码模块的实际返回类型/契约（例如空状态返回 null 或特定结构）。',
+        '2. 仅依据已核实的源码契约校准你的自建测试断言，并重跑验证命令通过后立即输出最终总结。',
       ].join('\n');
     }
 
@@ -932,6 +1178,17 @@ export class ExecutionReasoningTracker {
       budgetFinalCallAdvised: this._budgetFinalCallAdvised,
       budgetPruneCount: this._budgetPruneCount,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],
+      reproductionEvidence: this.reproductionEvidence.map((r) => ({ ...r })),
+      rootCauseLedger: {
+        ...this.rootCauseLedger,
+        preEditFailureSignatures: [...this.rootCauseLedger.preEditFailureSignatures],
+        resolvedSignatures: [...this.rootCauseLedger.resolvedSignatures],
+        hypotheses: [...this.rootCauseLedger.hypotheses],
+      },
+      rootCauseVerifiedAfterEdit: this._rootCauseVerifiedAfterEdit,
+      rootCauseVerified: this._rootCauseVerifiedAfterEdit,
+      mutationBreakdown: this.#buildMutationBreakdown(),
+      contractComplianceSignals: { ...this._contractComplianceSignals },
       errorFingerprints: this.errorFingerprints.map((fp) => ({ ...fp })),
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
       stuckDetections: this.stuckDetections.map((d) => ({ ...d })),
@@ -940,13 +1197,16 @@ export class ExecutionReasoningTracker {
   }
 
   getMetrics({ finalOutcomePassed = null, stopReason = null } = {}) {
+    const codeSeqStart = this._firstCodeMutationSeq !== -1 ? this._firstCodeMutationSeq : this._firstMutationSeq;
     const postEditVerifications =
-      this._firstMutationSeq === -1
+      codeSeqStart === -1
         ? []
-        : this.verifications.filter((v) => v.seq > this._firstMutationSeq);
+        : this.verifications.filter((v) => v.seq > codeSeqStart);
     const latestVerification = this.verifications.at(-1) ?? null;
     const executionStuckDetections = this.stuckDetections.filter(
-      (d) => d.pattern !== STUCK_PATTERNS.POLICY_BLOCK_LOOP,
+      (d) =>
+        d.pattern !== STUCK_PATTERNS.POLICY_BLOCK_LOOP &&
+        d.pattern !== STUCK_PATTERNS.SELF_TEST_CALIBRATION,
     );
 
     let firstFixSucceeded = null;
@@ -995,6 +1255,17 @@ export class ExecutionReasoningTracker {
       firstFixSucceeded,
       selfCorrectionRecovered,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],
+      reproductionEvidence: this.reproductionEvidence.map((r) => ({ ...r })),
+      rootCauseLedger: {
+        ...this.rootCauseLedger,
+        preEditFailureSignatures: [...this.rootCauseLedger.preEditFailureSignatures],
+        resolvedSignatures: [...this.rootCauseLedger.resolvedSignatures],
+        hypotheses: [...this.rootCauseLedger.hypotheses],
+      },
+      rootCauseVerifiedAfterEdit: this._rootCauseVerifiedAfterEdit,
+      rootCauseVerified: this._rootCauseVerifiedAfterEdit,
+      mutationBreakdown: this.#buildMutationBreakdown(),
+      contractComplianceSignals: { ...this._contractComplianceSignals },
       errorFingerprints: this.errorFingerprints.map((fp) => ({ ...fp })),
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
       stuckDetections: this.stuckDetections.map((d) => ({
@@ -1006,7 +1277,11 @@ export class ExecutionReasoningTracker {
         warningIssued: d.warningIssued,
       })),
       repairRounds: this._repairRounds,
-      thrashWarned: [...this._warnedPatterns].some((p) => p !== STUCK_PATTERNS.POLICY_BLOCK_LOOP),
+      thrashWarned: [...this._warnedPatterns].some(
+        (p) =>
+          p !== STUCK_PATTERNS.POLICY_BLOCK_LOOP &&
+          p !== STUCK_PATTERNS.SELF_TEST_CALIBRATION,
+      ),
       circuitBroken: stopReason === 'thrashing_circuit_break',
       latestVerificationPassed: latestVerification ? latestVerification.passed : null,
     };

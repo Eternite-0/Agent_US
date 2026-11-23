@@ -3,6 +3,8 @@
  * inspired by Agnes Harness `packages/core/src/execution/turn/gate.ts`.
  */
 
+import { classifyMutationPath } from './kernel/execution-reasoning.js';
+
 const TOOL_CALL_AS_TEXT_RE =
   /\{\s*"(?:tool|name|function)"\s*:\s*"(?:shell|pty|git|read_file|write_file|mcp|read_blob)"|\btool_call\s*:\s*\{/i;
 
@@ -165,14 +167,27 @@ export function verifyTurn({ events = [], text = '', node = null, execution = nu
   };
 }
 
-export function buildRepairNote(result, { reasoningState = result?.reasoningState ?? null } = {}) {
+export function buildRepairNote(
+  result,
+  {
+    reasoningState = result?.reasoningState ?? null,
+    contractReadiness = result?.contractReadiness ?? null,
+  } = {},
+) {
   const isEvidenceOnlyFailure =
     Array.isArray(result?.reasons) &&
     result.reasons.length > 0 &&
     result.reasons.every((r) => String(r).startsWith('EVIDENCE_INCOMPLETE:'));
   const latestVerification = reasoningState?.verifications?.at(-1) ?? null;
+  const mutatedAfterVerify =
+    result?.mutatedFilesAfterVerification ?? result?.checks?.mutatedFilesAfterVerification ?? [];
+  const docOnlyMutationAfterPass =
+    Array.isArray(mutatedAfterVerify) &&
+    mutatedAfterVerify.length > 0 &&
+    mutatedAfterVerify.every((p) => classifyMutationPath(p) === 'doc');
   const verifiedAfterLastMutation = Boolean(
-    latestVerification?.passed === true && !reasoningState?.hasUnverifiedMutationsAfterLastPass,
+    latestVerification?.passed === true &&
+      (!reasoningState?.hasUnverifiedMutationsAfterLastPass || docOnlyMutationAfterPass),
   );
   if (isEvidenceOnlyFailure && verifiedAfterLastMutation) {
     const mutatedList =
@@ -201,10 +216,11 @@ export function buildRepairNote(result, { reasoningState = result?.reasoningStat
     return `- ${reason}${explain ? `: ${explain(result)}` : ''}`;
   });
   const extra = [];
-  const mutatedAfterVerify =
-    result.mutatedFilesAfterVerification ?? result.checks?.mutatedFilesAfterVerification;
-  if (Array.isArray(mutatedAfterVerify) && mutatedAfterVerify.length > 0) {
+  if (Array.isArray(mutatedAfterVerify) && mutatedAfterVerify.length > 0 && !docOnlyMutationAfterPass) {
     extra.push(`Modified files needing re-verification: ${mutatedAfterVerify.join(', ')}.`);
+  }
+  if (contractReadiness?.evaluated && !contractReadiness.ready && contractReadiness.checklistText) {
+    extra.push(contractReadiness.checklistText);
   }
   const diagnosticExcerpt =
     result.diagnosticExcerpt ??

@@ -31,6 +31,8 @@ export const WORKSPACE_TOOL_META = Object.freeze({
   glob: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   grep: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   read_blob: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
+  expand_context: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
+  compute_file_digest: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   inspect_repository: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   web_fetch: { readOnly: true, risk: 'low', effectClass: 'external_network', replayable: true, outward: false },
   search_history: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
@@ -336,6 +338,7 @@ export function createWorkspaceTools({
       onToolOutput,
     }),
     ...createMetaTools({
+      workspaceRoot,
       store,
       sessionId,
       mcpTools,

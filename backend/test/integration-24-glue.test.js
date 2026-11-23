@@ -20,7 +20,8 @@ import {
   summarizeReasoningMetrics,
 } from '../src/evaluation/service.js';
 import { ToolDispatcher } from '../src/tools/dispatcher.js';
-import { createWorkspaceTools } from '../src/workspace-tools.js';
+import { WORKSPACE_TOOL_META, createWorkspaceTools, needsApproval } from '../src/workspace-tools.js';
+import { sha256Hex } from '../src/integrity.js';
 
 class ScriptedAdapter extends LlmAdapter {
   constructor(handler) {
@@ -781,4 +782,164 @@ test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers f
     await directT2.close();
     store2.close();
   }
+});
+
+test('glue: Wave 2 compute_file_digest confinement, expand_context lossless restore, and AgentLoop contract pre-completion check', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-w2-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-w2-work-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  mkdirSync(join(workDir, 'handoff'), { recursive: true });
+  writeFileSync(join(workDir, 'src', 'a.js'), 'export const alpha = 1;\n', 'utf8');
+  writeFileSync(join(workDir, 'src', 'b.js'), 'export const beta = 2;\n', 'utf8');
+  writeFileSync(join(workDir, 'handoff', 'cfg.json'), '{"b":2,"a":1}', 'utf8');
+  writeFileSync(join(workDir, '.env.local'), 'SECRET=nope\n', 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  t.after(() => {
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  // 1. Metadata & zero-approval read-only classification
+  assert.equal(WORKSPACE_TOOL_META.compute_file_digest?.readOnly, true);
+  assert.equal(WORKSPACE_TOOL_META.compute_file_digest?.effectClass, 'read_only');
+  assert.equal(WORKSPACE_TOOL_META.expand_context?.readOnly, true);
+  assert.equal(WORKSPACE_TOOL_META.expand_context?.effectClass, 'read_only');
+  assert.equal(needsApproval('compute_file_digest', { paths: ['src/a.js'] }, 'auto-safe'), false);
+  assert.equal(needsApproval('expand_context', { ref: 'artifact://abc' }, 'auto-safe'), false);
+
+  const tools = createWorkspaceTools({
+    workspaceRoot: workDir,
+    store,
+    permissionMode: 'auto-safe',
+  });
+  const digestTool = tools.find((tool) => tool.name === 'compute_file_digest');
+  const expandTool = tools.find((tool) => tool.name === 'expand_context');
+  assert.ok(digestTool);
+  assert.ok(expandTool);
+
+  const digestRaw = await digestTool.execute({ paths: ['src/b.js', 'src/a.js', 'handoff/cfg.json'] }, {});
+  const digestJsonText = String(digestRaw).replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>$/, '');
+  const digestParsed = JSON.parse(digestJsonText);
+  assert.equal(digestParsed.files.length, 3);
+  assert.equal(digestParsed.files[1].path, 'src/a.js');
+  assert.equal(digestParsed.files[1].sha256, sha256Hex('export const alpha = 1;\n'));
+  assert.equal(digestParsed.files[2].canonicalJsonSha256, sha256Hex('{"a":1,"b":2}'));
+  assert.equal(digestParsed.sortedArtifactsSha256.length, 64);
+
+  // Confinement & secret blocks on compute_file_digest
+  await assert.rejects(() => digestTool.execute({ paths: ['../outside.txt'] }, {}), /超出/);
+  await assert.rejects(() => digestTool.execute({ paths: ['.env.local'] }, {}), /受保护/);
+  await assert.rejects(() => digestTool.execute({ paths: ['upstream/secret.txt'] }, {}), /受保护/);
+
+  // 2. expand_context lossless line-range & refId restoration
+  const rawBlobText = ['line-one-alpha', 'line-two-beta', 'line-three-gamma', 'line-four-delta'].join('\n');
+  const put = store.putBlob(rawBlobText);
+  store.setSetting('aci.ref:ctx-ref-1', { uri: put.uri });
+
+  const expandedUri = await expandTool.execute({ ref: put.uri, startLine: 2, endLine: 3 }, {});
+  assert.match(expandedUri, /line-two-beta\nline-three-gamma/);
+  const expandedRef = await expandTool.execute({ ref: 'ctx-ref-1', offset: 0, limit: 100 }, {});
+  const restoredBody = String(expandedRef)
+    .replace(/^<tool_result[^>]*>\n?/, '')
+    .replace(/\n?<\/tool_result>$/, '');
+  assert.equal(restoredBody.slice(restoredBody.indexOf('\n') + 1), rawBlobText);
+
+  // 3. AgentLoop ContractReasoningEngine pre-completion deliverable check without breaking static system prompt
+  const staticSys = buildStaticSystemPrompt('fixed-nonce-w2');
+  let loopStep = 0;
+  let sawContractNudge = false;
+  const kernel = new AgentRuntimeKernel({
+    store,
+    adapter: {
+      async *stream({ messages }) {
+        loopStep += 1;
+        assert.equal(messages[0]?.content?.[0]?.text, staticSys);
+        const userText = messages
+          .filter((m) => m.role === 'user')
+          .flatMap((m) => m.content ?? [])
+          .map((b) => b.text ?? '')
+          .join('\n');
+        if (loopStep === 1) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-c1', name: 'read_file', arguments: JSON.stringify({ path: 'src/a.js' }) },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (loopStep === 2) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-c2', name: 'write_file', arguments: JSON.stringify({ path: 'src/a.js', content: 'export const alpha = 42;\n' }) },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (loopStep === 3) {
+          // Attempts early stop BEFORE creating required handoff/digest.txt!
+          yield { type: 'text-delta', text: 'Updated src/a.js.' };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+          return;
+        }
+        if (loopStep === 4) {
+          assert.match(userText, /\[契约与根因核对\]/);
+          assert.match(userText, /handoff\/digest\.txt/);
+          sawContractNudge = true;
+          yield {
+            type: 'block-end',
+            block: {
+              type: 'tool-call',
+              id: 'tc-c3',
+              name: 'write_file',
+              arguments: JSON.stringify({ path: 'handoff/digest.txt', content: digestParsed.sortedArtifactsSha256 }),
+            },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (loopStep === 5) {
+          yield {
+            type: 'block-end',
+            block: {
+              type: 'tool-call',
+              id: 'tc-c4',
+              name: 'bash',
+              arguments: JSON.stringify({ command: 'node --test' }),
+            },
+          };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        yield { type: 'text-delta', text: 'Completed src/a.js and handoff/digest.txt.' };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    },
+    toolDispatcher: new ToolDispatcher({}),
+  });
+  t.after(() => kernel.close());
+
+  const contractTurn = await kernel.executeTurn({
+    sessionId: 'sess-w2-contract',
+    turnId: 'turn-w2-contract',
+    profile: { id: 'default', defaultMaxSteps: 8, streamDeltas: false, emitAssistantMessage: false, emitToolEvents: false, persistTurn: false },
+    input: 'Update src/a.js and emit handoff/digest.txt.',
+    model: 'mock',
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: staticSys }] },
+      { role: 'user', content: [{ type: 'text', text: 'Update src/a.js and emit handoff/digest.txt.' }] },
+    ],
+    tools: createWorkspaceTools({
+      workspaceRoot: workDir,
+      store,
+      permissionMode: 'full-access',
+      sandbox: { async run() { return { exitCode: 0, stdout: 'pass 1\nfail 0', stderr: '' }; } },
+    }),
+  });
+  assert.equal(contractTurn.status, 'completed');
+  assert.equal(sawContractNudge, true);
+  assert.equal(contractTurn.reasoningMetrics?.contractComplianceSignals?.ready, true);
 });

@@ -3,6 +3,7 @@ import { verifyTurn } from '../verifier.js';
 import { resolveConfinedPath } from '../tools/sandbox.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import {
+  classifyMutationPath,
   extractFailureFingerprint,
   extractMutatedFilesFromToolCall,
   isVerificationCommand,
@@ -379,9 +380,13 @@ export class EvidenceVerifier {
     let lastPassingVerification = null;
     let mutatedAfterLastPass = [];
     let mutatedAfterLastPassSet = new Set();
+    let mutatedDocAfterLastPass = [];
+    let mutatedDocAfterLastPassSet = new Set();
     let verificationRunsCount = 0;
     let latestFailureRun = null;
     const failureRunByCallId = new Map();
+    const baselineTestFiles =
+      execution?.baselineTestFiles ?? node?.baselineTestFiles ?? [];
 
     for (let idx = 0; idx < orderedToolRuns.length; idx += 1) {
       const run = orderedToolRuns[idx];
@@ -397,9 +402,20 @@ export class EvidenceVerifier {
             allMutatedSet.add(f);
             allMutatedFiles.push(f);
           }
-          if (lastPassingVerification && !mutatedAfterLastPassSet.has(f)) {
-            mutatedAfterLastPassSet.add(f);
-            mutatedAfterLastPass.push(f);
+          if (lastPassingVerification) {
+            const mutKind = classifyMutationPath(f, {
+              workspaceRoot,
+              baselineTestFiles,
+            });
+            if (mutKind === 'doc') {
+              if (!mutatedDocAfterLastPassSet.has(f)) {
+                mutatedDocAfterLastPassSet.add(f);
+                mutatedDocAfterLastPass.push(f);
+              }
+            } else if (!mutatedAfterLastPassSet.has(f)) {
+              mutatedAfterLastPassSet.add(f);
+              mutatedAfterLastPass.push(f);
+            }
           }
         }
       } else if (run.toolName === 'bash' && isVerificationCommand(run.args?.command)) {
@@ -416,6 +432,8 @@ export class EvidenceVerifier {
           };
           mutatedAfterLastPass = [];
           mutatedAfterLastPassSet = new Set();
+          mutatedDocAfterLastPass = [];
+          mutatedDocAfterLastPassSet = new Set();
         } else {
           const fp = run.output
             ? extractFailureFingerprint({
@@ -467,6 +485,7 @@ export class EvidenceVerifier {
     const staleAfterEdit = Boolean(lastPassingVerification && mutatedAfterLastPass.length > 0);
     checks.staleVerificationAfterEdit = staleAfterEdit;
     checks.mutatedFilesAfterVerification = [...mutatedAfterLastPass];
+    checks.mutatedDocFilesAfterVerification = [...mutatedDocAfterLastPass];
     if (staleAfterEdit) {
       checks.lastPassingVerificationCommand = lastPassingVerification.command;
       reasons.push(

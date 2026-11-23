@@ -1,9 +1,40 @@
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import { z } from 'zod';
+import { canonicalJson, sha256Hex } from '../../integrity.js';
 import { PolicyError } from '../../kernel/errors.js';
+import { normalizeProtectedSegment, resolveConfinedPath } from '../sandbox.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
 import { safeFetchExternal } from '../ssrf-guard.js';
 
 const MAX_WEB_FETCH_BYTES = 512 * 1024;
+const MAX_DIGEST_FILE_BYTES = 10 * 1024 * 1024;
+
+function isBlockedWorkspaceRel(relPath) {
+  const normRel = String(relPath ?? '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+  if (
+    normRel === 'upstream' ||
+    normRel.startsWith('upstream/') ||
+    normRel === 'var' ||
+    normRel.startsWith('var/') ||
+    normRel === 'backend/var' ||
+    normRel.startsWith('backend/var/')
+  ) {
+    return true;
+  }
+  const segments = String(relPath ?? '').split(/[\\/]/).filter(Boolean);
+  return segments.some((seg) => {
+    const norm = normalizeProtectedSegment(seg);
+    return (
+      norm === '.git' ||
+      norm === 'upstream' ||
+      norm === 'var' ||
+      /^\.env(?:$|[._-])/i.test(norm) ||
+      /\.(?:pem|key|pfx|p12|crt|der|sqlite(?:3)?|sqlite-wal|sqlite-shm)$/i.test(norm)
+    );
+  });
+}
 
 async function readResponseTextCapped(res, maxBytes = MAX_WEB_FETCH_BYTES) {
   if (res?.body && typeof res.body.getReader === 'function') {
@@ -50,12 +81,14 @@ function stripHtml(html) {
 }
 
 export function createMetaTools({
+  workspaceRoot = null,
   store,
   sessionId,
   mcpTools = [],
   wrapResult,
   guardFallback,
   onPlanUpdated,
+  resolveContextRef = null,
   runSubagent = null,
   orchestrateSwarm = null,
   sendAgentMessage = null,
@@ -244,6 +277,160 @@ export function createMetaTools({
         return wrapResult(
           'read_blob',
           `[blob ${blob.sha256.slice(0, 12)} chars ${start}-${start + slice.length} / ${blob.content.length}]\n${slice}`,
+        );
+      },
+    }),
+
+    defineTool({
+      name: 'compute_file_digest',
+      readOnly: true,
+      description:
+        '只读计算工作区内指定文件的确定性 SHA-256 十六进制摘要与字节长度（`.json` 文件同步计算 RFC-8785 规范化 JSON 摘要及排序组合摘要），无需执行 shell 命令。',
+      effectClass: EFFECT_CLASSES.READ_ONLY,
+      riskLevel: RISK_LEVELS.LOW,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        paths: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(16)
+          .describe('工作区内 1–16 个目标文件路径列表'),
+      }),
+      async execute(args, ctx) {
+        await guardFallback('compute_file_digest', args, ctx);
+        if (!workspaceRoot) {
+          throw new Error('compute_file_digest requires an active workspaceRoot');
+        }
+        const realRoot = realpathSync(resolve(workspaceRoot));
+        const entries = [];
+        for (const rawPath of args.paths) {
+          const confined = resolveConfinedPath(workspaceRoot, rawPath);
+          if (isBlockedWorkspaceRel(confined.rel)) {
+            throw new Error(`受保护目录或密钥文件不允许访问: ${rawPath}`);
+          }
+          if (!existsSync(confined.full)) {
+            throw new Error(`文件不存在: ${confined.rel}`);
+          }
+          const realTarget = realpathSync(confined.full);
+          const realRel = relative(realRoot, realTarget).replace(/\\/g, '/');
+          if (realRel.startsWith('..') || isBlockedWorkspaceRel(realRel)) {
+            throw new Error(`受保护目录或密钥文件不允许访问: ${rawPath}`);
+          }
+          const st = statSync(realTarget);
+          if (!st.isFile()) {
+            throw new Error(`目标不是常规文件: ${confined.rel}`);
+          }
+          if (st.size > MAX_DIGEST_FILE_BYTES) {
+            throw new Error(`文件超出摘要读取上限 (${MAX_DIGEST_FILE_BYTES} bytes): ${confined.rel}`);
+          }
+          const buf = readFileSync(realTarget);
+          const sha256 = createHash('sha256').update(buf).digest('hex');
+          const normPath = confined.rel.replace(/\\/g, '/');
+          const entry = {
+            path: normPath,
+            sha256,
+            bytes: buf.length,
+          };
+          if (normPath.toLowerCase().endsWith('.json')) {
+            try {
+              const parsed = JSON.parse(buf.toString('utf8'));
+              entry.canonicalJsonSha256 = sha256Hex(canonicalJson(parsed));
+            } catch (err) {
+              entry.jsonParseError = String(err?.message ?? err);
+            }
+          }
+          entries.push(entry);
+        }
+        const sortedForBundle = [...entries]
+          .sort((a, b) => a.path.localeCompare(b.path))
+          .map(({ path: p, sha256 }) => ({ path: p, sha256 }));
+        const sortedArtifactsSha256 = sha256Hex(JSON.stringify(sortedForBundle));
+        return wrapResult(
+          'compute_file_digest',
+          JSON.stringify(
+            {
+              files: entries,
+              sortedArtifactsSha256,
+            },
+            null,
+            2,
+          ),
+        );
+      },
+    }),
+
+    defineTool({
+      name: 'expand_context',
+      readOnly: true,
+      description:
+        '无损恢复被折叠的 artifact://<sha256> 或 ACI refId 原始上下文内容，支持按起止行号（startLine/endLine）或字符偏移（offset/limit）精确展开。',
+      effectClass: EFFECT_CLASSES.READ_ONLY,
+      riskLevel: RISK_LEVELS.LOW,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        ref: z.string().min(1).optional().describe('artifact://<sha256> URI 或 ACI refId'),
+        uri: z.string().min(1).optional().describe('artifact://<sha256> URI 别名'),
+        refId: z.string().min(1).optional().describe('ACI refId 别名'),
+        startLine: z.number().int().min(1).optional().describe('起始行号（1-based，含）'),
+        endLine: z.number().int().min(1).optional().describe('结束行号（1-based，含）'),
+        offset: z.number().int().min(0).optional().describe('起始字符偏移（0-based）'),
+        limit: z.number().int().min(1).max(32768).optional().describe('最大返回字符数（默认 16384）'),
+      }),
+      async execute(args, ctx) {
+        await guardFallback('expand_context', args, ctx);
+        const rawRef = String(args.ref ?? args.uri ?? args.refId ?? '').trim();
+        if (!rawRef) {
+          throw new Error('expand_context requires ref, uri, or refId');
+        }
+        let blob = null;
+        if (typeof resolveContextRef === 'function') {
+          const resolved = await resolveContextRef(rawRef);
+          if (resolved && typeof resolved.content === 'string') {
+            blob = {
+              sha256: resolved.sha256 ?? sha256Hex(resolved.content),
+              content: resolved.content,
+            };
+          } else if (resolved && typeof resolved.uri === 'string') {
+            blob = store.getBlob(resolved.uri);
+          }
+        }
+        if (!blob) {
+          const clean = rawRef.replace(/^ref:/i, '').replace(/^aci:\/\//i, '');
+          if (!/^artifact:\/\//i.test(clean) && !/^[0-9a-f]{64}$/i.test(clean) && typeof store?.getSetting === 'function') {
+            const mapped =
+              store.getSetting(`aci.ref:${clean}`) ??
+              store.getSetting(`aci_ref:${clean}`);
+            const mappedUri = typeof mapped === 'string' ? mapped : mapped?.uri;
+            if (mappedUri) {
+              blob = store.getBlob(mappedUri);
+            }
+          }
+          if (!blob) {
+            blob = store.getBlob(clean);
+          }
+        }
+        const fullText = String(blob.content ?? '');
+        const lines = fullText.split('\n');
+        let slice = fullText;
+        let rangeDesc = '';
+        if (args.startLine !== undefined || args.endLine !== undefined) {
+          const sLine = Math.max(1, Number(args.startLine ?? 1));
+          const eLine = Math.min(lines.length, Math.max(sLine, Number(args.endLine ?? lines.length)));
+          const selected = lines.slice(sLine - 1, eLine).join('\n');
+          const maxChars = Math.min(32768, Math.max(1, Number(args.limit ?? 32768)));
+          slice = selected.slice(0, maxChars);
+          rangeDesc = `lines ${sLine}-${eLine}/${lines.length}`;
+        } else {
+          const offset = Math.max(0, Number(args.offset ?? 0));
+          const limit = Math.min(32768, Math.max(1, Number(args.limit ?? 16384)));
+          slice = fullText.slice(offset, offset + limit);
+          rangeDesc = `chars ${offset}-${offset + slice.length}/${fullText.length}`;
+        }
+        return wrapResult(
+          'expand_context',
+          `[expand_context ${String(blob.sha256 || '').slice(0, 12)} ${rangeDesc}]\n${slice}`,
         );
       },
     }),
