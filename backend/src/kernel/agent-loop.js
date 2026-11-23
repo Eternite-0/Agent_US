@@ -1,4 +1,5 @@
 import { sha256Hex } from '../integrity.js';
+import { computeArgsDigest } from '../tools/dispatcher.js';
 import { excerpt } from '../context.js';
 import { verifyTurn, buildRepairNote } from '../verifier.js';
 import { BudgetError, RecoveryError, classifyError } from './errors.js';
@@ -84,7 +85,10 @@ export class DecisionEngine {
           return {
             action: 'repair',
             verdict,
-            note: buildRepairNote(verdict),
+            note: !node && !execution?.evidenceContract &&
+              verdict.reasons?.length === 1 && verdict.reasons[0].startsWith('FABRICATED_PASS_CLAIM:')
+              ? `[验证未通过] ${verdict.reasons[0]}\n完成后用自然语言如实汇报执行过的验证和结果。`
+              : buildRepairNote(verdict),
           };
         }
         return { action: 'fail', verdict };
@@ -137,11 +141,21 @@ export class TurnManager {
     }
   }
 
-  recordToolSignature(tc, isError) {
-    const sig = sha256Hex(`${tc.name}::${tc.arguments}::${isError}`);
+  recordToolSignature(tc, isError, effectiveArgs, pending = false) {
+    // Polling a still-running operation is not a repeated failure or effect.
+    // Keep other successful reads in the existing no-progress check.
+    let sig = null;
+    if (isError || !pending) {
+      try {
+        sig = computeArgsDigest(tc.name, { args: effectiveArgs ?? tc.arguments, isError });
+      } catch {
+        // Malformed/unknown tool arguments must not crash the turn's warning path.
+        sig = sha256Hex(`${tc.name}::${tc.arguments}::${isError}`);
+      }
+    }
     this.recentCallSigs.push(sig);
     if (this.recentCallSigs.length > 6) this.recentCallSigs.shift();
-    return this.recentCallSigs.filter((s) => s === sig).length >= 3;
+    return sig !== null && this.recentCallSigs.filter((s) => s === sig).length >= 3;
   }
 
   saveCheckpoint({ step, phase, state }) {
@@ -760,6 +774,7 @@ export class AgentLoop {
               name: tc.name,
               isError,
               content: output,
+              effectiveArgs: item.parsedArgs,
               receipt,
             },
           });
@@ -781,7 +796,7 @@ export class AgentLoop {
               audit: false,
             });
           }
-          if (tm.recordToolSignature(tc, isError)) {
+          if (tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending)) {
             detectedThrashing = true;
           }
         }

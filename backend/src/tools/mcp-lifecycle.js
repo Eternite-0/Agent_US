@@ -29,10 +29,12 @@ export class McpLifecycleManager {
         store: this.store,
         trustWorkspaceMcp: this.trustWorkspaceMcp,
       });
+    this.closed = false;
     this.health = new Map(); // serverKey -> { server, status, toolCount, lastError, lastCheckedAt, failures }
   }
 
   async discoverTools(workspaceRoot, { trustManager = null, trustWorkspaceMcp = null } = {}) {
+    if (this.closed) return [];
     const ws = resolve(workspaceRoot);
     const effTrust = trustManager ?? this.trustManager ?? this.hub?.trustManager ?? null;
     const effAllowWs =
@@ -87,6 +89,7 @@ export class McpLifecycleManager {
           resultsByServer.set(serverName, info);
         },
       });
+      if (this.closed) return [];
       for (const mt of discovered) {
         tools.push({
           ...mt,
@@ -109,7 +112,7 @@ export class McpLifecycleManager {
             server: serverName,
             status: 'ready',
             toolCount: res.toolCount ?? 0,
-            lastError: null,
+            lastError: res.error ?? null,
             lastCheckedAt: checkedAt,
             failures: 0,
           });
@@ -125,6 +128,7 @@ export class McpLifecycleManager {
         }
       }
     } catch (err) {
+      if (this.closed) return [];
       const checkedAt = Date.now();
       for (const serverName of allowedServers) {
         const key = `${ws}::${serverName}`;
@@ -153,6 +157,7 @@ export class McpLifecycleManager {
   }
 
   close() {
+    this.closed = true;
     for (const h of this.health.values()) {
       h.status = 'closed';
     }

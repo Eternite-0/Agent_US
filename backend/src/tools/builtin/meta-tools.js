@@ -64,6 +64,7 @@ export function createMetaTools({
   const tools = [
     defineTool({
       name: 'update_plan',
+      isConcurrencySafe: () => false,
       description:
         '维护当前多步骤任务的轻量级进度清单（Codex update_plan / Claude Code TodoWrite）。实时同步到用户界面，帮助长任务不跑偏。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
@@ -197,6 +198,7 @@ export function createMetaTools({
     tools.push(
       defineTool({
         name: 'spawn_subagent',
+        isConcurrencySafe: () => false,
         description:
           '按需派生或 Fork 独立的子代理（独立上下文或缓存复用上下文）。支持单任务 objective、并行 tasks 数组、mode (spawn|fork)、resumeSessionId 与 isolatedWorktree 隔离验证。',
         effectClass: EFFECT_CLASSES.READ_ONLY,
@@ -317,8 +319,12 @@ export function createMetaTools({
         outward: true,
         async execute(args, ctx) {
           await guardFallback(mt.fullName, args, ctx);
-          const out = await mt.call(args);
-          return wrapResult(mt.fullName, String(out ?? ''));
+          const out = await mt.call(args, { signal: ctx?.signal ?? signal });
+          if (out?.isError === true) ctx?.reportOutcome?.({ errorCode: 'MCP_TOOL_ERROR' });
+          if (out?.outcomeUnknown === true) {
+            ctx?.reportOutcome?.({ errorCode: 'MCP_OUTCOME_UNKNOWN', outcomeUnknown: true });
+          }
+          return wrapResult(mt.fullName, String(out?.text ?? out ?? ''));
         },
       }),
     );

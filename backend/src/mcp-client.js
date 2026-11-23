@@ -10,6 +10,12 @@ import { HookTrustManager } from './tools/hook-trust.js';
  * SHA-256 trusted `<workspaceRoot>/.agent-us/mcp.json`, enumerates tools via `initialize` + `tools/list`,
  * and dispatches `tools/call` with sanitized child environment and process-tree cleanup.
  */
+class McpResponseError extends Error {}
+
+const MAX_DISCOVERY_CONCURRENCY = 4;
+const MAX_TOOL_PAGES = 16;
+const MAX_SERVER_TOOLS = 2048;
+
 class StdioMcpConnection {
   constructor(name, argv, cwd) {
     this.name = name;
@@ -52,6 +58,7 @@ class StdioMcpConnection {
         // isolate broken-pipe errors when server exits early
       });
       child.stdout?.on('data', (chunk) => {
+        if (this.proc !== child) return;
         this.buffer += chunk.toString('utf8');
         const lines = this.buffer.split(/\r?\n/);
         this.buffer = lines.pop() ?? '';
@@ -63,7 +70,7 @@ class StdioMcpConnection {
             if (msg.id !== undefined && this.pending.has(msg.id)) {
               const p = this.pending.get(msg.id);
               this.pending.delete(msg.id);
-              if (msg.error) p.reject(new Error(msg.error.message || 'MCP error'));
+              if (msg.error) p.reject(new McpResponseError(msg.error.message || 'MCP error'));
               else p.resolve(msg.result);
             }
           } catch {
@@ -72,13 +79,15 @@ class StdioMcpConnection {
         }
       });
       child.on('error', (err) => {
+        if (this.proc !== child) return;
         this.initialized = false;
-        if (this.proc === child) this.proc = null;
+        this.proc = null;
         this.#rejectAllPending(new Error(`MCP server ${this.name} spawn error: ${err?.message ?? err}`));
       });
       child.on('exit', () => {
+        if (this.proc !== child) return;
         this.initialized = false;
-        if (this.proc === child) this.proc = null;
+        this.proc = null;
         this.#rejectAllPending(new Error(`MCP server ${this.name} exited`));
       });
 
@@ -118,59 +127,93 @@ class StdioMcpConnection {
     }
   }
 
-  request(method, params, timeoutMs = 10000) {
+  request(method, params, timeoutMs = 10000, signal = null) {
     return new Promise((resolveReq, rejectReq) => {
+      signal?.throwIfAborted();
       if (!this.proc || this.proc.killed || !this.proc.stdin || this.proc.stdin.destroyed) {
         rejectReq(new Error(`MCP server ${this.name} is not running`));
         return;
       }
       const id = this.nextId++;
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        rejectReq(new Error(`MCP request ${method} timed out after ${timeoutMs}ms`));
+        fail(new Error(`MCP request ${method} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       timer.unref?.();
+      const cleanup = () => {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+      };
+      const fail = (err) => {
+        cleanup();
+        rejectReq(err);
+      };
+      const onAbort = () => fail(signal.reason);
+      signal?.addEventListener('abort', onAbort, { once: true });
       this.pending.set(id, {
         resolve: (val) => {
-          clearTimeout(timer);
+          cleanup();
           resolveReq(val);
         },
-        reject: (err) => {
-          clearTimeout(timer);
-          rejectReq(err);
-        },
+        reject: fail,
       });
       try {
-        this.proc.stdin.write(
-          `${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`,
-        );
+        this.proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
       } catch (err) {
-        const entry = this.pending.get(id);
-        this.pending.delete(id);
-        entry?.reject(err instanceof Error ? err : new Error(String(err)));
+        fail(err);
       }
     });
   }
 
   async listTools() {
     await this.connect();
-    const res = await this.request('tools/list', {});
-    return Array.isArray(res?.tools) ? res.tools : [];
+    const deadline = Date.now() + 6000;
+    const tools = [];
+    const seen = new Set();
+    let cursor;
+    for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error('MCP tools/list deadline exceeded');
+      const res = await this.request('tools/list', cursor === undefined ? {} : { cursor }, remaining);
+      if (!Array.isArray(res?.tools)) throw new Error('Invalid MCP tool catalog');
+      if (tools.length + res.tools.length > MAX_SERVER_TOOLS) {
+        throw new Error('MCP tool catalog exceeds the tool limit');
+      }
+      for (const tool of res.tools) {
+        if (typeof tool?.name !== 'string' || !tool.name.trim()) throw new Error('Invalid MCP tool name');
+        tools.push(tool);
+      }
+      cursor = res.nextCursor;
+      if (cursor === undefined) return tools;
+      if (typeof cursor !== 'string' || seen.has(cursor)) {
+        throw new Error('MCP tools/list returned an invalid or repeated cursor');
+      }
+      seen.add(cursor);
+    }
+    throw new Error('MCP tools/list exceeded the page limit');
   }
 
-  async callTool(toolName, args, timeoutMs = 20000) {
+  async callTool(toolName, args, { signal = null } = {}) {
     await this.connect();
-    const res = await this.request(
-      'tools/call',
-      { name: toolName, arguments: args ?? {} },
-      timeoutMs,
-    );
-    if (Array.isArray(res?.content)) {
-      return res.content
-        .map((c) => (c.type === 'text' ? c.text : JSON.stringify(c)))
-        .join('\n');
+    signal?.throwIfAborted();
+    let res;
+    try {
+      res = await this.request('tools/call', { name: toolName, arguments: args ?? {} }, 20000, signal);
+    } catch (err) {
+      // An explicit protocol error is a response. A lost response is not evidence
+      // that the remote effect did not happen; never retry it automatically.
+      if (err instanceof McpResponseError) return { isError: true, text: err.message };
+      return { outcomeUnknown: true, text: 'MCP tools/call 未收到可确认的响应。' };
     }
-    return JSON.stringify(res ?? {});
+    if (!res || typeof res !== 'object' ||
+        (!Array.isArray(res.content) && (!res.structuredContent || typeof res.structuredContent !== 'object')) ||
+        (res.isError !== undefined && typeof res.isError !== 'boolean')) {
+      return { outcomeUnknown: true, text: 'MCP tools/call 返回了无效的响应。' };
+    }
+    const text = Array.isArray(res.content)
+      ? res.content.map((c) => (c?.type === 'text' ? c.text : JSON.stringify(c))).join('\n')
+      : '';
+    return { text: text || JSON.stringify(res.structuredContent ?? {}), isError: res.isError === true };
   }
 
   close() {
@@ -286,6 +329,7 @@ export class McpHub {
     this.store = store;
     this.trustWorkspaceMcp = Boolean(trustWorkspaceMcp);
     this.conns = new Map(); // `${workspaceRoot}::${serverName}` -> StdioMcpConnection
+    this.closed = false;
   }
 
   async discoverTools(
@@ -307,45 +351,60 @@ export class McpHub {
         trustWorkspaceMcp !== null ? Boolean(trustWorkspaceMcp) : this.trustWorkspaceMcp,
       onUntrusted,
     });
-    const tools = [];
-    for (const [serverName, argv] of Object.entries(specs)) {
-      if (includeServers instanceof Set && !includeServers.has(serverName)) {
-        continue;
-      }
-      const key = `${resolve(workspaceRoot)}::${serverName}`;
-      let conn = this.conns.get(key);
-      if (!conn) {
-        conn = new StdioMcpConnection(serverName, argv, resolve(workspaceRoot));
-        this.conns.set(key, conn);
-      }
-      try {
-        const remote = await conn.listTools();
-        for (const t of remote) {
-          const safeServer = serverName.replace(/[^a-zA-Z0-9_-]/g, '_');
-          const safeTool = String(t.name).replace(/[^a-zA-Z0-9_-]/g, '_');
-          tools.push({
-            fullName: `mcp__${safeServer}__${safeTool}`,
+    const entries = Object.entries(specs).filter(([name]) =>
+      !(includeServers instanceof Set) || includeServers.has(name),
+    );
+    const results = new Array(entries.length);
+    let next = 0;
+    const work = async () => {
+      while (!this.closed && next < entries.length) {
+        const index = next++;
+        const [serverName, argv] = entries[index];
+        const key = `${resolve(workspaceRoot)}::${serverName}`;
+        let conn = this.conns.get(key);
+        if (!conn) {
+          conn = new StdioMcpConnection(serverName, argv, resolve(workspaceRoot));
+          this.conns.set(key, conn);
+        }
+        try {
+          const remote = await conn.listTools();
+          results[index] = { serverName, tools: remote.map((t) => ({
+            fullName: `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__${t.name.replace(/[^a-zA-Z0-9_-]/g, '_')}`,
             serverName,
             toolName: t.name,
             description: `[MCP:${serverName}] ${t.description || t.name}`,
             parameters: t.inputSchema ?? { type: 'object', properties: {} },
-            call: (args) => conn.callTool(t.name, args),
-          });
+            call: (args, opts) => {
+              if (this.closed) throw new Error('MCP hub is closed');
+              return conn.callTool(t.name, args, opts);
+            },
+          })) };
+        } catch (err) {
+          results[index] = { serverName, tools: [], error: String(err?.message ?? err) };
         }
-        onServerResult?.(serverName, { ok: true, toolCount: remote.length, error: null });
-      } catch (err) {
-        onServerResult?.(serverName, {
-          ok: false,
-          toolCount: 0,
-          error: String(err?.message ?? err),
-        });
-        // Offline MCP server degrades gracefully without crashing the session
       }
+    };
+    await Promise.all(Array.from({ length: Math.min(MAX_DISCOVERY_CONCURRENCY, entries.length) }, work));
+    if (this.closed) return [];
+    const counts = new Map();
+    for (const { tools } of results) {
+      for (const t of tools) counts.set(t.fullName, (counts.get(t.fullName) ?? 0) + 1);
     }
-    return tools;
+    return results.flatMap(({ serverName, tools, error }) => {
+      // A normalized alias must not silently bind to a different server/tool.
+      const unique = tools.filter((t) => counts.get(t.fullName) === 1);
+      const collision = unique.length !== tools.length;
+      onServerResult?.(serverName, {
+        ok: !error && (!collision || unique.length > 0),
+        toolCount: unique.length,
+        error: error ?? (collision ? 'Ambiguous MCP tool aliases omitted' : null),
+      });
+      return unique;
+    });
   }
 
   close() {
+    this.closed = true;
     for (const c of this.conns.values()) c.close();
     this.conns.clear();
   }

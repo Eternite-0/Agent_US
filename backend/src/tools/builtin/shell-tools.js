@@ -50,7 +50,7 @@ export class BackgroundProcessManager {
     child.stderr.on('data', append);
     child.on('close', (code) => {
       entry.running = false;
-      entry.exitCode = code ?? 0;
+      entry.exitCode = code ?? entry.exitCode ?? 1;
     });
     child.on('error', (err) => {
       entry.running = false;
@@ -105,7 +105,7 @@ export function createShellTools({
     defineTool({
       name: 'bash',
       description:
-        '在当前项目工作区执行本地终端命令（实时流式日志输出），适合运行测试、构建、git 等一次性命令。',
+        '在工作区执行一次性终端命令（测试、构建、git 等）。将测试/构建单独调用，检查真实退出状态；失败修复后用相同命令和目录重跑，不以无关命令成功代替。',
       effectClass: EFFECT_CLASSES.IRREVERSIBLE_SIDE_EFFECT,
       riskLevel: RISK_LEVELS.HIGH,
       replayable: false,
@@ -137,8 +137,13 @@ export function createShellTools({
               ...chunk,
             }),
         });
+        const exitCode = Number.isInteger(res.exitCode) ? res.exitCode : 1;
+        ctx?.reportOutcome?.({
+          exitCode,
+          ...(res.timedOut ? { errorCode: 'COMMAND_TIMEOUT', outcomeUnknown: true } : {}),
+        });
         const combined = [
-          `exitCode: ${res.exitCode}`,
+          `exitCode: ${exitCode}`,
           res.stdout?.trim() ? `stdout:\n${res.stdout.trim()}` : '',
           res.stderr?.trim() ? `stderr:\n${res.stderr.trim()}` : '',
         ]
@@ -179,7 +184,7 @@ export function createShellTools({
 
     defineTool({
       name: 'read_process_output',
-      description: '读取后台进程最近的运行状态与日志输出。',
+      description: '按 processId 读取后台进程状态和日志。running=true 表示还未完成，不能据此宣布验证通过。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
       riskLevel: RISK_LEVELS.LOW,
       replayable: true,
@@ -193,7 +198,14 @@ export function createShellTools({
         const info = bgProcs.read(String(args.processId ?? ''), {
           tailChars: args.tailChars,
         });
-        if (!info) return `未找到后台进程: ${args.processId}`;
+        if (!info) {
+          ctx?.reportOutcome?.({ errorCode: 'PROCESS_NOT_FOUND' });
+          return `未找到后台进程: ${args.processId}`;
+        }
+        if (info.running) ctx?.reportOutcome?.({ pending: true });
+        else if (info.exitCode !== 0) {
+          ctx?.reportOutcome?.({ exitCode: info.exitCode, errorCode: 'PROCESS_NON_ZERO_EXIT' });
+        }
         return wrapResult(
           'read_process_output',
           `processId: ${info.id} | running: ${info.running} | exitCode: ${info.exitCode}\n${info.output || '(暂无输出)'}`,
@@ -214,6 +226,7 @@ export function createShellTools({
       async execute(args, ctx) {
         await guardFallback('kill_process', { processId: args.processId }, ctx);
         const ok = bgProcs.kill(String(args.processId ?? ''));
+        if (!ok) ctx?.reportOutcome?.({ errorCode: 'PROCESS_NOT_FOUND' });
         return ok ? `已停止后台进程 ${args.processId}` : `未找到后台进程 ${args.processId}`;
       },
     }),

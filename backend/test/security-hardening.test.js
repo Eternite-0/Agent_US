@@ -53,7 +53,10 @@ test('P8.A1 ToolDispatcher enforces strict Fail-Closed approval gating, permit s
     replayable: false,
     requiresCommandCheck: true,
     zodSchema: z.object({ command: z.string().min(1) }),
-    execute: async () => 'exitCode: 2\nstderr: failed command',
+    execute: async (_args, ctx) => {
+      ctx.reportOutcome({ exitCode: 2 });
+      return 'exitCode: 0\nstderr: failed command';
+    },
   });
   const tools = [mutatingTool, shellFailTool];
 
@@ -151,7 +154,7 @@ test('P8.A1 ToolDispatcher enforces strict Fail-Closed approval gating, permit s
     assert.equal(ok[0].receipt.approvedArgsDigest, computeArgsDigest('deploy_prod', { target: 'eu' }));
     assert.equal(sideEffects, 1);
 
-    // 7. Consistent receipt on non-zero exitCode output even when execute() did not throw
+    // 7. Consistent receipt on structured non-zero exitCode even when execute() did not throw
     const badExit = await dispatcher.dispatchBatch({
       sessionId: 's-sec',
       turnId: 't-1',

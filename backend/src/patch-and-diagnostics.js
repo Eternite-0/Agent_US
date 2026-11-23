@@ -581,25 +581,34 @@ export function runQuickDiagnostics(fullPath, relPath) {
  */
 export async function scheduleToolBatch(calls, isReadOnlyFn, executeOneFn) {
   const results = new Array(calls.length);
+  const maxParallelReads = 4;
   let i = 0;
   while (i < calls.length) {
-    if (isReadOnlyFn(calls[i])) {
-      const batch = [];
-      while (i < calls.length && isReadOnlyFn(calls[i])) {
-        batch.push({ index: i, call: calls[i] });
-        i++;
-      }
-      const settled = await Promise.all(
-        batch.map(async ({ index, call }) => ({
-          index,
-          value: await executeOneFn(call),
-        })),
-      );
-      for (const s of settled) results[s.index] = s.value;
-    } else {
+    if (!isReadOnlyFn(calls[i])) {
       results[i] = await executeOneFn(calls[i]);
       i++;
+      continue;
     }
+
+    let end = i + 1;
+    while (end < calls.length && isReadOnlyFn(calls[end])) end++;
+    let stopped = false;
+    let failure;
+    const worker = async () => {
+      while (!stopped && i < end) {
+        const index = i++;
+        try {
+          results[index] = await executeOneFn(calls[index]);
+        } catch (err) {
+          if (!stopped) failure = err;
+          stopped = true;
+        }
+      }
+    };
+    // A fatal dispatch exception stops admissions, but drain in-flight calls so a
+    // turn cannot settle or cross a write barrier with sibling dispatch still active.
+    await Promise.all(Array.from({ length: Math.min(maxParallelReads, end - i) }, worker));
+    if (stopped) throw failure;
   }
   return results;
 }

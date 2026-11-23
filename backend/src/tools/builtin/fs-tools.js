@@ -181,7 +181,7 @@ export function createFsTools({
     defineTool({
       name: 'edit_file',
       description:
-        '对工作区已有文件做精准局部替换（内置 Codex 4 级容错匹配与自动语法诊断）。',
+        '对已有文件做局部替换。先用 read_file 获取最新内容；若文件已变化或目标不匹配，重新读取再编辑。多文件修改可用 apply_patch；快速语法诊断不代替测试。',
       effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
       riskLevel: RISK_LEVELS.MEDIUM,
       replayable: true,
@@ -301,7 +301,7 @@ export function createFsTools({
 
     defineTool({
       name: 'glob',
-      description: '按通配符模式快速查找工作区内的文件（自动忽略 node_modules 与 .git）。',
+      description: '按文件名/路径通配符找文件（不搜索内容）；找文本或符号引用用 grep。自动忽略 node_modules 和 .git。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
       riskLevel: RISK_LEVELS.LOW,
       replayable: true,
@@ -332,7 +332,7 @@ export function createFsTools({
 
     defineTool({
       name: 'grep',
-      description: '在工作区代码文件中搜索文本或正则表达式，返回精确的文件名、行号和内容。',
+      description: '按文本或正则找代码位置（文件名、行号、内容）。找到后用 read_file 读取相关行；独立的只读定位可在同一批调用。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
       riskLevel: RISK_LEVELS.LOW,
       replayable: true,

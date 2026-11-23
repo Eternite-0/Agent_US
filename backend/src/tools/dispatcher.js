@@ -11,6 +11,16 @@ export function computeArgsDigest(toolName, args) {
   return sha256Hex(canonicalJson({ tool: String(toolName || ''), args: args ?? {} }));
 }
 
+export function isParallelReadTool(tool) {
+  const meta = tool?.meta;
+  if (!meta?.readOnly || !meta.replayable || meta.outward || meta.effectClass !== 'read_only') return false;
+  try {
+    return typeof tool.isConcurrencySafe !== 'function' || tool.isConcurrencySafe() === true;
+  } catch {
+    return false;
+  }
+}
+
 function deepFreeze(value, seen = new WeakSet()) {
   if (!value || typeof value !== 'object') return value;
   if (seen.has(value) || Object.isFrozen(value)) return value;
@@ -141,17 +151,7 @@ export class ToolDispatcher {
 
     return scheduleToolBatch(
       toolCalls,
-      (tc) => {
-        const impl = toolMap.get(tc.name);
-        if (typeof impl?.isConcurrencySafe === 'function') {
-          try {
-            return impl.isConcurrencySafe() === true;
-          } catch {
-            return false;
-          }
-        }
-        return Boolean(impl?.meta?.readOnly);
-      },
+      (tc) => isParallelReadTool(toolMap.get(tc.name)),
       (tc) =>
         this.#dispatchOne({
           tc,
@@ -778,6 +778,7 @@ export class ToolDispatcher {
     let output = '';
     let isError = false;
     let execErr = null;
+    let outcome = null;
     try {
       output = String(
         (await withTraceContext({ toolCallId: tc.id, sessionId, turnId }, () =>
@@ -790,6 +791,9 @@ export class ToolDispatcher {
               tainted,
               approvalId,
               permitProof: permit,
+              // Only registered implementations can report facts here; payload text
+              // (including shell stdout and MCP content) is never parsed as status.
+              reportOutcome: (facts) => { outcome = { ...facts }; },
             }),
           ),
         )) ?? '',
@@ -800,20 +804,22 @@ export class ToolDispatcher {
       output = `执行失败：${String(err?.message ?? err)}`;
     }
 
-    const unwrappedHead = output.replace(/^<untrusted\b[^>]*>/, '');
-    const exitMatch = /^exitCode:\s*(-?\d+)/m.exec(unwrappedHead);
-    const parsedExit = exitMatch ? Number(exitMatch[1]) : null;
-    if (parsedExit !== null && parsedExit !== 0) {
-      isError = true;
-    }
+    const parsedExit = Number.isInteger(outcome?.exitCode) ? outcome.exitCode : null;
     const abortedMidFlight = Boolean(signal?.aborted || execErr?.name === 'AbortError');
-    const finalStatus =
-      abortedMidFlight && (!meta.replayable || meta.outward)
-        ? 'outcome_unknown'
-        : isError
-          ? 'failed'
-          : 'finished';
-    const finalExitCode = parsedExit ?? (isError ? 1 : 0);
+    const unknown = (abortedMidFlight || outcome?.outcomeUnknown === true) &&
+      (!meta.replayable || meta.outward);
+    isError ||= abortedMidFlight || unknown || Boolean(outcome?.errorCode) ||
+      (parsedExit !== null && parsedExit !== 0);
+    const finalStatus = unknown ? 'outcome_unknown' : isError ? 'failed' : 'finished';
+    const finalExitCode = unknown ? null : parsedExit ?? (isError ? 1 : 0);
+    const errorCode = unknown
+      ? outcome?.errorCode ?? 'INTERRUPTED_UNKNOWN_OUTCOME'
+      : isError
+        ? outcome?.errorCode ?? (parsedExit !== null && parsedExit !== 0 ? 'NON_ZERO_EXIT' : 'TOOL_EXECUTION_ERROR')
+        : null;
+    if (outcome && errorCode) {
+      output = `[${errorCode}]${unknown ? ' 执行结果未知；需先核对，不要自动重试。' : ''}\n${output}`;
+    }
 
     if (receipt && this.reconciler) {
       receipt = this.reconciler.recordReceiptFinish(receipt.id, {
@@ -821,14 +827,7 @@ export class ToolDispatcher {
         output: redactSecrets(output),
         exitCode: finalExitCode,
         durationMs: Date.now() - tStart,
-        errorCode:
-          finalStatus === 'outcome_unknown'
-            ? 'INTERRUPTED_UNKNOWN_OUTCOME'
-            : isError
-              ? parsedExit !== null && parsedExit !== 0
-                ? 'NON_ZERO_EXIT'
-                : 'TOOL_EXECUTION_ERROR'
-              : null,
+        errorCode,
         leaseGuard,
       });
       this.#safeEmit({
@@ -875,6 +874,7 @@ export class ToolDispatcher {
       parsedArgs: effectiveArgs,
       output,
       isError,
+      pending: !isError && outcome?.pending === true,
       durationMs: Date.now() - tStart,
       receipt,
     };

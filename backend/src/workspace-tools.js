@@ -97,7 +97,7 @@ function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback 
   return defineTool({
     name: 'inspect_repository',
     description:
-      '只读分析工作区仓库结构、Git 状态、项目配置与测试/构建命令、模块调用图及问题相关文件排序（严格受沙箱与密钥隔离约束）。',
+      '陌生仓库优先用此工具定位入口、测试/构建命令及相关模块；然后用 grep/read_file 核对实际代码。输出建议命令不代表已运行或通过。',
     effectClass: EFFECT_CLASSES.READ_ONLY,
     riskLevel: RISK_LEVELS.LOW,
     readOnly: true,
