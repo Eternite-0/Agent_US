@@ -63,7 +63,7 @@ const PROVIDER_LOGIN_GROUPS: Record<
 > = {
   ready: {
     label: '可直接登录 / 导入',
-    description: '通过内置网页登录，或扫描本机凭证，完成后自动返回 Token 并加入账号池。',
+    description: '可通过内置网关授权或导入本机凭证接入，具体方式见卡片。',
   },
   manual: {
     label: '需手动获取 Token / 配置网关',
@@ -87,6 +87,7 @@ function providerLoginGroup(p: ProviderPreset): ProviderLoginGroupId {
 }
 
 function providerLoginBadge(p: ProviderPreset): string {
+  if (p.nativeLogin) return '内置网关网页登录';
   switch (providerLoginMode(p)) {
     case 'web':
       return '一键网页登录';
@@ -125,13 +126,14 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
 
   // Native Web Login (OpenRouter PKCE / GitHub Copilot Device Flow / Official Portal)
   const [webFlowId, setWebFlowId] = useState<string | null>(null);
-  const [webEngine, setWebEngine] = useState<'openrouter-pkce' | 'github-device' | 'portal-token' | null>(null);
+  const [webEngine, setWebEngine] = useState<'openrouter-pkce' | 'github-device' | 'provider-native' | 'portal-token' | null>(null);
   const [webAuthUrl, setWebAuthUrl] = useState<string | null>(null);
   const [webUserCode, setWebUserCode] = useState<string | null>(null);
   const [webHint, setWebHint] = useState<string | null>(null);
   const [webStarting, setWebStarting] = useState(false);
   const [webCallbackInput, setWebCallbackInput] = useState('');
   const [webSubmittingCb, setWebSubmittingCb] = useState(false);
+  const flowGeneration = useRef(0);
   const pollTimerRef = useRef<number | null>(null);
 
   // Local CLI auto-scan & Credential File Import
@@ -177,6 +179,9 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
   };
 
   const resetFlowState = () => {
+    flowGeneration.current++;
+    if (webFlowId) void client?.cancelWebLogin?.(webFlowId).catch(() => {});
+    setWebStarting(false);
     stopPolling();
     setWebFlowId(null);
     setWebEngine(null);
@@ -216,23 +221,29 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialPresetId, initialCategory]);
 
-  useEffect(() => () => stopPolling(), []);
+  useEffect(() => () => { flowGeneration.current++; stopPolling(); }, []);
 
   // Poll active OAuth / Device Flow login status
   useEffect(() => {
     if (!open || !webFlowId || !client?.getWebLoginStatus) return;
     if (webEngine === 'portal-token') return;
     stopPolling();
+    let active = true;
+    let polling = false;
+    const generation = flowGeneration.current;
     pollTimerRef.current = window.setInterval(async () => {
+      if (polling) return;
+      polling = true;
       try {
         const st = await client.getWebLoginStatus!(webFlowId);
+        if (!active || generation !== flowGeneration.current) return;
         if (st.hint) setWebHint(st.hint);
         if (st.status === 'done') {
           stopPolling();
           const syncedCount = st.syncedModelsCount ?? 0;
           onToast?.(
-            `已登录「${st.account?.label || selectedPreset?.name}」${syncedCount ? `，同步 ${syncedCount} 个模型` : ''}`,
-            'success',
+            st.hint || `已登录「${st.account?.label || selectedPreset?.name}」${syncedCount ? `，同步 ${syncedCount} 个模型` : ''}`,
+            st.hint ? 'warning' : 'success',
           );
           await onAccountSynced?.();
           onClose();
@@ -245,9 +256,9 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
         }
       } catch {
         // transient poll error
-      }
+      } finally { polling = false; }
     }, 2500);
-    return () => stopPolling();
+    return () => { active = false; stopPolling(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, webFlowId, webEngine]);
 
@@ -310,17 +321,11 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
   }, [filteredPresets]);
 
   const handleClose = () => {
-    if (webFlowId && client?.cancelWebLogin) {
-      void client.cancelWebLogin(webFlowId).catch(() => {});
-    }
     resetFlowState();
     onClose();
   };
 
   const handleBackToGrid = () => {
-    if (webFlowId && client?.cancelWebLogin) {
-      void client.cancelWebLogin(webFlowId).catch(() => {});
-    }
     resetFlowState();
     setSelectedPreset(null);
   };
@@ -329,11 +334,16 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
     if (!selectedPreset || !client?.startWebLogin) return;
     setError(null);
     setWebStarting(true);
+    const generation = flowGeneration.current;
     try {
       const res = await client.startWebLogin({
         preset: selectedPreset.id,
         autoSync,
       });
+      if (generation !== flowGeneration.current) {
+        if (res.flowId) void client.cancelWebLogin?.(res.flowId).catch(() => {});
+        return;
+      }
       if (!res.ok) {
         setError(res.message || '发起网页登录失败');
         return;
@@ -349,7 +359,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setWebStarting(false);
+      if (generation === flowGeneration.current) setWebStarting(false);
     }
   };
 
@@ -491,6 +501,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
   if (!open) return null;
 
   const editionGroup = selectedPreset ? findEditionGroup(selectedPreset.id) : null;
+  const isProviderLogin = selectedPreset?.nativeLogin === true;
   const isNativeOAuth =
     selectedPreset?.id === 'openrouter' || selectedPreset?.id === 'github-copilot';
 
@@ -683,13 +694,14 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                     className="a2a-segment-btn"
                     data-active={method === 'manual' ? 'true' : undefined}
                     onClick={() => {
+                      if (method === 'web') resetFlowState();
                       setError(null);
                       setMethod('manual');
                     }}
                   >
                     API Key / 反代地址
                   </button>
-                  {(isNativeOAuth || selectedPreset.category !== 'custom' || selectedPreset.officialUrl) && (
+                  {(isProviderLogin || isNativeOAuth || selectedPreset.category !== 'custom' || selectedPreset.officialUrl) && (
                     <button
                       type="button"
                       className="a2a-segment-btn"
@@ -699,7 +711,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                         setMethod('web');
                       }}
                     >
-                      {isNativeOAuth ? '网页登录 (原生 OAuth)' : '打开官网获取 Key'}
+                      {isProviderLogin ? '通过内置网关登录' : isNativeOAuth ? '网页登录 (原生 OAuth)' : '打开官网获取 Key'}
                     </button>
                   )}
                   <button
@@ -707,6 +719,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                     className="a2a-segment-btn"
                     data-active={method === 'file' ? 'true' : undefined}
                     onClick={() => {
+                      if (method === 'web') resetFlowState();
                       setError(null);
                       setMethod('file');
                     }}
@@ -787,7 +800,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                   <div className="a2a-login-card">
                     {!webFlowId ? (
                       <div className="a2a-login-card-text">
-                        {selectedPreset.id === 'openrouter'
+                        {isProviderLogin ? '在供应商网站授权后，内置网关会将凭证加密保存到本机账号池，无需手动粘贴 Token。' : selectedPreset.id === 'openrouter'
                           ? '内置标准 OpenRouter OAuth2 PKCE：新标签页确认授权后自动回调本地 8787 换取 API Key 入池，零外部依赖。'
                           : selectedPreset.id === 'github-copilot'
                             ? '内置官方 GitHub OAuth 设备码登录：获取 8 位验证码并在 GitHub 确认后，自动换取 Copilot 推理令牌直连（无需 Magpie）。'
@@ -849,7 +862,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                           </div>
                         )}
 
-                        {webEngine !== 'github-device' && (
+                        {(webEngine === 'openrouter-pkce' || webEngine === 'portal-token') && (
                           <div className="a2a-field">
                             <label className="a2a-field-label">
                               {webEngine === 'openrouter-pkce'
@@ -993,7 +1006,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                 {method === 'web'
                   ? webFlowId
                     ? '授权完成后将自动入池并刷新模型列表'
-                    : isNativeOAuth
+                    : isProviderLogin ? '由内置网关完成，无需外部服务' : isNativeOAuth
                       ? '单进程内置 OAuth，无需任何外部网关服务'
                       : '将在新标签页打开官网控制台'
                   : method === 'file'
@@ -1007,7 +1020,7 @@ export const AddAccountModal: React.FC<AddAccountModalProps> = ({
                     type="button"
                     className="codex-btn codex-btn-primary"
                     disabled={webStarting}
-                    onClick={handleStartWebLogin}
+                    onClick={() => webFlowId && webAuthUrl ? window.open(webAuthUrl, '_blank', 'noopener,noreferrer') : void handleStartWebLogin()}
                   >
                     {webStarting ? '正在启动…' : webFlowId ? '重新打开网页' : '打开网页登录'}
                   </button>

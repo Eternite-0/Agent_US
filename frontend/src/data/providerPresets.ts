@@ -1316,7 +1316,7 @@ export function mergeProviderPresetCatalog(
   for (const [id, builtin] of Object.entries(BUILTIN_PROVIDER_PRESETS.items)) {
     const remote = remoteItems[id];
     items[id] = remote
-      ? { ...remote, ...builtin, accountCount: remote.accountCount ?? builtin.accountCount }
+      ? { ...remote, ...builtin, ...(remote.nativeLogin ? { nativeLogin: remote.nativeLogin, loginMode: remote.loginMode, category: remote.category } : {}), accountCount: remote.accountCount ?? builtin.accountCount }
       : builtin;
   }
 

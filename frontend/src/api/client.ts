@@ -302,7 +302,7 @@ export interface AgentBackendClient {
   }) => Promise<{
     ok: boolean;
     flowId?: string;
-    engine?: 'openrouter-pkce' | 'github-device' | 'portal-token';
+    engine?: 'openrouter-pkce' | 'github-device' | 'provider-native' | 'portal-token';
     preset?: string;
     authUrl?: string;
     state?: string;
@@ -1295,7 +1295,7 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.req<{
       ok: boolean;
       flowId?: string;
-      engine?: 'openrouter-pkce' | 'github-device' | 'portal-token';
+      engine?: 'openrouter-pkce' | 'github-device' | 'provider-native' | 'portal-token';
       preset?: string;
       authUrl?: string;
       state?: string;
@@ -1807,6 +1807,9 @@ export class LiveBackendClient implements AgentBackendClient {
         sequence: Number(msg.seq ?? index),
         text: String(msg.content ?? ''),
         reasoning: typeof msg.reasoning === 'string' ? msg.reasoning : undefined,
+        toolCalls: Array.isArray(msg.toolCalls)
+          ? msg.toolCalls.filter((call) => typeof call?.id === 'string' && typeof call?.name === 'string')
+          : undefined,
         name: typeof msg.toolName === 'string' ? msg.toolName : undefined,
         callId: typeof msg.toolCallId === 'string' ? msg.toolCallId : undefined,
         meta:
@@ -1900,6 +1903,7 @@ export class LiveBackendClient implements AgentBackendClient {
       artifacts: [] as Artifact[],
       usage,
       events,
+      swarmRuns,
     };
   }
 

@@ -1,3 +1,4 @@
+import { resolveComposerDraft, type ComposerMode } from '../utils/composerMode';
 import { isSwarmCommand, swarmAttachmentError } from '../utils/swarmCommand';
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
@@ -21,7 +22,9 @@ import {
   IconChevronDown,
   IconChevronRight,
   IconCircleClose,
-  IconDagNodes,
+  IconAgentTeam,
+  IconLightbulb,
+  IconTarget,
   IconClose,
   IconFileDoc,
   IconFileEdit,
@@ -32,7 +35,6 @@ import {
   IconPlus,
   IconPuzzle,
   IconSkillsNode,
-  IconSparkle,
   IconReset,
   IconSearch,
   IconShieldAlert,
@@ -68,7 +70,7 @@ interface ComposerProps {
   commandAvailability?: CommandAvailability;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal?: (goal: string, files: Record<string, string>) => Promise<boolean>;
-  onSubmit: (text: string, files: Record<string, string>) => Promise<void> | void;
+  onSubmit: (text: string, files: Record<string, string>) => Promise<boolean | void> | void;
   onStop?: () => void;
 }
 
@@ -114,6 +116,9 @@ export const Composer: React.FC<ComposerProps> = ({
   onStop,
 }) => {
   const [text, setText] = useState('');
+  const [draftMode, setDraftMode] = useState<'swarm' | 'goal' | null>(null);
+  const activeMode = draftMode ?? (codexMode === 'Work' ? 'plan' : null);
+  const sendingRef = useRef(false);
   const [files, setFiles] = useState<Record<string, string>>({});
   const [popover, setPopover] = useState<PopoverKind>(null);
   const [dragging, setDragging] = useState(false);
@@ -240,8 +245,8 @@ ${draftInjection.text}`
     const addActions: MentionItem[] = [
       { id: 'files', label: '文件和文件夹', icon: IconFolder, action: 'files' },
       { id: 'snapshot', label: '附加应用快照', description: canCaptureWindow ? '截取当前 Agent_US 窗口' : '在桌面版可用', icon: IconImageInspect, action: 'snapshot', disabled: !canCaptureWindow },
-      { id: 'goal', label: '目标', description: onSubmitGoal ? '设置要持续追求的目标' : '当前连接未提供自主任务', icon: IconSparkle, action: 'goal', disabled: !onSubmitGoal },
-      { id: 'plan', label: '计划模式', description: codexMode === 'Work' ? '退出计划模式' : '先制定计划，再审批执行', icon: IconDagNodes, action: 'plan', disabled: !onSlashCommand },
+      { id: 'goal', label: '目标', description: onSubmitGoal ? '设置要持续追求的目标' : '当前连接未提供自主任务', icon: IconTarget, action: 'goal', disabled: !onSubmitGoal },
+      { id: 'plan', label: '计划模式', description: codexMode === 'Work' ? '退出计划模式' : '先制定计划，再审批执行', icon: IconLightbulb, action: 'plan', disabled: !onSlashCommand },
       { id: 'sketch', label: '绘图', description: '绘制草图并附加到消息', icon: IconFileEdit, action: 'sketch' },
     ];
     if (!mentionToken.scope) choices.push({ label: '添加', items: addActions });
@@ -347,6 +352,40 @@ ${draftInjection.text}`
   };
 
 
+  const setMode = (mode: ComposerMode, draft = '') => {
+    const command = findSlashCommand(`/${mode}`);
+    const blocked = command && commandBlock(command);
+    if (blocked) {
+      setCommandError(blocked);
+      return;
+    }
+    if (mode === 'plan') {
+      if (codexMode !== 'Work' || !draftMode) {
+        if (command) onSlashCommand?.(command);
+      }
+      setDraftMode(null);
+    } else {
+      setDraftMode(mode);
+    }
+    setText(draft);
+    setCommandError('');
+    setAddContextOpen(false);
+    setMenuHighlight(null);
+    setMenuDismissed(true);
+    setPopover(null);
+    placeCaret(draft.length);
+  };
+
+  const clearMode = () => {
+    if (draftMode) setDraftMode(null);
+    else if (activeMode === 'plan') {
+      const command = findSlashCommand('/plan');
+      if (command) onSlashCommand?.(command);
+    }
+    setCommandError('');
+    placeCaret(caret);
+  };
+
   const executeSlash = (command: SlashCommand) => {
     const blocked = commandBlock(command);
     if (blocked) {
@@ -356,8 +395,13 @@ ${draftInjection.text}`
     setCommandError('');
     setAddContextOpen(false);
     const { cmd } = command;
-    const insertion = cmd === '/swarm' ? '/swarm ' : cmd === '/goal' ? '/goal ' : cmd === '/file' ? '@file:' : cmd === '/folder' ? '@folder:' : cmd === '/help' ? '/' : '';
-    setMenuDismissed(Boolean(insertion === '/goal '));
+    if (cmd === '/swarm' || cmd === '/goal' || cmd === '/plan') {
+      setMode(cmd.slice(1) as ComposerMode);
+      return;
+    }
+    if (cmd === '/chat' || cmd === '/run') setDraftMode(null);
+    const insertion = cmd === '/file' ? '@file:' : cmd === '/folder' ? '@folder:' : cmd === '/help' ? '/' : '';
+    setMenuDismissed(false);
     setText(insertion);
     setCaret(insertion.length);
     if (insertion) {
@@ -391,10 +435,8 @@ ${draftInjection.text}`
     const rest = text.slice(mentionToken.end);
     setAddContextOpen(false);
     setMenuDismissed(true);
-    if (item.action === 'goal') {
-      const next = `/goal ${(before + rest).trim().replace(/^\/goal\s+/i, '')}`;
-      setText(next);
-      placeCaret(next.length);
+    if (item.action === 'goal' || item.action === 'plan') {
+      setMode(item.action, (before + rest).trim());
     } else if (item.action) {
       setText(before + rest);
       placeCaret(before.length);
@@ -444,50 +486,56 @@ ${draftInjection.text}`
     placeCaret(draft.length);
   };
 
+  const clearDraft = () => {
+    setText('');
+    setCaret(0);
+    setFiles({});
+    setDraftMode(null);
+    setMenuDismissed(true);
+  };
+
   const handleSend = async () => {
-    const trimmed = text.trim();
-    if (!trimmed || submitting) return;
-    const swarm = isSwarmCommand(trimmed);
-    const blocked = swarm && ((pendingFileReads.current > 0 ? '请等待附件读取完成。' : swarmAttachmentError(trimmed, files)) || commandAvailability?.['/swarm']);
-    if (blocked) {
-      setCommandError(blocked);
-      return;
-    }
-    if (!swarm && slashQuery !== null && slashMatches.length) {
+    if (submitting || sendingRef.current) return;
+    const draft = resolveComposerDraft(text, activeMode);
+    if (draft.kind === 'empty') return;
+    if (slashQuery !== null && slashMatches.length > 0 && !exactSlash) {
       executeSlash(slashMatches[selectedIndex]);
       return;
     }
-    const [word] = trimmed.split(/\s/, 1);
+    if (draft.kind === 'activate') {
+      setMode(draft.mode);
+      return;
+    }
+    const [word] = text.trim().split(/\s/, 1);
     const command = onSlashCommand ? findSlashCommand(word) : undefined;
-    if (!swarm && command && !(command.cmd === '/plan' && trimmed.length > word.length)) {
-      const blocked = commandBlock(command);
-      if (blocked) {
-        setCommandError(blocked);
-        return;
-      }
-      const argument = trimmed.slice(word.length).trim();
-      if (!argument) {
-        executeSlash(command);
-      } else if (command.cmd === '/goal' && onSubmitGoal) {
-        if (await onSubmitGoal(argument, files)) {
-          setText('');
-          setCaret(0);
-          setFiles({});
-          setMenuDismissed(true);
-        }
-      } else {
-        setCommandError(`${command.cmd} 无需参数，请仅输入命令。`);
-      }
+    if (command && !['/plan', '/swarm', '/goal'].includes(command.cmd)) {
+      if (text.trim().length === word.length) executeSlash(command);
+      else setCommandError(`${command.cmd} 无需参数，请仅输入命令。`);
+      return;
+    }
+    const swarm = draft.kind === 'submit' && isSwarmCommand(draft.body);
+    const blocked = (swarm && (swarmAttachmentError(draft.body, files) || commandAvailability?.['/swarm']))
+      || (draft.kind === 'goal' && ((!onSubmitGoal ? '当前连接未提供自主任务' : undefined) || commandAvailability?.['/goal']
+        || (isRunning ? '请等待当前对话执行结束' : undefined)));
+    if (blocked || pendingFileReads.current > 0) {
+      setCommandError(blocked || '请等待附件读取完成。');
       return;
     }
     setCommandError('');
     const attached = { ...files };
-    setText('');
-    setCaret(0);
-    setFiles({});
-    if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    const input = !swarm && codexMode === 'Work' && !/^\/plan\s/.test(trimmed) ? `/plan ${trimmed}` : trimmed;
-    await onSubmit(input, attached);
+    sendingRef.current = true;
+    try {
+      if (draft.kind === 'goal') {
+        if (await onSubmitGoal?.(draft.body, attached)) clearDraft();
+      } else if (swarm) {
+        if (await onSubmit(draft.body, attached) !== false) clearDraft();
+      } else {
+        clearDraft();
+        await onSubmit(draft.body, attached);
+      }
+    } finally {
+      sendingRef.current = false;
+    }
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -508,8 +556,7 @@ ${draftInjection.text}`
     if (menuCount && !event.shiftKey && (event.key === 'Enter' || event.key === 'Tab')) {
       event.preventDefault();
       if (slashMatches.length) {
-        if (event.key === 'Enter' && slashMatches[selectedIndex].cmd === '/swarm' && isSwarmCommand(text)) void handleSend();
-        else executeSlash(slashMatches[selectedIndex]);
+        executeSlash(slashMatches[selectedIndex]);
       } else insertMention(mentionItems[selectedIndex]);
       return;
     }
@@ -541,6 +588,14 @@ ${draftInjection.text}`
     setEffortByIndex(Math.round(ratio * (EFFORT_STOPS.length - 1)));
   };
 
+  const modeControl = activeMode && {
+    swarm: { label: 'Swarm', icon: IconAgentTeam, placeholder: '描述要交给 Swarm 的任务…' },
+    goal: { label: '目标', icon: IconTarget, placeholder: '描述你的目标，定义可衡量的成果…' },
+    plan: { label: '计划', icon: IconLightbulb, placeholder: '描述你的任务以生成计划…' },
+  }[activeMode];
+  const sendLabel = activeMode === 'swarm' || isSwarmCommand(text) ? '发送 Swarm 命令'
+    : activeMode === 'goal' ? '提交目标' : activeMode === 'plan' ? '提交计划请求'
+      : isRunning ? '实时注入纠偏指令' : '发送消息';
   const displayModel = selectedModel || models[0]?.model || 'Auto Router';
   const attachedKeys = Object.keys(files);
   const filteredProjects = projects.filter((p) =>
@@ -1102,7 +1157,7 @@ ${draftInjection.text}`
           className="codex-composer-textarea"
           rows={1}
           aria-label="消息内容"
-          placeholder="输入消息"
+          placeholder={modeControl?.placeholder ?? "输入消息"}
           value={text}
           aria-controls={menuIsOpen ? menuId : undefined}
           aria-activedescendant={menuCount ? `${menuId}-${selectedIndex}` : undefined}
@@ -1145,13 +1200,6 @@ ${draftInjection.text}`
               <IconPlus size={16} />
             </button>
 
-            {codexMode === 'Work' && onSlashCommand && (
-              <button type="button" className="codex-composer-pill composer-active-plan" aria-label="关闭计划模式"
-                title="关闭计划模式" aria-pressed="true" onClick={() => {
-                  const command = findSlashCommand('/plan');
-                  if (command) onSlashCommand(command);
-                }}><IconDagNodes size={14} /><span>计划模式</span></button>
-            )}
             <div style={{ position: 'relative' }}>
               <button
                 type="button"
@@ -1263,6 +1311,14 @@ ${draftInjection.text}`
               )}
             </div>
 
+            {modeControl && (
+              <div className="composer-mode-slot">
+                <button type="button" className="codex-composer-pill composer-mode-toggle" data-mode={activeMode}
+                  aria-label={`关闭${modeControl.label}模式`} aria-pressed="true" title={`退出${modeControl.label}模式`} onClick={clearMode}>
+                  <modeControl.icon size={16} aria-hidden="true" /><span>{modeControl.label}</span>
+                </button>
+              </div>
+            )}
             {!showHomeTray && renderBranchBadge(true)}
           </div>
 
@@ -1438,7 +1494,7 @@ ${draftInjection.text}`
               )}
             </div>
 
-            {isRunning && onStop && !text.trim() ? (
+            {isRunning && onStop && !text.trim() && !activeMode ? (
               <button
                 type="button"
                 className="codex-send-btn"
@@ -1452,8 +1508,8 @@ ${draftInjection.text}`
               <button
                 type="button"
                 className="codex-send-btn"
-                aria-label={isSwarmCommand(text) ? '发送 Swarm 命令' : isRunning ? '实时注入纠偏指令' : '发送消息'}
-                title={isSwarmCommand(text) ? '发送 Swarm 命令' : isRunning ? 'Agent 运行中：发送实时纠偏指令 (Steer)' : '发送消息'}
+                aria-label={sendLabel}
+                title={sendLabel}
                 disabled={!text.trim() || submitting}
                 onClick={() => void handleSend()}
               >

@@ -47,7 +47,7 @@ interface HomeViewProps {
   commandAvailability?: CommandAvailability;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
-  onSubmitTask: (text: string, files: Record<string, string>) => Promise<void>;
+  onSubmitTask: (text: string, files: Record<string, string>) => Promise<boolean | void>;
   onToggleInspector: () => void;
   onOpenSettings: (section?: string) => void;
 }

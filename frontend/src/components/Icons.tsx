@@ -782,3 +782,15 @@ export const IconSkillsNode: React.FC<IconProps> = ({ size = 16, ...props }) => 
     />
   </svg>
 );
+
+export const IconLightbulb: React.FC<IconProps> = ({ size = 16, ...props }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <path d="M6 12h4m-3.2 2h2.4M6 12c0-2-2-2.4-2-5a4 4 0 1 1 8 0c0 2.6-2 3-2 5M1.25 6h1m11.5 0h1M2.7 2.35l.8.7m9-0.7-.8.7" />
+  </svg>
+);
+
+export const IconTarget: React.FC<IconProps> = ({ size = 16, ...props }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" {...props}>
+    <path d="M13.9 7A6 6 0 1 1 9 2.1M11.05 7.7A3.1 3.1 0 1 1 8.3 4.95M8 8l5.5-5.5m-3 0h3v3" />
+  </svg>
+);

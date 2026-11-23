@@ -7,6 +7,7 @@ import {
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import OpenAI from 'openai';
+import { nativeProviders, nativeRequest } from './providers/browser-session.js';
 import { LlmAdapter, attributionHeaders } from '@deepseek-ai/dsh-llm';
 import { Fault, id as uuid } from './store.js';
 import { withTraceContext } from './observability/trace.js';
@@ -38,6 +39,12 @@ const GATEWAY_FIELDS = [
 ];
 
 export const PROVIDER_PRESETS = {
+  ...Object.fromEntries([...nativeProviders].map(([id, {name}]) => [id, {
+    id, name,
+    category: 'oauth', kind: 'gateway', protocol: 'openai', ownedBy: id,
+    loginMode: 'web', nativeLogin: true, defaultEndpoint: '', fields: GATEWAY_FIELDS,
+    supportsBalance: false, supportsCheckin: false,
+  }])),
   // ---- Native Web Login / Subscription & Local CLI Direct Providers (Zero External Gateway!) ----
   'github-copilot': {
     id: 'github-copilot',
@@ -866,6 +873,7 @@ export class AccountPool {
     this.root = root;
     this.legacyProviders = legacyProviders;
     this.metrics = metrics ?? null;
+    this.sessionRefreshes = new Map();
     this.masterKey = loadOrCreateMasterKey(root);
     this.sessionStickiness = new Map(); // sessionKey -> { accountId, at }
     this.cooldownStrikes = new Map(); // accountId -> consecutive 429 count
@@ -1093,7 +1101,7 @@ export class AccountPool {
     return this.#formatAccount(row, ranks, new Map([[accountId, cnt]]));
   }
 
-  createAccount(input) {
+  createAccount(input, nativeSession = null) {
     const preset = String(input.preset || '').trim();
     if (!preset) throw new Fault('PRESET_REQUIRED', 400);
     const spec = this.getPreset(preset);
@@ -1141,12 +1149,16 @@ export class AccountPool {
           JSON.stringify(models),
           '{}',
           secret ? this.encrypt(secret) : null,
-          secret ? maskSecret(secret) : null,
-          input.expiresAt ? Number(input.expiresAt) : null,
+          nativeSession ? '网页登录' : secret ? maskSecret(secret) : null,
+          nativeSession?.expiresAt || (input.expiresAt ? Number(input.expiresAt) : null),
           JSON.stringify(meta),
           now,
           now,
         );
+      if (nativeSession) {
+        this.store.db.prepare('INSERT INTO native_provider_sessions(accountId, encrypted) VALUES(?,?)')
+          .run(accountId, this.encrypt(JSON.stringify(nativeSession)));
+      }
       // Seed explicit user-entered models into pool_models immediately
       for (const m of models) {
         this.#upsertPoolModelTx(accountId, preset, m, { source: 'manual' });
@@ -1315,7 +1327,30 @@ export class AccountPool {
     return { order };
   }
 
+  async #nativeSession(accountId, provider) {
+    const existing = this.sessionRefreshes.get(accountId);
+    if (existing) return existing;
+    const record = this.store.db.prepare('SELECT encrypted FROM native_provider_sessions WHERE accountId=?').get(accountId);
+    if (!record) throw new Error('账号已移除');
+    const session = JSON.parse(this.decrypt(record.encrypted));
+    if (!session.expiresAt || session.expiresAt > Date.now() + 30000) return session;
+    const pending = provider.refresh(provider, session).then(next => this.store.tx(() => {
+      const updated = this.store.db.prepare('UPDATE native_provider_sessions SET encrypted=? WHERE accountId=? AND encrypted=?')
+        .run(this.encrypt(JSON.stringify(next)), accountId, record.encrypted);
+      if (!updated.changes) throw new Error('账号已变更，请重试');
+      this.store.db.prepare('UPDATE provider_accounts SET expiresAt=?, updatedAt=? WHERE id=?').run(next.expiresAt || null, Date.now(), accountId);
+      return next;
+    })).finally(() => this.sessionRefreshes.delete(accountId));
+    this.sessionRefreshes.set(accountId, pending);
+    return pending;
+  }
+
   #buildUpstreamAuth(row) {
+    const provider = nativeProviders.get(row.preset);
+    if (provider && this.store.db.prepare('SELECT 1 FROM native_provider_sessions WHERE accountId=?').get(row.id)) {
+      return { preset: row.preset, protocol: 'openai', endpoint: provider.endpoint, apiKey: '', customHeaders: {},
+        fetch: (input, init) => nativeRequest(provider, () => this.#nativeSession(row.id, provider), input, init) };
+    }
     const spec = this.getPreset(row.preset);
     const meta = parseJsonSafe(row.meta, {});
     const protocol = meta.protocol || spec.protocol || 'openai';
@@ -1368,7 +1403,7 @@ export class AccountPool {
       headers.Authorization = `Bearer ${apiKey}`;
       headers['x-api-key'] = apiKey;
     }
-    const res = await fetch(url, {
+    const res = await (rawAuth.fetch ?? fetch)(url, {
       headers,
       signal: AbortSignal.timeout(8000),
     });
@@ -2434,6 +2469,7 @@ export class AccountPool {
           label: acc.label,
           protocol: auth.protocol,
           endpoint: auth.endpoint,
+          fetch: auth.fetch,
           apiKey: auth.apiKey,
           customHeaders: auth.customHeaders,
           wireModel: p.wireModel,
@@ -2773,7 +2809,7 @@ export class AccountPool {
           };
         }
 
-        const res = await fetch(`${r.endpoint}/chat/completions`, {
+        const res = await (r.fetch ?? fetch)(`${r.endpoint}/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -2940,7 +2976,7 @@ export class AccountPool {
         }
 
         const oaiPayload = anthropicRequestToOpenai(body, r.wireModel);
-        const res = await fetch(`${r.endpoint}/chat/completions`, {
+        const res = await (r.fetch ?? fetch)(`${r.endpoint}/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -3197,6 +3233,7 @@ export class PoolLlmAdapter extends LlmAdapter {
     const sdk = new OpenAI({
       apiKey: r.apiKey || 'no-key',
       baseURL: r.endpoint,
+      ...(r.fetch && { fetch: r.fetch }),
       maxRetries: 0,
       timeout: 120000,
       defaultHeaders: { ...attributionHeaders(), ...r.customHeaders },

@@ -55,6 +55,7 @@ import type {
   UsageItem,
   WorkspaceEntryKind,
 } from './types/backend';
+import { isDirectTurnEnd, type DirectLiveStream, type DirectLiveToolOutput } from './utils/directMessages';
 import { isSwarmCommand } from './utils/swarmCommand';
 import { randomIdempotencyKey } from './utils/format';
 import { BUILTIN_PROVIDER_PRESETS, mergeProviderPresetCatalog } from './data/providerPresets';
@@ -233,8 +234,8 @@ export const App: React.FC = () => {
   const [effort, setEffort] = useState<EffortLevel>('xhigh');
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('auto-safe');
   const [workspaceRoot, setWorkspaceRoot] = useState('');
-  const [liveStreams, setLiveStreams] = useState<Record<string, { text: string; reasoning: string }>>({});
-  const [liveToolOutputs, setLiveToolOutputs] = useState<Record<string, { callId: string; name: string; text: string }>>({});
+  const [liveStreams, setLiveStreams] = useState<Record<string, DirectLiveStream>>({});
+  const [liveToolOutputs, setLiveToolOutputs] = useState<Record<string, DirectLiveToolOutput[]>>({});
   const [gitState, setGitState] = useState<{ sessionId?: string; status: GitStatus } | null>(null);
   const gitStatus = gitState?.sessionId === gitSessionId ? gitState?.status ?? null : null;
 
@@ -718,44 +719,50 @@ export const App: React.FC = () => {
       {},
       (ev) => {
         const sid = ev.taskId || (typeof ev.payload?.sessionId === 'string' ? ev.payload.sessionId : '');
+        const turnId = typeof ev.payload?.turnId === 'string' ? ev.payload.turnId : undefined;
+        const callId = typeof ev.payload?.callId === 'string' ? ev.payload.callId : '';
         if (sid && ev.type === 'tool/output') {
           const chunk = String(ev.payload?.chunk ?? '');
-          const callId = String(ev.payload?.callId ?? '');
           const name = String(ev.payload?.name ?? 'bash');
-          if (chunk) {
+          if (callId && chunk) {
             setLiveToolOutputs((prev) => {
-              const cur = prev[sid];
-              const base = cur && cur.callId === callId ? cur.text : '';
-              const nextText = (base + chunk).slice(-12000);
-              return { ...prev, [sid]: { callId, name, text: nextText } };
+              const outputs = prev[sid] ?? [];
+              const cur = outputs.find((entry) => entry.callId === callId && entry.turnId === turnId);
+              const output = { turnId, callId, name, text: ((cur?.text ?? '') + chunk).slice(-12000) };
+              return { ...prev, [sid]: [...outputs.filter((entry) => entry !== cur), output] };
             });
           }
           return;
         }
         if (sid && (ev.type === 'assistant/delta' || ev.type === 'reasoning/delta')) {
           setLiveStreams((prev) => {
-            const cur = prev[sid] ?? { text: '', reasoning: '' };
-            return {
-              ...prev,
-              [sid]: {
-                text: ev.type === 'assistant/delta' ? String(ev.payload?.text ?? (cur.text + String(ev.payload?.delta ?? ''))) : cur.text,
-                reasoning: ev.type === 'reasoning/delta' ? String(ev.payload?.text ?? (cur.reasoning + String(ev.payload?.delta ?? ''))) : cur.reasoning,
-              },
-            };
+            const stream = prev[sid];
+            const cur = stream && stream.turnId === turnId ? stream : { text: '', reasoning: '' };
+            const key = ev.type === 'assistant/delta' ? 'text' : 'reasoning';
+            return { ...prev, [sid]: { ...cur, turnId, [key]: String(ev.payload?.text ?? (cur[key] + String(ev.payload?.delta ?? ''))) } };
           });
           return;
         }
-        if (sid && (ev.type === 'tool/result' || ev.type === 'turn/completed' || ev.type === 'turn/failed' || ev.type === 'turn/cancelled' || ev.type === 'turn/parked')) {
+        const turnEnded = isDirectTurnEnd(ev.type);
+        if (sid && (ev.type === 'tool/result' || turnEnded || ev.type === 'turn/started')) {
           setLiveToolOutputs((prev) => {
             if (!prev[sid]) return prev;
+            const outputs = prev[sid].filter((entry) =>
+              ev.type === 'turn/started' ? entry.turnId === turnId
+                : (turnId && entry.turnId !== turnId) || (!turnEnded && entry.callId !== callId),
+            );
+            if (outputs.length === prev[sid].length) return prev;
             const next = { ...prev };
-            delete next[sid];
+            if (outputs.length) next[sid] = outputs;
+            else delete next[sid];
             return next;
           });
         }
-        if (sid && (ev.type === 'turn/completed' || ev.type === 'turn/failed' || ev.type === 'turn/cancelled' || ev.type === 'turn/parked' || ev.type === 'assistant/message')) {
+        // A reasoning-only model step can transition directly to tools without assistant/message.
+        if (sid && (turnEnded || ev.type === 'assistant/message' || ev.type === 'tool/call' || ev.type === 'turn/started')) {
           setLiveStreams((prev) => {
-            if (!prev[sid]) return prev;
+            const stream = prev[sid];
+            if (!stream || (ev.type === 'turn/started' ? turnId === stream.turnId : turnId && turnId !== stream.turnId)) return prev;
             const next = { ...prev };
             delete next[sid];
             return next;
@@ -833,7 +840,7 @@ export const App: React.FC = () => {
     setInspectorOpen(true);
   };
 
-  const handleSubmitNewTask = async (text: string, files: Record<string, string>) => {
+  const handleSubmitNewTask = async (text: string, files: Record<string, string>): Promise<boolean> => {
     setSubmitting(true);
     try {
       const sideSource = sideProject?.startsWith('session:') ? await client.getTask(sideProject.slice(8)) : null;
@@ -856,7 +863,7 @@ export const App: React.FC = () => {
         ...(Object.keys(files).length ? { files } : {}),
       });
 
-      if (currentClient.current !== client) return;
+      if (currentClient.current !== client) return false;
       if ('mode' in task) {
         showSwarmReceipt(task);
         void refreshWorkspace(false);
@@ -864,18 +871,19 @@ export const App: React.FC = () => {
         setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
       }
       navigate({ kind: 'thread', taskId: task.id });
+      return true;
     } catch (e) {
       pushToast(`提交任务失败：${e instanceof Error ? e.message : '未知错误'}`, 'danger');
+      return false;
     } finally {
       setSubmitting(false);
     }
   };
 
   // Multi-turn follow-up inside an existing ThreadView: appends Turn N+1 to the same conversation!
-  const handleSubmitFollowup = async (text: string, files: Record<string, string>) => {
+  const handleSubmitFollowup = async (text: string, files: Record<string, string>): Promise<boolean> => {
     if (!activeRootTaskId) {
-      await handleSubmitNewTask(text, files);
-      return;
+      return handleSubmitNewTask(text, files);
     }
     setSubmitting(true);
     try {
@@ -884,7 +892,7 @@ export const App: React.FC = () => {
         const steered = await client.steerSession(activeRootTaskId, text);
         if (steered.steered) {
           pushToast('已实时注入纠偏指令，Agent 将在下一步生效', 'success');
-          return;
+          return true;
         }
       }
       if (client.submitFollowupTurn) {
@@ -895,11 +903,11 @@ export const App: React.FC = () => {
           effort,
           clientTurnId: randomIdempotencyKey(),
         });
-        if (currentClient.current !== client || activeChainRef.current[0] !== activeRootTaskId) return;
+        if (currentClient.current !== client || activeChainRef.current[0] !== activeRootTaskId) return false;
         if ('mode' in updated) showSwarmReceipt(updated);
         else setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
         await refreshActiveBundles([activeRootTaskId], true);
-        return;
+        return true;
       }
       const rootTask = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
       let projectId = rootTask?.projectId ?? selectedProjectId;
@@ -925,7 +933,7 @@ export const App: React.FC = () => {
         showSwarmReceipt(nextTask);
         navigate({ kind: 'thread', taskId: nextTask.id });
         void refreshWorkspace(false);
-        return;
+        return true;
       }
       setTasks((prev) => [nextTask, ...prev.filter((t) => t.id !== nextTask.id)]);
       setThreadChains((prev) => ({
@@ -933,8 +941,10 @@ export const App: React.FC = () => {
         [activeRootTaskId]: [...(prev[activeRootTaskId] ?? []), nextTask.id],
       }));
       setInspectorTaskId(nextTask.id);
+      return true;
     } catch (e) {
       pushToast(`发送追问失败：${e instanceof Error ? e.message : '未知错误'}`, 'danger');
+      return false;
     } finally {
       setSubmitting(false);
     }

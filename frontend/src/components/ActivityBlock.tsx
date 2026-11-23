@@ -923,7 +923,7 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
           <span className="codex-activity-row-icon">
             <IconSparkle size={15} />
           </span>
-          <span className="codex-shimmer-text">{liveText || '正在思考与规划任务…'}</span>
+          <span className="codex-activity-row-label codex-shimmer-text" title={liveText}>{liveText || '正在思考与规划任务…'}</span>
           {liveElapsedMs !== undefined && (
             <span
               className="tabular-nums"

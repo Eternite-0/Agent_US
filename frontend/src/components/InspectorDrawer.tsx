@@ -749,7 +749,12 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
               </div>
 
               <div className="codex-subagent-panel">
-                {focusedAssignment?.objective && <p className="subagent-objective">{focusedAssignment.objective}</p>}
+                {focusedAssignment?.objective && (
+                  <details className="subagent-objective-card" open>
+                    <summary>子任务目标</summary>
+                    <p className="subagent-objective">{focusedAssignment.objective}</p>
+                  </details>
+                )}
                 <div className="subagent-detail-meta">
                   {[getWorkerDisplayRole(focusedSubagent), focusedSubagent.model,
                     focusedSubagent.attempt > 1 && `第 ${focusedSubagent.attempt} 次尝试`].filter(Boolean).join(' · ')}
@@ -789,9 +794,10 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                         taskFiles={bundle.task.files}
                         artifactFiles={wArtifactFiles}
                         events={wEvents}
-                        durationMs={wRunning ? undefined : 1000 * 60 * 1 + 42000}
+                        durationMs={!wRunning && wEvents.length > 1
+                          ? Math.max(0, wEvents.at(-1)!.timestamp - wEvents[0].timestamp) : undefined}
                         isLive={wRunning}
-                        liveText={getWorkerActivityLabel(focusedSubagent) || `正在运行 ${getTaskLabel(focusedSubagent)}…`}
+                        liveText={getWorkerActivityLabel(focusedSubagent) || "正在执行子任务…"}
                         finalProseTexts={finalBlocks.map((b) => b.text)}
                         defaultOpen
                         subagentMode

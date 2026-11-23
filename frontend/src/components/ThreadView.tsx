@@ -1,4 +1,6 @@
-import { groupDirectMessages } from '../utils/directMessages';
+import { SwarmThreadCard } from './SwarmThreadCard';
+import { groupDirectMessages, type DirectLiveStream, type DirectLiveToolOutput } from '../utils/directMessages';
+import { DirectActivityGroup, DirectTurnProcess } from './DirectActivity';
 import type { CommandAvailability, MentionExtension, SlashCommand } from './slashCommands';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
@@ -129,8 +131,8 @@ interface ThreadViewProps {
   onOpenSwarmRun?: (sessionId: string, runId: string) => void;
   loading: boolean;
   focusWorkerId?: string;
-  liveStreams?: Record<string, { text: string; reasoning: string }>;
-  liveToolOutputs?: Record<string, { callId: string; name: string; text: string }>;
+  liveStreams?: Record<string, DirectLiveStream>;
+  liveToolOutputs?: Record<string, DirectLiveToolOutput[]>;
   onRewindSession?: (sessionId: string, scope: 'code' | 'conversation' | 'both', turnId?: string) => Promise<void>;
   onCompactSession?: (sessionId: string) => Promise<void>;
   codexMode: CodexMode;
@@ -162,7 +164,7 @@ interface ThreadViewProps {
   commandAvailability?: CommandAvailability;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
-  onSubmitFollowup: (text: string, files: Record<string, string>) => Promise<void>;
+  onSubmitFollowup: (text: string, files: Record<string, string>) => Promise<boolean | void>;
   onControlTask: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'retry') => Promise<void>;
   archiving: boolean;
   onToggleArchive: (task: Task) => void;
@@ -365,9 +367,16 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
         }
       };
 
+      const pendingApprovals = visibleApprovals.filter((a) => a.status === 'pending');
       const isDirectSession = sessions[0]?.assignmentId === 'direct';
-      const liveStream = liveStreams[task.id] ?? null;
-      const directExchanges = groupDirectMessages(task.id, task.input, isDirectSession ? histories[task.id] ?? [] : []);
+      const directExchanges = isDirectSession ? groupDirectMessages(task.id, task.input, histories[task.id] ?? [], {
+        isLive,
+        events,
+        liveStream: liveStreams[task.id],
+        liveToolOutputs: liveToolOutputs[task.id],
+        pendingCallIds: new Set(pendingApprovals.flatMap((approval) => approval.callId ? [approval.callId] : [])),
+        awaitingApproval: pendingApprovals.length > 0,
+      }) : [];
 
       const assistantBlocks: Array<{ id: string; title?: string; text: string }> = [];
       // Only show the final assistant prose once the turn completes (or when scoped to a worker),
@@ -424,7 +433,6 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
         }
       }
 
-      const pendingApprovals = visibleApprovals.filter((a) => a.status === 'pending');
       const runningWorker = workers.find((w) => w.status === 'running');
       const runningWorkerName = runningWorker ? getWorkerDisplayName(runningWorker) : '';
       const runningActivity = runningWorker ? getWorkerActivityLabel(runningWorker) : '';
@@ -485,10 +493,9 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
         hasProcess,
         isDirectSession,
         directExchanges,
-        liveStream,
       };
     });
-  }, [bundles, focusWorkerId, isLiveBackend, routerReady, liveStreams]);
+  }, [bundles, focusWorkerId, isLiveBackend, routerReady, liveStreams, liveToolOutputs]);
 
   // Exact Codex Turn Minimap: 1 tick per User Turn (prompt title + 3-line assistant snippet)
   const minimapEntries = useMemo<MinimapEntry[]>(() => {
@@ -1220,9 +1227,9 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
           )}
 
           {turnModels.map((tm) => {
-            const { bundle, isLive, visibleEvidence, visibleApprovals, visibleEvents, assistantBlocks, computedFiles, isDirectSession, directExchanges, liveStream } =
+            const { bundle, isLive, visibleEvidence, visibleApprovals, visibleEvents, assistantBlocks, computedFiles, isDirectSession, directExchanges } =
               tm;
-            const { task, assignments, workers, sessions, histories } = bundle;
+            const { task, assignments, workers, sessions, histories, swarmRuns = [] } = bundle;
             const tid = task.id;
             const progress = <SubagentProgress workers={workers} onOpen={() => onOpenSubagent(null, tid)} />;
             const longUserInput = task.input.length > 360 || task.input.split('\n').length > 6;
@@ -1240,11 +1247,9 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
             const filesKey = `${tid}:files`;
 
             if (isDirectSession) {
-              const exchanges =
-                directExchanges.length > 0
-                  ? directExchanges
-                  : [{ key: `${tid}-init`, userText: task.input, command: false, swarmRunId: undefined, assistantTexts: [], tools: [] }];
-              const liveExchangeIndex = exchanges.findLastIndex((exchange) => !exchange.command);
+              const runsById = new Map(swarmRuns.map((run) => [run.id, run]));
+              const linkedRuns = new Set(directExchanges.map((exchange) => exchange.swarmRunId));
+              const goalRun = swarmRuns.find((run) => !linkedRuns.has(run.id));
               return (
                 <React.Fragment key={tid}>
                   {showDateSep && <div className="codex-date-sep">{dateLabel}</div>}
@@ -1278,104 +1283,53 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                         </div>
                       );
                     })()}
-                    {exchanges.map((ex, exIdx) => {
-                      const showLiveStream = exIdx === liveExchangeIndex && isLive && Boolean(liveStream?.text || liveStream?.reasoning);
+                    {directExchanges.map((ex) => {
+                      const showSwarm = ex.command && Boolean(ex.swarmRunId);
+                      const tail = ex.blocks.at(-1);
+                      const final = !ex.active && tail?.kind === 'message' ? tail : undefined;
+                      const process = final ? ex.blocks.slice(0, -1) : ex.blocks;
+                      const renderMessage = (block: Extract<(typeof ex.blocks)[number], { kind: 'message' }>) => (
+                        <div key={block.id} className="codex-assistant-turn">
+                          <Markdown
+                            text={block.text}
+                            imageFiles={{ ...(task.files ?? {}), ...tm.artFiles }}
+                            onOpenFile={(path) => onOpenInspector('diff', path, tid)}
+                            onOpenImage={(imgs, idx) => setLightbox({ images: imgs, index: idx })}
+                            onCopy={onToast}
+                          />
+                          {block.live && <span className="a2a-stream-cursor" aria-hidden="true" />}
+                        </div>
+                      );
                       return (
-                        <div key={ex.key} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                        <div key={ex.key} className="codex-direct-exchange">
                           {ex.userText && (
                             <div className="codex-user-turn">
                               <div className="codex-user-bubble">
-                                <div className="codex-user-bubble-text">{ex.userText}</div>
+                                <div className="codex-user-bubble-text">{showSwarm && <span className="swarm-message-mark"><IconAgentTeam size={14} aria-hidden="true" />Swarm</span>}
+                                  {showSwarm ? ex.userText.replace(/^\/swarm\s*/i, '') : ex.userText}</div>
                               </div>
                             </div>
                           )}
 
-                          {ex.swarmRunId && onOpenSwarmRun && (
-                            <div className="codex-assistant-turn">
-                              <button type="button" className="codex-select" onClick={() => onOpenSwarmRun(tid, ex.swarmRunId!)}>
-                                <IconAgentTeam size={14} aria-hidden="true" /> 查看 Swarm 进度
-                              </button>
-                            </div>
-                          )}
-
-                          {ex.tools.length > 0 && (
-                            <div className="a2a-tool-pills">
-                              {ex.tools.map((t) => (
-                                <details key={t.id} className="a2a-tool-pill" data-error={t.isError ? 'true' : undefined}>
-                                  <summary>
-                                    <span>{t.isError ? '✗' : '✓'}</span>
-                                    <code>{t.name}</code>
-                                  </summary>
-                                  {t.output && (
-                                    <pre className="a2a-tool-output">{t.output.slice(0, 2400)}</pre>
-                                  )}
-                                </details>
-                              ))}
-                            </div>
-                          )}
-
-                          {ex.assistantTexts.map((m) => (
-                            <div key={m.id} className="codex-assistant-turn">
-                              {m.reasoning && (
-                                <details className="a2a-reasoning-box">
-                                  <summary>思考过程</summary>
-                                  <div className="a2a-reasoning-body">{m.reasoning}</div>
-                                </details>
-                              )}
-                              {m.text && (
-                                <Markdown
-                                  text={m.text}
-                                  imageFiles={{ ...(task.files ?? {}), ...tm.artFiles }}
-                                  onOpenFile={(path) => onOpenInspector('diff', path, tid)}
-                                  onOpenImage={(imgs, idx) => setLightbox({ images: imgs, index: idx })}
-                                  onCopy={onToast}
-                                />
-                              )}
-                            </div>
-                          ))}
-
-                          {showLiveStream && (
-                            <div className="codex-assistant-turn">
-                              {liveStream?.reasoning && (
-                                <details className="a2a-reasoning-box" open>
-                                  <summary>正在思考…</summary>
-                                  <div className="a2a-reasoning-body">{liveStream.reasoning}</div>
-                                </details>
-                              )}
-                              {liveStream?.text && (
-                                <div className="a2a-live-stream">
-                                  <Markdown
-                                    text={liveStream.text}
-                                    imageFiles={{ ...(task.files ?? {}), ...tm.artFiles }}
-                                    onOpenFile={(path) => onOpenInspector('diff', path, tid)}
-                                    onOpenImage={(imgs, idx) => setLightbox({ images: imgs, index: idx })}
-                                    onCopy={onToast}
-                                  />
-                                  <span className="a2a-stream-cursor" />
-                                </div>
-                              )}
-                            </div>
+                          {showSwarm ? (
+                            <SwarmThreadCard run={runsById.get(ex.swarmRunId!)}
+                              onOpen={onOpenSwarmRun ? () => onOpenSwarmRun(tid, ex.swarmRunId!) : undefined} />
+                          ) : (
+                            <>
+                              <DirectTurnProcess active={ex.active} timing={ex.timing}>
+                                {process.length > 0 ? process.map((block) => block.kind === 'activity'
+                                  ? <DirectActivityGroup key={block.id} block={block} />
+                                  : renderMessage(block)) : null}
+                              </DirectTurnProcess>
+                              {final && renderMessage(final)}
+                            </>
                           )}
                         </div>
                       );
                     })}
 
-                    {isLive && liveToolOutputs[tid]?.text && (
-                      <div className="a2a-live-terminal">
-                        <div className="a2a-live-terminal-head">
-                          <span className="codex-sidebar-spinner" />
-                          <code>{liveToolOutputs[tid].name || 'bash'}</code>
-                          <span className="a2a-muted-meta">实时输出</span>
-                        </div>
-                        <pre className="a2a-live-terminal-body">{liveToolOutputs[tid].text}</pre>
-                      </div>
-                    )}
-
-                    {isLive && !liveStream?.text && !liveStream?.reasoning && !liveToolOutputs[tid]?.text && visibleApprovals.filter((a) => a.status === 'pending').length === 0 && (
-                      <div className="a2a-live-thinking">
-                        <span className="codex-sidebar-spinner" />
-                        <span>{tm.liveStatusText}</span>
-                      </div>
+                    {goalRun && (
+                      <SwarmThreadCard run={goalRun} onOpen={onOpenSwarmRun ? () => onOpenSwarmRun(tid, goalRun.id) : undefined} />
                     )}
 
                     {visibleApprovals

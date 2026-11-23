@@ -24,6 +24,7 @@ import type {
 import { WorkerStatusMark } from './WorkerStatusMark';
 import { fmtTokens } from '../utils/format';
 import { subtaskTitle } from '../utils/worker';
+import { summarizeSwarmRun } from '../utils/swarmCommand';
 import { swarmWorkerStatus } from '../utils/subagentProgress';
 import { AgentAvatar } from './AgentAvatar';
 import {
@@ -215,7 +216,7 @@ function RunDetail({ run, client, approvals, revision, onRefresh, sectionRequest
   });
   const current = updated && updated.updatedAt >= run.updatedAt ? updated : run;
   const active = isActive(current);
-  const completed = current.nodes.filter((node) => node.status === 'completed').length;
+  const { completed, total } = summarizeSwarmRun(current);
   const nodesBySession = new Map(current.nodes.flatMap((node) => node.childSessionId ? [[node.childSessionId, node] as const] : []));
   const pendingApprovals = approvals.filter((approval) =>
     approval.status === 'pending' && approval.taskId && nodesBySession.has(approval.taskId),
@@ -302,29 +303,34 @@ function RunDetail({ run, client, approvals, revision, onRefresh, sectionRequest
         {current.planVersion != null && <span className="swarm-plan-version"><IconBranch size={13} aria-hidden="true" />计划 v{current.planVersion}</span>}
       </div>
       <h2>{current.goal}</h2>
-      {teamRationale && <p><strong>单成员原因</strong> · {teamRationale}</p>}
-      {ledger ? <div className="swarm-dependencies" aria-label="预算快照">
-        <small>步骤预留 <code>{budgetValue(ledger.reservedSteps)}</code> · 剩余 <code>{budgetValue(ledger.remainingSteps)}</code></small>
-        <small>Token 预留 <code>{budgetValue(ledger.reservedTokens)}</code> · 剩余 <code>{budgetValue(ledger.remainingTokens)}</code></small>
-        {ledger.updatedAt != null && <small>预算更新于 {when(ledger.updatedAt)}</small>}
-      </div> : <p><small>暂无预算快照</small></p>}
-      {current.nodes.length > 0 && <div className="swarm-progress">
-        <progress aria-label="节点完成进度" value={completed} max={current.nodes.length} />
-        <small>{completed}/{current.nodes.length} 节点完成</small>
+      {total > 0 && <div className="swarm-progress">
+        <progress aria-label="节点完成进度" value={completed} max={total} />
+        <small>{completed}/{total} 节点完成</small>
       </div>}
-      {telemetry.hasTelemetry && <div className="swarm-dependencies" aria-label="执行遥测">
-        {telemetry.steps !== undefined && <small>步骤 <code>{telemetry.steps}</code></small>}
-        {telemetry.totalTokens !== undefined && <small title={
-          telemetry.inputTokens !== undefined || telemetry.outputTokens !== undefined
-            ? `输入 ${telemetry.inputTokens ?? 0} · 输出 ${telemetry.outputTokens ?? 0}`
-            : undefined
-        }>Token <code>{fmtTokens(telemetry.totalTokens)}</code></small>}
-        {telemetry.replanCount !== undefined && <small>重规划 <code>{telemetry.replanCount}</code></small>}
-        {telemetry.branch && <small title={telemetry.headSha ?? undefined}>
-          <IconBranch size={12} aria-hidden="true" /> 分支 <code>{telemetry.branch}{telemetry.headSha ? ` @ ${telemetry.headSha.slice(0, 7)}` : ''}</code>
-        </small>}
-        {telemetry.testCommands.length > 0 && <small>测试 {telemetry.testCommands.map((cmd) => <code key={cmd}>{cmd}</code>)}</small>}
-      </div>}
+      {(teamRationale || ledger || telemetry.hasTelemetry) && (
+        <details className="swarm-run-diagnostics">
+          <summary>运行详情</summary>
+          {teamRationale && <p><strong>单成员原因</strong> · {teamRationale}</p>}
+          {ledger ? <div className="swarm-dependencies" aria-label="预算快照">
+            <small>步骤预留 <code>{budgetValue(ledger.reservedSteps)}</code> · 剩余 <code>{budgetValue(ledger.remainingSteps)}</code></small>
+            <small>Token 预留 <code>{budgetValue(ledger.reservedTokens)}</code> · 剩余 <code>{budgetValue(ledger.remainingTokens)}</code></small>
+            {ledger.updatedAt != null && <small>预算更新于 {when(ledger.updatedAt)}</small>}
+          </div> : null}
+          {telemetry.hasTelemetry && <div className="swarm-dependencies" aria-label="执行遥测">
+            {telemetry.steps !== undefined && <small>步骤 <code>{telemetry.steps}</code></small>}
+            {telemetry.totalTokens !== undefined && <small title={
+              telemetry.inputTokens !== undefined || telemetry.outputTokens !== undefined
+                ? `输入 ${telemetry.inputTokens ?? 0} · 输出 ${telemetry.outputTokens ?? 0}`
+                : undefined
+            }>Token <code>{fmtTokens(telemetry.totalTokens)}</code></small>}
+            {telemetry.replanCount !== undefined && <small>重规划 <code>{telemetry.replanCount}</code></small>}
+            {telemetry.branch && <small title={telemetry.headSha ?? undefined}>
+              <IconBranch size={12} aria-hidden="true" /> 分支 <code>{telemetry.branch}{telemetry.headSha ? ` @ ${telemetry.headSha.slice(0, 7)}` : ''}</code>
+            </small>}
+            {telemetry.testCommands.length > 0 && <small>测试 {telemetry.testCommands.map((cmd) => <code key={cmd}>{cmd}</code>)}</small>}
+          </div>}
+        </details>
+      )}
       {(effectiveVerdict || reviewerVerdicts.length > 0) ? <details className="autonomous-verdict">
         <summary className="codex-subagent-list-row swarm-row">
           <RowContents

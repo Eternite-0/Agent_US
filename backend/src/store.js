@@ -43,6 +43,7 @@ const REQUIRED_V7_TABLES = Object.freeze([
   'direct_events',
   'direct_approvals',
   'provider_accounts',
+  'native_provider_sessions',
   'provider_priorities',
   'pool_models',
   'model_mappings',
@@ -316,6 +317,7 @@ export class Store {
         CREATE TABLE IF NOT EXISTS direct_approvals(id TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT, callId TEXT, tool TEXT NOT NULL, arguments TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', scope TEXT, reason TEXT, expiresAt INTEGER NOT NULL, createdAt INTEGER NOT NULL, resolvedAt INTEGER);
         CREATE INDEX IF NOT EXISTS direct_approvals_session ON direct_approvals(sessionId, status);
         CREATE TABLE IF NOT EXISTS provider_accounts(id TEXT PRIMARY KEY, preset TEXT NOT NULL, label TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'official', priority INTEGER NOT NULL DEFAULT 100, enabled INTEGER NOT NULL DEFAULT 1, endpoint TEXT, proxyUrl TEXT, headers TEXT NOT NULL DEFAULT '{}', models TEXT NOT NULL DEFAULT '[]', modelProfiles TEXT NOT NULL DEFAULT '{}', credentialEnc TEXT, credentialMask TEXT, status TEXT NOT NULL DEFAULT 'unknown', lastError TEXT, lastErrorAt INTEGER, cooldownUntil INTEGER NOT NULL DEFAULT 0, lastSuccessAt INTEGER, balanceJson TEXT, expiresAt INTEGER, activeConns INTEGER NOT NULL DEFAULT 0, meta TEXT NOT NULL DEFAULT '{}', createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS native_provider_sessions(accountId TEXT PRIMARY KEY REFERENCES provider_accounts(id) ON DELETE CASCADE, encrypted TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS provider_priorities(preset TEXT PRIMARY KEY, rank INTEGER NOT NULL, updatedAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS pool_models(id TEXT PRIMARY KEY, accountId TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE, preset TEXT NOT NULL, upstreamModel TEXT NOT NULL, displayName TEXT, enabled INTEGER NOT NULL DEFAULT 1, visible INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL DEFAULT 'remote', multiplier REAL NOT NULL DEFAULT 1.0, contextWindow INTEGER NOT NULL DEFAULT 128000, maxOutput INTEGER NOT NULL DEFAULT 16384, capabilities TEXT NOT NULL DEFAULT '{}', createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, UNIQUE(accountId, upstreamModel));
         CREATE INDEX IF NOT EXISTS pool_models_preset ON pool_models(preset, enabled);

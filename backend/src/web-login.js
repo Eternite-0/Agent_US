@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Fault, id as uuid } from './store.js';
+import { nativeProviders } from './providers/browser-session.js';
 import { maskSecret } from './pool.js';
 
 const LOGIN_TTL_MS = 10 * 60 * 1000;
@@ -295,6 +296,11 @@ export class WebLoginService {
     this.flows = new Map();
   }
 
+  close() {
+    for (const flow of this.flows.values()) { clearTimeout(flow.timer); flow.controller?.abort(); flow.status = 'canceled'; }
+    this.flows.clear();
+  }
+
   #cleanupExpired() {
     const now = Date.now();
     for (const [id, flow] of this.flows.entries()) {
@@ -351,6 +357,24 @@ export class WebLoginService {
     const presetSpec = this.pool.getPreset(preset);
     const resolvedPreset = presetSpec.id;
     const flowId = uuid();
+
+    const provider = nativeProviders.get(resolvedPreset);
+    if (provider) {
+      const controller = new AbortController();
+      try {
+        const login = await provider.start(provider, controller.signal);
+        const flow = { engine: 'provider-native', preset: resolvedPreset, login, controller,
+          autoSync, createdAt: Date.now(), status: 'pending' };
+        this.flows.set(flowId, flow);
+        flow.timer = setTimeout(() => { void this.cancelWebLogin(flowId); }, LOGIN_TTL_MS);
+        flow.timer.unref();
+        return { ok: true, engine: flow.engine, flowId, authUrl: login.authUrl,
+          instructions: '请在浏览器完成供应商授权。凭证由本项目的内置网关接收并在本机加密保存。' };
+      } catch {
+        controller.abort();
+        return { ok: false, message: `${provider.name} 无法开始授权，请检查网络或稍后重试。` };
+      }
+    }
 
     // 1. Native OpenRouter OAuth2 PKCE (S256)
     if (resolvedPreset === 'openrouter') {
@@ -578,6 +602,12 @@ export class WebLoginService {
     if (flow.status === 'failed') return { status: 'failed', error: flow.error };
     if (flow.status === 'canceled') return { status: 'canceled' };
 
+    if (flow.engine === 'provider-native') {
+      // Concurrent polls must not persist the same grant twice.
+      if (!flow.poll) flow.poll = this.#pollNative(flow).finally(() => { flow.poll = null; });
+      return flow.poll;
+    }
+
     // Poll GitHub Device Flow directly when due
     if (flow.engine === 'github-device') {
       const now = Date.now();
@@ -665,6 +695,44 @@ export class WebLoginService {
     };
   }
 
+  async #pollNative(flow) {
+    try {
+      const grant = await flow.login.poll();
+      if (flow.status !== 'pending') return { status: flow.status };
+      if (!grant) return { status: 'pending' };
+      const spec = nativeProviders.get(flow.preset);
+      const account = this.pool.createAccount({
+        preset: flow.preset,
+        endpoint: spec.endpoint,
+        label: grant.label || `${spec.name} 账号`,
+      }, grant.session);
+      clearTimeout(flow.timer);
+      flow.controller.abort();
+      flow.login = null;
+      flow.status = 'saving';
+      let syncedModelsCount = 0;
+      if (flow.autoSync) {
+        try {
+          syncedModelsCount = (await this.pool.syncAccountModels(account.id)).models.length;
+        } catch { /* A catalog outage must not discard a valid grant. */ }
+      }
+      flow.result = {
+        account: this.pool.getAccount(account.id), syncedModelsCount,
+        ...(flow.autoSync && !syncedModelsCount && { hint: '凭证已保存，但未获取到可用模型。可在账号池点击「获取模型」重试。' }),
+      };
+      flow.status = 'done';
+      return { status: 'done', ...flow.result };
+    } catch {
+      if (flow.status === 'canceled') return { status: 'canceled' };
+      clearTimeout(flow.timer);
+      flow.controller.abort();
+      flow.login = null;
+      flow.status = 'failed';
+      flow.error = '供应商未完成授权，请重新登录。';
+      return { status: 'failed', error: flow.error };
+    }
+  }
+
   async submitWebLoginCallback(
     flowId,
     { callbackUrl = '', token = '', label = '', endpoint = '' } = {},
@@ -677,6 +745,7 @@ export class WebLoginService {
       });
     }
 
+    if (flow.engine === 'provider-native') throw new Fault('NATIVE_CALLBACK_MANAGED_BY_PROVIDER', 400);
     if (flow.engine === 'openrouter-pkce' && callbackUrl.trim()) {
       try {
         const u = new URL(callbackUrl.trim());
@@ -714,7 +783,11 @@ export class WebLoginService {
   async cancelWebLogin(flowId) {
     const flow = this.flows.get(flowId);
     if (!flow) return { ok: true };
+    if (flow.status !== 'pending') return { ok: true };
     flow.status = 'canceled';
+    clearTimeout(flow.timer);
+    flow.controller?.abort();
+    flow.login = null;
     return { ok: true };
   }
 

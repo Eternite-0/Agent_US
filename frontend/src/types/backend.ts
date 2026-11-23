@@ -162,6 +162,7 @@ export interface SessionHistoryItem {
   sequence: number;
   text?: string;
   reasoning?: string;
+  toolCalls?: Array<{ id: string; name: string; arguments?: string | Record<string, unknown> }>;
   name?: string;
   callId?: string;
   meta?: Record<string, unknown>;
@@ -296,6 +297,7 @@ export interface ProviderPreset {
   accountCount?: number;
   /** How the frontend can connect this provider without inventing unsupported OAuth flows. */
   loginMode?: 'web' | 'file' | 'manual';
+  nativeLogin?: boolean;
   /** Optional stable URL shown when the user needs to obtain a key/token. */
   officialUrl?: string;
   fields: ProviderPresetField[];
@@ -636,6 +638,7 @@ export interface TaskBundle {
   artifacts: Artifact[];
   usage: UsageItem[];
   events: EventEnvelope[];
+  swarmRuns?: SwarmRunRecord[];
 }
 
 export type ThemeMode = 'light' | 'dark' | 'system';

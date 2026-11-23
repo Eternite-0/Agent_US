@@ -76,5 +76,34 @@ test('a receipt interleaved with a busy direct turn stays in its own exchange', 
   ]);
   assert.equal(exchanges[1].swarmRunId, 'r1');
   assert.equal(exchanges[0].swarmRunId, undefined);
-  assert.deepEqual(exchanges.map((e) => [e.command, e.assistantTexts.map((m) => m.text), e.tools.length]), [[false, ['ordinary answer'], 1], [true, ['stopped'], 0]]);
+  assert.deepEqual(exchanges.map((e) => [e.command, e.blocks.map((block) => block.kind === 'message' ? block.text : block.items[0]?.name)]), [[false, ['ls', 'ordinary answer']], [true, ['stopped']]]);
+});
+
+test('thread bundles expose current Swarm progress separately from the historical receipt', async (t) => {
+  let current = { ...run, status: 'planning' };
+  const base = '/v1/sessions/chat%2F1';
+  const receiptMeta = { swarmAction: 'start', runId: run.id };
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    const { pathname, searchParams } = new URL(url);
+    if (pathname === base) return Response.json(session);
+    if (pathname === `${base}/messages`) return Response.json({ items: [
+      { seq: 1, role: 'user', content: '/swarm analyze logs', meta: receiptMeta },
+      { seq: 2, role: 'assistant', content: 'planning · 0 个节点', meta: receiptMeta },
+    ] });
+    if (pathname === '/v1/swarm/runs') {
+      assert.equal(searchParams.get('sessionId'), session.id);
+      return Response.json({ items: [current] });
+    }
+    assert.ok([`${base}/turns`, `${base}/events`, `${base}/receipts`, '/v1/usage', '/v1/approvals'].includes(pathname));
+    return Response.json({ items: [] });
+  });
+  const client = new LiveBackendClient({ mode: 'live', token: '', baseUrl: 'http://localhost:8787' });
+  const initial = await client.loadTaskBundle(session.id);
+  assert.equal(initial.swarmRuns[0].status, 'planning');
+  current = { ...run, status: 'completed', updatedAt: 99 };
+  const refreshed = await client.loadTaskBundle(session.id);
+  const [exchange] = groupDirectMessages(session.id, '', refreshed.histories[session.id]);
+  assert.equal(exchange.swarmRunId, run.id);
+  assert.equal(refreshed.swarmRuns.find((item) => item.id === exchange.swarmRunId).status, 'completed');
+  assert.equal(exchange.blocks[0].text, 'planning · 0 个节点');
 });

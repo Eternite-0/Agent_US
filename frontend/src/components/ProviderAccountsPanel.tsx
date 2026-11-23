@@ -224,7 +224,7 @@ export const ProviderAccountsPanel: React.FC<ProviderAccountsPanelProps> = ({
       {/* Header Status Badges (Screenshot 3 top-right pills) */}
       <div className="a2a-page-header">
         <div>
-          <h1 className="codex-settings-h1" style={{ marginBottom: 4 }}>账号号池</h1>
+          <h1 className="codex-settings-h1" style={{ marginBottom: 4 }}>账号池</h1>
           <p className="codex-settings-lede" style={{ margin: 0 }}>
             按顺位调度多账号、自动限流冷却切号、会话粘性保缓存，添加账号获取模型后即刻热接入后端 Agent。
           </p>
@@ -442,16 +442,16 @@ export const ProviderAccountsPanel: React.FC<ProviderAccountsPanelProps> = ({
       {/* Priority-Grouped Account Pool Table (Screenshot 3 main table) */}
       <div className="a2a-pool-table">
         <div className="a2a-pool-thead">
-          <span style={{ width: 26 }} />
-          <span style={{ width: 72 }}>顺位</span>
-          <span style={{ flex: 2 }}>账号</span>
-          <span style={{ flex: 1 }}>代理</span>
-          <span style={{ width: 64 }}>连接数</span>
-          <span style={{ width: 88 }}>状态</span>
-          <span style={{ width: 92 }}>限流</span>
-          <span style={{ width: 96 }}>有效期</span>
-          <span style={{ width: 120 }}>余额</span>
-          <span style={{ width: 220, textAlign: 'right' }}>操作</span>
+          <span />
+          <span>顺位</span>
+          <span>账号</span>
+          <span>代理</span>
+          <span>连接数</span>
+          <span>状态</span>
+          <span>限流</span>
+          <span>有效期</span>
+          <span>余额</span>
+          <span>操作</span>
         </div>
 
         {groups.length === 0 ? (
@@ -494,11 +494,11 @@ export const ProviderAccountsPanel: React.FC<ProviderAccountsPanelProps> = ({
                     }))
                   }
                 >
-                  <span style={{ width: 26, display: 'inline-flex', color: 'var(--text-tertiary)' }}>
+                  <span style={{ width: 24, display: 'inline-flex', color: 'var(--text-tertiary)' }}>
                     {isExpanded ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
                   </span>
 
-                  <span className="a2a-rank-badge" style={{ width: 72 }}>
+                  <span className="a2a-rank-badge" style={{ width: 64 }}>
                     第 {groupIdx + 1} 顺位
                   </span>
 
@@ -587,19 +587,19 @@ export const ProviderAccountsPanel: React.FC<ProviderAccountsPanelProps> = ({
 
                     return (
                       <div key={acc.id} className="a2a-pool-item-row">
-                        <span style={{ width: 26 }}>
+                        <span>
                           <input
                             type="checkbox"
                             checked={checked}
                             onChange={() => toggleSelectOne(acc.id)}
                           />
                         </span>
-                        <span style={{ width: 72, color: 'var(--text-tertiary)', fontSize: 12 }}>
+                        <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>
                           #{idx + 1} · P{acc.priority}
                         </span>
-                        <div style={{ flex: 2, minWidth: 0 }}>
+                        <div style={{ minWidth: 0 }}>
                           <div className="a2a-item-title">
-                            {acc.label || acc.id}
+                            <span className="a2a-cell-label" title={acc.label || acc.id}>{acc.label || acc.id}</span>
                             <span className="a2a-model-count-tag">{acc.modelCount} 模型</span>
                           </div>
                           <div className="a2a-item-sub">
@@ -610,29 +610,28 @@ export const ProviderAccountsPanel: React.FC<ProviderAccountsPanelProps> = ({
                             ) : null}
                           </div>
                         </div>
-                        <span style={{ flex: 1, fontSize: 12, color: 'var(--text-secondary)' }}>
+                        <span className="a2a-cell-label" title={acc.proxyUrl || '直连'} style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
                           {acc.proxyUrl || '直连'}
                         </span>
-                        <span style={{ width: 64, fontSize: 12 }} className="tabular-nums">
+                        <span style={{ fontSize: 12 }} className="tabular-nums">
                           {acc.activeConns ?? 0}
                         </span>
-                        <span style={{ width: 88 }}>
+                        <span>
                           <span className="a2a-badge" data-tone={statusTone}>
                             {statusLabel}
                           </span>
                         </span>
-                        <span style={{ width: 92, fontSize: 12, color: acc.rateLimited ? 'var(--color-warning)' : 'var(--text-tertiary)' }}>
+                        <span style={{ fontSize: 12, color: acc.rateLimited ? 'var(--color-warning)' : 'var(--text-tertiary)' }}>
                           {fmtCooldown(acc.cooldownRemainingMs)}
                         </span>
-                        <span style={{ width: 96, fontSize: 12, color: 'var(--text-secondary)' }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
                           {fmtExpiry(acc.expiresAt)}
                         </span>
-                        <span style={{ width: 120, fontSize: 12, color: 'var(--text-secondary)' }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
                           {acc.balance?.display || '—'}
                         </span>
                         <div
                           style={{
-                            width: 220,
                             display: 'flex',
                             gap: 4,
                             justifyContent: 'flex-end',

@@ -1,9 +1,9 @@
 import type { AppView, InspectorTab } from '../types/backend';
 import {
   IconActivity, IconAgent, IconAgentTeam, IconArchive, IconBranch, IconColumns, IconCompose, IconCopy, IconCpu,
-  IconDagNodes, IconDatabase, IconDiffBox, IconFileDoc, IconFileEdit, IconFolder, IconFolderPlus,
+  IconDagNodes, IconLightbulb, IconTarget, IconDatabase, IconDiffBox, IconFileDoc, IconFileEdit, IconFolder, IconFolderPlus,
   IconGlobe, IconHistory, IconKeyboard, IconPin, IconPlay, IconPlus, IconPuzzle,
-  IconRailClock, IconReset, IconSearch, IconSettingsGear, IconShieldCheck, IconSparkle,
+  IconRailClock, IconReset, IconSearch, IconSettingsGear, IconShieldCheck,
   IconStopSquare, IconSun, IconTerminal, IconUndo,
 } from './Icons';
 
@@ -52,13 +52,13 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
     { cmd: '/clear', desc: '清空输入与附件', icon: IconReset },
   ] },
   { label: '执行', commands: [
-    { cmd: '/goal', desc: '输入目标并启动自主任务', icon: IconSparkle, aliases: ['目标'] },
-    { cmd: '/swarm', desc: '输入目标启动任务，status 查看状态，stop 停止，留空查看用法', icon: IconAgentTeam },
+    { cmd: '/goal', desc: '输入目标并启动自主任务', icon: IconTarget, aliases: ['目标'] },
+    { cmd: '/swarm', desc: '切换到多智能体协作；/swarm status 查看状态，/swarm stop 停止', icon: IconAgentTeam },
     { cmd: '/swarm-plan', desc: '查看自主任务的执行计划', icon: IconDagNodes, inspector: 'autonomous', swarmSection: 'plan', aliases: ['autonomous'] },
     { cmd: '/messages', desc: '查看 Swarm 协作消息', icon: IconActivity, inspector: 'autonomous', swarmSection: 'messages', aliases: ['swarm-messages'] },
     { cmd: '/artifacts', desc: '查看 Swarm 文件产物', icon: IconArchive, inspector: 'autonomous', swarmSection: 'artifacts', aliases: ['swarm-artifacts'] },
     { cmd: '/agents', desc: '查看子智能体和运行详情', icon: IconAgentTeam, inspector: 'subagents', aliases: ['dag', 'subagents'] },
-    { cmd: '/plan', title: '计划模式', desc: '切换计划模式', icon: IconDagNodes },
+    { cmd: '/plan', title: '计划模式', desc: '切换计划模式', icon: IconLightbulb },
     { cmd: '/run', desc: '切换为 Codex 执行模式', icon: IconPlay },
     { cmd: '/chat', desc: '切换为 Chat 对话模式', icon: IconCompose },
     { cmd: '/stop', desc: '暂停当前正在执行的对话任务', aliases: ['pause'], icon: IconStopSquare, threadOnly: true },

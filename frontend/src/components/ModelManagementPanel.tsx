@@ -466,21 +466,21 @@ export const ModelManagementPanel: React.FC<ModelManagementPanelProps> = ({
         {/* Models Table */}
         <div className="a2a-models-table">
           <div className="a2a-models-thead">
-            <span style={{ flex: 2.2 }}>上游模型</span>
-            <span style={{ width: 56 }}>倍率</span>
-            <span style={{ width: 68 }}>可见性</span>
-            <span style={{ width: 58 }}>来源</span>
-            <span style={{ width: 105 }}>上下文 / 输出</span>
-            <span style={{ width: 96 }}>能力</span>
-            <span style={{ flex: 2.3 }}>模型映射</span>
-            <span style={{ width: 120, textAlign: 'right' }}>操作</span>
+            <span>上游模型</span>
+            <span>倍率</span>
+            <span>可见性</span>
+            <span>来源</span>
+            <span>上下文 / 输出</span>
+            <span>能力</span>
+            <span>模型映射</span>
+            <span>操作</span>
           </div>
 
           {groupedModels.length === 0 ? (
             <div className="a2a-empty-box" style={{ padding: '42px 20px' }}>
               <div style={{ fontWeight: 500, marginBottom: 6 }}>暂无已同步的模型</div>
               <div style={{ color: 'var(--text-tertiary)', marginBottom: 14 }}>
-                请先在「账号号池」中添加至少一个启用账号，然后点击右上角「获取模型」，所有模型会自动挂载为后端 Agent 可用 Provider。
+                请先在「账号池」中添加至少一个启用账号，然后点击右上角「获取模型」，所有模型会自动挂载为后端 Agent 可用 Provider。
               </div>
               <button
                 type="button"
@@ -510,9 +510,9 @@ export const ModelManagementPanel: React.FC<ModelManagementPanelProps> = ({
                       className="a2a-models-row"
                       data-disabled={!m.enabled ? 'true' : undefined}
                     >
-                      <div style={{ flex: 2.2, minWidth: 0 }}>
+                      <div style={{ minWidth: 0 }}>
                         <div className="a2a-model-id-line">
-                          <span className="a2a-mono-strong">{m.upstreamModel}</span>
+                          <span className="a2a-mono-strong a2a-cell-label" title={m.upstreamModel}>{m.upstreamModel}</span>
                           {isDefault && <span className="a2a-default-tag">默认</span>}
                         </div>
                         <div className="a2a-item-sub">
@@ -533,11 +533,11 @@ export const ModelManagementPanel: React.FC<ModelManagementPanelProps> = ({
                         </div>
                       </div>
 
-                      <span style={{ width: 56, fontSize: 12 }} className="tabular-nums">
+                      <span style={{ fontSize: 12 }} className="tabular-nums">
                         {m.multiplier}x
                       </span>
 
-                      <span style={{ width: 68 }}>
+                      <span>
                         <button
                           type="button"
                           className="a2a-vis-btn"
@@ -549,18 +549,18 @@ export const ModelManagementPanel: React.FC<ModelManagementPanelProps> = ({
                         </button>
                       </span>
 
-                      <span style={{ width: 58, fontSize: 12, color: 'var(--text-secondary)' }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
                         {m.source === 'manual' ? '手动' : '远程'}
                       </span>
 
                       <span
-                        style={{ width: 105, fontSize: 12, color: 'var(--text-secondary)' }}
+                        style={{ fontSize: 12, color: 'var(--text-secondary)' }}
                         className="tabular-nums"
                       >
                         {fmtCtx(m.contextWindow)} / {fmtCtx(m.maxOutput)}
                       </span>
 
-                      <div style={{ width: 96, display: 'flex', gap: 4 }}>
+                      <div style={{ display: 'flex', gap: 4 }}>
                         <span
                           className="a2a-cap-icon"
                           data-on={m.capabilities.tools ? 'true' : undefined}
@@ -591,7 +591,7 @@ export const ModelManagementPanel: React.FC<ModelManagementPanelProps> = ({
                         </span>
                       </div>
 
-                      <div style={{ flex: 2.3, display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
                         {m.mappings.map((mp) => (
                           <span
                             key={mp.id}
@@ -605,7 +605,7 @@ export const ModelManagementPanel: React.FC<ModelManagementPanelProps> = ({
                               onClick={() => void handleToggleMapping(m, mp)}
                               title={mp.enabled ? '点击禁用此映射' : '点击启用此映射'}
                             />
-                            <span>{mp.alias}</span>
+                            <span className="a2a-cell-label" title={mp.alias}>{mp.alias}</span>
                             {mp.isDefault && <span className="a2a-mapping-sub">默认</span>}
                             {!mp.isDefault && (
                               <button
@@ -631,7 +631,7 @@ export const ModelManagementPanel: React.FC<ModelManagementPanelProps> = ({
                         </button>
                       </div>
 
-                      <div style={{ width: 120, display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                      <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
                         <button
                           type="button"
                           className="a2a-mini-btn"

@@ -158,6 +158,7 @@ export async function service({
     shutdownCoordinator.registerStage(
       'checkin_scheduler',
       () => {
+        webLogin.close();
         checkin?.stop();
         controlPlane?.close();
       },
