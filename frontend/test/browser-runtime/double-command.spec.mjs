@@ -80,6 +80,9 @@ test('an open real terminal command stays mounted through the next command and f
   // Force overflow and repeat the opening at the tail with a taller dock.
   // Even a clipped footer may report .toBeVisible(), so assert the actual bounds.
   await page.setViewportSize({ width: 780, height: 650 });
+  // Observe the resized tail before clicking. Otherwise Playwright may scroll
+  // the toggle into view while the resize is still being reconciled.
+  await expectClearTail(page, exchange);
   const toggle = second.locator(':scope > summary');
   await toggle.click();
   await expect(second).not.toHaveAttribute('open', '');
