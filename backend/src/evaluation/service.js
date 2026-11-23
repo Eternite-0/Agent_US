@@ -14,7 +14,7 @@ import { createFixtureWorkspace, createGitRepoWorkspace } from './fixtures.js';
 import { compareRegression } from './regression.js';
 import { TRAFFIC_SOURCES, withTraceContext } from '../observability/trace.js';
 import { redactSecrets } from '../envelope.js';
-import { scoreResults } from './scoring.js';
+import { extractResultTelemetry, scoreResults } from './scoring.js';
 import { estimateTaskBudget, queryHistoricalTaskMetrics } from '../planning/budget-estimator.js';
 import { BenchmarkSandbox } from '../tools/benchmark-sandbox.js';
 import { DEFAULT_DEPENDENCY_POLICY } from './dependency-policy.js';
@@ -266,6 +266,116 @@ function deriveMeasuredCapabilities(results = [], score = {}) {
   };
 }
 
+export function summarizeReasoningMetrics(results = []) {
+  const items = Array.isArray(results) ? results : [];
+  const withMetrics = [];
+  for (const r of items) {
+    const rm =
+      r?.telemetry?.reasoningMetrics ??
+      r?.output?.reasoningMetrics ??
+      r?.judge?.evidence?.reasoningMetrics ??
+      r?.reasoningMetrics ??
+      null;
+    if (rm && typeof rm === 'object') {
+      withMetrics.push({ result: r, rm });
+    }
+  }
+
+  let totalIneffectiveActions = 0;
+  let ineffectiveSamples = 0;
+  let firstFixEvaluated = 0;
+  let firstFixSuccessCount = 0;
+  let reproducedEvaluated = 0;
+  let reproducedBeforeEditCount = 0;
+  let selfCorrectionAttempts = 0;
+  let selfCorrectionRecoveredCount = 0;
+  let rootCauseReadEvaluated = 0;
+  let rootCauseFilesReadCount = 0;
+  let unverifiedMutationsAfterPassCount = 0;
+  let totalFalsifiedAttempts = 0;
+  const stuckTriggerCounts = {};
+  const uniqueFingerprints = new Set();
+
+  for (const { rm } of withMetrics) {
+    if (rm.ineffectiveActionCount != null && Number.isFinite(Number(rm.ineffectiveActionCount))) {
+      totalIneffectiveActions += Math.max(0, Number(rm.ineffectiveActionCount));
+      ineffectiveSamples += 1;
+    }
+    if (typeof rm.firstFixSucceeded === 'boolean') {
+      firstFixEvaluated += 1;
+      if (rm.firstFixSucceeded) firstFixSuccessCount += 1;
+    }
+    if (typeof rm.reproducedFailureBeforeEdit === 'boolean') {
+      reproducedEvaluated += 1;
+      if (rm.reproducedFailureBeforeEdit) reproducedBeforeEditCount += 1;
+    }
+    const hadStuckOrFalsified =
+      rm.selfCorrectionRecovered === true ||
+      Number(rm.stuckTriggerCount || 0) > 0 ||
+      (Array.isArray(rm.stuckTriggers) && rm.stuckTriggers.length > 0) ||
+      (Array.isArray(rm.falsifiedAttempts) && rm.falsifiedAttempts.length > 0);
+    if (hadStuckOrFalsified) {
+      selfCorrectionAttempts += 1;
+      if (rm.selfCorrectionRecovered === true) selfCorrectionRecoveredCount += 1;
+    }
+    if (rm.rootCauseFilesReadBeforeEdit !== undefined && rm.rootCauseFilesReadBeforeEdit !== null) {
+      rootCauseReadEvaluated += 1;
+      if (
+        rm.rootCauseFilesReadBeforeEdit === true ||
+        (Array.isArray(rm.rootCauseFilesReadBeforeEdit) && rm.rootCauseFilesReadBeforeEdit.length > 0) ||
+        Number(rm.rootCauseFilesReadBeforeEdit) > 0
+      ) {
+        rootCauseFilesReadCount += 1;
+      }
+    }
+    if (rm.hasUnverifiedMutationsAfterLastPass === true) {
+      unverifiedMutationsAfterPassCount += 1;
+    }
+    if (Array.isArray(rm.falsifiedAttempts)) {
+      totalFalsifiedAttempts += rm.falsifiedAttempts.length;
+    } else if (rm.falsifiedAttemptCount != null && Number.isFinite(Number(rm.falsifiedAttemptCount))) {
+      totalFalsifiedAttempts += Math.max(0, Number(rm.falsifiedAttemptCount));
+    }
+    if (Array.isArray(rm.stuckTriggers)) {
+      for (const trig of rm.stuckTriggers) {
+        const key = typeof trig === 'string' ? trig : String(trig?.pattern ?? trig?.type ?? 'unknown');
+        stuckTriggerCounts[key] = (stuckTriggerCounts[key] ?? 0) + 1;
+      }
+    } else if (rm.stuckPatternCounts && typeof rm.stuckPatternCounts === 'object') {
+      for (const [k, v] of Object.entries(rm.stuckPatternCounts)) {
+        stuckTriggerCounts[k] = (stuckTriggerCounts[k] ?? 0) + Math.max(0, Number(v || 0));
+      }
+    }
+    if (Array.isArray(rm.errorFingerprints)) {
+      for (const fp of rm.errorFingerprints) {
+        const key = typeof fp === 'string' ? fp : fp?.signature ?? fp?.code ?? null;
+        if (key) uniqueFingerprints.add(String(key));
+      }
+    }
+  }
+
+  const sampleCount = withMetrics.length;
+  return {
+    totalResults: items.length,
+    sampleCount,
+    totalIneffectiveActions,
+    meanIneffectiveActions: ineffectiveSamples > 0 ? Number((totalIneffectiveActions / ineffectiveSamples).toFixed(4)) : 0,
+    firstFixSuccessCount,
+    firstFixSuccessRate: firstFixEvaluated > 0 ? roundMetric4(firstFixSuccessCount / firstFixEvaluated) : null,
+    reproducedBeforeEditCount,
+    reproducedBeforeEditRate: reproducedEvaluated > 0 ? roundMetric4(reproducedBeforeEditCount / reproducedEvaluated) : null,
+    selfCorrectionAttempts,
+    selfCorrectionRecoveredCount,
+    selfCorrectionRecoveryRate: selfCorrectionAttempts > 0 ? roundMetric4(selfCorrectionRecoveredCount / selfCorrectionAttempts) : null,
+    rootCauseFilesReadCount,
+    rootCauseReadBeforeEditRate: rootCauseReadEvaluated > 0 ? roundMetric4(rootCauseFilesReadCount / rootCauseReadEvaluated) : null,
+    unverifiedMutationsAfterPassCount,
+    totalFalsifiedAttempts,
+    stuckTriggerCounts,
+    uniqueErrorFingerprintsCount: uniqueFingerprints.size,
+  };
+}
+
 function extractCallCommandsFromMessages(db, sessionId, turnId) {
   const map = new Map();
   if (!db?.isOpen || !sessionId || !turnId) return map;
@@ -296,6 +406,7 @@ function collectTurnTelemetry(directAgent, sessionId, turnId, currentTurn) {
   const db = directAgent?.store?.db;
   let toolReceipts = null;
   let parsedVerdict = parseJson(currentTurn?.verdict ?? currentTurn?.verdictJson, null);
+  let reasoningMetrics = null;
   let stepUsage = currentTurn?.step != null ? { steps: Number(currentTurn.step) } : null;
   let tokenUsage = currentTurn?.inputTokens != null || currentTurn?.outputTokens != null
     ? {
@@ -323,11 +434,18 @@ function collectTurnTelemetry(directAgent, sessionId, turnId, currentTurn) {
           parsedVerdict = parseJson(turnRow.verdictJson, null);
         }
       }
+      const termEvRow = db
+        .prepare("SELECT data FROM direct_events WHERE sessionId=? AND turnId=? AND type IN ('turn/completed','turn/failed') ORDER BY seq DESC LIMIT 1")
+        .get(sessionId, turnId);
+      const termEvData = parseJson(termEvRow?.data, null);
+      if (termEvData?.reasoningMetrics && typeof termEvData.reasoningMetrics === 'object') {
+        reasoningMetrics = termEvData.reasoningMetrics;
+      }
     } catch {
       // minimal store mock fallback
     }
   }
-  return { toolReceipts, parsedVerdict, stepUsage, tokenUsage };
+  return { toolReceipts, parsedVerdict, stepUsage, tokenUsage, reasoningMetrics };
 }
 
 function resolveTaskSandbox({
@@ -536,6 +654,7 @@ function createDirectRuntimeAdapter(directAgent, { model = null, sandbox = null,
                 tokenUsage: telemetry.tokenUsage,
                 toolReceiptCount: telemetry.toolReceipts?.length ?? 0,
                 trustedVerdict,
+                ...(telemetry.reasoningMetrics ? { reasoningMetrics: telemetry.reasoningMetrics } : {}),
               };
               throw error;
             }
@@ -552,6 +671,7 @@ function createDirectRuntimeAdapter(directAgent, { model = null, sandbox = null,
               trustedVerdict,
               stepUsage: telemetry.stepUsage,
               tokenUsage: telemetry.tokenUsage,
+              ...(telemetry.reasoningMetrics ? { reasoningMetrics: telemetry.reasoningMetrics } : {}),
             };
           }
           await delay(100, undefined, { signal });
@@ -918,7 +1038,7 @@ export class EvaluationService {
         error: null,
       });
       const finalRun = this.getRun(runId);
-      this.#recordTrustedOutcomes(finalRun, mergedReport);
+      this.#recordTrustedOutcomes(finalRun, mergedReport, preparedTasks);
       if (finalRun.model && finalRun.status === 'completed' && mergedReport.score?.total > 0) {
         try {
           const measuredCaps = deriveMeasuredCapabilities(mergedReport.results, mergedReport.score);
@@ -1044,35 +1164,158 @@ export class EvaluationService {
     });
   }
 
-  #recordTrustedOutcomes(run, report) {
-    if (run.status !== 'completed' || !report?.score || report.score.passed !== report.score.total || !this.memory) return;
-    const verifier = this.memory.createTrustedVerifier?.();
+  summarizeReasoningMetrics(results = []) {
+    return summarizeReasoningMetrics(results);
+  }
+
+  #recordTrustedOutcomes(run, report, tasks = []) {
+    if (!this.memory) return;
+    const verifier = typeof this.memory.createTrustedVerifier === 'function'
+      ? this.memory.createTrustedVerifier()
+      : null;
     const runProjectId = run.projectId ?? run.evaluationProjectId ?? run.benchmarkId;
-    for (const result of report.results ?? []) {
-      if (result.status !== 'passed' || !result.judge?.deterministic) continue;
-      let memory;
-      try {
-        memory = this.memory.remember({
+    const taskById = new Map((Array.isArray(tasks) ? tasks : []).map((t) => [String(t.id), t]));
+
+    for (const result of report?.results ?? []) {
+      const task = taskById.get(String(result.taskId)) ?? this.registry?.get?.(String(result.taskId)) ?? null;
+      const taskInput = task?.prompt || task?.title || `Evaluation task ${result.taskId}`;
+      const modifiedFiles = [
+        ...(Array.isArray(result.judge?.evidence?.actualChangedFiles) ? result.judge.evidence.actualChangedFiles : []),
+        ...(Array.isArray(result.output?.modifiedFiles) ? result.output.modifiedFiles : []),
+        ...(Array.isArray(result.output?.changedFiles) ? result.output.changedFiles : []),
+        ...(Array.isArray(task?.metadata?.acceptanceCriteria?.requiredChangedFiles) ? task.metadata.acceptanceCriteria.requiredChangedFiles : []),
+      ];
+      const toolReceipts = Array.isArray(result.output?.toolReceipts) ? result.output.toolReceipts : [];
+      const reasoningMetrics = result.telemetry?.reasoningMetrics ?? result.output?.reasoningMetrics ?? null;
+
+      if (result.status === 'passed' && result.passed === true) {
+        if (run.status !== 'completed' || !result.judge?.deterministic) continue;
+        let distilled = [];
+        try {
+          if (typeof this.memory.distillTurnExperience === 'function') {
+            distilled = this.memory.distillTurnExperience({
+              projectId: runProjectId,
+              input: taskInput,
+              summary: result.judge?.reason || (typeof result.output?.output === 'string' ? result.output.output : JSON.stringify(result.output?.output ?? 'passed')),
+              workspaceRoot: null,
+              verdict: {
+                verdict: 'pass',
+                accepted: true,
+                reason: result.judge?.reason ?? 'deterministic_pass',
+                checks: result.judge?.evidence?.checks ?? {},
+              },
+              reasoningMetrics,
+              toolReceipts,
+              modifiedFiles,
+              evaluationEvidence: null,
+              source: 'evaluation',
+              sourceTaskId: result.taskId,
+              sessionId: result.output?.sessionId ?? null,
+              turnId: result.output?.turnId ?? null,
+              runId: run.id,
+            });
+          } else {
+            distilled = this.memory.remember({
+              projectId: runProjectId,
+              type: 'lesson',
+              memoryClass: 'verified_fix_pattern',
+              content: `Evaluation task ${result.taskId} passed deterministic verification.`,
+              source: 'evaluation',
+            }, { projectId: runProjectId, source: 'evaluation' });
+          }
+        } catch {
+          continue;
+        }
+        const items = Array.isArray(distilled) ? distilled : [distilled].filter(Boolean);
+        if (!items.length || !verifier) continue;
+        const taskScore =
+          report?.score && report.score.passed === report.score.total
+            ? report.score
+            : { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 };
+        const evidence = {
           projectId: runProjectId,
-          type: 'lesson',
-          content: `Evaluation task ${result.taskId} passed deterministic verification.`,
-          source: 'evaluation',
-        }, { projectId: runProjectId, source: 'evaluation' });
-      } catch {
-        continue;
-      }
-      const item = Array.isArray(memory) ? memory[0] : memory;
-      if (!item || !verifier) continue;
-      try {
-        verifier({
-          projectId: runProjectId,
-          id: item.id,
           sourceTaskId: result.taskId,
           evaluationRunId: run.id,
-          evidence: { projectId: runProjectId, sourceTaskId: result.taskId, evaluationRunId: run.id, score: report.score, evidenceRef: `evaluation:${run.id}:${result.taskId}` },
-        });
-      } catch {
-        // A failed trust grant must not change the evaluation terminal state.
+          score: taskScore,
+          ...(report?.score ? { runScore: report.score } : {}),
+          evidenceRef: `evaluation:${run.id}:${result.taskId}`,
+          deterministic: true,
+          passed: true,
+          ...(result.judge?.evidence ? { judgeEvidence: result.judge.evidence } : {}),
+        };
+        for (const item of items) {
+          if (!item?.id) continue;
+          try {
+            verifier({
+              projectId: runProjectId,
+              id: item.id,
+              sourceTaskId: result.taskId,
+              evaluationRunId: run.id,
+              evidence,
+              sourceArtifact: `evaluation:${run.id}:${result.taskId}`,
+            });
+          } catch {
+            // A failed trust grant must not change the evaluation terminal state.
+          }
+        }
+        continue;
+      }
+
+      if (result.status === 'failed' || result.status === 'timeout') {
+        const telemetryInfo = extractResultTelemetry(result);
+        const failureCategory =
+          telemetryInfo.failureCategory !== 'none'
+            ? telemetryInfo.failureCategory
+            : (result.judge?.evidence?.failureCategory ?? result.errorCode ?? result.status ?? 'failed');
+        const errorMsg = safeError(
+          result.error ||
+            result.judge?.reason ||
+            (Array.isArray(result.judge?.vetoReasons) && result.judge.vetoReasons.length
+              ? result.judge.vetoReasons.join('; ')
+              : null) ||
+            result.errorCode ||
+            result.status,
+        );
+        try {
+          if (typeof this.memory.distillTurnExperience === 'function') {
+            this.memory.distillTurnExperience({
+              projectId: runProjectId,
+              input: taskInput,
+              summary: typeof result.output?.output === 'string' ? result.output.output : '',
+              workspaceRoot: null,
+              verdict: {
+                verdict: 'fail',
+                accepted: false,
+                reasons: [errorMsg],
+                checks: result.judge?.evidence?.checks ?? {},
+              },
+              reasoningMetrics,
+              toolReceipts,
+              modifiedFiles,
+              evaluationEvidence: null,
+              error: errorMsg,
+              errorCode: result.errorCode ?? result.telemetry?.errorCode ?? null,
+              failureCategory,
+              source: 'evaluation',
+              sourceTaskId: result.taskId,
+              sessionId: result.output?.sessionId ?? null,
+              turnId: result.output?.turnId ?? null,
+              runId: run.id,
+            });
+          } else {
+            this.memory.remember({
+              projectId: runProjectId,
+              type: 'lesson',
+              memoryClass: 'failure_trap_pattern',
+              content: `Evaluation task ${result.taskId} failed (${failureCategory}): ${errorMsg}`,
+              tags: ['failure_trap_pattern', failureCategory],
+              metadata: { failureCategory, error: errorMsg, sourceTaskId: result.taskId, runId: run.id },
+              source: 'evaluation',
+            }, { projectId: runProjectId, source: 'evaluation' });
+          }
+        } catch {
+          // Failure trap distillation is advisory and cannot alter the evaluation terminal state.
+        }
       }
     }
   }

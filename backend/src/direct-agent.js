@@ -115,6 +115,7 @@ export class DirectAgentRuntime {
       enableHeartbeat = true,
       artifactStoreDir = null,
       metrics = null,
+      distillSyntheticTurns = false,
     } = {},
   ) {
     this.store = store;
@@ -123,6 +124,8 @@ export class DirectAgentRuntime {
     this.judgment = judgment;
     this.metrics = metrics ?? pool?.metrics ?? null;
     this.intelligence = null;
+    this.experienceMemory = null;
+    this.distillSyntheticTurns = Boolean(distillSyntheticTurns);
     this.defaultWorkspace = resolve(defaultWorkspace);
     this.dataRoot = dataRoot ? resolve(dataRoot) : null;
     this.closed = false;
@@ -418,6 +421,7 @@ export class DirectAgentRuntime {
   attachIntelligenceServices(intelligence) {
     if (intelligence !== null && (typeof intelligence !== 'object' || !intelligence)) throw new TypeError('intelligence must be an object or null');
     this.intelligence = intelligence;
+    this.experienceMemory = intelligence?.memory ?? null;
     if (intelligence?.memory) {
       this.contextAssembler.experienceMemoryService = intelligence.memory;
       this.swarmOrchestrator.experienceMemory = intelligence.memory;
@@ -1008,6 +1012,141 @@ export class DirectAgentRuntime {
     return this.modelFeedback.record(payload);
   }
 
+  #collectTurnExecutionSignals({ verifierEvents = null, modifiedFiles = null, sessionId, turnId } = {}) {
+    const files = new Set(modifiedFiles ?? []);
+    const toolReceipts = [];
+    if (Array.isArray(verifierEvents) && verifierEvents.length > 0) {
+      for (const ev of verifierEvents) {
+        if (ev?.type !== 'tool/result' || !ev.data) continue;
+        const { callId, name, isError, content, effectiveArgs, receipt } = ev.data;
+        if (!isError && ['write_file', 'edit_file', 'apply_patch', 'delete_file'].includes(String(name))) {
+          if (effectiveArgs?.path) files.add(String(effectiveArgs.path));
+          if (effectiveArgs?.file_path) files.add(String(effectiveArgs.file_path));
+          if (Array.isArray(effectiveArgs?.paths)) {
+            for (const p of effectiveArgs.paths) if (p) files.add(String(p));
+          }
+        }
+        toolReceipts.push({
+          id: receipt?.id ?? callId ?? null,
+          callId: callId ?? receipt?.callId ?? null,
+          toolName: receipt?.toolName ?? name ?? '',
+          status: receipt?.status ?? (isError ? 'failed' : 'finished'),
+          isError: Boolean(isError),
+          exitCode: receipt?.exitCode ?? null,
+          errorCode: receipt?.errorCode ?? null,
+          command: typeof effectiveArgs?.command === 'string' ? effectiveArgs.command : '',
+          path: typeof effectiveArgs?.path === 'string' ? effectiveArgs.path : '',
+          output: typeof content === 'string' ? content.slice(0, 600) : '',
+        });
+      }
+    } else if (this.store?.db?.isOpen && sessionId && turnId) {
+      try {
+        const rows = this.store.db
+          .prepare('SELECT id, callId, toolName, status, exitCode, errorCode FROM tool_receipts WHERE sessionId=? AND turnId=? ORDER BY createdAt ASC')
+          .all(sessionId, turnId);
+        for (const row of rows) {
+          toolReceipts.push({ ...row, isError: row.status === 'failed' || (typeof row.exitCode === 'number' && row.exitCode !== 0) });
+        }
+      } catch {
+        // minimal store fallback
+      }
+    }
+    return { toolReceipts, modifiedFiles: [...files] };
+  }
+
+  #finalizeTurnExperienceAndTelemetry({
+    session,
+    sessionId,
+    turnId,
+    workspaceRoot,
+    input,
+    summary = '',
+    verdict = null,
+    evidenceCount = 0,
+    reasoningMetrics = null,
+    verifierEvents = null,
+    modifiedFiles = null,
+    error = null,
+    errorCode = null,
+    status = 'completed',
+    effectiveModel = null,
+    actualProvider = 'pool',
+    actualAccountId = null,
+    durationMs = 0,
+    trafficSource = 'production',
+    isSynthetic = false,
+    distillSyntheticTurns = false,
+  }) {
+    if (reasoningMetrics && typeof reasoningMetrics === 'object') {
+      safeIsolateSideEffect(() =>
+        this.metrics?.record('reasoning_metrics', {
+          sessionId,
+          turnId,
+          model: effectiveModel,
+          provider: actualProvider,
+          accountId: actualAccountId,
+          ok: status === 'completed',
+          durationMs,
+          code: errorCode ?? null,
+          trafficSource,
+          isSynthetic: Boolean(isSynthetic),
+          detail: reasoningMetrics,
+        }),
+      );
+    }
+
+    const expMemory = this.experienceMemory ?? this.intelligence?.memory ?? null;
+    if (!expMemory) return;
+
+    const turnIsSynthetic = Boolean(isSynthetic || session?.isSynthetic);
+    const allowSynthetic = Boolean(distillSyntheticTurns || this.distillSyntheticTurns || session?.distillSyntheticTurns);
+    if (turnIsSynthetic && !allowSynthetic) return;
+
+    const signals = this.#collectTurnExecutionSignals({ verifierEvents, modifiedFiles, sessionId, turnId });
+    let distilledCount = 0;
+
+    if (typeof expMemory.distillTurnExperience === 'function') {
+      const distilled = safeIsolateSideEffect(() =>
+        expMemory.distillTurnExperience({
+          projectId: session?.projectId ?? workspaceRoot,
+          input,
+          summary,
+          workspaceRoot,
+          verdict,
+          reasoningMetrics: reasoningMetrics ?? null,
+          toolReceipts: signals.toolReceipts,
+          modifiedFiles: signals.modifiedFiles,
+          evaluationEvidence: null,
+          error,
+          errorCode,
+          source: 'direct_turn',
+          sourceTaskId: turnId,
+          sessionId,
+          turnId,
+        }),
+      );
+      distilledCount = Array.isArray(distilled) ? distilled.length : 0;
+    }
+
+    const hasTaggedLines = /^\[(fact|preference|lesson|decision|constraint)\]\s+/im.test(String(summary ?? ''));
+    if (!turnIsSynthetic && expMemory.recordExecutionCandidates && (distilledCount === 0 || hasTaggedLines)) {
+      safeIsolateSideEffect(() =>
+        expMemory.recordExecutionCandidates({
+          projectId: session?.projectId ?? workspaceRoot,
+          source: 'direct_turn',
+          sourceTaskId: turnId,
+          sessionId,
+          turnId,
+          goal: input,
+          summary,
+          verdict,
+          evidenceCount: Number(evidenceCount || 0),
+          isSynthetic: Boolean(turnIsSynthetic),
+        }),
+      );
+    }
+  }
+
   // ---- Turn Enqueue & Lifecycle ----
 
   startTurn(
@@ -1024,6 +1163,7 @@ export class DirectAgentRuntime {
       evidenceContract = null,
       trafficSource = undefined,
       isSynthetic = undefined,
+      distillSyntheticTurns = undefined,
     } = {},
   ) {
     const session = this.getSession(sessionId);
@@ -1082,6 +1222,7 @@ export class DirectAgentRuntime {
       evidenceContract: evidenceContract && typeof evidenceContract === 'object' ? evidenceContract : null,
       trafficSource: classifiedTraffic.trafficSource,
       isSynthetic: classifiedTraffic.isSynthetic,
+      ...(distillSyntheticTurns !== undefined ? { distillSyntheticTurns: Boolean(distillSyntheticTurns) } : {}),
     };
 
     const txResult = this.store.tx(() => {
@@ -1297,6 +1438,7 @@ export class DirectAgentRuntime {
             signal: combinedSignal,
             trafficSource: classifiedTraffic.trafficSource,
             isSynthetic: classifiedTraffic.isSynthetic,
+            distillSyntheticTurns: Boolean(payload.distillSyntheticTurns),
           });
         } catch (err) {
           if (isLeaseLostError(err)) throw err;
@@ -1422,9 +1564,12 @@ export class DirectAgentRuntime {
     signal,
     trafficSource = 'production',
     isSynthetic = false,
+    distillSyntheticTurns = false,
   }) {
     const started = Date.now();
     const nonce = this.sessionRepo.ensureSessionNonce(sessionId);
+    const turnModifiedFiles = new Set();
+    let sessionObj = null;
     const sbxCfg = this.#resolveSessionSandboxConfig(sessionId);
     if (sbxCfg?.sandbox) {
       sbxCfg.sandbox.resolveBackend();
@@ -1543,6 +1688,7 @@ export class DirectAgentRuntime {
         onBeforeMutate: (rel, full) =>
           this.sessionRepo.capturePreMutationSnapshot(sessionId, turnId, rel, full),
         onFileChanged: (change) => {
+          if (change?.path) turnModifiedFiles.add(String(change.path));
           this.#emitPersisted(sessionId, turnId, 'file/changed', { turnId, sessionId, ...change });
         },
         onToolOutput: (chunk) => {
@@ -1580,6 +1726,7 @@ export class DirectAgentRuntime {
       });
 
       const currentSession = this.getSession(sessionId);
+      sessionObj = currentSession;
       const assembled = this.contextAssembler.assemble({
         session: currentSession,
         turnId,
@@ -1761,6 +1908,7 @@ export class DirectAgentRuntime {
       actualAccountId = loopResult.route?.accountId ?? null;
       const finalAssistantText = loopResult.text || '';
       const finalVerdict = loopResult.verdict ?? null;
+      const reasoningMetrics = loopResult.reasoningMetrics ?? null;
       const evidenceCount =
         finalVerdict?.evidenceCount ??
         this.store.db
@@ -1932,6 +2080,7 @@ export class DirectAgentRuntime {
               verdict: finalVerdict,
               evidenceCount: Number(evidenceCount || 0),
               durationMs,
+              ...(reasoningMetrics ? { reasoningMetrics } : {}),
             },
             audit: false,
             at: finishedAt,
@@ -1951,6 +2100,7 @@ export class DirectAgentRuntime {
               steps,
               code: errorCode,
               durationMs,
+              ...(reasoningMetrics ? { reasoningMetrics } : {}),
             }),
           );
           safeIsolateSideEffect(() =>
@@ -1972,22 +2122,31 @@ export class DirectAgentRuntime {
               isSynthetic,
             }),
           );
-          if (!isSynthetic && this.intelligence?.memory?.recordExecutionCandidates) {
           safeIsolateSideEffect(() =>
-            this.intelligence.memory.recordExecutionCandidates({
-              projectId: currentSession.projectId ?? workspaceRoot,
-              source: 'direct_turn',
-              sourceTaskId: turnId,
+            this.#finalizeTurnExperienceAndTelemetry({
+              session: currentSession,
               sessionId,
               turnId,
-              goal: input,
+              workspaceRoot,
+              input,
               summary: finalAssistantText,
               verdict: finalVerdict,
-              evidenceCount: Number(evidenceCount || 0),
-              isSynthetic: Boolean(isSynthetic),
+              evidenceCount,
+              reasoningMetrics,
+              verifierEvents: loopResult.verifierEvents,
+              modifiedFiles: turnModifiedFiles,
+              error: errorMessage,
+              errorCode,
+              status: 'failed',
+              effectiveModel,
+              actualProvider,
+              actualAccountId,
+              durationMs,
+              trafficSource,
+              isSynthetic,
+              distillSyntheticTurns,
             }),
           );
-        }
 
         if (isRecovery) {
             safeIsolateSideEffect(() =>
@@ -2102,6 +2261,7 @@ export class DirectAgentRuntime {
             verdict: finalVerdict,
             evidenceCount: Number(evidenceCount || 0),
             text: excerpt(finalAssistantText, 4000),
+            ...(reasoningMetrics ? { reasoningMetrics } : {}),
           },
           audit: false,
           at: finishedAt,
@@ -2127,6 +2287,7 @@ export class DirectAgentRuntime {
             cacheEligibleInputTokens: totalCacheEligible,
             durationMs,
             evidenceCount: Number(evidenceCount || 0),
+            ...(reasoningMetrics ? { reasoningMetrics } : {}),
           }),
         );
 
@@ -2149,22 +2310,29 @@ export class DirectAgentRuntime {
           }),
         );
 
-        if (!isSynthetic && this.intelligence?.memory?.recordExecutionCandidates) {
-          safeIsolateSideEffect(() =>
-            this.intelligence.memory.recordExecutionCandidates({
-              projectId: currentSession.projectId ?? workspaceRoot,
-              source: 'direct_turn',
-              sourceTaskId: turnId,
-              sessionId,
-              turnId,
-              goal: input,
-              summary: finalAssistantText,
-              verdict: finalVerdict,
-              evidenceCount: Number(evidenceCount || 0),
-              isSynthetic: Boolean(isSynthetic),
-            }),
-          );
-        }
+        safeIsolateSideEffect(() =>
+          this.#finalizeTurnExperienceAndTelemetry({
+            session: currentSession,
+            sessionId,
+            turnId,
+            workspaceRoot,
+            input,
+            summary: finalAssistantText,
+            verdict: finalVerdict,
+            evidenceCount,
+            reasoningMetrics,
+            verifierEvents: loopResult.verifierEvents,
+            modifiedFiles: turnModifiedFiles,
+            status: 'completed',
+            effectiveModel,
+            actualProvider,
+            actualAccountId,
+            durationMs,
+            trafficSource,
+            isSynthetic,
+            distillSyntheticTurns,
+          }),
+        );
 
         if (isRecovery) {
           safeIsolateSideEffect(() =>
@@ -2401,6 +2569,31 @@ export class DirectAgentRuntime {
             isSynthetic,
           });
         });
+
+        if (!isCancelled) {
+          safeIsolateSideEffect(() =>
+            this.#finalizeTurnExperienceAndTelemetry({
+              session: sessionObj,
+              sessionId,
+              turnId,
+              workspaceRoot,
+              input,
+              verdict: { verdict: 'fail', accepted: false, reasons: [message] },
+              reasoningMetrics: err?.reasoningMetrics ?? classified?.reasoningMetrics ?? null,
+              modifiedFiles: turnModifiedFiles,
+              error: message,
+              errorCode: classified.code ?? null,
+              status: 'failed',
+              effectiveModel,
+              actualProvider,
+              actualAccountId,
+              durationMs,
+              trafficSource,
+              isSynthetic,
+              distillSyntheticTurns,
+            }),
+          );
+        }
 
         if (isRecovery && !isCancelled) {
           safeIsolateSideEffect(() =>
