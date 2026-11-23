@@ -18,6 +18,7 @@ import {
   getAutonomousReasoningReferenceFix,
   instantiateAutonomousReasoningWorkspace,
   materializeAutonomousReasoningRepos,
+  resolveTaskCriticalContextFiles,
 } from '../../src/evaluation/autonomous-reasoning-benchmark.js';
 import {
   createFixtureWorkspace,
@@ -38,6 +39,7 @@ import {
 } from '../../src/tools/benchmark-sandbox.js';
 import {
   authorizeRealBenchmarkApproval,
+  computeTrialCriticalContextRecall,
   enrichReceiptsWithCommands,
   extractTurnDiagnosticsFromEvents,
   loadAndProbeWorktreeArm,
@@ -1267,5 +1269,26 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       seedStore.close();
       rmSync(seedDir, { recursive: true, force: true });
     }
+
+    // Round 2: criticalContextRecall resolves against baseline source/spec files (not newly created CONTRACT.json / ANALYSIS.md)
+    const ar01Task = AUTONOMOUS_REASONING_DATASET.find((t) => t.id === 'ar-01-unfamiliar-codebase');
+    const ar01Critical = resolveTaskCriticalContextFiles(ar01Task);
+    assert.ok(ar01Critical.includes('src/index.js'));
+    assert.ok(ar01Critical.includes('src/config/env-loader.js'));
+    assert.equal(ar01Critical.includes('CONTRACT.json'), false);
+    assert.equal(ar01Critical.includes('ANALYSIS.md'), false);
+    assert.equal(
+      computeTrialCriticalContextRecall({
+        task: ar01Task,
+        reasoningMetrics: { rootCauseFilesReadBeforeEdit: ar01Critical },
+      }),
+      1,
+    );
+
+    const ar10Task = AUTONOMOUS_REASONING_DATASET.find((t) => t.id === 'ar-10-long-horizon-delivery');
+    const ar10Critical = resolveTaskCriticalContextFiles(ar10Task);
+    assert.deepEqual([...ar10Critical].sort(), ['src/cli/audit.js', 'src/core/ledger.js', 'src/core/reconcile.js']);
+    assert.equal(ar10Critical.includes('REPORTS/delivery-audit.json'), false);
+    assert.equal(ar10Critical.includes('test/reconcile.test.js'), false);
   });
 });

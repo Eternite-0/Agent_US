@@ -1253,3 +1253,149 @@ test('Step 3: ContextAssembler & DirectAgent admit ONLY verified experience memo
   });
   assert.ok(completedEv.experienceMemory.usedTokens > 0);
 });
+
+test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-only Supervisor while single-step tokens stay ~5k, plus ordering_precedence pre-completion check', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-r2-cumul-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-r2-cumul-ws-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  const adj = ['fast', 'safe', 'clean', 'strict', 'pure', 'lazy', 'async', 'sync'];
+  const noun = ['Parser', 'Router', 'Ledger', 'Cache', 'Codec', 'Guard', 'Planner', 'Store'];
+  const bigModule = Array.from({ length: 65 }, (_, i) => `export function fn_${noun[i % noun.length]}_${adj[(i * 3) % adj.length]}(v) { return v; }`).join('\n');
+  writeFileSync(join(workDir, 'src', 'index.js'), `${bigModule}\nexport const port = 8420;\n`, 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.createAccount({
+    preset: 'workbuddy',
+    label: 'cumul-test-pool',
+    credential: 'sk-test-cumul-pool-0001',
+    protocol: 'openai',
+    endpoint: 'https://api.example.invalid/v1',
+    models: ['main-model', 'fast-supervisor'],
+  });
+  pool.setDefaultModel('main-model');
+
+  const sysPrefixes = [];
+  let supCalls = 0;
+  let stepIdx = 0;
+  let sawOrderingReminder = false;
+
+  class CumulativeAciAdapter extends LlmAdapter {
+    async *stream(opts) {
+      if (opts.model === 'fast-supervisor' || (Array.isArray(opts.tools) && opts.tools.length === 0 && /ContextSupervisor/i.test(String(opts.system ?? '')))) {
+        assert.deepEqual(opts.tools, []);
+        supCalls += 1;
+        const payload = JSON.parse(opts.messages[0].content[0].text);
+        const idxCand = payload.candidates.find((c) => /index\.js/.test(c.path));
+        yield {
+          type: 'text-delta',
+          index: 0,
+          text: JSON.stringify({
+            keepRefs: [],
+            compressRefs: [idxCand?.id].filter(Boolean),
+            rationale: 'Compress older index.js read at cumulative 45% epoch',
+          }),
+        };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
+
+      stepIdx += 1;
+      sysPrefixes.push(opts.messages?.[0]?.content?.[0]?.text ?? '');
+
+      if (stepIdx === 1) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-read-idx', name: 'read_file', arguments: JSON.stringify({ path: 'src/index.js' }) } };
+        yield { type: 'usage', usage: { inputTokens: 25000, outputTokens: 1000 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 2) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-glob-1', name: 'glob', arguments: JSON.stringify({ pattern: 'src/*' }) } };
+        yield { type: 'usage', usage: { inputTokens: 25000, outputTokens: 1000 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 3) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-write-contract', name: 'write_file', arguments: JSON.stringify({ path: 'CONTRACT.json', content: JSON.stringify({ precedence: ['env', 'profile', 'defaults'] }) }) } };
+        yield { type: 'usage', usage: { inputTokens: 26000, outputTokens: 1000 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 4) {
+        // Cumulative totalIn+totalOut = 79k + current ~5k >= 0.45 * 160000 (72k) -> Epoch 1 + Supervisor MUST fire here!
+        const stubMsg = (opts.messages ?? []).find((m) => m.role === 'tool' && /\[ACI-REF\s+artifact:\/\//.test(m.content?.[0]?.text ?? ''));
+        assert.ok(stubMsg, 'Cumulative budget crossing 45% of 160k must trigger Epoch DTOC compression');
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-bash-ok', name: 'bash', arguments: JSON.stringify({ command: 'node --test' }) } };
+        yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 500 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 5) {
+        yield { type: 'text-delta', index: 0, text: 'Produced CONTRACT.json.' };
+        yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
+      const lastUser = [...(opts.messages ?? [])].reverse().find((m) => m.role === 'user')?.content?.[0]?.text ?? '';
+      if (/highest-to-lowest/i.test(lastUser)) sawOrderingReminder = true;
+      yield { type: 'text-delta', index: 0, text: 'Verified highest-to-lowest precedence in CONTRACT.json.' };
+      yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+
+  const adapter = new CumulativeAciAdapter();
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+  const app = Fastify();
+  v1Routes(app, { store, providers: { models: [] }, pool, directAgent: direct });
+  await app.ready();
+
+  t.after(async () => {
+    await app.close();
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  await app.inject({
+    method: 'PATCH',
+    url: '/v1/context/supervisor',
+    payload: { enabled: true, mode: 'custom', model: 'fast-supervisor', epochWatermarks: [0.45, 0.70, 0.85] },
+  });
+  direct.sandbox = {
+    async run() { return { exitCode: 0, stdout: 'pass 1\nfail 0', stderr: '' }; },
+  };
+  const session = direct.createSession({
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    budget: { maxTokens: 160000, maxSteps: 12 },
+  });
+  const { turn } = direct.startTurn(session.id, {
+    input: 'Inspect src/index.js precedence rules and write CONTRACT.json (`precedence`).',
+    maxSteps: 12,
+  });
+  const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
+  assert.equal(settled.state, 'completed');
+  assert.ok(supCalls >= 1, 'Expected read-only Supervisor call on cumulative 45% epoch');
+  assert.equal(sawOrderingReminder, true, 'Expected highest-to-lowest ordering_precedence pre-completion check');
+  for (const p of sysPrefixes) assert.equal(p, sysPrefixes[0]);
+
+  const completedEv = JSON.parse(
+    store.db.prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed'").get(turn.id).data,
+  );
+  const am = completedEv.reasoningMetrics?.aciMetrics;
+  assert.ok(am.offloadedCount >= 1);
+  assert.ok(am.savedTokens > 0);
+  assert.equal(am.supervisorCalls, supCalls);
+  const compactedEvs = store.db
+    .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='context/compacted'")
+    .all(turn.id)
+    .map((r) => JSON.parse(r.data));
+  assert.equal(compactedEvs.find((d) => d.stage === 'aci_dtoc')?.pairClosedValid, true);
+});

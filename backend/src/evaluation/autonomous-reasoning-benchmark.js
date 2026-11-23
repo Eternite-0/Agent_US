@@ -2101,6 +2101,39 @@ export async function instantiateAutonomousReasoningWorkspace(task, options = {}
 // 9-Metric + 3-Way Attribution Engine
 // ---------------------------------------------------------------------------
 
+export function resolveTaskCriticalContextFiles(task = null) {
+  if (!task || typeof task !== 'object') return [];
+  const fixtureFiles = Object.keys(task?.fixture?.files ?? {})
+    .map((f) => normalizeEvidencePath(f))
+    .filter(Boolean);
+  const fixtureSet = new Set(fixtureFiles);
+
+  const rawRootCause = Array.isArray(task?.metadata?.rootCauseFiles) ? task.metadata.rootCauseFiles : [];
+  if (rawRootCause.length > 0) {
+    const filtered = rawRootCause
+      .map((f) => normalizeEvidencePath(f))
+      .filter((f) => Boolean(f) && (!fixtureSet.size || fixtureSet.has(f)));
+    if (filtered.length > 0) return [...new Set(filtered)];
+  }
+
+  const requiredChanged = Array.isArray(task?.metadata?.acceptanceCriteria?.requiredChangedFiles)
+    ? task.metadata.acceptanceCriteria.requiredChangedFiles
+    : [];
+  const existingRequired = requiredChanged
+    .map((f) => normalizeEvidencePath(f))
+    .filter((f) => Boolean(f) && (!fixtureSet.size || fixtureSet.has(f)));
+  if (existingRequired.length > 0) return [...new Set(existingRequired)];
+
+  // Fallback when all requiredChangedFiles are newly created deliverables (e.g. ar-01):
+  // evaluate recall strictly against existing baseline source modules & spec *.md files.
+  const srcAndSpec = fixtureFiles.filter(
+    (f) => /^(?:src|lib|bin)\//i.test(f) || /^(?:SPEC|CONSTRAINTS)\.md$/i.test(f),
+  );
+  if (srcAndSpec.length > 0) return [...new Set(srcAndSpec)];
+
+  return [...new Set(fixtureFiles.filter((f) => /\.md$/i.test(f) && !/^README\.md$/i.test(f)))];
+}
+
 function resolveBoolean(val, fallback) {
   return typeof val === 'boolean' ? val : fallback;
 }

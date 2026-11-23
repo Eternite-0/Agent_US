@@ -24,6 +24,7 @@ import {
   createAutonomousReasoningDataset,
   getAutonomousReasoningReferenceFix,
   instantiateAutonomousReasoningWorkspace,
+  resolveTaskCriticalContextFiles,
 } from '../src/evaluation/autonomous-reasoning-benchmark.js';
 import { removeFixtureWorkspace } from '../src/evaluation/fixtures.js';
 import { parseCodexPatch } from '../src/patch-and-diagnostics.js';
@@ -538,11 +539,7 @@ class DeterministicProbeAdapter extends LlmAdapter {
 }
 
 export function computeTrialCriticalContextRecall({ task, reasoningMetrics = null } = {}) {
-  const criticalFiles = (
-    Array.isArray(task?.metadata?.rootCauseFiles) && task.metadata.rootCauseFiles.length
-      ? task.metadata.rootCauseFiles
-      : task?.metadata?.acceptanceCriteria?.requiredChangedFiles
-  ) ?? [];
+  const criticalFiles = resolveTaskCriticalContextFiles(task);
   const normCritical = [...new Set(
     criticalFiles.map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase()).filter(Boolean),
   )];

@@ -1727,6 +1727,7 @@ export class DirectAgentRuntime {
         aciStore,
         ledger: aciLedger,
         maxTotalTokens: Math.min(200_000, contextWindow),
+        contextWindow: Math.min(200_000, contextWindow),
         watermarks: supervisorCfg.epochWatermarks,
       });
       const resolveContextRef = (rawRef) => {
@@ -1884,11 +1885,13 @@ export class DirectAgentRuntime {
         ? filterToolsByPolicy(tools, { denyTools: effectiveTurnDenyTools })
         : tools;
       contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
+      const clampedWindow = Math.min(200_000, contextWindow);
+      aciEngine.contextWindow = clampedWindow;
       const explicitBudgetTokens = sessionBudget?.maxTokens ?? sessionBudget?.maxTotalTokens ?? null;
       if (explicitBudgetTokens !== null && Number.isFinite(Number(explicitBudgetTokens)) && Number(explicitBudgetTokens) > 0) {
-        aciEngine.maxTotalTokens = Math.min(200_000, contextWindow, Math.max(1024, Number(explicitBudgetTokens)));
+        aciEngine.maxTotalTokens = Math.max(1024, Number(explicitBudgetTokens));
       } else {
-        aciEngine.maxTotalTokens = Math.min(200_000, contextWindow);
+        aciEngine.maxTotalTokens = clampedWindow;
       }
       const defaultMaxOutputTokens = Math.min(
         16384,

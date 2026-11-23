@@ -1,3 +1,5 @@
+import { existsSync, readdirSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { sha256Hex } from '../integrity.js';
 import { computeArgsDigest } from '../tools/dispatcher.js';
 import { compactTwoStage, excerpt } from '../context.js';
@@ -24,6 +26,53 @@ import {
 
 function normalizeAciPath(p) {
   return String(p ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+function collectBaselineSourceFallback(workspaceRoot, maxFiles = 40) {
+  const results = [];
+  const skipDirs = new Set(['.git', 'node_modules', 'upstream', 'var']);
+  const walk = (dir) => {
+    if (results.length >= maxFiles) return;
+    let entries = [];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (results.length >= maxFiles) return;
+      if (skipDirs.has(ent.name)) continue;
+      const full = join(dir, ent.name);
+      const rel = relative(workspaceRoot, full).replace(/\\/g, '/');
+      if (ent.isDirectory()) {
+        if (!/^backend\/var(?:\/|$)/i.test(rel)) walk(full);
+      } else if (ent.isFile()) {
+        if (/^(?:src|lib|bin)\//i.test(rel) || /^(?:SPEC|CONSTRAINTS)\.md$/i.test(rel)) {
+          results.push(rel);
+        }
+      }
+    }
+  };
+  walk(resolve(String(workspaceRoot)));
+  return results;
+}
+
+function resolveBaselineCriticalFiles(workspaceRoot, candidateCriticalFiles = []) {
+  const candidates = Array.isArray(candidateCriticalFiles)
+    ? candidateCriticalFiles.map((f) => String(f ?? '').trim()).filter(Boolean)
+    : [];
+  if (!candidates.length || !workspaceRoot || !existsSync(resolve(String(workspaceRoot)))) {
+    return candidates;
+  }
+  const existing = candidates.filter((rel) => {
+    try {
+      return existsSync(resolve(String(workspaceRoot), rel));
+    } catch {
+      return false;
+    }
+  });
+  if (existing.length > 0) return existing;
+  return collectBaselineSourceFallback(workspaceRoot);
 }
 
 function aciPathsMatch(a, b) {
@@ -427,6 +476,8 @@ export class AgentLoop {
     let aciSupervisorCalls = 0;
     let aciSupervisorMode = initialSupCfg ? (initialSupCfg.enabled ? initialSupCfg.mode : 'off') : null;
     let aciSupervisorModel = aci?.supervisor?.resolveModel?.()?.effectiveModel ?? null;
+    const rawAciCritical = aci?.criticalFiles ?? execution?.evidenceContract?.requiredChangedFiles ?? [];
+    const resolvedAciCriticalFiles = resolveBaselineCriticalFiles(workspaceRoot, rawAciCritical);
     const syncAciMetrics = () => {
       if (!aci?.engine && !aci?.aciStore && !aci?.ledger) return;
       const refs = aci.aciStore?.listRefs?.() ?? [];
@@ -436,7 +487,7 @@ export class AgentLoop {
       const savedTokens = Number(ledgerSummary.totalTokensSaved || 0);
       const epochTransitions = Number(aci.engine?.epochState?.epochCount || 0);
       const criticalContextRecall = computeActiveCriticalContextRecall({
-        criticalFiles: aci.criticalFiles ?? execution?.evidenceContract?.requiredChangedFiles ?? [],
+        criticalFiles: resolvedAciCriticalFiles,
         reasoningTracker,
         aciStore: aci.aciStore ?? null,
         ledger: aci.ledger ?? null,
@@ -692,9 +743,13 @@ export class AgentLoop {
           signal,
         };
         if (aci?.engine) {
+          const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
+          const epochContextWindow = aci.engine.contextWindow ?? 128000;
           const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
             currentStep: steps,
             tools: requestOptions.tools,
+            cumulativeUsedTokens,
+            contextWindow: epochContextWindow,
           });
           if (epochProbe?.triggered) {
             let keepRefs = [];
@@ -711,7 +766,7 @@ export class AgentLoop {
                   query: input,
                   candidates,
                   errorSummary: lastErrFp,
-                  budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (${epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
+                  budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
                   signal,
                 })
                 .catch(() => null);
@@ -727,6 +782,8 @@ export class AgentLoop {
             const compResult = aci.engine.compress(requestOptions.messages, {
               currentStep: steps,
               tools: requestOptions.tools,
+              cumulativeUsedTokens,
+              contextWindow: epochContextWindow,
               keepRefs,
               compressRefs,
               activeMutationTargets: [...reasoningTracker.filesMutated],
@@ -1211,13 +1268,16 @@ export class AgentLoop {
             !budgetFinalCallAdvised &&
             (remainingTokens === null || remainingTokens > finalManifestReserve + estTurnCost) &&
             lastContractReadiness?.evaluated &&
-            !lastContractReadiness.ready
+            (!lastContractReadiness.ready ||
+              lastContractReadiness.gaps?.some((g) => g.kind === 'ordering_precedence_verify'))
           ) {
             const actionableGaps = lastContractReadiness.gaps.filter(
               (g) =>
                 g.kind === 'forbidden_mutation' ||
                 g.kind === 'invalid_json' ||
                 g.kind === 'missing_exports' ||
+                g.kind === 'missing_constraint_ids' ||
+                g.kind === 'ordering_precedence_verify' ||
                 (g.kind === 'missing_deliverables' && reasoningTracker.filesMutated.length > 0),
             );
             if (actionableGaps.length > 0) {

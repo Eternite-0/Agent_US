@@ -21,6 +21,7 @@ import {
   getLearnedGuidelines,
   learnFromFailure,
   refineCandidates,
+  shouldTriggerAciEpoch,
 } from '../../src/context/aci-engine.js';
 import {
   ContextSupervisor,
@@ -615,4 +616,45 @@ test('GET and PATCH /v1/context/supervisor routes expose catalog, validate updat
     const getAfter = await app.inject({ method: 'GET', url: '/v1/context/supervisor' });
     assert.equal(getAfter.json().effectiveModel, 'deepseek-chat');
   });
+});
+
+test('Round 2: cumulativeUsedTokens triggers 160k epoch watermarks when single-step prompt stays small and keeps KV prefix warm between epochs', () => {
+  const store = new Store(':memory:');
+  try {
+    const aciStore = new ReversibleContextStore(store);
+    const ledger = new ContextEvidenceLedger();
+    const fillerRead = 'const entry = "module payload chunk";\n'.repeat(65);
+    const msgs = [
+      { role: 'system', content: [{ type: 'text', text: 'static system prompt' }] },
+      { role: 'user', content: [{ type: 'text', text: 'inspect workspace modules' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read_file', arguments: JSON.stringify({ path: 'src/a.js' }) }] },
+      { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: fillerRead }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c2', name: 'glob', arguments: '{"pattern":"src/*.js"}' }] },
+      { role: 'tool', toolCallId: 'c2', content: [{ type: 'text', text: 'src/a.js' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c3', name: 'glob', arguments: '{"pattern":"test/*.js"}' }] },
+      { role: 'tool', toolCallId: 'c3', content: [{ type: 'text', text: 'test/a.test.js' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c4', name: 'glob', arguments: '{"pattern":"*.json"}' }] },
+      { role: 'tool', toolCallId: 'c4', content: [{ type: 'text', text: 'package.json' }] },
+    ];
+    const engine = new ACIEngine({ store, aciStore, ledger, maxTotalTokens: 160000, contextWindow: 128000 });
+
+    const lowProbe = engine.inspectEpoch(msgs, { cumulativeUsedTokens: 20000, contextWindow: 128000 });
+    assert.equal(lowProbe.triggered, false);
+
+    const crossedProbe = engine.inspectEpoch(msgs, { cumulativeUsedTokens: 73000, contextWindow: 128000 });
+    assert.equal(crossedProbe.triggered, true);
+    assert.equal(crossedProbe.watermark, 0.45);
+
+    const comp = engine.compress(msgs, { cumulativeUsedTokens: 73000, contextWindow: 128000, compressRefs: ['c1'] });
+    assert.equal(comp.triggered, true);
+    assert.equal(comp.epoch, 1);
+    assert.equal(comp.compressedCount, 1);
+    assert.equal(comp.pairClosedValid, true);
+    assert.ok(comp.messages[3].content[0].text.startsWith('[ACI-REF artifact://'));
+
+    const betweenProbe = engine.inspectEpoch(comp.messages, { cumulativeUsedTokens: 85000, contextWindow: 128000 });
+    assert.equal(betweenProbe.triggered, false);
+  } finally {
+    store.close();
+  }
 });

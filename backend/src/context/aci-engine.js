@@ -634,6 +634,8 @@ function computeEpochTriggerState(
   messages,
   {
     maxTotalTokens = 128000,
+    contextWindow = 128000,
+    cumulativeUsedTokens = null,
     watermarks = DEFAULT_EPOCH_WATERMARKS,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     epochState = { lastWatermark: -1, epochCount: 0 },
@@ -654,7 +656,18 @@ function computeEpochTriggerState(
     messages: srcMessages,
   });
   const tokensBefore = compBefore.totalTokens;
-  const ratio = maxTotalTokens > 0 ? tokensBefore / maxTotalTokens : 0;
+  const singleStepRatio = contextWindow > 0 ? tokensBefore / contextWindow : 0;
+  const hasCumulative =
+    cumulativeUsedTokens != null &&
+    cumulativeUsedTokens !== '' &&
+    Number.isFinite(Number(cumulativeUsedTokens));
+  const cumulativeRatio =
+    hasCumulative && maxTotalTokens > 0
+      ? (Math.max(0, Number(cumulativeUsedTokens)) + tokensBefore) / maxTotalTokens
+      : maxTotalTokens > 0
+        ? tokensBefore / maxTotalTokens
+        : 0;
+  const ratio = Math.max(singleStepRatio, cumulativeRatio);
 
   let highestCrossedWatermark = -1;
   for (const wm of sortedWatermarks) {
@@ -690,6 +703,8 @@ function computeEpochTriggerState(
   return {
     srcMessages,
     tokensBefore,
+    singleStepRatio,
+    cumulativeRatio,
     ratio,
     highestCrossedWatermark,
     measuredSingleStep,
@@ -711,6 +726,8 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
     triggered: state.triggered,
     watermarkTriggered: state.watermarkTriggered,
     singleStepTriggered: state.singleStepTriggered,
+    singleStepRatio: state.singleStepRatio,
+    cumulativeRatio: state.cumulativeRatio,
     ratio: state.ratio,
     tokensBefore: state.tokensBefore,
     singleStepTokens: state.measuredSingleStep,
@@ -732,6 +749,8 @@ export function compressMessagesEpoch(
     aciStore = new ReversibleContextStore(),
     ledger = null,
     maxTotalTokens = 128000,
+    contextWindow = 128000,
+    cumulativeUsedTokens = null,
     watermarks = DEFAULT_EPOCH_WATERMARKS,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     epochState = { lastWatermark: -1, epochCount: 0 },
@@ -749,6 +768,8 @@ export function compressMessagesEpoch(
 ) {
   const trigger = computeEpochTriggerState(messages, {
     maxTotalTokens,
+    contextWindow,
+    cumulativeUsedTokens,
     watermarks,
     singleStepBudget,
     epochState,
@@ -862,10 +883,16 @@ export function compressMessagesEpoch(
 
     const isMutationTarget = rawFilePath && pathMatchesAny(rawFilePath, activeMutations);
     const isErr = isErrorToolMessage(m, rawText);
+    const fallbackMsgId = `tool_msg_${i}`;
+    const normRawPath = normalizeContextPath(rawFilePath);
+    const normTargetPath = normalizeContextPath(targetPath);
     const isPinnedKeep =
       (m.toolCallId && keepSet.has(m.toolCallId)) ||
+      keepSet.has(fallbackMsgId) ||
       (rawFilePath && keepSet.has(rawFilePath)) ||
-      keepSet.has(targetPath);
+      (normRawPath && keepSet.has(normRawPath)) ||
+      keepSet.has(targetPath) ||
+      (normTargetPath && keepSet.has(normTargetPath));
 
     const isCompressibleTool = compressibleTools.has(lowerTool);
     const isLarge = rawText.length >= minChars;
@@ -873,7 +900,11 @@ export function compressMessagesEpoch(
     const isSingleStepOverflow = singleStepTriggered && rawTokens > singleStepBudget;
     const isPreferred =
       (m.toolCallId && preferCompressSet.has(m.toolCallId)) ||
-      preferCompressSet.has(targetPath);
+      preferCompressSet.has(fallbackMsgId) ||
+      (rawFilePath && preferCompressSet.has(rawFilePath)) ||
+      (normRawPath && preferCompressSet.has(normRawPath)) ||
+      preferCompressSet.has(targetPath) ||
+      (normTargetPath && preferCompressSet.has(normTargetPath));
 
     const eligible =
       isCompressibleTool &&
@@ -1193,6 +1224,7 @@ export class ACIEngine {
     aciStore = null,
     ledger = null,
     maxTotalTokens = 128000,
+    contextWindow = 128000,
     watermarks = DEFAULT_EPOCH_WATERMARKS,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     weights = DEFAULT_ACI_WEIGHTS,
@@ -1201,6 +1233,7 @@ export class ACIEngine {
     this.aciStore = aciStore ?? new ReversibleContextStore(store);
     this.ledger = ledger;
     this.maxTotalTokens = maxTotalTokens;
+    this.contextWindow = contextWindow;
     this.watermarks = [...watermarks];
     this.singleStepBudget = singleStepBudget;
     this.weights = { ...DEFAULT_ACI_WEIGHTS, ...weights };
@@ -1222,6 +1255,7 @@ export class ACIEngine {
   inspectEpoch(messages, options = {}) {
     return shouldTriggerAciEpoch(messages, {
       maxTotalTokens: this.maxTotalTokens,
+      contextWindow: this.contextWindow,
       watermarks: this.watermarks,
       singleStepBudget: this.singleStepBudget,
       epochState: this.epochState,
@@ -1234,6 +1268,7 @@ export class ACIEngine {
       aciStore: this.aciStore,
       ledger: this.ledger,
       maxTotalTokens: this.maxTotalTokens,
+      contextWindow: this.contextWindow,
       watermarks: this.watermarks,
       singleStepBudget: this.singleStepBudget,
       epochState: this.epochState,

@@ -26,7 +26,8 @@ const EDGE_CASE_PATTERNS = [
   ['backward_compat', /\b(?:backward compat|legacy|preserve existing|without breaking)\b|向后兼容/i],
 ];
 
-const BUILTIN_CONTRACT_FILES = ['package.json', 'CONSTRAINTS.md', 'CONTRACT.json', 'README.md'];
+const BUILTIN_CONTRACT_FILES = ['package.json', 'CONSTRAINTS.md', 'SPEC.md', 'CONTRACT.json', 'README.md'];
+const CONSTRAINT_ID_RE = /\b(C\d+|R\d+|REQ-\d+)\b/g;
 const MAX_INSPECTED_BYTES = 64 * 1024;
 
 function isSafeWorkspaceRelativePath(relPath) {
@@ -222,12 +223,16 @@ export function extractTaskContract({ prompt = '', workspaceRoot = null, filesRe
   const inspectedContractFiles = [];
   const workspaceExports = {};
   const extraConstraintText = [];
+  const builtinSpecTexts = [];
 
   if (workspaceRoot && existsSync(resolve(String(workspaceRoot)))) {
     for (const rel of BUILTIN_CONTRACT_FILES) {
       const info = readConfinedText(workspaceRoot, rel);
       if (!info) continue;
       contractFilesOnDisk.push(info.rel);
+      if (/^(?:CONSTRAINTS|SPEC|README)\.md$/i.test(info.rel)) {
+        builtinSpecTexts.push(info.text.slice(0, 8000));
+      }
     }
 
     const pkgInfo = readConfinedText(workspaceRoot, 'package.json');
@@ -266,6 +271,17 @@ export function extractTaskContract({ prompt = '', workspaceRoot = null, filesRe
   }
 
   const combinedText = [promptText, ...extraConstraintText].join('\n');
+  const constraintCorpus = [promptText, ...builtinSpecTexts, ...extraConstraintText].join('\n');
+  const constraintIds = [];
+  const seenConstraintIds = new Set();
+  for (const m of constraintCorpus.matchAll(CONSTRAINT_ID_RE)) {
+    const cid = String(m[1] || '').toUpperCase();
+    if (cid && !seenConstraintIds.has(cid)) {
+      seenConstraintIds.add(cid);
+      constraintIds.push(cid);
+    }
+  }
+
   const requestedSymbols = collectRequestedSymbols(promptText, requiredFiles);
   const jsonContracts = collectJsonContracts(promptText, requiredFiles);
 
@@ -282,6 +298,7 @@ export function extractTaskContract({ prompt = '', workspaceRoot = null, filesRe
     expectedCommands,
     requestedSymbols,
     jsonContracts,
+    constraintIds,
     edgeCaseKeywords,
     contractFilesOnDisk,
     inspectedContractFiles,
@@ -338,8 +355,34 @@ export function evaluateContractReadiness({
   const invalidJsonFiles = [];
   const missingJsonKeys = [];
   const missingExportedSymbols = [];
+  const missingConstraintIds = [];
+  let hasOrderingContractDeliverable = false;
+  const deliverableAuditTexts = [];
+  const candidateDeliverablePaths = new Set([
+    ...(contract.requiredFiles ?? []),
+    ...filesMutated,
+  ]);
 
   if (workspaceRoot && existsSync(resolve(String(workspaceRoot)))) {
+    let hasNonPackageJsonDeliverable = false;
+    for (const relPath of candidateDeliverablePaths) {
+      const normRel = String(relPath || '').replace(/\\/g, '/').replace(/^\.\//, '');
+      if (!normRel || normRel.toLowerCase() === 'package.json') continue;
+      const lowerRel = normRel.toLowerCase();
+      const info = readConfinedText(workspaceRoot, normRel);
+      if (info) {
+        if (lowerRel.endsWith('.json')) {
+          hasNonPackageJsonDeliverable = true;
+          deliverableAuditTexts.push(info.text);
+          if (/contract/i.test(lowerRel)) {
+            hasOrderingContractDeliverable = true;
+          }
+        } else if (/(?:audit|report|analysis)/i.test(lowerRel)) {
+          deliverableAuditTexts.push(info.text);
+        }
+      }
+    }
+
     for (const req of contract.requiredFiles ?? []) {
       const info = readConfinedText(workspaceRoot, req);
       if (!info) {
@@ -367,6 +410,21 @@ export function evaluateContractReadiness({
           }
         } catch {
           invalidJsonFiles.push(req);
+        }
+      }
+    }
+
+    if (
+      hasNonPackageJsonDeliverable &&
+      Array.isArray(contract.constraintIds) &&
+      contract.constraintIds.length > 0 &&
+      deliverableAuditTexts.length > 0
+    ) {
+      const combinedDeliverables = deliverableAuditTexts.join('\n');
+      for (const cid of contract.constraintIds) {
+        const esc = cid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (!new RegExp(`(?:^|[^A-Za-z0-9_])${esc}(?=$|[^A-Za-z0-9_])`, 'i').test(combinedDeliverables)) {
+          missingConstraintIds.push(cid);
         }
       }
     }
@@ -443,6 +501,20 @@ export function evaluateContractReadiness({
       message: `Prompt 明确要求的交付文件尚不存在: ${missingDeliverables.join(', ')}`,
     });
   }
+  if (missingConstraintIds.length > 0) {
+    gaps.push({
+      kind: 'missing_constraint_ids',
+      severity: 'blocking',
+      message: `JSON/审计产物缺少必须逐条核验的约束编号 (${missingConstraintIds.join(', ')})；请逐条验证对应约束并在交付 JSON 中明确记录`,
+    });
+  }
+  if (hasOrderingContractDeliverable && contract.edgeCaseKeywords?.includes('ordering_precedence')) {
+    gaps.push({
+      kind: 'ordering_precedence_verify',
+      severity: 'advisory',
+      message: '请最后核对 CONTRACT.json 中优先级数组排序方向（highest-to-lowest vs lowest-to-highest）是否与源码实际覆盖逻辑一致。',
+    });
+  }
   if (unverifiedChanges) {
     gaps.push({
       kind: 'unverified_changes',
@@ -475,6 +547,7 @@ export function evaluateContractReadiness({
     missingDeliverables,
     invalidJsonFiles,
     missingJsonKeys,
+    missingConstraintIds,
     missingExportedSymbols,
     missingContractReads: missingContractReads.slice(0, 8),
     forbiddenViolations,

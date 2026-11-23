@@ -1637,3 +1637,70 @@ test('Wave 2: ContractReasoningEngine extracts constraints, checks readiness, an
   assert.equal(metrics.rootCauseVerified, true);
   assert.deepEqual(metrics.rootCauseLedger.resolvedSignatures, metrics.rootCauseLedger.preEditFailureSignatures);
 });
+
+test('Round 2: SPEC.md contract detection, C1..C5 missingConstraintIds blocking check, and ordering_precedence reminder', (t) => {
+  const { workDir } = createTempEnv(t);
+  mkdirSync(join(workDir, 'REPORTS'), { recursive: true });
+  writeFileSync(join(workDir, 'SPEC.md'), '# Spec\n- C1: Preserve compatibility.\n- REQ-2: Deterministic JSON.', 'utf8');
+  writeFileSync(
+    join(workDir, 'CONSTRAINTS.md'),
+    '- C1: Zero dependencies\n- C2: Keep legacySummary\n- C3: Sorted order\n',
+    'utf8',
+  );
+  writeFileSync(
+    join(workDir, 'REPORTS', 'delivery-audit.json'),
+    JSON.stringify({ constraints: { C2: { verified: true }, C3: { verified: true } } }),
+    'utf8',
+  );
+  writeFileSync(
+    join(workDir, 'CONTRACT.json'),
+    JSON.stringify({ precedence: ['env', 'profile', 'defaults'] }),
+    'utf8',
+  );
+
+  const contract = extractTaskContract({
+    prompt: 'Check precedence order and emit REPORTS/delivery-audit.json and CONTRACT.json (`precedence`).',
+    workspaceRoot: workDir,
+    filesRead: ['CONSTRAINTS.md', 'SPEC.md'],
+  });
+  assert.ok(contract.contractFilesOnDisk.includes('SPEC.md'));
+  assert.ok(contract.constraintIds.includes('C1'));
+  assert.ok(contract.constraintIds.includes('C2'));
+  assert.ok(contract.constraintIds.includes('C3'));
+  assert.ok(contract.constraintIds.includes('REQ-2'));
+  assert.ok(contract.edgeCaseKeywords.includes('ordering_precedence'));
+
+  const missingReadiness = evaluateContractReadiness({
+    contract,
+    workspaceRoot: workDir,
+    verifierEvents: [{ type: 'tool/result', data: {} }],
+    reasoningState: {
+      filesRead: ['CONSTRAINTS.md', 'SPEC.md'],
+      filesMutated: ['REPORTS/delivery-audit.json', 'CONTRACT.json'],
+      hasUnverifiedMutationsAfterLastPass: false,
+    },
+  });
+  assert.equal(missingReadiness.ready, false);
+  assert.ok(missingReadiness.missingConstraintIds.includes('C1'));
+  assert.ok(missingReadiness.missingConstraintIds.includes('REQ-2'));
+  assert.ok(missingReadiness.gaps.some((g) => g.kind === 'missing_constraint_ids' && g.severity === 'blocking'));
+  assert.ok(missingReadiness.gaps.some((g) => g.kind === 'ordering_precedence_verify' && /highest-to-lowest/i.test(g.message)));
+
+  writeFileSync(
+    join(workDir, 'REPORTS', 'delivery-audit.json'),
+    JSON.stringify({ constraints: { C1: { verified: true }, C2: { verified: true }, C3: { verified: true } }, reqs: ['REQ-2'] }),
+    'utf8',
+  );
+  const resolvedReadiness = evaluateContractReadiness({
+    contract,
+    workspaceRoot: workDir,
+    verifierEvents: [{ type: 'tool/result', data: {} }],
+    reasoningState: {
+      filesRead: ['CONSTRAINTS.md', 'SPEC.md'],
+      filesMutated: ['REPORTS/delivery-audit.json', 'CONTRACT.json'],
+      hasUnverifiedMutationsAfterLastPass: false,
+    },
+  });
+  assert.equal(resolvedReadiness.ready, true);
+  assert.deepEqual(resolvedReadiness.missingConstraintIds, []);
+});
