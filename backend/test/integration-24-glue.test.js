@@ -493,3 +493,81 @@ test('glue: DirectAgent catch path persists reasoningMetrics on TURN_CANCELLED e
   assert.equal(parsed.reasoningMetrics.selfCorrectionRecovered, false);
   assert.ok(observedCancelEvents[0]?.reasoningMetrics, 'live SSE turn/cancelled event must include reasoningMetrics');
 });
+
+test('glue: direct.cancelTurn + waitForTurnTerminal drains worker and backfills reasoningMetrics on turn/cancelled event', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-cancel-backfill-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-cancel-backfill-work-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  writeFileSync(join(workDir, 'src', 'cancel-backfill.js'), 'export const v = 1;\n', 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.setDefaultModel('glue-cancel-backfill-model');
+
+  let stepCall = 0;
+  let markStep2Entered;
+  const enteredStep2 = new Promise((resolve) => {
+    markStep2Entered = resolve;
+  });
+
+  const adapter = new ScriptedAdapter(async function* (opts) {
+    stepCall += 1;
+    if (stepCall === 1) {
+      yield {
+        type: 'block-end',
+        block: {
+          type: 'tool-call',
+          id: 'tc-cancel-bf-w1',
+          name: 'write_file',
+          arguments: JSON.stringify({ path: 'src/cancel-backfill.js', content: 'export const v = 2;\n' }),
+        },
+      };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    markStep2Entered();
+    await new Promise((_, reject) => {
+      const rejectAfterDelay = () =>
+        setTimeout(() => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })), 30);
+      if (opts.signal?.aborted) {
+        rejectAfterDelay();
+        return;
+      }
+      opts.signal?.addEventListener('abort', rejectAfterDelay, { once: true });
+    });
+  });
+
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+
+  t.after(async () => {
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const session = direct.createSession({ workspaceRoot: workDir, permissionMode: 'full-access' });
+  const { turn } = direct.startTurn(session.id, {
+    input: 'Edit src/cancel-backfill.js',
+    model: 'glue-cancel-backfill-model',
+  });
+
+  await enteredStep2;
+  direct.cancelTurn(turn.id);
+  const terminal = await direct.waitForTurnTerminal(turn.id, { timeoutMs: 5000 });
+  assert.equal(terminal.state, 'cancelled');
+
+  const cancelEv = store.db
+    .prepare("SELECT seq, data FROM direct_events WHERE turnId=? AND type='turn/cancelled' ORDER BY seq DESC LIMIT 1")
+    .get(turn.id);
+  assert.ok(cancelEv, 'expected turn/cancelled event row in direct_events');
+  const parsed = JSON.parse(cancelEv.data);
+  assert.ok(parsed.reasoningMetrics, 'waitForTurnTerminal must drain worker backfill of turn/cancelled reasoningMetrics');
+  assert.deepEqual(parsed.reasoningMetrics.filesMutated, ['src/cancel-backfill.js']);
+  assert.equal(parsed.reasoningMetrics.selfCorrectionRecovered, false);
+});

@@ -39,6 +39,7 @@ import {
 import {
   authorizeRealBenchmarkApproval,
   enrichReceiptsWithCommands,
+  extractTurnDiagnosticsFromEvents,
   loadAndProbeWorktreeArm,
   parseCliArgs,
   recordArmExperienceMemory,
@@ -1044,5 +1045,33 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       }),
       false,
     );
+  });
+
+  test('extractTurnDiagnosticsFromEvents preserves reasoningMetrics from turn/cancelled events without fabricating turnErrorCode', () => {
+    const cancelDiag = extractTurnDiagnosticsFromEvents(
+      [
+        {
+          type: 'tool/call',
+          data: JSON.stringify({ callId: 'c1', step: 2 }),
+        },
+        {
+          type: 'turn/cancelled',
+          data: JSON.stringify({
+            turnId: 't-cancel-1',
+            reasoningMetrics: {
+              filesMutated: ['src/recovery.js'],
+              repairRounds: 1,
+              selfCorrectionRecovered: false,
+            },
+          }),
+        },
+      ],
+      [{ callId: 'c1', toolName: 'write_file', status: 'finished', exitCode: 0 }],
+      [],
+      'sk-secret-key',
+    );
+    assert.deepEqual(cancelDiag.reasoningMetrics?.filesMutated, ['src/recovery.js']);
+    assert.equal(cancelDiag.repairRounds, 1);
+    assert.equal(cancelDiag.turnErrorCode, null);
   });
 });

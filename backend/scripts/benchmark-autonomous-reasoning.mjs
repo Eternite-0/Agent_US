@@ -1017,7 +1017,7 @@ export function authorizeRealBenchmarkApproval({
   return false;
 }
 
-function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], assistantMessageRows = [], benchKey = '') {
+export function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], assistantMessageRows = [], benchKey = '') {
   const callMetaById = buildCallMetaMap(assistantMessageRows);
   const stepByCallId = new Map();
   let reasoningMetrics = null;
@@ -1036,7 +1036,7 @@ function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], assista
       thrashingWarnings.push(safeRedactValue(data, benchKey));
     } else if (type === 'verifier/repair') {
       repairRounds += 1;
-    } else if (type === 'turn/completed' || type === 'turn/failed') {
+    } else if (type === 'turn/completed' || type === 'turn/failed' || type === 'turn/cancelled') {
       if (data.reasoningMetrics && typeof data.reasoningMetrics === 'object') {
         reasoningMetrics = safeRedactValue(data.reasoningMetrics, benchKey);
       }

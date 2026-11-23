@@ -588,7 +588,49 @@ export class DirectAgentRuntime {
       if (signal?.aborted) throw Object.assign(new Error('wait aborted'), { name: 'AbortError', code: 'E_WAIT_ABORTED' });
       const row = this.store.db?.prepare('SELECT * FROM direct_turns WHERE id=?').get(id);
       if (!row) throw new Fault('TURN_NOT_FOUND', 404);
-      if (['completed', 'failed', 'cancelled'].includes(row.state)) return row;
+      if (['completed', 'failed', 'cancelled'].includes(row.state)) {
+        const pendingDones = [];
+        for (const entry of this.recoveryWorker?.active?.values?.() ?? []) {
+          if (entry?.turnId === id && entry?.done) {
+            pendingDones.push(entry.done);
+          }
+        }
+        if (pendingDones.length > 0) {
+          const remainingMs = deadline - Date.now();
+          if (remainingMs <= 0) {
+            throw Object.assign(new Error('turn drain timeout'), { code: 'TURN_DRAIN_TIMEOUT' });
+          }
+          let drained = false;
+          await new Promise((resolve, reject) => {
+            let settled = false;
+            const cleanup = () => {
+              clearTimeout(timer);
+              signal?.removeEventListener('abort', onAbort);
+            };
+            const finish = (err = null) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              if (err) reject(err);
+              else resolve();
+            };
+            const timer = setTimeout(() => finish(null), remainingMs);
+            timer.unref?.();
+            const onAbort = () =>
+              finish(Object.assign(new Error('wait aborted'), { name: 'AbortError', code: 'E_WAIT_ABORTED' }));
+            signal?.addEventListener('abort', onAbort, { once: true });
+            Promise.allSettled(pendingDones).then(() => {
+              drained = true;
+              finish(null);
+            });
+          });
+          if (!drained) {
+            throw Object.assign(new Error('turn drain timeout'), { code: 'TURN_DRAIN_TIMEOUT' });
+          }
+          return this.store.db?.prepare('SELECT * FROM direct_turns WHERE id=?').get(id) ?? row;
+        }
+        return row;
+      }
       if (Date.now() >= deadline) throw Object.assign(new Error('turn drain timeout'), { code: 'TURN_DRAIN_TIMEOUT' });
       await new Promise((resolve, reject) => {
         const timer = setTimeout(resolve, 50);
@@ -2388,8 +2430,13 @@ export class DirectAgentRuntime {
         return;
       }
 
+      const catchReasoningMetrics = err?.reasoningMetrics ?? classified?.reasoningMetrics ?? null;
+
       // Fix D6 / D7 / P0-1: NEVER swallow LEASE_LOST before RecoveryWorker.#runJob sees it!
       if (isLeaseLostError(classified)) {
+        if (signal?.aborted && catchReasoningMetrics) {
+          this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
+        }
         this.metrics?.record('lease_lost_fenced', {
           sessionId,
           turnId,
@@ -2406,6 +2453,9 @@ export class DirectAgentRuntime {
         throw classified;
       }
       if (!checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
+        if (signal?.aborted && catchReasoningMetrics) {
+          this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
+        }
         this.metrics?.record('lease_lost_fenced', {
           sessionId,
           turnId,
@@ -2428,29 +2478,12 @@ export class DirectAgentRuntime {
       const message = String(classified?.detail?.message ?? classified?.message ?? err);
       const nextState = isCancelled ? 'cancelled' : 'failed';
 
-      const catchReasoningMetrics = err?.reasoningMetrics ?? classified?.reasoningMetrics ?? null;
       const currentTurn = this.store.db
         .prepare('SELECT state, phase, step FROM direct_turns WHERE id=?')
         .get(turnId);
       if (!currentTurn || ['completed', 'failed', 'cancelled'].includes(currentTurn.state)) {
         if (isCancelled && currentTurn?.state === 'cancelled' && catchReasoningMetrics) {
-          try {
-            this.store.tx(() => {
-              const evRow = this.store.db
-                .prepare("SELECT id, data FROM direct_events WHERE turnId=? AND type='turn/cancelled' ORDER BY seq DESC LIMIT 1")
-                .get(turnId);
-              if (!evRow) return;
-              const evData = JSON.parse(evRow.data || '{}');
-              if (!evData.reasoningMetrics) {
-                evData.reasoningMetrics = catchReasoningMetrics;
-                this.store.db
-                  .prepare('UPDATE direct_events SET data=? WHERE id=?')
-                  .run(JSON.stringify(evData), evRow.id);
-              }
-            });
-          } catch {
-            // Best-effort enrichment when turn was already marked cancelled before catch settled.
-          }
+          this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
         }
         return;
       }
@@ -2651,6 +2684,29 @@ export class DirectAgentRuntime {
       if (this.activeSessionTurn.get(sessionId) === turnId) {
         this.activeSessionTurn.delete(sessionId);
       }
+    }
+  }
+
+  #backfillCancelledReasoningMetrics(turnId, reasoningMetrics) {
+    if (!reasoningMetrics || !this.store?.db?.isOpen) return;
+    try {
+      this.store.tx(() => {
+        const turnRow = this.store.db.prepare('SELECT state FROM direct_turns WHERE id=?').get(turnId);
+        if (turnRow?.state !== 'cancelled') return;
+        const evRow = this.store.db
+          .prepare("SELECT seq, data FROM direct_events WHERE turnId=? AND type='turn/cancelled' ORDER BY seq DESC LIMIT 1")
+          .get(turnId);
+        if (!evRow) return;
+        const evData = JSON.parse(evRow.data || '{}');
+        if (!evData.reasoningMetrics) {
+          evData.reasoningMetrics = reasoningMetrics;
+          this.store.db
+            .prepare('UPDATE direct_events SET data=? WHERE seq=?')
+            .run(JSON.stringify(evData), evRow.seq);
+        }
+      });
+    } catch {
+      // Best-effort enrichment when DB is closing after cancellation.
     }
   }
 }
