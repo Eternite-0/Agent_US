@@ -919,4 +919,61 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       true,
     );
   });
+
+  test('loadAndProbeWorktreeArm exposes constructors for real and deterministic arms including BenchmarkSandbox', async () => {
+    const repoRoot = join(import.meta.dirname, '..', '..', '..');
+    const probed = await loadAndProbeWorktreeArm(repoRoot);
+
+    const requiredConstructors = [
+      'Store',
+      'AccountPool',
+      'DirectAgentRuntime',
+      'BenchmarkSandbox',
+      'AgentLoop',
+      'DecisionEngine',
+      'EventRouter',
+      'InferenceEngine',
+      'EvidenceVerifier',
+      'compactTwoStage',
+      'MultiStageCompactor',
+      'AdaptivePlanner',
+      'AdaptiveReplanner',
+      'PlannerFeedbackCollector',
+      'ExperienceMemoryService',
+      'createWorkspaceTools',
+      'ToolDispatcher',
+      'UnknownOutcomeReconciler',
+      'CheckpointStore',
+    ];
+    for (const key of requiredConstructors) {
+      assert.equal(typeof probed.modules[key], 'function', `Expected module ${key} to be a function`);
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'ar-probe-constructors-'));
+    let store = null;
+    let direct = null;
+    try {
+      const { Store: ArmStore, AccountPool, DirectAgentRuntime, BenchmarkSandbox } = probed.modules;
+      store = new ArmStore(join(tempDir, 'eval.sqlite'));
+      const pool = new AccountPool(store, { root: tempDir });
+      direct = new DirectAgentRuntime(store, pool, {
+        dataRoot: tempDir,
+        defaultWorkspace: repoRoot,
+      });
+      const sandbox = new BenchmarkSandbox({
+        mode: 'docker',
+        workspaceRoot: repoRoot,
+        allowProcessHardeningOnly: false,
+      });
+
+      assert.ok(store instanceof ArmStore);
+      assert.ok(pool instanceof AccountPool);
+      assert.ok(direct instanceof DirectAgentRuntime);
+      assert.ok(sandbox instanceof BenchmarkSandbox);
+    } finally {
+      if (direct) await direct.close();
+      if (store) store.close();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });

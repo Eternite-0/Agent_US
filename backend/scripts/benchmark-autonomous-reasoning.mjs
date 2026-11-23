@@ -186,6 +186,7 @@ export async function loadAndProbeWorktreeArm(worktreeRoot) {
     dispatcherMod,
     reconMod,
     checkpointMod,
+    sandboxMod,
     execReasoningMod,
     evalServiceMod,
   ] = await Promise.all([
@@ -206,6 +207,7 @@ export async function loadAndProbeWorktreeArm(worktreeRoot) {
     importRequired(root, 'tools/dispatcher.js'),
     importRequired(root, 'durable/reconciliation.js'),
     importRequired(root, 'durable/checkpoint.js'),
+    importRequired(root, 'tools/benchmark-sandbox.js'),
     importOptional(root, 'kernel/execution-reasoning.js'),
     importOptional(root, 'evaluation/service.js'),
   ]);
@@ -311,31 +313,40 @@ export async function loadAndProbeWorktreeArm(worktreeRoot) {
     capabilities.richCompactionAnchor = false;
   }
 
+  const modules = {
+    Store: storeMod.Store,
+    AccountPool: poolMod.AccountPool,
+    DirectAgentRuntime: directMod.DirectAgentRuntime,
+    BenchmarkSandbox: sandboxMod.BenchmarkSandbox,
+    AgentLoop: agentLoopMod.AgentLoop,
+    DecisionEngine: agentLoopMod.DecisionEngine,
+    EventRouter: eventsMod.EventRouter,
+    InferenceEngine: inferenceMod.InferenceEngine,
+    EvidenceVerifier: verifierMod.EvidenceVerifier,
+    compactTwoStage: contextMod.compactTwoStage,
+    MultiStageCompactor: compactionMod.MultiStageCompactor,
+    AdaptivePlanner: plannerMod.AdaptivePlanner,
+    AdaptiveReplanner: replannerMod.AdaptiveReplanner,
+    PlannerFeedbackCollector: feedbackMod.PlannerFeedbackCollector,
+    ExperienceMemoryService: memoryMod.ExperienceMemoryService,
+    createWorkspaceTools: toolsMod.createWorkspaceTools,
+    ToolDispatcher: dispatcherMod.ToolDispatcher,
+    UnknownOutcomeReconciler: reconMod.UnknownOutcomeReconciler,
+    CheckpointStore: checkpointMod.CheckpointStore,
+    ExecutionReasoningTracker: execReasoningMod?.ExecutionReasoningTracker ?? null,
+  };
+  for (const [name, exported] of Object.entries(modules)) {
+    if (name === 'ExecutionReasoningTracker') continue;
+    if (typeof exported !== 'function') {
+      throw new Error(`Missing required export "${name}" from worktree ${root}`);
+    }
+  }
+
   return {
     root,
     revision: getWorktreeRevision(root),
     capabilities,
-    modules: {
-      Store: storeMod.Store,
-      AccountPool: poolMod.AccountPool,
-      DirectAgentRuntime: directMod.DirectAgentRuntime,
-      AgentLoop: agentLoopMod.AgentLoop,
-      DecisionEngine: agentLoopMod.DecisionEngine,
-      EventRouter: eventsMod.EventRouter,
-      InferenceEngine: inferenceMod.InferenceEngine,
-      EvidenceVerifier: verifierMod.EvidenceVerifier,
-      compactTwoStage: contextMod.compactTwoStage,
-      MultiStageCompactor: compactionMod.MultiStageCompactor,
-      AdaptivePlanner: plannerMod.AdaptivePlanner,
-      AdaptiveReplanner: replannerMod.AdaptiveReplanner,
-      PlannerFeedbackCollector: feedbackMod.PlannerFeedbackCollector,
-      ExperienceMemoryService: memoryMod.ExperienceMemoryService,
-      createWorkspaceTools: toolsMod.createWorkspaceTools,
-      ToolDispatcher: dispatcherMod.ToolDispatcher,
-      UnknownOutcomeReconciler: reconMod.UnknownOutcomeReconciler,
-      CheckpointStore: checkpointMod.CheckpointStore,
-      ExecutionReasoningTracker: execReasoningMod?.ExecutionReasoningTracker ?? null,
-    },
+    modules,
   };
 }
 
