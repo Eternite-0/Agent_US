@@ -16,11 +16,14 @@ export interface DirectLiveToolOutput {
 export interface DirectToolActivity {
   kind: 'tool';
   id: string;
+  callId: string;
   name: string;
   args?: string | Record<string, unknown>;
   output?: string;
   liveOutput?: string;
   status: 'running' | 'waiting' | 'completed' | 'failed' | 'interrupted';
+  durationMs?: number;
+  exitCode?: number;
 }
 
 type ActivityItem = DirectToolActivity | { kind: 'reasoning'; id: string; text: string; live?: boolean };
@@ -63,11 +66,19 @@ export function groupDirectMessages(sessionId: string, input: string, items: Ses
   const byTurn = new Map<string, Exchange>();
   const tools = new Map<string, DirectToolActivity>();
   const timing = new Map<string, DirectTurnTiming>();
-  for (const event of options.events ?? []) {
+  let latestStartedTurn: string | undefined;
+  let latestStartedAt = -Infinity;
+  const turnEvents = (options.events ?? []).filter((event) => event.type === 'turn/started' || isDirectTurnEnd(event.type))
+    .sort((a, b) => a.timestamp - b.timestamp || (a.seq ?? 0) - (b.seq ?? 0));
+  for (const event of turnEvents) {
     const { turnId, durationMs } = event.payload ?? {};
     if (typeof turnId !== 'string') continue;
     if (event.type === 'turn/started') {
       timing.set(turnId, { startedAt: event.timestamp });
+      if (event.timestamp >= latestStartedAt) {
+        latestStartedTurn = turnId;
+        latestStartedAt = event.timestamp;
+      }
     } else if (isDirectTurnEnd(event.type)) {
       const startedAt = timing.get(turnId)?.startedAt;
       timing.set(turnId, {
@@ -79,101 +90,190 @@ export function groupDirectMessages(sessionId: string, input: string, items: Ses
     }
   }
 
+  const id = (...parts: Array<string | number>) => JSON.stringify([sessionId, ...parts]);
+  const turnKey = (turnId: string) => id('turn', turnId);
+  const liveTurnCandidates = [options.liveStream?.turnId, ...[...(options.liveToolOutputs ?? [])].reverse().map((row) => row.turnId)];
+  const activeTurnId = liveTurnCandidates.find((turnId) => turnId && !timing.get(turnId)?.end) ?? latestStartedTurn ?? liveTurnCandidates[0];
+  const historyTurns = new Set(items.flatMap((item) => item.turnId && item.type === 'user/message' && !item.meta?.swarmAction ? [item.turnId] : []));
+  const turnScope = (exchange: Exchange) => exchange.turnId ? turnKey(exchange.turnId) : exchange.key;
+
   function add(key: string, userText: string, command = false, turnId?: string): Exchange {
     const exchange: Exchange = { key, userText, command, turnId, blocks: [] };
     exchanges.push(exchange);
+    if (turnId && !command) {
+      if (!byTurn.has(turnId)) exchange.timing = timing.get(turnId);
+      byTurn.set(turnId, exchange);
+    }
     return exchange;
   }
 
-  function activity(exchange: Exchange): Extract<DirectTimelineBlock, { kind: 'activity' }> {
+  function phase(exchange: Exchange): Extract<DirectTimelineBlock, { kind: 'activity' }> {
     const tail = exchange.blocks.at(-1);
     if (tail?.kind === 'activity') return tail;
-    const block = { kind: 'activity' as const, id: `${tail?.id ?? exchange.key}-activity`, items: [] };
+    const block = { kind: 'activity' as const, id: id('phase', tail?.id ?? exchange.key), items: [] };
     exchange.blocks.push(block);
     return block;
   }
 
-  function tool(exchange: Exchange, id: string, name: string, args?: DirectToolActivity['args']): DirectToolActivity {
-    const key = `${exchange.turnId ?? exchange.key}:${id}`;
+  function tool(exchange: Exchange, callId: string, name?: string, args?: DirectToolActivity['args']): DirectToolActivity {
+    const key = id('tool', turnScope(exchange), callId);
     const existing = tools.get(key);
-    if (existing) return existing;
-    const row: DirectToolActivity = { kind: 'tool', id, name, args, status: 'interrupted' };
+    if (existing) {
+      if (name && existing.name === 'tool') existing.name = name;
+      if (args !== undefined && existing.args === undefined) existing.args = args;
+      return existing;
+    }
+    const row: DirectToolActivity = { kind: 'tool', id: key, callId, name: name || 'tool', args, status: 'interrupted' };
     tools.set(key, row);
-    activity(exchange).items.push(row);
+    phase(exchange).items.push(row);
     return row;
   }
 
-  const lastAssistant = new Map<Exchange, SessionHistoryItem>();
+  // A live model step and the history row that replaces it share the same predecessor.
+  // Cursors are session-wide sequence numbers, so user steering and tool rows may occupy
+  // the intervening cursors; predicting the new assistant cursor would be incorrect.
+  const lastAssistant = new Map<string, SessionHistoryItem>();
+  const stepId = (exchange: Exchange) => id('step', turnScope(exchange), lastAssistant.get(turnScope(exchange))?.cursor ?? 'first');
+  const seenCursors = new Set<number>();
   for (const item of items) {
+    if (seenCursors.has(item.cursor)) continue;
+    seenCursors.add(item.cursor);
     if (item.type === 'user/message') {
-      const exchange = add(`${sessionId}-ex-${item.cursor}`, item.text ?? '', Boolean(item.meta?.swarmAction), item.turnId);
-      if (exchange.command && typeof item.meta?.runId === 'string') exchange.swarmRunId = item.meta.runId;
-      if (item.turnId) {
-        if (!byTurn.has(item.turnId)) exchange.timing = timing.get(item.turnId);
-        byTurn.set(item.turnId, exchange);
+      const command = Boolean(item.meta?.swarmAction);
+      const turnId = command ? undefined : item.turnId;
+      const existing = turnId ? byTurn.get(turnId) : undefined;
+      if (existing && !item.meta?.steering && !existing.userText) {
+        existing.userText = item.text ?? '';
+        continue;
       }
+      const key = turnId && !existing ? turnKey(turnId) : id(command ? 'command' : 'user', item.cursor);
+      const exchange = add(key, item.text ?? '', command, turnId);
+      if (command && typeof item.meta?.runId === 'string') exchange.swarmRunId = item.meta.runId;
       continue;
     }
-    // Synchronous commands (e.g. /swarm stop) can arrive while another turn is streaming.
-    const exchange = (item.turnId && byTurn.get(item.turnId)) || exchanges.at(-1) || add(`${sessionId}-ex-0`, input, false, item.turnId);
+    if (item.type !== 'assistant/message' && item.type !== 'tool/call' && item.type !== 'tool/result') continue;
+    // Commands are independent even when their acknowledgement lands inside a running turn.
+    // Older receipts may omit metadata on the acknowledgement itself.
+    const last = exchanges.at(-1);
+    const legacyAck = item.type === 'assistant/message' && last?.command && last.blocks.length === 0 ? last : undefined;
+    const exchange = item.turnId
+      ? byTurn.get(item.turnId) ?? add(turnKey(item.turnId), historyTurns.has(item.turnId) ? '' : input, false, item.turnId)
+      : (item.meta?.swarmAction ? exchanges.findLast((ex) => ex.command && ex.swarmRunId === item.meta?.runId)
+        : legacyAck ?? exchanges.findLast((ex) => !ex.command)) ?? add(id('fallback'), input);
     if (item.type === 'assistant/message') {
-      const id = `${sessionId}-m-${item.cursor}`;
-      lastAssistant.set(exchange, item);
-      if (item.reasoning?.trim()) activity(exchange).items.push({ kind: 'reasoning', id: `${id}-reasoning`, text: item.reasoning });
-      if (item.text?.trim()) exchange.blocks.push({ kind: 'message', id, text: item.text });
+      const key = stepId(exchange);
+      lastAssistant.set(turnScope(exchange), item);
+      if (item.reasoning?.trim()) phase(exchange).items.push({ kind: 'reasoning', id: id('reasoning', key), text: item.reasoning });
+      if (item.text?.trim()) exchange.blocks.push({ kind: 'message', id: key, text: item.text });
       for (const call of item.toolCalls ?? []) tool(exchange, call.id, call.name, call.arguments);
-    } else if (item.type === 'tool/call') {
-      tool(exchange, item.callId || `${sessionId}-t-${item.cursor}`, item.name || 'tool');
-    } else if (item.type === 'tool/result') {
-      const row = tool(exchange, item.callId || `${sessionId}-t-${item.cursor}`, item.name || 'tool');
-      row.output = item.text;
-      row.status = item.meta?.isError ? 'failed' : 'completed';
+    } else {
+      const row = tool(exchange, item.callId || id('history-call', item.cursor), item.name);
+      if (item.type === 'tool/result') {
+        row.output = item.text;
+        row.status = item.meta?.isError ? 'failed' : 'completed';
+        if (typeof item.meta?.durationMs === 'number') row.durationMs = item.meta.durationMs;
+        if (typeof item.meta?.exitCode === 'number') row.exitCode = item.meta.exitCode;
+      }
     }
   }
 
-  if (!exchanges.length) add(`${sessionId}-ex-0`, input);
-
+  let active: Exchange | undefined;
   if (options.isLive) {
-    const { liveStream, liveToolOutputs, pendingCallIds, awaitingApproval } = options;
-    const activeTurnId = liveStream?.turnId ?? liveToolOutputs?.at(-1)?.turnId;
-    const active = activeTurnId
-      ? byTurn.get(activeTurnId) ?? exchanges.findLast((exchange) => !exchange.command && !exchange.turnId)
-      : exchanges.findLast((exchange) => !exchange.command);
-    if (active && !timing.get(active.turnId ?? activeTurnId ?? '')?.end) {
+    const lastChat = exchanges.findLast((exchange) => !exchange.command);
+    const turnId = activeTurnId && timing.get(activeTurnId)?.end && lastChat?.turnId && !timing.get(lastChat.turnId)?.end
+      ? lastChat.turnId : activeTurnId;
+    active = turnId ? byTurn.get(turnId) : lastChat;
+    if (!active && (!turnId || !timing.get(turnId)?.end)) {
+      active = add(turnId ? turnKey(turnId) : id('fallback'), input, false, turnId);
+    }
+    if (active && (active.timing?.end || timing.get(active.turnId ?? '')?.end)) active = undefined;
+    if (active) {
       active.active = true;
-      active.timing ??= timing.get(active.turnId ?? activeTurnId ?? '');
-      const persisted = lastAssistant.get(active);
-      // The REST bundle can pick up the saved message before the stream is cleared.
-      const alreadySaved = persisted && (persisted.text ?? '') === liveStream?.text && (persisted.reasoning ?? '') === liveStream.reasoning;
-      if (!alreadySaved && liveStream?.reasoning.trim()) {
-        activity(active).items.push({ kind: 'reasoning', id: `${active.key}-live-reasoning`, text: liveStream.reasoning, live: true });
+      active.timing ??= timing.get(active.turnId ?? '');
+      const live = options.liveStream;
+      const persisted = lastAssistant.get(turnScope(active));
+      const alreadySaved = persisted && (persisted.text ?? '') === live?.text && (persisted.reasoning ?? '') === live.reasoning;
+      if (live && (!live.turnId || live.turnId === active.turnId) && !alreadySaved) {
+        const key = stepId(active);
+        if (live.reasoning.trim()) phase(active).items.push({ kind: 'reasoning', id: id('reasoning', key), text: live.reasoning, live: true });
+        if (live.text.trim()) active.blocks.push({ kind: 'message', id: key, text: live.text, live: true });
       }
-      if (!alreadySaved && liveStream?.text.trim()) {
-        active.blocks.push({ kind: 'message', id: `${active.key}-live`, text: liveStream.text, live: true });
-      } else {
-        for (const output of liveToolOutputs ?? []) {
-          if (output.turnId && output.turnId !== (active.turnId ?? activeTurnId)) continue;
-          const row = tool(active, output.callId, output.name);
-          if (row.status === 'interrupted') row.liveOutput = output.text;
-        }
-        if (!awaitingApproval && (!active.blocks.length || active.blocks.at(-1)?.kind === 'activity')) {
-          activity(active).waiting = true;
-        }
-      }
-      for (const exchange of exchanges) {
-        if (exchange !== active && (!active.turnId || exchange.turnId !== active.turnId)) continue;
-        for (const block of exchange.blocks) {
-          if (block.kind !== 'activity') continue;
-          for (const row of block.items) {
-            if (row.kind === 'tool' && row.status === 'interrupted') {
-              row.status = pendingCallIds?.has(row.id) ? 'waiting' : 'running';
-            }
+    }
+  }
+
+  // Runtime events can reach the UI before the next REST history fetch. Enrich an existing
+  // call in place, or use the same call identity for a temporary row until its history lands.
+  for (const event of options.events ?? []) {
+    if (event.type !== 'tool/call' && event.type !== 'tool/result') continue;
+    const { turnId, callId, name, arguments: args, output, isError, durationMs } = event.payload ?? {};
+    if (typeof turnId !== 'string' || typeof callId !== 'string' || !callId) continue;
+    const exchange = byTurn.get(turnId);
+    if (!exchange) continue;
+    if (exchange !== active && !tools.has(id('tool', turnKey(turnId), callId))) continue;
+    const row = tool(exchange, callId, typeof name === 'string' ? name : undefined,
+      typeof args === 'string' || (args && typeof args === 'object' && !Array.isArray(args)) ? args as DirectToolActivity['args'] : undefined);
+    if (event.type === 'tool/result' && row.status === 'interrupted') {
+      row.status = isError ? 'failed' : 'completed';
+      if (typeof output === 'string') row.output = output;
+      if (typeof durationMs === 'number') row.durationMs = durationMs;
+    }
+  }
+
+  // Receipt facts take priority over the shell output's display-only exit prefix.
+  for (const event of options.events ?? []) {
+    if (event.type !== 'tool/receipt') continue;
+    const { turnId, callId, exitCode } = event.payload ?? {};
+    if (typeof turnId !== 'string' || typeof callId !== 'string' || typeof exitCode !== 'number') continue;
+    const row = tools.get(id('tool', turnKey(turnId), callId));
+    if (row && row.exitCode === undefined) row.exitCode = exitCode;
+  }
+
+  if (active) {
+    for (const output of options.liveToolOutputs ?? []) {
+      if (!output.callId || (output.turnId && output.turnId !== active.turnId)) continue;
+      const row = tool(active, output.callId, output.name);
+      if (row.status === 'interrupted') row.liveOutput = output.text;
+    }
+    for (const exchange of exchanges) {
+      if (turnScope(exchange) !== turnScope(active)) continue;
+      for (const block of exchange.blocks) {
+        if (block.kind !== 'activity') continue;
+        for (const row of block.items) {
+          if (row.kind === 'tool' && row.status === 'interrupted') {
+            row.status = options.pendingCallIds?.has(row.callId) ? 'waiting' : 'running';
           }
         }
       }
     }
+    if (!options.awaitingApproval && (!active.blocks.length || active.blocks.at(-1)?.kind === 'activity')) {
+      phase(active).waiting = true;
+    }
   }
+  if (!exchanges.length) add(id('fallback'), input);
   return exchanges;
+}
+
+/** Remove the runtime's display-only framing, keeping stdout/stderr as plain text. */
+export function directToolOutput(row: Pick<DirectToolActivity, 'name' | 'output' | 'exitCode'>): { output?: string; exitCode?: number } {
+  let { output, exitCode } = row;
+  if (output === undefined) return { output, exitCode };
+
+  const frame = /^((?:\[[A-Z][A-Z0-9_]*\][^\r\n]*\r?\n)?)<untrusted id="([0-9a-f]{32,64}-tool-[A-Za-z0-9_.:-]+)" bytes="\d+">/.exec(output);
+  const closeTag = frame && `</untrusted id="${frame[2]}">`;
+  const framed = frame && closeTag && output.endsWith(closeTag);
+  let body = framed ? output.slice(frame[0].length, -closeTag.length) : output;
+  if (row.name === 'bash') {
+    // Only the bash result protocol has this first-line field; never read it from
+    // live output, arbitrary tools, or from inside stdout/stderr.
+    const prefix = /^exitCode: (-?\d+)(?:\r?\n(?=(?:stdout|stderr):\r?\n)|$)/.exec(body);
+    if (prefix) {
+      const value = Number(prefix[1]);
+      if (Number.isSafeInteger(value)) exitCode ??= value;
+      body = body.slice(prefix[0].length);
+    }
+  }
+  output = (framed ? frame[1] : '') + body;
+  return { output, exitCode };
 }
 
 /** A small, current progress label, not a disclosure of the full reasoning transcript. */

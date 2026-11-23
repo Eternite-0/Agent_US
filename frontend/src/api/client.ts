@@ -673,7 +673,7 @@ export class LiveBackendClient implements AgentBackendClient {
     const result = await this.req<{ promptCache?: PromptCacheStats }>('GET', '/v1/observability/metrics', {
       query: { windowHours: 24, view: 'prompt-cache' }, signal,
     });
-    return result.promptCache ?? null;
+    return result?.promptCache?.global ? result.promptCache : null;
   }
 
   async health() {
@@ -1685,22 +1685,37 @@ export class LiveBackendClient implements AgentBackendClient {
     return [];
   }
 
+  private async readDirectTimeline(taskId: string, kind: 'messages' | 'events') {
+    const path = `/v1/sessions/${encodeURIComponent(taskId)}/${kind}`;
+    const pageSize = 300;
+    const timeline: Record<string, unknown>[] = [];
+    let after = 0;
+    while (true) {
+      const { items = [] } = await this.req<{ items?: Record<string, unknown>[] }>('GET', path, {
+        query: { after, limit: pageSize },
+      });
+      timeline.push(...items);
+      if (items.length < pageSize) return timeline;
+      const cursor = Number(items.at(-1)?.seq);
+      // An invalid/non-advancing full page must not replace a cached thread with
+      // partial history (or loop forever on a proxy that ignores `after`).
+      if (!Number.isSafeInteger(cursor) || cursor <= after) throw new Error('Direct timeline cursor did not advance');
+      after = cursor;
+    }
+  }
+
   async loadTaskBundle(taskId: string): Promise<TaskBundle> {
     const [task, messages, rawEvents, approvals, usage, receipts, swarmRuns] = await Promise.all([
       this.getTask(taskId),
-      this.req<{ items?: Array<Record<string, unknown>> }>(
-        'GET',
-        `/v1/sessions/${encodeURIComponent(taskId)}/messages`,
-        { query: { after: 0, limit: 300 } },
-      ),
-      this.listEvents({ taskId, after: 0 }),
+      this.readDirectTimeline(taskId, 'messages'),
+      this.readDirectTimeline(taskId, 'events'),
       this.listApprovals({ taskId }),
       this.listUsage({ sessionId: taskId }),
       this.rt.getSessionReceipts(taskId).catch(() => [] as ToolReceiptRecord[]),
       this.rt.listSwarmRuns({ sessionId: taskId, limit: 10 }).catch(() => [] as SwarmRunRecord[]),
     ]);
 
-    const events = [...rawEvents].sort((a, b) => {
+    const events = rawEvents.map(mapEvent).sort((a, b) => {
       if (a.seq > 0 && b.seq > 0 && a.seq !== b.seq) return a.seq - b.seq;
       return a.timestamp - b.timestamp;
     });
@@ -1800,7 +1815,7 @@ export class LiveBackendClient implements AgentBackendClient {
             : 'done',
     };
 
-    const historyItems: SessionHistoryItem[] = (messages.items ?? []).map((msg, index) => {
+    const historyItems: SessionHistoryItem[] = messages.map((msg, index) => {
       const role = String(msg.role ?? 'user');
       const type: SessionHistoryItem['type'] =
         role === 'assistant'

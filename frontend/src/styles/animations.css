@@ -119,7 +119,7 @@
   animation: codex-loading-shimmer 2.2s linear infinite;
 }
 
-/* Vertical scroll edge fade mask (exact Codex signature detail) */
+/* Edge fade for secondary panels only; the transcript keeps text and focus rings legible. */
 .vertical-scroll-fade-mask {
   -webkit-mask-image: linear-gradient(
     to bottom,
@@ -154,4 +154,10 @@
   transition-duration: 0.01ms !important;
   animation-duration: 0.01ms !important;
   scroll-behavior: auto !important;
+}
+
+/* Moving an activity between "live" and "done" should not animate geometry. */
+@keyframes codex-activity-pulse {
+  0%, 100% { opacity: 0.66; }
+  50% { opacity: 1; }
 }

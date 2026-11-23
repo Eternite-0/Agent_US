@@ -28,4 +28,4 @@ export function cachePercent(value: number | null | undefined): string {
 }
 
 export const cacheRefreshEvent = (type: string) =>
-  ['turn/completed', 'turn/failed', 'turn/cancelled', 'swarm/run_completed'].includes(type);
+  ['turn/completed', 'turn/failed', 'turn/cancelled', 'turn/parked', 'swarm/run_completed'].includes(type);

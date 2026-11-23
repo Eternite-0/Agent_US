@@ -1,116 +1,80 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 
 interface CollapsibleProps {
   open: boolean;
+  id?: string;
   className?: string;
+  keepMounted?: boolean;
   children: React.ReactNode;
 }
 
-/**
- * Exact Codex Desktop collapse/expand animation:
- * Measures inner wrapper scrollHeight -> animates outer height & opacity -> releases to height: auto.
- * Releases overflow: visible when fully open so nested collapsibles (like inline file diff cards
- * inside tool batches) expand cleanly without ever clipping or freezing at 0px.
- */
-export const Collapsible: React.FC<CollapsibleProps> = ({ open, className = '', children }) => {
+/** Animate from the current on-screen size, including when direction reverses mid-transition. */
+export const Collapsible: React.FC<CollapsibleProps> = ({ open, id, className = '', keepMounted = false, children }) => {
   const outerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
+  const previousOpen = useRef(open);
   const [rendered, setRendered] = useState(open);
-  const [height, setHeight] = useState<string | number>(open ? 'auto' : 0);
-  const [opacity, setOpacity] = useState<number>(open ? 1 : 0);
-  const [settledOpen, setSettledOpen] = useState<boolean>(open);
-  const prevOpenRef = useRef(open);
-
-  useEffect(() => {
-    if (open) setRendered(true);
-  }, [open]);
 
   useLayoutEffect(() => {
     const el = outerRef.current;
     const inner = innerRef.current;
-    const wasOpen = prevOpenRef.current;
-    prevOpenRef.current = open;
+    if (!el || !inner || previousOpen.current === open) return;
+    previousOpen.current = open;
+    if (open) setRendered(true);
 
-    if (!el || !inner) return;
-    if (open === wasOpen && ((open && height === 'auto') || (!open && height === 0))) return;
+    const settle = () => {
+      el.style.height = open ? 'auto' : '0px';
+      el.style.opacity = open ? '1' : '0';
+      el.style.overflow = open ? 'visible' : 'hidden';
+      if (!open) setRendered(false);
+    };
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      settle();
+      return;
+    }
 
-    if (open) {
-      const target = Math.max(inner.scrollHeight, el.scrollHeight);
-      if (target <= 0) {
-        setHeight('auto');
-        setOpacity(1);
-        setSettledOpen(true);
+    const from = el.getBoundingClientRect().height;
+    const opacity = window.getComputedStyle(el).opacity;
+    el.style.transition = 'none';
+    el.style.height = `${from}px`;
+    el.style.opacity = opacity;
+    el.style.overflow = 'hidden';
+    // Commit the starting height before changing the target.
+    void el.offsetHeight;
+    el.style.removeProperty('transition');
+
+    let fallback: number | undefined;
+    const onEnd = (event: TransitionEvent) => {
+      if (event.target !== el || event.propertyName !== 'height') return;
+      window.clearTimeout(fallback);
+      settle();
+    };
+    el.addEventListener('transitionend', onEnd);
+    const frame = requestAnimationFrame(() => {
+      const target = open ? inner.scrollHeight : 0;
+      if (target === from) {
+        settle();
         return;
       }
-      setSettledOpen(false);
-      setHeight(0);
-      setOpacity(0);
-      let raf2 = 0;
-      const raf1 = requestAnimationFrame(() => {
-        raf2 = requestAnimationFrame(() => {
-          const measured = Math.max(innerRef.current?.scrollHeight ?? 0, target);
-          setHeight(measured || 'auto');
-          setOpacity(1);
-        });
-      });
-      const fallback = window.setTimeout(() => {
-        setHeight('auto');
-        setOpacity(1);
-        setSettledOpen(true);
-      }, 210);
-      return () => {
-        cancelAnimationFrame(raf1);
-        cancelAnimationFrame(raf2);
-        window.clearTimeout(fallback);
-      };
-    } else {
-      setSettledOpen(false);
-      const current = Math.max(inner.scrollHeight, el.scrollHeight);
-      setHeight(current);
-      setOpacity(1);
-      let raf2 = 0;
-      const raf1 = requestAnimationFrame(() => {
-        raf2 = requestAnimationFrame(() => {
-          setHeight(0);
-          setOpacity(0);
-        });
-      });
-      const done = window.setTimeout(() => {
-        setRendered(false);
-      }, 190);
-      return () => {
-        cancelAnimationFrame(raf1);
-        cancelAnimationFrame(raf2);
-        window.clearTimeout(done);
-      };
-    }
-  }, [open, rendered]);
+      el.style.height = `${target}px`;
+      el.style.opacity = open ? '1' : '0';
+      // Covers display changes when an ancestor gets hidden mid-transition.
+      fallback = window.setTimeout(settle, 250);
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(fallback);
+      el.removeEventListener('transitionend', onEnd);
+    };
+  }, [open]);
 
-  const handleTransitionEnd = (e: React.TransitionEvent<HTMLDivElement>) => {
-    if (e.target !== outerRef.current || e.propertyName !== 'height') return;
-    if (open) {
-      setHeight('auto');
-      setSettledOpen(true);
-    } else {
-      setRendered(false);
-    }
-  };
-
-  if (!rendered && !open) return null;
-
+  const initialOpen = useRef(open);
   return (
-    <div
-      ref={outerRef}
-      className={`codex-collapsible ${className}`}
-      style={{
-        height,
-        opacity,
-        overflow: settledOpen && height === 'auto' ? 'visible' : 'hidden',
-      }}
-      aria-hidden={!open}
-      onTransitionEnd={handleTransitionEnd}
+    <div ref={outerRef} id={id} className={`codex-collapsible ${className}`}
+      style={initialOpen.current ? { height: 'auto', opacity: 1, overflow: 'visible' } : { height: 0, opacity: 0, overflow: 'hidden' }}
+      inert={!open} aria-hidden={!open}
     >
-      <div ref={innerRef}>{children}</div>
+      <div ref={innerRef}>{(keepMounted || open || rendered) && children}</div>
     </div>
   );
 };

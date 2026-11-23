@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useId, useMemo, useState } from 'react';
 import type {
   Approval,
   Assignment,
@@ -7,20 +7,24 @@ import type {
   SessionHistoryItem,
   SessionRecord,
   TaskPlan,
+  TaskStatus,
   Worker,
 } from '../types/backend';
 import { type DiffLine } from '../utils/diff';
 import { buildUnifiedActivityTimeline } from '../utils/activity';
-import { fmtActionCommand, fmtDuration, fmtStatusLabel } from '../utils/format';
+import { fmtActionCommand, fmtStatusLabel } from '../utils/format';
 import { getWorkerDisplayName, getWorkerDisplayRole } from '../utils/worker';
 import { AgentAvatar } from './AgentAvatar';
 import { Collapsible } from './Collapsible';
+import {
+  ActivityDisclosureScope, ActivityStatusText, ActivityToolRow, activityToolKind,
+  useActivityDisclosure, type ActivityStatus,
+} from './ActivityPresentation';
 import { Markdown } from './Markdown';
 import {
   IconArrowUpRight,
   IconCheck,
   IconChevronRight,
-  IconClose,
   IconCopy,
   IconFileEdit,
   IconImageInspect,
@@ -30,126 +34,9 @@ import {
 import { isImagePath, toImageDataUrl, type PreviewImageItem } from './ImageLightbox';
 import {
   ConvergedApprovalRow,
-  ConvergedCommandRow,
   ConvergedErrorRow,
   ConvergedFileSummaryRow,
 } from './ActivityEventRow';
-
-/* ============================================================================
- * Command Card — appears ONLY when expanding a shell/git/mcp command step
- * Exact specs: 0.8px border-strong, 12.5px radius, bg-secondary-soft-alpha
- * ========================================================================== */
-
-interface CommandCardProps {
-  label: string;
-  command: string;
-  output?: string;
-  exitCode?: number;
-  status?: string;
-  filePath?: string;
-  onInspectFile?: (path: string) => void;
-  onCopy?: (msg: string) => void;
-}
-
-export const CommandCard: React.FC<CommandCardProps> = ({
-  label,
-  command,
-  output,
-  exitCode,
-  status,
-  filePath,
-  onInspectFile,
-  onCopy,
-}) => {
-  const [copied, setCopied] = useState(false);
-  const [cmdExpanded, setCmdExpanded] = useState(false);
-  const failed = (typeof exitCode === 'number' && exitCode !== 0) || status === 'failed';
-
-  const handleCopy = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(command);
-      setCopied(true);
-      onCopy?.('已复制命令');
-      window.setTimeout(() => setCopied(false), 1200);
-    } catch {
-      // ignore
-    }
-  };
-
-  return (
-    <div className="codex-command-card">
-      <div className="codex-command-header">
-        <span>{label}</span>
-        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-          {filePath && onInspectFile && (
-            <button
-              type="button"
-              className="codex-inline-link-btn"
-              onClick={() => onInspectFile(filePath)}
-            >
-              <span>查看文件</span>
-              <IconArrowUpRight size={12} />
-            </button>
-          )}
-          {failed ? (
-            <span style={{ color: 'var(--color-danger)', fontSize: 12 }}>
-              failed{typeof exitCode === 'number' ? ` (${exitCode})` : ''}
-            </span>
-          ) : typeof exitCode === 'number' ? (
-            <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }} className="tabular-nums">
-              exit {exitCode}
-            </span>
-          ) : null}
-        </div>
-      </div>
-      <div className="codex-command-cmd-wrap">
-        <div
-          role="button"
-          tabIndex={0}
-          className="codex-command-cmd"
-          data-expanded={cmdExpanded ? 'true' : undefined}
-          title="点击展开/收起完整命令"
-          style={{ cursor: 'pointer' }}
-          onClick={() => setCmdExpanded((v) => !v)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              setCmdExpanded((v) => !v);
-            }
-          }}
-        >
-          <span className="codex-command-dollar">$</span>
-          <code>{command}</code>
-        </div>
-        <button
-          type="button"
-          className="codex-command-copy"
-          aria-label="复制"
-          onClick={handleCopy}
-        >
-          {copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-        </button>
-      </div>
-      {output ? (
-        <div className="codex-command-output vertical-scroll-fade-mask">{output}</div>
-      ) : null}
-      <div className="codex-command-footer" data-failed={failed ? 'true' : undefined}>
-        {failed ? (
-          <>
-            <IconClose size={12} />
-            <span>失败{typeof exitCode === 'number' ? ` (${exitCode})` : ''}</span>
-          </>
-        ) : (
-          <>
-            <IconCheck size={12} />
-            <span>成功</span>
-          </>
-        )}
-      </div>
-    </div>
-  );
-};
 
 /* ============================================================================
  * Inline & Above-Composer Approval Gate Card
@@ -362,12 +249,13 @@ export const ApprovalGateCard: React.FC<ApprovalCardProps> = ({
  * ========================================================================== */
 
 interface InlineFileStepProps {
+  activityId: string;
+  status: ActivityStatus;
   path: string;
   base: string;
   added: number;
   deleted: number;
   isCreated: boolean;
-  failed?: boolean;
   errorNote?: string;
   afterText: string;
   lines: DiffLine[];
@@ -376,20 +264,23 @@ interface InlineFileStepProps {
 }
 
 const InlineFileStepRow: React.FC<InlineFileStepProps> = ({
+  activityId,
+  status,
   path,
   base,
   added,
   deleted,
   isCreated,
-  failed = false,
   errorNote,
   afterText,
   lines,
   onInspectFile,
   onCopy,
 }) => {
-  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  const [open, setOpen] = useActivityDisclosure(`file:${activityId}`, false);
   const [copied, setCopied] = useState(false);
+  const failed = status === 'failed';
 
   const visibleLines = useMemo(() => {
     if (isCreated) return lines.slice(0, 120);
@@ -419,13 +310,15 @@ const InlineFileStepRow: React.FC<InlineFileStepProps> = ({
   };
 
   return (
-    <div className="codex-activity-group">
+    <div className="codex-activity-group" data-scroll-anchor={`file:${activityId}`} data-status={status}>
       <div className="codex-activity-row" style={{ gap: 6 }}>
         <button
           type="button"
-          className="codex-activity-row"
+          className="codex-activity-row codex-activity-disclosure"
           aria-expanded={open}
-          onClick={() => setOpen((v) => !v)}
+          aria-controls={panelId}
+          data-scroll-disclosure
+          onClick={() => setOpen(!open)}
           title={open ? '收起内联变更' : '点击展开内联代码变更'}
         >
           <span className="codex-activity-row-icon">
@@ -440,7 +333,7 @@ const InlineFileStepRow: React.FC<InlineFileStepProps> = ({
               className="codex-activity-row-label"
               style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
             >
-              <span>{failed ? '尝试编辑' : isCreated ? '已创建' : '已编辑'}</span>
+              <span>{status === 'running' ? '正在编辑' : failed ? '尝试编辑' : isCreated ? '已创建' : '已编辑'}</span>
               <span className="codex-step-file-link">{base}</span>
               {(added > 0 || deleted > 0 || isCreated) && (
                 <span className="codex-diff-counts tabular-nums" style={{ fontSize: 12 }}>
@@ -460,7 +353,7 @@ const InlineFileStepRow: React.FC<InlineFileStepProps> = ({
         </button>
       </div>
 
-      <Collapsible open={open}>
+      <Collapsible open={open} id={panelId}>
         <div className="codex-activity-detail-nested">
           <div className="codex-inline-diff-card">
             <div className="codex-inline-diff-head">
@@ -549,26 +442,31 @@ const InlineFileStepRow: React.FC<InlineFileStepProps> = ({
  * ========================================================================== */
 
 interface ImageViewRowProps {
+  activityId: string;
   images: PreviewImageItem[];
   defaultOpen?: boolean;
   onOpenImage?: (images: PreviewImageItem[], index: number) => void;
 }
 
 const ImageViewRow: React.FC<ImageViewRowProps> = ({
+  activityId,
   images,
   defaultOpen = false,
   onOpenImage,
 }) => {
-  const [open, setOpen] = useState(defaultOpen);
+  const panelId = useId();
+  const [open, setOpen] = useActivityDisclosure(`images:${activityId}`, defaultOpen);
   if (!images.length) return null;
 
   return (
-    <div className="codex-activity-group">
+    <div className="codex-activity-group" data-scroll-anchor={`images:${activityId}`}>
       <button
         type="button"
-        className="codex-activity-row"
+        className="codex-activity-row codex-activity-disclosure"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        aria-controls={panelId}
+        data-scroll-disclosure
+        onClick={() => setOpen(!open)}
       >
         <span className="codex-activity-row-icon">
           <IconImageInspect size={15} />
@@ -581,7 +479,7 @@ const ImageViewRow: React.FC<ImageViewRowProps> = ({
         </span>
       </button>
 
-      <Collapsible open={open}>
+      <Collapsible open={open} id={panelId}>
         <div className="codex-image-strip">
           {images.map((img, idx) => (
             <button
@@ -605,6 +503,8 @@ const ImageViewRow: React.FC<ImageViewRowProps> = ({
  * ========================================================================== */
 
 interface ActivityBlockProps {
+  activityId?: string;
+  status?: TaskStatus;
   plan?: TaskPlan;
   assignments: Assignment[];
   workers: Worker[];
@@ -628,7 +528,13 @@ interface ActivityBlockProps {
   onCopy?: (msg: string) => void;
 }
 
-export const ActivityBlock: React.FC<ActivityBlockProps> = ({
+export const ActivityBlock: React.FC<ActivityBlockProps> = (props) => (
+  <ActivityDisclosureScope key={props.activityId}><SwarmActivityPanel {...props} /></ActivityDisclosureScope>
+);
+
+const SwarmActivityPanel: React.FC<ActivityBlockProps> = ({
+  activityId,
+  status,
   plan,
   assignments,
   workers,
@@ -651,8 +557,11 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
   onOpenImage,
   onCopy,
 }) => {
-  const [open, setOpen] = useState(defaultOpen);
-  const [planOpen, setPlanOpen] = useState(false);
+  const processId = useId();
+  const planId = useId();
+  const scopeId = activityId ?? processId;
+  const [open, setOpen] = useActivityDisclosure(`process:${scopeId}`, isLive || defaultOpen);
+  const [planOpen, setPlanOpen] = useActivityDisclosure(`plan:${scopeId}`, false);
   const [liveNow, setLiveNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -701,8 +610,12 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
   const { planSummary, items } = timeline;
   const hasDetail = Boolean(planSummary || items.length > 0);
 
-  const liveElapsedMs = startedAt ? Math.max(1000, liveNow - startedAt) : undefined;
-  const displayDuration = durationMs ?? liveElapsedMs;
+  const liveElapsedMs = isLive && startedAt !== undefined ? Math.max(0, liveNow - startedAt) : undefined;
+  const waiting = (isLive || status === 'paused') && approvals.some((approval) => approval.status === 'pending');
+  const processStatus: ActivityStatus = waiting ? 'waiting' : status === 'failed' ? 'failed'
+    : status === 'paused' || status === 'cancelled' ? 'interrupted' : isLive ? 'running' : 'completed';
+  const processTitle = waiting ? undefined : status === 'paused' ? '已暂停' : status === 'cancelled' ? '已停止'
+    : isLive ? liveText : undefined;
 
   const renderProcessSteps = () => (
     <div className="codex-process-timeline" aria-label="运行活动">
@@ -711,9 +624,11 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
         <div className="codex-activity-group">
           <button
             type="button"
-            className="codex-activity-row"
+            className="codex-activity-row codex-activity-disclosure"
             aria-expanded={planOpen}
-            onClick={() => setPlanOpen((v) => !v)}
+            aria-controls={planId}
+            data-scroll-disclosure
+            onClick={() => setPlanOpen(!planOpen)}
           >
             <span className="codex-activity-row-icon">
               <IconSparkle size={15} />
@@ -731,7 +646,7 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
               <IconChevronRight size={14} />
             </span>
           </button>
-          <Collapsible open={planOpen}>
+          <Collapsible open={planOpen} id={planId}>
             <div className="codex-activity-detail-nested">
               {planSummary.nodes.map((node) => (
                 <div key={node.nodeId} className="codex-plan-node-row">
@@ -820,16 +735,19 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
         }
 
         if (item.kind === 'file') {
+          const fileId = JSON.stringify([scopeId, item.callId || item.id, item.path]);
+          const fileStatus = item.status === 'running' && !isLive ? 'interrupted' : item.status;
           if (item.operation !== 'read' && item.diffLines && item.afterText !== undefined) {
             return (
               <InlineFileStepRow
-                key={item.id}
+                key={fileId}
+                activityId={fileId}
+                status={fileStatus}
                 path={item.path}
                 base={item.base}
                 added={item.added ?? 0}
                 deleted={item.deleted ?? 0}
                 isCreated={Boolean(item.isCreated)}
-                failed={item.status === 'failed'}
                 errorNote={item.errorNote}
                 afterText={item.afterText}
                 lines={item.diffLines}
@@ -840,7 +758,7 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
           }
           return (
             <ConvergedFileSummaryRow
-              key={item.id}
+              key={fileId}
               item={item}
               onInspectFile={onInspectFile}
             />
@@ -848,11 +766,26 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
         }
 
         if (item.kind === 'command') {
+          const toolId = JSON.stringify([scopeId, item.callId || item.id]);
+          const status = item.status === 'running' && !isLive ? 'interrupted' : item.status;
+          const kind = activityToolKind(item.toolName, item.command);
           return (
-            <ConvergedCommandRow
-              key={item.id}
-              item={item}
-              defaultOpen={subagentMode || (isLive && idx === items.length - 1)}
+            <ActivityToolRow
+              key={toolId}
+              id={toolId}
+              name={item.toolName}
+              kind={kind}
+              command={kind === 'command' || kind === 'test' ? item.command : undefined}
+              target={item.command || item.toolName}
+              output={item.output}
+              error={item.error}
+              exitCode={item.exitCode}
+              durationMs={item.durationMs}
+              paths={item.filePath ? [item.filePath] : undefined}
+              eventType={item.eventType}
+              meta={item.workerLabel}
+              status={status}
+              defaultOpen={status === 'failed' || subagentMode || (status === 'running' && idx === items.length - 1)}
               onInspectFile={onInspectFile}
               onCopy={onCopy}
             />
@@ -884,6 +817,7 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
           return (
             <ImageViewRow
               key={item.id}
+              activityId={JSON.stringify([scopeId, item.id])}
               images={previewImages}
               defaultOpen={isLive}
               onOpenImage={onOpenImage}
@@ -914,50 +848,25 @@ export const ActivityBlock: React.FC<ActivityBlockProps> = ({
     </div>
   );
 
-  // LIVE EXECUTION MODE: stream interleaved steps inline + ticking shimmer status line
-  if (isLive) {
-    return (
-      <div className="codex-activity-group" style={{ gap: 10 }}>
-        {hasDetail && renderProcessSteps()}
-        <div className="codex-activity-row" style={{ cursor: 'default' }}>
-          <span className="codex-activity-row-icon">
-            <IconSparkle size={15} />
-          </span>
-          <span className="codex-activity-row-label codex-shimmer-text" title={liveText}>{liveText || '正在思考与规划任务…'}</span>
-          {liveElapsedMs !== undefined && (
-            <span
-              className="tabular-nums"
-              style={{ fontSize: 12.5, color: 'var(--text-tertiary)', marginLeft: 4 }}
-            >
-              · {fmtDuration(liveElapsedMs)}
-            </span>
-          )}
-        </div>
-      </div>
-    );
-  }
+  if (!hasDetail && !isLive) return null;
 
-  if (!hasDetail) return null;
-
-  // COMPLETED MODE: exact `用时 X >` collapsible header (1:1 with User Screenshots 1, 2, 4!)
+  const title = <ActivityStatusText status={processStatus} title={processTitle} durationMs={durationMs ?? liveElapsedMs} />;
   return (
-    <div className="codex-activity-group">
-      <button
-        type="button"
-        className="codex-activity-row codex-duration-toggle"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span className="codex-activity-row-label tabular-nums">
-          {displayDuration ? `用时 ${fmtDuration(displayDuration)}` : '查看执行过程'}
-        </span>
-        <span className="codex-activity-chevron">
-          <IconChevronRight size={14} />
-        </span>
-      </button>
-
-      <Collapsible open={open}>
-        <div className="codex-duration-body">{renderProcessSteps()}</div>
+    <div className="codex-activity-group" data-scroll-anchor={`process:${scopeId}`} data-status={processStatus}>
+      {hasDetail ? (
+        <button type="button" className="codex-activity-row codex-duration-toggle codex-activity-disclosure"
+          aria-expanded={open} aria-controls={processId} data-scroll-disclosure onClick={() => setOpen(!open)}>
+          <span className="codex-activity-row-label tabular-nums" title={processTitle}>{title}</span>
+          <span className="codex-activity-chevron"><IconChevronRight size={14} aria-hidden="true" /></span>
+        </button>
+      ) : (
+        <div className="codex-activity-row">
+          <span className="codex-activity-row-icon"><IconSparkle size={15} aria-hidden="true" /></span>
+          <span className="codex-activity-row-label" title={processTitle}>{title}</span>
+        </div>
+      )}
+      <Collapsible open={open && hasDetail} id={processId} keepMounted>
+        <div className="codex-duration-body">{hasDetail && renderProcessSteps()}</div>
       </Collapsible>
     </div>
   );

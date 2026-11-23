@@ -70,10 +70,10 @@
   /* Typography (crisp Codex Desktop density matching screenshots) */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --text-chat: 13.5px;
-  --text-chat-line: 20px;
-  --text-assistant: 14px;
-  --text-assistant-line: 22px;
+  --text-chat: 14px;
+  --text-chat-line: 22px;
+  --text-assistant: 14.5px;
+  --text-assistant-line: 1.66;
   --text-meta: 12.5px;
   --text-meta-line: 17px;
   --text-small: 12px;
@@ -86,7 +86,14 @@
   --rail-width: 48px;
   --sidebar-width: 248px;
   --thread-header-height: 44px;
-  --thread-content-max-width: 688px;
+  --thread-content-max-width: 728px;
+  --thread-gutter: clamp(16px, 3.1cqi, 28px);
+  --thread-turn-gap: 32px;
+  --thread-block-gap: 14px;
+  --thread-radius-bubble: 17px;
+  --thread-radius-detail: 10px;
+  --thread-detail-surface: var(--bg-surface-secondary);
+  --thread-focus-ring: var(--color-accent);
   --row-height: 28px;
   --settings-nav-width: 252px;
   --settings-content-max: 760px;
@@ -412,7 +419,7 @@
   --text-chat: 13px;
   --text-chat-line: 19.5px;
   --text-assistant: 14.5px;
-  --text-assistant-line: 22px;
+  --text-assistant-line: 1.66;
 }
 
 [data-font-size="comfortable"] {

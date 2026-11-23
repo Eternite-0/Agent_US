@@ -9,6 +9,7 @@ test('unknown, measured zero and near-perfect cache hits stay distinct', () => {
   assert.equal(cachePercent(0.9999), '99.99%');
   assert.equal(cachePercent(1), '100%');
   assert.equal(cacheRefreshEvent('turn/completed'), true);
+  assert.equal(cacheRefreshEvent('turn/parked'), true);
   assert.equal(cacheRefreshEvent('swarm/run_completed'), true);
   assert.equal(cacheRefreshEvent('assistant/delta'), false);
 });
@@ -20,7 +21,8 @@ test('the Composer asks the existing metrics route for 24-hour production teleme
     assert.equal(query.get('windowHours'), '24');
     assert.equal(query.get('view'), 'prompt-cache');
     assert.equal(query.has('includeSynthetic'), false);
-    return Response.json({}); // older backends must not display fabricated percentages
+    // The older backend's ratio treats some absent measurements as misses.
+    return Response.json({ averageTokenUsage: { cacheReadRatio: 0.8 } });
   });
   const client = new LiveBackendClient({ baseUrl: 'http://127.0.0.1:8787', token: '' });
   assert.equal(await client.getPromptCacheStats(), null);
