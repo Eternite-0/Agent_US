@@ -1,8 +1,13 @@
 import { existsSync } from 'node:fs';
 import { verifyTurn } from '../verifier.js';
 import { resolveConfinedPath } from '../tools/sandbox.js';
-import { scanCommandSyntax } from '../tools/command-analyzer.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
+import {
+  extractFailureFingerprint,
+  extractMutatedFilesFromToolCall,
+  isVerificationCommand,
+  safeParseToolArgs,
+} from '../kernel/execution-reasoning.js';
 import { buildPlainTextPassVerdict } from '../kernel/verdict.js';
 import { classifyJobOwnership } from '../durable/lease-guard.js';
 import { validateEvidenceManifest } from '../evaluation/schemas.js';
@@ -11,47 +16,40 @@ import { listWorkspaceChangedFiles } from '../evaluation/fixtures.js';
 const PASS_CLAIM_RE =
   /(?:全部|所有|tests?|suites?|checks?|build|lint|typecheck|npm run check).*?(?:pass(?:ed|es)?|通过|成功|0\s*(?:fail(?:ure)?s?|errors?))|(?:验证通过|测试通过|构建成功|编译通过|0\s*(?:failures|errors))/i;
 
-// Recognize common synchronous validation commands, not arbitrary successful
-// shell commands. Compound commands cannot supply evidence for an earlier check.
-function isVerificationCommand(command) {
-  if (typeof command !== 'string') return false;
-  const { tokens, hasCompound, hasSubstitution } = scanCommandSyntax(command);
-  if (hasCompound || hasSubstitution) return false;
-  const [program, sub, target] = tokens;
-  const bin = program?.replace(/\.exe$/i, '')?.toLowerCase();
-  const verificationScript = /^(?:tests?|checks?|lint|build|typecheck)(?::[a-z0-9:_-]+)?$/i;
-  if (bin === 'npm' || bin === 'pnpm' || bin === 'yarn' || bin === 'bun') {
-    return sub === 'run' ? verificationScript.test(target ?? '') : verificationScript.test(sub ?? '');
-  }
-  if (bin === 'node') return sub === '--test' || sub === '--check';
-  if (bin === 'cargo') return ['test', 'check', 'clippy', 'build'].includes(sub);
-  if (bin === 'go') return ['test', 'vet', 'build'].includes(sub);
-  if (bin === 'python' || bin === 'python3') return sub === '-m' && ['pytest', 'unittest'].includes(target);
-  return ['pytest', 'vitest', 'jest', 'tsc', 'eslint'].includes(bin);
-}
+const POST_EDIT_FILE_MUTATION_TOOLS = new Set(['write_file', 'edit_file', 'apply_patch']);
 
-function findUnresolvedVerification(receipts, events, workspaceRoot) {
-  const resultsByReceipt = new Map();
+function findUnresolvedVerification(receipts, events, workspaceRoot, callsById = new Map()) {
+  const resultsByKey = new Map();
   for (const ev of events) {
-    const { receipt, effectiveArgs } = ev.data ?? {};
-    if (ev.type === 'tool/result' && receipt?.id && effectiveArgs) {
-      resultsByReceipt.set(receipt.id, effectiveArgs);
+    const { receipt, effectiveArgs, callId } = ev.data ?? {};
+    if (ev.type === 'tool/result' && effectiveArgs) {
+      if (receipt?.id) resultsByKey.set(`id:${receipt.id}`, effectiveArgs);
+      const cid = receipt?.callId ?? callId;
+      if (cid) resultsByKey.set(`call:${cid}`, effectiveArgs);
     }
   }
   const latestByCommand = new Map();
   for (const receipt of receipts) {
     if (receipt.toolName !== 'bash') continue;
-    const args = resultsByReceipt.get(receipt.id);
+    const args =
+      (receipt.id ? resultsByKey.get(`id:${receipt.id}`) : null) ??
+      (receipt.callId ? resultsByKey.get(`call:${receipt.callId}`) : null) ??
+      (receipt.callId ? callsById.get(receipt.callId)?.args : null) ??
+      receipt.args ??
+      null;
     if (!isVerificationCommand(args?.command)) continue;
     let cwd = args.cwd || '.';
     if (workspaceRoot) {
       try { cwd = resolveConfinedPath(workspaceRoot, cwd).rel; } catch { /* keep raw cwd */ }
     }
-    const key = JSON.stringify([receipt.sessionId, cwd, args.command.trim()]);
+    const key = JSON.stringify([receipt.sessionId ?? null, cwd, args.command.trim()]);
     // Rejections are unsuccessful attempts; they must not turn a failing check green.
-    latestByCommand.set(key, receipt);
+    latestByCommand.set(key, { receipt, command: args.command.trim(), cwd });
   }
-  return [...latestByCommand.values()].findLast((r) => r.status !== 'finished' || r.exitCode !== 0);
+  const failed = [...latestByCommand.values()].findLast(
+    ({ receipt }) => receipt.status !== 'finished' || receipt.exitCode !== 0,
+  );
+  return failed ?? null;
 }
 
 const DELETE_SEGMENT_RE =
@@ -133,6 +131,7 @@ export class EvidenceVerifier {
     sessionIds = null,
     turnIds = null,
     workspaceRoot = null,
+    reasoningState = null,
   } = {}) {
     const reasons = [];
     const checks = {
@@ -235,21 +234,221 @@ export class EvidenceVerifier {
       reasons.push(...base.reasons);
     }
 
-    // 2. Cross-check pass/success claims against real bash / process receipts
+    // Collect tool call arguments from DB messages + live events so verification and mutation
+    // timeline checks work identically with or without a live Store/event pair.
+    const callsById = new Map();
+    const callCommands = new Map();
+    if (this.store?.db?.isOpen && allSessionIds.length > 0) {
+      try {
+        const sPh = allSessionIds.map(() => '?').join(',');
+        const msgRows = allTurnIds.length > 0
+          ? this.store.db
+              .prepare(`SELECT toolCalls FROM direct_messages WHERE sessionId IN (${sPh}) AND turnId IN (${allTurnIds.map(() => '?').join(',')}) AND role='assistant' AND toolCalls IS NOT NULL`)
+              .all(...allSessionIds, ...allTurnIds)
+          : this.store.db
+              .prepare(`SELECT toolCalls FROM direct_messages WHERE sessionId IN (${sPh}) AND role='assistant' AND toolCalls IS NOT NULL`)
+              .all(...allSessionIds);
+        for (const row of msgRows) {
+          try {
+            const calls = JSON.parse(row.toolCalls);
+            if (!Array.isArray(calls)) continue;
+            for (const tc of calls) {
+              if (!tc?.id) continue;
+              const args = safeParseToolArgs(tc.arguments);
+              callsById.set(tc.id, { index: -1, name: tc.name ?? '', args });
+              if (typeof args?.command === 'string') callCommands.set(tc.id, args.command);
+            }
+          } catch {
+            // ignore unparseable historical toolCalls
+          }
+        }
+      } catch {
+        // table unavailable in minimal store mocks
+      }
+    }
+    for (let idx = 0; idx < events.length; idx += 1) {
+      const ev = events[idx];
+      if (ev.type === 'tool/call' && ev.data?.callId) {
+        const args = safeToolArgs(ev.data?.arguments);
+        callsById.set(ev.data.callId, {
+          index: idx,
+          name: ev.data?.name ?? '',
+          args,
+        });
+        if (typeof args?.command === 'string') {
+          callCommands.set(ev.data.callId, args.command);
+        }
+      }
+    }
+
+    const receiptById = new Map();
+    const receiptByCallId = new Map();
+    for (const r of turnReceipts) {
+      if (r.id) receiptById.set(r.id, r);
+      if (r.callId) receiptByCallId.set(r.callId, r);
+    }
+
+    const seenReceiptIds = new Set();
+    const seenCallIds = new Set();
+    const orderedToolRuns = [];
+    for (const ev of events) {
+      if (ev.type !== 'tool/result') continue;
+      const cid = ev.data?.receipt?.callId ?? ev.data?.callId ?? null;
+      const callInfo = cid ? callsById.get(cid) : null;
+      const dbReceipt =
+        (ev.data?.receipt?.id ? receiptById.get(ev.data.receipt.id) : null) ??
+        (cid ? receiptByCallId.get(cid) : null);
+      const receipt = dbReceipt ?? ev.data?.receipt ?? null;
+      if (dbReceipt?.id) seenReceiptIds.add(dbReceipt.id);
+      if (cid) seenCallIds.add(cid);
+
+      const toolName = ev.data?.name ?? receipt?.toolName ?? callInfo?.name ?? '';
+      const args = ev.data?.effectiveArgs ?? callInfo?.args ?? safeToolArgs(ev.data?.arguments);
+      const status = receipt?.status ?? (ev.data?.isError ? 'failed' : 'finished');
+      const exitCode =
+        receipt?.exitCode !== undefined && receipt?.exitCode !== null
+          ? receipt.exitCode
+          : ev.data?.isError
+            ? 1
+            : 0;
+      const isError =
+        Boolean(ev.data?.isError) ||
+        status === 'failed' ||
+        status === 'rejected_before_effect' ||
+        (typeof exitCode === 'number' && exitCode !== 0);
+      const output = typeof ev.data?.content === 'string' ? ev.data.content : '';
+      orderedToolRuns.push({
+        toolName,
+        args,
+        status,
+        exitCode,
+        isError,
+        receipt,
+        callId: cid ?? receipt?.callId ?? null,
+        output,
+      });
+    }
+    for (const r of turnReceipts) {
+      if ((r.id && seenReceiptIds.has(r.id)) || (r.callId && seenCallIds.has(r.callId))) {
+        continue;
+      }
+      const callInfo = r.callId ? callsById.get(r.callId) : null;
+      const isError = r.status === 'failed' || (typeof r.exitCode === 'number' && r.exitCode !== 0);
+      orderedToolRuns.push({
+        toolName: r.toolName,
+        args: callInfo?.args ?? {},
+        status: r.status,
+        exitCode: r.exitCode,
+        isError,
+        receipt: r,
+        callId: r.callId ?? null,
+        output: '',
+      });
+    }
+
+    // 2. Cross-check pass/success claims and post-edit verification against real receipts/timeline
     const shellReceipts = turnReceipts.filter((r) =>
       ['bash', 'start_process'].includes(r.toolName),
     );
-    const failedShells = shellReceipts.filter(
+    const effectiveShellReceipts =
+      shellReceipts.length > 0
+        ? shellReceipts
+        : orderedToolRuns
+            .filter((run) => ['bash', 'start_process'].includes(run.toolName))
+            .map((run, idx) => ({
+              id: run.receipt?.id ?? run.callId ?? `event-shell-${idx}`,
+              callId: run.callId ?? run.receipt?.callId ?? `event-shell-${idx}`,
+              sessionId: sessionId ?? 'event-session',
+              toolName: run.toolName,
+              status: run.status,
+              exitCode: run.exitCode,
+              args: run.args,
+            }));
+
+    const failedShells = effectiveShellReceipts.filter(
       (r) => r.status === 'failed' || (typeof r.exitCode === 'number' && r.exitCode !== 0),
     );
-    const latestShell = shellReceipts.at(-1);
+    const latestShell = effectiveShellReceipts.at(-1);
     const unresolvedShellFailure =
       failedShells.length > 0 &&
       (!latestShell || latestShell.status === 'failed' || (latestShell.exitCode ?? 0) !== 0);
     checks.failedShellReceipts = failedShells.length;
 
-    const unresolvedCheck = findUnresolvedVerification(shellReceipts, events, workspaceRoot);
-    if (PASS_CLAIM_RE.test(String(text || '')) && (unresolvedCheck || unresolvedShellFailure)) {
+    const allMutatedFiles = [];
+    const allMutatedSet = new Set();
+    let lastPassingVerification = null;
+    let mutatedAfterLastPass = [];
+    let mutatedAfterLastPassSet = new Set();
+    let verificationRunsCount = 0;
+    let latestFailureRun = null;
+    const failureRunByCallId = new Map();
+
+    for (let idx = 0; idx < orderedToolRuns.length; idx += 1) {
+      const run = orderedToolRuns[idx];
+      if (
+        POST_EDIT_FILE_MUTATION_TOOLS.has(run.toolName) &&
+        !run.isError &&
+        run.status !== 'rejected_before_effect' &&
+        run.status !== 'outcome_unknown'
+      ) {
+        const files = extractMutatedFilesFromToolCall(run.toolName, run.args, workspaceRoot);
+        for (const f of files) {
+          if (!allMutatedSet.has(f)) {
+            allMutatedSet.add(f);
+            allMutatedFiles.push(f);
+          }
+          if (lastPassingVerification && !mutatedAfterLastPassSet.has(f)) {
+            mutatedAfterLastPassSet.add(f);
+            mutatedAfterLastPass.push(f);
+          }
+        }
+      } else if (run.toolName === 'bash' && isVerificationCommand(run.args?.command)) {
+        verificationRunsCount += 1;
+        const passed =
+          run.status === 'finished' &&
+          !run.isError &&
+          (run.exitCode === 0 || run.exitCode === null || run.exitCode === undefined);
+        if (passed) {
+          lastPassingVerification = {
+            index: idx,
+            command: run.args.command.trim(),
+            callId: run.callId,
+          };
+          mutatedAfterLastPass = [];
+          mutatedAfterLastPassSet = new Set();
+        } else {
+          const fp = run.output
+            ? extractFailureFingerprint({
+                toolName: run.toolName,
+                args: run.args,
+                output: run.output,
+                receipt: run.receipt,
+                workspaceRoot,
+              })
+            : null;
+          const failInfo = {
+            command: run.args.command.trim(),
+            exitCode: run.exitCode,
+            output: run.output,
+            callId: run.callId,
+            fingerprint: fp,
+          };
+          latestFailureRun = failInfo;
+          if (run.callId) failureRunByCallId.set(run.callId, failInfo);
+        }
+      }
+    }
+
+    const unresolvedEntry = findUnresolvedVerification(
+      effectiveShellReceipts,
+      events,
+      workspaceRoot,
+      callsById,
+    );
+    const unresolvedCheck = unresolvedEntry?.receipt ?? null;
+    const unresolvedCommand = unresolvedEntry?.command ?? null;
+    const hasPassClaim = PASS_CLAIM_RE.test(String(text || ''));
+    if (hasPassClaim && (unresolvedCheck || unresolvedShellFailure)) {
       if (unresolvedCheck) {
         reasons.push(
           `FABRICATED_PASS_CLAIM: 验证命令未成功 (callId=${unresolvedCheck.callId}, exitCode=${unresolvedCheck.exitCode ?? 'unknown'})。请修复后在同一目录重跑原验证命令，或如实报告未通过。`,
@@ -262,6 +461,50 @@ export class EvidenceVerifier {
     }
 
     const contract = execution?.evidenceContract ?? node?.evidenceContract ?? null;
+    const requirePostEditVerification = Boolean(execution?.requirePostEditVerification);
+    checks.mutatedFiles = [...allMutatedFiles];
+
+    const staleAfterEdit = Boolean(lastPassingVerification && mutatedAfterLastPass.length > 0);
+    checks.staleVerificationAfterEdit = staleAfterEdit;
+    checks.mutatedFilesAfterVerification = [...mutatedAfterLastPass];
+    if (staleAfterEdit) {
+      checks.lastPassingVerificationCommand = lastPassingVerification.command;
+      reasons.push(
+        `STALE_VERIFICATION_AFTER_EDIT: 文件 (${mutatedAfterLastPass.join(', ')}) 在上次验证通过 (${lastPassingVerification.command}) 之后被修改，且修改后未重新运行通过的验证命令。`,
+      );
+    }
+
+    let diagnosticExcerpt = null;
+    let failureFingerprint = null;
+    const hasActivePostEditGate =
+      allMutatedFiles.length > 0 || Boolean(contract) || requirePostEditVerification;
+    if (unresolvedCheck && hasActivePostEditGate) {
+      const matchingFailure =
+        (unresolvedCheck.callId ? failureRunByCallId.get(unresolvedCheck.callId) : null) ??
+        latestFailureRun;
+      failureFingerprint =
+        matchingFailure?.fingerprint ??
+        reasoningState?.errorFingerprints?.at(-1) ??
+        null;
+      diagnosticExcerpt =
+        failureFingerprint?.summary ??
+        (matchingFailure?.output ? matchingFailure.output.slice(0, 200).trim() : null);
+      checks.unresolvedVerificationFailure = true;
+      if (unresolvedCommand) checks.unresolvedVerificationCommand = unresolvedCommand;
+      if (diagnosticExcerpt) checks.diagnosticExcerpt = diagnosticExcerpt;
+      reasons.push(
+        `UNRESOLVED_VERIFICATION_FAILURE: 最新验证命令 (${unresolvedCommand || 'verification'}, callId=${unresolvedCheck.callId ?? 'unknown'}, exitCode=${unresolvedCheck.exitCode ?? 'unknown'}) 仍未通过${diagnosticExcerpt ? ` (${diagnosticExcerpt})` : ''}。请先定位根因修复后再重跑验证。`,
+      );
+    } else {
+      checks.unresolvedVerificationFailure = false;
+    }
+
+    if (requirePostEditVerification && allMutatedFiles.length > 0 && verificationRunsCount === 0 && !contract) {
+      checks.postEditVerificationMissing = true;
+      reasons.push(
+        `POST_EDIT_VERIFICATION_MISSING: 文件 (${allMutatedFiles.join(', ')}) 已修改，但本轮尚未运行任何验证命令。`,
+      );
+    }
 
     // 3. Verify claimed file mutations exist on disk when workspaceRoot is supplied
     if (workspaceRoot && events.length) {
@@ -376,41 +619,6 @@ export class EvidenceVerifier {
     }
     let contractValidation = null;
     if (contract) {
-      const callCommands = new Map();
-      for (const ev of events) {
-        if (ev.type === 'tool/call' && ev.data?.callId) {
-          const cmd = ev.data?.arguments?.command;
-          if (typeof cmd === 'string') callCommands.set(ev.data.callId, cmd);
-        }
-      }
-      if (this.store?.db?.isOpen && allSessionIds.length > 0) {
-        try {
-          const sPh = allSessionIds.map(() => '?').join(',');
-          const msgRows = allTurnIds.length > 0
-            ? this.store.db
-                .prepare(`SELECT toolCalls FROM direct_messages WHERE sessionId IN (${sPh}) AND turnId IN (${allTurnIds.map(() => '?').join(',')}) AND role='assistant' AND toolCalls IS NOT NULL`)
-                .all(...allSessionIds, ...allTurnIds)
-            : this.store.db
-                .prepare(`SELECT toolCalls FROM direct_messages WHERE sessionId IN (${sPh}) AND role='assistant' AND toolCalls IS NOT NULL`)
-                .all(...allSessionIds);
-          for (const row of msgRows) {
-            try {
-              const calls = JSON.parse(row.toolCalls);
-              if (!Array.isArray(calls)) continue;
-              for (const tc of calls) {
-                if (!tc?.id) continue;
-                const args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
-                if (typeof args?.command === 'string') callCommands.set(tc.id, args.command);
-              }
-            } catch {
-              // ignore unparseable historical toolCalls
-            }
-          }
-        } catch {
-          // table unavailable in minimal store mocks
-        }
-      }
-
       const receiptsForContract = turnReceipts.length > 0
         ? turnReceipts.map((r) => ({ ...r, command: callCommands.get(r.callId) ?? '' }))
         : events
@@ -460,6 +668,8 @@ export class EvidenceVerifier {
         : {
             verdict: reasons.length ? 'fail' : 'pass',
             ...(contractValidation && !contractValidation.valid ? { status: contractValidation.status, missingFields: contractValidation.missingFields, expectedTestCommand: contract.expectedTestCommand, actualChangedFiles: checks.evidenceContract ? (contract.workspaceRoot || workspaceRoot ? listWorkspaceChangedFiles(contract.workspaceRoot || workspaceRoot) : undefined) : undefined } : {}),
+            ...(diagnosticExcerpt ? { diagnosticExcerpt } : {}),
+            ...(failureFingerprint ? { failureFingerprint } : {}),
             accepted: reasons.length === 0,
             evidenceRequired: true,
             verificationMode: contract ? 'evidence_contract_checked' : 'evidence_checked',

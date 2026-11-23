@@ -26,6 +26,27 @@ const REASON_TEXT = {
     `required deliverable file(s) are missing from the workspace: ${(ctx.missingFiles ?? []).join(', ')}`,
   unverified_coder_claim: () =>
     'the reply claimed tests/verification passed, but zero tool executions were recorded in this session',
+  STALE_VERIFICATION_AFTER_EDIT: (ctx) => {
+    const mutated =
+      ctx.mutatedFilesAfterVerification ?? ctx.checks?.mutatedFilesAfterVerification ?? [];
+    const filesText = Array.isArray(mutated) && mutated.length ? ` (${mutated.join(', ')})` : '';
+    return `files${filesText} were modified after the last passing verification; review your edits and re-run the verification command via bash after your final edit so it passes with exitCode 0`;
+  },
+  UNRESOLVED_VERIFICATION_FAILURE: (ctx) => {
+    const cmd =
+      ctx.unresolvedVerificationCommand ?? ctx.checks?.unresolvedVerificationCommand ?? null;
+    const excerpt =
+      ctx.diagnosticExcerpt ??
+      ctx.checks?.diagnosticExcerpt ??
+      ctx.failureFingerprint?.summary ??
+      null;
+    return `verification${cmd ? ` (${cmd})` : ''} is still failing${excerpt ? ` — ${excerpt}` : ''}; read the failing test and root-cause source files (read_file/grep), fix the underlying root cause instead of repeating blind edits, and re-run verification until exitCode is 0`;
+  },
+  POST_EDIT_VERIFICATION_MISSING: (ctx) => {
+    const mutated = ctx.mutatedFiles ?? ctx.checks?.mutatedFiles ?? [];
+    const filesText = Array.isArray(mutated) && mutated.length ? ` (${mutated.join(', ')})` : '';
+    return `files${filesText} were modified without running a verification command; run the relevant test/check command via bash to verify your changes`;
+  },
 };
 
 function extractAssistantText(event) {
@@ -151,6 +172,19 @@ export function buildRepairNote(result) {
     return `- ${reason}${explain ? `: ${explain(result)}` : ''}`;
   });
   const extra = [];
+  const mutatedAfterVerify =
+    result.mutatedFilesAfterVerification ?? result.checks?.mutatedFilesAfterVerification;
+  if (Array.isArray(mutatedAfterVerify) && mutatedAfterVerify.length > 0) {
+    extra.push(`Modified files needing re-verification: ${mutatedAfterVerify.join(', ')}.`);
+  }
+  const diagnosticExcerpt =
+    result.diagnosticExcerpt ??
+    result.checks?.diagnosticExcerpt ??
+    result.failureFingerprint?.summary ??
+    null;
+  if (diagnosticExcerpt) {
+    extra.push(`Diagnostic failure excerpt: ${diagnosticExcerpt}.`);
+  }
   if (Array.isArray(result.missingFields) && result.missingFields.length > 0) {
     extra.push(`Missing or incomplete evidence fields: ${result.missingFields.join(', ')}.`);
   }

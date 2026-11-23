@@ -4,6 +4,10 @@ import { excerpt } from '../context.js';
 import { verifyTurn, buildRepairNote } from '../verifier.js';
 import { BudgetError, RecoveryError, classifyError } from './errors.js';
 import { RUNTIME_EVENTS } from './events.js';
+import {
+  ExecutionReasoningTracker,
+  MUTATING_FILE_TOOLS,
+} from './execution-reasoning.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
 import { resolveTurnOutcome } from './verdict.js';
 import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
@@ -22,6 +26,11 @@ export class DecisionEngine {
     this.judgment = judgment;
     this.verifier = verifier ?? verifyTurn;
     this.maxRepairRounds = maxRepairRounds;
+    this._explicitMaxRepairRounds =
+      arguments.length > 0 &&
+      arguments[0] != null &&
+      Object.hasOwn(arguments[0], 'maxRepairRounds') &&
+      arguments[0].maxRepairRounds !== undefined;
   }
 
   async shouldContinueOnIdle({
@@ -38,6 +47,7 @@ export class DecisionEngine {
     sessionId = null,
     turnId = null,
     workspaceRoot = null,
+    reasoningState = null,
     signal,
   }) {
     if (
@@ -75,13 +85,19 @@ export class DecisionEngine {
           sessionId,
           turnId,
           workspaceRoot,
+          reasoningState,
         }),
       );
       if (verdict && verdict.verdict === 'block_reconciliation') {
         return { action: 'reconcile', verdict };
       }
       if (verdict && (verdict.verdict !== 'pass' || verdict.accepted === false)) {
-        if (repairRound < this.maxRepairRounds && steps < maxSteps) {
+        const effectiveMaxRepairRounds =
+          !this._explicitMaxRepairRounds &&
+          (execution?.evidenceContract || execution?.requirePostEditVerification)
+            ? Math.max(this.maxRepairRounds, 2)
+            : this.maxRepairRounds;
+        if (repairRound < effectiveMaxRepairRounds && steps < maxSteps) {
           return {
             action: 'repair',
             verdict,
@@ -296,6 +312,7 @@ export class AgentLoop {
     const verificationReserve = normalizeBudgetLimit(budget.finalVerificationReserve) ?? 0;
     const verifierEvents = [];
     const argStrikes = new Map();
+    const reasoningTracker = new ExecutionReasoningTracker({ workspaceRoot });
 
     let steps = Number(initialStep || 0);
     let executedStepsThisTurn = 0;
@@ -304,6 +321,7 @@ export class AgentLoop {
     let finalStepAdvised = false;
     let repairedOnce = false;
     let repairRound = 0;
+    let monologueWarned = false;
     let finalAssistantText = '';
     let finalVerdict = null;
     let stopReason = 'completed';
@@ -661,6 +679,12 @@ export class AgentLoop {
             }
           }
 
+          const monologueTrigger = reasoningTracker.recordAssistantTurn({
+            text: stepResult.text,
+            toolCallCount: 0,
+            step: steps,
+          });
+
           verifierEvents.push({
             type: 'turn/end',
             data: { reason: { kind: stepResult.finishReason || 'completed' } },
@@ -681,18 +705,53 @@ export class AgentLoop {
             sessionId,
             turnId,
             workspaceRoot,
+            reasoningState: reasoningTracker.getState(),
             signal,
           });
 
           if (decision.action === 'continue_stop') {
             stopContinuedOnce = true;
+            if (monologueTrigger) {
+              if (monologueWarned) {
+                stopReason = 'thrashing_circuit_break';
+                break;
+              }
+              monologueWarned = true;
+              this.eventRouter.emitPersisted({
+                sessionId,
+                turnId,
+                type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
+                data: {
+                  step: steps,
+                  pattern: monologueTrigger.pattern,
+                  fingerprint: monologueTrigger.fingerprint ?? null,
+                  falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
+                },
+                audit: false,
+              });
+              messages.push({
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: `${decision.note}\n\n${reasoningTracker.buildDiagnosticSteeringMessage(monologueTrigger)}`,
+                  },
+                ],
+              });
+              continue;
+            }
             messages.push({ role: 'user', content: [{ type: 'text', text: decision.note }] });
             continue;
           }
           if (decision.action === 'repair') {
             repairedOnce = true;
             repairRound++;
+            reasoningTracker.recordRepairRound({ step: steps });
             finalVerdict = decision.verdict;
+            if (monologueTrigger && monologueWarned) {
+              stopReason = 'thrashing_circuit_break';
+              break;
+            }
             this.eventRouter.emitPersisted({
               sessionId,
               turnId,
@@ -702,7 +761,24 @@ export class AgentLoop {
                 reasons: decision.verdict.reasons,
               },
             });
-            messages.push({ role: 'user', content: [{ type: 'text', text: decision.note }] });
+            let noteText = decision.note;
+            if (monologueTrigger && !monologueWarned) {
+              monologueWarned = true;
+              this.eventRouter.emitPersisted({
+                sessionId,
+                turnId,
+                type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
+                data: {
+                  step: steps,
+                  pattern: monologueTrigger.pattern,
+                  fingerprint: monologueTrigger.fingerprint ?? null,
+                  falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
+                },
+                audit: false,
+              });
+              noteText = `${noteText}\n\n${reasoningTracker.buildDiagnosticSteeringMessage(monologueTrigger)}`;
+            }
+            messages.push({ role: 'user', content: [{ type: 'text', text: noteText }] });
             continue;
           }
           if (decision.action === 'reconcile') {
@@ -727,6 +803,11 @@ export class AgentLoop {
 
         // Tools dispatch phase
         hadToolCalls = true;
+        reasoningTracker.recordAssistantTurn({
+          text: stepResult.text,
+          toolCallCount: stepResult.toolCalls.length,
+          step: steps,
+        });
         sm.transition(TURN_PHASES.TOOLS, { step: steps, persist: profile?.persistTurn !== false });
         const executedBatch = await toolDispatcher.dispatchBatch({
           sessionId,
@@ -754,6 +835,7 @@ export class AgentLoop {
         leaseGuard?.();
 
         let detectedThrashing = false;
+        let batchTrigger = null;
         for (const item of executedBatch) {
           const { tc, isError, durationMs, receipt } = item;
           const hint = selectionRecoveryHint?.(item, getModelTools);
@@ -800,7 +882,23 @@ export class AgentLoop {
               audit: false,
             });
           }
-          if (tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending)) {
+          if (tm.thrashWarned && MUTATING_FILE_TOOLS.has(tc.name) && !isError) {
+            tm.recentCallSigs = [];
+          }
+          const tmRepeat = tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending);
+          const reasoningEvent = reasoningTracker.recordToolResult({
+            tc,
+            args: item.parsedArgs,
+            output,
+            isError,
+            pending: item.pending,
+            receipt,
+            step: steps,
+          });
+          if (reasoningEvent?.trigger) {
+            detectedThrashing = true;
+            batchTrigger = reasoningEvent.trigger;
+          } else if (tmRepeat) {
             detectedThrashing = true;
           }
         }
@@ -823,11 +921,17 @@ export class AgentLoop {
         if (detectedThrashing) {
           if (!tm.thrashWarned) {
             tm.thrashWarned = true;
+            const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(batchTrigger);
             this.eventRouter.emitPersisted({
               sessionId,
               turnId,
               type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
-              data: { step: steps },
+              data: {
+                step: steps,
+                pattern: batchTrigger?.pattern ?? 'exact_repeat',
+                fingerprint: batchTrigger?.fingerprint ?? null,
+                falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
+              },
               audit: false,
             });
             messages.push({
@@ -835,7 +939,7 @@ export class AgentLoop {
               content: [
                 {
                   type: 'text',
-                  text: '[系统防死循环提示] 检测到你连续多次执行相同的失败/重复工具调用。请停止重复相同参数，换一种思路排查，或直接向用户如实汇报当前进展与阻塞点。',
+                  text: steeringText,
                 },
               ],
             });
@@ -870,6 +974,7 @@ export class AgentLoop {
               sessionId,
               turnId,
               workspaceRoot,
+              reasoningState: reasoningTracker.getState(),
             }),
           );
           if (postLoopVerdict) {
@@ -902,6 +1007,11 @@ export class AgentLoop {
         persist: profile?.persistTurn !== false,
       });
 
+      const reasoningMetrics = reasoningTracker.getMetrics({
+        finalOutcomePassed: outcome.status === 'completed' && outcome.verdict?.accepted !== false,
+        stopReason,
+      });
+
       return {
         status: outcome.status,
         stopReason,
@@ -920,6 +1030,7 @@ export class AgentLoop {
         verdict: outcome.verdict,
         verifiedPass: outcome.verifiedPass,
         failureKind: outcome.failureKind,
+        reasoningMetrics,
         verifierEvents,
         phaseHistory: sm.history,
         deferredPhaseTransition: sm.deferredTerminalTransition ?? null,
@@ -935,6 +1046,10 @@ export class AgentLoop {
       };
       classified.steps = steps;
       classified.route = lastRoute;
+      classified.reasoningMetrics = reasoningTracker.getMetrics({
+        finalOutcomePassed: false,
+        stopReason: classified.code,
+      });
       // Fix D6: On LEASE_LOST (or if lease was already lost before error), exit cleanly without corrupting turn phase
       if (isLeaseLostError(classified) || !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
         throw isLeaseLostError(classified)
