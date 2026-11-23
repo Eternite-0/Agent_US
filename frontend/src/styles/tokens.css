@@ -70,12 +70,13 @@
   --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --text-chat: 14px;
   --text-chat-line: 22px;
-  --text-assistant: 15px;
-  --text-assistant-line: 1.68;
+  --text-assistant: 14px;
+  --text-assistant-line: 1.65;
   --text-meta: 12.5px;
   --text-meta-line: 17px;
   --text-small: 12px;
   --text-small-line: 16px;
+  --text-caption: 11px;
   --font-weight-body: 400;
   --font-weight-strong: 560;
 
@@ -84,15 +85,19 @@
   --rail-width: 48px;
   --sidebar-width: 248px;
   --thread-header-height: 44px;
-  --thread-content-max-width: 704px;
+  --thread-content-max-width: 720px;
   --thread-gutter: clamp(16px, 3.1cqi, 28px);
   --thread-turn-gap: 34px;
   --thread-block-gap: 13px;
   --thread-radius-detail: 5px;
+  --thread-prompt-surface: var(--bg-ghost-hover-soft);
   --thread-detail-surface: var(--bg-surface-secondary);
-  --activity-row-height: 28px;
+  --composer-border: color-mix(in srgb, var(--text-default) 18%, transparent);
+  --composer-border-active: color-mix(in srgb, var(--text-default) 43%, transparent);
+  --activity-row-height: 26px;
   --activity-icon-size: 14px;
-  --activity-inset: 25px;
+  --activity-gap: 7px;
+  --activity-inset: calc(var(--activity-icon-size) + var(--activity-gap) + 4px);
   --radius-control: 8px;
   --radius-composer: 10px;
   --radius-popover: 8px;
@@ -122,9 +127,9 @@
 
 /* Dark workspace and overlay colors */
 [data-theme="dark"] {
-  --bg-chrome: #202123;
+  --bg-chrome: #1f2022;
   --bg-surface: #191a1c;
-  --bg-surface-secondary: rgba(252, 252, 252, 0.055);
+  --bg-surface-secondary: rgba(252, 252, 252, 0.041);
   --bg-surface-elevated: #27292b;
   --bg-surface-elevated-secondary: rgba(252, 252, 252, 0.042);
   --bg-secondary-soft-alpha: rgba(252, 252, 252, 0.055);
@@ -138,7 +143,7 @@
 
   --text-default: #eceef0;
   --text-secondary: #b0b5ba;
-  --text-tertiary: #969da4;
+  --text-tertiary: #a0a6ac;
   --text-description: var(--text-secondary);
   --text-inverse: #111111;
 

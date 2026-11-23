@@ -137,6 +137,7 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
   const displayOutput = output ?? liveOutput;
   const isShell = kind === 'command' || kind === 'test';
   const outputLabel = output === undefined && liveOutput !== undefined ? '实时工具输出' : '工具输出';
+  const showHeader = !isShell || Boolean(meta);
   const summary = target.replace(/\s+/g, ' ');
   const useMono = isShell || ['read', 'edit', 'search'].includes(kind);
   return (
@@ -152,7 +153,7 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
       </summary>
       <div id={panelId} hidden={!open} className="codex-direct-tool-detail">
         <div className={command !== undefined || displayOutput ? 'codex-terminal-inset' : undefined}>
-          <div className="codex-command-header">{meta ? `${meta} · ${name}` : name}</div>
+          {showHeader && <div className="codex-command-header">{meta ? `${meta} · ${name}` : name}</div>}
           {command !== undefined && <div className="codex-activity-raw-line">
             {isShell && <span className="codex-activity-shell-prompt" aria-hidden="true">$</span>}
             <code>{command}</code>
@@ -166,14 +167,15 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
               : <code key={path}>{path}</code>)}
           </div>}
           {displayOutput && <pre className="codex-command-output codex-activity-output" aria-label={outputLabel} tabIndex={0}>{displayOutput}</pre>}
+          <div className="codex-command-footer" data-failed={status === 'failed' || undefined}>
+            {status === 'completed' && <IconCheck size={12} aria-hidden="true" />}
+            <ActivityStatusText status={status} />
+            {durationMs !== undefined && <span className="tabular-nums">· {fmtDuration(durationMs) || '0秒'}</span>}
+            {isShell && exitCode !== undefined && <span className="tabular-nums">· exit {exitCode}</span>}
+            {displayOutput && <ActivityCopyButton label="复制输出" text={displayOutput} onCopy={onCopy} />}
+          </div>
         </div>
         {error && error !== displayOutput && <div className="codex-event-error">{error}</div>}
-        <div className="codex-command-footer" data-failed={status === 'failed' || undefined}>
-          {status === 'completed' && <IconCheck size={12} aria-hidden="true" />}
-          <ActivityStatusText status={status} />
-          {isShell && exitCode !== undefined && <span className="tabular-nums">· exit {exitCode}</span>}
-          {displayOutput && <ActivityCopyButton label="复制输出" text={displayOutput} onCopy={onCopy} />}
-        </div>
       </div>
     </details>
   );

@@ -130,7 +130,7 @@ export async function startFixture(workspaceRoot, token) {
         return send(res, 200, { ok: true });
       }
       if (req.method === 'POST' && path === '/__e2e/advance') {
-        const { id = 'transcript', action, text, name = 'bash', callId = 'fixture-tool', reason } = await body(req);
+        const { id = 'transcript', action, text, name = 'bash', callId = 'fixture-tool', reason, args, change } = await body(req);
         const session = sessions.get(id);
         const turn = session?.turns[0];
         if (!turn || turn.state !== 'running') return send(res, 409, { error: 'No running fixture turn' });
@@ -139,13 +139,14 @@ export async function startFixture(workspaceRoot, token) {
           case 'assistant/delta': case 'reasoning/delta':
             event(session, action, { turnId, delta: text }, true); break;
           case 'tool/call': {
-            const args = { command: 'printf "fixture output\\n"' };
-            message(session, turnId, { role: 'assistant', content: '', toolCalls: [{ id: callId, name, arguments: args }] });
-            event(session, action, { turnId, callId, name, arguments: args }); break;
+            const toolArgs = args ?? { command: 'printf "fixture output\\n"' };
+            message(session, turnId, { role: 'assistant', content: '', toolCalls: [{ id: callId, name, arguments: toolArgs }] });
+            event(session, action, { turnId, callId, name, arguments: toolArgs }); break;
           }
           case 'tool/output':
             event(session, action, { turnId, callId, name, chunk: text }, true); break;
           case 'tool/result':
+            if (change) event(session, 'file/changed', { turnId, callId, ...change });
             message(session, turnId, { role: 'tool', content: text, toolCallId: callId, toolName: name });
             event(session, action, { turnId, callId, name, output: text, isError: false }); break;
           case 'burst':

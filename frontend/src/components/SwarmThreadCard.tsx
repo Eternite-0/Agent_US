@@ -4,21 +4,22 @@ import { summarizeSwarmRun } from '../utils/swarmCommand';
 
 export function SwarmThreadCard({ run, onOpen }: { run?: SwarmRunRecord; onOpen?: () => void }) {
   const progress = run && summarizeSwarmRun(run);
+  const status = progress?.label ?? '等待同步';
+  const nodes = progress && progress.total > 0 ? ` · ${progress.completed}/${progress.total} 个节点完成` : '';
   const heading = (
     <>
-      <span className="swarm-thread-icon"><IconAgentTeam size={17} aria-hidden="true" /></span>
-      <span className="swarm-thread-copy">
+      <IconAgentTeam size={14} aria-hidden="true" />
+      <span className="codex-direct-activity-label">
         <span className="swarm-thread-title">Swarm 协作</span>
-        <span className="swarm-thread-status" data-tone={progress?.tone}>
-          <i aria-hidden="true" />{progress?.label ?? '等待同步'}
-          {progress && progress.total > 0 && <span> · {progress.completed}/{progress.total} 个节点完成</span>}
-        </span>
-        {progress && progress.total > 0 && <progress value={progress.completed} max={progress.total} aria-label="Swarm 节点完成进度" />}
+        <span className="swarm-thread-status tabular-nums" data-tone={progress?.tone}> · {status}{nodes}</span>
       </span>
-      {onOpen && <IconChevronRight size={15} aria-hidden="true" className="swarm-thread-chevron" />}
+      {onOpen && <IconChevronRight size={13} aria-hidden="true" className="codex-direct-chevron" />}
     </>
   );
+  const className = 'swarm-thread-card codex-direct-activity-row';
+  const running = progress?.tone === 'active';
   return onOpen
-    ? <button type="button" className="swarm-thread-card" onClick={onOpen} title="查看 Swarm 计划和节点">{heading}</button>
-    : <div className="swarm-thread-card">{heading}</div>;
+    ? <button type="button" className={className} data-running={running} onClick={onOpen}
+        title={`查看 Swarm 计划和节点 · ${status}${nodes}`}>{heading}</button>
+    : <div className={className} data-running={running}>{heading}</div>;
 }

@@ -150,6 +150,11 @@ test('Direct prose and five operations with short and long terminal output', asy
       const composer = page.locator('.codex-composer-card');
       await expect(composer).toHaveCSS('box-shadow', 'none');
       await expect(composer).toHaveCSS('border-top-left-radius', '10px');
+      await expect(short.getByRole('button', { name: '复制命令' })).toBeVisible();
+      await expect(short.getByRole('button', { name: '复制输出' })).toBeVisible();
+      await expect(short.getByText('工具输出', { exact: true })).toHaveCount(0);
+      const view = await transcript(page).boundingBox();
+      expect(view.y + view.height).toBeLessThanOrEqual((await composer.boundingBox()).y);
     }
     await capture(page, info, 'terminal');
     await short.locator(':scope > summary').click();
@@ -175,7 +180,11 @@ test('home and Markdown hierarchy in light and dark themes; file diff in Inspect
     await expect(transcript(page).getByRole('img', { name: 'Sample output chart' })).toBeVisible();
     await capture(page, info, 'markdown');
     const files = transcript(page).locator('.codex-file-card');
-    if (!process.env.E2E_FRONTEND_DIR) await expectFlatSurface(files, 0);
+    if (!process.env.E2E_FRONTEND_DIR) {
+      await expectFlatSurface(files, 0);
+      await expect(transcript(page).locator('.codex-code-pre')).toBeVisible();
+      expect((await files.boundingBox()).y).toBeGreaterThan((await transcript(page).getByText('Review the patch in the workspace before delivery.').boundingBox()).y);
+    }
     await files.locator('.codex-file-row-trigger').click();
     await expect(files.locator('.codex-inline-diff-body')).toBeVisible();
     await capture(page, info, 'file-inline-diff');
@@ -197,6 +206,11 @@ test('approval and Swarm execution with Reviewer evidence', async ({ page }, inf
     await navigate(page, '/t/swarm-visual');
     const card = page.locator('.swarm-thread-card');
     await expect(card).toBeVisible();
+    if (!process.env.E2E_FRONTEND_DIR) {
+      await expectFlatSurface(card, 0);
+      await expect(card).toContainText('2/2 个节点完成');
+      expect((await card.boundingBox()).height).toBeLessThanOrEqual(30);
+    }
     await capture(page, info, 'swarm');
     await card.click();
     const result = page.locator('details.autonomous-verdict');

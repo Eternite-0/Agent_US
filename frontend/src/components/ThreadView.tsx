@@ -1,5 +1,5 @@
 import { SwarmThreadCard } from './SwarmThreadCard';
-import { groupDirectMessages, type DirectLiveStream, type DirectLiveToolOutput, type DirectTimelineBlock } from '../utils/directMessages';
+import { groupDirectMessages, isDirectTurnEnd, type DirectLiveStream, type DirectLiveToolOutput, type DirectTimelineBlock } from '../utils/directMessages';
 import { ActivityDisclosureScope, DirectActivityGroup, DirectTurnProcess } from './DirectActivity';
 import type { CommandAvailability, MentionExtension, SlashCommand } from './slashCommands';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -430,6 +430,18 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       Object.assign(artFiles, a.files ?? {});
     }
     const computedFiles = aggregateFileChanges(changes, artFiles, task.files);
+    // File writes arrive before tests, approvals, and the final reply. Keep
+    // them available in the work log and Inspector without showing delivery.
+    const latestTurnEvent = isDirectSession ? events.findLast((event) =>
+      typeof event.payload?.turnId === 'string' && (event.type === 'turn/started' || isDirectTurnEnd(event.type)),
+    ) : undefined;
+    const swarmStillWorking = b.swarmRuns?.some((run) =>
+      !['completed', 'failed', 'cancelled', 'parked', 'interrupted'].includes(run.status),
+    );
+    const showFileSummary = computedFiles.length > 0 && task.status === 'completed' && !swarmStillWorking
+      && !approvals.some((approval) => approval.status === 'pending')
+      && (!latestTurnEvent || (latestTurnEvent.type === 'turn/completed'
+        && (!task.code || latestTurnEvent.payload?.turnId === task.code)));
 
     // Published image artifacts (outside internal inputs/ handoffs) for inline closing preview
     const artifactImages: PreviewImageItem[] = [];
@@ -500,6 +512,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       artFiles,
       artifactImages,
       computedFiles,
+      showFileSummary,
       liveStatusText,
       totalTokens,
       totalUSD,
@@ -579,7 +592,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       if (tm.assistantBlocks.some((blk) => blk.text.toLowerCase().includes(q))) {
         hits.push({ anchorKey: `${tid}:assistant`, snippet: '回复正文匹配' });
       }
-      if (tm.computedFiles.some((f) => f.path.toLowerCase().includes(q))) {
+      if (tm.showFileSummary && tm.computedFiles.some((f) => f.path.toLowerCase().includes(q))) {
         hits.push({ anchorKey: `${tid}:files`, snippet: '文件改动匹配' });
       }
     }
@@ -1228,7 +1241,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
 
           <ActivityDisclosureScope>
           {turnModels.map((tm) => {
-            const { bundle, isLive, visibleEvidence, visibleApprovals, visibleEvents, assistantBlocks, computedFiles, isDirectSession, directExchanges } =
+            const { bundle, isLive, visibleEvidence, visibleApprovals, visibleEvents, assistantBlocks, computedFiles, showFileSummary, isDirectSession, directExchanges } =
               tm;
             const { task, assignments, workers, sessions, histories, swarmRuns = [] } = bundle;
             const tid = task.id;
@@ -1376,7 +1389,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       </div>
                     )}
 
-                    {computedFiles.length > 0 && (
+                    {showFileSummary && (
                       <div data-anchor-key={filesKey}>
                         <FileChangeCard
                           files={computedFiles}
@@ -1793,8 +1806,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                     </div>
                   )}
 
-                  {/* 5. File Change / Diff Resource Card (1:1 with live/conversation.png) */}
-                  {computedFiles.length > 0 && (
+                  {/* 5. Delivered file changes */}
+                  {showFileSummary && (
                     <div
                       className={flashedKey === filesKey ? 'codex-turn-flash' : undefined}
                       data-anchor-key={filesKey}

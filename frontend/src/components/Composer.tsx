@@ -692,6 +692,7 @@ ${draftInjection.text}`
           }
           disabled={initGitBusy}
           title={branchTitle}
+          aria-label={initGitBusy ? '正在创建 Git 存储库' : '创建 Git 存储库'}
           onClick={() => void handleInitGit()}
         >
           <IconBranch size={14} style={{ flex: 'none' }} />
@@ -712,6 +713,7 @@ ${draftInjection.text}`
           data-dirty={isDirty ? 'true' : undefined}
           data-open={popover === 'branch' ? 'true' : undefined}
           title={branchTitle}
+          aria-label={branchTitle}
           aria-expanded={popover === 'branch'}
           aria-haspopup="dialog"
           onClick={() => openBranchPopover()}

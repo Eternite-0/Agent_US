@@ -237,8 +237,23 @@ test('glue: DirectAgent catch path persists reasoningMetrics to turn/failed even
     rmDirSafe(workDir);
   });
 
-  // Exercise createDirectRuntimeAdapter when AgentLoop throws STEP_BUDGET_EXHAUSTED (catch path)
-  const runtimeFactory = createDirectRuntimeAdapter(direct, { model: 'glue-model' });
+  // This test exercises a write_file-only step-budget failure, not shell isolation.
+  // Inject a test sandbox so it can reach the catch path without a Docker dependency.
+  let sandboxResolveCalls = 0;
+  let sandboxRunCalls = 0;
+  const rejectShellTestSandbox = {
+    resolveBackend() {
+      sandboxResolveCalls += 1;
+    },
+    async run() {
+      sandboxRunCalls += 1;
+      throw new Error('The glue test sandbox does not execute shell commands');
+    },
+  };
+  const runtimeFactory = createDirectRuntimeAdapter(direct, {
+    model: 'glue-model',
+    sandbox: rejectShellTestSandbox,
+  });
   const handle = await runtimeFactory({
     task: {
       id: 'glue-budget-task',
@@ -257,6 +272,8 @@ test('glue: DirectAgent catch path persists reasoningMetrics to turn/failed even
   }
   assert.ok(caughtErr, 'expected maxSteps=1 turn to throw STEP_BUDGET_EXHAUSTED');
   assert.equal(caughtErr.code, 'STEP_BUDGET_EXHAUSTED');
+  assert.ok(sandboxResolveCalls > 0, 'the injected test sandbox must be resolved');
+  assert.equal(sandboxRunCalls, 0, 'the write_file-only turn must not invoke shell execution');
   assert.ok(caughtErr.telemetry?.reasoningMetrics, 'catch-path turn/failed event must carry reasoningMetrics');
   assert.deepEqual(caughtErr.telemetry.reasoningMetrics.filesMutated, ['src/a.js']);
 

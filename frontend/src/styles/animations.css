@@ -86,7 +86,7 @@
 .codex-shimmer-text { color: var(--text-secondary); animation: codex-activity-pulse 1.6s ease-in-out infinite; }
 
 @keyframes codex-detail-enter {
-  from { opacity: .55; }
+  from { opacity: .8; }
   to { opacity: 1; }
 }
 

@@ -77,6 +77,44 @@ test('A — nested tool output stays readable across the live-to-durable handoff
   await screenshot(page, 'A-persisted-completion');
 });
 
+for (const reason of ['completed', 'parked']) {
+  test(`file edit summary waits for delivery (${reason})`, async ({ page, request }) => {
+    test.skip(baseline, 'Delivery timing is a new regression assertion');
+    const prompt = 'Edit the config and run the checks before delivering';
+    const path = 'src/config.ts';
+    await begin(page, request, prompt);
+    const exchange = turn(page, prompt);
+    const summary = transcript(page).locator('.codex-file-card');
+    const edit = { name: 'edit_file', callId: 'edit-config' };
+    await advance(request, 'tool/call', { ...edit, args: { path } });
+    await advance(request, 'tool/result', {
+      ...edit, text: `Edited ${path}`, change: { path, before: 'export const version = 1;\n', after: 'export const version = 2;\n' },
+    });
+    // The completed tool row confirms the bundle that includes the edit was rendered.
+    const row = exchange.locator('details.codex-direct-tool[data-status="completed"]').filter({ hasText: path });
+    await expect(row).toHaveCount(1);
+    await expect(summary).toHaveCount(0);
+    await advance(request, 'tool/call', { callId: 'test-config', args: { command: 'npm test' } });
+    await advance(request, 'tool/result', { callId: 'test-config', text: 'Checks passed' });
+    await advance(request, 'assistant/delta', { text: 'The configuration is updated and the checks passed.' });
+    await expect(exchange.getByText('The configuration is updated and the checks passed.', { exact: true })).toBeVisible();
+    await expect(summary).toHaveCount(0);
+
+    await advance(request, 'finish', { text: finalText, reason });
+    const status = exchange.locator('.codex-direct-status');
+    await expect(status).toHaveAttribute('data-status', reason === 'completed' ? 'completed' : 'interrupted');
+    if (reason === 'completed') {
+      await expect(summary).toHaveCount(1);
+      await expect(summary.getByText(path, { exact: true })).toBeVisible();
+      const reply = exchange.getByText(finalText, { exact: true });
+      await expect(reply).toBeVisible();
+      expect((await summary.boundingBox()).y).toBeGreaterThan((await reply.boundingBox()).y);
+    } else {
+      await expect(summary).toHaveCount(0);
+    }
+  });
+}
+
 async function resetHistory(request, count, historyTool = false) {
   expect((await request.post('/__e2e/reset', { data: { count, historyTool } })).ok()).toBe(true);
 }
