@@ -190,6 +190,13 @@ test('home and Markdown hierarchy in light and dark themes; file diff in Inspect
     await capture(page, info, 'file-inline-diff');
     await files.getByRole('button', { name: '在右侧分屏打开 src/config.ts', exact: true }).click();
     await expect(page.locator('.codex-drawer[data-open="true"]')).toBeVisible();
+    if (!process.env.E2E_FRONTEND_DIR) {
+      const editor = page.locator('.codex-ide-editor');
+      await expect(editor.getByText('export const version = 2;', { exact: true })).toBeVisible();
+      const tree = page.locator('.codex-ide-tree');
+      await expect(tree.getByRole('textbox', { name: '筛选文件…' })).toBeVisible();
+      expect((await editor.boundingBox()).width).toBeGreaterThan((await tree.boundingBox()).width * 1.5);
+    }
     await capture(page, info, 'file-diff');
     await page.getByRole('button', { name: '关闭右侧面板', exact: true }).click();
     await navigate(page, '/');

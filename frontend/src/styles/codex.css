@@ -2236,7 +2236,7 @@ button:disabled {
 
 .codex-diff-line {
   display: grid;
-  grid-template-columns: 36px 36px 18px minmax(0, 1fr);
+  grid-template-columns: 26px 26px 16px minmax(0, 1fr);
   min-width: 100%;
   width: max-content;
   padding: 0 12px 0 4px;
@@ -3641,8 +3641,8 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 0 12px;
+  gap: 6px;
+  padding: 0 8px;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-surface);
 }
@@ -3673,7 +3673,8 @@ button:disabled {
   font-size: 12.5px;
   line-height: 20px;
   background: var(--bg-surface);
-  padding: 10px 0;
+  padding: 7px 0;
+  overscroll-behavior-inline: contain;
 }
 
 .codex-code-line {
@@ -3718,7 +3719,7 @@ button:disabled {
 [data-theme="light"] .tok-fn { color: #0369a1; }
 
 .codex-ide-tree {
-  width: 216px;
+  width: clamp(110px, 31%, 216px);
   flex: none;
   border-left: 1px solid var(--border-subtle);
   background: var(--bg-surface);
