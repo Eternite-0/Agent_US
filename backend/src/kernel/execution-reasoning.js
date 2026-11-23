@@ -411,11 +411,16 @@ export class ExecutionReasoningTracker {
     this._nonReproFailureCount = 0;
     this._policyBlockCount = 0;
     this._consecutivePolicyBlocks = 0;
+    this._budgetReserveAdvised = false;
     this.ineffectiveActionCount = 0;
   }
 
   get hasUnverifiedMutationsAfterLastPass() {
     return this._lastMutationSeq > this._lastPassingVerificationSeq;
+  }
+
+  markBudgetReserveAdvised() {
+    this._budgetReserveAdvised = true;
   }
 
   recordRepairRound({ step = 0 } = {}) {
@@ -912,6 +917,7 @@ export class ExecutionReasoningTracker {
       hasUnverifiedMutationsAfterLastPass: this.hasUnverifiedMutationsAfterLastPass,
       ineffectiveActionCount: this.ineffectiveActionCount,
       policyBlockCount: this._policyBlockCount,
+      budgetReserveAdvised: this._budgetReserveAdvised,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],
       errorFingerprints: this.errorFingerprints.map((fp) => ({ ...fp })),
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
@@ -970,6 +976,7 @@ export class ExecutionReasoningTracker {
       hasUnverifiedMutationsAfterLastPass: this.hasUnverifiedMutationsAfterLastPass,
       ineffectiveActionCount: this.ineffectiveActionCount,
       policyBlockCount: this._policyBlockCount,
+      budgetReserveAdvised: this._budgetReserveAdvised,
       firstFixSucceeded,
       selfCorrectionRecovered,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],

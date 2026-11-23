@@ -12,6 +12,7 @@ import { MultiStageCompactor } from '../src/context/compaction.js';
 import { AgentRuntimeKernel } from '../src/kernel/runtime.js';
 import { ExecutionReasoningTracker } from '../src/kernel/execution-reasoning.js';
 import { buildStaticSystemPrompt } from '../src/agent-context.js';
+import { pairClosed } from '../src/context.js';
 import { ExperienceMemoryService } from '../src/memory/index.js';
 import {
   EvaluationService,
@@ -570,4 +571,127 @@ test('glue: direct.cancelTurn + waitForTurnTerminal drains worker and backfills 
   assert.ok(parsed.reasoningMetrics, 'waitForTurnTerminal must drain worker backfill of turn/cancelled reasoningMetrics');
   assert.deepEqual(parsed.reasoningMetrics.filesMutated, ['src/cancel-backfill.js']);
   assert.equal(parsed.reasoningMetrics.selfCorrectionRecovered, false);
+});
+
+test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers from reserveInference TOKEN_BUDGET via emergency Stage-1 budget_prune', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-r4-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-r4-work-'));
+  const alphaTag = (n) => [12, 8, 4, 0].map((s) => String.fromCharCode(97 + ((n >> s) & 15))).join('');
+  const bigLines = Array.from(
+    { length: 240 },
+    (_, i) => `export const mod_${alphaTag(i)} = "segment_${alphaTag(i)}_token_payload_abcdef";`,
+  ).join('\n');
+  writeFileSync(join(workDir, 'a.js'), `${bigLines}\n`, 'utf8');
+  writeFileSync(join(workDir, 'b.js'), `${bigLines}\n`, 'utf8');
+  writeFileSync(join(workDir, 'c.js'), `${bigLines}\n`, 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.setDefaultModel('glue-r4-model');
+
+  let stepCall = 0;
+  let sawWrapUp = false;
+  let prunedStepMessages = null;
+  let firstSystemText = null;
+  const adapter = new ScriptedAdapter(async function* (opts) {
+    stepCall += 1;
+    const sysText = opts.messages?.[0]?.content?.[0]?.text ?? '';
+    if (firstSystemText === null) firstSystemText = sysText;
+    assert.equal(sysText, firstSystemText, 'static system prompt must stay byte-identical across Round 4 budget prune');
+
+    const userText = opts.messages
+      .filter((m) => m.role === 'user')
+      .flatMap((m) => m.content ?? [])
+      .map((b) => b.text ?? '')
+      .join('\n');
+
+    if (stepCall === 1) {
+      yield {
+        type: 'block-end',
+        block: { type: 'tool-call', id: 'tc-g4-1', name: 'read_file', arguments: JSON.stringify({ path: 'a.js' }) },
+      };
+      yield { type: 'usage', usage: { inputTokens: 45_000, outputTokens: 200 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    if (stepCall === 2) {
+      yield {
+        type: 'block-end',
+        block: { type: 'tool-call', id: 'tc-g4-2', name: 'read_file', arguments: JSON.stringify({ path: 'b.js' }) },
+      };
+      yield { type: 'usage', usage: { inputTokens: 45_000, outputTokens: 200 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    if (stepCall === 3) {
+      yield {
+        type: 'block-end',
+        block: { type: 'tool-call', id: 'tc-g4-3', name: 'read_file', arguments: JSON.stringify({ path: 'c.js' }) },
+      };
+      // Remaining after step 3: 160k - (45.2k + 45.2k + 30.2k) = 39.4k <= 41.6k (26%)
+      yield { type: 'usage', usage: { inputTokens: 29_900, outputTokens: 300 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    if (stepCall === 4) {
+      assert.match(userText, /\[预算收尾提醒\]/);
+      assert.match(userText, /update_plan/);
+      sawWrapUp = true;
+      yield {
+        type: 'block-end',
+        block: { type: 'tool-call', id: 'tc-g4-4', name: 'read_file', arguments: JSON.stringify({ path: 'a.js' }) },
+      };
+      // Remaining after step 4: ~12,400 (< ~15k accumulated across 3 distinct files + catalog/system -> reserveInference TOKEN_BUDGET -> budget_prune!)
+      yield { type: 'usage', usage: { inputTokens: 26_700, outputTokens: 300 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+
+    prunedStepMessages = opts.messages;
+    yield { type: 'text-delta', text: 'Completed within DirectAgent sessionBudget via Stage-1 budget_prune.' };
+    yield { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 100 } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  });
+
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+
+  t.after(async () => {
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const session = direct.createSession({
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    budget: { maxSteps: 10, maxTotalTokens: 160_000, maxOutputTokens: 4096 },
+  });
+  const { turn } = direct.startTurn(session.id, {
+    input: 'Read a.js and b.js then finish cleanly',
+    model: 'glue-r4-model',
+    maxSteps: 10,
+  });
+
+  const terminal = await direct.waitForTurnTerminal(turn.id, { timeoutMs: 8000 });
+  assert.equal(terminal.state, 'completed');
+  assert.equal(sawWrapUp, true);
+  assert.ok(prunedStepMessages && pairClosed(prunedStepMessages, 1, prunedStepMessages.length - 1));
+
+  const compactEvs = store.db
+    .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='context/compacted'")
+    .all(turn.id)
+    .map((r) => JSON.parse(r.data));
+  assert.ok(compactEvs.some((d) => d.stage === 'budget_prune'), 'DirectAgent budgetLedger reserveInference failure must recover via budget_prune');
+
+  const doneEv = store.db
+    .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed' ORDER BY seq DESC LIMIT 1")
+    .get(turn.id);
+  const doneData = JSON.parse(doneEv.data);
+  assert.equal(doneData.reasoningMetrics?.budgetReserveAdvised, true);
 });

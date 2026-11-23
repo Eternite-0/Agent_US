@@ -636,7 +636,8 @@ export async function compactTwoStage(
   }
 
   // Deterministic fallback if Stage 2 wasn't available or failed.
-  const fallback = compact(stage1Opts, Math.max(1800, trigger * 3.5));
+  const msgTriggerTokens = Math.max(512, trigger - initial.toolSchemaTokens);
+  const fallback = compact(stage1Opts, Math.max(1800, msgTriggerTokens * 3.5));
   return {
     options: fallback,
     stage: 'prune-fallback',

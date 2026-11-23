@@ -1,6 +1,6 @@
 import { sha256Hex } from '../integrity.js';
 import { computeArgsDigest } from '../tools/dispatcher.js';
-import { excerpt } from '../context.js';
+import { compactTwoStage, excerpt } from '../context.js';
 import { verifyTurn, buildRepairNote } from '../verifier.js';
 import { BudgetError, RecoveryError, classifyError } from './errors.js';
 import { RUNTIME_EVENTS } from './events.js';
@@ -396,7 +396,7 @@ export class AgentLoop {
           });
         }
         const tokenReserveThreshold =
-          maxTotalTokens !== null ? Math.max(24000, Math.floor(maxTotalTokens * 0.16)) : null;
+          maxTotalTokens !== null ? Math.max(38000, Math.floor(maxTotalTokens * 0.26)) : null;
         const remainingTokens =
           maxTotalTokens !== null ? maxTotalTokens - (tm.totalIn + tm.totalOut) : null;
         const remainingDurationMs = deadlineAt !== null ? deadlineAt - Date.now() : null;
@@ -408,10 +408,11 @@ export class AgentLoop {
             (remainingDurationMs !== null && remainingDurationMs <= 35000))
         ) {
           budgetReserveAdvised = true;
+          reasoningTracker.markBudgetReserveAdvised();
           const hasUnverifiedMutations = reasoningTracker.hasUnverifiedMutationsAfterLastPass;
           const budgetWrapUpText = execution?.evidenceContract
-            ? `[预算收尾提醒] 当前预算余量已低于安全阈值（剩余约 ${remainingTokens ?? '未知'} tokens / ${remainingDurationMs !== null ? `${Math.max(0, Math.round(remainingDurationMs / 1000))}s` : '无时间限制'}）。请立即停止可选的文件探索、额外 bash 检查或辅助脚本，${hasUnverifiedMutations ? '仅运行一次必需测试以验证已修改文件后' : '勿再执行额外工具调用，'}立即输出简洁总结与完整的 Evidence Manifest v1.0.0 JSON。`
-            : `[预算收尾提醒] 当前 Token 或时间预算余量已低于安全阈值。请停止可选的文件探索与额外 bash 检查，${hasUnverifiedMutations ? '仅在必要时运行一次关键验证后' : ''}立即输出简洁的最终交付总结，切勿耗尽预算。`;
+            ? `[预算收尾提醒] 当前预算余量已低于安全阈值（剩余约 ${remainingTokens ?? '未知'} tokens / ${remainingDurationMs !== null ? `${Math.max(0, Math.round(remainingDurationMs / 1000))}s` : '无时间限制'}）。请立即停止探索性读取（read_file/grep/glob），严禁调用额外的 update_plan、辅助探测命令或未授权脚本，${hasUnverifiedMutations ? '仅运行一次必需测试验证已修改文件后' : '切勿再执行多余 bash 或工具调用，'}立即输出简洁总结与完整的 Evidence Manifest v1.0.0 JSON。`
+            : `[预算收尾提醒] 当前 Token 或时间预算余量已低于安全阈值。请立即停止探索性读取，严禁调用额外的 update_plan、额外 bash 探测或未授权辅助脚本，${hasUnverifiedMutations ? '仅在必要时运行一次关键验证后' : ''}立即输出简洁的最终交付总结，切勿耗尽预算。`;
           messages.push({
             role: 'user',
             content: [
@@ -498,36 +499,102 @@ export class AgentLoop {
         }
 
         // Pre-inference budget admission, atomic reservation & controllable maxOutputTokens clamping
-        const estimatedInputTokens = estimateRequestInputTokens(requestOptions);
+        let estimatedInputTokens = estimateRequestInputTokens(requestOptions);
         const nodeBudgetCaps = {
           maxSteps: explicitMaxSteps,
           maxTokens: maxTotalTokens,
           maxOutputTokens: explicitMaxOutput,
         };
-        let activeReservation = null;
-        if (budgetLedger && budgetContext?.treeId) {
-          activeReservation = budgetLedger.reserveInference({
-            treeId: budgetContext.treeId,
-            scope: budgetContext.scope || BUDGET_SCOPES.NODE_EXECUTION,
-            nodeId: budgetContext.nodeId || null,
-            nodeKey: budgetContext.nodeKey || null,
+        const tryEmergencyBudgetPrune = async (budgetRemaining) => {
+          if (!(budgetRemaining > 2000 && estimatedInputTokens >= budgetRemaining)) {
+            return false;
+          }
+          let emergency = null;
+          try {
+            emergency = await compactTwoStage(requestOptions, {
+              contextWindow: Math.max(4096, Math.floor(budgetRemaining * 0.85)),
+              reserveTokens: 512,
+              keepRecentTokens: Math.max(1024, Math.floor(budgetRemaining * 0.45)),
+              summarize: null,
+            });
+          } catch {
+            return false;
+          }
+          if (!emergency?.stage || emergency.stage === 'none') {
+            return false;
+          }
+          const nextOpts = emergency.options;
+          const nextEstimated = estimateRequestInputTokens(nextOpts);
+          if (nextEstimated >= estimatedInputTokens) {
+            return false;
+          }
+          requestOptions = nextOpts;
+          if (Array.isArray(requestOptions?.messages)) {
+            messages = [...requestOptions.messages];
+            requestOptions = { ...requestOptions, messages };
+          }
+          estimatedInputTokens = nextEstimated;
+          this.eventRouter.emitPersisted({
             sessionId,
             turnId,
-            attempt: budgetContext.attempt ?? 1,
-            estimatedInputTokens,
-            requestedMaxOutputTokens: requestOptions.maxTokens ?? baseMaxOutputTokens,
-            nodeBudget: nodeBudgetCaps,
-            nodeUsedSteps: executedStepsThisTurn,
-            nodeUsedTokens: tm.totalIn + tm.totalOut,
-            defaultMaxOutputTokens: baseMaxOutputTokens,
-            leaseGuard,
+            type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
+            data: {
+              stage: 'budget_prune',
+              step: steps,
+              tokens: emergency.tokens ?? estimatedInputTokens,
+            },
+            audit: false,
           });
+          return true;
+        };
+
+        let activeReservation = null;
+        if (budgetLedger && budgetContext?.treeId) {
+          const makeReservation = () =>
+            budgetLedger.reserveInference({
+              treeId: budgetContext.treeId,
+              scope: budgetContext.scope || BUDGET_SCOPES.NODE_EXECUTION,
+              nodeId: budgetContext.nodeId || null,
+              nodeKey: budgetContext.nodeKey || null,
+              sessionId,
+              turnId,
+              attempt: budgetContext.attempt ?? 1,
+              estimatedInputTokens,
+              requestedMaxOutputTokens: requestOptions.maxTokens ?? baseMaxOutputTokens,
+              nodeBudget: nodeBudgetCaps,
+              nodeUsedSteps: executedStepsThisTurn,
+              nodeUsedTokens: tm.totalIn + tm.totalOut,
+              defaultMaxOutputTokens: baseMaxOutputTokens,
+              leaseGuard,
+            });
+          try {
+            activeReservation = makeReservation();
+          } catch (reserveErr) {
+            if (reserveErr?.code === 'TOKEN_BUDGET') {
+              const availList = [
+                reserveErr?.detail?.availableTokens,
+                reserveErr?.detail?.nodeAvailable,
+              ].filter((v) => v != null && Number.isFinite(Number(v)));
+              const avail = availList.length > 0 ? Math.min(...availList.map(Number)) : 0;
+              const pruned = await tryEmergencyBudgetPrune(avail);
+              if (pruned && estimatedInputTokens < avail) {
+                activeReservation = makeReservation();
+              } else {
+                throw reserveErr;
+              }
+            } else {
+              throw reserveErr;
+            }
+          }
           requestOptions = {
             ...requestOptions,
             maxTokens: activeReservation.constrainedMaxOutputTokens,
           };
         } else if (maxTotalTokens !== null) {
           const localRemaining = Math.max(0, maxTotalTokens - (tm.totalIn + tm.totalOut));
+          if (localRemaining > 2000 && estimatedInputTokens >= localRemaining) {
+            await tryEmergencyBudgetPrune(localRemaining);
+          }
           if (localRemaining <= 0 || estimatedInputTokens >= localRemaining) {
             throw new BudgetError('TOKEN_BUDGET', {
               message: `预估输入 Token (${estimatedInputTokens}) 超出剩余 Token 预算 (${localRemaining})`,

@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmDirSafe } from '../fixtures.js';
 import { Store } from '../../src/store.js';
+import { pairClosed } from '../../src/context.js';
+import { BudgetError } from '../../src/kernel/errors.js';
 import { AgentRuntimeKernel } from '../../src/kernel/runtime.js';
 import { DecisionEngine } from '../../src/kernel/agent-loop.js';
 import {
@@ -1119,4 +1121,165 @@ test('AgentLoop steers varied POLICY_BLOCK_LOOP without fatal break, injects tok
     },
   );
   assert.match(fallbackNote, /Keep any work you have already verified/);
+});
+
+test('AgentLoop triggers early ~26%/38k budget wrap-up with telemetry, saves near-limit turn via zero-LLM Stage-1 budget_prune preserving pairClosed, and throws on genuine exhaustion', async (t) => {
+  const { workDir, store } = createTempEnv(t);
+  const alphaTag = (n) => [12, 8, 4, 0].map((s) => String.fromCharCode(97 + ((n >> s) & 15))).join('');
+  const largeSource = Array.from(
+    { length: 240 },
+    (_, i) => `export const entry_${alphaTag(i)} = "payload_${alphaTag(i)}_data_segment_abcdefghij";`,
+  ).join('\n');
+  writeFileSync(join(workDir, 'large.js'), `${largeSource}\n`, 'utf8');
+  writeFileSync(join(workDir, 'side.js'), `${largeSource}\n`, 'utf8');
+
+  // Direct tracker unit check for markBudgetReserveAdvised + getState/getMetrics exposure
+  const tracker = new ExecutionReasoningTracker({ workspaceRoot: workDir });
+  assert.equal(tracker.getState().budgetReserveAdvised, false);
+  assert.equal(tracker.getMetrics().budgetReserveAdvised, false);
+  tracker.markBudgetReserveAdvised();
+  assert.equal(tracker.getState().budgetReserveAdvised, true);
+  assert.equal(tracker.getMetrics().budgetReserveAdvised, true);
+
+  // 1. Early ~26%/38k wrap-up warning + emergency Stage-1 budget_prune saves turn from spurious TOKEN_BUDGET
+  const staticSysPrompt = 'STATIC_SYS_PROMPT_ROUND4';
+  let stepCall = 0;
+  let sawEarlyReserve = false;
+  let observedMaxTokensAtPrunedStep = null;
+  let observedMessagesAtPrunedStep = null;
+  const maxTokens = 160_000;
+
+  const kernel = new AgentRuntimeKernel({
+    store,
+    adapter: {
+      async *stream({ messages, maxTokens: stepMaxOut }) {
+        stepCall += 1;
+        assert.equal(messages[0]?.content?.[0]?.text, staticSysPrompt);
+        const userText = messages
+          .filter((m) => m.role === 'user')
+          .flatMap((m) => m.content ?? [])
+          .map((b) => b.text ?? '')
+          .join('\n');
+
+        if (stepCall === 1) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-r4-1', name: 'read_file', arguments: JSON.stringify({ path: 'large.js' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 40_000, outputTokens: 200 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 2) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-r4-2', name: 'read_file', arguments: JSON.stringify({ path: 'side.js' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 40_000, outputTokens: 200 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 3) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-r4-3', name: 'read_file', arguments: JSON.stringify({ path: 'large.js' }) },
+          };
+          // Total used after step 3: 118,400 + 800 = 119,200 => remaining = 40,800 <= 41,600 (26% of 160k!)
+          yield { type: 'usage', usage: { inputTokens: 38_400, outputTokens: 400 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (stepCall === 4) {
+          assert.match(userText, /\[预算收尾提醒\]/);
+          assert.match(userText, /update_plan/);
+          sawEarlyReserve = true;
+          // Burn another chunk so remaining drops to ~18,000 (< 10.9k tools + ~13k accumulated message tokens!)
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: 'tc-r4-4', name: 'read_file', arguments: JSON.stringify({ path: 'large.js' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 22_500, outputTokens: 300 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+
+        observedMaxTokensAtPrunedStep = stepMaxOut;
+        observedMessagesAtPrunedStep = messages;
+        yield { type: 'text-delta', text: 'Completed cleanly after emergency budget_prune.' };
+        yield { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 100 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    },
+    toolDispatcher: new ToolDispatcher({}),
+  });
+  t.after(() => kernel.close());
+
+  const turnId = 'turn-r4-prune';
+  const sessionId = 'sess-r4-prune';
+  const emittedEvents = [];
+  const unsub = kernel.eventRouter.subscribe(sessionId, (ev) => emittedEvents.push(ev));
+  t.after(() => unsub());
+
+  const res = await kernel.executeTurn({
+    sessionId,
+    turnId,
+    profile: { id: 'default', defaultMaxSteps: 10, streamDeltas: false, emitAssistantMessage: false, emitToolEvents: false, persistTurn: false },
+    input: 'Analyze large.js within token budget',
+    model: 'mock',
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    budget: { maxSteps: 10, maxTokens, maxOutputTokens: 8192 },
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: staticSysPrompt }] },
+      { role: 'user', content: [{ type: 'text', text: 'Analyze large.js within token budget' }] },
+    ],
+    tools: createWorkspaceTools({ workspaceRoot: workDir, store, permissionMode: 'full-access' }),
+  });
+
+  assert.equal(res.status, 'completed');
+  assert.equal(sawEarlyReserve, true);
+  assert.equal(res.reasoningMetrics.budgetReserveAdvised, true);
+  assert.ok(
+    emittedEvents.some((e) => e.type === 'context/compacted' && e.data?.stage === 'budget_prune'),
+    'expected context/compacted event with stage=budget_prune',
+  );
+  assert.ok(observedMessagesAtPrunedStep && pairClosed(observedMessagesAtPrunedStep, 1, observedMessagesAtPrunedStep.length - 1), 'emergency budget prune must preserve pairClosed');
+  assert.ok(observedMaxTokensAtPrunedStep > 0 && observedMaxTokensAtPrunedStep <= 18_000, 'maxTokens must remain strictly clamped within remaining maxTotalTokens');
+
+  // 2. Genuine budget exhaustion (remaining <= 2000 or unshrinkable prompt) still throws BudgetError('TOKEN_BUDGET')
+  const exhaustedKernel = new AgentRuntimeKernel({
+    store,
+    adapter: {
+      async *stream() {
+        yield {
+          type: 'block-end',
+          block: { type: 'tool-call', id: 'tc-exh-1', name: 'read_file', arguments: JSON.stringify({ path: 'large.js' }) },
+        };
+        yield { type: 'usage', usage: { inputTokens: 3_500, outputTokens: 200 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      },
+    },
+    toolDispatcher: new ToolDispatcher({}),
+  });
+  t.after(() => exhaustedKernel.close());
+
+  await assert.rejects(
+    () =>
+      exhaustedKernel.executeTurn({
+        sessionId: 'sess-r4-exhaust',
+        turnId: 'turn-r4-exhaust',
+        profile: { id: 'default', defaultMaxSteps: 8, streamDeltas: false, emitAssistantMessage: false, emitToolEvents: false, persistTurn: false },
+        input: 'Exhaust budget',
+        model: 'mock',
+        workspaceRoot: workDir,
+        permissionMode: 'full-access',
+        budget: { maxSteps: 8, maxTokens: 5_000, maxOutputTokens: 1024 },
+        messages: [
+          { role: 'system', content: [{ type: 'text', text: staticSysPrompt }] },
+          { role: 'user', content: [{ type: 'text', text: 'Exhaust budget' }] },
+        ],
+        tools: createWorkspaceTools({ workspaceRoot: workDir, store, permissionMode: 'full-access' }),
+      }),
+    (err) => err instanceof BudgetError && err.code === 'TOKEN_BUDGET' && err.reasoningMetrics?.budgetReserveAdvised === false,
+  );
 });
