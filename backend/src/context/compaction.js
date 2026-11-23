@@ -130,6 +130,13 @@ function mergeReasoningStateIntoAnchor(anchor, reasoningState) {
     }
   }
 
+  const fpBySig = new Map();
+  for (const fp of Array.isArray(reasoningState.errorFingerprints) ? reasoningState.errorFingerprints : []) {
+    if (fp && typeof fp === 'object' && fp.signature) {
+      fpBySig.set(String(fp.signature), fp);
+    }
+  }
+
   const verificationLedger = Array.isArray(anchor.verificationLedger)
     ? anchor.verificationLedger.map((v) => ({ ...v }))
     : [];
@@ -141,15 +148,24 @@ function mergeReasoningStateIntoAnchor(anchor, reasoningState) {
     if (!v || typeof v !== 'object') continue;
     const command = String(v.command || v.toolName || 'verification').trim();
     const status = v.passed ? 'pass' : 'fail';
+    const sig = String(v.signature || v.fingerprint?.signature || '').trim();
+    const matchedFp = sig ? fpBySig.get(sig) : null;
+    const failureExcerpt = v.passed
+      ? ''
+      : (sig
+          ? matchedFp?.assertionExcerpt && !sig.includes(matchedFp.assertionExcerpt)
+            ? `${sig} | ${matchedFp.assertionExcerpt}`
+            : sig
+          : String(v.fingerprint?.assertionExcerpt || '').trim()
+        ).slice(0, 280);
     const entry = {
       command,
       tool: String(v.toolName || 'bash'),
       exitCode: v.exitCode ?? null,
       status,
       passed: Boolean(v.passed),
-      failureExcerpt: v.passed
-        ? ''
-        : String(v.fingerprint?.assertionExcerpt || v.fingerprint?.signature || '').slice(0, 280),
+      ...(sig ? { signature: sig } : {}),
+      failureExcerpt,
       seq: v.seq ?? null,
     };
     const existingIdx = vIdxByCmd.get(command);
@@ -170,20 +186,34 @@ function mergeReasoningStateIntoAnchor(anchor, reasoningState) {
   for (const a of Array.isArray(reasoningState.falsifiedAttempts) ? reasoningState.falsifiedAttempts : []) {
     if (!a || typeof a !== 'object') continue;
     const tool = String(a.toolName || 'unknown');
-    const target = (Array.isArray(a.targetFiles) && a.targetFiles.length
-      ? a.targetFiles.join(', ')
-      : tool
+    const editedFiles = Array.isArray(a.editedFiles) && a.editedFiles.length
+      ? a.editedFiles.map((f) => String(f || '').trim()).filter(Boolean)
+      : Array.isArray(a.targetFiles) && a.targetFiles.length
+        ? a.targetFiles.map((f) => String(f || '').trim()).filter(Boolean)
+        : [];
+    const targetParts = [];
+    if (a.target) targetParts.push(String(a.target).trim());
+    for (const ef of editedFiles) {
+      if (!targetParts.includes(ef)) targetParts.push(ef);
+    }
+    const target = (
+      targetParts.length ? targetParts.join(', ') : String(a.argsSummary || tool)
     ).slice(0, 160);
-    const errorSignature = String(a.errorSignature || a.errorType || '').slice(0, 160);
+    const errorSignature = String(
+      a.fingerprint?.signature || a.errorSignature || a.errorType || a.fingerprint?.errorType || '',
+    ).slice(0, 160);
     const key = `${tool}|${target}|${errorSignature}`;
     if (seenFalsified.has(key)) continue;
     seenFalsified.add(key);
     falsifiedAttempts.push({
       tool,
       target,
+      ...(editedFiles.length ? { editedFiles } : {}),
       errorSignature,
-      excerpt: String(a.hypothesisSummary || errorSignature).slice(0, 240),
-      exitCode: null,
+      excerpt: String(
+        a.hypothesisSummary || a.fingerprint?.assertionExcerpt || errorSignature,
+      ).slice(0, 240),
+      exitCode: a.fingerprint?.exitCode ?? null,
       count: 1,
       repeated: false,
       lastSeq: a.seq ?? null,

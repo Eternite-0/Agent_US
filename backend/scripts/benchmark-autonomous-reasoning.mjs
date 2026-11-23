@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -369,7 +370,8 @@ class DeterministicProbeAdapter extends LlmAdapter {
         index: 0,
         block: { type: 'tool-call', id: 'initial-test', name: 'bash', arguments: JSON.stringify({ command: cmd }) },
       };
-      yield { type: 'finish', reason: { kind: 'tool-calls' }, usage: { inputTokens: 180, outputTokens: 35 } };
+      yield { type: 'usage', usage: { inputTokens: 180, outputTokens: 35 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }
 
@@ -409,7 +411,8 @@ class DeterministicProbeAdapter extends LlmAdapter {
           arguments: JSON.stringify({ path: firstRel, content: firstBody }),
         },
       };
-      yield { type: 'finish', reason: { kind: 'tool-calls' }, usage: { inputTokens: 210, outputTokens: 60 } };
+      yield { type: 'usage', usage: { inputTokens: 210, outputTokens: 60 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }
 
@@ -420,7 +423,8 @@ class DeterministicProbeAdapter extends LlmAdapter {
         index: 0,
         text: JSON.stringify(buildAutonomousReasoningEvidenceOutput(this.task).output),
       };
-      yield { type: 'finish', reason: { kind: 'stop' }, usage: { inputTokens: 190, outputTokens: 50 } };
+      yield { type: 'usage', usage: { inputTokens: 190, outputTokens: 50 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
 
@@ -451,7 +455,8 @@ class DeterministicProbeAdapter extends LlmAdapter {
           arguments: JSON.stringify({ command: this.task.metadata.acceptanceCriteria.testCommand.join(' ') }),
         },
       };
-      yield { type: 'finish', reason: { kind: 'tool-calls' }, usage: { inputTokens: 240, outputTokens: 75 } };
+      yield { type: 'usage', usage: { inputTokens: 240, outputTokens: 75 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }
 
@@ -483,13 +488,15 @@ class DeterministicProbeAdapter extends LlmAdapter {
           arguments: JSON.stringify({ command: this.task.metadata.acceptanceCriteria.testCommand.join(' ') }),
         },
       };
-      yield { type: 'finish', reason: { kind: 'tool-calls' }, usage: { inputTokens: 220, outputTokens: 80 } };
+      yield { type: 'usage', usage: { inputTokens: 220, outputTokens: 80 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }
 
     const out = buildAutonomousReasoningEvidenceOutput(this.task);
     yield { type: 'text-delta', index: 0, text: JSON.stringify(out.output) };
-    yield { type: 'finish', reason: { kind: 'stop' }, usage: { inputTokens: 160, outputTokens: 55 } };
+    yield { type: 'usage', usage: { inputTokens: 160, outputTokens: 55 } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
   }
 }
 
@@ -624,6 +631,7 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
     // Exercise AdaptiveReplanner on recovery/multi-agent tasks
     let replanTriggered = false;
     let replanSucceeded = false;
+    let degenerateReplanBlocked = false;
     if (task.id === 'ar-08-mid-task-recovery' || task.id === 'ar-09-multi-agent-collab') {
       replanTriggered = true;
       const planner = new AdaptivePlanner({ permissionCeiling: 'full' });
@@ -633,6 +641,13 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
         tasks: [{ taskKey: 'stage-1', objective: 'Initial attempt', taskType: 'recovery', permissionMode: 'auto-safe' }],
         budget: { maxSteps: 12 },
       });
+      try {
+        replanner.replan(plan, {}, {
+          failedStrategies: [{ taskKey: 'stage-1', objective: 'Initial attempt', strategy: 'retry_same' }],
+        });
+      } catch (err) {
+        degenerateReplanBlocked = err?.code === 'PLANNER_DEGENERATE_REPLAN_DENIED';
+      }
       try {
         const nextPlan = replanner.replan(plan, {
           tasks: [{ taskKey: 'stage-1', objective: 'Pivot: checkpoint + fence recovery', taskType: 'recovery', permissionMode: 'auto-safe' }],
@@ -644,6 +659,10 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
     }
 
     const eventRouter = new EventRouter(store);
+    const emittedRepairEvents = [];
+    eventRouter.subscribe(sessionId, (ev) => {
+      if (ev?.type === 'verifier/repair') emittedRepairEvents.push(ev);
+    });
     const reconciler = new UnknownOutcomeReconciler(store, eventRouter);
     const checkpointStore = new CheckpointStore(store);
     const verifier = new EvidenceVerifier({ store, eventRouter });
@@ -763,7 +782,12 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
 
     const durationMs = Math.round(performance.now() - started);
     const rm = loopResult.reasoningMetrics ?? {};
-    const repairEvents = (loopResult.verifierEvents ?? []).filter((e) => e.type === 'verifier/repair').length;
+    const verifierRepairEvents = (loopResult.verifierEvents ?? []).filter((e) => e.type === 'verifier/repair').length;
+    const repairRounds = Math.max(
+      Number(rm.repairRounds ?? 0),
+      verifierRepairEvents,
+      emittedRepairEvents.length,
+    );
 
     return {
       taskId: task.id,
@@ -773,14 +797,15 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
       rep,
       passed: Boolean(judgment.passed),
       status: judgment.passed ? 'passed' : 'failed',
-      attempts: 1 + repairEvents,
-      repairRounds: repairEvents,
+      attempts: 1 + repairRounds,
+      repairRounds,
       rootCauseAccurate: Boolean(judgment.evidence.rootCauseMatch),
-      firstFixSucceeded: Boolean(judgment.passed && repairEvents === 0 && !rm.selfCorrectionRecovered),
+      firstFixSucceeded: Boolean(judgment.passed && repairRounds === 0 && !rm.selfCorrectionRecovered),
       regressionPassed: Boolean(judgment.evidence.regressionPassed),
       ineffectiveActionCount: Number(rm.ineffectiveActionCount ?? (judgment.passed ? 0 : 1)),
       replanTriggered,
       replanSucceeded: replanTriggered && replanSucceeded && judgment.passed,
+      degenerateReplanBlocked,
       isRecoveryTask: Boolean(task.metadata.recoveryRequirements),
       recoverySucceeded: Boolean(task.metadata.recoveryRequirements && judgment.passed),
       tokenUsage: loopResult.usage,
@@ -995,6 +1020,229 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
   }
 }
 
+export async function runArmDiagnosticProbes(armRuntime) {
+  const {
+    Store,
+    AgentLoop,
+    DecisionEngine,
+    EventRouter,
+    InferenceEngine,
+    EvidenceVerifier,
+    AdaptivePlanner,
+    AdaptiveReplanner,
+    createWorkspaceTools,
+    ToolDispatcher,
+    UnknownOutcomeReconciler,
+    CheckpointStore,
+  } = armRuntime.modules;
+
+  // Probe 1: Degenerate replan guard (PLANNER_DEGENERATE_REPLAN_DENIED / 409)
+  let degenerateReplanGuard = { blocked: false, code: null, status: null };
+  try {
+    const planner = new AdaptivePlanner({ permissionCeiling: 'full' });
+    const replanner = new AdaptiveReplanner({ planner, permissionCeiling: 'full' });
+    const basePlan = planner.createPlan({
+      goal: 'Repair tax module',
+      tasks: [{ taskKey: 'fix-1', objective: 'Patch tax module', taskType: 'bug-fix', permissionMode: 'auto-safe' }],
+      budget: { maxSteps: 10 },
+    });
+    replanner.replan(basePlan, {}, {
+      failedStrategies: [{ taskKey: 'fix-1', objective: 'Patch tax module', strategy: 'retry_same' }],
+    });
+  } catch (err) {
+    degenerateReplanGuard = {
+      blocked: err?.code === 'PLANNER_DEGENERATE_REPLAN_DENIED',
+      code: err?.code ?? null,
+      status: err?.status ?? null,
+    };
+  }
+
+  // Probe 2: Stuck-loop self-correction (edit_test_fail_loop -> diagnostic steering -> read_file pivot -> recovery)
+  const probeDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-probe-'));
+  const probeWork = join(probeDir, 'ws');
+  mkdirSync(join(probeWork, 'src'), { recursive: true });
+  writeFileSync(join(probeWork, 'src', 'bug.js'), 'export const val = 0;\n', 'utf8');
+  const store = new Store(join(probeDir, 'probe.sqlite'));
+
+  let stuckLoopSelfCorrection = {
+    detected: false,
+    recovered: false,
+    pattern: null,
+    status: 'failed',
+    selfCorrectionRecovered: false,
+  };
+  try {
+    const sessionId = 'sess-probe-stuck';
+    const turnId = 'turn-probe-stuck';
+    const now = Date.now();
+    store.db
+      .prepare('INSERT INTO direct_sessions(id,title,workspaceRoot,model,permissionMode,state,createdAt,updatedAt) VALUES(?,?,?,?,?,?,?,?)')
+      .run(sessionId, 'Stuck Probe', probeWork, 'probe-model', 'full-access', 'running', now, now);
+    store.db
+      .prepare('INSERT INTO direct_turns(id,sessionId,input,model,state,phase,step,createdAt) VALUES(?,?,?,?,?,?,?,?)')
+      .run(turnId, sessionId, 'Fix src/bug.js so val equals 42', 'probe-model', 'running', 'init', 0, now);
+
+    const eventRouter = new EventRouter(store);
+    const thrashEvents = [];
+    eventRouter.subscribe(sessionId, (ev) => {
+      if (ev?.type === 'loop/thrashing_warning') thrashEvents.push(ev);
+    });
+    const reconciler = new UnknownOutcomeReconciler(store, eventRouter);
+    const checkpointStore = new CheckpointStore(store);
+    const verifier = new EvidenceVerifier({ store, eventRouter });
+
+    const tools = createWorkspaceTools({
+      workspaceRoot: probeWork,
+      dataRoot: probeDir,
+      store,
+      sessionId,
+      permissionMode: 'full-access',
+      nonce: '0123456789abcdef0123456789abcdef',
+      sandbox: {
+        async run() {
+          const body = readFileSync(join(probeWork, 'src', 'bug.js'), 'utf8');
+          if (body.includes('42')) {
+            return { exitCode: 0, stdout: 'pass 1\nfail 0', stderr: '' };
+          }
+          return { exitCode: 1, stdout: '', stderr: 'AssertionError: expected 42 at src/bug.js:1' };
+        },
+      },
+    });
+    const dispatcher = new ToolDispatcher({ store, eventRouter, reconciler });
+
+    let probeStep = 0;
+    const probeAdapter = new (class extends LlmAdapter {
+      async *stream(opts) {
+        probeStep += 1;
+        const msgs = opts.messages ?? [];
+        const sawSteering = msgs.some(
+          (m) =>
+            m.role === 'user' &&
+            (m.content ?? []).some((b) => String(b?.text ?? '').includes('系统防死循环提示')),
+        );
+        const hasReadBug = msgs.some(
+          (m) =>
+            m.role === 'assistant' &&
+            (m.content ?? []).some((b) => b?.type === 'tool-call' && b?.name === 'read_file'),
+        );
+        const fixedBug = readFileSync(join(probeWork, 'src', 'bug.js'), 'utf8').includes('42');
+        const lastToolMsg = [...msgs].reverse().find((m) => m.role === 'tool');
+        const lastPassed = String(lastToolMsg?.content?.[0]?.text ?? '').includes('pass 1');
+
+        if (!sawSteering) {
+          if (probeStep % 2 === 1) {
+            yield {
+              type: 'block-end',
+              index: 0,
+              block: {
+                type: 'tool-call',
+                id: `probe-w-${probeStep}`,
+                name: 'write_file',
+                arguments: JSON.stringify({ path: 'src/bug.js', content: `export const val = ${probeStep};\n` }),
+              },
+            };
+          } else {
+            yield {
+              type: 'block-end',
+              index: 0,
+              block: {
+                type: 'tool-call',
+                id: `probe-t-${probeStep}`,
+                name: 'bash',
+                arguments: JSON.stringify({ command: 'node --test test/bug.test.js' }),
+              },
+            };
+          }
+          yield { type: 'usage', usage: { inputTokens: 50, outputTokens: 20 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+
+        if (!hasReadBug) {
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: { type: 'tool-call', id: 'probe-read', name: 'read_file', arguments: JSON.stringify({ path: 'src/bug.js' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 60, outputTokens: 20 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (!fixedBug) {
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: {
+              type: 'tool-call',
+              id: 'probe-fix',
+              name: 'write_file',
+              arguments: JSON.stringify({ path: 'src/bug.js', content: 'export const val = 42;\n' }),
+            },
+          };
+          yield { type: 'usage', usage: { inputTokens: 60, outputTokens: 25 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        if (!lastPassed) {
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: { type: 'tool-call', id: 'probe-verify', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/bug.test.js' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 60, outputTokens: 20 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        yield { type: 'text-delta', index: 0, text: 'Recovered from edit_test_fail_loop after inspecting src/bug.js.' };
+        yield { type: 'usage', usage: { inputTokens: 50, outputTokens: 20 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      }
+    })();
+
+    const loop = new AgentLoop({
+      store,
+      eventRouter,
+      inferenceEngine: new InferenceEngine(probeAdapter),
+      decisionEngine: new DecisionEngine({ verifier: (args) => verifier.verify(args), maxRepairRounds: 2 }),
+      checkpointStore,
+    });
+    const loopRes = await loop.run({
+      sessionId,
+      turnId,
+      profile: { name: 'eval', defaultMaxSteps: 10, streamDeltas: false, persistTurn: true },
+      input: 'Fix src/bug.js so val equals 42',
+      model: 'probe-model',
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: 'Diagnostic probe' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Fix src/bug.js so val equals 42' }] },
+      ],
+      tools,
+      toolDispatcher: dispatcher,
+      permissionMode: 'full-access',
+      budget: { maxSteps: 10 },
+      workspaceRoot: probeWork,
+      execution: { requirePostEditVerification: true },
+    });
+
+    const rm = loopRes.reasoningMetrics ?? {};
+    const detectedPattern = thrashEvents[0]?.data?.pattern ?? rm.stuckDetections?.[0]?.pattern ?? null;
+    stuckLoopSelfCorrection = {
+      detected: thrashEvents.length > 0 || (Array.isArray(rm.stuckDetections) && rm.stuckDetections.length > 0),
+      recovered: loopRes.status === 'completed' && Boolean(rm.selfCorrectionRecovered),
+      pattern: detectedPattern,
+      status: loopRes.status,
+      selfCorrectionRecovered: Boolean(rm.selfCorrectionRecovered),
+    };
+  } catch {
+    // Baseline fallback
+  } finally {
+    store.close();
+    rmSync(probeDir, { recursive: true, force: true });
+  }
+
+  return { degenerateReplanGuard, stuckLoopSelfCorrection };
+}
+
 export async function runAutonomousReasoningBenchmark(opts) {
   const baselineRoot = resolve(opts.baseline || DEFAULT_REPO_ROOT);
   const candidateRoot = resolve(opts.candidate || DEFAULT_REPO_ROOT);
@@ -1079,6 +1327,14 @@ export async function runAutonomousReasoningBenchmark(opts) {
 
   const baselineMetrics = computeAutonomousReasoningMetrics(baselineTrials);
   const candidateMetrics = computeAutonomousReasoningMetrics(candidateTrials);
+  const [baselineProbes, candidateProbes] =
+    opts.mode === 'deterministic'
+      ? await Promise.all([
+          runArmDiagnosticProbes(baselineRuntime),
+          runArmDiagnosticProbes(candidateRuntime),
+        ])
+      : [null, null];
+
   const summary = {
     benchmarkId: AUTONOMOUS_REASONING_BENCHMARK_ID,
     version: VERSION,
@@ -1088,12 +1344,14 @@ export async function runAutonomousReasoningBenchmark(opts) {
       root: baselineRuntime.root,
       revision: baselineRuntime.revision,
       capabilities: baselineRuntime.capabilities,
+      ...(baselineProbes ? { probes: baselineProbes } : {}),
       metrics: baselineMetrics,
     },
     candidate: {
       root: candidateRuntime.root,
       revision: candidateRuntime.revision,
       capabilities: candidateRuntime.capabilities,
+      ...(candidateProbes ? { probes: candidateProbes } : {}),
       metrics: candidateMetrics,
     },
     deltas: {

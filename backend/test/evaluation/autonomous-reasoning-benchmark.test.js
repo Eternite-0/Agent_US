@@ -650,12 +650,25 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       assert.equal(summary.baseline.metrics.totalTrials, 2);
       assert.equal(summary.candidate.metrics.totalTrials, 2);
       assert.equal(summary.baseline.metrics.trials.length, 2);
+      assert.ok(summary.baseline.metrics.tokenCost > 0, 'baseline deterministic tokenCost must be > 0');
+      assert.ok(summary.candidate.metrics.tokenCost > 0, 'candidate deterministic tokenCost must be > 0');
+      assert.equal(summary.candidate.probes?.degenerateReplanGuard?.blocked, true);
+      assert.equal(summary.candidate.probes?.degenerateReplanGuard?.code, 'PLANNER_DEGENERATE_REPLAN_DENIED');
+      assert.equal(summary.candidate.probes?.stuckLoopSelfCorrection?.detected, true);
+      assert.equal(summary.candidate.probes?.stuckLoopSelfCorrection?.recovered, true);
+      assert.equal(summary.candidate.probes?.stuckLoopSelfCorrection?.pattern, 'edit_test_fail_loop');
       const lines = readFileSync(outPath, 'utf8').trim().split(/\r?\n/).map((l) => JSON.parse(l));
       assert.equal(lines.length, 4);
       const ar01Trial = lines.find((r) => r.taskId === 'ar-01-unfamiliar-codebase');
       assert.equal(ar01Trial?.compactionProbe?.twoStageCompacted, true);
       assert.notEqual(ar01Trial?.compactionProbe?.stage, 'none');
       assert.equal(ar01Trial?.memoryRecorded, true);
+      const ar02Candidate = lines.find((r) => r.taskId === 'ar-02-complex-bug-root-cause' && r.arm === 'candidate');
+      assert.ok(ar02Candidate, 'ar-02 candidate trial must be present');
+      assert.ok(ar02Candidate.repairRounds >= 1, 'ar-02 candidate must record repairRounds >= 1');
+      assert.ok(ar02Candidate.attempts >= 2, 'ar-02 candidate must record attempts >= 2');
+      assert.equal(ar02Candidate.firstFixSucceeded, false);
+      assert.ok(ar02Candidate.tokenCost > 0, 'ar-02 candidate trial tokenCost must be > 0');
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }

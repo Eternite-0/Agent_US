@@ -10,6 +10,7 @@ import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { MultiStageCompactor } from '../src/context/compaction.js';
 import { AgentRuntimeKernel } from '../src/kernel/runtime.js';
+import { ExecutionReasoningTracker } from '../src/kernel/execution-reasoning.js';
 import { buildStaticSystemPrompt } from '../src/agent-context.js';
 import { ExperienceMemoryService } from '../src/memory/index.js';
 import {
@@ -336,4 +337,90 @@ test('glue: DirectAgent catch path persists reasoningMetrics to turn/failed even
   assert.equal(distilled[0].memoryClass, 'failure_trap_pattern');
   assert.deepEqual(distilled[0].metadata.modifiedFiles, ['src/a.js']);
   assert.ok(distilled[0].metadata.errorFingerprints.includes('src/a.js:10'));
+});
+
+test('glue: ExecutionReasoningTracker.getState() preserves v.signature, a.target, a.editedFiles, and a.fingerprint.signature across MultiStageCompactor.prepareRequest', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-r2-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-r2-work-'));
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  t.after(() => {
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const now = Date.now();
+  const sessId = 'sess-r2-anchor';
+  const turnId = 'turn-r2-anchor';
+  store.db
+    .prepare('INSERT INTO direct_sessions(id,title,workspaceRoot,model,permissionMode,state,createdAt,updatedAt) VALUES(?,?,?,?,?,?,?,?)')
+    .run(sessId, 'R2 Anchor Mapping', workDir, 'mock', 'auto-safe', 'running', now, now);
+
+  const tracker = new ExecutionReasoningTracker({ workspaceRoot: workDir });
+  tracker.recordToolResult({
+    tc: { id: 'tc-e1', name: 'write_file', arguments: JSON.stringify({ path: 'src/tax.js', content: 'export const tax = 0;' }) },
+    args: { path: 'src/tax.js', content: 'export const tax = 0;' },
+    output: 'Wrote src/tax.js',
+    isError: false,
+    step: 1,
+  });
+  tracker.recordToolResult({
+    tc: { id: 'tc-v1', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/tax.test.js' }) },
+    args: { command: 'node --test test/tax.test.js' },
+    output: [
+      '✖ computes regional tax correctly (14.2ms)',
+      '  AssertionError [ERR_ASSERTION]: Expected 108 to strictly equal 100',
+      '      at computeTax (src/tax.js:18:5)',
+      'exitCode: 1',
+    ].join('\n'),
+    isError: true,
+    receipt: { exitCode: 1, status: 'failed' },
+    step: 2,
+  });
+
+  const reasoningState = tracker.getState();
+  const v0 = reasoningState.verifications[0];
+  const a0 = reasoningState.falsifiedAttempts[0];
+  assert.ok(v0?.signature, 'ExecutionReasoningTracker must record v.signature');
+  assert.ok(a0?.target, 'ExecutionReasoningTracker must record a.target');
+  assert.deepEqual(a0?.editedFiles, ['src/tax.js']);
+  assert.equal(a0?.fingerprint?.signature, v0.signature);
+
+  const compactor = new MultiStageCompactor({ store });
+  const filler = 'long-history '.repeat(750);
+  const out = await compactor.prepareRequest(
+    {
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: buildStaticSystemPrompt('nonce-r2') }] },
+        { role: 'user', content: [{ type: 'text', text: `History 1 ${filler}` }] },
+        { role: 'assistant', content: [{ type: 'text', text: `Summary 1 ${filler}` }] },
+        { role: 'user', content: [{ type: 'text', text: 'Continue fixing src/tax.js' }] },
+      ],
+    },
+    {
+      contextWindow: 6000,
+      sessionId: sessId,
+      turnId,
+      reasoningState,
+      summarize: async () => 'Prior tax debugging step.',
+    },
+  );
+
+  assert.equal(out.stage, 'summary');
+  const summaryText = out.options.messages.find(
+    (m) => m.role === 'assistant' && m.content?.[0]?.text?.includes('[历史上下文摘要]'),
+  )?.content?.[0]?.text ?? '';
+
+  assert.ok(summaryText.includes(v0.signature), 'Stage-2 summary anchor must preserve v.signature verbatim');
+  assert.ok(summaryText.includes(a0.target), 'Stage-2 summary anchor must preserve a.target verbatim');
+  assert.ok(summaryText.includes('src/tax.js'), 'Stage-2 summary anchor must preserve a.editedFiles verbatim');
+  assert.ok(summaryText.includes(a0.fingerprint.signature), 'Stage-2 summary anchor must preserve a.fingerprint.signature verbatim');
+
+  const persisted = compactor.listCompactions(sessId)[0];
+  assert.ok(persisted, 'compaction record should be persisted');
+  assert.equal(persisted.taskState.verificationLedger[0].signature, v0.signature);
+  assert.ok(persisted.taskState.verificationLedger[0].failureExcerpt.includes(v0.signature));
+  assert.equal(persisted.taskState.falsifiedAttempts[0].errorSignature, a0.fingerprint.signature);
+  assert.deepEqual(persisted.taskState.falsifiedAttempts[0].editedFiles, ['src/tax.js']);
+  assert.ok(persisted.taskState.falsifiedAttempts[0].target.includes(a0.target));
 });
