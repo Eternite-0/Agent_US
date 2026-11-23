@@ -82,6 +82,53 @@ export function createMetaTools({
             }),
           )
           .describe('完整任务步骤清单（每步标注 pending / in_progress / completed）'),
+        hypotheses: z
+          .array(
+            z.union([
+              z.string(),
+              z.object({
+                id: z.string().optional(),
+                statement: z.string().optional(),
+                title: z.string().optional(),
+                status: z
+                  .enum(['active', 'confirmed', 'falsified', 'rejected', 'pending'])
+                  .optional(),
+                evidence: z.string().optional(),
+              }),
+            ]),
+          )
+          .max(20)
+          .optional()
+          .describe('可选：当前根因假设与证伪/确认状态列表'),
+        verificationCriteria: z
+          .array(
+            z.union([
+              z.string(),
+              z.object({
+                description: z.string(),
+                status: z.enum(['pending', 'passed', 'failed']).optional(),
+              }),
+            ]),
+          )
+          .max(20)
+          .optional()
+          .describe('可选：验收与验证通过标准列表'),
+        blockers: z
+          .array(
+            z.union([
+              z.string(),
+              z.object({
+                id: z.string().optional(),
+                description: z.string().optional(),
+                title: z.string().optional(),
+                severity: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+                resolved: z.boolean().optional(),
+              }),
+            ]),
+          )
+          .max(20)
+          .optional()
+          .describe('可选：当前阻塞项或待解风险列表'),
       }),
       async execute(args, ctx) {
         await guardFallback('update_plan', args, ctx);
@@ -98,6 +145,46 @@ export function createMetaTools({
           steps,
           updatedAt: Date.now(),
         };
+        if (Array.isArray(args.hypotheses)) {
+          plan.hypotheses = args.hypotheses
+            .slice(0, 20)
+            .map((h, idx) => {
+              if (typeof h === 'string') return h.trim().slice(0, 400);
+              return {
+                id: String(h.id || `h-${idx + 1}`),
+                statement: String(h.statement ?? h.title ?? '').trim().slice(0, 400),
+                status: h.status ?? 'active',
+                ...(h.evidence ? { evidence: String(h.evidence).trim().slice(0, 400) } : {}),
+              };
+            })
+            .filter((h) => (typeof h === 'string' ? Boolean(h) : Boolean(h.statement)));
+        }
+        if (Array.isArray(args.verificationCriteria)) {
+          plan.verificationCriteria = args.verificationCriteria
+            .slice(0, 20)
+            .map((c) => {
+              if (typeof c === 'string') return c.trim().slice(0, 400);
+              return {
+                description: String(c.description ?? '').trim().slice(0, 400),
+                status: c.status ?? 'pending',
+              };
+            })
+            .filter((c) => (typeof c === 'string' ? Boolean(c) : Boolean(c.description)));
+        }
+        if (Array.isArray(args.blockers)) {
+          plan.blockers = args.blockers
+            .slice(0, 20)
+            .map((b, idx) => {
+              if (typeof b === 'string') return b.trim().slice(0, 400);
+              return {
+                id: String(b.id || `blk-${idx + 1}`),
+                description: String(b.description ?? b.title ?? '').trim().slice(0, 400),
+                severity: b.severity ?? 'medium',
+                resolved: Boolean(b.resolved),
+              };
+            })
+            .filter((b) => (typeof b === 'string' ? Boolean(b) : Boolean(b.description)));
+        }
         onPlanUpdated(plan);
         const done = steps.filter((s) => s.status === 'completed').length;
         return `任务清单已更新（${done}/${steps.length} 已完成）。`;

@@ -53,6 +53,204 @@ function pruneTextHeadTail(text, head = 4096, tail = 1024) {
   );
 }
 
+const ERROR_DIAG_LINE_RE =
+  /(?:^exitCode:\s*[1-9]\d*\b|AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|ECONNREFUSED|Traceback \(most recent call last\)|\b(?:FAIL|FAILED|FATAL|PANIC)\b|✖\s|×\s|^not ok \d+|^\s*(?:Expected|Actual|Received)\b|^\s*[+-]\s+\S|^\s+at\s+\S+:\d+:\d+|^\s+File\s+".+",\s+line\s+\d+|\bTS\d{4,5}:|\berror\[E\d+\]|\bError:\s)/;
+const SHELL_TOOL_NAMES = new Set(['bash', 'shell', 'pty', 'read_process_output']);
+
+function pruneErrorAware(text, head = 4096, tail = 1024, { toolName = '' } = {}) {
+  if (text.length <= head + tail + 80) return text;
+  const isShellOrErr =
+    SHELL_TOOL_NAMES.has(String(toolName || '').toLowerCase()) ||
+    ERROR_DIAG_LINE_RE.test(text);
+  if (!isShellOrErr) return pruneTextHeadTail(text, head, tail);
+
+  const headCap = Math.min(head, Math.max(400, Math.floor(head * 0.45)));
+  const tailCap = Math.max(512, tail);
+  const middleBudget = Math.max(1024, head + tail - headCap - tailCap);
+
+  const lines = text.split('\n');
+  const lineStarts = [];
+  let offset = 0;
+  for (const line of lines) {
+    lineStarts.push(offset);
+    offset += line.length + 1;
+  }
+
+  const middleStartChar = headCap;
+  const middleEndChar = Math.max(headCap, text.length - tailCap);
+  const matchIndices = [];
+  for (let i = 0; i < lines.length; i++) {
+    const pos = lineStarts[i];
+    if (pos + lines[i].length < middleStartChar || pos >= middleEndChar) continue;
+    if (ERROR_DIAG_LINE_RE.test(lines[i])) {
+      matchIndices.push(i);
+    }
+  }
+  if (!matchIndices.length) {
+    return pruneTextHeadTail(text, head, tail);
+  }
+
+  const windows = [];
+  for (const idx of matchIndices) {
+    const from = Math.max(0, idx - 1);
+    const to = Math.min(lines.length - 1, idx + 3);
+    if (windows.length && from <= windows.at(-1).to + 1) {
+      windows.at(-1).to = Math.max(windows.at(-1).to, to);
+    } else {
+      windows.push({ from, to });
+    }
+  }
+
+  const extractedChunks = [];
+  let usedMiddleChars = 0;
+  let preservedDiagLines = 0;
+  for (const w of windows) {
+    if (usedMiddleChars >= middleBudget) break;
+    const chunkLines = [];
+    for (let li = w.from; li <= w.to; li++) {
+      const pos = lineStarts[li];
+      if (pos + lines[li].length < middleStartChar || pos >= middleEndChar) continue;
+      const lineText = lines[li].length > 500 ? `${lines[li].slice(0, 480)}...` : lines[li];
+      if (usedMiddleChars + lineText.length + 1 > middleBudget) break;
+      chunkLines.push(lineText);
+      usedMiddleChars += lineText.length + 1;
+      preservedDiagLines++;
+    }
+    if (chunkLines.length) extractedChunks.push(chunkLines.join('\n'));
+  }
+
+  if (!extractedChunks.length) {
+    return pruneTextHeadTail(text, head, tail);
+  }
+
+  const headSlice = text.slice(0, headCap);
+  const tailSlice = text.slice(-tailCap);
+  const middleSection = extractedChunks.join('\n...\n');
+  const marker = `\n[compacted ${text.length} chars, sha256 ${fingerprint(text)}; preserved ${preservedDiagLines} error/stack/assertion lines]\n`;
+  const result = `${headSlice}${marker}${middleSection}\n[compacted tail]\n${tailSlice}`;
+  return result.length < text.length ? result : pruneTextHeadTail(text, head, tail);
+}
+
+function parseToolArgs(rawArgs) {
+  if (!rawArgs) return {};
+  if (typeof rawArgs === 'object') return rawArgs;
+  try {
+    const parsed = JSON.parse(String(rawArgs));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeToolPath(rawPath) {
+  if (typeof rawPath !== 'string') return '';
+  let p = rawPath.trim().replace(/\\/g, '/');
+  if (!p) return '';
+  while (p.startsWith('./')) p = p.slice(2);
+  p = p.replace(/\/{2,}/g, '/');
+  const isAbs = p.startsWith('/');
+  const driveMatch = p.match(/^([A-Za-z]:)(\/.*)?$/);
+  const drivePrefix = driveMatch ? driveMatch[1] : '';
+  const rest = driveMatch ? (driveMatch[2] ?? '') : p;
+  const parts = [];
+  for (const seg of rest.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length && parts.at(-1) !== '..') parts.pop();
+      else if (!isAbs && !drivePrefix) parts.push('..');
+    } else {
+      parts.push(seg);
+    }
+  }
+  let norm =
+    (drivePrefix || (isAbs ? '/' : '')) +
+    (drivePrefix && rest.startsWith('/') ? '/' : '') +
+    parts.join('/');
+  if (!norm || norm === '.') return '';
+  if (process.platform === 'win32') norm = norm.toLowerCase();
+  return norm;
+}
+
+function extractReadRange(args) {
+  if (!args || typeof args !== 'object') {
+    return { isFull: true, from: 0, to: Infinity, label: '' };
+  }
+  const sLine = args.startLine ?? args.start_line;
+  const eLine = args.endLine ?? args.end_line;
+  if (sLine != null || eLine != null) {
+    const from = Number.isFinite(Number(sLine)) ? Math.max(1, Number(sLine)) : 1;
+    const to =
+      eLine != null && Number.isFinite(Number(eLine))
+        ? Math.max(from, Number(eLine))
+        : Infinity;
+    return {
+      isFull: false,
+      from,
+      to,
+      label: `lines ${from}-${Number.isFinite(to) ? to : 'EOF'}`,
+    };
+  }
+  if (args.offset != null || args.limit != null) {
+    const from = Number.isFinite(Number(args.offset)) ? Math.max(0, Number(args.offset)) : 0;
+    const limit =
+      args.limit != null && Number.isFinite(Number(args.limit))
+        ? Math.max(0, Number(args.limit))
+        : null;
+    const to = limit != null ? from + Math.max(0, limit - 1) : Infinity;
+    return {
+      isFull: false,
+      from,
+      to,
+      label: `offset ${from}${limit != null ? `..${to}` : ''}`,
+    };
+  }
+  if (args.start != null || args.end != null) {
+    const from = Number.isFinite(Number(args.start)) ? Math.max(0, Number(args.start)) : 0;
+    const to =
+      args.end != null && Number.isFinite(Number(args.end))
+        ? Math.max(from, Number(args.end))
+        : Infinity;
+    return {
+      isFull: false,
+      from,
+      to,
+      label: `range ${from}-${Number.isFinite(to) ? to : 'EOF'}`,
+    };
+  }
+  return { isFull: true, from: 0, to: Infinity, label: '' };
+}
+
+function rangesOverlap(a, b) {
+  return Math.max(a.from, b.from) <= Math.min(a.to, b.to);
+}
+
+function isReadErrorText(text) {
+  const s = String(text ?? '').trim();
+  if (!s) return true;
+  const head = s.slice(0, 320);
+  return /^(?:<untrusted[^>]*>\s*)?(?:FILE_NOT_FOUND|ENOENT|EACCES|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]|Error:|\[recovered from tool_receipt|\[interrupted before tool result)/i.test(
+    head,
+  );
+}
+
+function indexToolCalls(messages) {
+  const byId = new Map();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role !== 'assistant') continue;
+    for (const b of m.content ?? []) {
+      if (b?.type === 'tool-call' && b.id) {
+        byId.set(b.id, {
+          name: b.name ?? '',
+          args: parseToolArgs(b.arguments),
+          assistantIndex: i,
+        });
+      }
+    }
+  }
+  return byId;
+}
+
 /**
  * Folds runs of >= 4 consecutive log lines that differ only in digits (progress counters, timestamps).
  */
@@ -230,18 +428,21 @@ export function compact(options, maxChars) {
   const size = () => JSON.stringify(messages).length;
   let messages = options.messages.map((m) => ({
     ...m,
-    content: m.content.map((b) => ({ ...b })),
+    content: (m.content ?? []).map((b) => ({ ...b })),
   }));
   if (size() <= maxChars) return options;
 
-  // Stage 1a: deterministically prune oversized tool results first (preserving head + tail).
+  const toolCallsById = indexToolCalls(messages);
+
+  // Stage 1a: deterministically prune oversized tool results first (error/stack-preserving + head/tail).
   const toolHead = Math.min(4096, Math.max(240, Math.floor(maxChars * 0.25)));
   const toolTail = Math.min(1024, Math.max(100, Math.floor(maxChars * 0.08)));
   for (const m of messages.slice(1, -1)) {
     if (m.role !== 'tool') continue;
+    const toolName = toolCallsById.get(m.toolCallId)?.name || m.toolName || m.name || '';
     m.content = m.content.map((b) =>
       b.type === 'text' && b.text.length > toolHead + toolTail + 80
-        ? { ...b, text: pruneTextHeadTail(b.text, toolHead, toolTail) }
+        ? { ...b, text: pruneErrorAware(b.text, toolHead, toolTail, { toolName }) }
         : b,
     );
     if (size() <= maxChars) return { ...options, messages };
@@ -263,8 +464,12 @@ const SUMMARY_BRIDGE_TEXT =
 
 /**
  * Two-stage budgeted compaction:
- * - Stage 1 (zero LLM cost): deterministically prunes old tool results (> 8,192 chars -> 4,096 head + 1,024 tail)
- *   only within the atomic older span, preserving the recent suffix verbatim.
+ * - Stage 1 (zero LLM cost):
+ *   1a) Deduplicates superseded `read_file` tool results in the atomic older span [start..cut-1]
+ *       when a later `read_file` in [start..messages.length-1] read the same normalized path
+ *       (full file or overlapping/same range).
+ *   1b) Prunes oversized older tool results (> 8,192 chars) with error/stack/assertion-preserving
+ *       pruning for test/bash error outputs or head+tail pruning otherwise, preserving recent suffix verbatim.
  * - Stage 2 (structured LLM summary): if still over threshold and `summarize` is provided,
  *   replaces the atomic older span with a structured summary (non-destructive to SQLite history).
  */
@@ -287,7 +492,7 @@ export async function compactTwoStage(
 
   const messages = options.messages.map((m) => ({
     ...m,
-    content: m.content.map((b) => ({ ...b })),
+    content: (m.content ?? []).map((b) => ({ ...b })),
   }));
 
   const effectiveKeep = Math.min(
@@ -298,14 +503,83 @@ export async function compactTwoStage(
   const start = cutInfo?.start ?? (messages[0]?.role === 'system' ? 1 : 0);
   const cut = cutInfo?.cut ?? Math.max(start + 1, messages.length - 1);
 
-  // Preserve the longest reusable prefix: prune from the end of the
-  // eligible older span, stopping as soon as the prompt fits.
   const stage1Opts = { ...options, messages };
+  const toolCallsById = indexToolCalls(messages);
+
+  // Stage 1a: Collapse superseded read_file outputs in [start..cut-1] before touching unique outputs.
+  const readEntries = [];
+  for (let i = start; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role !== 'tool') continue;
+    const tc = toolCallsById.get(m.toolCallId);
+    const toolName = tc?.name || m.toolName || m.name || '';
+    if (toolName !== 'read_file') continue;
+    const rawPath =
+      tc?.args?.path ?? tc?.args?.filePath ?? tc?.args?.file ?? tc?.args?.target_file ?? '';
+    const normPath = normalizeToolPath(rawPath);
+    if (!normPath) continue;
+    const combinedText = (m.content ?? [])
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text ?? '')
+      .join('\n');
+    if (isReadErrorText(combinedText)) continue;
+    readEntries.push({
+      msgIndex: i,
+      normPath,
+      displayPath: String(rawPath).trim().replace(/\\/g, '/'),
+      range: extractReadRange(tc?.args),
+    });
+  }
+
+  for (const entry of readEntries) {
+    if (entry.msgIndex >= cut) break;
+    let laterMatch = null;
+    for (let j = readEntries.length - 1; j >= 0; j--) {
+      const candidate = readEntries[j];
+      if (candidate.msgIndex <= entry.msgIndex) break;
+      if (candidate.normPath !== entry.normPath) continue;
+      if (
+        candidate.range.isFull ||
+        (!entry.range.isFull && rangesOverlap(entry.range, candidate.range))
+      ) {
+        laterMatch = candidate;
+        break;
+      }
+    }
+    if (!laterMatch) continue;
+    const m = messages[entry.msgIndex];
+    let changed = false;
+    m.content = (m.content ?? []).map((b) => {
+      if (b.type !== 'text' || typeof b.text !== 'string') return b;
+      if (b.text.startsWith('[compacted superseded read_file ')) return b;
+      const rangeSuffix = entry.range.label ? ` (${entry.range.label})` : '';
+      const pointer = `[compacted superseded read_file ${entry.displayPath}${rangeSuffix}; later read at msg#${laterMatch.msgIndex}, original ${b.text.length} chars, sha256 ${fingerprint(b.text)}]`;
+      if (b.text.length <= pointer.length) return b;
+      changed = true;
+      return { ...b, text: pointer };
+    });
+    if (changed) {
+      const measured = measureRequestComposition(stage1Opts);
+      if (measured.totalTokens <= trigger) {
+        return {
+          options: stage1Opts,
+          stage: 'prune',
+          compacted: true,
+          cut,
+          tokens: measured.totalTokens,
+        };
+      }
+    }
+  }
+
+  // Stage 1b: Preserve the longest reusable prefix: prune remaining oversized tool outputs
+  // from the end of the eligible older span, stopping as soon as the prompt fits.
   for (let i = cut - 1; i >= start; i--) {
     const m = messages[i];
     if (m?.role !== 'tool' || !m.content.some(b => b.type === 'text' && b.text.length > 8192)) continue;
+    const toolName = toolCallsById.get(m.toolCallId)?.name || m.toolName || m.name || '';
     m.content = m.content.map(b => b.type === 'text' && b.text.length > 8192
-      ? { ...b, text: pruneTextHeadTail(b.text, 4096, 1024) } : b);
+      ? { ...b, text: pruneErrorAware(b.text, 4096, 1024, { toolName }) } : b);
     const measured = measureRequestComposition(stage1Opts);
     if (measured.totalTokens <= trigger) {
       return { options: stage1Opts, stage: 'prune', compacted: true, cut, tokens: measured.totalTokens };

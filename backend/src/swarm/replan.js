@@ -23,6 +23,374 @@ function parseJsonSafe(str, fallback) {
   }
 }
 
+function safeGet(db, sql, ...params) {
+  if (!db || typeof db.prepare !== 'function') return null;
+  try {
+    return db.prepare(sql).get(...params) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function safeAll(db, sql, ...params) {
+  if (!db || typeof db.prepare !== 'function') return [];
+  try {
+    const rows = db.prepare(sql).all(...params);
+    return Array.isArray(rows) ? rows : [];
+  } catch {
+    return [];
+  }
+}
+
+const VALID_DIAGNOSIS_STRATEGIES = new Set([
+  'retry_same',
+  'switch_model',
+  'split_subgraph',
+  'repair_and_reverify',
+  'abort',
+]);
+
+const VALID_FAILURE_CLASSES = new Set([
+  'transient',
+  'model_capability',
+  'decomposition',
+  'verification',
+  'environment',
+  'permission',
+  'unknown',
+]);
+
+function extractJsonObject(rawText) {
+  const s = String(rawText ?? '').trim();
+  if (!s) return null;
+  const direct = parseJsonSafe(s, null);
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+
+  const fenced = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) {
+    const parsed = parseJsonSafe(fenced[1].trim(), null);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  }
+
+  const firstBrace = s.indexOf('{');
+  const lastBrace = s.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const parsed = parseJsonSafe(s.slice(firstBrace, lastBrace + 1), null);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  }
+  return null;
+}
+
+/**
+ * Deterministically gathers concrete execution evidence for a failed swarm node:
+ * tool_receipts, node errors/tool excerpts, modified files, and prior swarm_replans rows.
+ */
+export function collectFailureEvidence(runId, failedNode, { store = null } = {}) {
+  const db = store?.db ?? null;
+  const nodeKey = failedNode?.nodeKey ?? null;
+  const nodeId = failedNode?.id ?? null;
+
+  let liveNode = null;
+  if (db && (nodeId || (runId && nodeKey))) {
+    liveNode = nodeId
+      ? safeGet(db, 'SELECT * FROM swarm_nodes WHERE id=?', nodeId)
+      : safeGet(db, 'SELECT * FROM swarm_nodes WHERE runId=? AND nodeKey=?', runId, nodeKey);
+  }
+  const effectiveNode = liveNode ? { ...failedNode, ...liveNode } : { ...(failedNode ?? {}) };
+  const effectiveNodeKey = effectiveNode.nodeKey ?? nodeKey ?? null;
+  const effectiveNodeId = effectiveNode.id ?? nodeId ?? null;
+  const childSessionId = effectiveNode.childSessionId ?? null;
+  const childTurnId = effectiveNode.childTurnId ?? null;
+
+  const runRow = db && runId ? safeGet(db, 'SELECT id, goal, status, planVersion, replanCount FROM swarm_runs WHERE id=?', runId) : null;
+
+  // 1. Collect tool_receipts scoped to childTurnId / childSessionId / nodeId / runId
+  let rawReceipts = [];
+  if (db) {
+    const conditions = [];
+    const params = [];
+    if (childTurnId) {
+      conditions.push('turnId=?');
+      params.push(childTurnId);
+    }
+    if (childSessionId) {
+      conditions.push('sessionId=?');
+      params.push(childSessionId);
+    }
+    if (effectiveNodeId) {
+      conditions.push('taskId=?');
+      params.push(effectiveNodeId);
+    }
+    if (runId) {
+      conditions.push('taskId=?');
+      params.push(runId);
+    }
+    if (conditions.length > 0) {
+      rawReceipts = safeAll(
+        db,
+        `SELECT id, callId, toolName, status, exitCode, errorCode, reconciliationNote, createdAt
+         FROM tool_receipts
+         WHERE ${conditions.join(' OR ')}
+         ORDER BY createdAt DESC LIMIT 30`,
+        ...params,
+      );
+    }
+  }
+  const toolReceipts = rawReceipts.map((r) => ({
+    toolName: r.toolName,
+    status: r.status,
+    exitCode: r.exitCode ?? null,
+    errorCode: r.errorCode ?? null,
+    note: r.reconciliationNote ? String(r.reconciliationNote).slice(0, 200) : null,
+  }));
+  const failedReceipts = toolReceipts.filter(
+    (r) =>
+      r.status !== 'finished' ||
+      (r.exitCode !== null && r.exitCode !== 0) ||
+      Boolean(r.errorCode),
+  );
+
+  // 2. Collect tool error / failure excerpts from childSessionId direct_messages
+  const toolExcerpts = [];
+  if (db && childSessionId) {
+    const msgRows = childTurnId
+      ? safeAll(
+          db,
+          `SELECT seq, role, toolName, content, meta FROM direct_messages
+           WHERE sessionId=? AND turnId=? AND role='tool' ORDER BY seq DESC LIMIT 15`,
+          childSessionId,
+          childTurnId,
+        )
+      : safeAll(
+          db,
+          `SELECT seq, role, toolName, content, meta FROM direct_messages
+           WHERE sessionId=? AND role='tool' ORDER BY seq DESC LIMIT 15`,
+          childSessionId,
+        );
+    for (const row of msgRows) {
+      const text = String(row.content || '');
+      const meta = parseJsonSafe(row.meta, {});
+      const isFailure =
+        meta?.isError === true ||
+        /exitCode:\s*[1-9]|AssertionError|TypeError|Error:|FAIL|ENOENT|ERR_/i.test(text);
+      if (isFailure || toolExcerpts.length < 2) {
+        toolExcerpts.push({
+          toolName: row.toolName || 'tool',
+          isError: Boolean(isFailure),
+          excerpt: text.slice(0, 400),
+        });
+      }
+      if (toolExcerpts.length >= 5) break;
+    }
+  }
+
+  // 3. Collect modified files from turn_snapshots & swarm_artifacts
+  const modifiedSet = new Set();
+  if (Array.isArray(effectiveNode.modifiedFiles)) {
+    for (const f of effectiveNode.modifiedFiles) {
+      if (typeof f === 'string' && f.trim()) modifiedSet.add(f.trim());
+      else if (f?.path) modifiedSet.add(String(f.path).trim());
+    }
+  }
+  if (db && (childTurnId || childSessionId)) {
+    const snaps = childTurnId
+      ? safeAll(db, 'SELECT DISTINCT path FROM turn_snapshots WHERE turnId=?', childTurnId)
+      : safeAll(db, 'SELECT DISTINCT path FROM turn_snapshots WHERE sessionId=?', childSessionId);
+    for (const s of snaps) {
+      if (s?.path) modifiedSet.add(String(s.path));
+    }
+  }
+  if (db && runId && (effectiveNodeKey || effectiveNodeId)) {
+    const artifacts = safeAll(
+      db,
+      `SELECT manifestJson FROM swarm_artifacts
+       WHERE runId=? AND (nodeKey=? OR nodeId=?) ORDER BY attempt DESC LIMIT 5`,
+      runId,
+      effectiveNodeKey || '',
+      effectiveNodeId || '',
+    );
+    for (const a of artifacts) {
+      const manifest = parseJsonSafe(a.manifestJson, {});
+      for (const ent of manifest?.entries ?? []) {
+        if (ent?.path) modifiedSet.add(String(ent.path));
+      }
+    }
+  }
+
+  // 4. Collect prior swarm_replans rows for failedNode.nodeKey (plus run-wide failed models)
+  const priorReplans = [];
+  const priorStrategies = [];
+  const priorAvoidPatterns = [];
+  const priorFailedModels = [];
+  if (db && runId) {
+    const replanRows = effectiveNodeKey
+      ? safeAll(
+          db,
+          `SELECT id, version, failedNodeKey, strategy, reason, diffJson, createdAt
+           FROM swarm_replans WHERE runId=? AND failedNodeKey=? ORDER BY version ASC`,
+          runId,
+          effectiveNodeKey,
+        )
+      : [];
+    for (const r of replanRows) {
+      const diff = parseJsonSafe(r.diffJson, {});
+      priorReplans.push({
+        version: r.version,
+        strategy: r.strategy,
+        reason: r.reason ? String(r.reason).slice(0, 240) : '',
+        diff,
+        createdAt: r.createdAt,
+      });
+      if (r.strategy && !priorStrategies.includes(r.strategy)) {
+        priorStrategies.push(r.strategy);
+      }
+      const patterns = diff?.structuredDiagnosis?.avoidPatterns ?? diff?.avoidPatterns ?? [];
+      if (Array.isArray(patterns)) {
+        for (const p of patterns) {
+          const s = String(p || '').trim();
+          if (s && !priorAvoidPatterns.includes(s)) priorAvoidPatterns.push(s);
+        }
+      }
+    }
+    const switchRows = safeAll(
+      db,
+      "SELECT diffJson FROM swarm_replans WHERE runId=? AND strategy='switch_model'",
+      runId,
+    );
+    for (const r of switchRows) {
+      const d = parseJsonSafe(r.diffJson, {});
+      if (d?.fromModel && !priorFailedModels.includes(d.fromModel)) {
+        priorFailedModels.push(d.fromModel);
+      }
+    }
+  }
+
+  const parsedNodeBudget = parseJsonSafe(effectiveNode.budgetJson, {});
+  return {
+    runId: runId ?? null,
+    runGoal: runRow?.goal ?? null,
+    nodeId: effectiveNodeId,
+    nodeKey: effectiveNodeKey,
+    taskType: effectiveNode.taskType ?? null,
+    model: effectiveNode.model ?? null,
+    attempts: Number(effectiveNode.attempts ?? 0),
+    objective: effectiveNode.objective ? String(effectiveNode.objective).slice(0, 600) : '',
+    errorCode: effectiveNode.errorCode ?? null,
+    errorMessage: effectiveNode.errorMessage ? String(effectiveNode.errorMessage).slice(0, 800) : null,
+    resultExcerpt: effectiveNode.resultText ? String(effectiveNode.resultText).slice(-800) : '',
+    verificationResult: parsedNodeBudget?.verificationResult ?? null,
+    toolReceipts,
+    failedReceipts,
+    toolExcerpts,
+    modifiedFiles: [...modifiedSet].slice(0, 40),
+    priorReplans,
+    priorStrategies,
+    priorAvoidPatterns,
+    priorFailedModels,
+  };
+}
+
+function parseDiagnosticResponse(rawText, evidence, { errorCode = null, errorMessage = null } = {}) {
+  const trimmed = String(rawText ?? '').trim();
+  const parsed = extractJsonObject(trimmed);
+  const priorSet = new Set(evidence?.priorStrategies ?? []);
+
+  let rootCause = '';
+  let failureClass = 'unknown';
+  let strategy = null;
+  let nextObjectivePatch = '';
+  let avoidPatterns = [];
+  let parsedJson = false;
+
+  if (parsed) {
+    parsedJson = Boolean(parsed.rootCause || parsed.root_cause || parsed.strategy);
+    rootCause = String(parsed.rootCause ?? parsed.root_cause ?? '').trim().slice(0, 500);
+    const rawClass = String(parsed.failureClass ?? parsed.failure_class ?? 'unknown').trim().toLowerCase();
+    failureClass = VALID_FAILURE_CLASSES.has(rawClass) ? rawClass : 'unknown';
+    const rawStrat = String(parsed.strategy ?? '').trim().toLowerCase();
+    if (VALID_DIAGNOSIS_STRATEGIES.has(rawStrat)) {
+      strategy = rawStrat;
+    }
+    nextObjectivePatch = String(
+      parsed.nextObjectivePatch ?? parsed.next_objective_patch ?? parsed.objectivePatch ?? '',
+    )
+      .trim()
+      .slice(0, 600);
+    if (Array.isArray(parsed.avoidPatterns ?? parsed.avoid_patterns)) {
+      avoidPatterns = (parsed.avoidPatterns ?? parsed.avoid_patterns)
+        .map((p) => String(p ?? '').trim().slice(0, 200))
+        .filter(Boolean);
+    }
+  }
+
+  if (!rootCause) {
+    rootCause =
+      trimmed.slice(0, 300) ||
+      String(errorMessage || evidence?.errorMessage || errorCode || evidence?.errorCode || 'Unknown failure').slice(
+        0,
+        300,
+      );
+  }
+  if (!strategy) {
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('split_subgraph')) strategy = 'split_subgraph';
+    else if (lower.includes('switch_model')) strategy = 'switch_model';
+    else if (lower.includes('repair_and_reverify')) strategy = 'repair_and_reverify';
+    else if (lower.includes('abort')) strategy = 'abort';
+    else strategy = 'retry_same';
+  }
+
+  // Prevent repeating an already-failed strategy unchanged
+  let repeatedStrategyAvoided = false;
+  let replacedStrategy = null;
+  const isUnchangedRetry =
+    strategy === 'retry_same' &&
+    priorSet.has('retry_same') &&
+    !nextObjectivePatch;
+  const isRepeatedSwitch =
+    strategy === 'switch_model' &&
+    priorSet.has('switch_model') &&
+    evidence?.priorReplans?.some(
+      (r) => r.strategy === 'switch_model' && r.diff?.toModel && r.diff.toModel === evidence?.model,
+    );
+  const isRepeatedSplit = strategy === 'split_subgraph' && priorSet.has('split_subgraph');
+
+  if (
+    (priorSet.has(strategy) && strategy !== 'switch_model' && (!nextObjectivePatch || strategy === 'retry_same')) ||
+    isUnchangedRetry ||
+    isRepeatedSwitch ||
+    isRepeatedSplit
+  ) {
+    repeatedStrategyAvoided = true;
+    replacedStrategy = strategy;
+    avoidPatterns.push(`Do not repeat already-failed strategy "${strategy}" unchanged`);
+    if (strategy === 'retry_same') {
+      strategy = !priorSet.has('switch_model')
+        ? 'switch_model'
+        : !priorSet.has('split_subgraph')
+          ? 'split_subgraph'
+          : 'abort';
+    } else if (strategy === 'switch_model') {
+      strategy = !priorSet.has('split_subgraph') ? 'split_subgraph' : 'abort';
+    } else {
+      strategy = 'abort';
+    }
+  }
+
+  const mergedAvoid = [...new Set([...(evidence?.priorAvoidPatterns ?? []), ...avoidPatterns])].slice(0, 12);
+
+  return {
+    rootCause,
+    failureClass,
+    strategy,
+    nextObjectivePatch,
+    avoidPatterns: mergedAvoid,
+    repeatedStrategyAvoided,
+    ...(replacedStrategy ? { replacedStrategy } : {}),
+    parsedJson,
+  };
+}
+
 const NON_REPLANABLE_ERRORS = new Set([
   'WORKTREE_ISOLATION_FAILED',
   'WORKTREE_ARTIFACT_CONFLICT',
@@ -91,6 +459,14 @@ export class DynamicReplanner {
   }
 
   /**
+   * Deterministically gathers runtime evidence (tool_receipts, node errors/excerpts,
+   * modified files, and prior swarm_replans) for a failed swarm node.
+   */
+  collectFailureEvidence(runId, failedNode) {
+    return collectFailureEvidence(runId, failedNode, { store: this.store });
+  }
+
+  /**
    * Optional model-backed replanning diagnosis call. Strictly admitted, output-clamped,
    * and settled under `BUDGET_SCOPES.REPLANNING` against the shared task-tree budget ledger.
    */
@@ -107,8 +483,55 @@ export class DynamicReplanner {
     const adapter = this.adapter;
     if (!adapter) return null;
     const picked =
-      model || this.router?.select?.({ taskType: 'planning', objective: failedNode?.objective || '' })?.model;
+      model ||
+      this.router?.select?.({ taskType: 'planning', objective: failedNode?.objective || '' })?.model ||
+      failedNode?.model;
     if (!picked) return null;
+
+    const evidence = this.collectFailureEvidence(run?.id, failedNode);
+    const effErrorCode = errorCode || evidence.errorCode || 'UNKNOWN';
+    const effErrorMessage = errorMessage || evidence.errorMessage || '';
+
+    const evidenceLines = [
+      evidence.runGoal ? `Run Goal: ${String(evidence.runGoal).slice(0, 400)}` : '',
+      `Node: ${failedNode?.nodeKey ?? evidence.nodeKey} (taskType=${failedNode?.taskType ?? evidence.taskType ?? 'general'}, model=${failedNode?.model ?? evidence.model ?? 'unknown'}, attempts=${failedNode?.attempts ?? evidence.attempts ?? 1})`,
+      `Objective: ${failedNode?.objective ?? evidence.objective}`,
+      `Error: ${effErrorCode}: ${effErrorMessage}`,
+      evidence.failedReceipts.length
+        ? `Failed Tool Receipts:\n${evidence.failedReceipts
+            .slice(0, 8)
+            .map(
+              (r) =>
+                `- ${r.toolName}: status=${r.status} exit=${r.exitCode ?? '-'} error=${r.errorCode ?? '-'}${r.note ? ` (${r.note})` : ''}`,
+            )
+            .join('\n')}`
+        : evidence.toolReceipts.length
+          ? `Tool Receipts (${evidence.toolReceipts.length}): ${evidence.toolReceipts
+              .slice(0, 6)
+              .map((r) => `${r.toolName}:${r.status}(exit=${r.exitCode ?? '-'})`)
+              .join(', ')}`
+          : '',
+      evidence.toolExcerpts.length
+        ? `Tool Error Excerpts:\n${evidence.toolExcerpts
+            .slice(0, 4)
+            .map((e) => `- [${e.toolName}${e.isError ? ' ERROR' : ''}] ${e.excerpt}`)
+            .join('\n')}`
+        : '',
+      evidence.resultExcerpt ? `Node Result Excerpt:\n${evidence.resultExcerpt.slice(0, 500)}` : '',
+      evidence.modifiedFiles.length
+        ? `Modified Files: ${evidence.modifiedFiles.slice(0, 15).join(', ')}`
+        : '',
+      evidence.priorReplans.length
+        ? `Prior Replan History for ${failedNode?.nodeKey ?? evidence.nodeKey} (DO NOT repeat an already-failed strategy unchanged):\n${evidence.priorReplans
+            .map((r) => `- v${r.version} strategy=${r.strategy} reason=${r.reason}`)
+            .join('\n')}`
+        : '',
+      evidence.priorAvoidPatterns.length
+        ? `Known Avoid Patterns:\n- ${evidence.priorAvoidPatterns.join('\n- ')}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
 
     const ledger = budgetLedger ?? this.budgetLedger;
     const messages = [
@@ -117,7 +540,10 @@ export class DynamicReplanner {
         content: [
           {
             type: 'text',
-            text: 'Diagnose why this swarm node failed and suggest a concise recovery strategy (retry_same, switch_model, or split_subgraph).',
+            text:
+              'Diagnose why this swarm node failed using the concrete execution evidence and prior replan history. ' +
+              'Never repeat an already-failed strategy unchanged. ' +
+              'Respond strictly with a JSON object: {"rootCause":"...","failureClass":"transient|model_capability|decomposition|verification|environment|permission","strategy":"retry_same|switch_model|split_subgraph|repair_and_reverify|abort","nextObjectivePatch":"...","avoidPatterns":["..."]}.',
           },
         ],
       },
@@ -126,7 +552,7 @@ export class DynamicReplanner {
         content: [
           {
             type: 'text',
-            text: `Node: ${failedNode?.nodeKey}\nObjective: ${failedNode?.objective}\nError: ${errorCode}: ${errorMessage}`,
+            text: evidenceLines,
           },
         ],
       },
@@ -173,7 +599,12 @@ export class DynamicReplanner {
           leaseGuard,
         });
       }
-      return { text: text.trim(), usage };
+      const trimmed = text.trim();
+      const diagnosis = parseDiagnosticResponse(trimmed, evidence, {
+        errorCode: effErrorCode,
+        errorMessage: effErrorMessage,
+      });
+      return { text: trimmed, usage, diagnosis, evidence };
     } catch (err) {
       if (reservation?.reservationId) {
         try {
@@ -378,6 +809,7 @@ export class DynamicReplanner {
 
     const activeLedger = budgetLedger ?? this.budgetLedger;
     let diagnosisNote = null;
+    let diagnosisResult = null;
     if (useModelDiagnosis && this.adapter) {
       try {
         const diag = await this.diagnoseWithModel({
@@ -389,6 +821,7 @@ export class DynamicReplanner {
           signal,
           leaseGuard,
         });
+        diagnosisResult = diag ?? null;
         diagnosisNote = diag?.text || null;
       } catch (err) {
         if (err?.code === 'LEASE_LOST') throw err;
@@ -450,13 +883,25 @@ export class DynamicReplanner {
         }
       }
 
-      const alreadySplit = this.store.db
+      const priorNodeReplans = this.store.db
         .prepare(
-          "SELECT 1 FROM swarm_replans WHERE runId=? AND failedNodeKey=? AND strategy='split_subgraph' LIMIT 1",
+          'SELECT version, strategy, reason, diffJson FROM swarm_replans WHERE runId=? AND failedNodeKey=? ORDER BY version ASC',
         )
-        .get(liveRun.id, liveNode.nodeKey);
-      if (alreadySplit) {
+        .all(liveRun.id, liveNode.nodeKey);
+      const priorNodeStrategies = new Set(priorNodeReplans.map((r) => r.strategy));
+
+      if (priorNodeStrategies.has('split_subgraph')) {
         return { replanned: false, strategy: 'none', reason: 'ALREADY_REPLANNED' };
+      }
+
+      const structuredDiag = diagnosisResult?.diagnosis ?? null;
+      if (structuredDiag?.parsedJson && structuredDiag.strategy === 'abort') {
+        return {
+          replanned: false,
+          strategy: 'none',
+          reason: `DIAGNOSIS_ABORT:${String(structuredDiag.rootCause || 'aborted').slice(0, 120)}`,
+          diagnosis: structuredDiag,
+        };
       }
 
       const nextVersion = currentPlanVersion + 1;
@@ -504,13 +949,36 @@ export class DynamicReplanner {
         errorMessage: null,
       };
 
-      // 1. Transient retry on same model (first failure, unless model already failed out in this run)
-      if (attempts < 2 && !(liveNode.model && runKnownFailedModels.has(liveNode.model) && altModel)) {
+      const diagPatchText = structuredDiag?.nextObjectivePatch
+        ? `\n[Diagnosis Guidance] ${structuredDiag.nextObjectivePatch}`
+        : '';
+      const diagAvoidText = structuredDiag?.avoidPatterns?.length
+        ? `\n[Avoid Patterns] ${structuredDiag.avoidPatterns.join('; ')}`
+        : '';
+      const canRetrySame =
+        attempts < 2 &&
+        !priorNodeStrategies.has('retry_same') &&
+        !(liveNode.model && runKnownFailedModels.has(liveNode.model) && altModel);
+      const diagWantsSwitch =
+        structuredDiag?.parsedJson && structuredDiag.strategy === 'switch_model' && Boolean(altModel);
+      const diagWantsSplit =
+        structuredDiag?.parsedJson &&
+        structuredDiag.strategy === 'split_subgraph' &&
+        !liveNode.nodeKey.includes('__split');
+
+      // 1. Transient retry on same model (first failure, unless model already failed out or diagnosis escalates)
+      if (canRetrySame && !diagWantsSwitch && !diagWantsSplit) {
         if (liveNode.status !== SWARM_NODE_STATES.FAILED) {
           transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.FAILED, {
             emitEvent: false,
             patch: { errorCode, errorMessage },
           });
+        }
+        if (diagPatchText || diagAvoidText) {
+          const nextObj = `${liveNode.objective}${diagPatchText}${diagAvoidText}`.slice(0, 4000);
+          this.store.db
+            .prepare('UPDATE swarm_nodes SET objective=? WHERE id=?')
+            .run(nextObj, liveNode.id);
         }
         updatedNode = transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.READY, {
           emitEvent: false,
@@ -521,13 +989,19 @@ export class DynamicReplanner {
         reason = errorMessage || errorCode || 'transient failure retry';
         diff = { nodeKey: liveNode.nodeKey, attempts };
       } else {
-        // 2. Switch to an alternate untried healthy model if available
-        if (altModel) {
+        // 2. Switch to an alternate untried healthy model if available (unless diagnosis explicitly calls for split_subgraph)
+        if (altModel && !diagWantsSplit) {
           if (liveNode.status !== SWARM_NODE_STATES.FAILED) {
             transitionSwarmNode(this.store, null, liveNode.id, SWARM_NODE_STATES.FAILED, {
               emitEvent: false,
               patch: { errorCode, errorMessage },
             });
+          }
+          if (diagPatchText || diagAvoidText) {
+            const nextObj = `${liveNode.objective}${diagPatchText}${diagAvoidText}`.slice(0, 4000);
+            this.store.db
+              .prepare('UPDATE swarm_nodes SET objective=? WHERE id=?')
+              .run(nextObj, liveNode.id);
           }
           updatedNode = transitionSwarmNode(
             this.store,
@@ -576,11 +1050,12 @@ export class DynamicReplanner {
           const deps = parseJsonSafe(liveNode.dependenciesJson, []);
           const s1Key = `${liveNode.nodeKey}__split1_v${nextVersion}`.slice(0, 64);
           const s2Key = `${liveNode.nodeKey}__split2_v${nextVersion}`.slice(0, 64);
+          const extraSplitGuidance = `${diagPatchText}${diagAvoidText}`;
           const subNodes = [
             {
               nodeKey: s1Key,
               taskType: 'research',
-              objective: `[拆分子步骤 1/2] 先只读梳理并准备上下文：${liveNode.objective}`,
+              objective: `[拆分子步骤 1/2] 先只读梳理并准备上下文：${liveNode.objective}${extraSplitGuidance}`.slice(0, 4000),
               acceptance: '产出缩小范围的具体信息与改动前置条件',
               dependencies: deps,
               priority: Number(liveNode.priority ?? 0) + 2,
@@ -590,7 +1065,7 @@ export class DynamicReplanner {
             {
               nodeKey: s2Key,
               taskType: liveNode.taskType || 'research',
-              objective: `[拆分子步骤 2/2] 基于前置结论完成剩余目标：${liveNode.objective}`,
+              objective: `[拆分子步骤 2/2] 基于前置结论完成剩余目标：${liveNode.objective}${extraSplitGuidance}`.slice(0, 4000),
               acceptance: liveNode.acceptance,
               dependencies: [s1Key],
               priority: Number(liveNode.priority ?? 0) + 1,
@@ -704,6 +1179,19 @@ export class DynamicReplanner {
 
       if (diagnosisNote) {
         diff = { ...diff, diagnosis: diagnosisNote.slice(0, 500) };
+      }
+      if (structuredDiag) {
+        diff = { ...diff, structuredDiagnosis: structuredDiag };
+      }
+      if (diagnosisResult?.evidence) {
+        diff = {
+          ...diff,
+          evidenceSummary: {
+            failedReceipts: diagnosisResult.evidence.failedReceipts.length,
+            modifiedFiles: diagnosisResult.evidence.modifiedFiles.slice(0, 10),
+            priorStrategies: diagnosisResult.evidence.priorStrategies,
+          },
+        };
       }
 
       return this.#finalizeReplanInTx({

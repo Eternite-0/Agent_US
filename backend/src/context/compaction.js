@@ -15,6 +15,108 @@ function parseJsonSafe(str, fallback) {
 const CONSTRAINT_RE =
   /(?:必须|不要|禁止|务必|严格|保留|只能|不能|never|must|do not|don't|always|constraint|require)/i;
 
+const ACCEPTANCE_RE =
+  /(?:acceptance(?:\s+criteria)?|done\s+when|success\s+criteria|exit\s+criteria|verification\s+criteria|验收标准|完成条件|验收要求|通过条件|must\s+pass|0\s+fail(?:ures)?|0\s+skips?|npm\s+(?:test|run\s+(?:check|build|test))|node\s+--test|tsc\s+--noEmit)/i;
+
+const VERIFICATION_CMD_RE =
+  /(?:\b(?:npm\s+(?:test|run\s+(?:check|build|test|lint|typecheck|verify))|pnpm\s+(?:test|check|build)|yarn\s+(?:test|check|build)|node\s+--test|node\s+--check|npx\s+tsc|tsc\b|vitest|jest|mocha|pytest|unittest|cargo\s+(?:test|check)|go\s+test|mvn\s+test|gradle\s+test|eslint)\b)/i;
+
+const FAILURE_LINE_RE =
+  /(?:AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|FAIL\b|FAILED|✖\s|not ok \d+|TS\d{4,5}:|error\[E\d+\]|参数校验失败|安全策略拦截|Error:\s|Traceback)/i;
+
+function safeGet(db, sql, ...params) {
+  if (!db || typeof db.prepare !== 'function') return null;
+  try {
+    return db.prepare(sql).get(...params) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function safeAll(db, sql, ...params) {
+  if (!db || typeof db.prepare !== 'function') return [];
+  try {
+    const rows = db.prepare(sql).all(...params);
+    return Array.isArray(rows) ? rows : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseExitCode(text) {
+  const m = String(text ?? '').match(/(?:exitCode|exit\s+code)[:=\s]+(-?\d+)/i);
+  if (!m) return null;
+  const code = Number(m[1]);
+  return Number.isInteger(code) ? code : null;
+}
+
+function extractFailureExcerpt(content, maxLen = 280) {
+  const lines = String(content ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return '';
+  const diagLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (FAILURE_LINE_RE.test(lines[i])) {
+      diagLines.push(lines[i]);
+      if (lines[i + 1] && !diagLines.includes(lines[i + 1])) {
+        diagLines.push(lines[i + 1]);
+      }
+      if (diagLines.length >= 4) break;
+    }
+  }
+  const chosen = diagLines.length
+    ? diagLines.join(' | ')
+    : lines.filter((l) => !/^exitCode:/i.test(l)).slice(-3).join(' | ');
+  return chosen.slice(0, maxLen);
+}
+
+function normalizeErrorSignature(excerpt) {
+  return String(excerpt ?? '')
+    .replace(/\b[0-9a-f]{8,64}\b/gi, '<hex>')
+    .replace(/\b\d{4,}\b/g, '<num>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+}
+
+function extractModifiedFilesFromToolCalls(msgRows, existingPaths) {
+  const extra = [];
+  const seen = new Set(existingPaths);
+  for (const r of msgRows) {
+    if (r.role !== 'assistant' || !r.toolCalls) continue;
+    const calls = parseJsonSafe(r.toolCalls, []);
+    if (!Array.isArray(calls)) continue;
+    for (const tc of calls) {
+      const name = String(tc?.name || '');
+      const args =
+        typeof tc?.arguments === 'string'
+          ? parseJsonSafe(tc.arguments, {})
+          : tc?.arguments ?? {};
+      if (name === 'write_file' || name === 'edit_file') {
+        const p = String(args?.path ?? args?.filePath ?? '').trim();
+        if (p && !seen.has(p)) {
+          seen.add(p);
+          extra.push({ path: p, action: name === 'write_file' ? 'created' : 'modified' });
+        }
+      } else if (name === 'apply_patch') {
+        const patchText = String(args?.patch ?? args?.input ?? '');
+        const matches = patchText.matchAll(/^\*\*\*\s+(Add|Update|Delete)\s+File:\s*(.+)$/gm);
+        for (const m of matches) {
+          const p = String(m[2] || '').trim();
+          if (p && !seen.has(p)) {
+            seen.add(p);
+            const act = m[1] === 'Add' ? 'created' : m[1] === 'Delete' ? 'deleted' : 'modified';
+            extra.push({ path: p, action: act });
+          }
+        }
+      }
+    }
+  }
+  return extra;
+}
+
 /**
  * Layer 5 Non-Destructive MultiStageCompactor.
  * Never deletes rows from `direct_messages`; persists structured compaction records
@@ -28,68 +130,270 @@ export class MultiStageCompactor {
   }
 
   /**
-   * Deterministically extracts critical task goals, user constraints, active plan,
-   * modified files, and tool evidence URIs so compaction never loses execution state.
+   * Deterministically extracts critical task goals, acceptance criteria, user constraints,
+   * active plan, modified files, verification ledger, falsified attempts, and tool evidence
+   * so compaction never loses execution state.
    */
   extractTaskStateAnchor(sessionId) {
-    if (!this.store?.db || !sessionId) {
+    if (!this.store?.db || typeof this.store.db.prepare !== 'function' || !sessionId) {
       return {
         goal: '',
+        acceptanceCriteria: [],
         constraints: [],
         activePlan: null,
         modifiedFiles: [],
+        verificationLedger: [],
+        falsifiedAttempts: [],
         evidence: [],
+        artifactUris: [],
       };
     }
 
-    const sess = this.store.db
-      .prepare('SELECT title, planJson, workspaceRoot FROM direct_sessions WHERE id=?')
-      .get(sessionId);
-    const userMsgs = this.store.db
-      .prepare("SELECT content FROM direct_messages WHERE sessionId=? AND role='user' ORDER BY seq ASC")
-      .all(sessionId);
-    const goal = userMsgs[0]?.content?.slice(0, 600) ?? sess?.title ?? '';
+    const db = this.store.db;
+    const sess = safeGet(
+      db,
+      'SELECT title, planJson, workspaceRoot FROM direct_sessions WHERE id=?',
+      sessionId,
+    );
+    const userMsgs = safeAll(
+      db,
+      "SELECT content FROM direct_messages WHERE sessionId=? AND role='user' ORDER BY seq ASC",
+      sessionId,
+    );
+    const goal = String(userMsgs[0]?.content ?? sess?.title ?? '')
+      .trim()
+      .slice(0, 1200);
 
+    const activePlan = parseJsonSafe(sess?.planJson, null);
     const constraints = [];
+    const acceptanceCriteria = [];
+    if (Array.isArray(activePlan?.verificationCriteria)) {
+      for (const vc of activePlan.verificationCriteria) {
+        const text =
+          typeof vc === 'string'
+            ? vc.trim()
+            : String(vc?.description ?? vc?.title ?? '').trim();
+        if (text) acceptanceCriteria.push(text.slice(0, 300));
+      }
+    }
+
     for (const m of userMsgs) {
       for (const line of String(m.content || '').split(/\r?\n/)) {
         const trimmed = line.trim();
-        if (trimmed.length >= 6 && CONSTRAINT_RE.test(trimmed)) {
-          constraints.push(trimmed.slice(0, 240));
+        if (trimmed.length < 6) continue;
+        if (CONSTRAINT_RE.test(trimmed)) {
+          constraints.push(trimmed.slice(0, 300));
+        }
+        if (ACCEPTANCE_RE.test(trimmed)) {
+          acceptanceCriteria.push(trimmed.slice(0, 300));
         }
       }
     }
 
-    const snaps = this.store.db
-      .prepare('SELECT DISTINCT path, existed FROM turn_snapshots WHERE sessionId=?')
-      .all(sessionId);
+    const snaps = safeAll(
+      db,
+      'SELECT DISTINCT path, existed FROM turn_snapshots WHERE sessionId=?',
+      sessionId,
+    );
     const modifiedFiles = snaps.map((s) => ({
       path: s.path,
       action: s.existed ? 'modified' : 'created',
     }));
 
-    const receipts = this.store.db
-      .prepare(
-        `SELECT toolName, status, exitCode, effectClass
-         FROM tool_receipts WHERE sessionId=? ORDER BY createdAt DESC LIMIT 20`,
-      )
-      .all(sessionId);
+    const receipts = safeAll(
+      db,
+      `SELECT callId, toolName, status, exitCode, errorCode, effectClass
+       FROM tool_receipts WHERE sessionId=? ORDER BY createdAt DESC LIMIT 50`,
+      sessionId,
+    );
+    const receiptByCallId = new Map();
+    for (const r of receipts) {
+      if (r?.callId && !receiptByCallId.has(r.callId)) {
+        receiptByCallId.set(r.callId, r);
+      }
+    }
 
-    const msgTexts = this.store.db
-      .prepare('SELECT content FROM direct_messages WHERE sessionId=? ORDER BY seq DESC LIMIT 30')
-      .all(sessionId);
+    const msgRowsDesc = safeAll(
+      db,
+      `SELECT seq, turnId, role, content, toolCalls, toolCallId, toolName, meta, createdAt
+       FROM direct_messages WHERE sessionId=? ORDER BY seq DESC LIMIT 300`,
+      sessionId,
+    );
+    const msgRows = [...msgRowsDesc].reverse();
+
+    const extraFiles = extractModifiedFilesFromToolCalls(
+      msgRows,
+      modifiedFiles.map((f) => f.path),
+    );
+    const allModifiedFiles = [...modifiedFiles, ...extraFiles].slice(0, 40);
+
+    const callInfoById = new Map();
+    for (const r of msgRows) {
+      if (r.role !== 'assistant' || !r.toolCalls) continue;
+      const calls = parseJsonSafe(r.toolCalls, []);
+      if (!Array.isArray(calls)) continue;
+      for (const tc of calls) {
+        if (!tc?.id) continue;
+        const args =
+          typeof tc.arguments === 'string'
+            ? parseJsonSafe(tc.arguments, {})
+            : tc.arguments ?? {};
+        callInfoById.set(tc.id, {
+          name: String(tc.name || ''),
+          args: args && typeof args === 'object' ? args : {},
+        });
+      }
+    }
+
+    const verificationByCmd = new Map();
+    const falsifiedMap = new Map();
+
+    for (const r of msgRows) {
+      if (r.role !== 'tool') continue;
+      const callInfo = r.toolCallId ? callInfoById.get(r.toolCallId) : null;
+      const toolName = String(r.toolName || callInfo?.name || '');
+      const args = callInfo?.args ?? {};
+      const content = String(r.content || '');
+      const meta = parseJsonSafe(r.meta, {});
+      const receipt = r.toolCallId ? receiptByCallId.get(r.toolCallId) : null;
+
+      const command = String(
+        args.command ??
+          (Array.isArray(args.argv) ? args.argv.join(' ') : '') ??
+          args.cmd ??
+          '',
+      ).trim();
+      const lowerTool = toolName.toLowerCase();
+      const isShell =
+        lowerTool === 'bash' ||
+        lowerTool === 'shell' ||
+        lowerTool === 'pty' ||
+        lowerTool === 'read_process_output';
+
+      const parsedExit = parseExitCode(content);
+      const exitCode =
+        parsedExit !== null
+          ? parsedExit
+          : receipt?.exitCode !== undefined && receipt?.exitCode !== null
+            ? Number(receipt.exitCode)
+            : meta?.isError === true
+              ? 1
+              : receipt?.status === 'finished'
+                ? 0
+                : null;
+      const hasFailMarkers = FAILURE_LINE_RE.test(content);
+      const isFailed =
+        (exitCode !== null && exitCode !== 0) ||
+        meta?.isError === true ||
+        receipt?.status === 'failed' ||
+        receipt?.status === 'rejected_before_effect' ||
+        hasFailMarkers;
+      const isPassed =
+        !isFailed &&
+        (exitCode === 0 || (receipt?.status === 'finished' && meta?.isError !== true));
+
+      const isVerification =
+        VERIFICATION_CMD_RE.test(command) ||
+        VERIFICATION_CMD_RE.test(content.slice(0, 400)) ||
+        lowerTool.includes('verify') ||
+        lowerTool.includes('test') ||
+        (isShell && (Boolean(command) || exitCode !== null));
+
+      if (isVerification) {
+        const key = command || `${toolName}#${r.toolCallId || r.seq}`;
+        const status = isFailed ? 'fail' : isPassed ? 'pass' : 'unknown';
+        verificationByCmd.set(key, {
+          command: command || toolName,
+          tool: toolName || 'bash',
+          exitCode,
+          status,
+          passed: status === 'pass',
+          failureExcerpt: status === 'fail' ? extractFailureExcerpt(content, 280) : '',
+          seq: r.seq ?? null,
+        });
+      }
+
+      if (isFailed) {
+        const excerpt = extractFailureExcerpt(content, 240);
+        const target = String(
+          command || args.path || args.filePath || args.pattern || toolName || 'tool',
+        ).slice(0, 160);
+        const signature = normalizeErrorSignature(excerpt || `${toolName}:${exitCode ?? 'err'}`);
+        const fKey = `${lowerTool}|${target}|${signature}`;
+        const prev = falsifiedMap.get(fKey);
+        if (prev) {
+          prev.count += 1;
+          prev.repeated = true;
+          prev.lastSeq = r.seq ?? prev.lastSeq;
+          if (excerpt) prev.excerpt = excerpt;
+        } else {
+          falsifiedMap.set(fKey, {
+            tool: toolName || 'unknown',
+            target,
+            errorSignature: signature,
+            excerpt,
+            exitCode,
+            count: 1,
+            repeated: false,
+            lastSeq: r.seq ?? null,
+          });
+        }
+      }
+    }
+
+    if (Array.isArray(activePlan?.hypotheses)) {
+      for (const h of activePlan.hypotheses) {
+        if (
+          h &&
+          typeof h === 'object' &&
+          (h.status === 'falsified' || h.status === 'rejected')
+        ) {
+          const stmt = String(h.statement ?? h.title ?? h.id ?? '').trim();
+          if (stmt) {
+            const key = `hypothesis|${stmt.slice(0, 120)}`;
+            if (!falsifiedMap.has(key)) {
+              falsifiedMap.set(key, {
+                tool: 'update_plan',
+                target: stmt.slice(0, 160),
+                errorSignature: String(h.evidence || h.status).slice(0, 160),
+                excerpt: String(h.evidence || stmt).slice(0, 240),
+                exitCode: null,
+                count: 1,
+                repeated: false,
+                lastSeq: null,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    const verificationLedger = [...verificationByCmd.values()]
+      .sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0))
+      .slice(-10);
+
+    const falsifiedAttempts = [...falsifiedMap.values()]
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count;
+        return Number(b.lastSeq ?? 0) - Number(a.lastSeq ?? 0);
+      })
+      .slice(0, 10);
+
     const artifactUris = new Set();
-    for (const m of msgTexts) {
+    for (const m of msgRows.slice(-40)) {
       const matches = String(m.content || '').match(/artifact:\/\/[0-9a-f]{64}/g);
       if (matches) matches.forEach((u) => artifactUris.add(u));
     }
 
     return {
       goal,
-      constraints: [...new Set(constraints)].slice(0, 12),
-      activePlan: parseJsonSafe(sess?.planJson, null),
-      modifiedFiles: modifiedFiles.slice(0, 30),
-      evidence: receipts.map((r) => ({
+      acceptanceCriteria: [...new Set(acceptanceCriteria)].slice(0, 12),
+      constraints: [...new Set(constraints)].slice(0, 16),
+      activePlan,
+      modifiedFiles: allModifiedFiles,
+      verificationLedger,
+      falsifiedAttempts,
+      evidence: receipts.slice(0, 20).map((r) => ({
         tool: r.toolName,
         status: r.status,
         exitCode: r.exitCode,
@@ -100,14 +404,18 @@ export class MultiStageCompactor {
   }
 
   getActiveCompaction(sessionId) {
-    if (!this.store?.db || !sessionId) return null;
-    const sess = this.store.db
-      .prepare('SELECT activeCompactionId FROM direct_sessions WHERE id=?')
-      .get(sessionId);
+    if (!this.store?.db || typeof this.store.db.prepare !== 'function' || !sessionId) return null;
+    const sess = safeGet(
+      this.store.db,
+      'SELECT activeCompactionId FROM direct_sessions WHERE id=?',
+      sessionId,
+    );
     if (!sess?.activeCompactionId) return null;
-    const row = this.store.db
-      .prepare('SELECT * FROM context_compactions WHERE id=?')
-      .get(sess.activeCompactionId);
+    const row = safeGet(
+      this.store.db,
+      'SELECT * FROM context_compactions WHERE id=?',
+      sess.activeCompactionId,
+    );
     if (!row) return null;
     return {
       ...row,
@@ -117,20 +425,24 @@ export class MultiStageCompactor {
   }
 
   listCompactions(sessionId) {
-    if (!this.store?.db || !sessionId) return [];
-    return this.store.db
-      .prepare('SELECT * FROM context_compactions WHERE sessionId=? ORDER BY createdAt DESC')
-      .all(sessionId)
-      .map((r) => ({
-        ...r,
-        taskState: parseJsonSafe(r.taskStateJson, {}),
-        preservedConstraints: parseJsonSafe(r.preservedConstraintsJson, []),
-      }));
+    if (!this.store?.db || typeof this.store.db.prepare !== 'function' || !sessionId) return [];
+    return safeAll(
+      this.store.db,
+      'SELECT * FROM context_compactions WHERE sessionId=? ORDER BY createdAt DESC',
+      sessionId,
+    ).map((r) => ({
+      ...r,
+      taskState: parseJsonSafe(r.taskStateJson, {}),
+      preservedConstraints: parseJsonSafe(r.preservedConstraintsJson, []),
+    }));
   }
 
   formatAnchorText(summaryText, taskState) {
     const parts = [`[历史上下文摘要]\n${summaryText || '(无额外文本摘要)'}`];
     if (taskState?.goal) parts.push(`任务目标: ${taskState.goal}`);
+    if (taskState?.acceptanceCriteria?.length) {
+      parts.push(`验收标准:\n- ${taskState.acceptanceCriteria.join('\n- ')}`);
+    }
     if (taskState?.constraints?.length) {
       parts.push(`关键约束:\n- ${taskState.constraints.join('\n- ')}`);
     }
@@ -140,10 +452,42 @@ export class MultiStageCompactor {
       );
       parts.push(`任务计划:\n${planLines.join('\n')}`);
     }
+    if (taskState?.activePlan?.hypotheses?.length) {
+      const hypLines = taskState.activePlan.hypotheses.map((h) =>
+        typeof h === 'string'
+          ? `- ${h}`
+          : `- [${h.status || 'active'}] ${h.statement || h.title || h.id || ''}${h.evidence ? ` (${h.evidence})` : ''}`,
+      );
+      parts.push(`当前假设:\n${hypLines.join('\n')}`);
+    }
+    if (taskState?.activePlan?.blockers?.length) {
+      const blkLines = taskState.activePlan.blockers.map((b) =>
+        typeof b === 'string'
+          ? `- ${b}`
+          : `- [${b.severity || 'medium'}] ${b.description || b.title || b.id || ''}`,
+      );
+      parts.push(`当前阻塞项:\n${blkLines.join('\n')}`);
+    }
     if (taskState?.modifiedFiles?.length) {
       parts.push(
         `已改动文件: ${taskState.modifiedFiles.map((f) => `${f.path}(${f.action})`).join(', ')}`,
       );
+    }
+    if (taskState?.verificationLedger?.length) {
+      const vLines = taskState.verificationLedger.map((v) => {
+        const badge = String(v.status || 'unknown').toUpperCase();
+        const code = v.exitCode !== null && v.exitCode !== undefined ? ` exit=${v.exitCode}` : '';
+        const err = v.failureExcerpt ? ` :: ${v.failureExcerpt}` : '';
+        return `- [${badge}${code}] ${v.command}${err}`;
+      });
+      parts.push(`验证台账:\n${vLines.join('\n')}`);
+    }
+    if (taskState?.falsifiedAttempts?.length) {
+      const fLines = taskState.falsifiedAttempts.map((f) => {
+        const repeatTag = f.count > 1 ? ` (repeated ${f.count}x)` : '';
+        return `- [${f.tool}] ${f.target}${repeatTag}: ${f.errorSignature || f.excerpt}`;
+      });
+      parts.push(`已证伪尝试与重复错误:\n${fLines.join('\n')}`);
     }
     if (taskState?.evidence?.length) {
       parts.push(

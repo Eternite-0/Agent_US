@@ -74,6 +74,17 @@ export const feedbackSchema = z.object({
   latencyMs: z.number().int().nonnegative().default(0),
   effectsApplied: z.array(z.string().trim().min(1).max(128)).max(128).default([]),
   evidence: stringList.default([]),
+  planVersion: z.number().int().positive().optional(),
+  replanAttempt: z.boolean().optional(),
+  isReplan: z.boolean().optional(),
+  replanStrategy: z.string().trim().min(1).max(128).optional(),
+  strategy: z.string().trim().min(1).max(128).optional(),
+  recoveredAfterReplan: z.boolean().optional(),
+  recovered: z.boolean().optional(),
+  avoidedRepeatFailure: z.boolean().optional(),
+  degenerateReplanBlocked: z.boolean().optional(),
+  priorFailureTaskKey: z.string().trim().min(1).max(64).optional(),
+  failureSignature: z.string().trim().min(1).max(256).optional(),
 }).strict();
 
 export function parseSchema(schema, value, code = 'PLANNER_SCHEMA_INVALID') {
