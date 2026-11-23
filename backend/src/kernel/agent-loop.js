@@ -18,6 +18,7 @@ import {
 } from './contract-reasoning.js';
 import { resolveTurnOutcome } from './verdict.js';
 import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
+import { selectOffloadableAciCandidates } from '../context/aci-engine.js';
 import {
   BUDGET_SCOPES,
   estimateRequestInputTokens,
@@ -80,57 +81,6 @@ function aciPathsMatch(a, b) {
   const nb = normalizeAciPath(b);
   if (!na || !nb) return false;
   return na === nb || na.endsWith(`/${nb}`) || nb.endsWith(`/${na}`);
-}
-
-function extractAciSupervisorCandidates(messages = [], currentStep = 0) {
-  const toolCallsById = new Map();
-  let stepCounter = 0;
-  for (const m of messages ?? []) {
-    if (m?.role === 'assistant') {
-      stepCounter += 1;
-      for (const b of m.content ?? []) {
-        if (b?.type === 'tool-call' && b.id) {
-          let args = {};
-          if (typeof b.arguments === 'string') {
-            try {
-              const parsed = JSON.parse(b.arguments);
-              if (parsed && typeof parsed === 'object') args = parsed;
-            } catch {
-              args = {};
-            }
-          } else if (b.arguments && typeof b.arguments === 'object') {
-            args = b.arguments;
-          }
-          toolCallsById.set(b.id, { name: String(b.name ?? ''), args, step: stepCounter });
-        }
-      }
-    }
-  }
-  const candidates = [];
-  for (let i = 0; i < (messages ?? []).length; i += 1) {
-    const m = messages[i];
-    if (m?.role !== 'tool') continue;
-    const text = (m.content ?? [])
-      .filter((b) => b?.type === 'text' && typeof b.text === 'string')
-      .map((b) => b.text)
-      .join('\n');
-    if (!text || text.startsWith('[ACI-REF ') || text.length < 600) continue;
-    const tc = m.toolCallId ? toolCallsById.get(m.toolCallId) : null;
-    const path = String(
-      tc?.args?.path ?? tc?.args?.filePath ?? tc?.args?.file ?? tc?.name ?? m.toolName ?? 'tool',
-    ).trim();
-    const ageSteps = Math.max(0, Number(currentStep || stepCounter) - Number(tc?.step ?? stepCounter));
-    candidates.push({
-      id: m.toolCallId || `tool_msg_${i}`,
-      refId: m.toolCallId || `tool_msg_${i}`,
-      path,
-      tokens: Math.ceil(text.length / 4),
-      ageSteps,
-      hasError: Boolean(m?.isError || /\b(error|failed|assertionerror|typeerror|syntaxerror)\b/i.test(text.slice(0, 600))),
-      excerpt: text.slice(0, 260),
-    });
-  }
-  return candidates;
 }
 
 function computeActiveCriticalContextRecall({ criticalFiles = [], reasoningTracker, aciStore = null, ledger = null } = {}) {
@@ -752,64 +702,81 @@ export class AgentLoop {
             contextWindow: epochContextWindow,
           });
           if (epochProbe?.triggered) {
-            let keepRefs = [];
-            let compressRefs = [];
-            const candidates = extractAciSupervisorCandidates(requestOptions.messages, steps);
-            if (aci.supervisor && candidates.length > 0) {
-              const supStatus = aci.supervisor.getConfig?.() ?? null;
-              if (supStatus) {
-                aciSupervisorMode = supStatus.enabled ? supStatus.mode : 'off';
-              }
-              const lastErrFp = reasoningTracker.errorFingerprints.at(-1)?.summary ?? '';
-              const supRes = await aci.supervisor
-                .supervise({
-                  query: input,
-                  candidates,
-                  errorSummary: lastErrFp,
-                  budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
-                  signal,
-                })
-                .catch(() => null);
-              if (supRes && !supRes.bypassed) {
-                if (supRes.model) {
-                  aciSupervisorCalls += 1;
-                  aciSupervisorModel = supRes.model;
-                }
-                keepRefs = Array.isArray(supRes.keepRefs) ? supRes.keepRefs : [];
-                compressRefs = Array.isArray(supRes.compressRefs) ? supRes.compressRefs : [];
-              }
-            }
-            const compResult = aci.engine.compress(requestOptions.messages, {
+            const activeMutationTargets = [...reasoningTracker.filesMutated];
+            const eligibleCandidates = selectOffloadableAciCandidates(requestOptions.messages, {
               currentStep: steps,
-              tools: requestOptions.tools,
-              cumulativeUsedTokens,
-              contextWindow: epochContextWindow,
-              keepRefs,
-              compressRefs,
-              activeMutationTargets: [...reasoningTracker.filesMutated],
+              singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
+              singleStepBudget: aci.engine.singleStepBudget,
+              activeMutationTargets,
             });
-            if (compResult?.triggered && compResult.pairClosedValid !== false && Array.isArray(compResult.messages)) {
-              messages = [...compResult.messages];
-              requestOptions = { ...requestOptions, messages };
-              this.eventRouter.emitPersisted({
-                sessionId,
-                turnId,
-                type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
-                data: {
-                  stage: 'aci_dtoc',
-                  reason: compResult.reason,
-                  epoch: compResult.epoch,
-                  watermark: compResult.watermark,
-                  step: steps,
-                  compressedCount: compResult.compressedCount,
-                  tokens: {
-                    before: compResult.tokensBefore,
-                    after: compResult.tokensAfter,
-                  },
-                  pairClosedValid: compResult.pairClosedValid,
-                },
-                audit: false,
+            if (eligibleCandidates.length > 0) {
+              let keepRefs = [];
+              let compressRefs = [];
+              const totalEligibleChars = eligibleCandidates.reduce(
+                (sum, c) => sum + (Number(c.chars) || 0),
+                0,
+              );
+              if (
+                aci.supervisor &&
+                eligibleCandidates.length >= 2 &&
+                totalEligibleChars >= 2400 &&
+                aciSupervisorCalls < 2
+              ) {
+                const supStatus = aci.supervisor.getConfig?.() ?? null;
+                if (supStatus) {
+                  aciSupervisorMode = supStatus.enabled ? supStatus.mode : 'off';
+                }
+                const lastErrFp = reasoningTracker.errorFingerprints.at(-1)?.summary ?? '';
+                const supRes = await aci.supervisor
+                  .supervise({
+                    query: input,
+                    candidates: eligibleCandidates,
+                    errorSummary: lastErrFp,
+                    budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
+                    signal,
+                  })
+                  .catch(() => null);
+                if (supRes && !supRes.bypassed) {
+                  if (supRes.model) {
+                    aciSupervisorCalls += 1;
+                    aciSupervisorModel = supRes.model;
+                  }
+                  keepRefs = Array.isArray(supRes.keepRefs) ? supRes.keepRefs : [];
+                  compressRefs = Array.isArray(supRes.compressRefs) ? supRes.compressRefs : [];
+                }
+              }
+              const compResult = aci.engine.compress(requestOptions.messages, {
+                currentStep: steps,
+                tools: requestOptions.tools,
+                cumulativeUsedTokens,
+                contextWindow: epochContextWindow,
+                keepRefs,
+                compressRefs,
+                activeMutationTargets,
               });
+              if (compResult?.triggered && compResult.pairClosedValid !== false && Array.isArray(compResult.messages)) {
+                messages = [...compResult.messages];
+                requestOptions = { ...requestOptions, messages };
+                this.eventRouter.emitPersisted({
+                  sessionId,
+                  turnId,
+                  type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
+                  data: {
+                    stage: 'aci_dtoc',
+                    reason: compResult.reason,
+                    epoch: compResult.epoch,
+                    watermark: compResult.watermark,
+                    step: steps,
+                    compressedCount: compResult.compressedCount,
+                    tokens: {
+                      before: compResult.tokensBefore,
+                      after: compResult.tokensAfter,
+                    },
+                    pairClosedValid: compResult.pairClosedValid,
+                  },
+                  audit: false,
+                });
+              }
             }
           }
           syncAciMetrics();

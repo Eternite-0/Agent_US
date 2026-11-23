@@ -15,8 +15,10 @@ export const DEFAULT_ACI_WEIGHTS = Object.freeze({
   recency: 0.08,
 });
 
-export const DEFAULT_EPOCH_WATERMARKS = Object.freeze([0.45, 0.7, 0.85]);
+export const DEFAULT_EPOCH_WATERMARKS = Object.freeze([0.6, 0.82]);
 export const DEFAULT_SINGLE_STEP_BUDGET = 8000;
+export const DEFAULT_DTOC_MIN_CHARS = 700;
+export const DEFAULT_DTOC_SUPERSEDED_MIN_CHARS = 600;
 export const ACON_SETTINGS_KEY = 'aci.learned_guidelines';
 export const ACON_MAX_GUIDELINES = 12;
 
@@ -209,29 +211,91 @@ function parseToolArgs(rawArgs) {
   }
 }
 
-function extractMutationPathsFromMessages(messages) {
-  const mutated = new Set();
-  for (const m of messages ?? []) {
+function extractPathsFromMutationToolCall(name, args) {
+  const paths = [];
+  if (name === 'apply_patch') {
+    const patchText = String(args?.patch ?? args?.input ?? '');
+    for (const match of patchText.matchAll(/^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+)$/gm)) {
+      const norm = normalizeContextPath(match[1]);
+      if (norm) paths.push(norm);
+    }
+  } else {
+    const rawPath = args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '';
+    const norm = normalizeContextPath(rawPath);
+    if (norm) paths.push(norm);
+  }
+  return paths;
+}
+
+function assignMessageSteps(srcMessages = [], currentStep = undefined) {
+  const msgSteps = [];
+  let stepCounter = 0;
+  for (const m of srcMessages) {
+    if (m?.step != null && m.step !== '' && Number.isFinite(Number(m.step))) {
+      stepCounter = Math.max(stepCounter, Number(m.step));
+      msgSteps.push(Number(m.step));
+    } else {
+      if (m?.role === 'assistant') stepCounter += 1;
+      msgSteps.push(stepCounter);
+    }
+  }
+  const effectiveCurrentStep =
+    currentStep != null && currentStep !== '' && Number.isFinite(Number(currentStep))
+      ? Number(currentStep)
+      : stepCounter;
+  return { msgSteps, effectiveCurrentStep };
+}
+
+function indexToolCallsAndMutations(srcMessages = [], msgSteps = [], activeMutationTargets = []) {
+  const toolCallsById = new Map();
+  const activeMutations = new Set();
+  const lastMutationStepByPath = new Map();
+
+  for (let i = 0; i < srcMessages.length; i += 1) {
+    const m = srcMessages[i];
     if (m?.role !== 'assistant') continue;
+    const step = msgSteps[i] ?? 0;
     for (const b of m.content ?? []) {
       if (b?.type !== 'tool-call') continue;
-      const name = String(b.name || '').toLowerCase();
-      if (!MUTATION_TOOLS.has(name)) continue;
+      const toolName = String(b.name || '').trim();
+      const lower = toolName.toLowerCase();
       const args = parseToolArgs(b.arguments);
-      if (name === 'apply_patch') {
-        const patchText = String(args.patch ?? args.input ?? '');
-        for (const match of patchText.matchAll(/^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+)$/gm)) {
-          const norm = normalizeContextPath(match[1]);
-          if (norm) mutated.add(norm);
+      if (b.id) {
+        toolCallsById.set(b.id, { name: toolName, args, step });
+      }
+      if (MUTATION_TOOLS.has(lower)) {
+        for (const norm of extractPathsFromMutationToolCall(lower, args)) {
+          activeMutations.add(norm);
+          const prev = lastMutationStepByPath.get(norm) ?? -1;
+          if (step > prev) lastMutationStepByPath.set(norm, step);
         }
-      } else {
-        const rawPath = args.path ?? args.filePath ?? args.file ?? args.target_file ?? '';
-        const norm = normalizeContextPath(rawPath);
-        if (norm) mutated.add(norm);
       }
     }
   }
-  return mutated;
+
+  for (const p of activeMutationTargets ?? []) {
+    const norm = normalizeContextPath(p);
+    if (norm) activeMutations.add(norm);
+  }
+
+  return { toolCallsById, activeMutations, lastMutationStepByPath };
+}
+
+function findLastMutationStep(rawFilePath, lastMutationStepByPath) {
+  const norm = normalizeContextPath(rawFilePath);
+  if (!norm || !lastMutationStepByPath?.size) return -1;
+  let maxStep = -1;
+  for (const [mutPath, mutStep] of lastMutationStepByPath.entries()) {
+    if (norm === mutPath || norm.endsWith(`/${mutPath}`) || mutPath.endsWith(`/${norm}`)) {
+      if (mutStep > maxStep) maxStep = mutStep;
+    }
+  }
+  return maxStep;
+}
+
+function extractMutationPathsFromMessages(messages) {
+  const { msgSteps } = assignMessageSteps(messages);
+  return indexToolCallsAndMutations(messages, msgSteps).activeMutations;
 }
 
 function extractLocalContextCoverage(localContextMessages = [], activeDiff = '', coveredPaths = [], coveredSymbols = []) {
@@ -738,8 +802,195 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
 }
 
 /**
+ * Shared eligibility evaluator used by both `selectOffloadableAciCandidates` and
+ * `compressMessagesEpoch` so Supervisor gating and DTOC execution never diverge.
+ */
+export function evaluateToolMessageEligibility(
+  msg,
+  {
+    index = 0,
+    toolCallsById,
+    activeMutations,
+    lastMutationStepByPath,
+    effectiveCurrentStep = 0,
+    fallbackStep = 0,
+    compressibleTools = COMPRESSIBLE_TOOLS,
+    minAgeSteps = 3,
+    minChars = DEFAULT_DTOC_MIN_CHARS,
+    supersededMinAgeSteps = 2,
+    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
+    singleStepTriggered = false,
+    singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
+    keepSet = new Set(),
+    preferCompressSet = new Set(),
+  } = {},
+) {
+  if (!msg || msg.role !== 'tool') {
+    return { eligible: false, skipReason: 'not_tool' };
+  }
+  const tc = msg.toolCallId ? toolCallsById?.get(msg.toolCallId) : null;
+  const toolName = String(tc?.name || msg.toolName || msg.name || '').trim();
+  const lowerTool = toolName.toLowerCase();
+  const args = tc?.args ?? {};
+  const targetPath = extractToolTargetPath(toolName, args);
+  const rawFilePath = String(
+    args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '',
+  ).trim();
+
+  const textBlocks = (msg.content ?? []).filter(
+    (b) => b?.type === 'text' && typeof b.text === 'string',
+  );
+  const rawText = textBlocks.map((b) => b.text).join('\n');
+  if (!rawText || rawText.startsWith('[ACI-REF ')) {
+    return { eligible: false, skipReason: 'empty_or_stub' };
+  }
+
+  const msgStep = tc?.step ?? fallbackStep;
+  const age = effectiveCurrentStep - msgStep;
+  const rawTokens = estimateTokens(rawText);
+  const fallbackMsgId = `tool_msg_${index}`;
+  const normRawPath = normalizeContextPath(rawFilePath);
+  const normTargetPath = normalizeContextPath(targetPath);
+
+  const isErr = isErrorToolMessage(msg, rawText);
+  const isPinnedKeep =
+    (msg.toolCallId && keepSet.has(msg.toolCallId)) ||
+    keepSet.has(fallbackMsgId) ||
+    (rawFilePath && keepSet.has(rawFilePath)) ||
+    (normRawPath && keepSet.has(normRawPath)) ||
+    keepSet.has(targetPath) ||
+    (normTargetPath && keepSet.has(normTargetPath));
+
+  let isActiveMutation = false;
+  let superseded = false;
+  if (rawFilePath) {
+    const mutStep = findLastMutationStep(rawFilePath, lastMutationStepByPath);
+    if (lowerTool === 'read_file' && mutStep >= 0) {
+      if (msgStep < mutStep) {
+        superseded = true;
+      } else {
+        isActiveMutation = true;
+      }
+    } else if (pathMatchesAny(rawFilePath, activeMutations)) {
+      isActiveMutation = true;
+    }
+  }
+
+  const isCompressibleTool = compressibleTools.has(lowerTool);
+  const isSingleStepOverflow = singleStepTriggered && rawTokens > singleStepBudget;
+  const isPreferred =
+    (msg.toolCallId && preferCompressSet.has(msg.toolCallId)) ||
+    preferCompressSet.has(fallbackMsgId) ||
+    (rawFilePath && preferCompressSet.has(rawFilePath)) ||
+    (normRawPath && preferCompressSet.has(normRawPath)) ||
+    preferCompressSet.has(targetPath) ||
+    (normTargetPath && preferCompressSet.has(normTargetPath));
+
+  const thresholdChars = superseded ? supersededMinChars : minChars;
+  const thresholdAge = superseded ? supersededMinAgeSteps : minAgeSteps;
+  const meetsSizeAndAge = rawText.length >= thresholdChars && age >= thresholdAge;
+  const meetsPreferred = isPreferred && rawText.length >= thresholdChars && age >= 1;
+
+  const eligible =
+    isCompressibleTool &&
+    !isErr &&
+    !isActiveMutation &&
+    !isPinnedKeep &&
+    (meetsSizeAndAge || isSingleStepOverflow || meetsPreferred);
+
+  const reason = isErr
+    ? 'error_preserved'
+    : isActiveMutation
+      ? 'active_mutation'
+      : 'recent_or_pinned';
+
+  return {
+    eligible,
+    reason,
+    superseded,
+    id: msg.toolCallId || fallbackMsgId,
+    toolName,
+    args,
+    targetPath,
+    rawFilePath,
+    rawText,
+    rawTokens,
+    chars: rawText.length,
+    msgStep,
+    age,
+  };
+}
+
+/**
+ * Returns offloadable tool message candidates aligned identically with `compressMessagesEpoch`.
+ */
+export function selectOffloadableAciCandidates(
+  messages = [],
+  {
+    compressibleTools = COMPRESSIBLE_TOOLS,
+    minAgeSteps = 3,
+    minChars = DEFAULT_DTOC_MIN_CHARS,
+    supersededMinAgeSteps = 2,
+    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
+    currentStep = undefined,
+    singleStepTriggered = false,
+    singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
+    keepRefs = [],
+    compressRefs = [],
+    activeMutationTargets = [],
+  } = {},
+) {
+  const srcMessages = Array.isArray(messages) ? messages : [];
+  const { msgSteps, effectiveCurrentStep } = assignMessageSteps(srcMessages, currentStep);
+  const { toolCallsById, activeMutations, lastMutationStepByPath } = indexToolCallsAndMutations(
+    srcMessages,
+    msgSteps,
+    activeMutationTargets,
+  );
+  const keepSet = normalizeIdSet(keepRefs);
+  const preferCompressSet = normalizeIdSet(compressRefs);
+  const candidates = [];
+
+  for (let i = 0; i < srcMessages.length; i += 1) {
+    const m = srcMessages[i];
+    if (m?.role !== 'tool') continue;
+    const ev = evaluateToolMessageEligibility(m, {
+      index: i,
+      toolCallsById,
+      activeMutations,
+      lastMutationStepByPath,
+      effectiveCurrentStep,
+      fallbackStep: msgSteps[i],
+      compressibleTools,
+      minAgeSteps,
+      minChars,
+      supersededMinAgeSteps,
+      supersededMinChars,
+      singleStepTriggered,
+      singleStepBudget,
+      keepSet,
+      preferCompressSet,
+    });
+    if (!ev.eligible) continue;
+    candidates.push({
+      id: ev.id,
+      refId: ev.id,
+      path: ev.rawFilePath || ev.targetPath,
+      toolName: ev.toolName,
+      tokens: ev.rawTokens,
+      chars: ev.chars,
+      ageSteps: ev.age,
+      superseded: ev.superseded,
+      hasError: false,
+      excerpt: ev.rawText.slice(0, 260),
+    });
+  }
+  return candidates;
+}
+
+/**
  * Epoch-based DTOC Reversible Compression:
- * Triggers ONLY when crossing budget watermarks (45%, 70%, 85% of maxTotalTokens)
+ * Triggers ONLY when crossing budget watermarks (60%, 82% of maxTotalTokens)
  * or when a single-step input exceeds `singleStepBudget` (default 8000 tokens).
  * Keeps prefix bytes 100% untouched between epochs so KV Prompt Cache stays warm.
  */
@@ -755,7 +1006,9 @@ export function compressMessagesEpoch(
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     epochState = { lastWatermark: -1, epochCount: 0 },
     minAgeSteps = 3,
-    minChars = 1200,
+    minChars = DEFAULT_DTOC_MIN_CHARS,
+    supersededMinAgeSteps = 2,
+    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
     compressibleTools = COMPRESSIBLE_TOOLS,
     currentStep = undefined,
     singleStepTokens = undefined,
@@ -807,43 +1060,12 @@ export function compressMessagesEpoch(
     };
   }
 
-  // Assign logical step index per assistant turn (or respect explicit msg.step)
-  const msgSteps = [];
-  let stepCounter = 0;
-  for (const m of srcMessages) {
-    if (m?.step != null && m.step !== '' && Number.isFinite(Number(m.step))) {
-      stepCounter = Math.max(stepCounter, Number(m.step));
-      msgSteps.push(Number(m.step));
-    } else {
-      if (m?.role === 'assistant') stepCounter += 1;
-      msgSteps.push(stepCounter);
-    }
-  }
-  const effectiveCurrentStep =
-    currentStep != null && currentStep !== '' && Number.isFinite(Number(currentStep))
-      ? Number(currentStep)
-      : stepCounter;
-
-  const toolCallsById = new Map();
-  for (let i = 0; i < srcMessages.length; i += 1) {
-    const m = srcMessages[i];
-    if (m?.role !== 'assistant') continue;
-    for (const b of m.content ?? []) {
-      if (b?.type === 'tool-call' && b.id) {
-        toolCallsById.set(b.id, {
-          name: String(b.name ?? ''),
-          args: parseToolArgs(b.arguments),
-          step: msgSteps[i],
-        });
-      }
-    }
-  }
-
-  const activeMutations = extractMutationPathsFromMessages(srcMessages);
-  for (const p of activeMutationTargets ?? []) {
-    const norm = normalizeContextPath(p);
-    if (norm) activeMutations.add(norm);
-  }
+  const { msgSteps, effectiveCurrentStep } = assignMessageSteps(srcMessages, currentStep);
+  const { toolCallsById, activeMutations, lastMutationStepByPath } = indexToolCallsAndMutations(
+    srcMessages,
+    msgSteps,
+    activeMutationTargets,
+  );
 
   const keepSet = normalizeIdSet(keepRefs);
   const preferCompressSet = normalizeIdSet(compressRefs);
@@ -861,79 +1083,47 @@ export function compressMessagesEpoch(
     const m = outMessages[i];
     if (m?.role !== 'tool') continue;
 
-    const tc = m.toolCallId ? toolCallsById.get(m.toolCallId) : null;
-    const toolName = String(tc?.name || m.toolName || m.name || '').trim();
-    const lowerTool = toolName.toLowerCase();
-    const args = tc?.args ?? {};
-    const targetPath = extractToolTargetPath(toolName, args);
-    const rawFilePath = String(
-      args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '',
-    ).trim();
+    const ev = evaluateToolMessageEligibility(m, {
+      index: i,
+      toolCallsById,
+      activeMutations,
+      lastMutationStepByPath,
+      effectiveCurrentStep,
+      fallbackStep: msgSteps[i],
+      compressibleTools,
+      minAgeSteps,
+      minChars,
+      supersededMinAgeSteps,
+      supersededMinChars,
+      singleStepTriggered,
+      singleStepBudget,
+      keepSet,
+      preferCompressSet,
+    });
 
-    const textBlocks = (m.content ?? []).filter(
-      (b) => b?.type === 'text' && typeof b.text === 'string',
-    );
-    const rawText = textBlocks.map((b) => b.text).join('\n');
+    if (ev.skipReason === 'empty_or_stub') continue;
 
-    if (!rawText || rawText.startsWith('[ACI-REF ')) continue;
-
-    const msgStep = tc?.step ?? msgSteps[i];
-    const age = effectiveCurrentStep - msgStep;
-    const rawTokens = estimateTokens(rawText);
-
-    const isMutationTarget = rawFilePath && pathMatchesAny(rawFilePath, activeMutations);
-    const isErr = isErrorToolMessage(m, rawText);
-    const fallbackMsgId = `tool_msg_${i}`;
-    const normRawPath = normalizeContextPath(rawFilePath);
-    const normTargetPath = normalizeContextPath(targetPath);
-    const isPinnedKeep =
-      (m.toolCallId && keepSet.has(m.toolCallId)) ||
-      keepSet.has(fallbackMsgId) ||
-      (rawFilePath && keepSet.has(rawFilePath)) ||
-      (normRawPath && keepSet.has(normRawPath)) ||
-      keepSet.has(targetPath) ||
-      (normTargetPath && keepSet.has(normTargetPath));
-
-    const isCompressibleTool = compressibleTools.has(lowerTool);
-    const isLarge = rawText.length >= minChars;
-    const isAged = age >= minAgeSteps;
-    const isSingleStepOverflow = singleStepTriggered && rawTokens > singleStepBudget;
-    const isPreferred =
-      (m.toolCallId && preferCompressSet.has(m.toolCallId)) ||
-      preferCompressSet.has(fallbackMsgId) ||
-      (rawFilePath && preferCompressSet.has(rawFilePath)) ||
-      (normRawPath && preferCompressSet.has(normRawPath)) ||
-      preferCompressSet.has(targetPath) ||
-      (normTargetPath && preferCompressSet.has(normTargetPath));
-
-    const eligible =
-      isCompressibleTool &&
-      !isErr &&
-      !isMutationTarget &&
-      !isPinnedKeep &&
-      ((isAged && isLarge) || isSingleStepOverflow || (isPreferred && isLarge && age >= 1));
-
-    if (!eligible) {
-      if (rawFilePath) {
+    if (!ev.eligible) {
+      if (ev.rawFilePath) {
         keptItems.push({
           refId: m.toolCallId ?? null,
-          path: rawFilePath,
-          reason: isErr ? 'error_preserved' : isMutationTarget ? 'active_mutation' : 'recent_or_pinned',
-          tokens: rawTokens,
-          step: msgStep,
+          path: ev.rawFilePath,
+          reason: ev.reason,
+          tokens: ev.rawTokens,
+          step: ev.msgStep,
         });
       }
       continue;
     }
 
-    const extracted = extractSymbolsFromText(rawFilePath || targetPath, rawText);
-    const ref = aciStore.put(rawText, {
-      toolName,
-      path: rawFilePath || targetPath,
-      lineRange: extractLineRangeLabel(args, rawText),
+    const extracted = extractSymbolsFromText(ev.rawFilePath || ev.targetPath, ev.rawText);
+    const ref = aciStore.put(ev.rawText, {
+      toolName: ev.toolName,
+      path: ev.rawFilePath || ev.targetPath,
+      lineRange: extractLineRangeLabel(ev.args, ev.rawText),
       symbolOutline: extracted.names,
-      originalTokens: rawTokens,
-      step: msgStep,
+      originalTokens: ev.rawTokens,
+      step: ev.msgStep,
     });
 
     const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
@@ -946,7 +1136,7 @@ export function compressMessagesEpoch(
       path: ref.path,
       originalTokens: ref.originalTokens,
       stubTokens: ref.stubTokens,
-      step: msgStep,
+      step: ev.msgStep,
       epoch: nextEpoch,
     });
   }

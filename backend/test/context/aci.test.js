@@ -15,12 +15,14 @@ import {
   ACIEngine,
   ACON_MAX_GUIDELINES,
   ACON_SETTINGS_KEY,
+  DEFAULT_EPOCH_WATERMARKS,
   compressMessagesEpoch,
   evaluateRetrievalGate,
   expandContext,
   getLearnedGuidelines,
   learnFromFailure,
   refineCandidates,
+  selectOffloadableAciCandidates,
   shouldTriggerAciEpoch,
 } from '../../src/context/aci-engine.js';
 import {
@@ -283,7 +285,7 @@ test('Epoch-based DTOC compression triggers only at watermarks or single-step ov
   assert.equal(r0.compressedCount, 0);
   assert.equal(r0.messages, baseMsgs);
 
-  // Cross 45% watermark: maxTotalTokens = 3000 -> triggers Epoch 1
+  // Cross 60% watermark: maxTotalTokens = 3000 -> triggers Epoch 1
   const r1 = compressMessagesEpoch(baseMsgs, {
     aciStore,
     ledger,
@@ -292,7 +294,7 @@ test('Epoch-based DTOC compression triggers only at watermarks or single-step ov
   });
   assert.equal(r1.triggered, true);
   assert.equal(r1.epoch, 1);
-  assert.equal(r1.watermark, 0.45);
+  assert.equal(r1.watermark, 0.6);
   assert.equal(r1.compressedCount, 1);
   assert.equal(r1.pairClosedValid, true);
   assert.equal(pairClosed(r1.messages, 0, r1.messages.length - 1), true);
@@ -641,19 +643,70 @@ test('Round 2: cumulativeUsedTokens triggers 160k epoch watermarks when single-s
     const lowProbe = engine.inspectEpoch(msgs, { cumulativeUsedTokens: 20000, contextWindow: 128000 });
     assert.equal(lowProbe.triggered, false);
 
-    const crossedProbe = engine.inspectEpoch(msgs, { cumulativeUsedTokens: 73000, contextWindow: 128000 });
+    const crossedProbe = engine.inspectEpoch(msgs, { cumulativeUsedTokens: 97000, contextWindow: 128000 });
     assert.equal(crossedProbe.triggered, true);
-    assert.equal(crossedProbe.watermark, 0.45);
+    assert.equal(crossedProbe.watermark, 0.6);
 
-    const comp = engine.compress(msgs, { cumulativeUsedTokens: 73000, contextWindow: 128000, compressRefs: ['c1'] });
+    const comp = engine.compress(msgs, { cumulativeUsedTokens: 97000, contextWindow: 128000, compressRefs: ['c1'] });
     assert.equal(comp.triggered, true);
     assert.equal(comp.epoch, 1);
     assert.equal(comp.compressedCount, 1);
     assert.equal(comp.pairClosedValid, true);
     assert.ok(comp.messages[3].content[0].text.startsWith('[ACI-REF artifact://'));
 
-    const betweenProbe = engine.inspectEpoch(comp.messages, { cumulativeUsedTokens: 85000, contextWindow: 128000 });
+    const betweenProbe = engine.inspectEpoch(comp.messages, { cumulativeUsedTokens: 110000, contextWindow: 128000 });
     assert.equal(betweenProbe.triggered, false);
+  } finally {
+    store.close();
+  }
+});
+
+test('Round 3: default [0.60, 0.82] watermarks, superseded pre-edit read offloading, post-edit protection, and 700/600 char thresholds', () => {
+  assert.deepEqual([...DEFAULT_EPOCH_WATERMARKS], [0.6, 0.82]);
+  const store = new Store(':memory:');
+  try {
+    const sup = new ContextSupervisor({ store });
+    assert.deepEqual(sup.getConfig().epochWatermarks, [0.6, 0.82]);
+
+    const aciStore = new ReversibleContextStore(store);
+    const ledger = new ContextEvidenceLedger();
+    const preEditRead = 'export function calc(x) { return x + 1; }\n'.repeat(16); // ~672 chars (>= 600)
+    const postEditRead = 'export function calc(x) { return x + 2; }\n'.repeat(20); // ~840 chars (>= 700)
+    const smallGlob = 'src/calc.js\nsrc/other.js'; // < 700 chars
+    const msgs = [
+      { role: 'system', content: [{ type: 'text', text: 'static system' }] },
+      { role: 'user', content: [{ type: 'text', text: 'fix calc.js' }] },
+      // Step 1: pre-edit read of src/calc.js
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c-pre', name: 'read_file', arguments: JSON.stringify({ path: 'src/calc.js' }) }] },
+      { role: 'tool', toolCallId: 'c-pre', content: [{ type: 'text', text: preEditRead }] },
+      // Step 2: small glob (< 700 chars -> skipped) + write_file rewriting src/calc.js (supersedes c-pre!)
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', id: 'c-small', name: 'glob', arguments: '{"pattern":"src/*.js"}' },
+          { type: 'tool-call', id: 'c-edit', name: 'write_file', arguments: JSON.stringify({ path: 'src/calc.js', content: 'export function calc(x) { return x + 2; }\n' }) },
+        ],
+      },
+      { role: 'tool', toolCallId: 'c-small', content: [{ type: 'text', text: smallGlob }] },
+      { role: 'tool', toolCallId: 'c-edit', content: [{ type: 'text', text: 'wrote src/calc.js' }] },
+      // Step 3: post-edit read of src/calc.js + non-error grep
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c-post', name: 'read_file', arguments: JSON.stringify({ path: 'src/calc.js' }) }] },
+      { role: 'tool', toolCallId: 'c-post', content: [{ type: 'text', text: postEditRead }] },
+    ];
+    // At step 3: age of c-pre = 3 - 1 = 2 (>= 2) and superseded (< write_file step 2); c-post is at step 3 (>= 2) -> protected!
+    const candidates = selectOffloadableAciCandidates(msgs, { activeMutationTargets: ['src/calc.js'] });
+    assert.deepEqual(candidates.map((c) => c.id), ['c-pre']);
+    assert.equal(candidates[0].superseded, true);
+    assert.ok(candidates[0].chars >= 600);
+
+    const engine = new ACIEngine({ store, aciStore, ledger, maxTotalTokens: 160000, contextWindow: 128000 });
+    const comp = engine.compress(msgs, { cumulativeUsedTokens: 97000, activeMutationTargets: ['src/calc.js'] });
+    assert.equal(comp.triggered, true);
+    assert.equal(comp.compressedCount, 1);
+    assert.equal(comp.pairClosedValid, true);
+    assert.ok(comp.messages[3].content[0].text.startsWith('[ACI-REF artifact://'));
+    assert.equal(comp.messages[8].content[0].text, postEditRead, 'post-edit read_file must stay verbatim');
+    assert.equal(aciStore.restore(comp.compressedRefs[0].uri), preEditRead);
   } finally {
     store.close();
   }

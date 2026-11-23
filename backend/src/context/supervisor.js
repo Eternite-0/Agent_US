@@ -8,7 +8,7 @@ export const DEFAULT_ACI_SUPERVISOR_CONFIG = Object.freeze({
   mode: 'auto',
   model: null,
   maxBudgetRatio: 0.72,
-  epochWatermarks: [0.45, 0.7, 0.85],
+  epochWatermarks: [0.6, 0.82],
   maxOutputTokens: 1200,
   timeoutMs: 12000,
 });

@@ -1017,28 +1017,28 @@ test('Step 3: DirectAgent + AgentLoop ACI Epoch DTOC, read-only Supervisor via v
       mainSystemPrefixes.push(sysText);
 
       if (mainTurnIdx === 1) {
-        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r1', name: 'read_file', arguments: JSON.stringify({ path: 'src/target.js' }) } };
+        yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'tc-r1', name: 'read_file', arguments: JSON.stringify({ path: 'src/target.js' }) } };
+        yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'tc-r2', name: 'read_file', arguments: JSON.stringify({ path: 'src/notes.txt' }) } };
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
       if (mainTurnIdx === 2) {
-        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r2', name: 'read_file', arguments: JSON.stringify({ path: 'src/notes.txt' }) } };
-        yield { type: 'finish', reason: { kind: 'tool-calls' } };
-        return;
-      }
-      if (mainTurnIdx === 3) {
-        // Trigger additional steps so age >= 1 / 3 advances cleanly without breaking epoch boundary
         yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3', name: 'glob', arguments: JSON.stringify({ pattern: 'src/*' }) } };
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
-      if (mainTurnIdx === 4) {
+      if (mainTurnIdx === 3) {
         yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r4', name: 'glob', arguments: JSON.stringify({ pattern: '*.txt' }) } };
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
+      if (mainTurnIdx === 4) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r5', name: 'glob', arguments: JSON.stringify({ pattern: 'src/*.js' }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
       if (mainTurnIdx === 5) {
-        // Find the ACI stub in messages and restore target.js verbatim via expand_context
+        // Both src/target.js & src/notes.txt (step 1) now have age = 4 - 1 = 3 >= 3 -> Supervisor + DTOC offload both!
         const stubMsg = (opts.messages ?? []).find(
           (m) => m.role === 'tool' && /\[ACI-REF\s+(artifact:\/\/[a-f0-9]+|aci_\d+_[a-f0-9]+)/.test(m.content?.[0]?.text ?? ''),
         );
@@ -1316,13 +1316,19 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
         return;
       }
       if (stepIdx === 3) {
-        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-write-contract', name: 'write_file', arguments: JSON.stringify({ path: 'CONTRACT.json', content: JSON.stringify({ precedence: ['env', 'profile', 'defaults'] }) }) } };
-        yield { type: 'usage', usage: { inputTokens: 26000, outputTokens: 1000 } };
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-glob-2', name: 'glob', arguments: JSON.stringify({ pattern: 'src/*.js' }) } };
+        yield { type: 'usage', usage: { inputTokens: 20000, outputTokens: 1000 } };
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
       if (stepIdx === 4) {
-        // Cumulative totalIn+totalOut = 79k + current ~5k >= 0.45 * 160000 (72k) -> Epoch 1 + Supervisor MUST fire here!
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-write-contract', name: 'write_file', arguments: JSON.stringify({ path: 'CONTRACT.json', content: JSON.stringify({ precedence: ['env', 'profile', 'defaults'] }) }) } };
+        yield { type: 'usage', usage: { inputTokens: 15000, outputTokens: 1000 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 5) {
+        // Cumulative totalIn+totalOut = 88k + ~5k >= 0.45 * 160000 (72k) and src/index.js age = 4 - 1 = 3 >= 3 -> offloaded deterministically with Supervisor abstaining (only 1 candidate)
         const stubMsg = (opts.messages ?? []).find((m) => m.role === 'tool' && /\[ACI-REF\s+artifact:\/\//.test(m.content?.[0]?.text ?? ''));
         assert.ok(stubMsg, 'Cumulative budget crossing 45% of 160k must trigger Epoch DTOC compression');
         yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-bash-ok', name: 'bash', arguments: JSON.stringify({ command: 'node --test' }) } };
@@ -1330,7 +1336,7 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
-      if (stepIdx === 5) {
+      if (stepIdx === 6) {
         yield { type: 'text-delta', index: 0, text: 'Produced CONTRACT.json.' };
         yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
         yield { type: 'finish', reason: { kind: 'stop' } };
@@ -1382,7 +1388,7 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
   });
   const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
   assert.equal(settled.state, 'completed');
-  assert.ok(supCalls >= 1, 'Expected read-only Supervisor call on cumulative 45% epoch');
+  assert.equal(supCalls, 0, 'Repoformer abstention gate must skip Supervisor when fewer than 2 eligible candidates exist');
   assert.equal(sawOrderingReminder, true, 'Expected highest-to-lowest ordering_precedence pre-completion check');
   for (const p of sysPrefixes) assert.equal(p, sysPrefixes[0]);
 
@@ -1392,10 +1398,160 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
   const am = completedEv.reasoningMetrics?.aciMetrics;
   assert.ok(am.offloadedCount >= 1);
   assert.ok(am.savedTokens > 0);
-  assert.equal(am.supervisorCalls, supCalls);
+  assert.equal(am.supervisorCalls, 0);
   const compactedEvs = store.db
     .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='context/compacted'")
     .all(turn.id)
     .map((r) => JSON.parse(r.data));
   assert.equal(compactedEvs.find((d) => d.stage === 'aci_dtoc')?.pairClosedValid, true);
+});
+
+test('Round 3: Repoformer abstains when 0 eligible (< 2 / < 2400 chars), while superseded pre-edit read_file offloads cleanly with >= 2 candidates and restores verbatim', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-r3-sup-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-r3-sup-ws-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  const preReadContent = Array.from({ length: 24 }, (_, i) => `export const modA_item_${['a','b','c','d'][i % 4]}_${i * 13} = () => '${['x','y','z'][i % 3]}';`).join('\n');
+  const helperContent = Array.from({ length: 30 }, (_, i) => `export const modB_item_${['p','q','r','s'][i % 4]}_${i * 17} = () => '${['m','n','k'][i % 3]}';`).join('\n');
+  writeFileSync(join(workDir, 'src', 'a.js'), preReadContent, 'utf8');
+  writeFileSync(join(workDir, 'src', 'b.js'), helperContent, 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.createAccount({
+    preset: 'workbuddy',
+    label: 'r3-sup-pool',
+    credential: 'sk-test-r3-pool-0001',
+    protocol: 'openai',
+    endpoint: 'https://api.example.invalid/v1',
+    models: ['main-model', 'fast-supervisor'],
+  });
+  pool.setDefaultModel('main-model');
+
+  let supCalls = 0;
+  let stepIdx = 0;
+  let restoredStubText = '';
+
+  class R3SupervisorAdapter extends LlmAdapter {
+    async *stream(opts) {
+      if (opts.model === 'fast-supervisor' || (Array.isArray(opts.tools) && opts.tools.length === 0 && /ContextSupervisor/i.test(String(opts.system ?? '')))) {
+        assert.deepEqual(opts.tools, []);
+        supCalls += 1;
+        const payload = JSON.parse(opts.messages[0].content[0].text);
+        assert.ok(payload.candidates.length >= 2, 'Supervisor only fires with >= 2 eligible candidates');
+        const totalChars = payload.candidates.reduce((s, c) => s + Number(c.chars || 0), 0);
+        assert.ok(totalChars >= 2400, 'Supervisor only fires when totalEligibleChars >= 2400');
+        yield {
+          type: 'text-delta',
+          index: 0,
+          text: JSON.stringify({
+            keepRefs: [],
+            compressRefs: payload.candidates.map((c) => c.id),
+            rationale: 'Offload superseded pre-edit src/a.js and old src/b.js reads',
+          }),
+        };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
+
+      stepIdx += 1;
+      if (stepIdx === 1) {
+        // Step 1: read src/b.js (age reaches 3 at step 4!)
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3-b1', name: 'read_file', arguments: JSON.stringify({ path: 'src/b.js' }) } };
+        yield { type: 'usage', usage: { inputTokens: 49000, outputTokens: 1000 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 2) {
+        // Step 2: read src/a.js (superseded by write_file at step 3, age reaches 2 at step 4!)
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3-a1', name: 'read_file', arguments: JSON.stringify({ path: 'src/a.js' }) } };
+        yield { type: 'usage', usage: { inputTokens: 49000, outputTokens: 1000 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 3) {
+        // Cumulative 100k >= 0.60 * 160000 (96k), BUT at steps=2 neither b1 (age=1) nor a1 (age=0) is eligible -> skips cleanly (supCalls=0)
+        assert.equal(supCalls, 0, 'Must abstain completely when eligibleCandidates.length === 0');
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3-wa', name: 'write_file', arguments: JSON.stringify({ path: 'src/a.js', content: 'export const updatedA = true;\n' }) } };
+        yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 4) {
+        // At steps=3: b1 age=2 (<3), a1 age=1 (<2) -> STILL 0 eligible, 0 wasted supervisor calls, 0.60 stays armed!
+        assert.equal(supCalls, 0, 'Must keep abstaining while age thresholds are unmet');
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3-g', name: 'glob', arguments: JSON.stringify({ pattern: 'src/*' }) } };
+        yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 5) {
+        // Now steps=4: b1 (step 1, age=3 >= 3) AND superseded a1 (step 2, age=2 >= 2) are BOTH eligible -> Supervisor runs ONCE and DTOC offloads BOTH!
+        const stubs = (opts.messages ?? []).filter((m) => m.role === 'tool' && /\[ACI-REF\s+artifact:\/\//.test(m.content?.[0]?.text ?? ''));
+        assert.ok(stubs.length >= 2, `Expected >= 2 compressed [ACI-REF] stubs including superseded pre-edit src/a.js; got ${stubs.length}`);
+        const refUriA = stubs.find((m) => m.toolCallId === 'tc-r3-a1')?.content?.[0]?.text?.match(/\[ACI-REF\s+(artifact:\/\/[a-f0-9]+)/)?.[1]
+          ?? stubs[0].content[0].text.match(/\[ACI-REF\s+(artifact:\/\/[a-f0-9]+)/)[1];
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3-exp', name: 'expand_context', arguments: JSON.stringify({ uri: refUriA, startLine: 1, endLine: 6 }) } };
+        yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepIdx === 6) {
+        restoredStubText = (opts.messages ?? []).find((m) => m.toolCallId === 'tc-r3-exp')?.content?.[0]?.text ?? '';
+        assert.match(restoredStubText, /modA_item_/, 'expand_context must restore superseded pre-edit src/a.js verbatim');
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3-bash', name: 'bash', arguments: JSON.stringify({ command: 'node --test' }) } };
+        yield { type: 'usage', usage: { inputTokens: 3000, outputTokens: 100 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      yield { type: 'text-delta', index: 0, text: 'Completed Round 3 verification.' };
+      yield { type: 'usage', usage: { inputTokens: 3000, outputTokens: 100 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+
+  const adapter = new R3SupervisorAdapter();
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+  const app = Fastify();
+  v1Routes(app, { store, providers: { models: [] }, pool, directAgent: direct });
+  await app.ready();
+
+  t.after(async () => {
+    await app.close();
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  await app.inject({
+    method: 'PATCH',
+    url: '/v1/context/supervisor',
+    payload: { enabled: true, mode: 'custom', model: 'fast-supervisor', epochWatermarks: [0.6, 0.82] },
+  });
+  direct.sandbox = {
+    async run() { return { exitCode: 0, stdout: 'pass 1\nfail 0', stderr: '' }; },
+  };
+  const session = direct.createSession({
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    budget: { maxTokens: 160000, maxSteps: 14 },
+  });
+  const { turn } = direct.startTurn(session.id, { input: 'Update src/a.js after inspecting src/b.js', maxSteps: 14 });
+  const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
+  assert.equal(settled.state, 'completed');
+  assert.equal(supCalls, 1, 'Supervisor should run exactly once when >= 2 eligible candidates reach >= 2400 chars');
+
+  const completedEv = JSON.parse(
+    store.db.prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed'").get(turn.id).data,
+  );
+  const am = completedEv.reasoningMetrics?.aciMetrics;
+  assert.ok(am.offloadedCount >= 2);
+  assert.ok(am.savedTokens > 0);
+  assert.ok(am.restoredCount >= 1);
+  assert.equal(am.supervisorCalls, 1);
 });
