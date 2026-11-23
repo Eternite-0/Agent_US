@@ -28,6 +28,11 @@ import {
   verifyWorkspacePinnedBaseline,
 } from '../../src/evaluation/index.js';
 import { EVIDENCE_STATUSES } from '../../src/evaluation/schemas.js';
+import { DockerBenchmarkSandbox, SANDBOX_MODES } from '../../src/tools/benchmark-sandbox.js';
+
+const TEST_SANDBOX_OPTIONS = new DockerBenchmarkSandbox().isAvailable()
+  ? { mode: SANDBOX_MODES.STRONG }
+  : { mode: SANDBOX_MODES.NODE_PERMISSION, allowProcessHardeningOnly: true };
 
 function writeTreeFiles(dir, files) {
   for (const [rel, content] of Object.entries(files)) {
@@ -901,7 +906,7 @@ suite('External OSS benchmark verification', { concurrency: 4 }, () => {
           const cachedOverrides = Object.fromEntries(
             Object.entries(sharedJudgeFixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
           );
-          const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
+          const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides, sandboxOptions: TEST_SANDBOX_OPTIONS });
           const task = tasks.find((item) => item.id === taskId);
           assert.ok(task, `missing task ${taskId}`);
 
@@ -997,7 +1002,7 @@ suite('External OSS benchmark verification', { concurrency: 4 }, () => {
     const cachedOverrides = Object.fromEntries(
       Object.entries(sharedJudgeFixtures.overrides).map(([id, cfg]) => [id, { ...cfg, cacheDir }]),
     );
-    const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides });
+    const tasks = createOssBenchmarkDataset({ repoOverrides: cachedOverrides, sandboxOptions: TEST_SANDBOX_OPTIONS });
 
     const [brokenWs, tamperedTestWs] = await Promise.all([
       createFixtureWorkspace(tasks[1]), // trough
@@ -1073,6 +1078,7 @@ suite('External OSS benchmark verification', { concurrency: 4 }, () => {
       store,
       ossCacheDir: cacheDir,
       ossRepoOverrides: sharedJudgeFixtures.overrides,
+      sandboxOptions: TEST_SANDBOX_OPTIONS,
       concurrency: 4,
       timeoutMs: 55_000,
       runtimeFactory: async ({ task, workspaceRoot }) => {

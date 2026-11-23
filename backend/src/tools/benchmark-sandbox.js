@@ -1,7 +1,8 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -20,6 +21,7 @@ import {
   dirname,
   isAbsolute,
   join,
+  parse as parsePath,
   posix as posixPath,
   relative,
   resolve,
@@ -31,12 +33,47 @@ import {
   DEFAULT_DEPENDENCY_POLICY,
   validateDependencyPolicy,
 } from '../evaluation/dependency-policy.js';
+import {
+  computeSha256Hex,
+  computeWorkspaceArtifactDigest,
+  extractAndVerifyHiddenEnvelope,
+  normalizeExpectedTests,
+} from '../evaluation/hidden-acceptance.js';
+
+export const SANDBOX_TIERS = Object.freeze({
+  STRONG_OS_ISOLATION: 'strong-os-isolation',
+  PROCESS_HARDENING_ONLY: 'process-hardening-only',
+});
 
 export const SANDBOX_MODES = Object.freeze({
+  STRONG: 'strong',
   AUTO: 'auto',
   DOCKER: 'docker',
   NODE_PERMISSION: 'node-permission',
 });
+
+export const SIGNAL_EXIT_CODES = Object.freeze({
+  SIGHUP: 1,
+  SIGINT: 2,
+  SIGQUIT: 3,
+  SIGABRT: 6,
+  SIGKILL: 9,
+  SIGSEGV: 11,
+  SIGTERM: 15,
+  SIGXCPU: 24,
+});
+
+export function resolveSignalExitCode(exitSignal) {
+  if (!exitSignal) return 1;
+  const num = osConstants.signals?.[exitSignal] ?? SIGNAL_EXIT_CODES[exitSignal] ?? 15;
+  return 128 + num;
+}
+
+export function isCpuLimitExceeded({ exitCode, signal = null, stderr = '' } = {}) {
+  if (signal === 'SIGXCPU' || exitCode === 128 + SIGNAL_EXIT_CODES.SIGXCPU) return true;
+  if (exitCode === 137) return true;
+  return /ERR_SANDBOX_CPU_LIMIT/i.test(String(stderr ?? ''));
+}
 
 export const STRICT_ENV_ALLOWLIST_BASE = Object.freeze([
   'PATH',
@@ -186,6 +223,13 @@ const PRELOAD_FILE_PATH = nativeRealpath(
   fileURLToPath(new URL('./benchmark-sandbox-preload.mjs', import.meta.url)),
 );
 const PRELOAD_FILE_URL = pathToFileURL(PRELOAD_FILE_PATH).href;
+const HIDDEN_SUPERVISOR_SRC_PATH = nativeRealpath(
+  fileURLToPath(new URL('./hidden-acceptance-supervisor.mjs', import.meta.url)),
+);
+const HIDDEN_WORKER_SRC_PATH = nativeRealpath(
+  fileURLToPath(new URL('./hidden-acceptance-worker.mjs', import.meta.url)),
+);
+const SUPERVISOR_RUN_SYM = Symbol('agentUsSupervisorRun');
 
 const FORBIDDEN_EXTRA_ENV_KEYS = new Set([
   'NODE_OPTIONS',
@@ -565,7 +609,11 @@ export function runHardenedGitSync(
     shell: false,
   });
   return {
-    exitCode: Number.isInteger(res.status) ? res.status : 1,
+    exitCode: Number.isInteger(res.status)
+      ? res.status
+      : res.signal
+        ? resolveSignalExitCode(res.signal)
+        : 1,
     stdout: typeof res.stdout === 'string' ? res.stdout : res.stdout?.toString(encoding) ?? '',
     stderr: typeof res.stderr === 'string' ? res.stderr : res.stderr?.toString(encoding) ?? '',
     timedOut: res.error?.code === 'ETIMEDOUT',
@@ -611,6 +659,7 @@ function spawnCollected({
   signal = null,
   onOutput = null,
   onTimeoutOrAbort = null,
+  stdinData = null,
 }) {
   return new Promise((resolveRun, rejectRun) => {
     const isWin = process.platform === 'win32';
@@ -620,8 +669,17 @@ function spawnCollected({
       shell: false,
       windowsHide: true,
       detached: !isWin,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [stdinData != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
+
+    if (stdinData != null && child.stdin) {
+      child.stdin.on('error', () => {});
+      try {
+        child.stdin.end(stdinData, 'utf8');
+      } catch {
+        // ignore if child exited immediately
+      }
+    }
 
     const stdoutChunks = [];
     const stderrChunks = [];
@@ -661,6 +719,7 @@ function spawnCollected({
         stdout,
         stderr,
         timedOut: true,
+        signal: null,
         truncated,
       });
     }, effectiveTimeout);
@@ -697,10 +756,11 @@ function spawnCollected({
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
       resolveRun({
-        exitCode: code ?? (exitSignal ? 128 + (osConstants.signals[exitSignal] ?? 0) : 1),
+        exitCode: code ?? (exitSignal ? resolveSignalExitCode(exitSignal) : 1),
         stdout: Buffer.concat(stdoutChunks).toString('utf8'),
         stderr: Buffer.concat(stderrChunks).toString('utf8'),
         timedOut: false,
+        signal: exitSignal ?? null,
         truncated,
       });
     });
@@ -864,9 +924,183 @@ function translateHostPathToContainer(hostPath, canonicalWs, readOnlyDirs) {
 const DEFAULT_DOCKER_PROBE_CACHE = new Map();
 const DEFAULT_NODE_PERMISSION_PROBE_CACHE = new Map();
 
+function buildDockerClientEnv() {
+  const env = buildStrictSandboxEnv({ tmpDir: tmpdir() });
+  for (const key of [
+    'DOCKER_HOST',
+    'DOCKER_CONTEXT',
+    'DOCKER_CONFIG',
+    'DOCKER_TLS_VERIFY',
+    'DOCKER_CERT_PATH',
+  ]) {
+    const val = lookupEnvCaseInsensitive(process.env, key);
+    if (val !== undefined) {
+      env[key] = String(val);
+    }
+  }
+  return env;
+}
+
+function assertSafeDockerMountSource(hostPath, label = 'mount') {
+  const canonical = nativeRealpath(hostPath);
+  const parsed = parsePath(canonical);
+  if (parsed.root && normalizeForComparison(parsed.root) === normalizeForComparison(canonical)) {
+    throw new SandboxPolicyError(
+      `Refusing to bind-mount filesystem root into Docker (${label}): ${canonical}`,
+      'E_SANDBOX_PATH_ESCAPE',
+      { path: canonical, label },
+    );
+  }
+  const normalizedSlash = canonical.replace(/\\/g, '/').toLowerCase();
+  const forbiddenSegments = [
+    'docker.sock',
+    'docker_engine',
+    '/var/run',
+    '/run/docker',
+    '/backend/var',
+    '/upstream',
+    '/.ssh',
+    '/.aws',
+    '/.gnupg',
+  ];
+  for (const seg of forbiddenSegments) {
+    if (normalizedSlash.includes(seg)) {
+      throw new SandboxPolicyError(
+        `Forbidden Docker bind-mount source (${label}): ${canonical}`,
+        'E_SANDBOX_PATH_ESCAPE',
+        { path: canonical, label, matched: seg },
+      );
+    }
+  }
+  if (
+    normalizedSlash === '/etc' ||
+    normalizedSlash.startsWith('/etc/') ||
+    normalizedSlash === '/proc' ||
+    normalizedSlash.startsWith('/proc/') ||
+    normalizedSlash === '/sys' ||
+    normalizedSlash.startsWith('/sys/') ||
+    /^([a-z]:)?\/windows(\/|$)/.test(normalizedSlash)
+  ) {
+    throw new SandboxPolicyError(
+      `System directory bind-mount forbidden (${label}): ${canonical}`,
+      'E_SANDBOX_PATH_ESCAPE',
+      { path: canonical, label },
+    );
+  }
+  return canonical;
+}
+
+function chmodTreeForContainerPosix(rootDir, { readOnly }) {
+  const stack = [rootDir];
+  const dirs = [];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) {
+      chmodSync(cur, 0o755);
+      dirs.push(cur);
+      for (const ent of readdirSync(cur, { withFileTypes: true })) {
+        stack.push(join(cur, ent.name));
+      }
+    } else if (st.isFile()) {
+      if (readOnly) {
+        chmodSync(cur, st.mode & 0o111 ? 0o555 : 0o444);
+      } else {
+        chmodSync(cur, st.mode & 0o111 ? 0o777 : 0o666);
+      }
+    }
+  }
+  for (let i = dirs.length - 1; i >= 0; i--) {
+    chmodSync(dirs[i], readOnly ? 0o555 : 0o777);
+  }
+}
+
+function restoreWritableAndRemovePosix(targetDir) {
+  if (!targetDir || !existsSync(targetDir)) return;
+  const stack = [targetDir];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) {
+      chmodSync(cur, 0o700);
+      for (const ent of readdirSync(cur, { withFileTypes: true })) {
+        stack.push(join(cur, ent.name));
+      }
+    } else if (st.isFile()) {
+      chmodSync(cur, 0o600);
+    }
+  }
+  rmSync(targetDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
+}
+
+function syncWritableStageBackPosix(stageDir, targetDir) {
+  assertNoSymlinkEscape(stageDir);
+
+  const walkSync = (srcDir, dstDir, isRoot) => {
+    const srcEntries = new Map(readdirSync(srcDir, { withFileTypes: true }).map((e) => [e.name, e]));
+    const dstEntries = existsSync(dstDir)
+      ? new Map(readdirSync(dstDir, { withFileTypes: true }).map((e) => [e.name, e]))
+      : new Map();
+
+    for (const [name] of dstEntries) {
+      if (isRoot && name === '.git') continue;
+      if (!srcEntries.has(name)) {
+        rmSync(join(dstDir, name), { recursive: true, force: true });
+      }
+    }
+
+    for (const [name] of srcEntries) {
+      if (isRoot && name === '.git') continue;
+      const srcPath = join(srcDir, name);
+      const dstPath = join(dstDir, name);
+      const st = lstatSync(srcPath);
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) {
+        if (dstEntsIsFile(dstEntries.get(name))) {
+          rmSync(dstPath, { force: true });
+        }
+        mkdirSync(dstPath, { recursive: true });
+        walkSync(srcPath, dstPath, false);
+      } else if (st.isFile()) {
+        const srcBuf = readFileSync(srcPath);
+        if (existsSync(dstPath)) {
+          try {
+            const dstSt = lstatSync(dstPath);
+            if (dstSt.isFile() && dstSt.size === srcBuf.length) {
+              const dstBuf = readFileSync(dstPath);
+              if (Buffer.compare(srcBuf, dstBuf) === 0) continue;
+            }
+          } catch {
+            // overwrite below
+          }
+        }
+        writeFileSync(dstPath, srcBuf);
+      }
+    }
+  };
+  walkSync(stageDir, targetDir, true);
+}
+
+function dstEntsIsFile(ent) {
+  return Boolean(ent && !ent.isDirectory());
+}
+
 /**
  * Docker-based benchmark sandbox enforcing network=none, read-only rootfs,
- * cap-drop=ALL, no-new-privileges, non-root user 65534:65534, pids/memory/cpu limits.
+ * cap-drop=ALL, no-new-privileges, ipc=none, non-root user 65534:65534,
+ * pids/memory/cpu limits, and cross-platform UID-compatible bind mounts.
  */
 export class DockerBenchmarkSandbox {
   constructor({
@@ -897,40 +1131,60 @@ export class DockerBenchmarkSandbox {
       this._probeCache = {
         ...normalizeProbeOutcome(this.probes, 'docker_probe_failed'),
         image: this.image,
+        imageId: this.probes.imageId ?? null,
+        imageDigest: this.probes.imageDigest ?? null,
+        serverVersion: this.probes.serverVersion ?? null,
       };
       return this._probeCache;
     }
 
     if (this.probes?.isAvailable) {
+      const raw = this.probes.isAvailable();
       this._probeCache = {
-        ...normalizeProbeOutcome(this.probes.isAvailable(), 'docker_probe_failed'),
+        ...normalizeProbeOutcome(raw, 'docker_probe_failed'),
         image: this.image,
+        imageId: raw?.imageId ?? null,
+        imageDigest: raw?.imageDigest ?? null,
+        serverVersion: raw?.serverVersion ?? null,
       };
       return this._probeCache;
     }
 
+    const dockerEnv = buildDockerClientEnv();
     let daemonOk = false;
     let daemonReason = 'docker_daemon_unavailable';
+    let serverVersion = null;
     if (this.probes?.dockerInfo) {
-      const res = normalizeProbeOutcome(this.probes.dockerInfo(), 'docker_daemon_unavailable');
+      const rawInfo = this.probes.dockerInfo();
+      const res = normalizeProbeOutcome(rawInfo, 'docker_daemon_unavailable');
       daemonOk = res.available;
       daemonReason = res.reason;
+      serverVersion = rawInfo?.serverVersion ?? null;
     } else {
-      const info = spawnSync('docker', ['info', '--format', '{{.ServerVersion}}'], {
-        env: buildStrictSandboxEnv({ tmpDir: tmpdir() }),
+      const info = spawnSync('docker', ['version', '--format', '{{.Server.Version}}'], {
+        env: dockerEnv,
         windowsHide: true,
         encoding: 'utf8',
-        timeout: 3000,
+        timeout: 15000,
         shell: false,
       });
       daemonOk = info.status === 0;
-      if (!daemonOk) {
+      if (daemonOk) {
+        serverVersion = info.stdout?.trim() || null;
+      } else {
         daemonReason = info.error?.message || info.stderr?.trim() || 'docker_daemon_unavailable';
       }
     }
 
     if (!daemonOk) {
-      this._probeCache = { available: false, image: this.image, reason: daemonReason };
+      this._probeCache = {
+        available: false,
+        image: this.image,
+        reason: daemonReason,
+        serverVersion,
+        imageId: null,
+        imageDigest: null,
+      };
       if (this.probes == null) {
         DEFAULT_DOCKER_PROBE_CACHE.set(this.image, this._probeCache);
       }
@@ -939,23 +1193,34 @@ export class DockerBenchmarkSandbox {
 
     let imageOk = false;
     let imageReason = `docker_image_missing:${this.image}`;
+    let imageId = null;
+    let imageDigest = null;
     if (this.probes?.dockerImageInspect) {
-      const res = normalizeProbeOutcome(
-        this.probes.dockerImageInspect(this.image),
-        imageReason,
-      );
+      const rawImg = this.probes.dockerImageInspect(this.image);
+      const res = normalizeProbeOutcome(rawImg, imageReason);
       imageOk = res.available;
       imageReason = res.reason;
+      imageId = rawImg?.imageId ?? null;
+      imageDigest = rawImg?.imageDigest ?? null;
     } else {
       const inspect = spawnSync('docker', ['image', 'inspect', this.image], {
-        env: buildStrictSandboxEnv({ tmpDir: tmpdir() }),
+        env: dockerEnv,
         windowsHide: true,
         encoding: 'utf8',
-        timeout: 3000,
+        timeout: 15000,
         shell: false,
       });
       imageOk = inspect.status === 0;
-      if (!imageOk) {
+      if (imageOk) {
+        try {
+          const parsed = JSON.parse(inspect.stdout || '[]');
+          const imgMeta = Array.isArray(parsed) ? parsed[0] : parsed;
+          imageId = imgMeta?.Id ?? null;
+          imageDigest = imgMeta?.RepoDigests?.[0] ?? imageId;
+        } catch {
+          // image metadata optional
+        }
+      } else {
         imageReason = inspect.error?.message || inspect.stderr?.trim() || imageReason;
       }
     }
@@ -964,6 +1229,9 @@ export class DockerBenchmarkSandbox {
       available: imageOk,
       image: this.image,
       reason: imageOk ? 'ok' : imageReason,
+      serverVersion,
+      imageId,
+      imageDigest,
     };
     if (this.probes == null) {
       DEFAULT_DOCKER_PROBE_CACHE.set(this.image, this._probeCache);
@@ -978,7 +1246,11 @@ export class DockerBenchmarkSandbox {
   capabilities() {
     return {
       mode: SANDBOX_MODES.DOCKER,
+      isolationTier: SANDBOX_TIERS.STRONG_OS_ISOLATION,
+      strongOsIsolation: true,
       networkIsolated: true,
+      ipcNone: true,
+      cpuUlimitEnforced: true,
       fsRootReadOnly: true,
       capDropAll: true,
       noNewPrivileges: true,
@@ -1004,13 +1276,19 @@ export class DockerBenchmarkSandbox {
       memoryLimitMb = this.memoryLimitMb,
       cpus = this.cpus,
       pidsLimit = this.pidsLimit,
+      cpuLimitSec = null,
       extraEnv = {},
+      containerWorkSource = null,
+      containerRoSources = null,
+      stdinData = null,
     } = {},
   ) {
     if (!Array.isArray(argv) || argv.length === 0) {
       throw new SandboxPolicyError('argv must be a non-empty array', 'E_SANDBOX_COMMAND_BLOCKED');
     }
-    const canonicalWs = assertNoSymlinkEscape(workspaceRoot);
+    const canonicalWs = assertNoSymlinkEscape(
+      assertSafeDockerMountSource(workspaceRoot, 'workspaceRoot'),
+    );
     const canonicalCwd = nativeRealpath(cwd ?? canonicalWs);
     if (!isPathInsideRoot(canonicalWs, canonicalCwd, { allowEqual: true })) {
       throw new SandboxPolicyError(
@@ -1019,7 +1297,18 @@ export class DockerBenchmarkSandbox {
       );
     }
 
-    const canonicalRoDirs = readOnlyDirs.map((d) => nativeRealpath(d));
+    const canonicalRoDirs = readOnlyDirs.map((d, idx) =>
+      assertSafeDockerMountSource(nativeRealpath(d), `readOnlyDir[${idx}]`),
+    );
+    const mountWs = containerWorkSource
+      ? assertSafeDockerMountSource(nativeRealpath(containerWorkSource), 'containerWorkSource')
+      : canonicalWs;
+    const mountRoDirs = Array.isArray(containerRoSources)
+      ? containerRoSources.map((d, idx) =>
+          assertSafeDockerMountSource(nativeRealpath(d), `containerRoSource[${idx}]`),
+        )
+      : canonicalRoDirs;
+
     const containerName = `agent-us-bench-${randomUUID().slice(0, 12)}`;
     const relCwd = relative(canonicalWs, canonicalCwd).replace(/\\/g, '/');
     const containerWorkdir = relCwd ? posixPath.join('/work', relCwd) : '/work';
@@ -1040,29 +1329,41 @@ export class DockerBenchmarkSandbox {
       NPM_CONFIG_FUND: 'false',
       NPM_CONFIG_IGNORE_SCRIPTS: 'true',
       NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+      PYTHONDONTWRITEBYTECODE: '1',
+      PIP_NO_INDEX: '1',
+      PIP_DISABLE_PIP_VERSION_CHECK: '1',
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'safe.directory',
+      GIT_CONFIG_VALUE_0: '/work',
       NO_PROXY: '*',
       HTTP_PROXY: 'http://127.0.0.1:0',
       HTTPS_PROXY: 'http://127.0.0.1:0',
       ALL_PROXY: 'http://127.0.0.1:0',
     };
     for (const [k, v] of Object.entries(validatedExtra)) {
-      if (v && isAbsolute(v) && existsSync(v) && isPathInsideRoot(canonicalWs, v, { allowEqual: true })) {
-        containerEnv[k] = translateHostPathToContainer(v, canonicalWs, canonicalRoDirs);
-      } else {
-        containerEnv[k] = v;
+      if (v && isAbsolute(v) && existsSync(v)) {
+        const insideWs = isPathInsideRoot(canonicalWs, v, { allowEqual: true });
+        const insideRo = canonicalRoDirs.some((ro) => isPathInsideRoot(ro, v, { allowEqual: true }));
+        if (insideWs || insideRo) {
+          containerEnv[k] = translateHostPathToContainer(v, canonicalWs, canonicalRoDirs);
+          continue;
+        }
       }
+      containerEnv[k] = v;
     }
 
     const dockerArgs = [
       'run',
+      ...(stdinData != null ? ['-i'] : []),
       '--rm',
       '--init',
       '--pull=never',
       '--name',
       containerName,
       '--network=none',
+      '--ipc=none',
       '--read-only',
       '--cap-drop=ALL',
       '--security-opt=no-new-privileges',
@@ -1071,14 +1372,19 @@ export class DockerBenchmarkSandbox {
       `--memory=${memoryLimitMb}m`,
       `--memory-swap=${memoryLimitMb}m`,
       `--cpus=${cpus}`,
+      '--ulimit',
+      'nofile=1024:1024',
+      ...(Number.isFinite(cpuLimitSec) && cpuLimitSec > 0
+        ? [`--ulimit`, `cpu=${Math.max(1, Math.ceil(cpuLimitSec))}:${Math.max(1, Math.ceil(cpuLimitSec))}`]
+        : []),
       '--tmpfs',
       '/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
       '-v',
-      `${canonicalWs}:/work:${workspaceReadOnly ? 'ro' : 'rw'}`,
+      `${mountWs}:/work:${workspaceReadOnly ? 'ro' : 'rw'}`,
     ];
 
-    for (let i = 0; i < canonicalRoDirs.length; i++) {
-      dockerArgs.push('-v', `${canonicalRoDirs[i]}:/agent-us-ro/${i}:ro`);
+    for (let i = 0; i < mountRoDirs.length; i++) {
+      dockerArgs.push('-v', `${mountRoDirs[i]}:/agent-us-ro/${i}:ro`);
     }
 
     for (const [k, v] of Object.entries(containerEnv)) {
@@ -1109,7 +1415,7 @@ export class DockerBenchmarkSandbox {
     });
 
     dockerArgs.push(...mappedArgv);
-    return { containerName, dockerArgs };
+    return { containerName, dockerArgs, containerEnv };
   }
 
   async execArgv(argv, opts = {}) {
@@ -1121,47 +1427,116 @@ export class DockerBenchmarkSandbox {
       );
     }
     const {
+      workspaceRoot,
+      workspaceReadOnly = false,
+      readOnlyDirs = [],
       timeoutMs = 30000,
       cpuLimitSec = null,
       maxOutputBytes = this.maxOutputBytes,
       signal = null,
       onOutput = null,
+      stdinData = null,
     } = opts;
-    const { containerName, dockerArgs } = this.buildDockerRunArgs(argv, opts);
 
-    const effectiveTimeoutMs =
-      Number.isFinite(cpuLimitSec) && cpuLimitSec > 0
-        ? Math.min(timeoutMs, Math.max(1500, Math.ceil(cpuLimitSec * 1000 * 2.5) + 1000))
-        : timeoutMs;
+    const canonicalWs = assertNoSymlinkEscape(
+      assertSafeDockerMountSource(workspaceRoot, 'workspaceRoot'),
+    );
+    const canonicalRoDirs = readOnlyDirs.map((d, idx) =>
+      assertSafeDockerMountSource(nativeRealpath(d), `readOnlyDir[${idx}]`),
+    );
 
-    const result = await spawnCollected({
-      command: 'docker',
-      args: dockerArgs,
-      cwd: opts.workspaceRoot,
-      env: buildStrictSandboxEnv({ tmpDir: tmpdir() }),
-      timeoutMs: effectiveTimeoutMs,
-      maxOutputBytes,
-      signal,
-      onOutput,
-      onTimeoutOrAbort: () => {
+    let stageOuter = null;
+    let containerWorkSource = canonicalWs;
+    let containerRoSources = canonicalRoDirs;
+
+    if (process.platform !== 'win32') {
+      stageOuter = nativeRealpath(mkdtempSync(join(tmpdir(), 'agent-us-dkr-stage-')));
+      chmodSync(stageOuter, 0o700);
+      const stageWs = join(stageOuter, 'work');
+      cpSync(canonicalWs, stageWs, { recursive: true, verbatimSymlinks: true });
+      chmodTreeForContainerPosix(stageWs, { readOnly: Boolean(workspaceReadOnly) });
+      containerWorkSource = stageWs;
+
+      containerRoSources = canonicalRoDirs.map((roDir, idx) => {
+        const stageRo = join(stageOuter, `ro-${idx}`);
+        cpSync(roDir, stageRo, { recursive: true, verbatimSymlinks: true });
+        chmodTreeForContainerPosix(stageRo, { readOnly: true });
+        return stageRo;
+      });
+    }
+
+    const dockerClientEnv = buildDockerClientEnv();
+    try {
+      const { containerName, dockerArgs } = this.buildDockerRunArgs(argv, {
+        ...opts,
+        workspaceRoot: canonicalWs,
+        readOnlyDirs: canonicalRoDirs,
+        containerWorkSource,
+        containerRoSources,
+        stdinData,
+      });
+
+      const effectiveTimeoutMs =
+        Number.isFinite(cpuLimitSec) && cpuLimitSec > 0
+          ? Math.min(timeoutMs, Math.max(1500, Math.ceil(cpuLimitSec * 1000 * 2.5) + 1000))
+          : timeoutMs;
+
+      const forceRmContainer = () => {
         spawnSync('docker', ['rm', '-f', containerName], {
-          env: buildStrictSandboxEnv({ tmpDir: tmpdir() }),
+          env: dockerClientEnv,
           windowsHide: true,
           stdio: 'ignore',
           timeout: 5000,
           shell: false,
         });
-      },
-    });
+      };
 
-    return {
-      ...result,
-      cpuLimitExceeded: Boolean(
-        result.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(result.stderr),
-      ),
-      outputTruncated: Boolean(result.truncated),
-      backend: SANDBOX_MODES.DOCKER,
-    };
+      const result = await spawnCollected({
+        command: 'docker',
+        args: dockerArgs,
+        cwd: canonicalWs,
+        env: dockerClientEnv,
+        timeoutMs: effectiveTimeoutMs,
+        maxOutputBytes,
+        signal,
+        stdinData,
+        onTimeoutOrAbort: forceRmContainer,
+      });
+
+      if (result.timedOut || result.exitCode !== 0) {
+        forceRmContainer();
+      }
+
+      if (process.platform !== 'win32' && !workspaceReadOnly) {
+        syncWritableStageBackPosix(containerWorkSource, canonicalWs);
+      }
+
+      const exitSignal = result.signal ?? null;
+      return {
+        ...result,
+        signal: exitSignal,
+        containerName,
+        imageId: probe.imageId ?? null,
+        imageDigest: probe.imageDigest ?? null,
+        cpuLimitExceeded: isCpuLimitExceeded({
+          exitCode: result.exitCode,
+          signal: exitSignal,
+          stderr: result.stderr,
+        }),
+        outputTruncated: Boolean(result.truncated),
+        backend: SANDBOX_MODES.DOCKER,
+        isolationTier: SANDBOX_TIERS.STRONG_OS_ISOLATION,
+        strongOsIsolation: true,
+      };
+    } finally {
+      if (stageOuter) {
+        try {
+          restoreWritableAndRemovePosix(stageOuter);
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    }
   }
 }
 
@@ -1451,6 +1826,8 @@ export class NodePermissionBenchmarkSandbox {
   capabilities() {
     return {
       mode: SANDBOX_MODES.NODE_PERMISSION,
+      isolationTier: SANDBOX_TIERS.PROCESS_HARDENING_ONLY,
+      strongOsIsolation: false,
       networkIsolated: true,
       fsRootReadOnly: false,
       fsScopedByPermissionModel: true,
@@ -1478,6 +1855,7 @@ export class NodePermissionBenchmarkSandbox {
       cpuLimitSec = null,
       memoryLimitMb = 512,
       extraEnv = {},
+      [SUPERVISOR_RUN_SYM]: isSupervisorRun = false,
     },
   ) {
     const canonicalWs = assertNoSymlinkEscape(workspaceRoot);
@@ -1506,15 +1884,24 @@ export class NodePermissionBenchmarkSandbox {
       ...canonicalRwDirs,
     ]);
 
-    const parentNodeFlags = [
-      '--permission',
-      '--no-addons',
-      `--max-old-space-size=${memoryLimitMb}`,
-      ...[...readAllowSet].map((p) => `--allow-fs-read=${p}`),
-      ...[...writeAllowSet].map((p) => `--allow-fs-write=${p}`),
-      ...(allowWorkspaceNodeCli ? ['--allow-child-process'] : []),
-      `--import=${PRELOAD_FILE_URL}`,
-    ];
+    const parentNodeFlags = isSupervisorRun
+      ? [
+          '--permission',
+          '--no-addons',
+          `--max-old-space-size=${memoryLimitMb}`,
+          ...[...readAllowSet].map((p) => `--allow-fs-read=${p}`),
+          `--allow-fs-write=${canonicalTmp}`,
+          '--allow-child-process',
+        ]
+      : [
+          '--permission',
+          '--no-addons',
+          `--max-old-space-size=${memoryLimitMb}`,
+          ...[...readAllowSet].map((p) => `--allow-fs-read=${p}`),
+          ...[...writeAllowSet].map((p) => `--allow-fs-write=${p}`),
+          ...(allowWorkspaceNodeCli ? ['--allow-child-process'] : []),
+          `--import=${PRELOAD_FILE_URL}`,
+        ];
 
     const strictEnv = buildStrictSandboxEnv({ tmpDir: canonicalTmp, extraEnv });
     const cpuLimitMs =
@@ -1549,20 +1936,34 @@ export class NodePermissionBenchmarkSandbox {
         })
       : undefined;
 
-    const env = {
-      ...strictEnv,
-      AGENT_US_SANDBOX_CONFIG: JSON.stringify({
-        workspaceRoot: canonicalWs,
-        workspaceReadOnly: Boolean(workspaceReadOnly),
-        allowWorkspaceNodeCli: Boolean(allowWorkspaceNodeCli),
-        nodeExecPath: this.nodeExecPath,
-        cpuLimitMs,
-        maxChildSpawns,
-        grandchildNodeFlags,
-        grandchildBaseEnv: allowWorkspaceNodeCli ? strictEnv : undefined,
-        grandchildConfigJson,
-      }),
-    };
+    const sandboxConfigJson = JSON.stringify({
+      workspaceRoot: canonicalWs,
+      workspaceReadOnly: Boolean(workspaceReadOnly),
+      allowWorkspaceNodeCli: Boolean(allowWorkspaceNodeCli),
+      nodeExecPath: this.nodeExecPath,
+      cpuLimitMs,
+      maxChildSpawns,
+      grandchildNodeFlags,
+      grandchildBaseEnv: allowWorkspaceNodeCli ? strictEnv : undefined,
+      grandchildConfigJson,
+    });
+
+    const env = isSupervisorRun
+      ? { ...strictEnv }
+      : {
+          ...strictEnv,
+          AGENT_US_SANDBOX_CONFIG: sandboxConfigJson,
+        };
+
+    const workerFlags = [
+      '--permission',
+      '--no-addons',
+      `--max-old-space-size=${memoryLimitMb}`,
+      ...[...readAllowSet].map((p) => `--allow-fs-read=${p}`),
+      ...[...writeAllowSet].map((p) => `--allow-fs-write=${p}`),
+      ...(allowWorkspaceNodeCli ? ['--allow-child-process'] : []),
+      `--import=${PRELOAD_FILE_URL}`,
+    ];
 
     const effectiveNodeArgs = validateTopLevelNodeArgs(nodeArgs, { canonicalCwd });
     return {
@@ -1572,6 +1973,8 @@ export class NodePermissionBenchmarkSandbox {
       effectiveNodeArgs,
       env,
       cpuLimitMs,
+      workerFlags,
+      workerSandboxConfigJson: sandboxConfigJson,
     };
   }
 
@@ -1590,6 +1993,7 @@ export class NodePermissionBenchmarkSandbox {
       maxOutputBytes = this.maxOutputBytes,
       signal = null,
       onOutput = null,
+      stdinData = null,
     } = opts;
 
     const ephemeralTmp = nativeRealpath(mkdtempSync(join(tmpdir(), 'agent-us-sbx-tmp-')));
@@ -1632,15 +2036,22 @@ export class NodePermissionBenchmarkSandbox {
         maxOutputBytes,
         signal,
         onOutput,
+        stdinData,
       });
 
+      const exitSignal = result.signal ?? null;
       return {
         ...result,
-        cpuLimitExceeded: Boolean(
-          result.exitCode === 137 || /ERR_SANDBOX_CPU_LIMIT/i.test(result.stderr),
-        ),
+        signal: exitSignal,
+        cpuLimitExceeded: isCpuLimitExceeded({
+          exitCode: result.exitCode,
+          signal: exitSignal,
+          stderr: result.stderr,
+        }),
         outputTruncated: Boolean(result.truncated),
         backend: SANDBOX_MODES.NODE_PERMISSION,
+        isolationTier: SANDBOX_TIERS.PROCESS_HARDENING_ONLY,
+        strongOsIsolation: false,
       };
     } finally {
       try {
@@ -1918,12 +2329,14 @@ function mergeShorthandProbes(probes) {
 }
 
 /**
- * Fail-closed unified benchmark sandbox facade resolving Docker or Node `--permission`.
- * Never falls back to `HostSandboxAdapter` or unsandboxed host execution.
+ * Fail-closed benchmark sandbox facade requiring strong OS isolation (Docker)
+ * by default. Never silently downgrades `STRONG`, `DOCKER`, or `AUTO` to
+ * process-level Node `--permission` or unsandboxed host execution.
  */
 export class BenchmarkSandbox {
   constructor({
-    mode = process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || SANDBOX_MODES.AUTO,
+    mode = process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || SANDBOX_MODES.STRONG,
+    allowProcessHardeningOnly = process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY === '1',
     workspaceRoot = null,
     dependencyPolicy = DEFAULT_DEPENDENCY_POLICY,
     dockerSandbox = null,
@@ -1946,6 +2359,7 @@ export class BenchmarkSandbox {
       );
     }
     this.mode = mode;
+    this.allowProcessHardeningOnly = Boolean(allowProcessHardeningOnly);
     this.workspaceRoot = workspaceRoot;
     this.dependencyPolicy = validateDependencyPolicy(dependencyPolicy);
     this.allowWorkspaceNodeCli = Boolean(allowWorkspaceNodeCli);
@@ -1990,19 +2404,23 @@ export class BenchmarkSandbox {
   }
 
   resolveBackend() {
-    if (this.mode === SANDBOX_MODES.DOCKER) {
-      if (this.dockerSandbox.isAvailable()) {
-        return { mode: SANDBOX_MODES.DOCKER, backend: this.dockerSandbox };
-      }
-      throw new SandboxUnavailableError(
-        'Docker benchmark sandbox is unavailable (mode locked to "docker")',
-        { requestedMode: this.mode, dockerProbe: this.dockerSandbox.probe() },
-      );
-    }
-
     if (this.mode === SANDBOX_MODES.NODE_PERMISSION) {
+      if (!this.allowProcessHardeningOnly) {
+        throw new SandboxUnavailableError(
+          'Node --permission process-hardening mode requires explicit allowProcessHardeningOnly: true opt-in; strong OS isolation (Docker) is required by default',
+          {
+            requestedMode: this.mode,
+            isolationTierRequired: SANDBOX_TIERS.STRONG_OS_ISOLATION,
+          },
+        );
+      }
       if (this.nodePermissionSandbox.isAvailable()) {
-        return { mode: SANDBOX_MODES.NODE_PERMISSION, backend: this.nodePermissionSandbox };
+        return {
+          mode: SANDBOX_MODES.NODE_PERMISSION,
+          isolationTier: SANDBOX_TIERS.PROCESS_HARDENING_ONLY,
+          strongOsIsolation: false,
+          backend: this.nodePermissionSandbox,
+        };
       }
       throw new SandboxUnavailableError(
         'Node --permission benchmark sandbox is unavailable (mode locked to "node-permission")',
@@ -2011,18 +2429,20 @@ export class BenchmarkSandbox {
     }
 
     if (this.dockerSandbox.isAvailable()) {
-      return { mode: SANDBOX_MODES.DOCKER, backend: this.dockerSandbox };
-    }
-    if (this.nodePermissionSandbox.isAvailable()) {
-      return { mode: SANDBOX_MODES.NODE_PERMISSION, backend: this.nodePermissionSandbox };
+      return {
+        mode: SANDBOX_MODES.DOCKER,
+        isolationTier: SANDBOX_TIERS.STRONG_OS_ISOLATION,
+        strongOsIsolation: true,
+        backend: this.dockerSandbox,
+      };
     }
 
     throw new SandboxUnavailableError(
-      'No verified benchmark sandbox backend is available (docker and node-permission both unavailable)',
+      `Strong OS isolation Docker sandbox is unavailable (${this.dockerSandbox.probe().reason}); fail-closed policy forbids downgrade to Node permission model or host execution`,
       {
         requestedMode: this.mode,
+        isolationTierRequired: SANDBOX_TIERS.STRONG_OS_ISOLATION,
         dockerProbe: this.dockerSandbox.probe(),
-        nodeProbe: this.nodePermissionSandbox.probe(),
       },
     );
   }
@@ -2264,14 +2684,21 @@ export class BenchmarkSandbox {
   }
 
   /**
-   * Executes a hidden acceptance test from an ephemeral read-only directory outside
-   * `workspaceRoot`, keeping `workspaceRoot` read-only and exposing `WORKSPACE_ROOT`
-   * and `AGENT_US_WORKSPACE_ROOT`.
+   * Executes a hidden acceptance suite under 3-domain trust separation:
+   * Host Judge <-> Read-Only Supervisor <-> Fresh Per-Test Worker Process.
+   * Requires HMAC-SHA256 completion envelope bound to task, attempt, session nonce,
+   * artifact digest, and expected tests; fails closed on premature exit, skipped
+   * tests, insufficient assertions, tampered files, or forged stdout.
    */
   async runHiddenAcceptance({
     workspaceRoot = this.workspaceRoot,
     scriptSource,
     scriptFilename = 'hidden-acceptance.test.mjs',
+    taskId = 'adhoc-hidden-acceptance',
+    attemptId = 'attempt-1',
+    sessionNonce = randomUUID(),
+    expectedTests = null,
+    artifactDigest = null,
     allowWorkspaceNodeCli = this.allowWorkspaceNodeCli,
     timeoutMs = this.timeoutMs,
     cpuLimitSec = this.cpuLimitSec,
@@ -2298,71 +2725,236 @@ export class BenchmarkSandbox {
       );
     }
 
+    const resolvedBackend = this.resolveBackend();
     const canonicalWs = assertNoSymlinkEscape(workspaceRoot);
-    const hiddenDir = nativeRealpath(mkdtempSync(join(tmpdir(), 'agent-us-hidden-acc-')));
+    const expectedList = normalizeExpectedTests(expectedTests, scriptSource);
+    for (const exp of expectedList) {
+      if (exp.staticModifier === 'skip' || exp.staticModifier === 'todo') {
+        throw new SandboxPolicyError(
+          `Static test.${exp.staticModifier} is forbidden in hidden acceptance suite ("${exp.name}")`,
+          'E_SANDBOX_POLICY_VIOLATION',
+        );
+      }
+    }
+
+    const resolvedArtifactDigest =
+      typeof artifactDigest === 'string' && artifactDigest
+        ? artifactDigest
+        : computeWorkspaceArtifactDigest(canonicalWs);
+
+    const hiddenOuterDir = nativeRealpath(mkdtempSync(join(tmpdir(), 'agent-us-hidden-acc-')));
+    if (process.platform !== 'win32') {
+      chmodSync(hiddenOuterDir, 0o700);
+    }
+    const hiddenDir = join(hiddenOuterDir, 'suite');
+    mkdirSync(hiddenDir, { recursive: true });
+    const supervisorFile = join(hiddenDir, 'supervisor.mjs');
+    const workerFile = join(hiddenDir, 'worker.mjs');
     const hiddenFile = join(hiddenDir, cleanFilename);
+    const manifestFile = join(hiddenDir, 'manifest.json');
 
     try {
-      if (isPathInsideRoot(canonicalWs, hiddenDir, { allowEqual: true })) {
+      if (isPathInsideRoot(canonicalWs, hiddenOuterDir, { allowEqual: true })) {
         throw new SandboxPolicyError(
           'Ephemeral hidden acceptance directory must reside outside workspaceRoot',
           'E_SANDBOX_PATH_ESCAPE',
         );
       }
 
+      const supervisorBytes = readFileSync(HIDDEN_SUPERVISOR_SRC_PATH);
+      const workerBytes = readFileSync(HIDDEN_WORKER_SRC_PATH);
+      writeFileSync(supervisorFile, supervisorBytes);
+      writeFileSync(workerFile, workerBytes);
       writeFileSync(hiddenFile, scriptSource, 'utf8');
-      if (process.platform !== 'win32') {
-        chmodSync(hiddenFile, 0o400);
-        chmodSync(hiddenDir, 0o500);
+
+      const suiteSha256 = computeSha256Hex(readFileSync(hiddenFile));
+      const workerSha256 = computeSha256Hex(workerBytes);
+      const hmacKey = randomBytes(32).toString('hex');
+      const envelopeNonce = randomBytes(16).toString('hex');
+
+      const validatedExtra = validateExtraEnv(extraEnv);
+      const extraEnvKeys = Object.keys(validatedExtra);
+
+      let childExecArgv = [];
+      let workerSandboxConfigJson = null;
+      let tempForWorkerFlags = null;
+
+      if (resolvedBackend.mode === SANDBOX_MODES.NODE_PERMISSION) {
+        tempForWorkerFlags = nativeRealpath(mkdtempSync(join(tmpdir(), 'agent-us-ha-wrk-')));
+        const inv = this.nodePermissionSandbox.buildInvocation(['node', workerFile], {
+          workspaceRoot: canonicalWs,
+          cwd: canonicalWs,
+          tmpDir: tempForWorkerFlags,
+          workspaceReadOnly: true,
+          readOnlyDirs: [hiddenDir],
+          allowWorkspaceNodeCli: Boolean(allowWorkspaceNodeCli),
+          cpuLimitSec,
+          memoryLimitMb,
+          extraEnv: {
+            ...validatedExtra,
+            WORKSPACE_ROOT: canonicalWs,
+            AGENT_US_WORKSPACE_ROOT: canonicalWs,
+          },
+        });
+        childExecArgv = inv.workerFlags;
+        workerSandboxConfigJson = inv.workerSandboxConfigJson;
       }
 
-      const res = await this.execArgv(['node', '--test', hiddenFile], {
-        workspaceRoot: canonicalWs,
-        cwd: canonicalWs,
-        workspaceReadOnly: true,
-        readOnlyDirs: [hiddenDir],
-        allowWorkspaceNodeCli: Boolean(allowWorkspaceNodeCli),
-        timeoutMs,
-        cpuLimitSec,
-        memoryLimitMb,
-        maxOutputBytes,
-        onOutput,
-        signal,
-        extraEnv: {
-          ...extraEnv,
-          WORKSPACE_ROOT: canonicalWs,
-          AGENT_US_WORKSPACE_ROOT: canonicalWs,
+      const manifest = {
+        schemaVersion: 1,
+        sessionNonce: String(sessionNonce),
+        taskId: String(taskId),
+        attemptId: String(attemptId),
+        artifactDigest: resolvedArtifactDigest,
+        suiteFile: cleanFilename,
+        suiteSha256,
+        workerFile: 'worker.mjs',
+        workerSha256,
+        expectedTests: expectedList.map(({ index, id, name, minAssertions }) => ({
+          index,
+          id,
+          name,
+          minAssertions,
+        })),
+        perTestTimeoutMs: Math.max(500, Number(timeoutMs || 30000)),
+        extraEnvKeys,
+        childExecArgv,
+        ...(workerSandboxConfigJson ? { workerSandboxConfigJson } : {}),
+      };
+      writeFileSync(manifestFile, JSON.stringify(manifest), 'utf8');
+
+      if (process.platform !== 'win32') {
+        chmodSync(supervisorFile, 0o444);
+        chmodSync(workerFile, 0o444);
+        chmodSync(hiddenFile, 0o444);
+        chmodSync(manifestFile, 0o444);
+        chmodSync(hiddenDir, 0o555);
+      }
+
+      const supervisorStdin = JSON.stringify({ hmacKey, envelopeNonce }) + '\n';
+      const combinedExtraEnv = {
+        ...validatedExtra,
+        WORKSPACE_ROOT: canonicalWs,
+        AGENT_US_WORKSPACE_ROOT: canonicalWs,
+      };
+
+      let res;
+      try {
+        if (resolvedBackend.mode === SANDBOX_MODES.DOCKER) {
+          res = await resolvedBackend.backend.execArgv(
+            ['node', supervisorFile, manifestFile],
+            {
+              workspaceRoot: canonicalWs,
+              cwd: canonicalWs,
+              workspaceReadOnly: true,
+              readOnlyDirs: [hiddenDir],
+              timeoutMs,
+              cpuLimitSec,
+              memoryLimitMb,
+              maxOutputBytes,
+              onOutput,
+              signal,
+              stdinData: supervisorStdin,
+              extraEnv: combinedExtraEnv,
+            },
+          );
+        } else {
+          res = await resolvedBackend.backend.execNode([supervisorFile, manifestFile], {
+            workspaceRoot: canonicalWs,
+            cwd: canonicalWs,
+            workspaceReadOnly: true,
+            readOnlyDirs: [hiddenDir],
+            allowWorkspaceNodeCli: true,
+            timeoutMs,
+            cpuLimitSec,
+            memoryLimitMb,
+            maxOutputBytes,
+            onOutput,
+            signal,
+            stdinData: supervisorStdin,
+            extraEnv: combinedExtraEnv,
+            [SUPERVISOR_RUN_SYM]: true,
+          });
+        }
+      } finally {
+        if (tempForWorkerFlags) {
+          try {
+            rmSync(tempForWorkerFlags, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      const envelopeCheck = extractAndVerifyHiddenEnvelope({
+        stdout: res.stdout,
+        stderr: res.stderr,
+        hmacKey,
+        expected: {
+          envelopeNonce,
+          sessionNonce: String(sessionNonce),
+          taskId: String(taskId),
+          attemptId: String(attemptId),
+          artifactDigest: resolvedArtifactDigest,
+          suiteSha256,
+          workerSha256,
+          expectedTests: expectedList,
         },
       });
 
+      const passed = Boolean(
+        res.exitCode === 0 &&
+          !res.timedOut &&
+          envelopeCheck.verified &&
+          envelopeCheck.passed,
+      );
+
       return {
-        passed: res.exitCode === 0 && !res.timedOut,
+        passed,
+        verified: Boolean(envelopeCheck.verified),
         exitCode: res.exitCode,
+        signal: res.signal ?? null,
         stdout: res.stdout,
         stderr: res.stderr,
         timedOut: Boolean(res.timedOut),
         cpuLimitExceeded: Boolean(res.cpuLimitExceeded),
         backend: res.backend,
+        isolationTier: resolvedBackend.isolationTier,
+        strongOsIsolation: resolvedBackend.strongOsIsolation,
+        imageId: res.imageId ?? null,
+        imageDigest: res.imageDigest ?? null,
         truncated: Boolean(res.truncated),
         outputTruncated: Boolean(res.outputTruncated ?? res.truncated),
+        tamperingDetected: Boolean(envelopeCheck.tamperingDetected),
+        reason: res.timedOut ? 'hidden_acceptance_timeout' : envelopeCheck.reason,
+        error: envelopeCheck.errors?.[0] ?? null,
+        errors: envelopeCheck.errors ?? [],
+        expectedCount: envelopeCheck.expectedCount,
+        executedCount: envelopeCheck.executedCount,
+        passedCount: envelopeCheck.passedCount,
+        failedCount: envelopeCheck.failedCount,
+        skippedCount: envelopeCheck.skippedCount,
+        todoCount: envelopeCheck.todoCount,
+        tests: envelopeCheck.tests,
+        envelopeDigest: envelopeCheck.envelopeDigest,
+        artifactDigest: resolvedArtifactDigest,
+        taskId: String(taskId),
+        attemptId: String(attemptId),
+        sessionNonce: String(sessionNonce),
       };
     } finally {
       if (process.platform !== 'win32') {
         try {
-          chmodSync(hiddenDir, 0o700);
+          restoreWritableAndRemovePosix(hiddenOuterDir);
         } catch {
-          // ignore
+          // best effort
         }
+      } else {
         try {
-          chmodSync(hiddenFile, 0o600);
+          rmSync(hiddenOuterDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
         } catch {
-          // ignore
+          // ignore best-effort cleanup
         }
-      }
-      try {
-        rmSync(hiddenDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 30 });
-      } catch {
-        // ignore best-effort cleanup
       }
     }
   }

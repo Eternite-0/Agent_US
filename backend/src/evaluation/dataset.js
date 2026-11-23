@@ -9,7 +9,7 @@ import {
   validateEvidenceManifest,
 } from './schemas.js';
 import { listWorkspaceChangedFiles } from './fixtures.js';
-import { BenchmarkSandbox, isPathInsideRoot } from '../tools/benchmark-sandbox.js';
+import { BenchmarkSandbox, SANDBOX_MODES, isPathInsideRoot } from '../tools/benchmark-sandbox.js';
 import { DEFAULT_DEPENDENCY_POLICY, validatePackageDependencies } from './dependency-policy.js';
 import { estimateTaskBudget } from '../planning/budget-estimator.js';
 
@@ -90,7 +90,7 @@ function readFixtureJson(workspaceRoot, relativePath) {
 const DEFAULT_SANDBOX_BY_MODE = new Map();
 
 function getDefaultBenchmarkSandbox() {
-  const modeKey = process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || 'auto';
+  const modeKey = `${process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || SANDBOX_MODES.STRONG}:${process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY === '1' ? '1' : '0'}`;
   let sbx = DEFAULT_SANDBOX_BY_MODE.get(modeKey);
   if (!sbx) {
     sbx = new BenchmarkSandbox();
@@ -157,6 +157,9 @@ async function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }
   const activeSandbox = context.sandbox ?? getDefaultBenchmarkSandbox();
   const resolvedBackend = activeSandbox.resolveBackend();
   const sandboxBackend = resolvedBackend?.mode ?? activeSandbox.mode ?? null;
+  const isolationTier = resolvedBackend?.isolationTier ?? null;
+  const strongOsIsolation = Boolean(resolvedBackend?.strongOsIsolation);
+  const dockerProbe = sandboxBackend === SANDBOX_MODES.DOCKER ? activeSandbox.dockerSandbox?.probe?.() : null;
 
   const isolationMeta = task.metadata?.sandboxIsolation ?? {};
   const allowWorkspaceNodeCli =
@@ -247,6 +250,10 @@ async function judgeTask({ task, output, context = {}, taskChecks = () => ({}) }
       evidenceCompliant,
       sandboxIsolated: true,
       sandboxBackend,
+      isolationTier,
+      strongOsIsolation,
+      dockerImage: dockerProbe?.image ?? null,
+      dockerImageDigest: dockerProbe?.imageDigest ?? null,
       dependencyPolicyPassed: depCheck.ok,
       ...(depCheck.violations.length ? { dependencyPolicyViolations: depCheck.violations } : {}),
       independentVerdictSource: validation.independentVerdictSource,

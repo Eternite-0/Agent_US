@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -10,9 +11,11 @@ import {
 import { listWorkspaceChangedFiles, verifyWorkspacePinnedBaseline } from './fixtures.js';
 import {
   BenchmarkSandbox,
+  SANDBOX_MODES,
   isPathInsideRoot,
   runHardenedGit,
 } from '../tools/benchmark-sandbox.js';
+import { computeWorkspaceArtifactDigest } from './hidden-acceptance.js';
 import { DEFAULT_DEPENDENCY_POLICY, validatePackageDependencies } from './dependency-policy.js';
 import { estimateTaskBudget } from '../planning/budget-estimator.js';
 
@@ -23,7 +26,7 @@ export const OSS_DATASET_VERSION = '1.0.0';
 const DEFAULT_SANDBOX_BY_MODE = new Map();
 
 function getDefaultBenchmarkSandbox() {
-  const modeKey = process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || 'auto';
+  const modeKey = `${process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || SANDBOX_MODES.STRONG}:${process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY === '1' ? '1' : '0'}`;
   let sbx = DEFAULT_SANDBOX_BY_MODE.get(modeKey);
   if (!sbx) {
     sbx = new BenchmarkSandbox();
@@ -92,11 +95,20 @@ async function hasRealSourceDiff(workspaceRoot, baselineCommit, sourceFiles = []
   return true;
 }
 
-function classifyOssJudgeFailure({ historyUntouched, baselineTestsUntampered, implementationPassed, testsPassed, validation }) {
+function classifyOssJudgeFailure({
+  historyUntouched,
+  baselineTestsUntampered,
+  hiddenResult,
+  implementationPassed,
+  testsPassed,
+  validation,
+}) {
   if (historyUntouched && baselineTestsUntampered && implementationPassed && testsPassed && validation.valid) {
     return 'none';
   }
   if (!historyUntouched || !baselineTestsUntampered) return 'history_tampered';
+  if (hiddenResult?.tamperingDetected) return 'hidden_acceptance_tampered';
+  if (!hiddenResult?.passed || !hiddenResult?.verified) return 'hidden_acceptance_failed';
   if (!implementationPassed || !validation.checks.changedFiles) return 'implementation_failed';
   if (!testsPassed || !validation.checks.testReceiptVerified) return 'test_failed';
   if (validation.status === EVIDENCE_STATUSES.INCOMPLETE) return 'evidence_incomplete';
@@ -115,6 +127,9 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
     const activeSandbox = context.sandbox ?? getDefaultBenchmarkSandbox();
     const resolvedBackend = activeSandbox.resolveBackend();
     const sandboxBackend = resolvedBackend?.mode ?? activeSandbox.mode ?? null;
+    const isolationTier = resolvedBackend?.isolationTier ?? null;
+    const strongOsIsolation = Boolean(resolvedBackend?.strongOsIsolation);
+    const dockerProbe = sandboxBackend === SANDBOX_MODES.DOCKER ? activeSandbox.dockerSandbox?.probe?.() : null;
 
     const isolationMeta = task.metadata?.sandboxIsolation ?? {};
     const allowWorkspaceNodeCli = Boolean(isolationMeta.allowWorkspaceNodeCli);
@@ -148,8 +163,14 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
       }
     }
 
+    const attemptId =
+      context.attemptId ??
+      output?.attemptId ??
+      (context.attempt != null ? `attempt-${context.attempt}` : 'attempt-1');
+    const sessionNonce = context.sessionNonce ?? randomUUID();
     const historyCheck = verifyWorkspacePinnedBaseline(workspaceRoot, pinnedCommit);
     const actualFiles = listWorkspaceChangedFiles(workspaceRoot);
+    const artifactDigest = computeWorkspaceArtifactDigest(workspaceRoot);
     const [baselineFileCheck, sourceDiffPresent] = await Promise.all([
       checkFilesUnmodifiedSince(workspaceRoot, pinnedCommit, baselineTestFiles),
       historyCheck.ok
@@ -161,7 +182,19 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
     let actualTestExitCode = 1;
     let hiddenResult = {
       passed: false,
+      verified: false,
       exitCode: 1,
+      tamperingDetected: false,
+      reason: 'skipped_due_to_integrity_or_policy_failure',
+      expectedCount: 0,
+      executedCount: 0,
+      passedCount: 0,
+      failedCount: 0,
+      skippedCount: 0,
+      todoCount: 0,
+      tests: [],
+      envelopeDigest: null,
+      artifactDigest,
       error: 'skipped_due_to_integrity_or_policy_failure',
     };
 
@@ -188,6 +221,10 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
         activeSandbox.runHiddenAcceptance({
           workspaceRoot,
           scriptSource: hiddenAcceptanceScript,
+          taskId: task.id,
+          attemptId: String(attemptId),
+          sessionNonce: String(sessionNonce),
+          artifactDigest,
           allowWorkspaceNodeCli,
           memoryLimitMb,
           cpuLimitSec,
@@ -197,12 +234,42 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
       ]);
       baselineTestExitCode = baselineRun.timedOut ? 124 : baselineRun.exitCode;
       actualTestExitCode = actualRun.timedOut ? 124 : actualRun.exitCode;
+      const hiddenAllExecuted =
+        hiddenRun.verified === true &&
+        !hiddenRun.tamperingDetected &&
+        !hiddenRun.timedOut &&
+        Number.isInteger(hiddenRun.expectedCount) &&
+        hiddenRun.expectedCount > 0 &&
+        hiddenRun.executedCount === hiddenRun.expectedCount &&
+        hiddenRun.passedCount === hiddenRun.expectedCount &&
+        (hiddenRun.failedCount ?? 0) === 0 &&
+        (hiddenRun.skippedCount ?? 0) === 0 &&
+        (hiddenRun.todoCount ?? 0) === 0;
+      const hiddenPassedStrict = Boolean(hiddenRun.passed && hiddenAllExecuted);
       hiddenResult = {
-        passed: Boolean(hiddenRun.passed),
+        passed: hiddenPassedStrict,
+        verified: Boolean(hiddenRun.verified),
         exitCode: hiddenRun.exitCode,
-        error: hiddenRun.passed
+        tamperingDetected: Boolean(hiddenRun.tamperingDetected),
+        reason: hiddenRun.reason ?? (hiddenPassedStrict ? 'none' : 'hidden_acceptance_failed'),
+        expectedCount: hiddenRun.expectedCount ?? 0,
+        executedCount: hiddenRun.executedCount ?? 0,
+        passedCount: hiddenRun.passedCount ?? 0,
+        failedCount: hiddenRun.failedCount ?? 0,
+        skippedCount: hiddenRun.skippedCount ?? 0,
+        todoCount: hiddenRun.todoCount ?? 0,
+        tests: Array.isArray(hiddenRun.tests) ? hiddenRun.tests : [],
+        envelopeDigest: hiddenRun.envelopeDigest ?? null,
+        artifactDigest: hiddenRun.artifactDigest ?? artifactDigest,
+        error: hiddenPassedStrict
           ? null
-          : String(hiddenRun.stderr || hiddenRun.stdout || 'hidden acceptance test failed').slice(0, 1000),
+          : String(
+              hiddenRun.error ||
+                hiddenRun.reason ||
+                hiddenRun.stderr ||
+                hiddenRun.stdout ||
+                'hidden acceptance test failed',
+            ).slice(0, 1000),
       };
     }
     const extraChecks = extraCheck ? extraCheck({ workspaceRoot, actualFiles }) : {};
@@ -210,7 +277,7 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
 
     const validation = validateEvidenceManifest(output, {
       taskId: task.id,
-      attemptId: context.attemptId ?? output?.attemptId ?? (context.attempt != null ? `attempt-${context.attempt}` : null),
+      attemptId,
       planVersion: context.planVersion ?? output?.planVersion ?? 1,
       expectedTestCommand: acceptance.testCommand,
       requiredChangedFiles: acceptance.requiredChangedFiles,
@@ -231,7 +298,10 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
       sourceDiffPresent,
       baselineTestsPassed: baselineTestExitCode === 0,
       hiddenAcceptancePassed: hiddenResult.passed,
+      hiddenAcceptanceVerified: hiddenResult.verified,
+      hiddenAcceptanceTamperingDetected: hiddenResult.tamperingDetected,
       sandboxIsolated: true,
+      strongOsIsolation,
       dependencyPolicyPassed: depCheck.ok,
       ...extraChecks,
     };
@@ -250,12 +320,15 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
       baselineTestExitCode === 0 &&
       actualTestExitCode === 0 &&
       hiddenResult.passed &&
+      hiddenResult.verified &&
+      !hiddenResult.tamperingDetected &&
       Boolean(checks.testReceiptVerified);
     const evidenceCompliant = Boolean(validation.valid);
     const passed = implementationPassed && testsPassed && evidenceCompliant;
     const failureCategory = classifyOssJudgeFailure({
       historyUntouched,
       baselineTestsUntampered,
+      hiddenResult,
       implementationPassed,
       testsPassed,
       validation,
@@ -284,7 +357,7 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
         baselineCommitObserved: historyCheck.headCommit,
         historyReason: historyCheck.reason,
         tamperedBaselineTestFiles: baselineFileCheck.modified,
-        attemptId: evidence.attemptId ?? context.attemptId ?? null,
+        attemptId: evidence.attemptId ?? attemptId ?? null,
         planVersion: evidence.planVersion ?? context.planVersion ?? 1,
         manifestStatus: validation.status,
         missingFields: validation.missingFields,
@@ -294,6 +367,16 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
         actualTestExitCode,
         baselineTestExitCode,
         hiddenAcceptanceExitCode: hiddenResult.exitCode,
+        hiddenAcceptancePassed: hiddenResult.passed,
+        hiddenAcceptanceVerified: hiddenResult.verified,
+        hiddenAcceptanceTamperingDetected: hiddenResult.tamperingDetected,
+        hiddenAcceptanceReason: hiddenResult.reason,
+        hiddenAcceptanceExpectedCount: hiddenResult.expectedCount,
+        hiddenAcceptanceExecutedCount: hiddenResult.executedCount,
+        hiddenAcceptancePassedCount: hiddenResult.passedCount,
+        hiddenAcceptanceTests: hiddenResult.tests,
+        hiddenAcceptanceEnvelopeDigest: hiddenResult.envelopeDigest,
+        artifactDigest: hiddenResult.artifactDigest,
         reportedTestExitCode: Number.isInteger(evidence.testExitCode) ? evidence.testExitCode : null,
         expectedTestCommand: acceptance.testCommand,
         reportedTestCommand: evidence.testCommand ?? null,
@@ -302,6 +385,10 @@ function makeOssJudge({ sourceFiles, hiddenAcceptanceScript, extraCheck = null }
         evidenceCompliant,
         sandboxIsolated: true,
         sandboxBackend,
+        isolationTier,
+        strongOsIsolation,
+        dockerImage: dockerProbe?.image ?? null,
+        dockerImageDigest: dockerProbe?.imageDigest ?? null,
         dependencyPolicyPassed: depCheck.ok,
         ...(depCheck.violations.length ? { dependencyPolicyViolations: depCheck.violations } : {}),
         independentVerdictSource: validation.independentVerdictSource,

@@ -137,7 +137,11 @@ test('createDirectRuntimeAdapter grants isolated full-access without network for
     cancelTurn() {},
   };
 
-  const adapter = createDirectRuntimeAdapter(fakeDirectAgent, { model: 'test-model' });
+  const { DockerBenchmarkSandbox, SANDBOX_MODES } = await import('../../src/tools/benchmark-sandbox.js');
+  const testSandboxOpts = new DockerBenchmarkSandbox().isAvailable()
+    ? { mode: SANDBOX_MODES.STRONG }
+    : { mode: SANDBOX_MODES.NODE_PERMISSION, allowProcessHardeningOnly: true };
+  const adapter = createDirectRuntimeAdapter(fakeDirectAgent, { model: 'test-model', sandboxOptions: testSandboxOpts });
   const engTask = createRealEngineeringDataset()[0];
   const engHandle = adapter({ task: engTask, workspaceRoot: '/tmp/ws-eng', context: {} });
   await engHandle.run();

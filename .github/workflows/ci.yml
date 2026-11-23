@@ -71,6 +71,14 @@ jobs:
           npm run check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Build Docker benchmark sandbox image (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -f backend/sandbox/Dockerfile.benchmark -t agent-us/benchmark:node24 backend/sandbox
+          docker run --rm --network=none --ipc=none --read-only --cap-drop=ALL --security-opt=no-new-privileges --user=65534:65534 agent-us/benchmark:node24 sh -c "id && node -v && python3 --version && git --version"
+
       - name: Backend core and regression test suites (bash)
         if: runner.os != 'Windows'
         shell: bash
@@ -95,13 +103,13 @@ jobs:
             echo "No backend test files discovered" >&2
             exit 1
           fi
-          echo "Running ${#TESTS[@]} backend test files individually (--test-timeout=60000, concurrency=4)"
+          echo "Running ${#TESTS[@]} backend test files individually (--test-timeout=180000, concurrency=4)"
           failed=0
           for test_file in "${TESTS[@]}"; do
             echo "::group::${test_file}"
             log_file="$(mktemp)"
             set +e
-            node --test --test-concurrency=4 --test-timeout=60000 "$test_file" >"$log_file" 2>&1
+            node --test --test-concurrency=4 --test-timeout=180000 "$test_file" >"$log_file" 2>&1
             code=$?
             set -e
             cat "$log_file"
@@ -126,7 +134,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           Set-Location backend
           Write-Host "::group::Core & Non-Env-Gated Backend Regression Suites"
-          $envGated = @('security.test.js', 'providers.test.js', 'integration.test.js')
+          $envGated = @('security.test.js', 'providers.test.js', 'integration.test.js', 'docker-sandbox-acceptance.test.js')
           $tests = @(
             Get-ChildItem -Path 'test' -Recurse -Filter '*.test.js' -File |
               Where-Object { $envGated -notcontains $_.Name } |
@@ -137,7 +145,7 @@ jobs:
             Write-Error "No backend test files discovered"
             exit 1
           }
-          Write-Host "Running $($tests.Count) backend test files individually (--test-timeout=60000, concurrency=4)"
+          Write-Host "Running $($tests.Count) backend test files individually (--test-timeout=180000, concurrency=4)"
           $failed = $false
           foreach ($testFile in $tests) {
             Write-Host "::group::$testFile"
@@ -145,7 +153,7 @@ jobs:
             $prevNativePref = $PSNativeCommandUseErrorActionPreference
             $PSNativeCommandUseErrorActionPreference = $false
             try {
-              & node --test --test-concurrency=4 --test-timeout=60000 $testFile *> $logFile
+              & node --test --test-concurrency=4 --test-timeout=180000 $testFile *> $logFile
               $code = $LASTEXITCODE
             } finally {
               $PSNativeCommandUseErrorActionPreference = $prevNativePref
@@ -183,6 +191,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           Write-Host "::group::Env-Gated Backend Suites (Docker / Magpie)"
           Write-Host "[SKIP] backend/test/security.test.js — requires Docker Engine and prebuilt Codex sandbox image (not provisioned on standard CI runners)"
+          Write-Host "[SKIP] backend/test/evaluation/docker-sandbox-acceptance.test.js — requires Linux Docker Engine (tested on Ubuntu CI & local Windows Docker Desktop; unavailable on GitHub hosted windows-latest runner)"
           Write-Host "[SKIP] backend/test/providers.test.js — requires local Magpie sidecar binary and Docker host networking (not provisioned on standard CI runners)"
           Write-Host "[SKIP] backend/test/integration.test.js — requires both Magpie sidecar and Docker Codex sandbox image (not provisioned on standard CI runners)"
           Write-Host "::endgroup::"
