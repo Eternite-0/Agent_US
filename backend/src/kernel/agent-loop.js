@@ -217,6 +217,8 @@ export class AgentLoop {
     effort = null,
     messages,
     tools = [],
+    getModelTools = null,
+    selectionRecoveryHint = null,
     toolDispatcher,
     contextManager,
     drainSteering = () => [],
@@ -415,7 +417,7 @@ export class AgentLoop {
           sessionKey: sessionId,
           effort,
           messages,
-          tools,
+          tools: getModelTools ? getModelTools() : tools,
           maxTokens: baseMaxOutputTokens,
           signal,
         };
@@ -753,7 +755,9 @@ export class AgentLoop {
 
         let detectedThrashing = false;
         for (const item of executedBatch) {
-          const { tc, output, isError, durationMs, receipt } = item;
+          const { tc, isError, durationMs, receipt } = item;
+          const hint = selectionRecoveryHint?.(item, getModelTools);
+          const output = hint ? `${item.output}\n${hint}` : item.output;
           await onToolResult?.({
             tc,
             output,

@@ -325,7 +325,7 @@ export function createFsTools({
           .filter((f) => rx.test(f.rel) || rx.test(f.rel.split('/').at(-1) ?? ''))
           .slice(0, limit)
           .map((f) => f.rel);
-        if (!matched.length) return `未找到匹配「${args.pattern}」的文件。`;
+        if (!matched.length) return `未找到匹配「${args.pattern}」的文件。确认目录或换更宽的路径模式；相同输入不必重试。`;
         return wrapResult('glob', `找到 ${matched.length} 个匹配文件:\n${matched.join('\n')}`);
       },
     }),
@@ -396,7 +396,7 @@ export function createFsTools({
             // skip unreadable or protected/escaped paths
           }
         }
-        if (!hits.length) return `未搜索到匹配「${query}」的内容。`;
+        if (!hits.length) return `未搜索到匹配「${query}」的内容。可改关键词或放宽文件过滤；未命中不代表文件不存在。`;
         return wrapResult('grep', hits.join('\n'));
       },
     }),

@@ -1,3 +1,4 @@
+import { modelToolCatalog, selectionRecoveryHint } from './tools/selection.js';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Fault, id as uuid } from './store.js';
@@ -1657,6 +1658,10 @@ export class DirectAgentRuntime {
         execution: evidenceContract ? { evidenceContract } : null,
         messages: assembled.messages,
         tools: effectiveTools,
+        // Presentation only: the dispatcher still authorizes the actual arguments at execution.
+        getModelTools: () => modelToolCatalog(effectiveTools, this.toolPolicy,
+          this.#getLiveSessionPolicy(sessionId) ?? { permissionMode: 'read-only', allowTools: [] }),
+        selectionRecoveryHint,
         hooks,
         permissionMode: livePolicy?.permissionMode || effectivePermissionMode,
         allowTools: livePolicy?.allowTools,

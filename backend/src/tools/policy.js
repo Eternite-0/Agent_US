@@ -117,23 +117,8 @@ export class ToolPermissionPolicy {
     this.allowOutwardInFullAccess = Boolean(allowOutwardInFullAccess);
   }
 
-  evaluate(
-    toolDef,
-    args = {},
-    {
-      approvedPrefixes = [],
-      tainted = false,
-      permissionMode = this.permissionMode,
-      allowTools = undefined,
-      denyTools = undefined,
-    } = {},
-  ) {
-    const name = toolDef.name;
-    const meta = toolDef.meta ?? {};
-    const effectiveMode = Object.hasOwn(PERMISSION_RANK, permissionMode)
-      ? permissionMode
-      : 'read-only';
-
+  // Name-only exclusions are independent of command arguments and human approval.
+  nameDenial(name, { allowTools, denyTools } = {}) {
     if (this.alwaysDenyRules.has(name) || (Array.isArray(denyTools) && denyTools.includes(name))) {
       return {
         decision: 'deny',
@@ -153,6 +138,29 @@ export class ToolPermissionPolicy {
         rule: effectiveAllow.length === 0 ? 'allowlist_empty' : 'allowlist_denied',
       };
     }
+
+    return null;
+  }
+
+  evaluate(
+    toolDef,
+    args = {},
+    {
+      approvedPrefixes = [],
+      tainted = false,
+      permissionMode = this.permissionMode,
+      allowTools = undefined,
+      denyTools = undefined,
+    } = {},
+  ) {
+    const name = toolDef.name;
+    const meta = toolDef.meta ?? {};
+    const effectiveMode = Object.hasOwn(PERMISSION_RANK, permissionMode)
+      ? permissionMode
+      : 'read-only';
+
+    const nameDenial = this.nameDenial(name, { allowTools, denyTools });
+    if (nameDenial) return nameDenial;
 
     if (meta.requiresCommandCheck || name === 'bash' || name === 'start_process') {
       const analysis = analyzeCommand(args?.command);
