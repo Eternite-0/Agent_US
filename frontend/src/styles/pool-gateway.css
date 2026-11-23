@@ -391,7 +391,6 @@
   inset: 0;
   z-index: 1200;
   background: rgba(0, 0, 0, 0.42);
-  backdrop-filter: blur(3px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -403,10 +402,10 @@
   max-height: 86vh;
   display: flex;
   flex-direction: column;
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-dialog);
   border: 1px solid var(--border-strong);
   background: var(--bg-surface);
-  box-shadow: var(--shadow-modal);
+  box-shadow: var(--shadow-dialog);
   overflow: hidden;
 }
 
@@ -1279,10 +1278,10 @@
   max-height: 86vh;
   display: flex;
   flex-direction: column;
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-dialog);
   border: 1px solid var(--border-strong);
   background: var(--bg-surface);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.24);
+  box-shadow: var(--shadow-dialog);
   overflow: hidden;
 }
 

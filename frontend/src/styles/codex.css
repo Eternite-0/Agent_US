@@ -1,6 +1,4 @@
-/* ============================================================================
- * Codex Desktop 26.1111.2228.0 — 1:1 Layout & Component Stylesheet
- * ========================================================================== */
+/* Agent_US desktop shell, document, and workflow components. */
 
 *,
 *::before,
@@ -100,6 +98,7 @@ button:disabled {
 }
 
 .codex-topbar {
+  border-bottom: 1px solid var(--border-subtle);
   height: var(--topbar-height);
   flex: none;
   display: flex;
@@ -396,7 +395,7 @@ button:disabled {
   --edge-fade-bottom: 1.5rem;
 }
 
-/* Exact 30px Codex sidebar item row */
+/* Keep the title and actions aligned even when the title truncates. */
 .codex-sidebar-row {
   position: relative;
   height: var(--row-height);
@@ -405,7 +404,7 @@ button:disabled {
   align-items: center;
   gap: 8px;
   padding: 0 8px;
-  border-radius: var(--radius-md);
+  border-radius: var(--workspace-row-radius);
   font-size: 13.5px;
   line-height: 20px;
   font-weight: var(--font-weight-body);
@@ -437,13 +436,13 @@ button:disabled {
   padding-left: 28px;
 }
 
+
 .codex-sidebar-row-text {
-  min-width: 0;
   flex: 1;
-  overflow: hidden;
+  min-width: 0;
   white-space: nowrap;
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent 100%);
-  mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .codex-sidebar-row-meta {
@@ -453,29 +452,19 @@ button:disabled {
 }
 
 .codex-sidebar-row-actions {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
   display: flex;
   align-items: center;
   gap: 2px;
-  padding-left: 14px;
-  background: linear-gradient(90deg, transparent 0%, var(--bg-chrome) 36%);
   opacity: 0;
   pointer-events: none;
   flex: none;
   transition: opacity var(--duration-basic) var(--ease-basic);
 }
 
-.codex-sidebar-row:hover .codex-sidebar-row-actions {
+.codex-sidebar-row:hover .codex-sidebar-row-actions,
+.codex-sidebar-row:focus-within > .codex-sidebar-row-actions {
   opacity: 1;
   pointer-events: auto;
-  background: linear-gradient(90deg, transparent 0%, var(--bg-ghost-hover) 36%);
-}
-
-.codex-sidebar-row[data-selected="true"]:hover .codex-sidebar-row-actions {
-  background: linear-gradient(90deg, transparent 0%, var(--bg-selected) 36%);
 }
 
 .codex-sidebar-spinner {
@@ -517,7 +506,7 @@ button:disabled {
   opacity: 1 !important;
   pointer-events: auto !important;
   z-index: 65;
-  border-radius: 14px;
+  border-radius: var(--radius-popover);
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-modal);
@@ -530,7 +519,7 @@ button:disabled {
   z-index: 150;
   min-width: 196px;
   padding: 5px;
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-popover);
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-lg);
@@ -540,14 +529,13 @@ button:disabled {
 /* Composer drag-and-drop overlay */
 .codex-composer-card[data-dragging="true"] {
   border-color: var(--color-accent);
-  box-shadow: 0 0 0 3px var(--color-accent-soft);
 }
 
 .codex-drop-overlay {
   position: absolute;
   inset: 4px;
   z-index: 12;
-  border-radius: 16px;
+  border-radius: var(--radius-control);
   border: 1.5px dashed var(--color-accent);
   background: color-mix(in srgb, var(--bg-composer) 92%, var(--color-accent-soft));
   display: flex;
@@ -585,10 +573,10 @@ button:disabled {
   max-height: min(386px, 46dvh);
   overflow: hidden;
   padding: 6px;
-  border-radius: var(--workspace-popover-radius);
+  border-radius: var(--radius-popover);
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
-  box-shadow: var(--workspace-picker-shadow);
+  box-shadow: var(--shadow-popover);
   animation: codex-enter-popover-up 0.14s var(--ease-enter-snappy);
 }
 
@@ -765,13 +753,6 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-/* Command card expanded toggle */
-.codex-command-cmd[data-expanded="true"] {
-  display: block;
-  -webkit-line-clamp: unset;
-  overflow: visible;
-}
-
 /* Turn jump highlight pulse */
 @keyframes codex-turn-flash {
   0% {
@@ -878,9 +859,7 @@ button:disabled {
   min-height: 0;
   display: flex;
   background: var(--bg-surface);
-  border-top: 1px solid var(--border-subtle);
   border-left: 1px solid var(--border-subtle);
-  border-top-left-radius: 16px;
   overflow: hidden;
   position: relative;
 }
@@ -1060,8 +1039,8 @@ button:disabled {
 .codex-composer-tray {
   margin: 0 14px -12px;
   padding: 7px 14px 18px;
-  border-radius: 15px 15px 0 0;
-  background: var(--bg-composer-tray);
+  border-radius: var(--radius-control) var(--radius-control) 0 0;
+  background: transparent;
   border: 1px solid var(--border-subtle);
   border-bottom: 0;
   display: flex;
@@ -1118,25 +1097,22 @@ button:disabled {
   border-radius: 999px;
   background: var(--color-warning);
   flex: none;
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-warning) 20%, transparent);
 }
 
 .codex-composer-card {
   position: relative;
   z-index: 2;
+  min-width: 0;
+  container-type: inline-size;
   background: var(--bg-composer);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-2xl);
-  box-shadow: var(--shadow-sm);
-  padding: 12px 12px 9px 14px;
-  transition:
-    border-color var(--duration-basic) var(--ease-out),
-    box-shadow var(--duration-basic) var(--ease-out);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-composer);
+  padding: 10px 10px 7px 12px;
+  transition: border-color var(--duration-basic) var(--ease-out);
 }
 
 .codex-composer-card:focus-within {
-  border-color: var(--border-strong);
-  box-shadow: var(--shadow-md);
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--border-strong));
 }
 
 .codex-composer-attachments {
@@ -1274,11 +1250,11 @@ button:disabled {
   z-index: 80;
   background: var(--bg-surface-elevated);
   border: 1px solid var(--border-default);
-  border-radius: var(--workspace-popover-radius);
-  box-shadow: var(--workspace-picker-shadow);
+  border-radius: var(--radius-popover);
+  box-shadow: var(--shadow-popover);
   padding: 5px;
   min-width: 200px;
-  animation: codex-enter-popover 0.15s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-basic) var(--ease-enter-snappy);
 }
 
 .codex-popover[data-side="top"] {
@@ -1322,7 +1298,7 @@ button:disabled {
 .codex-effort-popover {
   width: 256px;
   padding: 14px 16px 15px;
-  border-radius: 16px;
+  border-radius: var(--radius-popover);
 }
 
 .codex-effort-header {
@@ -1396,7 +1372,7 @@ button:disabled {
   top: 2px;
   bottom: 2px;
   border-radius: 9999px;
-  background: linear-gradient(90deg, var(--color-accent), #3a83f7);
+  background: var(--color-accent);
   transition: width 0.2s var(--ease-spring-snappy);
   pointer-events: none;
 }
@@ -1457,7 +1433,7 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 16px;
+  padding: 0 14px;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-surface);
   z-index: 20;
@@ -1615,7 +1591,6 @@ button:disabled {
   border: 1px solid var(--border-default);
   background: var(--bg-surface);
   color: var(--text-secondary);
-  box-shadow: var(--shadow-sm);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1661,15 +1636,14 @@ button:disabled {
 }
 
 .codex-user-bubble {
-  max-width: min(86%, 590px);
-  background: var(--bg-user-message);
+  max-width: min(83%, 580px);
+  padding: 3px 12px 3px 0;
+  border-inline-end: 2px solid var(--border-strong);
   color: var(--text-default);
-  border-radius: var(--thread-radius-bubble) var(--thread-radius-bubble) 6px var(--thread-radius-bubble);
-  padding: 10px 15px;
   font-size: var(--text-chat);
   line-height: var(--text-chat-line);
-  font-weight: var(--font-weight-body);
-  word-break: break-word;
+  font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .codex-direct-prompt { position: relative; }
@@ -1833,9 +1807,9 @@ button:disabled {
 .codex-inline-code {
   font-family: var(--font-mono);
   font-size: 0.86em;
-  background: var(--bg-secondary-soft-alpha);
-  padding: 2px 6px;
-  border-radius: 6px;
+  background: var(--bg-surface-secondary);
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
 }
 
 .codex-file-chip {
@@ -1857,7 +1831,6 @@ button:disabled {
 
 .codex-code-block {
   margin: 12px 0;
-  border: 1px solid var(--border-default);
   border-radius: var(--thread-radius-detail);
   background: var(--thread-detail-surface);
   overflow: hidden;
@@ -1867,10 +1840,10 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 12px;
+  padding: 4px 10px;
   border-bottom: 1px solid var(--border-subtle);
-  font-size: 12px;
-  color: var(--text-tertiary);
+  font-size: var(--text-small);
+  color: var(--text-secondary);
 }
 
 .codex-code-pre {
@@ -2007,178 +1980,6 @@ button:disabled {
   gap: 8px;
 }
 
-/* Command Card — appears ONLY at leaf expansion (border-strong 0.8px, radius 12.5px) */
-.codex-command-card {
-  display: flex;
-  flex-direction: column;
-  border: 0.8px solid var(--border-strong);
-  border-radius: var(--radius-lg);
-  background: var(--bg-secondary-soft-alpha);
-  overflow: hidden;
-}
-
-.codex-command-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 4px 10px;
-  font-size: 13px;
-  line-height: 18px;
-  color: var(--text-description);
-  user-select: none;
-}
-
-.codex-command-cmd-wrap {
-  position: relative;
-  padding: 6px 32px 6px 10px;
-}
-
-.codex-command-cmd {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 19px;
-  color: var(--text-description);
-  white-space: pre-wrap;
-  word-break: break-word;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.codex-command-dollar {
-  color: var(--text-tertiary);
-  margin-right: 1ch;
-  user-select: none;
-}
-
-.codex-command-copy {
-  position: absolute;
-  top: 4px;
-  right: 6px;
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-tertiary);
-  opacity: 0;
-  transition:
-    opacity var(--duration-basic) var(--ease-basic),
-    background-color var(--duration-basic) var(--ease-out);
-}
-
-.codex-command-card:hover .codex-command-copy,
-.codex-command-copy:focus-visible {
-  opacity: 1;
-}
-
-.codex-command-copy:hover {
-  background: var(--bg-ghost-hover);
-  color: var(--text-default);
-}
-
-.codex-command-output {
-  max-height: 144px;
-  overflow: auto;
-  padding: 8px 10px;
-  border-top: 1px solid var(--border-subtle);
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  line-height: 18px;
-  font-weight: 500;
-  color: var(--text-description);
-  white-space: pre;
-  --edge-fade-top: 0.75rem;
-  --edge-fade-bottom: 1.25rem;
-}
-
-/* ============================================================================
- * 8. File Change Resource Card (1:1 with live/conversation.png & components.md)
- * ========================================================================== */
-
-.codex-file-card {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border-default);
-  background: var(--bg-surface-elevated-secondary);
-}
-
-.codex-file-card-head {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px;
-  cursor: pointer;
-  transition: background-color var(--duration-basic) var(--ease-out);
-}
-
-.codex-file-card-head:hover {
-  background: var(--bg-ghost-hover-soft);
-}
-
-.codex-file-card-icon {
-  width: 40px;
-  height: 40px;
-  flex: none;
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface-secondary);
-  color: var(--text-secondary);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.codex-file-card-meta {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.codex-file-card-title {
-  font-size: 14px;
-  line-height: 21px;
-  font-weight: 500;
-  color: var(--text-default);
-}
-
-.codex-file-card-sub {
-  font-size: 13px;
-  line-height: 18px;
-  color: var(--text-secondary);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.codex-file-card-head .codex-diff-hover-sub {
-  display: none;
-}
-
-.codex-file-card-head:hover .codex-diff-default-sub {
-  display: none;
-}
-
-.codex-file-card-head:hover .codex-diff-hover-sub {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-}
-
-.codex-file-card-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-}
-
 .codex-toolbar-btn {
   height: 28px;
   padding: 0 10px;
@@ -2232,90 +2033,16 @@ button:disabled {
   background: var(--color-danger-soft);
 }
 
-.codex-file-row {
-  height: 36px;
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 0 12px;
-  border-top: 1px solid var(--border-subtle);
-  background: color-mix(in srgb, var(--bg-surface) 78%, transparent);
-  font-size: 14px;
-  text-align: left;
-  transition: background-color var(--duration-basic) var(--ease-out);
-}
-
-.codex-file-row:hover {
-  background: var(--bg-ghost-hover-soft);
-}
-
-.codex-file-path {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  align-items: center;
-  overflow: hidden;
-}
-
-.codex-file-dir {
-  color: var(--text-description);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.codex-file-name {
-  color: var(--text-default);
-  flex-shrink: 0;
-}
-
-.codex-diff-counts {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  letter-spacing: -0.01em;
-  flex: none;
-}
-
-.codex-git-add {
-  color: var(--color-git-added);
-}
-
-.codex-git-del {
-  color: var(--color-git-deleted);
-}
-
-.codex-file-more-btn {
-  height: 36px;
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 12px;
-  border-top: 1px solid var(--border-subtle);
-  font-size: 14px;
-  color: var(--text-default);
-  transition: background-color var(--duration-basic) var(--ease-out);
-}
-
-.codex-file-more-btn:hover {
-  background: var(--bg-ghost-hover-soft);
-}
-
 /* ============================================================================
  * 9. Inline Approval Gate Card (Agent_US Approval Protocol in Codex Language)
  * ========================================================================== */
 
 .codex-approval-card {
-  border-radius: var(--radius-lg);
-  border: 1px solid color-mix(in srgb, var(--color-warning) 36%, var(--border-default));
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-sm);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 32%, var(--border-default));
+  border-inline-start: 2px solid var(--color-warning);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-warning-soft) 34%, var(--bg-surface));
   overflow: hidden;
-  animation: codex-enter-popover 0.18s var(--ease-enter-snappy);
 }
 
 .codex-approval-head {
@@ -2326,10 +2053,6 @@ button:disabled {
 }
 
 .codex-approval-icon {
-  width: 40px;
-  height: 40px;
-  border-radius: var(--radius-lg);
-  background: var(--color-warning-soft);
   color: var(--color-warning);
   display: inline-flex;
   align-items: center;
@@ -2340,7 +2063,7 @@ button:disabled {
 .codex-approval-body {
   padding: 10px 12px;
   border-top: 1px solid var(--border-subtle);
-  background: var(--bg-secondary-soft-alpha);
+  background: transparent;
   font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 18px;
@@ -2662,10 +2385,8 @@ button:disabled {
 }
 
 .codex-settings-card {
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  overflow: hidden;
+  border-block: 1px solid var(--border-subtle);
+  margin-bottom: 18px;
 }
 
 .codex-settings-row {
@@ -2821,7 +2542,7 @@ button:disabled {
 
 .codex-search-modal {
   width: min(680px, 92vw);
-  border-radius: 18px;
+  border-radius: var(--radius-dialog);
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-modal);
@@ -3300,7 +3021,7 @@ button:disabled {
 .codex-project-popover {
   width: 276px;
   padding: 0;
-  border-radius: 16px;
+  border-radius: var(--radius-popover);
   overflow: hidden;
 }
 
@@ -3361,7 +3082,7 @@ button:disabled {
 
 .codex-modal-card {
   width: min(440px, 100%);
-  border-radius: 18px;
+  border-radius: var(--radius-dialog);
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-dialog);
@@ -3573,10 +3294,10 @@ button:disabled {
   right: 16px;
   width: 248px;
   z-index: 22;
-  border-radius: 14px;
+  border-radius: var(--radius-popover);
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
-  box-shadow: var(--workspace-picker-shadow);
+  box-shadow: var(--shadow-popover);
   padding: 10px 10px 12px;
   display: flex;
   flex-direction: column;
@@ -4035,14 +3756,12 @@ button:disabled {
 
 
 /* ============================================================================
- * 16. Inline Expandable File Diff Card, Command Footer & 3-Mode Approval Menu
- *     (1:1 with User Latest 4 Screenshots)
+ * 16. Inline diff and approval controls
  * ========================================================================== */
 
 .codex-inline-diff-card {
-  border-radius: 12.5px;
-  border: 0.8px solid var(--border-strong);
-  background: var(--bg-secondary-soft-alpha);
+  border-radius: var(--thread-radius-detail);
+  border: 1px solid var(--border-subtle);
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -4093,21 +3812,6 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-.codex-command-footer {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 5px;
-  padding: 5px 10px 7px;
-  font-size: 12px;
-  color: var(--text-tertiary);
-  user-select: none;
-}
-
-.codex-command-footer[data-failed="true"] {
-  color: var(--color-danger);
-}
-
 .codex-activity-detail-nested {
   position: relative;
 }
@@ -4126,7 +3830,7 @@ button:disabled {
 .codex-perm-popover {
   width: 312px;
   padding: 10px 6px 6px;
-  border-radius: 16px;
+  border-radius: var(--radius-popover);
 }
 
 .codex-perm-header {
@@ -4236,7 +3940,7 @@ button:disabled {
   left: 34px;
   width: 304px;
   padding: 12px 14px;
-  border-radius: 14px;
+  border-radius: var(--radius-popover);
   border: 1px solid var(--border-strong);
   background: var(--bg-surface);
   box-shadow: var(--shadow-lg);
@@ -4288,10 +3992,6 @@ button:disabled {
  *     + 1:1 "自定义" (插件 & 技能) Center (User Screenshot 4)
  * ========================================================================== */
 
-.codex-thread-header {
-  height: var(--thread-header-height);
-  padding: 0 12px;
-}
 
 .codex-thread-title-btn {
   height: 28px;
@@ -4316,36 +4016,6 @@ button:disabled {
   min-height: 20px;
 }
 
-.codex-file-card {
-  border-radius: 11px;
-}
-
-.codex-file-card-head {
-  padding: 9px 11px;
-  gap: 10px;
-}
-
-.codex-file-card-icon {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-}
-
-.codex-file-card-title {
-  font-size: 13px;
-  line-height: 18px;
-}
-
-.codex-file-row,
-.codex-file-more-btn {
-  height: 32px;
-  font-size: 12.5px;
-}
-
-.codex-composer-card {
-  border-radius: 16px;
-  padding: 8px 10px 7px;
-}
 
 .codex-composer-textarea {
   font-size: 13.5px;
@@ -4369,10 +4039,6 @@ button:disabled {
   height: 26px;
 }
 
-.codex-sidebar-row {
-  font-size: 13px;
-  border-radius: 8px;
-}
 
 /* IDE Diff Toolbar branch pill (User Screenshot 3) */
 .codex-ide-branch-pill {
@@ -4839,7 +4505,7 @@ button:disabled {
   max-width: 100%;
   max-height: 100%;
   border-radius: 10px;
-  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-dialog);
   cursor: zoom-in;
   transition: transform 0.18s var(--ease-out);
 }
@@ -5003,27 +4669,6 @@ button:disabled {
  *     Codex-faithful refinements only: spacing, weight, shadow, motion, alignment.
  * ========================================================================== */
 
-:root {
-  --workspace-composer-radius: 18px;
-  --workspace-popover-radius: 14px;
-  --workspace-row-radius: 8px;
-  --workspace-picker-shadow: 0 6px 18px -5px rgb(0 0 0 / 14%);
-  --workspace-selection: var(--bg-selected);
-}
-
-[data-theme="dark"] {
-  --text-tertiary: rgba(252, 252, 252, 0.54);
-  --workspace-picker-shadow: 0 6px 18px -5px rgb(0 0 0 / 50%);
-}
-
-[data-theme="dark"][data-appearance-preset="codex"] {
-  --bg-chrome: #1b1b1a;
-  --bg-surface: #161615;
-  --bg-surface-elevated: #292928;
-  --bg-composer: #232322;
-  --bg-user-message: #252524;
-}
-
 ::selection {
   background: color-mix(in srgb, var(--color-accent) 22%, transparent);
 }
@@ -5089,22 +4734,6 @@ button:disabled {
   height: 14px;
 }
 
-.codex-composer-card {
-  border-radius: var(--workspace-composer-radius);
-  border-color: var(--border-default);
-  box-shadow: none;
-  padding: 12px 10px 8px 12px;
-  transition: border-color var(--duration-basic) var(--ease-out);
-}
-
-.codex-composer-card:hover {
-  border-color: var(--border-strong);
-}
-
-.codex-composer-card:focus-within {
-  border-color: color-mix(in srgb, var(--text-default) 24%, transparent);
-  box-shadow: none;
-}
 
 /* The rounded card carries focus; never draw a square ring on the raw textarea. */
 .codex-composer-textarea,
@@ -5140,7 +4769,6 @@ button:disabled {
 .codex-send-btn {
   width: 30px;
   height: 30px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
   transition:
     transform 0.18s var(--ease-spring-snappy),
     opacity var(--duration-basic) var(--ease-out),
@@ -5151,7 +4779,6 @@ button:disabled {
 .codex-send-btn:hover:not(:disabled) {
   opacity: 1;
   transform: translateY(-1px);
-  box-shadow: 0 3px 8px -2px rgba(0, 0, 0, 0.3);
 }
 
 .codex-send-btn:active:not(:disabled) {
@@ -5179,7 +4806,6 @@ button:disabled {
 .codex-branch-dirty {
   width: 5px;
   height: 5px;
-  box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--color-warning) 18%, transparent);
 }
 
 /* ---- Thread surface ------------------------------------------------------ */
@@ -5188,10 +4814,6 @@ button:disabled {
   container-name: thread;
 }
 
-.codex-thread-header {
-  border-bottom-color: transparent;
-  box-shadow: 0 1px 0 var(--border-subtle);
-}
 
 .codex-thread-title-btn {
   font-weight: 520;
@@ -5236,10 +4858,6 @@ button:disabled {
   text-decoration-color: currentColor;
 }
 
-.codex-inline-code {
-  border-radius: 5px;
-  padding: 1px 5px;
-}
 
 .codex-msg-meta {
   transition: opacity var(--duration-moderate) var(--ease-out);
@@ -5362,7 +4980,7 @@ button:focus-visible {
     inset: 0 0 0 auto;
     max-width: 100%;
     z-index: 85;
-    box-shadow: var(--workspace-picker-shadow);
+    box-shadow: var(--shadow-popover);
   }
   .codex-drawer-resizer { display: none; }
 }
@@ -5391,10 +5009,6 @@ button:focus-visible {
 .a2a-direct-actions:empty { display: none; }
 
 /* ---- Composer adapts to its own width (narrow thread / split view) ------- */
-.codex-composer-card {
-  container-type: inline-size;
-  container-name: composer;
-}
 
 .codex-composer-footer {
   min-width: 0;
@@ -5458,11 +5072,6 @@ button:focus-visible {
   transform: translate(-50%, -50%) scale(1.06);
 }
 
-.codex-code-header {
-  background: var(--bg-surface-secondary);
-  padding: 6px 12px;
-  font-weight: 450;
-}
 
 .codex-event-row {
   transition: border-color var(--duration-basic) var(--ease-out);
@@ -5496,11 +5105,6 @@ button:focus-visible {
 
 /* Sidebar titles: fade fully to transparent slightly before the right edge
    so tall uppercase characters never appear half-sliced. */
-.codex-sidebar-row-text {
-  padding-right: 4px;
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 34px), transparent calc(100% - 4px));
-  mask-image: linear-gradient(to right, #000 calc(100% - 34px), transparent calc(100% - 4px));
-}
 
 
 /* ---- Interactive Git Branch Switcher & Init Repo (Codex 1:1) ------------- */
@@ -5531,7 +5135,7 @@ button:focus-visible {
 .codex-branch-popover {
   width: 268px;
   padding: 0;
-  border-radius: 16px;
+  border-radius: var(--radius-popover);
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -5924,7 +5528,7 @@ button:focus-visible {
   overflow: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--border-default);
-  border-radius: 16px;
+  border-radius: var(--radius-dialog);
   background-color: var(--bg-surface-elevated);
   color: var(--text-default);
   box-shadow: var(--shadow-modal);
@@ -5942,7 +5546,7 @@ button:focus-visible {
   .codex-body[data-capabilities-view="true"] .codex-modal {
     width: 100% !important;
     max-height: calc(100vh - 24px);
-    border-radius: 16px;
+    border-radius: var(--radius-dialog);
     padding: 16px;
   }
 }
@@ -5951,11 +5555,6 @@ button:focus-visible {
 .chat-archive-shortcut {
   color: var(--text-secondary);
   margin-bottom: 8px;
-}
-
-.codex-sidebar-row:focus-within > .codex-sidebar-row-actions {
-  opacity: 1;
-  pointer-events: auto;
 }
 
 .chat-archive-shortcut > svg,
@@ -6258,10 +5857,8 @@ button:focus-visible {
 .autonomous-toolbar .codex-toolbar-btn svg { flex: none; }
 .autonomous-summary {
   margin: 12px 0;
+  border-bottom: 1px solid var(--border-subtle);
   padding: 12px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--workspace-popover-radius);
-  background: var(--bg-surface-secondary);
 }
 .autonomous-summary h2 { margin: 8px 0; font-size: 14px; font-weight: 620; line-height: 1.5; white-space: pre-wrap; }
 .autonomous-summary .autonomous-toolbar { margin-top: 9px; }
@@ -6278,12 +5875,10 @@ button:focus-visible {
 .swarm-progress progress::-webkit-progress-value { background: var(--color-success); border-radius: 8px; }
 .autonomous-sections {
   display: flex;
-  gap: 2px;
-  padding: 3px;
+  gap: 3px;
   overflow-x: auto;
   scrollbar-width: thin;
-  border-radius: calc(var(--workspace-row-radius) + 3px);
-  background: var(--bg-ghost-hover-soft);
+  border-bottom: 1px solid var(--border-subtle);
 }
 .swarm-section-tab {
   display: flex;
@@ -6292,8 +5887,7 @@ button:focus-visible {
   gap: 5px;
   flex: 1 0 auto;
   padding: 6px 8px;
-  border: 0;
-  border-radius: var(--workspace-row-radius);
+  border-block-end: 1px solid transparent;
   color: var(--text-secondary);
   background: transparent;
   font: inherit;
@@ -6301,10 +5895,9 @@ button:focus-visible {
   cursor: pointer;
 }
 .swarm-section-tab:hover { background: var(--bg-ghost-hover); color: var(--text-default); }
-.swarm-section-tab[aria-pressed='true'] { background: var(--workspace-selection); color: var(--text-default); font-weight: 600; }
+.swarm-section-tab[aria-pressed='true'] { border-block-end-color: var(--color-accent); color: var(--text-default); font-weight: 600; }
 .swarm-section-tab[aria-pressed='true'] svg { color: var(--color-text-accent); }
 .swarm-section-tab:focus-visible { outline-offset: -2px; }
-.codex-drawer { background: color-mix(in srgb, var(--bg-surface) 82%, var(--bg-chrome)); }
 .codex-drawer .codex-split-tabbar { background: transparent; }
 .codex-split-tab[data-active='true'] { background: var(--workspace-selection); }
 .codex-subagent-list-row { border-radius: var(--workspace-row-radius); }
@@ -6366,7 +5959,7 @@ button:focus-visible {
   max-height: calc(100dvh - 24px);
   padding: 14px;
   border: 1px solid var(--border-default);
-  border-radius: var(--workspace-popover-radius);
+  border-radius: var(--radius-dialog);
   background: var(--bg-surface-elevated);
   color: var(--text-default);
   box-shadow: var(--shadow-modal);
@@ -6428,7 +6021,7 @@ button:focus-visible {
 
 .codex-direct-status {
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--text-small);
   line-height: 20px;
   padding: 6px 0 9px;
   border-bottom: 1px solid var(--border-subtle);
@@ -6456,107 +6049,6 @@ button:focus-visible {
   transform: rotate(90deg);
 }
 
-.codex-direct-activity,
-.codex-direct-tool {
-  min-width: 0;
-}
-
-.codex-direct-activity-row,
-.codex-direct-tool-row {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-  min-height: 25px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 20px;
-  list-style: none;
-}
-
-.codex-direct-activity-row > svg,
-.codex-direct-tool-row > svg {
-  flex: none;
-}
-
-summary.codex-direct-activity-row,
-summary.codex-direct-tool-row {
-  width: fit-content;
-  max-width: 100%;
-  cursor: pointer;
-  outline-offset: 3px;
-}
-
-.codex-direct-activity-row::-webkit-details-marker,
-.codex-direct-tool-row::-webkit-details-marker {
-  display: none;
-}
-
-summary.codex-direct-activity-row:hover,
-summary.codex-direct-tool-row:hover,
-.codex-direct-activity[open] > summary {
-  color: var(--text-default);
-}
-
-.codex-direct-activity[data-running='true'] > summary,
-.codex-direct-activity-row[data-running='true'] {
-  color: var(--text-tertiary);
-}
-
-.codex-direct-activity-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.codex-direct-chevron {
-  color: var(--text-tertiary);
-  transition: transform 120ms var(--ease-out);
-}
-
-.codex-direct-activity[open] > summary > .codex-direct-chevron,
-.codex-direct-tool[open] > summary > .codex-direct-chevron {
-  transform: rotate(90deg);
-}
-
-.codex-direct-tools {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 1px;
-}
-
-.codex-direct-tool-detail {
-  margin: 3px 0 5px 22px;
-  padding: 8px 10px;
-  border-radius: var(--radius-md);
-  background: var(--bg-surface-secondary);
-  color: var(--text-secondary);
-  overflow-wrap: anywhere;
-  font-size: 12px;
-}
-
-.codex-direct-tool-detail > code {
-  white-space: pre-wrap;
-}
-
-.codex-direct-issue,
-[data-status='failed'] > .codex-direct-tool-row,
-.codex-direct-tool-row[data-status='failed'] {
-  color: var(--color-danger);
-}
-
-.codex-direct-issue {
-  flex: none;
-  font-size: 11px;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .codex-direct-chevron { transition: none; }
-  .codex-assistant-turn .a2a-stream-cursor { animation: none; }
-}
-
 /* Composer modes sit beside permissions, rather than in the editable prompt. */
 .composer-mode-slot {
   display: inline-flex;
@@ -6576,7 +6068,7 @@ summary.codex-direct-tool-row:hover,
 .codex-composer-card .composer-mode-toggle:hover { color: var(--text-default); }
 .codex-composer-card .composer-mode-toggle[data-mode='swarm'] { color: var(--color-text-accent); }
 
-/* Swarm runs use a compact transcript card populated from the current run. */
+/* The Swarm transcript entry is a linked task row, not a card. */
 .swarm-message-mark {
   display: inline-flex;
   align-items: center;
@@ -6593,16 +6085,12 @@ summary.codex-direct-tool-row:hover,
 }
 
 .swarm-thread-card {
-  box-sizing: border-box;
   display: flex;
   align-items: center;
-  align-self: flex-start;
-  gap: 10px;
-  width: min(100%, 400px);
-  padding: 10px 12px;
-  border: 1px solid var(--border-default);
-  border-radius: 12px;
-  background: var(--bg-surface);
+  gap: 9px;
+  width: 100%;
+  padding: 7px 6px;
+  border-block: 1px solid var(--border-subtle);
   color: var(--text-default);
   text-align: left;
 }
@@ -6613,16 +6101,12 @@ button.swarm-thread-card:focus-visible { outline-offset: 3px; }
   display: grid;
   place-items: center;
   flex: none;
-  width: 35px;
-  height: 35px;
-  border-radius: 9px;
-  color: var(--color-text-accent);
-  background: var(--color-accent-soft);
+  color: var(--text-secondary);
 }
 
 .swarm-thread-copy {
   display: grid;
-  gap: 4px;
+  gap: 1px;
   min-width: 0;
   flex: 1;
 }
@@ -6646,10 +6130,7 @@ button.swarm-thread-card:focus-visible { outline-offset: 3px; }
 
 .codex-subagent-panel > * { flex-shrink: 0; min-width: 0; }
 .subagent-objective-card {
-  padding: 10px 12px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  background: var(--bg-surface-secondary);
+  padding: 7px 0;
 }
 .subagent-objective-card > summary {
   cursor: pointer;

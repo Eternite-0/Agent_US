@@ -3,7 +3,7 @@ import type { ComputedFileDiff } from '../utils/diff';
 import { splitPath } from '../utils/format';
 import { ActivityCopyButton } from './ActivityPresentation';
 import { Collapsible } from './Collapsible';
-import { IconArrowUpRight, IconChevronDown, IconChevronRight, IconDiffBox, IconUndo } from './Icons';
+import { IconArrowUpRight, IconChevronDown, IconChevronRight, IconFileDoc, IconDiffBox, IconUndo } from './Icons';
 
 interface FileChangeCardProps {
   files: ComputedFileDiff[];
@@ -29,6 +29,7 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
   const previewId = useId();
   const { path, added, deleted, lines, afterText } = file;
   const { dir, name } = splitPath(path);
+  const status = file.isNew ? { kind: 'add', label: '新增' } : file.isDeleted ? { kind: 'del', label: '删除' } : { kind: 'edit', label: '修改' };
   const visibleLines = useMemo(() => {
     const keep = new Set<number>();
     lines.forEach((line, index) => {
@@ -41,18 +42,17 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
   return (
     <div className="codex-file-row-wrap" hidden={hidden} data-scroll-anchor={`file:${listId}:${path}`}>
       <div className="codex-file-row">
-        <button type="button" className="codex-file-row-trigger codex-activity-disclosure" aria-expanded={open}
-          aria-controls={previewId} data-scroll-disclosure title={path} onClick={() => setOpen(!open)}>
-          <span className="codex-file-path" style={{ gap: 6 }}>
-            <IconChevronRight className="codex-direct-chevron" size={13} aria-hidden="true" />
-            {dir && <span className="codex-file-dir">{dir}</span>}
-            <span className="codex-file-name">{name}</span>
+        <button type="button" className="codex-file-path" title={path} aria-label={`在右侧分屏打开 ${path}`} onClick={() => onInspectFile(path)}>
+          <IconFileDoc size={14} aria-hidden="true" />
+          <span className="codex-file-path-text">
+            {dir && <span className="codex-file-dir">{dir}</span>}{name}
           </span>
-          <DiffCounts added={added} deleted={deleted} />
         </button>
-        <button type="button" className="codex-icon-btn codex-activity-copy"
-          title="在右侧分屏打开" aria-label={`在右侧分屏打开 ${path}`} onClick={() => onInspectFile(path)}>
-          <IconArrowUpRight size={13} aria-hidden="true" />
+        <span className="codex-file-state" data-kind={status.kind}>{status.label}</span>
+        <DiffCounts added={added} deleted={deleted} />
+        <button type="button" className="codex-icon-btn codex-activity-copy codex-file-row-trigger codex-activity-disclosure"
+          aria-expanded={open} aria-controls={previewId} aria-label={`${open ? '收起' : '预览'}差异 ${path}`} data-scroll-disclosure onClick={() => setOpen(!open)}>
+          <IconChevronRight className="codex-direct-chevron" size={13} aria-hidden="true" />
         </button>
       </div>
       <Collapsible id={previewId} open={open}>
@@ -91,18 +91,13 @@ export function FileChangeCard({ files, onInspectFile, onUndo, onCopy }: FileCha
     <div className="codex-file-card" data-status="completed">
       <div className="codex-file-card-head">
         <button className="codex-file-card-trigger" type="button" onClick={inspectFirst} aria-label="查看已更改的文件">
-          <span className="codex-file-card-icon"><IconDiffBox size={20} aria-hidden="true" /></span>
-          <span className="codex-file-card-meta">
-            <span className="codex-file-card-title">已编辑 {uniqueFiles.length} 个文件</span>
-            <span className="codex-file-card-sub">
-              <span className="codex-diff-default-sub"><DiffCounts added={totalAdd} deleted={totalDel} /></span>
-              <span className="codex-diff-hover-sub"><span>查看变更</span><IconArrowUpRight size={13} aria-hidden="true" /></span>
-            </span>
-          </span>
+          <span className="codex-file-card-icon"><IconDiffBox size={14} aria-hidden="true" /></span>
+          <span>已编辑 {uniqueFiles.length} 个文件</span>
+          <DiffCounts added={totalAdd} deleted={totalDel} />
         </button>
         <div className="codex-file-card-actions">
           {onUndo && <button type="button" className="codex-toolbar-btn" onClick={onUndo}><span>撤销</span><IconUndo size={13} aria-hidden="true" /></button>}
-          <button type="button" className="codex-toolbar-btn" data-variant="outline" onClick={inspectFirst}>查看变更</button>
+          <button type="button" className="codex-toolbar-btn" onClick={inspectFirst}>查看变更<IconArrowUpRight size={12} aria-hidden="true" /></button>
         </div>
       </div>
 

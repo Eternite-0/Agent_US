@@ -84,11 +84,11 @@ export const activityToolLabels = {
   command: { icon: IconTerminal, running: '正在运行', completed: '已运行', unit: '条命令' },
   test: { icon: IconActivity, running: '正在运行测试', completed: '已运行测试', unit: '次' },
   mcp: { icon: IconPuzzle, running: '正在调用 MCP', completed: '已调用 MCP', unit: '次' },
-  read: { icon: IconFileDoc, running: '正在读取', completed: '已读取', unit: '次读取' },
-  edit: { icon: IconFileEdit, running: '正在编辑', completed: '已编辑', unit: '次编辑' },
-  search: { icon: IconSearch, running: '正在搜索', completed: '已搜索', unit: '次搜索' },
-  web: { icon: IconGlobe, running: '正在访问', completed: '已访问', unit: '次访问' },
-  tool: { icon: IconTool, running: '正在调用', completed: '已调用', unit: '次工具' },
+  read: { icon: IconFileDoc, running: '正在读取', completed: '已读取', unit: '次' },
+  edit: { icon: IconFileEdit, running: '正在编辑', completed: '已编辑', unit: '次' },
+  search: { icon: IconSearch, running: '正在搜索', completed: '已搜索', unit: '次' },
+  web: { icon: IconGlobe, running: '正在访问', completed: '已访问', unit: '次' },
+  tool: { icon: IconTool, running: '正在调用', completed: '已调用工具', unit: '次' },
 } as const;
 
 type ToolKind = keyof typeof activityToolLabels;
@@ -138,37 +138,39 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
   const isShell = kind === 'command' || kind === 'test';
   const outputLabel = output === undefined && liveOutput !== undefined ? '实时工具输出' : '工具输出';
   const summary = target.replace(/\s+/g, ' ');
+  const useMono = isShell || ['read', 'edit', 'search'].includes(kind);
   return (
     <details className="codex-direct-tool codex-activity-disclosure" data-status={status} data-tool-kind={kind} data-event-type={eventType} data-scroll-anchor={`tool:${id}`} open={open}>
       <summary className="codex-direct-tool-row" aria-controls={panelId} data-scroll-disclosure title={summary} onClick={(event) => {
         event.preventDefault();
         setOpen(!open);
       }}>
-        <Icon size={15} aria-hidden="true" />
-        <span className="codex-direct-activity-label">{toolActionLabel(kind, status)} {summary}</span>
+        <Icon size={14} aria-hidden="true" />
+        <span className="codex-direct-activity-label">{toolActionLabel(kind, status)} {useMono ? <code className="codex-tool-target">{summary}</code> : summary}</span>
+        {durationMs !== undefined && <small className="codex-tool-time tabular-nums">{fmtDuration(durationMs) || '0秒'}</small>}
         <IconChevronRight className="codex-direct-chevron" size={13} aria-hidden="true" />
       </summary>
-      <div id={panelId} hidden={!open} className="codex-direct-tool-detail codex-command-card">
-        <div className="codex-command-header">
-          <span>{meta ? `${meta} · ${name}` : name}</span>
+      <div id={panelId} hidden={!open} className="codex-direct-tool-detail">
+        <div className={command !== undefined || displayOutput ? 'codex-terminal-inset' : undefined}>
+          <div className="codex-command-header">{meta ? `${meta} · ${name}` : name}</div>
+          {command !== undefined && <div className="codex-activity-raw-line">
+            {isShell && <span className="codex-activity-shell-prompt" aria-hidden="true">$</span>}
+            <code>{command}</code>
+            <ActivityCopyButton label="复制命令" text={command} onCopy={onCopy} />
+          </div>}
+          {paths.length > 0 && <div className="codex-activity-file-links">
+            {paths.map((path) => onInspectFile
+              ? <button key={path} type="button" className="codex-inline-link-btn" title={path} onClick={() => onInspectFile(path)}>
+                  <span>{path}</span><IconArrowUpRight size={12} aria-hidden="true" />
+                </button>
+              : <code key={path}>{path}</code>)}
+          </div>}
+          {displayOutput && <pre className="codex-command-output codex-activity-output" aria-label={outputLabel} tabIndex={0}>{displayOutput}</pre>}
         </div>
-        {command !== undefined && <div className="codex-activity-raw-line">
-          {isShell && <span className="codex-activity-shell-prompt" aria-hidden="true">$</span>}
-          <code>{command}</code>
-          <ActivityCopyButton label="复制命令" text={command} onCopy={onCopy} />
-        </div>}
-        {paths.length > 0 && <div className="codex-activity-file-links">
-          {paths.map((path) => onInspectFile
-            ? <button key={path} type="button" className="codex-inline-link-btn" title={path} onClick={() => onInspectFile(path)}>
-                <span>{path}</span><IconArrowUpRight size={12} aria-hidden="true" />
-              </button>
-            : <code key={path}>{path}</code>)}
-        </div>}
-        {displayOutput && <pre className="codex-command-output codex-activity-output" aria-label={outputLabel} tabIndex={0}>{displayOutput}</pre>}
         {error && error !== displayOutput && <div className="codex-event-error">{error}</div>}
         <div className="codex-command-footer" data-failed={status === 'failed' || undefined}>
           {status === 'completed' && <IconCheck size={12} aria-hidden="true" />}
-          <ActivityStatusText status={status} durationMs={durationMs} />
+          <ActivityStatusText status={status} />
           {isShell && exitCode !== undefined && <span className="tabular-nums">· exit {exitCode}</span>}
           {displayOutput && <ActivityCopyButton label="复制输出" text={displayOutput} onCopy={onCopy} />}
         </div>
