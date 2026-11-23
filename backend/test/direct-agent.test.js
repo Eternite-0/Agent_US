@@ -48,7 +48,7 @@ test('DirectAgent handles direct multi-turn chat, real workspace tools, and inte
     async function* () {
       yield { type: 'text-delta', index: 0, text: '你好！' };
       yield { type: 'text-delta', index: 0, text: '直接对话已就绪。' };
-      yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 8 } };
+      yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 8, cacheReadTokens: 7, cacheWriteTokens: 3, cacheEligibleInputTokens: 12 } };
       yield { type: 'finish', reason: { kind: 'stop' } };
     },
     // Turn 2 step 1: read_file + edit_file on real workspace file
@@ -136,6 +136,12 @@ test('DirectAgent handles direct multi-turn chat, real workspace tools, and inte
     assert.equal(t1Res.statusCode, 200);
     const t1 = await waitTurnDone(direct, session.id, t1Res.json().turn.id);
     assert.equal(t1.state, 'completed');
+    const completed = JSON.parse(store.db.prepare(
+      "SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed'",
+    ).get(t1.id).data);
+    assert.equal(completed.cacheReadTokens, 7);
+    assert.equal(completed.cacheWriteTokens, 3);
+    assert.equal(completed.cacheEligibleInputTokens, 12);
     assert.deepEqual(deltas, ['你好！', '直接对话已就绪。']);
 
     // Turn 2: edit_file requires approval in 'approval' mode

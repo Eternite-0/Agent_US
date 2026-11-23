@@ -67,6 +67,7 @@ export async function service({
       maxAutoReviews: configuration.judgment?.maxAutoReviews ?? 20,
     });
     const metrics = new MetricsCollector({ store });
+    providers.adapter.metrics = metrics;
     pool = new AccountPool(store, { root, legacyProviders: providers, metrics });
     const defaultWorkspace = workspaceRoot
       ? resolve(workspaceRoot)

@@ -298,30 +298,20 @@ export async function compactTwoStage(
   const start = cutInfo?.start ?? (messages[0]?.role === 'system' ? 1 : 0);
   const cut = cutInfo?.cut ?? Math.max(start + 1, messages.length - 1);
 
-  // Stage 1: Deterministic prune of large tool outputs in [start..cut-1] (zero LLM cost).
-  let prunedAny = false;
-  for (let i = start; i < cut; i++) {
-    const m = messages[i];
-    if (m.role !== 'tool') continue;
-    m.content = m.content.map((b) => {
-      if (b.type === 'text' && b.text.length > 8192) {
-        prunedAny = true;
-        return { ...b, text: pruneTextHeadTail(b.text, 4096, 1024) };
-      }
-      return b;
-    });
-  }
+  // Preserve the longest reusable prefix: prune from the end of the
+  // eligible older span, stopping as soon as the prompt fits.
   const stage1Opts = { ...options, messages };
-  const afterStage1 = measureRequestComposition(stage1Opts);
-  if (prunedAny && afterStage1.totalTokens <= trigger) {
-    return {
-      options: stage1Opts,
-      stage: 'prune',
-      compacted: true,
-      cut,
-      tokens: afterStage1.totalTokens,
-    };
+  for (let i = cut - 1; i >= start; i--) {
+    const m = messages[i];
+    if (m?.role !== 'tool' || !m.content.some(b => b.type === 'text' && b.text.length > 8192)) continue;
+    m.content = m.content.map(b => b.type === 'text' && b.text.length > 8192
+      ? { ...b, text: pruneTextHeadTail(b.text, 4096, 1024) } : b);
+    const measured = measureRequestComposition(stage1Opts);
+    if (measured.totalTokens <= trigger) {
+      return { options: stage1Opts, stage: 'prune', compacted: true, cut, tokens: measured.totalTokens };
+    }
   }
+  const afterStage1 = measureRequestComposition(stage1Opts);
 
   // Stage 2: Structured LLM summary over the atomic older span [start..cut-1].
   if (typeof summarize === 'function' && cut > start && pairClosed(messages, start, cut - 1)) {

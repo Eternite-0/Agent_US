@@ -46,11 +46,12 @@ export function registerRuntimeRoutes(
       q.includeSynthetic === true ||
       q.includeSynthetic === 'true' ||
       q.includeSynthetic === '1';
+    const view = q.view === 'prompt-cache' ? q.view : undefined;
     if (typeof controlPlane?.getProductionMetrics === 'function') {
-      return controlPlane.getProductionMetrics({ windowHours, includeSynthetic });
+      return controlPlane.getProductionMetrics({ windowHours, includeSynthetic, view });
     }
     if (effectiveMetrics) {
-      return effectiveMetrics.getProductionMetrics({ windowHours, includeSynthetic });
+      return effectiveMetrics.getProductionMetrics({ windowHours, includeSynthetic, view });
     }
     return { ok: false, error: 'METRICS_UNAVAILABLE' };
   });

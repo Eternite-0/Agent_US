@@ -1,3 +1,4 @@
+import { normalizeProviderUsage, observeProviderUsage, openaiPromptCacheKey, stableTools } from './observability/prompt-cache.js';
 import {
   createCipheriv,
   createDecipheriv,
@@ -796,27 +797,17 @@ function toAnthropicPayload(o, wireModel) {
     }
   }
 
-  // Claude Code prompt-caching breakpoints: mark static system block, last tool, and recent turn
-  if (messages.length >= 2) {
-    const cacheTarget = messages[messages.length - 2];
-    if (Array.isArray(cacheTarget?.content) && cacheTarget.content.length > 0) {
-      const lastBlk = cacheTarget.content[cacheTarget.content.length - 1];
-      if (lastBlk && typeof lastBlk === 'object') {
-        lastBlk.cache_control = { type: 'ephemeral' };
-      }
-    }
-  }
-
-  const tools = o.tools?.length
-    ? o.tools.map((t, idx) => ({
-        name: t.name,
-        description: t.description ?? '',
-        input_schema: t.parameters ?? { type: 'object', properties: {} },
-        ...(idx === o.tools.length - 1
-          ? { cache_control: { type: 'ephemeral' } }
-          : {}),
-      }))
-    : undefined;
+  // The system checkpoint covers the tools too. Cache the current tail for
+  // the next step and retain a nearby boundary when a message has many blocks.
+  const mark = (block) => { if (block) block.cache_control = { type: 'ephemeral' }; };
+  const tail = messages.at(-1)?.content;
+  mark(tail?.at(-1));
+  if ((tail?.length ?? 0) >= 18) mark(messages.at(-2)?.content?.at(-1));
+  const tools = o.tools?.length ? stableTools(o.tools).map(t => ({
+    name: t.name, description: t.description ?? '',
+    input_schema: t.parameters ?? { type: 'object', properties: {} },
+  })) : undefined;
+  if (!system) mark(tools?.at(-1));
 
   const thinkingBudget = anthropicThinkingBudget(o.effort, wireModel);
   const baseMaxTokens = o.maxTokens ?? 4096;
@@ -2473,10 +2464,12 @@ export class AccountPool {
           apiKey: auth.apiKey,
           customHeaders: auth.customHeaders,
           wireModel: p.wireModel,
+          cacheTelemetry: parseJsonSafe(acc.meta, {})?.cacheTelemetry,
           mapPriority: p.mapPriority,
           providerRank: ranks.get(acc.preset) ?? 999,
           accountPriority: acc.priority,
           cooldownUntil: Number(acc.cooldownUntil ?? 0),
+          status: acc.status,
           activeConns: this.activeConns.get(acc.id) ?? 0,
         });
       }
@@ -2484,15 +2477,16 @@ export class AccountPool {
 
     // Sticky session preference (preserves prompt cache hit rate!)
     const sticky = sessionKey ? this.sessionStickiness.get(sessionKey) : null;
-    const stickyId =
-      sticky && now - sticky.at < 30 * 60 * 1000 ? sticky.accountId : null;
+    const stickyRoute = sticky && now - sticky.at < 30 * 60 * 1000 ? sticky : null;
 
     const healthy = candidates.filter((c) => c.cooldownUntil <= now);
     const cooling = candidates.filter((c) => c.cooldownUntil > now);
 
     const sortHealthy = (a, b) => {
-      const aSticky = a.accountId === stickyId ? 0 : 1;
-      const bSticky = b.accountId === stickyId ? 0 : 1;
+      const stickyRank = (route) => route.status === 'healthy' &&
+        route.accountId === stickyRoute?.accountId && route.wireModel === stickyRoute?.wireModel ? 0 : 1;
+      const aSticky = stickyRank(a);
+      const bSticky = stickyRank(b);
       if (aSticky !== bSticky) return aSticky - bSticky;
       return (
         a.providerRank - b.providerRank ||
@@ -2551,6 +2545,7 @@ export class AccountPool {
     if (sessionKey) {
       this.sessionStickiness.set(sessionKey, {
         accountId: route.accountId,
+        wireModel: route.wireModel,
         at: Date.now(),
       });
     }
@@ -3131,7 +3126,7 @@ export class PoolLlmAdapter extends LlmAdapter {
               },
             };
           }
-          yielded = true;
+          if (chunk.type !== 'usage') yielded = true;
           yield chunk;
         }
         if (!routeEmitted) {
@@ -3222,11 +3217,11 @@ export class PoolLlmAdapter extends LlmAdapter {
     const r = await resolveEffectiveRoute(rawRoute, this.pool.copilotTokenCache, {
       signal: o.signal,
     });
-    if (r.protocol === 'anthropic') {
-      yield* this.#streamAnthropic(r, o);
-      return;
-    }
-    yield* this.#streamOpenAI(r, o);
+    yield* observeProviderUsage(
+      r.protocol === 'anthropic' ? this.#streamAnthropic(r, o) : this.#streamOpenAI(r, o),
+      { metrics: this.pool.metrics, signal: o.signal, provider: r.preset, accountId: r.accountId,
+        model: r.wireModel ?? o.model, sessionId: o.sessionKey ?? undefined, cacheTelemetry: r.cacheTelemetry },
+    );
   }
 
   async *#streamOpenAI(r, o) {
@@ -3240,6 +3235,7 @@ export class PoolLlmAdapter extends LlmAdapter {
     });
     const wireModel = r.wireModel ?? o.model;
     const reasoningEffort = openAiReasoningEffort(o.effort, wireModel);
+    const cacheKey = openaiPromptCacheKey(r.endpoint, o.sessionKey);
     const stream = await sdk.chat.completions.create(
       {
         model: wireModel,
@@ -3247,10 +3243,11 @@ export class PoolLlmAdapter extends LlmAdapter {
         stream: true,
         stream_options: { include_usage: true },
         max_tokens: o.maxTokens,
+        ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
         ...(o.tools?.length
           ? {
-              tools: o.tools.map((t) => ({
+              tools: stableTools(o.tools).map((t) => ({
                 type: 'function',
                 function: {
                   name: t.name,
@@ -3274,15 +3271,7 @@ export class PoolLlmAdapter extends LlmAdapter {
       if (frame.usage) {
         yield {
           type: 'usage',
-          usage: {
-            inputTokens: frame.usage.prompt_tokens ?? 0,
-            outputTokens: frame.usage.completion_tokens ?? 0,
-            cacheReadTokens:
-              frame.usage.prompt_tokens_details?.cached_tokens ??
-              frame.usage.cache_read_input_tokens ??
-              0,
-            cacheWriteTokens: frame.usage.cache_creation_input_tokens ?? 0,
-          },
+          usage: normalizeProviderUsage('openai', frame.usage),
         };
       }
       const choice = frame.choices?.[0];
@@ -3391,10 +3380,7 @@ export class PoolLlmAdapter extends LlmAdapter {
     let buffer = '';
     const blocks = new Map();
     let stopReason = 'end_turn';
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let cacheReadTokens = 0;
-    let cacheWriteTokens = 0;
+    let upstreamUsage = {};
 
     while (true) {
       const { done, value } = await reader.read();
@@ -3414,10 +3400,10 @@ export class PoolLlmAdapter extends LlmAdapter {
         } catch {
           continue;
         }
+        if (ev.type === 'error') throw new Fault('PROVIDER_STREAM_INTERRUPTED', 502);
         if (ev.type === 'message_start' && ev.message?.usage) {
-          inputTokens = ev.message.usage.input_tokens ?? 0;
-          cacheReadTokens = ev.message.usage.cache_read_input_tokens ?? 0;
-          cacheWriteTokens = ev.message.usage.cache_creation_input_tokens ?? 0;
+          upstreamUsage = ev.message.usage;
+          yield { type: 'usage', usage: normalizeProviderUsage('anthropic', upstreamUsage) };
         } else if (ev.type === 'content_block_start') {
           const idx = ev.index ?? blocks.size;
           const cb = ev.content_block ?? {};
@@ -3464,15 +3450,14 @@ export class PoolLlmAdapter extends LlmAdapter {
           }
         } else if (ev.type === 'message_delta') {
           if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
-          if (ev.usage?.output_tokens) outputTokens = ev.usage.output_tokens;
+          if (ev.usage) {
+            upstreamUsage = { ...upstreamUsage, ...ev.usage };
+            yield { type: 'usage', usage: normalizeProviderUsage('anthropic', upstreamUsage) };
+          }
         }
       }
     }
 
-    yield {
-      type: 'usage',
-      usage: { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens },
-    };
     yield {
       type: 'finish',
       reason: {

@@ -116,8 +116,9 @@ export class TurnManager {
     this.leaseGuard = leaseGuard;
     this.totalIn = 0;
     this.totalOut = 0;
-    this.totalCacheRead = 0;
-    this.totalCacheWrite = 0;
+    this.totalCacheRead = null;
+    this.totalCacheWrite = null;
+    this.totalCacheEligible = null;
     this.recentCallSigs = [];
     this.thrashWarned = false;
   }
@@ -125,8 +126,15 @@ export class TurnManager {
   addUsage(usage) {
     this.totalIn += Number(usage?.inputTokens ?? 0);
     this.totalOut += Number(usage?.outputTokens ?? 0);
-    this.totalCacheRead += Number(usage?.cacheReadTokens ?? 0);
-    this.totalCacheWrite += Number(usage?.cacheWriteTokens ?? 0);
+    if (usage?.cacheReadTokens != null) {
+      this.totalCacheRead = (this.totalCacheRead ?? 0) + usage.cacheReadTokens;
+    }
+    if (usage?.cacheWriteTokens != null) {
+      this.totalCacheWrite = (this.totalCacheWrite ?? 0) + usage.cacheWriteTokens;
+    }
+    if (usage?.cacheEligibleInputTokens != null) {
+      this.totalCacheEligible = (this.totalCacheEligible ?? 0) + usage.cacheEligibleInputTokens;
+    }
   }
 
   recordToolSignature(tc, isError) {
@@ -249,12 +257,13 @@ export class AgentLoop {
         if (Number.isFinite(Number(latestCp.state.totalOut))) {
           tm.totalOut = Math.max(0, Number(latestCp.state.totalOut));
         }
-        if (Number.isFinite(Number(latestCp.state.totalCacheRead))) {
+        if (Number.isFinite(latestCp.state.totalCacheRead)) {
           tm.totalCacheRead = Math.max(0, Number(latestCp.state.totalCacheRead));
         }
-        if (Number.isFinite(Number(latestCp.state.totalCacheWrite))) {
+        if (Number.isFinite(latestCp.state.totalCacheWrite)) {
           tm.totalCacheWrite = Math.max(0, Number(latestCp.state.totalCacheWrite));
         }
+        tm.totalCacheEligible = latestCp.state.totalCacheEligible ?? null;
       }
     }
 
@@ -505,7 +514,7 @@ export class AgentLoop {
                     });
                     return activeReservation.constrainedMaxOutputTokens;
                   }
-                : null,
+                : ({ usage }) => tm.addUsage(usage),
             onTextDelta: (_delta, full) => {
               if (profile?.streamDeltas !== false) {
                 this.eventRouter.emitEphemeral({
@@ -787,6 +796,7 @@ export class AgentLoop {
             totalOut: tm.totalOut,
             totalCacheRead: tm.totalCacheRead,
             totalCacheWrite: tm.totalCacheWrite,
+            totalCacheEligible: tm.totalCacheEligible,
             lastToolCallIds: executedBatch.map((b) => b.tc.id),
           },
         });
@@ -885,6 +895,7 @@ export class AgentLoop {
           outputTokens: tm.totalOut,
           cacheReadTokens: tm.totalCacheRead,
           cacheWriteTokens: tm.totalCacheWrite,
+          cacheEligibleInputTokens: tm.totalCacheEligible,
         },
         route: lastRoute,
         verdict: outcome.verdict,
@@ -901,6 +912,7 @@ export class AgentLoop {
         outputTokens: tm.totalOut,
         cacheReadTokens: tm.totalCacheRead,
         cacheWriteTokens: tm.totalCacheWrite,
+        cacheEligibleInputTokens: tm.totalCacheEligible,
       };
       classified.steps = steps;
       classified.route = lastRoute;

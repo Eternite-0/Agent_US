@@ -152,6 +152,7 @@ export class ContextAssembler {
     const tailCache = this.#getOrCreateTailCache(session.id);
 
     // Group priorHistory by turnId preserving order and injecting cached/persisted notes before each turn's first msg
+    const priorNotes = [];
     const seenTurns = new Set();
     for (const m of priorHistory) {
       const tid = m.turnId || '__pre__';
@@ -164,6 +165,7 @@ export class ContextAssembler {
         }
         if (cachedNotes?.length) {
           messages.push(...cachedNotes);
+          priorNotes.push(...cachedNotes);
         }
       }
       messages.push({ role: m.role, toolCallId: m.toolCallId, content: m.content });
@@ -226,7 +228,8 @@ export class ContextAssembler {
         : []),
     ];
 
-    const deltas = liveContextNotes(sections, messages);
+    // Only the runtime-generated notes may establish which sections are already sent.
+    const deltas = liveContextNotes(sections, priorNotes);
     const turnNoteKey = turnId || '__current__';
     const firstCurrentUser = currentTurnMsgs.find((m) => m.role === 'user') ?? null;
     let turnNotes =

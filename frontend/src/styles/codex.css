@@ -1006,6 +1006,26 @@ button:disabled {
   position: relative;
 }
 
+.prompt-cache-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 0;
+  margin: 6px 0 0;
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+.prompt-cache-status > svg { flex: none; margin-right: 6px; }
+.prompt-cache-status > span + span::before {
+  content: '|';
+  margin: 0 7px;
+  opacity: .45;
+}
+
 .codex-composer-tray {
   margin: 0 14px -12px;
   padding: 7px 14px 18px;

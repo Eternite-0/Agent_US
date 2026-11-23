@@ -1,4 +1,5 @@
 import { resolveComposerDraft, type ComposerMode } from '../utils/composerMode';
+import { PromptCacheStatus } from './PromptCacheStatus';
 import { isSwarmCommand, swarmAttachmentError } from '../utils/swarmCommand';
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
@@ -1519,6 +1520,7 @@ ${draftInjection.text}`
           </div>
         </div>
       </div>
+      <PromptCacheStatus />
       {dialog === 'sketch' && <SketchDialog onClose={closeDialog} onAttach={(image) => {
         void attachFileList([new File([image], `sketch-${Date.now()}.png`, { type: 'image/png' })]);
         closeDialog();

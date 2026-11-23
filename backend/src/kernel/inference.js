@@ -1,3 +1,4 @@
+import { mergeUsageSnapshot } from '../observability/prompt-cache.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CancellationError, classifyError, InferenceError } from './errors.js';
 
@@ -36,9 +37,10 @@ export class InferenceEngine {
       let usage = {
         inputTokens: 0,
         outputTokens: 0,
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
       };
+      const usageByRequest = new Map();
       let emittedAnything = false;
       let providerInvoked = false;
 
@@ -55,14 +57,17 @@ export class InferenceEngine {
           maxTokens: activeMaxTokens,
           signal,
         })) {
-          signal?.throwIfAborted?.();
+          if (chunk.type !== 'usage') signal?.throwIfAborted?.();
           if (chunk.type === 'route' && chunk.route) {
             route = chunk.route;
           } else if (chunk.type === 'usage' && chunk.usage) {
-            usage.inputTokens += Number(chunk.usage.inputTokens ?? 0);
-            usage.outputTokens += Number(chunk.usage.outputTokens ?? 0);
-            usage.cacheReadTokens += Number(chunk.usage.cacheReadTokens ?? 0);
-            usage.cacheWriteTokens += Number(chunk.usage.cacheWriteTokens ?? 0);
+            const key = chunk.usageRequestId ?? '';
+            const previous = usageByRequest.get(key) ?? {};
+            const next = mergeUsageSnapshot({ ...previous }, chunk.usage);
+            for (const [field, n] of Object.entries(next)) {
+              usage[field] = (usage[field] ?? 0) + n - (previous[field] ?? 0);
+            }
+            usageByRequest.set(key, next);
           } else if (chunk.type === 'reasoning-delta' && chunk.text) {
             emittedAnything = true;
             reasoning += chunk.text;
@@ -84,6 +89,7 @@ export class InferenceEngine {
                 : String(chunk.reason);
           }
         }
+        signal?.throwIfAborted?.();
         return {
           text,
           reasoning,
@@ -147,8 +153,8 @@ export class InferenceEngine {
             cancelled.partialUsage = {
               inputTokens: 0,
               outputTokens: 0,
-              cacheReadTokens: 0,
-              cacheWriteTokens: 0,
+              cacheReadTokens: null,
+              cacheWriteTokens: null,
             };
             cancelled.abortedBeforeProvider = true;
             throw cancelled;
