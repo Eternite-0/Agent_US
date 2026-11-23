@@ -1383,7 +1383,11 @@ export class DirectAgentRuntime {
           sessionId: row.sessionId,
           turnId,
           type: RUNTIME_EVENTS.TURN_CANCELLED,
-          data: { turnId },
+          data: {
+            turnId,
+            sessionId: row.sessionId,
+            ...this.metrics?.getTurnProviderUsage?.(turnId),
+          },
           audit: false,
           at: now,
         });
@@ -1444,7 +1448,9 @@ export class DirectAgentRuntime {
         });
     let totalIn = 0;
     let totalOut = 0;
-    let totalCacheRead = 0;
+    let totalCacheRead = null;
+    let totalCacheWrite = null;
+    let totalCacheEligible = null;
     let steps = initialStep;
     let effectiveModel = model || null;
     let contextWindow = 128_000;
@@ -1742,6 +1748,8 @@ export class DirectAgentRuntime {
       totalIn = loopResult.usage.inputTokens;
       totalOut = loopResult.usage.outputTokens;
       totalCacheRead = loopResult.usage.cacheReadTokens;
+      totalCacheWrite = loopResult.usage.cacheWriteTokens;
+      totalCacheEligible = loopResult.usage.cacheEligibleInputTokens ?? null;
       steps = loopResult.steps;
       actualProvider = loopResult.route?.provider || 'pool';
       actualAccountId = loopResult.route?.accountId ?? null;
@@ -2082,6 +2090,8 @@ export class DirectAgentRuntime {
             inputTokens: totalIn,
             outputTokens: totalOut,
             cacheReadTokens: totalCacheRead,
+            cacheWriteTokens: totalCacheWrite,
+            cacheEligibleInputTokens: totalCacheEligible,
             durationMs,
             verdict: finalVerdict,
             evidenceCount: Number(evidenceCount || 0),
@@ -2107,6 +2117,8 @@ export class DirectAgentRuntime {
             inputTokens: totalIn,
             outputTokens: totalOut,
             cacheReadTokens: totalCacheRead,
+            cacheWriteTokens: totalCacheWrite,
+            cacheEligibleInputTokens: totalCacheEligible,
             durationMs,
             evidenceCount: Number(evidenceCount || 0),
           }),
@@ -2181,7 +2193,9 @@ export class DirectAgentRuntime {
       if (errUsage) {
         totalIn = Math.max(totalIn, Number(errUsage.inputTokens ?? 0));
         totalOut = Math.max(totalOut, Number(errUsage.outputTokens ?? 0));
-        totalCacheRead = Math.max(totalCacheRead, Number(errUsage.cacheReadTokens ?? 0));
+        if (errUsage.cacheReadTokens != null) totalCacheRead = Math.max(totalCacheRead ?? 0, errUsage.cacheReadTokens);
+        if (errUsage.cacheWriteTokens != null) totalCacheWrite = Math.max(totalCacheWrite ?? 0, errUsage.cacheWriteTokens);
+        totalCacheEligible = errUsage.cacheEligibleInputTokens ?? totalCacheEligible;
       }
       const errRoute = classified.route || err?.route || null;
       if (errRoute?.provider) actualProvider = errRoute.provider;
@@ -2321,7 +2335,7 @@ export class DirectAgentRuntime {
             turnId,
             type: isCancelled ? RUNTIME_EVENTS.TURN_CANCELLED : RUNTIME_EVENTS.TURN_FAILED,
             data: isCancelled
-              ? { turnId, sessionId, inputTokens: totalIn, outputTokens: totalOut, durationMs }
+              ? { turnId, sessionId, model: effectiveModel, provider: actualProvider, inputTokens: totalIn, outputTokens: totalOut, cacheReadTokens: totalCacheRead, cacheWriteTokens: totalCacheWrite, cacheEligibleInputTokens: totalCacheEligible, durationMs }
               : {
                   turnId,
                   sessionId,
@@ -2329,6 +2343,9 @@ export class DirectAgentRuntime {
                   provider: actualProvider,
                   inputTokens: totalIn,
                   outputTokens: totalOut,
+                  cacheReadTokens: totalCacheRead,
+                  cacheWriteTokens: totalCacheWrite,
+                  cacheEligibleInputTokens: totalCacheEligible,
                   error: message,
                   code: classified.code,
                   durationMs,

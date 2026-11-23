@@ -1,3 +1,4 @@
+import { normalizeProviderUsage } from './observability/prompt-cache.js';
 // Lightweight zero-dependency reverse-proxy protocol translator & native Copilot token exchange.
 // Enables Agent_US (single process on :8787) to route & reverse-proxy both
 // OpenAI (/v1/chat/completions) and Anthropic (/v1/messages) traffic across
@@ -215,6 +216,29 @@ function mapAnthropicStopReason(reason) {
   return 'stop';
 }
 
+function openaiUsage(raw) {
+  const u = normalizeProviderUsage('anthropic', raw);
+  if (!u) return undefined;
+  return {
+    ...(u.inputTokens == null ? {} : { prompt_tokens: u.inputTokens }),
+    ...(u.outputTokens == null ? {} : { completion_tokens: u.outputTokens }),
+    ...(u.inputTokens == null || u.outputTokens == null ? {} : { total_tokens: u.inputTokens + u.outputTokens }),
+    ...(u.cacheReadTokens == null ? {} : { prompt_tokens_details: { cached_tokens: u.cacheReadTokens } }),
+    ...(u.cacheWriteTokens == null ? {} : { cache_creation_input_tokens: u.cacheWriteTokens }),
+  };
+}
+
+function anthropicUsage(raw) {
+  const u = normalizeProviderUsage('openai', raw);
+  if (!u) return undefined;
+  return {
+    ...(u.inputTokens == null ? {} : { input_tokens: Math.max(0, u.inputTokens - (u.cacheReadTokens ?? 0) - (u.cacheWriteTokens ?? 0)) }),
+    ...(u.outputTokens == null ? {} : { output_tokens: u.outputTokens }),
+    ...(u.cacheReadTokens == null ? {} : { cache_read_input_tokens: u.cacheReadTokens }),
+    ...(u.cacheWriteTokens == null ? {} : { cache_creation_input_tokens: u.cacheWriteTokens }),
+  };
+}
+
 export function anthropicJsonToOpenai(anth, requestedModel) {
   const blocks = Array.isArray(anth?.content) ? anth.content : [];
   let content = '';
@@ -234,8 +258,6 @@ export function anthropicJsonToOpenai(anth, requestedModel) {
       });
     }
   }
-  const promptTokens = anth?.usage?.input_tokens ?? 0;
-  const completionTokens = anth?.usage?.output_tokens ?? 0;
   return {
     id: anth?.id ? `chatcmpl-${anth.id}` : `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
@@ -253,11 +275,7 @@ export function anthropicJsonToOpenai(anth, requestedModel) {
         finish_reason: mapAnthropicStopReason(anth?.stop_reason),
       },
     ],
-    usage: {
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-      total_tokens: promptTokens + completionTokens,
-    },
+    usage: openaiUsage(anth?.usage),
   };
 }
 
@@ -273,8 +291,7 @@ export function anthropicSseToOpenaiStream(anthBody, requestedModel) {
       const reader = anthBody.getReader();
       let buffer = '';
       let sentRole = false;
-      let inputTokens = 0;
-      let outputTokens = 0;
+      let usage;
       let stopReason = 'end_turn';
       const toolIdxByBlock = new Map();
       let nextToolIdx = 0;
@@ -315,7 +332,7 @@ export function anthropicSseToOpenaiStream(anthBody, requestedModel) {
               continue;
             }
             if (ev.type === 'message_start') {
-              inputTokens = ev.message?.usage?.input_tokens ?? 0;
+              usage = ev.message?.usage ?? usage;
               ensureRole();
             } else if (ev.type === 'content_block_start') {
               ensureRole();
@@ -389,9 +406,7 @@ export function anthropicSseToOpenaiStream(anthBody, requestedModel) {
               }
             } else if (ev.type === 'message_delta') {
               if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
-              if (ev.usage?.output_tokens !== undefined) {
-                outputTokens = ev.usage.output_tokens;
-              }
+              if (ev.usage) usage = { ...usage, ...ev.usage };
             }
           }
         }
@@ -407,11 +422,7 @@ export function anthropicSseToOpenaiStream(anthBody, requestedModel) {
               finish_reason: mapAnthropicStopReason(stopReason),
             },
           ],
-          usage: {
-            prompt_tokens: inputTokens,
-            completion_tokens: outputTokens,
-            total_tokens: inputTokens + outputTokens,
-          },
+          usage: openaiUsage(usage),
         });
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
         controller.close();
@@ -573,10 +584,7 @@ export function openaiJsonToAnthropic(oai, requestedModel) {
     content,
     stop_reason: mapOpenaiFinishReason(choice.finish_reason),
     stop_sequence: null,
-    usage: {
-      input_tokens: oai?.usage?.prompt_tokens ?? 0,
-      output_tokens: oai?.usage?.completion_tokens ?? 0,
-    },
+    usage: anthropicUsage(oai?.usage),
   };
 }
 
@@ -596,8 +604,7 @@ export function openaiSseToAnthropicStream(oaiBody, requestedModel) {
       let textIndex = null;
       const toolBlockMap = new Map();
       let finishReason = 'stop';
-      let inputTokens = 0;
-      let outputTokens = 0;
+      let usage;
 
       const emitEvent = (name, data) => {
         controller.enqueue(
@@ -644,10 +651,7 @@ export function openaiSseToAnthropicStream(oaiBody, requestedModel) {
             } catch {
               continue;
             }
-            if (chunk.usage) {
-              inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
-              outputTokens = chunk.usage.completion_tokens ?? outputTokens;
-            }
+            if (chunk.usage) usage = { ...usage, ...chunk.usage };
             const choice = chunk.choices?.[0];
             if (!choice) continue;
             const d = choice.delta ?? {};
@@ -731,10 +735,7 @@ export function openaiSseToAnthropicStream(oaiBody, requestedModel) {
             stop_reason: mapOpenaiFinishReason(finishReason),
             stop_sequence: null,
           },
-          usage: {
-            input_tokens: inputTokens,
-            output_tokens: outputTokens,
-          },
+          usage: anthropicUsage(usage),
         });
         emitEvent('message_stop', { type: 'message_stop' });
         controller.close();

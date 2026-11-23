@@ -1,3 +1,4 @@
+import type { PromptCacheStats } from '../utils/promptCache';
 import { swarmAttachmentError } from '../utils/swarmCommand.ts';
 import { swarmWorkerStatus } from '../utils/subagentProgress.ts';
 import type {
@@ -95,6 +96,7 @@ type TurnResponse = SwarmCommandReceipt | { mode?: 'direct'; turn?: Record<strin
 
 export interface AgentBackendClient {
   readonly isDemo: boolean;
+  getPromptCacheStats?: (signal?: AbortSignal) => Promise<PromptCacheStats | null>;
   health(): Promise<{
     ok: boolean;
     status?: string;
@@ -665,6 +667,13 @@ export class LiveBackendClient implements AgentBackendClient {
     }
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
+  }
+
+  async getPromptCacheStats(signal?: AbortSignal): Promise<PromptCacheStats | null> {
+    const result = await this.req<{ promptCache?: PromptCacheStats }>('GET', '/v1/observability/metrics', {
+      query: { windowHours: 24, view: 'prompt-cache' }, signal,
+    });
+    return result.promptCache ?? null;
   }
 
   async health() {

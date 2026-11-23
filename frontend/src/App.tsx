@@ -1,3 +1,5 @@
+import { PromptCacheContext } from './components/PromptCacheStatus';
+import { cacheRefreshEvent } from './utils/promptCache';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, LiveBackendClient, type AgentBackendClient } from './api/client';
 import { SimulatorClient } from './api/simulator';
@@ -1423,7 +1425,10 @@ export const App: React.FC = () => {
           : 'SSE 重连中'
         : '未连接后端';
 
+  const lastCacheEvent = recentEvents.findLast(event => cacheRefreshEvent(event.type));
+  const cacheRevision = lastCacheEvent ? `${lastCacheEvent.seq}:${lastCacheEvent.type}` : '';
   return (
+    <PromptCacheContext.Provider value={{ client, revision: cacheRevision }}>
     <div className="codex-shell">
       <TopBar
         canBack={nav.index > 0}
@@ -2117,5 +2122,6 @@ export const App: React.FC = () => {
       </ComposerDialog>}
       <ToastHost toasts={toasts} />
     </div>
+    </PromptCacheContext.Provider>
   );
 };

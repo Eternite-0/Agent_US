@@ -1,3 +1,4 @@
+import { summarizePromptCache } from './prompt-cache.js';
 import { id as uuid } from '../store.js';
 import { classifyTrafficSource, getTraceContext } from './trace.js';
 
@@ -108,7 +109,10 @@ export class MetricsCollector {
               runId, nodeId, sessionId, turnId, jobId, workerId,
               attempt, fence, model, provider, accountId,
               toolCallId, artifactId, ok, durationMs, code, detailJson
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ${kind === 'provider_usage' ? `ON CONFLICT(id) DO UPDATE SET
+              ok=excluded.ok, durationMs=excluded.durationMs, detailJson=excluded.detailJson
+              WHERE runtime_metrics_events.kind='provider_usage'` : ''}`,
           )
           .run(
             rowId,
@@ -141,17 +145,38 @@ export class MetricsCollector {
     }
   }
 
+  getTurnProviderUsage(turnId) {
+    if (!this.#dbReady()) return null;
+    const fields = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'cacheEligibleInputTokens'];
+    const row = this.store.db.prepare(`
+      SELECT COUNT(*) AS requests, ${fields.map(field => `SUM(json_extract(detailJson, '$.${field}')) AS ${field}`).join(', ')},
+             CASE WHEN COUNT(DISTINCT provider)=1 THEN MAX(provider) ELSE NULL END AS provider,
+             CASE WHEN COUNT(DISTINCT model)=1 THEN MAX(model) ELSE NULL END AS model
+      FROM runtime_metrics_events WHERE kind='provider_usage' AND turnId=?
+    `).get(turnId);
+    if (!row?.requests) return null;
+    const { requests: _requests, ...usage } = row;
+    return usage;
+  }
+
   /**
    * Computes all 10 production KPIs strictly from durable runtime/verifier state.
    * Defaults to real production traffic only (`includeSynthetic = false`).
    */
-  getProductionMetrics({ windowHours = 24, includeSynthetic = false, now = Date.now() } = {}) {
-    const winHours = Math.max(1 / 60, Number(windowHours || 24));
+  getProductionMetrics({ windowHours = 24, includeSynthetic = false, now = Date.now(), view } = {}) {
+    const hours = Number(windowHours);
+    const winHours = Number.isFinite(hours) ? Math.min(720, Math.max(1 / 60, hours || 24)) : 24;
     const sinceMs = now - winHours * 3_600_000;
     const includeSynth = Boolean(includeSynthetic);
 
-    if (!this.#dbReady()) {
-      return this.#emptyMetrics({ windowHours: winHours, includeSynthetic: includeSynth, sinceMs, now });
+    const ready = this.#dbReady();
+    const promptCache = summarizePromptCache(ready ? this.store.db.prepare(
+      `SELECT provider, model, detailJson FROM runtime_metrics_events
+       WHERE kind = 'provider_usage' AND at >= ? AND at <= ? ${includeSynth ? '' : 'AND isSynthetic = 0'}`,
+    ).iterate(sinceMs, now) : [], { windowHours: winHours, sinceMs, now, includeSynthetic: includeSynth });
+    if (view === 'prompt-cache') return { promptCache };
+    if (!ready) {
+      return { ...this.#emptyMetrics({ windowHours: winHours, includeSynthetic: includeSynth, sinceMs, now }), promptCache };
     }
 
     const db = this.store.db;
@@ -567,26 +592,18 @@ export class MetricsCollector {
     const sumOut = Number(usageRow?.sumOut ?? 0);
     const sumTotal = Number(usageRow?.sumTotal ?? 0);
 
-    // Derive cacheReadRatio from turn/completed events (and metrics events if present)
-    const cacheEvRows = db
-      .prepare(
-        `SELECT de.data
-         FROM direct_events de
-         LEFT JOIN direct_sessions s ON s.id = de.sessionId
-         WHERE de.type = 'turn/completed' AND de.at >= ? ${synthWhereAlias('s')}`,
-      )
-      .all(sinceMs);
-    let cacheReadSum = 0;
-    let cacheInputSum = 0;
-    for (const ev of cacheEvRows) {
-      const d = parseJsonSafe(ev.data, {});
-      const inTok = Number(d?.inputTokens ?? 0);
-      const cacheTok = Number(d?.cacheReadTokens ?? 0);
-      if (inTok > 0) {
-        cacheInputSum += inTok;
-        cacheReadSum += Math.max(0, cacheTok);
-      }
-    }
+    // Retain the old field for historical windows with a recorded positive hit.
+    // Unknown legacy samples never participate in the new denominator or UI.
+    const legacyCache = promptCache.global.requests ? null : db.prepare(`
+      SELECT SUM(CAST(json_extract(de.data, '$.cacheReadTokens') AS INTEGER)) AS reads,
+             SUM(CAST(json_extract(de.data, '$.inputTokens') AS INTEGER)) AS inputs
+      FROM direct_events de LEFT JOIN direct_sessions s ON s.id = de.sessionId
+      WHERE de.type = 'turn/completed' AND de.at >= ? AND de.at <= ?
+        AND json_valid(de.data) AND json_extract(de.data, '$.cacheEligibleInputTokens') IS NULL
+        AND json_extract(de.data, '$.inputTokens') > 0 AND json_extract(de.data, '$.cacheReadTokens') > 0
+        ${synthWhereAlias('s')}
+    `).get(sinceMs, now);
+    const legacyRatio = legacyCache?.inputs ? round4(Math.min(1, legacyCache.reads / legacyCache.inputs)) : null;
     const averageTokenUsage = {
       sampleCount: usageSamples,
       avgInputTokens: usageSamples > 0 ? Math.round(sumIn / usageSamples) : null,
@@ -595,8 +612,8 @@ export class MetricsCollector {
       totalInputTokens: sumIn,
       totalOutputTokens: sumOut,
       totalTokens: sumTotal,
-      cacheReadRatio:
-        cacheInputSum > 0 ? round4(Math.min(1, cacheReadSum / cacheInputSum)) : null,
+      cacheReadRatio: round4(promptCache.global.hitRate) ?? legacyRatio,
+      cacheReadRatioSource: promptCache.global.hitRate != null ? 'provider' : legacyRatio != null ? 'legacy' : null,
     };
 
     // 9. Budget Overrun
@@ -784,6 +801,7 @@ export class MetricsCollector {
       reconciliationCount,
       swarmCompletionTime,
       averageTokenUsage,
+      promptCache,
       budgetOverrun,
       modelRoutingSuccessRate,
       trafficBreakdown,

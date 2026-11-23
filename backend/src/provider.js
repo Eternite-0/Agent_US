@@ -1,3 +1,4 @@
+import { normalizeProviderUsage, observeProviderUsage, openaiPromptCacheKey, stableTools } from './observability/prompt-cache.js';
 import OpenAI from 'openai';
 import { LlmAdapter, attributionHeaders } from '@deepseek-ai/dsh-llm';
 import { Fault } from './store.js';
@@ -53,8 +54,11 @@ export class ChatAdapter extends LlmAdapter {
     let yielded = false;
     for (const r of routes) {
       try {
-        for await (const chunk of this.read(r, o)) {
-          yielded = true;
+        for await (const chunk of observeProviderUsage(this.read(r, o), {
+          metrics: this.metrics, signal: o.signal, provider: r.id ?? o.provider,
+          model: r.wireModel ?? o.model, sessionId: o.sessionKey ?? undefined,
+        })) {
+          if (chunk.type !== 'usage') yielded = true;
           yield chunk;
         }
         return;
@@ -67,6 +71,7 @@ export class ChatAdapter extends LlmAdapter {
     throw new Fault('PROVIDER_UNAVAILABLE', 503);
   }
   async *read(r, o) {
+    const cacheKey = openaiPromptCacheKey(r.endpoint, o.sessionKey);
     const stream = await client(r).chat.completions.create(
       {
         model: r.wireModel ?? o.model,
@@ -74,8 +79,9 @@ export class ChatAdapter extends LlmAdapter {
         stream: true,
         stream_options: { include_usage: true },
         max_tokens: o.maxTokens,
+        ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
         ...(o.tools?.length && {
-          tools: o.tools.map((t) => ({
+          tools: stableTools(o.tools).map((t) => ({
             type: 'function',
             function: {
               name: t.name,
@@ -97,15 +103,7 @@ export class ChatAdapter extends LlmAdapter {
       if (frame.usage)
         yield {
           type: 'usage',
-          usage: {
-            inputTokens: frame.usage.prompt_tokens,
-            outputTokens: frame.usage.completion_tokens,
-            cacheReadTokens:
-              frame.usage.prompt_tokens_details?.cached_tokens ??
-              frame.usage.cache_read_input_tokens ??
-              0,
-            cacheWriteTokens: frame.usage.cache_creation_input_tokens ?? 0,
-          },
+          usage: normalizeProviderUsage('openai', frame.usage),
         };
       const choice = frame.choices?.[0];
       if (!choice) continue;
