@@ -136,13 +136,22 @@ function extractErrorTokensFromText(rawText) {
   return tokens;
 }
 
-function collectNormalizedFiles({ modifiedFiles = [], toolReceipts = [], verdict = null, workspaceRoot = null } = {}) {
+function collectNormalizedFiles({
+  modifiedFiles = [],
+  reasoningMetrics = null,
+  toolReceipts = [],
+  verdict = null,
+  workspaceRoot = null,
+} = {}) {
   const out = new Set();
   const addPath = (p) => {
     const norm = normalizeMemoryPath(p, workspaceRoot);
     if (norm) out.add(norm);
   };
   for (const p of Array.isArray(modifiedFiles) ? modifiedFiles : []) addPath(p);
+  for (const p of Array.isArray(reasoningMetrics?.filesMutated) ? reasoningMetrics.filesMutated : []) {
+    addPath(p);
+  }
   for (const receipt of Array.isArray(toolReceipts) ? toolReceipts : []) {
     if (!receipt || typeof receipt !== 'object') continue;
     const args = receipt.effectiveArgs ?? receipt.args ?? receipt.arguments ?? null;
@@ -203,8 +212,11 @@ function extractErrorFingerprints({
           if (fp.signature) addSig(fp.signature);
           if (fp.errorType) addSig(fp.errorType);
           if (fp.code) addSig(fp.code);
+          if (fp.location) addSig(fp.location);
           if (fp.file) addSig(fp.line != null ? `${fp.file}:${fp.line}` : fp.file);
-          if (fp.message || fp.excerpt) addFromText(fp.message ?? fp.excerpt);
+          if (fp.message || fp.excerpt || fp.assertionExcerpt) {
+            addFromText(fp.message ?? fp.excerpt ?? fp.assertionExcerpt);
+          }
         }
       }
     }
@@ -213,7 +225,10 @@ function extractErrorFingerprints({
         if (!attempt || typeof attempt !== 'object') continue;
         if (attempt.errorSignature) addSig(attempt.errorSignature);
         if (attempt.errorCode) addSig(attempt.errorCode);
-        if (attempt.reason || attempt.error) addFromText(attempt.reason ?? attempt.error);
+        if (attempt.location) addSig(attempt.location);
+        if (attempt.reason || attempt.error || attempt.hypothesisSummary) {
+          addFromText(attempt.reason ?? attempt.error ?? attempt.hypothesisSummary);
+        }
       }
     }
   }
@@ -777,6 +792,7 @@ export class ExperienceMemoryService {
       : [];
     const normalizedFiles = collectNormalizedFiles({
       modifiedFiles,
+      reasoningMetrics,
       toolReceipts: receipts,
       verdict,
       workspaceRoot,
@@ -812,6 +828,7 @@ export class ExperienceMemoryService {
         error ||
         errorCode ||
         resolvedFailureCategory ||
+        reasoningMetrics?.circuitBroken === true ||
         (reasoningMetrics?.loopStopReason && reasoningMetrics.loopStopReason !== 'completed'),
     );
 
@@ -823,8 +840,10 @@ export class ExperienceMemoryService {
       reasoningMetrics &&
         typeof reasoningMetrics === 'object' &&
         (reasoningMetrics.selfCorrectionRecovered ||
+          reasoningMetrics.circuitBroken === true ||
           Number(reasoningMetrics.ineffectiveActionCount || 0) > 0 ||
           (Array.isArray(reasoningMetrics.stuckTriggers) && reasoningMetrics.stuckTriggers.length > 0) ||
+          (Array.isArray(reasoningMetrics.stuckDetections) && reasoningMetrics.stuckDetections.length > 0) ||
           errorFingerprints.length > 0),
     );
     const isEvaluationSource = ['evaluation', 'eval'].includes(

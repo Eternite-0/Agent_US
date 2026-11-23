@@ -240,6 +240,7 @@ export class EvaluationRunner {
             : null,
           trustedVerdict: output.trustedVerdict ?? null,
           reviewerVerdict: output.reviewerVerdict ?? null,
+          ...(output.reasoningMetrics ? { reasoningMetrics: output.reasoningMetrics } : {}),
         };
         const result = {
           taskId: task.id, status: judgment.passed ? 'passed' : 'failed', passed: Boolean(judgment.passed),

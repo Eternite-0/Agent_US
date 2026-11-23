@@ -441,7 +441,10 @@ export class AgentLoop {
         };
         if (contextManager) {
           sm.transition(TURN_PHASES.COMPACTING, { step: steps, persist: profile?.persistTurn !== false });
-          const compacted = await contextManager.prepareRequest(requestOptions, { step: steps });
+          const compacted = await contextManager.prepareRequest(requestOptions, {
+            step: steps,
+            reasoningState: reasoningTracker.getState(),
+          });
           requestOptions = compacted.options;
           if (compacted.stage && compacted.stage !== 'none') {
             if (Array.isArray(requestOptions?.messages)) {

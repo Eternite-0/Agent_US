@@ -117,6 +117,119 @@ function extractModifiedFilesFromToolCalls(msgRows, existingPaths) {
   return extra;
 }
 
+function mergeReasoningStateIntoAnchor(anchor, reasoningState) {
+  if (!reasoningState || typeof reasoningState !== 'object') return anchor;
+
+  const modifiedFiles = Array.isArray(anchor.modifiedFiles) ? [...anchor.modifiedFiles] : [];
+  const seenPaths = new Set(modifiedFiles.map((f) => f?.path).filter(Boolean));
+  for (const rawPath of Array.isArray(reasoningState.filesMutated) ? reasoningState.filesMutated : []) {
+    const p = String(rawPath || '').trim();
+    if (p && !seenPaths.has(p)) {
+      seenPaths.add(p);
+      modifiedFiles.push({ path: p, action: 'modified' });
+    }
+  }
+
+  const verificationLedger = Array.isArray(anchor.verificationLedger)
+    ? anchor.verificationLedger.map((v) => ({ ...v }))
+    : [];
+  const vIdxByCmd = new Map();
+  verificationLedger.forEach((v, idx) => {
+    if (v?.command) vIdxByCmd.set(String(v.command), idx);
+  });
+  for (const v of Array.isArray(reasoningState.verifications) ? reasoningState.verifications : []) {
+    if (!v || typeof v !== 'object') continue;
+    const command = String(v.command || v.toolName || 'verification').trim();
+    const status = v.passed ? 'pass' : 'fail';
+    const entry = {
+      command,
+      tool: String(v.toolName || 'bash'),
+      exitCode: v.exitCode ?? null,
+      status,
+      passed: Boolean(v.passed),
+      failureExcerpt: v.passed
+        ? ''
+        : String(v.fingerprint?.assertionExcerpt || v.fingerprint?.signature || '').slice(0, 280),
+      seq: v.seq ?? null,
+    };
+    const existingIdx = vIdxByCmd.get(command);
+    if (existingIdx !== undefined) {
+      verificationLedger[existingIdx] = { ...verificationLedger[existingIdx], ...entry };
+    } else {
+      vIdxByCmd.set(command, verificationLedger.length);
+      verificationLedger.push(entry);
+    }
+  }
+
+  const falsifiedAttempts = Array.isArray(anchor.falsifiedAttempts)
+    ? anchor.falsifiedAttempts.map((f) => ({ ...f }))
+    : [];
+  const seenFalsified = new Set(
+    falsifiedAttempts.map((f) => `${String(f.tool || '')}|${String(f.target || '')}|${String(f.errorSignature || '')}`),
+  );
+  for (const a of Array.isArray(reasoningState.falsifiedAttempts) ? reasoningState.falsifiedAttempts : []) {
+    if (!a || typeof a !== 'object') continue;
+    const tool = String(a.toolName || 'unknown');
+    const target = (Array.isArray(a.targetFiles) && a.targetFiles.length
+      ? a.targetFiles.join(', ')
+      : tool
+    ).slice(0, 160);
+    const errorSignature = String(a.errorSignature || a.errorType || '').slice(0, 160);
+    const key = `${tool}|${target}|${errorSignature}`;
+    if (seenFalsified.has(key)) continue;
+    seenFalsified.add(key);
+    falsifiedAttempts.push({
+      tool,
+      target,
+      errorSignature,
+      excerpt: String(a.hypothesisSummary || errorSignature).slice(0, 240),
+      exitCode: null,
+      count: 1,
+      repeated: false,
+      lastSeq: a.seq ?? null,
+    });
+  }
+  for (const fp of Array.isArray(reasoningState.errorFingerprints) ? reasoningState.errorFingerprints : []) {
+    if (!fp || typeof fp !== 'object' || Number(fp.count || 0) < 2) continue;
+    const sig = String(fp.signature || fp.errorType || '').slice(0, 160);
+    const target = String(fp.failingTarget || fp.location || 'execution').slice(0, 160);
+    const already = falsifiedAttempts.some(
+      (f) => f.errorSignature === sig || (sig && String(f.excerpt || '').includes(sig)),
+    );
+    if (!already && sig) {
+      falsifiedAttempts.push({
+        tool: 'tracker',
+        target,
+        errorSignature: sig,
+        excerpt: String(fp.assertionExcerpt || sig).slice(0, 240),
+        exitCode: fp.exitCode ?? null,
+        count: Number(fp.count),
+        repeated: true,
+        lastSeq: fp.lastSeq ?? null,
+      });
+    }
+  }
+
+  const stuckDetections = Array.isArray(reasoningState.stuckDetections)
+    ? reasoningState.stuckDetections.slice(-5).map((d) => ({
+        pattern: String(d?.pattern || ''),
+        signature: String(d?.signature || ''),
+        summary: String(d?.summary || '').slice(0, 200),
+      }))
+    : [];
+
+  return {
+    ...anchor,
+    modifiedFiles: modifiedFiles.slice(0, 40),
+    verificationLedger: verificationLedger.slice(-10),
+    falsifiedAttempts: falsifiedAttempts.slice(0, 10),
+    ...(reasoningState.hasUnverifiedMutationsAfterLastPass
+      ? { hasUnverifiedMutationsAfterLastPass: true }
+      : {}),
+    ...(stuckDetections.length ? { stuckDetections } : {}),
+  };
+}
+
 /**
  * Layer 5 Non-Destructive MultiStageCompactor.
  * Never deletes rows from `direct_messages`; persists structured compaction records
@@ -134,19 +247,22 @@ export class MultiStageCompactor {
    * active plan, modified files, verification ledger, falsified attempts, and tool evidence
    * so compaction never loses execution state.
    */
-  extractTaskStateAnchor(sessionId) {
+  extractTaskStateAnchor(sessionId, { reasoningState = null } = {}) {
     if (!this.store?.db || typeof this.store.db.prepare !== 'function' || !sessionId) {
-      return {
-        goal: '',
-        acceptanceCriteria: [],
-        constraints: [],
-        activePlan: null,
-        modifiedFiles: [],
-        verificationLedger: [],
-        falsifiedAttempts: [],
-        evidence: [],
-        artifactUris: [],
-      };
+      return mergeReasoningStateIntoAnchor(
+        {
+          goal: '',
+          acceptanceCriteria: [],
+          constraints: [],
+          activePlan: null,
+          modifiedFiles: [],
+          verificationLedger: [],
+          falsifiedAttempts: [],
+          evidence: [],
+          artifactUris: [],
+        },
+        reasoningState,
+      );
     }
 
     const db = this.store.db;
@@ -385,22 +501,25 @@ export class MultiStageCompactor {
       if (matches) matches.forEach((u) => artifactUris.add(u));
     }
 
-    return {
-      goal,
-      acceptanceCriteria: [...new Set(acceptanceCriteria)].slice(0, 12),
-      constraints: [...new Set(constraints)].slice(0, 16),
-      activePlan,
-      modifiedFiles: allModifiedFiles,
-      verificationLedger,
-      falsifiedAttempts,
-      evidence: receipts.slice(0, 20).map((r) => ({
-        tool: r.toolName,
-        status: r.status,
-        exitCode: r.exitCode,
-        effectClass: r.effectClass,
-      })),
-      artifactUris: [...artifactUris].slice(0, 16),
-    };
+    return mergeReasoningStateIntoAnchor(
+      {
+        goal,
+        acceptanceCriteria: [...new Set(acceptanceCriteria)].slice(0, 12),
+        constraints: [...new Set(constraints)].slice(0, 16),
+        activePlan,
+        modifiedFiles: allModifiedFiles,
+        verificationLedger,
+        falsifiedAttempts,
+        evidence: receipts.slice(0, 20).map((r) => ({
+          tool: r.toolName,
+          status: r.status,
+          exitCode: r.exitCode,
+          effectClass: r.effectClass,
+        })),
+        artifactUris: [...artifactUris].slice(0, 16),
+      },
+      reasoningState,
+    );
   }
 
   getActiveCompaction(sessionId) {
@@ -473,13 +592,16 @@ export class MultiStageCompactor {
         `已改动文件: ${taskState.modifiedFiles.map((f) => `${f.path}(${f.action})`).join(', ')}`,
       );
     }
-    if (taskState?.verificationLedger?.length) {
-      const vLines = taskState.verificationLedger.map((v) => {
+    if (taskState?.verificationLedger?.length || taskState?.hasUnverifiedMutationsAfterLastPass) {
+      const vLines = (taskState.verificationLedger ?? []).map((v) => {
         const badge = String(v.status || 'unknown').toUpperCase();
         const code = v.exitCode !== null && v.exitCode !== undefined ? ` exit=${v.exitCode}` : '';
         const err = v.failureExcerpt ? ` :: ${v.failureExcerpt}` : '';
         return `- [${badge}${code}] ${v.command}${err}`;
       });
+      if (taskState?.hasUnverifiedMutationsAfterLastPass) {
+        vLines.push('- [PENDING] 存在最近修改后尚未重新验证的文件，完成前必须运行验证命令');
+      }
       parts.push(`验证台账:\n${vLines.join('\n')}`);
     }
     if (taskState?.falsifiedAttempts?.length) {
@@ -488,6 +610,12 @@ export class MultiStageCompactor {
         return `- [${f.tool}] ${f.target}${repeatTag}: ${f.errorSignature || f.excerpt}`;
       });
       parts.push(`已证伪尝试与重复错误:\n${fLines.join('\n')}`);
+    }
+    if (taskState?.stuckDetections?.length) {
+      const sLines = taskState.stuckDetections.map(
+        (d) => `- [${d.pattern || 'stuck'}] ${d.summary || d.signature}`,
+      );
+      parts.push(`停滞诊断提示:\n${sLines.join('\n')}`);
     }
     if (taskState?.evidence?.length) {
       parts.push(
@@ -613,7 +741,7 @@ export class MultiStageCompactor {
    */
   async prepareRequest(
     options,
-    { contextWindow = 128000, sessionId = null, turnId = null, summarize = null } = {},
+    { contextWindow = 128000, sessionId = null, turnId = null, summarize = null, reasoningState = null } = {},
   ) {
     const compBefore = this.budgetManager.measure(options);
     const out = await compactTwoStage(options, {
@@ -621,8 +749,8 @@ export class MultiStageCompactor {
       summarize,
     });
 
-    if (out.stage === 'summary' && sessionId && this.store?.db) {
-      const taskState = this.extractTaskStateAnchor(sessionId);
+    if (out.stage === 'summary' && ((sessionId && this.store?.db) || reasoningState)) {
+      const taskState = this.extractTaskStateAnchor(sessionId, { reasoningState });
       const summaryMsg = out.options.messages.find(
         (m) =>
           m.role === 'assistant' &&
@@ -632,33 +760,35 @@ export class MultiStageCompactor {
         const rawSummary = summaryMsg.content[0].text.replace('[compacted summary]\n', '');
         const anchored = this.formatAnchorText(rawSummary, taskState);
         summaryMsg.content[0].text = anchored;
-        const compactionId = uuid();
-        const now = Date.now();
-        const maxSeqRow = this.store.db
-          .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM direct_messages WHERE sessionId=?')
-          .get(sessionId);
-        this.store.tx(() => {
-          this.store.db
-            .prepare(
-              `INSERT INTO context_compactions(
-                id, sessionId, turnId, stage, coveredThroughSeq, summaryText,
-                taskStateJson, preservedConstraintsJson, tokenBefore, tokenAfter, createdAt
-              ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-            )
-            .run(
-              compactionId,
-              sessionId,
-              turnId,
-              'auto-summary',
-              maxSeqRow?.m ?? 0,
-              rawSummary,
-              JSON.stringify(taskState),
-              JSON.stringify(taskState.constraints ?? []),
-              compBefore.totalTokens,
-              out.tokens ?? 0,
-              now,
-            );
-        });
+        if (sessionId && this.store?.db && typeof this.store.db.prepare === 'function') {
+          const compactionId = uuid();
+          const now = Date.now();
+          const maxSeqRow = this.store.db
+            .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM direct_messages WHERE sessionId=?')
+            .get(sessionId);
+          this.store.tx(() => {
+            this.store.db
+              .prepare(
+                `INSERT INTO context_compactions(
+                  id, sessionId, turnId, stage, coveredThroughSeq, summaryText,
+                  taskStateJson, preservedConstraintsJson, tokenBefore, tokenAfter, createdAt
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+              )
+              .run(
+                compactionId,
+                sessionId,
+                turnId,
+                'auto-summary',
+                maxSeqRow?.m ?? 0,
+                rawSummary,
+                JSON.stringify(taskState),
+                JSON.stringify(taskState.constraints ?? []),
+                compBefore.totalTokens,
+                out.tokens ?? 0,
+                now,
+              );
+          });
+        }
       }
     }
     return out;

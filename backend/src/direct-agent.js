@@ -1844,11 +1844,12 @@ export class DirectAgentRuntime {
         budgetContext: directBudgetContext,
         signal,
         contextManager: {
-          prepareRequest: (opts) =>
+          prepareRequest: (opts, meta) =>
             this.compactor.prepareRequest(opts, {
               contextWindow: Math.min(200000, contextWindow),
               sessionId,
               turnId,
+              reasoningState: meta?.reasoningState ?? null,
               summarize: (oldMsgs) =>
                 this.#summarizeHistoryWithLlm(oldMsgs, effectiveModel, signal),
             }),
@@ -2439,6 +2440,7 @@ export class DirectAgentRuntime {
       }
 
       const totalTokens = totalIn + totalOut;
+      const catchReasoningMetrics = err?.reasoningMetrics ?? classified?.reasoningMetrics ?? null;
       let outbox = null;
       try {
         outbox = this.store.tx(() => {
@@ -2523,6 +2525,7 @@ export class DirectAgentRuntime {
                   error: message,
                   code: classified.code,
                   durationMs,
+                  ...(catchReasoningMetrics ? { reasoningMetrics: catchReasoningMetrics } : {}),
                 },
             audit: false,
             at: finishedAt,

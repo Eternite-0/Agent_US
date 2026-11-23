@@ -311,8 +311,10 @@ export function summarizeReasoningMetrics(results = []) {
     }
     const hadStuckOrFalsified =
       rm.selfCorrectionRecovered === true ||
+      rm.circuitBroken === true ||
       Number(rm.stuckTriggerCount || 0) > 0 ||
       (Array.isArray(rm.stuckTriggers) && rm.stuckTriggers.length > 0) ||
+      (Array.isArray(rm.stuckDetections) && rm.stuckDetections.length > 0) ||
       (Array.isArray(rm.falsifiedAttempts) && rm.falsifiedAttempts.length > 0);
     if (hadStuckOrFalsified) {
       selfCorrectionAttempts += 1;
@@ -336,8 +338,13 @@ export function summarizeReasoningMetrics(results = []) {
     } else if (rm.falsifiedAttemptCount != null && Number.isFinite(Number(rm.falsifiedAttemptCount))) {
       totalFalsifiedAttempts += Math.max(0, Number(rm.falsifiedAttemptCount));
     }
-    if (Array.isArray(rm.stuckTriggers)) {
-      for (const trig of rm.stuckTriggers) {
+    const triggerList = Array.isArray(rm.stuckTriggers)
+      ? rm.stuckTriggers
+      : Array.isArray(rm.stuckDetections)
+        ? rm.stuckDetections
+        : null;
+    if (triggerList) {
+      for (const trig of triggerList) {
         const key = typeof trig === 'string' ? trig : String(trig?.pattern ?? trig?.type ?? 'unknown');
         stuckTriggerCounts[key] = (stuckTriggerCounts[key] ?? 0) + 1;
       }
