@@ -412,6 +412,8 @@ export class ExecutionReasoningTracker {
     this._policyBlockCount = 0;
     this._consecutivePolicyBlocks = 0;
     this._budgetReserveAdvised = false;
+    this._budgetFinalCallAdvised = false;
+    this._budgetPruneCount = 0;
     this.ineffectiveActionCount = 0;
   }
 
@@ -421,6 +423,15 @@ export class ExecutionReasoningTracker {
 
   markBudgetReserveAdvised() {
     this._budgetReserveAdvised = true;
+  }
+
+  markBudgetFinalCallAdvised() {
+    this._budgetFinalCallAdvised = true;
+  }
+
+  recordBudgetPrune() {
+    this._budgetPruneCount += 1;
+    return this._budgetPruneCount;
   }
 
   recordRepairRound({ step = 0 } = {}) {
@@ -918,6 +929,8 @@ export class ExecutionReasoningTracker {
       ineffectiveActionCount: this.ineffectiveActionCount,
       policyBlockCount: this._policyBlockCount,
       budgetReserveAdvised: this._budgetReserveAdvised,
+      budgetFinalCallAdvised: this._budgetFinalCallAdvised,
+      budgetPruneCount: this._budgetPruneCount,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],
       errorFingerprints: this.errorFingerprints.map((fp) => ({ ...fp })),
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
@@ -977,6 +990,8 @@ export class ExecutionReasoningTracker {
       ineffectiveActionCount: this.ineffectiveActionCount,
       policyBlockCount: this._policyBlockCount,
       budgetReserveAdvised: this._budgetReserveAdvised,
+      budgetFinalCallAdvised: this._budgetFinalCallAdvised,
+      budgetPruneCount: this._budgetPruneCount,
       firstFixSucceeded,
       selfCorrectionRecovered,
       rootCauseFilesReadBeforeEdit: [...this.rootCauseFilesReadBeforeEdit],

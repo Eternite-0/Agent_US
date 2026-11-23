@@ -635,6 +635,7 @@ test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers f
     }
     if (stepCall === 4) {
       assert.match(userText, /\[预算收尾提醒\]/);
+      assert.match(userText, /次模型调用/);
       assert.match(userText, /update_plan/);
       sawWrapUp = true;
       yield {
@@ -694,4 +695,90 @@ test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers f
     .get(turn.id);
   const doneData = JSON.parse(doneEv.data);
   assert.equal(doneData.reasoningMetrics?.budgetReserveAdvised, true);
+  assert.equal(doneData.reasoningMetrics?.budgetPruneCount, 1);
+
+  // Also verify DirectAgent triggers Tier-2 [最终预算警告 — 预算极度紧张] when unverified mutations remain
+  let t2Step = 0;
+  let sawTier2MutationWarning = false;
+  const t2Adapter = new ScriptedAdapter(async function* (opts) {
+    t2Step += 1;
+    const userText = opts.messages
+      .filter((m) => m.role === 'user')
+      .flatMap((m) => m.content ?? [])
+      .map((b) => b.text ?? '')
+      .join('\n');
+    if (t2Step === 1) {
+      yield {
+        type: 'block-end',
+        block: { type: 'tool-call', id: 'tc-t2g-1', name: 'read_file', arguments: JSON.stringify({ path: 'a.js' }) },
+      };
+      yield { type: 'usage', usage: { inputTokens: 10_000, outputTokens: 200 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    if (t2Step === 2) {
+      yield {
+        type: 'block-end',
+        block: { type: 'tool-call', id: 'tc-t2g-2', name: 'read_file', arguments: JSON.stringify({ path: 'b.js' }) },
+      };
+      yield { type: 'usage', usage: { inputTokens: 10_000, outputTokens: 200 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    if (t2Step === 3) {
+      yield {
+        type: 'block-end',
+        block: {
+          type: 'tool-call',
+          id: 'tc-t2g-3',
+          name: 'write_file',
+          arguments: JSON.stringify({ path: 'c.js', content: 'export const ok = true;\n' }),
+        },
+      };
+      // Used: 20,400 + 22,200 = 42,600 out of 60,000 => remaining = 17,400 (between ~10.7k estIn and ~24.5k Tier-2 limit)
+      yield { type: 'usage', usage: { inputTokens: 22_000, outputTokens: 200 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+      return;
+    }
+    assert.match(userText, /\[最终预算警告 — 预算极度紧张\]/);
+    sawTier2MutationWarning = true;
+    yield { type: 'text-delta', text: 'Completed within final budget warning.' };
+    yield { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 100 } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  });
+
+  const store2 = new Store(join(dataDir, 'engine-t2.sqlite'));
+  const pool2 = new AccountPool(store2, { root: dataDir });
+  pool2.setDefaultModel('glue-r4-model');
+  const directT2 = new DirectAgentRuntime(store2, pool2, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter: t2Adapter,
+    enableHeartbeat: false,
+  });
+  try {
+    const s2 = directT2.createSession({
+      workspaceRoot: workDir,
+      permissionMode: 'full-access',
+      budget: { maxSteps: 8, maxTotalTokens: 60_000, maxOutputTokens: 2048 },
+    });
+    const t2 = directT2.startTurn(s2.id, {
+      input: 'Update c.js cleanly',
+      model: 'glue-r4-model',
+      maxSteps: 8,
+    });
+    const t2Done = await directT2.waitForTurnTerminal(t2.turn.id, { timeoutMs: 8000 });
+    assert.equal(t2Done.state, 'completed');
+    assert.equal(sawTier2MutationWarning, true);
+
+    const t2DoneEv = store2.db
+      .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed' ORDER BY seq DESC LIMIT 1")
+      .get(t2.turn.id);
+    const t2DoneData = JSON.parse(t2DoneEv.data);
+    assert.equal(t2DoneData.reasoningMetrics?.budgetReserveAdvised, true);
+    assert.equal(t2DoneData.reasoningMetrics?.budgetFinalCallAdvised, true);
+  } finally {
+    await directT2.close();
+    store2.close();
+  }
 });

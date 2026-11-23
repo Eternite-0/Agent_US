@@ -320,6 +320,7 @@ export class AgentLoop {
     let stopContinuedOnce = false;
     let verificationReserveAdvised = false;
     let budgetReserveAdvised = false;
+    let budgetFinalCallAdvised = false;
     let finalStepAdvised = false;
     let repairedOnce = false;
     let repairRound = 0;
@@ -400,19 +401,72 @@ export class AgentLoop {
         const remainingTokens =
           maxTotalTokens !== null ? maxTotalTokens - (tm.totalIn + tm.totalOut) : null;
         const remainingDurationMs = deadlineAt !== null ? deadlineAt - Date.now() : null;
+        const currentStepEstimatedIn =
+          maxTotalTokens !== null
+            ? estimateRequestInputTokens({
+                provider,
+                model,
+                sessionKey: sessionId,
+                effort,
+                messages,
+                tools: getModelTools ? getModelTools() : tools,
+              })
+            : 0;
+        const estTurnCost = Math.max(4000, currentStepEstimatedIn + 1500);
+        const approxTurnsLeft =
+          remainingTokens !== null ? Math.max(0, Math.floor(remainingTokens / estTurnCost)) : null;
+        const hasUnverifiedMutations = reasoningTracker.hasUnverifiedMutationsAfterLastPass;
+
         if (
-          !budgetReserveAdvised &&
-          !advisedReserveThisStep &&
+          !budgetFinalCallAdvised &&
+          maxTotalTokens !== null &&
+          remainingTokens !== null &&
           steps >= 4 &&
-          ((tokenReserveThreshold !== null && remainingTokens <= tokenReserveThreshold) ||
+          !advisedReserveThisStep &&
+          remainingTokens > currentStepEstimatedIn &&
+          remainingTokens <= Math.floor(currentStepEstimatedIn * 2.15) + 1500
+        ) {
+          budgetFinalCallAdvised = true;
+          budgetReserveAdvised = true;
+          advisedReserveThisStep = true;
+          reasoningTracker.markBudgetReserveAdvised();
+          reasoningTracker.markBudgetFinalCallAdvised();
+          const finalCallWarningText = !hasUnverifiedMutations
+            ? execution?.evidenceContract
+              ? `[最终预算警告 — 仅剩最后 1 次模型调用] 剩余累计预算（约 ${remainingTokens} tokens）扣除本次上下文（约 ${currentStepEstimatedIn} tokens）后已不足以发起下一轮调用。你已完成修改且无未验证变更，严禁再调用任何工具（否则下步必将触发 TOKEN_BUDGET 失败）！请立即直接输出简洁结论与完整的 Evidence Manifest v1.0.0 JSON。`
+              : `[最终预算警告 — 仅剩最后 1 次模型调用] 剩余累计预算（约 ${remainingTokens} tokens）扣除本次上下文（约 ${currentStepEstimatedIn} tokens）后已不足以发起下一轮调用。你已完成修改且无未验证变更，严禁再调用任何工具（否则下步必将触发 TOKEN_BUDGET 失败）！请立即直接输出最终交付总结。`
+            : execution?.evidenceContract
+              ? `[最终预算警告 — 预算极度紧张] 剩余累计预算（约 ${remainingTokens} tokens）相对于当前单次上下文（约 ${currentStepEstimatedIn} tokens）仅够 1~2 次调用。请立即停止编辑与探索，若尚未运行必需测试请立即仅执行 1 次测试（或若余量不足以再调用则直接基于已有真实回执输出最终总结与 Evidence Manifest v1.0.0 JSON），切勿拆分多余步骤触发 TOKEN_BUDGET。`
+              : `[最终预算警告 — 预算极度紧张] 剩余累计预算（约 ${remainingTokens} tokens）相对于当前单次上下文（约 ${currentStepEstimatedIn} tokens）仅够 1~2 次调用。请立即停止编辑与探索，仅在必要时运行 1 次关键验证后立即输出最终交付总结，切勿拆分多余步骤触发 TOKEN_BUDGET。`;
+          messages.push({
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: finalCallWarningText,
+              },
+            ],
+          });
+        }
+
+        if (
+          !advisedReserveThisStep &&
+          !budgetReserveAdvised &&
+          steps >= 4 &&
+          ((tokenReserveThreshold !== null &&
+            remainingTokens <= Math.max(tokenReserveThreshold, Math.ceil(currentStepEstimatedIn * 3.0))) ||
             (remainingDurationMs !== null && remainingDurationMs <= 35000))
         ) {
           budgetReserveAdvised = true;
+          advisedReserveThisStep = true;
           reasoningTracker.markBudgetReserveAdvised();
-          const hasUnverifiedMutations = reasoningTracker.hasUnverifiedMutationsAfterLastPass;
+          const turnsNote =
+            remainingTokens !== null
+              ? `按每次调用重放当前约 ${currentStepEstimatedIn} tokens 上下文计，累计预算仅剩约 ${Math.max(1, approxTurnsLeft ?? 1)} 次模型调用`
+              : `剩余时间约 ${Math.max(0, Math.round((remainingDurationMs ?? 0) / 1000))}s`;
           const budgetWrapUpText = execution?.evidenceContract
-            ? `[预算收尾提醒] 当前预算余量已低于安全阈值（剩余约 ${remainingTokens ?? '未知'} tokens / ${remainingDurationMs !== null ? `${Math.max(0, Math.round(remainingDurationMs / 1000))}s` : '无时间限制'}）。请立即停止探索性读取（read_file/grep/glob），严禁调用额外的 update_plan、辅助探测命令或未授权脚本，${hasUnverifiedMutations ? '仅运行一次必需测试验证已修改文件后' : '切勿再执行多余 bash 或工具调用，'}立即输出简洁总结与完整的 Evidence Manifest v1.0.0 JSON。`
-            : `[预算收尾提醒] 当前 Token 或时间预算余量已低于安全阈值。请立即停止探索性读取，严禁调用额外的 update_plan、额外 bash 探测或未授权辅助脚本，${hasUnverifiedMutations ? '仅在必要时运行一次关键验证后' : ''}立即输出简洁的最终交付总结，切勿耗尽预算。`;
+            ? `[预算收尾提醒] 当前剩余预算约 ${remainingTokens ?? '未知'} tokens（${turnsNote}） / ${remainingDurationMs !== null ? `${Math.max(0, Math.round(remainingDurationMs / 1000))}s` : '无时间限制'}。请立即停止探索性读取（read_file/grep/glob），严禁将修改拆成多步、调用额外的 update_plan、辅助探测命令或未授权脚本；${hasUnverifiedMutations ? '请立即将剩余最小修改合并并仅运行至多 1 次必需测试验证后，' : '你当前无未验证变更，请勿再执行多余工具调用，直接'}立即输出简洁总结与完整的 Evidence Manifest v1.0.0 JSON。`
+            : `[预算收尾提醒] 当前剩余预算约 ${remainingTokens ?? '未知'} tokens（${turnsNote}）。请立即停止探索性读取，严禁将修改拆成多步、调用额外的 update_plan、额外 bash 探测或未授权辅助脚本；${hasUnverifiedMutations ? '仅在必要时运行至多 1 次关键验证后' : ''}立即输出简洁的最终交付总结，切勿耗尽预算。`;
           messages.push({
             role: 'user',
             content: [
@@ -512,9 +566,9 @@ export class AgentLoop {
           let emergency = null;
           try {
             emergency = await compactTwoStage(requestOptions, {
-              contextWindow: Math.max(4096, Math.floor(budgetRemaining * 0.85)),
-              reserveTokens: 512,
-              keepRecentTokens: Math.max(1024, Math.floor(budgetRemaining * 0.45)),
+              contextWindow: Math.max(2048, Math.floor(budgetRemaining * 0.78)),
+              reserveTokens: 384,
+              keepRecentTokens: Math.max(768, Math.floor(budgetRemaining * 0.35)),
               summarize: null,
             });
           } catch {
@@ -534,6 +588,7 @@ export class AgentLoop {
             requestOptions = { ...requestOptions, messages };
           }
           estimatedInputTokens = nextEstimated;
+          reasoningTracker.recordBudgetPrune();
           this.eventRouter.emitPersisted({
             sessionId,
             turnId,

@@ -983,7 +983,7 @@ test('AgentLoop steers varied POLICY_BLOCK_LOOP without fatal break, injects tok
           return;
         }
         if (policyStep === 4) {
-          // Steps >= 4 and remaining tokens (40k - 21k = 19k <= 24k) injects [预算收尾提醒]
+          // Steps >= 4 and remaining tokens (50k - 21k = 29k <= 38k, > 2.15 * 11.2k + 1.5k) injects Tier 1 [预算收尾提醒]
           assert.match(userText, /\[预算收尾提醒\]/);
           sawTokenWrapUp = true;
           yield {
@@ -1016,7 +1016,7 @@ test('AgentLoop steers varied POLICY_BLOCK_LOOP without fatal break, injects tok
     workspaceRoot: workDir,
     permissionMode: 'auto-safe',
     requestApproval: async () => ({ allowed: false }),
-    budget: { maxSteps: 10, maxTokens: 40_000 },
+    budget: { maxSteps: 10, maxTokens: 50_000 },
     messages: [
       { role: 'system', content: [{ type: 'text', text: staticSysPrompt }] },
       { role: 'user', content: [{ type: 'text', text: 'Inspect calc.js safely' }] },
@@ -1133,15 +1133,25 @@ test('AgentLoop triggers early ~26%/38k budget wrap-up with telemetry, saves nea
   writeFileSync(join(workDir, 'large.js'), `${largeSource}\n`, 'utf8');
   writeFileSync(join(workDir, 'side.js'), `${largeSource}\n`, 'utf8');
 
-  // Direct tracker unit check for markBudgetReserveAdvised + getState/getMetrics exposure
+  // Direct tracker unit check for budget telemetry + getState/getMetrics exposure
   const tracker = new ExecutionReasoningTracker({ workspaceRoot: workDir });
   assert.equal(tracker.getState().budgetReserveAdvised, false);
+  assert.equal(tracker.getState().budgetFinalCallAdvised, false);
+  assert.equal(tracker.getState().budgetPruneCount, 0);
   assert.equal(tracker.getMetrics().budgetReserveAdvised, false);
+  assert.equal(tracker.getMetrics().budgetFinalCallAdvised, false);
+  assert.equal(tracker.getMetrics().budgetPruneCount, 0);
   tracker.markBudgetReserveAdvised();
+  tracker.markBudgetFinalCallAdvised();
+  tracker.recordBudgetPrune();
   assert.equal(tracker.getState().budgetReserveAdvised, true);
+  assert.equal(tracker.getState().budgetFinalCallAdvised, true);
+  assert.equal(tracker.getState().budgetPruneCount, 1);
   assert.equal(tracker.getMetrics().budgetReserveAdvised, true);
+  assert.equal(tracker.getMetrics().budgetFinalCallAdvised, true);
+  assert.equal(tracker.getMetrics().budgetPruneCount, 1);
 
-  // 1. Early ~26%/38k wrap-up warning + emergency Stage-1 budget_prune saves turn from spurious TOKEN_BUDGET
+  // 1. Turn-aware Tier-1 wrap-up warning (approxTurnsLeft + context cost) + emergency Stage-1 budget_prune saves turn
   const staticSysPrompt = 'STATIC_SYS_PROMPT_ROUND4';
   let stepCall = 0;
   let sawEarlyReserve = false;
@@ -1184,13 +1194,15 @@ test('AgentLoop triggers early ~26%/38k budget wrap-up with telemetry, saves nea
             type: 'block-end',
             block: { type: 'tool-call', id: 'tc-r4-3', name: 'read_file', arguments: JSON.stringify({ path: 'large.js' }) },
           };
-          // Total used after step 3: 118,400 + 800 = 119,200 => remaining = 40,800 <= 41,600 (26% of 160k!)
-          yield { type: 'usage', usage: { inputTokens: 38_400, outputTokens: 400 } };
+          // Total used after step 3: 80,400 + 26,800 = 107,200 => remaining = 52,800 (> ~43k Tier-2, <= ~58k Tier-1!)
+          yield { type: 'usage', usage: { inputTokens: 26_400, outputTokens: 400 } };
           yield { type: 'finish', reason: { kind: 'tool-calls' } };
           return;
         }
         if (stepCall === 4) {
           assert.match(userText, /\[预算收尾提醒\]/);
+          assert.match(userText, /次模型调用/);
+          assert.match(userText, /上下文计/);
           assert.match(userText, /update_plan/);
           sawEarlyReserve = true;
           // Burn another chunk so remaining drops to ~18,000 (< 10.9k tools + ~13k accumulated message tokens!)
@@ -1198,7 +1210,7 @@ test('AgentLoop triggers early ~26%/38k budget wrap-up with telemetry, saves nea
             type: 'block-end',
             block: { type: 'tool-call', id: 'tc-r4-4', name: 'read_file', arguments: JSON.stringify({ path: 'large.js' }) },
           };
-          yield { type: 'usage', usage: { inputTokens: 22_500, outputTokens: 300 } };
+          yield { type: 'usage', usage: { inputTokens: 34_500, outputTokens: 300 } };
           yield { type: 'finish', reason: { kind: 'tool-calls' } };
           return;
         }
@@ -1239,6 +1251,7 @@ test('AgentLoop triggers early ~26%/38k budget wrap-up with telemetry, saves nea
   assert.equal(res.status, 'completed');
   assert.equal(sawEarlyReserve, true);
   assert.equal(res.reasoningMetrics.budgetReserveAdvised, true);
+  assert.equal(res.reasoningMetrics.budgetPruneCount, 1);
   assert.ok(
     emittedEvents.some((e) => e.type === 'context/compacted' && e.data?.stage === 'budget_prune'),
     'expected context/compacted event with stage=budget_prune',
@@ -1246,7 +1259,67 @@ test('AgentLoop triggers early ~26%/38k budget wrap-up with telemetry, saves nea
   assert.ok(observedMessagesAtPrunedStep && pairClosed(observedMessagesAtPrunedStep, 1, observedMessagesAtPrunedStep.length - 1), 'emergency budget prune must preserve pairClosed');
   assert.ok(observedMaxTokensAtPrunedStep > 0 && observedMaxTokensAtPrunedStep <= 18_000, 'maxTokens must remain strictly clamped within remaining maxTotalTokens');
 
-  // 2. Genuine budget exhaustion (remaining <= 2000 or unshrinkable prompt) still throws BudgetError('TOKEN_BUDGET')
+  // 2. Tier-2 [最终预算警告] fires when remainingTokens <= currentStepEstimatedIn * 2.15 + 1500 without mutating tools/system
+  const baseTools = createWorkspaceTools({ workspaceRoot: workDir, store, permissionMode: 'full-access' });
+  const expectedToolNames = baseTools.map((tool) => tool.name);
+  let tier2Step = 0;
+  let sawTier2Warning = false;
+  const tier2Kernel = new AgentRuntimeKernel({
+    store,
+    adapter: {
+      async *stream({ messages, tools: sentTools }) {
+        tier2Step += 1;
+        assert.equal(messages[0]?.content?.[0]?.text, staticSysPrompt);
+        assert.deepEqual(sentTools.map((tool) => tool.name), expectedToolNames);
+        const userText = messages
+          .filter((m) => m.role === 'user')
+          .flatMap((m) => m.content ?? [])
+          .map((b) => b.text ?? '')
+          .join('\n');
+        if (tier2Step <= 3) {
+          yield {
+            type: 'block-end',
+            block: { type: 'tool-call', id: `tc-t2-${tier2Step}`, name: 'glob', arguments: JSON.stringify({ pattern: '*.js' }) },
+          };
+          yield { type: 'usage', usage: { inputTokens: 9_000, outputTokens: 300 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+        // After 3 steps: used 27,900 out of 50,000 => remaining = 22,100 (<= 2.15 * ~11.2k + 1500 = ~25.5k, > 11.2k!)
+        assert.match(userText, /\[最终预算警告 — 仅剩最后 1 次模型调用\]/);
+        assert.match(userText, /严禁再调用任何工具/);
+        sawTier2Warning = true;
+        yield { type: 'text-delta', text: 'Stopped immediately with final summary.' };
+        yield { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 100 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    },
+    toolDispatcher: new ToolDispatcher({}),
+  });
+  t.after(() => tier2Kernel.close());
+
+  const tier2Res = await tier2Kernel.executeTurn({
+    sessionId: 'sess-r5-tier2',
+    turnId: 'turn-r5-tier2',
+    profile: { id: 'default', defaultMaxSteps: 8, streamDeltas: false, emitAssistantMessage: false, emitToolEvents: false, persistTurn: false },
+    input: 'Check files safely',
+    model: 'mock',
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    budget: { maxSteps: 8, maxTokens: 50_000, maxOutputTokens: 4096 },
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: staticSysPrompt }] },
+      { role: 'user', content: [{ type: 'text', text: 'Check files safely' }] },
+    ],
+    tools: baseTools,
+  });
+  assert.equal(tier2Res.status, 'completed');
+  assert.equal(sawTier2Warning, true);
+  assert.equal(tier2Res.reasoningMetrics.budgetReserveAdvised, true);
+  assert.equal(tier2Res.reasoningMetrics.budgetFinalCallAdvised, true);
+  assert.equal(tier2Res.reasoningMetrics.budgetPruneCount, 0);
+
+  // 3. Genuine budget exhaustion (remaining <= 2000 or unshrinkable prompt) still throws BudgetError('TOKEN_BUDGET')
   const exhaustedKernel = new AgentRuntimeKernel({
     store,
     adapter: {
