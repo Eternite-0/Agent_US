@@ -37,7 +37,6 @@ import { ActivityBlock, ApprovalGateCard } from './ActivityBlock';
 import { AgentCompanionCard } from './AgentCompanionCard';
 import { SubagentProgress } from './SubagentProgress';
 import { Composer } from './Composer';
-import { EvidenceBadge } from './EvidenceBadge';
 import { FileChangeCard } from './FileChangeCard';
 import { ReconciliationCard } from './ReconciliationCard';
 import {
@@ -61,6 +60,7 @@ import {
   IconReset,
   IconRightPanelToggle,
   IconSearch,
+  IconShieldAlert,
 } from './Icons';
 import {
   ImageLightbox,
@@ -1264,6 +1264,12 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
               const runsById = new Map(swarmRuns.map((run) => [run.id, run]));
               const linkedRuns = new Set(directExchanges.map((exchange) => exchange.swarmRunId));
               const goalRun = swarmRuns.find((run) => !linkedRuns.has(run.id));
+              // Successful verification belongs in the receipts/Reviewer, not in the transcript footer.
+              const verificationNotice = task.verdict?.verdict === 'block_reconciliation'
+                ? '待人工核对'
+                : task.verdict?.accepted === false && !(task.status === 'failed' && task.verdict.reason)
+                  ? '验证未通过'
+                  : undefined;
               return (
                 <React.Fragment key={tid}>
                   {showDateSep && <div className="codex-date-sep">{dateLabel}</div>}
@@ -1410,7 +1416,11 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       </div>
                     )}
                     <div className="a2a-direct-actions">
-                      {!isLive && <EvidenceBadge verdict={task.verdict} evidenceCount={task.evidenceCount} />}
+                      {!isLive && verificationNotice && (
+                        <span className="codex-verification-notice" title={task.verdict?.reason}>
+                          <IconShieldAlert size={13} aria-hidden="true" />{verificationNotice}
+                        </span>
+                      )}
                       {progress}
                       {!isLive && (onRewindSession || onCompactSession) && (
                         <div className="codex-turn-menu-wrap" ref={openTurnMenuId === tid ? turnMenuRef : undefined}

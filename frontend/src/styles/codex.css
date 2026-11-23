@@ -4894,6 +4894,13 @@ button:focus-visible {
 .subagent-empty { margin: 8px 10px; }
 .direct-turn-options { min-width: 132px; inset-inline-start: 0; }
 .a2a-direct-actions:empty { display: none; }
+.codex-verification-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--text-small);
+  color: var(--color-warning);
+}
 
 /* Composer adapts to the thread width, including split Inspector view. */
 

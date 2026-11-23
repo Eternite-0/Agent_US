@@ -1,18 +1,18 @@
 # Native workspace visual spec
 
-The transcript is the content surface. Assistant prose, the work log, and file changes do not each get a panel. User messages have right alignment and a short end rule instead of a bubble. The title bar, sidebar, and inspector are desktop chrome, separated from the transcript with single rules. The composer is a normal layout row below the scroller, not an overlay.
+The transcript is the content surface. Assistant prose, the work log, and file changes do not each get a panel. User messages are right-aligned on a faint, small-radius background, without a border or shadow. The title bar, sidebar, and inspector are desktop chrome, separated from the transcript with single rules. The composer is a normal layout row below the scroller, not an overlay.
 
 | Element | Treatment |
 | --- | --- |
-| Transcript | `--thread-content-max-width` (704 px); 15 px assistant body with 1.68 line-height; adaptive gutters |
-| Activity | 28 px minimum rows, 14 px icons, secondary text, monospace commands and paths; hover/focus only; warning/error carry color |
+| Transcript | `--thread-content-max-width` (720 px); 14 px default assistant body with 1.65 line-height; adaptive gutters |
+| Activity | 26 px minimum rows, 14 px icons, secondary text, monospace commands and paths; the disclosure marker stays beside its label; warning/error carry color |
 | Command / code | 5 px inset; no exterior border/shadow; output scrolls independently and chains vertical scrolling to the transcript at its bounds |
-| File changes | Flat list with a single divider at each boundary; file names open Inspector; a separate disclosure opens the inline diff |
+| File changes | Flat list shown below the final response only after successful delivery; file names open Inspector; a separate disclosure opens the inline diff |
 | Inputs | 8 px control / 10 px composer radius; borders imply editing, not elevation |
 | Overlays | 8 px popover / 10 px dialog radius; only true overlays use `--shadow-popover` or `--shadow-dialog` |
 | Motion | 150 ms opacity transition on detail reveal; progress uses a quiet opacity pulse; reduced-motion disables both |
 
-Use the semantic colors in `src/styles/tokens.css` so equivalent surfaces look consistent in light, dark, and customized themes. Shared work-log and file-list styles belong to `src/components/activity-presentation.css`; workspace layout to `src/styles/codex.css`; keyframes to `src/styles/animations.css`. Keep presentation separate from stable operation IDs and disclosure state.
+Use the semantic colors in `src/styles/tokens.css` so equivalent surfaces look consistent in light, dark, and customized themes. Shared work-log and file-list styles belong to `src/components/activity-presentation.css`; workspace layout to `src/styles/codex.css`; keyframes to `src/styles/animations.css`. Keep presentation separate from stable operation IDs and disclosure state. Successful verification stays in receipts or Reviewer, not in a transcript badge; only actionable failures or reconciliation need an inline notice.
 
 ## References reviewed
 

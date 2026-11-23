@@ -31,10 +31,8 @@ summary:is(.codex-direct-activity-row, .codex-direct-tool-row):focus-visible { o
 }
 
 .codex-tool-target { font: 400 .96em var(--font-mono); }
-.codex-tool-time { margin-inline-start: auto; flex: none; font-size: var(--text-caption); color: var(--text-tertiary); }
+.codex-tool-time { flex: none; font-size: var(--text-caption); color: var(--text-tertiary); }
 .codex-direct-chevron { flex: none; color: var(--text-tertiary); transition: transform var(--duration-basic) var(--ease-out); }
-.codex-direct-tool-row > .codex-direct-chevron { margin-inline-start: auto; }
-.codex-tool-time + .codex-direct-chevron { margin-inline-start: 0; }
 :is(.codex-direct-activity, .codex-direct-tool)[open] > summary > .codex-direct-chevron,
 .codex-file-row-trigger[aria-expanded='true'] .codex-direct-chevron { transform: rotate(90deg); }
 .codex-file-more-btn[aria-expanded='true'] .codex-direct-chevron { transform: rotate(180deg); }

@@ -73,6 +73,7 @@ test('an open real terminal command stays mounted through the next command and f
   await expect(second.locator('pre')).toContainText('RUNTIME-SECOND-OUTPUT');
   await expectClearTail(page, exchange);
   await expect(rows.getByText('工具输出', { exact: true })).toHaveCount(0);
+  await expect(transcript(page).getByText(/^(已验证|已通过验证)/)).toHaveCount(0);
   const firstOutput = first.locator('pre[aria-label="工具输出"]');
   await expect(firstOutput).toBeVisible();
   await screenshot(page, 'runtime-two-real-commands');

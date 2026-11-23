@@ -36,6 +36,7 @@ const cache = { promptCache: { windowHours: 24, global: {
 } } };
 const sessions = {
   'direct-visual': { title: 'Session refresh', prompt: 'Check how the app handles an expired session and run the auth tests.', state: 'completed' },
+  'unverified-visual': { title: 'Unverified result', prompt: 'Verify the workspace changes.', state: 'completed' },
   'tools-visual': { title: 'Auth workspace changes', prompt: 'Trace the expired-session path, make the smallest fix, and run the focused tests.', state: 'completed' },
   'markdown-visual': { title: 'Workspace audit', prompt: 'Review the configuration, include the diff and notes', state: 'completed' },
   'approval-visual': { title: 'Pending verification approval', prompt: 'Verify the migration using the test runner', state: 'running' },
@@ -52,7 +53,10 @@ async function attachVisualFixtures(page) {
     if (data) {
       const turnId = `${id}-turn`;
       if (!kind) value = { id, title: data.title, state: data.state, createdAt: FIXED_TIME, updatedAt: FIXED_TIME + 2000, model: 'fixture-model' };
-      if (kind === 'turns') value = { items: [{ id: turnId, input: data.prompt, state: data.state, createdAt: FIXED_TIME, durationMs: 1900 }] };
+      if (kind === 'turns') value = { items: [{ id: turnId, input: data.prompt, state: data.state, createdAt: FIXED_TIME, durationMs: 1900,
+        ...(id === 'tools-visual' ? { verdict: { accepted: true, reasons: ['Checks passed.'] }, evidenceCount: 2 } : {}),
+        ...(id === 'unverified-visual' ? { verdict: { accepted: false, reasons: ['Some checks failed.'] } } : {}),
+      }] };
       if (kind === 'messages') {
         const command = id === 'swarm-visual';
         const rows = [{ seq: 1, ...(command ? { meta: { swarmAction: 'start', runId: swarm.id } } : { turnId }), role: 'user', content: data.prompt }];
@@ -65,6 +69,7 @@ async function attachVisualFixtures(page) {
           }
           rows.push({ seq: ++seq, turnId, role: 'assistant', content: 'The app now refreshes the session before retrying a request. If refresh fails, it returns to sign-in without leaving a stale token behind.\n\nThe focused authentication suite passed.' });
         }
+        if (id === 'unverified-visual') rows.push({ seq: 2, turnId, role: 'assistant', content: 'Some changes require another review.' });
         if (id === 'markdown-visual') rows.push({ seq: 2, turnId, role: 'assistant', content: markdown });
         value = { items: rows };
       }
@@ -141,6 +146,7 @@ test('Direct prose and five operations with short and long terminal output', asy
     await capture(page, info, 'direct');
     await navigate(page, '/t/tools-visual');
     await openActivity(page);
+    if (!process.env.E2E_FRONTEND_DIR) await expect(transcript(page).getByText(/^(已验证|已通过验证)/)).toHaveCount(0);
     await capture(page, info, 'five-operations');
     const short = page.locator('details.codex-direct-tool').filter({ hasText: 'git status --short' });
     await short.locator(':scope > summary').click();
@@ -210,6 +216,10 @@ test('approval and Swarm execution with Reviewer evidence', async ({ page }, inf
     await navigate(page, '/t/approval-visual');
     await expect(transcript(page).locator('.codex-approval-card')).toBeVisible();
     await capture(page, info, 'pending-approval');
+    if (!process.env.E2E_FRONTEND_DIR) {
+      await navigate(page, '/t/unverified-visual');
+      await expect(transcript(page).getByText('验证未通过', { exact: true })).toBeVisible();
+    }
     await navigate(page, '/t/swarm-visual');
     const card = page.locator('.swarm-thread-card');
     await expect(card).toBeVisible();

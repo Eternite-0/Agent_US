@@ -138,6 +138,7 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
   const isShell = kind === 'command' || kind === 'test';
   const outputLabel = output === undefined && liveOutput !== undefined ? '实时工具输出' : '工具输出';
   const showHeader = !isShell || Boolean(meta);
+  const elapsed = durationMs === undefined ? undefined : fmtDuration(durationMs) || '0秒';
   const summary = target.replace(/\s+/g, ' ');
   const useMono = isShell || ['read', 'edit', 'search'].includes(kind);
   return (
@@ -148,8 +149,8 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
       }}>
         <Icon size={14} aria-hidden="true" />
         <span className="codex-direct-activity-label">{toolActionLabel(kind, status)} {useMono ? <code className="codex-tool-target">{summary}</code> : summary}</span>
-        {durationMs !== undefined && <small className="codex-tool-time tabular-nums">{fmtDuration(durationMs) || '0秒'}</small>}
         <IconChevronRight className="codex-direct-chevron" size={13} aria-hidden="true" />
+        {!open && elapsed && <small className="codex-tool-time tabular-nums">{elapsed}</small>}
       </summary>
       <div id={panelId} hidden={!open} className="codex-direct-tool-detail">
         <div className={command !== undefined || displayOutput ? 'codex-terminal-inset' : undefined}>
@@ -170,7 +171,7 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
           <div className="codex-command-footer" data-failed={status === 'failed' || undefined}>
             {status === 'completed' && <IconCheck size={12} aria-hidden="true" />}
             <ActivityStatusText status={status} />
-            {durationMs !== undefined && <span className="tabular-nums">· {fmtDuration(durationMs) || '0秒'}</span>}
+            {elapsed && <span className="tabular-nums">· {elapsed}</span>}
             {isShell && exitCode !== undefined && <span className="tabular-nums">· exit {exitCode}</span>}
             {displayOutput && <ActivityCopyButton label="复制输出" text={displayOutput} onCopy={onCopy} />}
           </div>
