@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { verifyTurn } from '../verifier.js';
 import { resolveConfinedPath } from '../tools/sandbox.js';
+import { scanCommandSyntax } from '../tools/command-analyzer.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
 import { buildPlainTextPassVerdict } from '../kernel/verdict.js';
 import { classifyJobOwnership } from '../durable/lease-guard.js';
@@ -9,6 +10,49 @@ import { listWorkspaceChangedFiles } from '../evaluation/fixtures.js';
 
 const PASS_CLAIM_RE =
   /(?:全部|所有|tests?|suites?|checks?|build|lint|typecheck|npm run check).*?(?:pass(?:ed|es)?|通过|成功|0\s*(?:fail(?:ure)?s?|errors?))|(?:验证通过|测试通过|构建成功|编译通过|0\s*(?:failures|errors))/i;
+
+// Recognize common synchronous validation commands, not arbitrary successful
+// shell commands. Compound commands cannot supply evidence for an earlier check.
+function isVerificationCommand(command) {
+  if (typeof command !== 'string') return false;
+  const { tokens, hasCompound, hasSubstitution } = scanCommandSyntax(command);
+  if (hasCompound || hasSubstitution) return false;
+  const [program, sub, target] = tokens;
+  const bin = program?.replace(/\.exe$/i, '')?.toLowerCase();
+  const verificationScript = /^(?:tests?|checks?|lint|build|typecheck)(?::[a-z0-9:_-]+)?$/i;
+  if (bin === 'npm' || bin === 'pnpm' || bin === 'yarn' || bin === 'bun') {
+    return sub === 'run' ? verificationScript.test(target ?? '') : verificationScript.test(sub ?? '');
+  }
+  if (bin === 'node') return sub === '--test' || sub === '--check';
+  if (bin === 'cargo') return ['test', 'check', 'clippy', 'build'].includes(sub);
+  if (bin === 'go') return ['test', 'vet', 'build'].includes(sub);
+  if (bin === 'python' || bin === 'python3') return sub === '-m' && ['pytest', 'unittest'].includes(target);
+  return ['pytest', 'vitest', 'jest', 'tsc', 'eslint'].includes(bin);
+}
+
+function findUnresolvedVerification(receipts, events, workspaceRoot) {
+  const resultsByReceipt = new Map();
+  for (const ev of events) {
+    const { receipt, effectiveArgs } = ev.data ?? {};
+    if (ev.type === 'tool/result' && receipt?.id && effectiveArgs) {
+      resultsByReceipt.set(receipt.id, effectiveArgs);
+    }
+  }
+  const latestByCommand = new Map();
+  for (const receipt of receipts) {
+    if (receipt.toolName !== 'bash') continue;
+    const args = resultsByReceipt.get(receipt.id);
+    if (!isVerificationCommand(args?.command)) continue;
+    let cwd = args.cwd || '.';
+    if (workspaceRoot) {
+      try { cwd = resolveConfinedPath(workspaceRoot, cwd).rel; } catch { /* keep raw cwd */ }
+    }
+    const key = JSON.stringify([receipt.sessionId, cwd, args.command.trim()]);
+    // Rejections are unsuccessful attempts; they must not turn a failing check green.
+    latestByCommand.set(key, receipt);
+  }
+  return [...latestByCommand.values()].findLast((r) => r.status !== 'finished' || r.exitCode !== 0);
+}
 
 const DELETE_SEGMENT_RE =
   /^\s*(?:sudo\s+|cmd(?:\.exe)?\s+\/[cq]\s+|powershell(?:\.exe)?\s+(?:-\w+\s+)*)?(?:rm|rmdir|unlink|del|erase|remove-item|ri|git\s+rm)\b/i;
@@ -173,13 +217,13 @@ export class EvidenceVerifier {
         const tPh = allTurnIds.map(() => '?').join(',');
         turnReceipts = this.store.db
           .prepare(
-            `SELECT * FROM tool_receipts WHERE sessionId IN (${sPh}) AND turnId IN (${tPh}) ORDER BY createdAt ASC`,
+            `SELECT * FROM tool_receipts WHERE sessionId IN (${sPh}) AND turnId IN (${tPh}) ORDER BY createdAt ASC, rowid ASC`,
           )
           .all(...allSessionIds, ...allTurnIds);
       } else {
         turnReceipts = this.store.db
           .prepare(
-            `SELECT * FROM tool_receipts WHERE sessionId IN (${sPh}) ORDER BY createdAt ASC`,
+            `SELECT * FROM tool_receipts WHERE sessionId IN (${sPh}) ORDER BY createdAt ASC, rowid ASC`,
           )
           .all(...allSessionIds);
       }
@@ -204,10 +248,17 @@ export class EvidenceVerifier {
       (!latestShell || latestShell.status === 'failed' || (latestShell.exitCode ?? 0) !== 0);
     checks.failedShellReceipts = failedShells.length;
 
-    if (PASS_CLAIM_RE.test(String(text || '')) && unresolvedShellFailure) {
-      reasons.push(
-        `FABRICATED_PASS_CLAIM: 最近命令执行失败 (exitCode=${latestShell?.exitCode ?? 'non-zero'})，不得声称验证或构建通过`,
-      );
+    const unresolvedCheck = findUnresolvedVerification(shellReceipts, events, workspaceRoot);
+    if (PASS_CLAIM_RE.test(String(text || '')) && (unresolvedCheck || unresolvedShellFailure)) {
+      if (unresolvedCheck) {
+        reasons.push(
+          `FABRICATED_PASS_CLAIM: 验证命令未成功 (callId=${unresolvedCheck.callId}, exitCode=${unresolvedCheck.exitCode ?? 'unknown'})。请修复后在同一目录重跑原验证命令，或如实报告未通过。`,
+        );
+      } else {
+        reasons.push(
+          `FABRICATED_PASS_CLAIM: 最近命令执行失败 (exitCode=${latestShell?.exitCode ?? 'non-zero'})，不得声称验证或构建通过`,
+        );
+      }
     }
 
     const contract = execution?.evidenceContract ?? node?.evidenceContract ?? null;

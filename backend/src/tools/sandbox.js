@@ -297,6 +297,7 @@ export class HostSandboxAdapter {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        signal?.removeEventListener('abort', onAbort);
         killProcessTree(child);
         resolveRun({
           exitCode: 124,
@@ -338,7 +339,7 @@ export class HostSandboxAdapter {
         clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
         resolveRun({
-          exitCode: code ?? 0,
+          exitCode: code ?? 1,
           stdout,
           stderr,
           timedOut: false,
