@@ -336,6 +336,15 @@ async function main() {
   const childExecArgv = Array.isArray(manifest.childExecArgv) ? manifest.childExecArgv : [];
   const extraEnvKeys = Array.isArray(manifest.extraEnvKeys) ? manifest.extraEnvKeys : [];
   const workerEnv = buildSanitizedWorkerEnv(process.env, extraEnvKeys);
+  if (typeof manifest.workerTempDir === 'string' && manifest.workerTempDir) {
+    workerEnv.HOME = manifest.workerTempDir;
+    workerEnv.USERPROFILE = manifest.workerTempDir;
+    workerEnv.TMP = manifest.workerTempDir;
+    workerEnv.TEMP = manifest.workerTempDir;
+    workerEnv.TMPDIR = manifest.workerTempDir;
+    workerEnv.APPDATA = join(manifest.workerTempDir, 'appdata');
+    workerEnv.LOCALAPPDATA = join(manifest.workerTempDir, 'localappdata');
+  }
   if (typeof manifest.workerSandboxConfigJson === 'string' && manifest.workerSandboxConfigJson) {
     workerEnv.AGENT_US_SANDBOX_CONFIG = manifest.workerSandboxConfigJson;
   }

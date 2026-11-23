@@ -51,6 +51,11 @@ import { compactTwoStage } from '../../src/context.js';
 import { ExperienceMemoryService } from '../../src/memory/service.js';
 import { ExecutionReasoningTracker } from '../../src/kernel/execution-reasoning.js';
 
+const DOCKER_AVAILABLE = new DockerBenchmarkSandbox().isAvailable();
+const TEST_SANDBOX_OPTIONS = DOCKER_AVAILABLE
+  ? { mode: SANDBOX_MODES.STRONG }
+  : { mode: SANDBOX_MODES.NODE_PERMISSION, allowProcessHardeningOnly: true };
+
 function buildTrustedContext(task, workspaceRoot, sandbox = null) {
   return {
     workspaceRoot,
@@ -75,12 +80,13 @@ function buildTrustedContext(task, workspaceRoot, sandbox = null) {
 }
 
 function listBenchmarkContainers() {
+  if (!DOCKER_AVAILABLE) return [];
   const res = spawnSync(
     'docker',
     ['ps', '-a', '--filter', 'name=agent-us-bench-', '--format', '{{.Names}}'],
     { encoding: 'utf8', windowsHide: true, timeout: 10_000, shell: false },
   );
-  if (res.status !== 0) return [];
+  if (res.error || res.status !== 0) return [];
   return String(res.stdout || '')
     .split(/\r?\n/)
     .map((s) => s.trim())
@@ -88,20 +94,27 @@ function listBenchmarkContainers() {
 }
 
 describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
-  const strongSandbox = new BenchmarkSandbox({ mode: SANDBOX_MODES.STRONG });
+  const activeSandbox = new BenchmarkSandbox(TEST_SANDBOX_OPTIONS);
 
   after(() => {
     const leftover = listBenchmarkContainers();
     assert.deepEqual(leftover, [], `Expected 0 leftover agent-us-bench-* containers, found: ${leftover.join(', ')}`);
   });
 
-  test('Docker strong OS isolation is active and BenchmarkSandbox fails closed when unavailable', () => {
+  test('Docker strong OS isolation is active (or node-permission fallback when Docker unavailable) and BenchmarkSandbox fails closed', () => {
     const dockerProbe = new DockerBenchmarkSandbox().probe();
-    assert.equal(dockerProbe.available, true, `Docker sandbox must be available: ${dockerProbe.reason}`);
-    const resolved = strongSandbox.resolveBackend();
-    assert.equal(resolved.mode, SANDBOX_MODES.DOCKER);
-    assert.equal(resolved.isolationTier, SANDBOX_TIERS.STRONG_OS_ISOLATION);
-    assert.equal(resolved.strongOsIsolation, true);
+    const resolved = activeSandbox.resolveBackend();
+    if (DOCKER_AVAILABLE) {
+      assert.equal(dockerProbe.available, true, `Docker sandbox must be available: ${dockerProbe.reason}`);
+      assert.equal(resolved.mode, SANDBOX_MODES.DOCKER);
+      assert.equal(resolved.isolationTier, SANDBOX_TIERS.STRONG_OS_ISOLATION);
+      assert.equal(resolved.strongOsIsolation, true);
+    } else {
+      assert.equal(dockerProbe.available, false);
+      assert.equal(resolved.mode, SANDBOX_MODES.NODE_PERMISSION);
+      assert.equal(resolved.isolationTier, SANDBOX_TIERS.PROCESS_HARDENING_ONLY);
+      assert.equal(resolved.strongOsIsolation, false);
+    }
 
     const unavailableSandbox = new BenchmarkSandbox({
       mode: SANDBOX_MODES.STRONG,
@@ -118,7 +131,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     assert.equal(VERSION, '1.0.0');
     assert.equal(AUTONOMOUS_REASONING_DATASET.length, 10);
 
-    const dataset = createAutonomousReasoningDataset({ sandbox: strongSandbox });
+    const dataset = createAutonomousReasoningDataset({ sandbox: activeSandbox });
     assert.deepEqual(
       dataset.map((t) => t.id),
       [
@@ -153,7 +166,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     const bareRoot = mkdtempSync(join(tmpdir(), 'agent-us-ar-mirrors-'));
     try {
       const { repoOverrides, cleanup } = await materializeAutonomousReasoningRepos(bareRoot);
-      const pinnedDataset = createAutonomousReasoningDataset({ sandbox: strongSandbox, repoOverrides });
+      const pinnedDataset = createAutonomousReasoningDataset({ sandbox: activeSandbox, repoOverrides });
       assert.equal(pinnedDataset.length, 10);
 
       await Promise.all(
@@ -172,7 +185,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
         }),
       );
 
-      const inlineDataset = createAutonomousReasoningDataset({ sandbox: strongSandbox });
+      const inlineDataset = createAutonomousReasoningDataset({ sandbox: activeSandbox });
       const inlineWs = await createFixtureWorkspace(inlineDataset[0]);
       try {
         const base = getWorkspaceBaselineCommit(inlineWs);
@@ -189,7 +202,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
   });
 
   test('all 10 reference fixes pass inside real Docker BenchmarkSandbox isolation', { concurrency: 4 }, async (t) => {
-    const dataset = createAutonomousReasoningDataset({ sandbox: strongSandbox });
+    const dataset = createAutonomousReasoningDataset({ sandbox: activeSandbox });
     await Promise.all(
       dataset.map((task) =>
         t.test(task.id, async (subT) => {
@@ -199,16 +212,22 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
           });
           applyWorkspaceFiles(ws, getAutonomousReasoningReferenceFix(task.id, ws));
           const output = buildAutonomousReasoningEvidenceOutput(task);
-          const ctx = buildTrustedContext(task, ws, strongSandbox);
+          const ctx = buildTrustedContext(task, ws, activeSandbox);
           const judgment = await task.judge({ task, output, context: ctx });
 
           assert.equal(judgment.passed, true, `${task.id} failed: ${JSON.stringify(judgment.evidence.errors)} checks=${JSON.stringify(judgment.evidence.checks)}`);
           assert.equal(judgment.score, 1);
           assert.equal(judgment.hardVetoed, false);
           assert.equal(judgment.evidence.sandboxIsolated, true);
-          assert.equal(judgment.evidence.sandboxBackend, SANDBOX_MODES.DOCKER);
-          assert.equal(judgment.evidence.strongOsIsolation, true);
-          assert.equal(judgment.evidence.isolationTier, SANDBOX_TIERS.STRONG_OS_ISOLATION);
+          if (DOCKER_AVAILABLE) {
+            assert.equal(judgment.evidence.sandboxBackend, SANDBOX_MODES.DOCKER);
+            assert.equal(judgment.evidence.strongOsIsolation, true);
+            assert.equal(judgment.evidence.isolationTier, SANDBOX_TIERS.STRONG_OS_ISOLATION);
+          } else {
+            assert.equal(judgment.evidence.sandboxBackend, SANDBOX_MODES.NODE_PERMISSION);
+            assert.equal(judgment.evidence.strongOsIsolation, false);
+            assert.equal(judgment.evidence.isolationTier, SANDBOX_TIERS.PROCESS_HARDENING_ONLY);
+          }
           assert.equal(judgment.evidence.hiddenAcceptancePassed, true);
           assert.equal(judgment.evidence.hiddenAcceptanceVerified, true);
           assert.equal(judgment.evidence.hiddenAcceptanceTamperingDetected, false);
@@ -221,7 +240,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
   });
 
   test('judges reject broken, surface-only, incomplete, and tampered fixes', { concurrency: 4 }, async (t) => {
-    const dataset = createAutonomousReasoningDataset({ sandbox: strongSandbox });
+    const dataset = createAutonomousReasoningDataset({ sandbox: activeSandbox });
     const byId = Object.fromEntries(dataset.map((item) => [item.id, item]));
 
     await Promise.all([
@@ -232,7 +251,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.hardVetoed, true);
@@ -257,7 +276,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task, ['src/pricing/checkout.js']),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.hardVetoed, true);
@@ -295,7 +314,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.evidence.hiddenAcceptancePassed, false);
@@ -312,7 +331,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task, ['test/backoff.test.js']),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.hardVetoed, true);
@@ -332,7 +351,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.hardVetoed, true);
@@ -351,7 +370,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.evidence.protectedFilesUntampered, false);
@@ -370,7 +389,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.evidence.hiddenAcceptancePassed, false);
@@ -396,7 +415,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.evidence.checks.reviewerSchemaValid, false);
@@ -414,7 +433,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       const judgment = await task.judge({
         task,
         output: buildAutonomousReasoningEvidenceOutput(task),
-        context: buildTrustedContext(task, ws, strongSandbox),
+        context: buildTrustedContext(task, ws, activeSandbox),
       });
       assert.equal(judgment.passed, false);
       assert.equal(judgment.evidence.checks.constraintsPreserved, false);
@@ -638,7 +657,11 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
 
     const outDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-cli-out-'));
     const outPath = join(outDir, 'results.jsonl');
+    const prevHardeningEnv = process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY;
     try {
+      if (!DOCKER_AVAILABLE) {
+        process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY = '1';
+      }
       const summary = await runAutonomousReasoningBenchmark({
         mode: 'deterministic',
         baseline: repoRoot,
@@ -648,10 +671,13 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
         repeats: 1,
         lane: 0,
         lanes: 1,
-        sandbox: SANDBOX_MODES.STRONG,
+        sandbox: DOCKER_AVAILABLE ? SANDBOX_MODES.STRONG : SANDBOX_MODES.NODE_PERMISSION,
       });
       assert.equal(summary.benchmarkId, AUTONOMOUS_REASONING_BENCHMARK_ID);
-      assert.equal(summary.sandboxBackend, SANDBOX_MODES.DOCKER);
+      assert.equal(
+        summary.sandboxBackend,
+        DOCKER_AVAILABLE ? SANDBOX_MODES.DOCKER : SANDBOX_MODES.NODE_PERMISSION,
+      );
       assert.equal(summary.baseline.metrics.totalTrials, 2);
       assert.equal(summary.candidate.metrics.totalTrials, 2);
       assert.equal(summary.baseline.metrics.trials.length, 2);
@@ -675,6 +701,13 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       assert.equal(ar02Candidate.firstFixSucceeded, false);
       assert.ok(ar02Candidate.tokenCost > 0, 'ar-02 candidate trial tokenCost must be > 0');
     } finally {
+      if (!DOCKER_AVAILABLE) {
+        if (prevHardeningEnv === undefined) {
+          delete process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY;
+        } else {
+          process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY = prevHardeningEnv;
+        }
+      }
       rmSync(outDir, { recursive: true, force: true });
     }
   });

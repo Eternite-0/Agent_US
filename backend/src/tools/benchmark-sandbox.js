@@ -2819,6 +2819,7 @@ export class BenchmarkSandbox {
         perTestTimeoutMs: Math.max(500, Number(timeoutMs || 30000)),
         extraEnvKeys,
         childExecArgv,
+        ...(tempForWorkerFlags ? { workerTempDir: tempForWorkerFlags } : {}),
         ...(workerSandboxConfigJson ? { workerSandboxConfigJson } : {}),
       };
       writeFileSync(manifestFile, JSON.stringify(manifest), 'utf8');

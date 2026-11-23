@@ -1302,7 +1302,6 @@ import { pathToFileURL } from 'node:url';
 const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
 
 test('hidden acceptance: resolveBundlePath blocks traversal, prefix collision, and symlink escapes', async () => {
-  const { resolveBundlePath } = await import(pathToFileURL(join(ws, 'src/fs/safe-bundle.js')).href);
   const base = mkdtempSync(join(tmpdir(), 'ar05-sec-'));
   const root = join(base, 'ws');
   const evil = join(base, 'ws-evil');
@@ -1310,19 +1309,30 @@ test('hidden acceptance: resolveBundlePath blocks traversal, prefix collision, a
   mkdirSync(evil, { recursive: true });
   writeFileSync(join(evil, 'secret.txt'), 'secret');
   writeFileSync(join(root, 'sub', 'ok.txt'), 'ok');
-  symlinkSync(evil, join(root, 'escape-link'), process.platform === 'win32' ? 'junction' : 'dir');
+  let symlinkCreated = false;
+  try {
+    symlinkSync(evil, join(root, 'escape-link'), process.platform === 'win32' ? 'junction' : 'dir');
+    symlinkCreated = true;
+  } catch (err) {
+    // Node --permission (fallback mode when Docker is absent) forbids fs.symlink without full fs.write=*.
+    if (!(err?.code === 'ERR_ACCESS_DENIED' && process.permission && !process.permission.has('fs.write', '*'))) {
+      throw err;
+    }
+  }
+  const { resolveBundlePath } = await import(pathToFileURL(join(ws, 'src/fs/safe-bundle.js')).href);
 
   try {
     assert.ok(resolveBundlePath(root, 'sub/ok.txt').endsWith('ok.txt'));
-    for (const bad of [
+    const badInputs = [
       '../ws-evil/secret.txt',
       '..\\\\ws-evil\\\\secret.txt',
       '/etc/passwd',
       'C:\\\\Windows\\\\System32',
       'sub/%2e%2e/%2e%2e/ws-evil/secret.txt',
       'sub/ok.txt\\0.png',
-      'escape-link/secret.txt',
-    ]) {
+      ...(symlinkCreated ? ['escape-link/secret.txt'] : []),
+    ];
+    for (const bad of badInputs) {
       assert.throws(() => resolveBundlePath(root, bad), Error, 'expected rejection for ' + bad);
     }
   } finally {
