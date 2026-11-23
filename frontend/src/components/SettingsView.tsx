@@ -23,6 +23,7 @@ import {
   fmtUSD,
 } from '../utils/format';
 import { ArchivedChats } from './ArchivedChats';
+import { AdaptiveContextPanel } from './AdaptiveContextPanel';
 import { CheckinCenterPanel } from './CheckinCenterPanel';
 import { ExperienceMemoryPanel } from './ExperienceMemoryPanel';
 import {
@@ -117,6 +118,7 @@ const NAV_GROUPS: Array<{
     items: [
       { id: 'approvals', label: '审批中心', icon: <IconShieldCheck size={15} /> },
       { id: 'memory', label: '记忆中心', icon: <IconDatabase size={15} /> },
+      { id: 'context', label: '自适应上下文', icon: <IconCpu size={15} /> },
       { id: 'usage', label: '用量与费用', icon: <IconActivity size={15} /> },
       { id: 'connection', label: '连接与端点', icon: <IconTerminal size={15} /> },
     ],
@@ -822,6 +824,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 )}
               </div>
             </>
+          )}
+
+          {activeSection === 'context' && (
+            <AdaptiveContextPanel client={client} onToast={onToast} />
           )}
 
           {activeSection === 'usage' && (

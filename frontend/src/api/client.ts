@@ -94,6 +94,57 @@ export interface ListTasksOptions {
 export type SubmittedTurn = Task | (SwarmCommandReceipt & { id: string });
 type TurnResponse = SwarmCommandReceipt | { mode?: 'direct'; turn?: Record<string, unknown>; session?: Record<string, unknown> };
 
+export type ContextSupervisorMode = 'auto' | 'custom' | 'off';
+
+export interface ContextSupervisorConfig {
+  enabled: boolean;
+  mode: ContextSupervisorMode;
+  model: string | null;
+  maxBudgetRatio: number;
+  epochWatermarks: number[];
+  maxOutputTokens: number;
+  timeoutMs: number;
+}
+
+export interface ContextSupervisorCandidate {
+  alias: string;
+  provider: string | null;
+  upstreamModel: string;
+  contextWindow: number;
+  maxOutput: number;
+  multiplier: number;
+  healthy: boolean;
+  recommended: boolean;
+  score: number;
+  capabilities: {
+    tools?: boolean;
+    reasoning?: boolean;
+    vision?: boolean;
+    cache?: boolean;
+  };
+}
+
+export interface ContextSupervisorStatus {
+  config: ContextSupervisorConfig;
+  effectiveModel: string | null;
+  rationale: string;
+  recommendedModel: string | null;
+  recommendedRationale: string;
+  active: boolean;
+  readOnly: boolean;
+  toolsAllowed: string[];
+  reversibleStore: boolean;
+  candidates: ContextSupervisorCandidate[];
+  guidelinesCount: number;
+}
+
+export type ContextSupervisorUpdate = Partial<
+  Pick<
+    ContextSupervisorConfig,
+    'enabled' | 'mode' | 'model' | 'maxBudgetRatio' | 'epochWatermarks' | 'maxOutputTokens' | 'timeoutMs'
+  >
+>;
+
 export interface AgentBackendClient {
   readonly isDemo: boolean;
   getPromptCacheStats?: (signal?: AbortSignal) => Promise<PromptCacheStats | null>;
@@ -447,6 +498,8 @@ export interface AgentBackendClient {
     candidateRunId?: string;
     signal?: AbortSignal;
   }) => Promise<EvaluationRegressionSummary>;
+  getContextSupervisor?: (signal?: AbortSignal) => Promise<ContextSupervisorStatus>;
+  updateContextSupervisor?: (patch: ContextSupervisorUpdate) => Promise<ContextSupervisorStatus>;
   listMemory(params?: {
     projectId?: string;
     taskId?: string;
@@ -1597,6 +1650,14 @@ export class LiveBackendClient implements AgentBackendClient {
   }): Promise<EvaluationRegressionSummary> {
     const { signal, ...query } = params;
     return this.req('GET', '/v1/evaluations/regression', { query, signal });
+  }
+
+  getContextSupervisor(signal?: AbortSignal): Promise<ContextSupervisorStatus> {
+    return this.req('GET', '/v1/context/supervisor', { signal });
+  }
+
+  updateContextSupervisor(patch: ContextSupervisorUpdate): Promise<ContextSupervisorStatus> {
+    return this.req('PATCH', '/v1/context/supervisor', { body: patch });
   }
 
   async listMemory(params?: {

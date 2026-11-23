@@ -6,6 +6,7 @@ import { AdaptiveReplanner } from '../planning/replanner.js';
 import { CommunicationValidationError, CommunicationStateError } from '../communication/envelope.js';
 import { classifyTrafficSource } from '../observability/trace.js';
 import { intersectPolicies } from '../tools/policy.js';
+import { ContextSupervisor } from '../context/supervisor.js';
 
 function sameWorkspacePath(a, b) {
   if (!a || !b) return false;
@@ -47,8 +48,16 @@ export function registerIntelligenceRoutes(app, {
   communication = null,
   memory = null,
   directAgent = null,
+  pool = null,
+  store = null,
 } = {}) {
   const effectiveReplanner = replanner ?? new AdaptiveReplanner({ planner });
+  const effectivePool = pool ?? directAgent?.pool ?? null;
+  const effectiveStore = store ?? directAgent?.store ?? null;
+  const contextSupervisor = new ContextSupervisor({
+    store: effectiveStore,
+    pool: effectivePool,
+  });
 
   app.get('/v1/benchmarks', async () => {
     if (!evaluation) return { items: [] };
@@ -268,6 +277,102 @@ export function registerIntelligenceRoutes(app, {
   app.delete('/v1/memory/experience/:id', async (req) => {
     if (!memory) fail('EXPERIENCE_MEMORY_UNAVAILABLE', 503);
     try { return memory.remove({ id: req.params.id, projectId: req.query?.projectId || req.body?.projectId }); } catch (error) { throw asRouteError(error); }
+  });
+
+  app.get('/v1/context/supervisor', async () => {
+    return contextSupervisor.getStatus();
+  });
+
+  app.patch('/v1/context/supervisor', async (req) => {
+    if (!effectiveStore) {
+      fail('CONTEXT_SUPERVISOR_UNAVAILABLE', 503, 'Store is required to persist supervisor configuration');
+    }
+    const body = req.body ?? {};
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      fail('INVALID_SUPERVISOR_CONFIG', 400, 'Request body must be a JSON object');
+    }
+
+    const patch = {};
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') {
+        fail('INVALID_SUPERVISOR_CONFIG', 400, 'enabled must be a boolean');
+      }
+      patch.enabled = body.enabled;
+    }
+    if (body.mode !== undefined) {
+      const m = String(body.mode).trim().toLowerCase();
+      if (m !== 'auto' && m !== 'custom' && m !== 'off') {
+        fail('INVALID_SUPERVISOR_MODE', 400, 'mode must be one of auto, custom, off');
+      }
+      patch.mode = m;
+    }
+    if (body.model !== undefined) {
+      if (body.model !== null && typeof body.model !== 'string') {
+        fail('INVALID_SUPERVISOR_MODEL', 400, 'model must be a string or null');
+      }
+      const trimmed = typeof body.model === 'string' ? body.model.trim() : '';
+      patch.model = trimmed || null;
+    }
+    if (body.maxBudgetRatio !== undefined) {
+      const ratio = Number(body.maxBudgetRatio);
+      if (!Number.isFinite(ratio) || ratio <= 0.1 || ratio > 0.98) {
+        fail('INVALID_SUPERVISOR_CONFIG', 400, 'maxBudgetRatio must be between 0.1 and 0.98');
+      }
+      patch.maxBudgetRatio = ratio;
+    }
+    if (body.epochWatermarks !== undefined) {
+      if (
+        !Array.isArray(body.epochWatermarks) ||
+        body.epochWatermarks.length === 0 ||
+        body.epochWatermarks.some((w) => !Number.isFinite(Number(w)) || Number(w) <= 0 || Number(w) >= 1)
+      ) {
+        fail('INVALID_SUPERVISOR_CONFIG', 400, 'epochWatermarks must be a non-empty array of ratios in (0, 1)');
+      }
+      patch.epochWatermarks = body.epochWatermarks.map(Number);
+    }
+    if (body.maxOutputTokens !== undefined) {
+      const tok = Number(body.maxOutputTokens);
+      if (!Number.isInteger(tok) || tok < 128 || tok > 8192) {
+        fail('INVALID_SUPERVISOR_CONFIG', 400, 'maxOutputTokens must be an integer between 128 and 8192');
+      }
+      patch.maxOutputTokens = tok;
+    }
+    if (body.timeoutMs !== undefined) {
+      const ms = Number(body.timeoutMs);
+      if (!Number.isInteger(ms) || ms < 500 || ms > 60000) {
+        fail('INVALID_SUPERVISOR_CONFIG', 400, 'timeoutMs must be an integer between 500 and 60000');
+      }
+      patch.timeoutMs = ms;
+    }
+
+    const current = contextSupervisor.getConfig();
+    const nextMode = patch.mode ?? current.mode;
+    const nextModel = patch.model !== undefined ? patch.model : current.model;
+
+    if (nextMode === 'custom') {
+      if (!nextModel) {
+        fail('SUPERVISOR_MODEL_REQUIRED', 400, 'model is required when mode is custom');
+      }
+      if (effectivePool) {
+        const catalog = effectivePool.getActiveCatalog?.();
+        const catalogItems = Array.isArray(catalog?.items) ? catalog.items : [];
+        const inCatalog = catalogItems.some(
+          (item) =>
+            item?.alias === nextModel ||
+            (Array.isArray(item?.targets) && item.targets.some((t) => t?.model === nextModel)),
+        );
+        if (!inCatalog) {
+          fail(
+            'INVALID_SUPERVISOR_MODEL',
+            400,
+            `Model '${nextModel}' is not available in the active pool catalog`,
+          );
+        }
+      }
+    }
+
+    contextSupervisor.saveConfig(patch);
+    return contextSupervisor.getStatus();
   });
 }
 
