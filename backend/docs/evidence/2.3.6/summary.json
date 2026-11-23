@@ -1,0 +1,1227 @@
+{
+  "completeDesign": true,
+  "received": 100,
+  "paired": 50,
+  "comparable": 49,
+  "nonComparable": [
+    "06-deprecated-reference/5"
+  ],
+  "overall": {
+    "before": {
+      "n": 50,
+      "pass": 39,
+      "independent": 42,
+      "infrastructure": 0,
+      "timeOut": 2,
+      "completed": 46,
+      "orderAll": 39,
+      "calls": 485,
+      "fit": 409,
+      "invalid": 77,
+      "repeats": 1,
+      "purposes": 236,
+      "failedAny": 49,
+      "recovered": 39,
+      "repairEvents": 0,
+      "mcp": {
+        "trials": 15,
+        "found": 15,
+        "expected": 20,
+        "calls": 17,
+        "reportedSuccess": 12
+      },
+      "p50Ms": 17864,
+      "providerStatuses": {
+        "200": 332,
+        "503": 12,
+        "AbortError": 2
+      },
+      "providerDone": 332,
+      "withUsage": 332,
+      "coverage": 49,
+      "p50Input": 30973,
+      "p50Output": 1257,
+      "p50Tokens": 32234,
+      "totalInput": 1467040,
+      "totalOutput": 66019,
+      "p50MsPassed": 15706,
+      "passedTokenStats": {
+        "coverage": 39,
+        "p50Input": 30162,
+        "p50Output": 1239,
+        "p50Tokens": 31156,
+        "totalInput": 1149977,
+        "totalOutput": 47902
+      }
+    },
+    "after": {
+      "n": 50,
+      "pass": 48,
+      "independent": 50,
+      "infrastructure": 0,
+      "timeOut": 0,
+      "completed": 48,
+      "orderAll": 49,
+      "calls": 484,
+      "fit": 415,
+      "invalid": 69,
+      "repeats": 0,
+      "purposes": 209,
+      "failedAny": 50,
+      "recovered": 48,
+      "repairEvents": 0,
+      "mcp": {
+        "trials": 15,
+        "found": 20,
+        "expected": 20,
+        "calls": 20,
+        "reportedSuccess": 15
+      },
+      "p50Ms": 16352,
+      "providerStatuses": {
+        "200": 343,
+        "503": 8
+      },
+      "providerDone": 343,
+      "withUsage": 343,
+      "coverage": 50,
+      "p50Input": 30236.5,
+      "p50Output": 1146.5,
+      "p50Tokens": 31455,
+      "totalInput": 1510995,
+      "totalOutput": 61071,
+      "p50MsPassed": 16326.5,
+      "passedTokenStats": {
+        "coverage": 48,
+        "p50Input": 30236.5,
+        "p50Output": 1146.5,
+        "p50Tokens": 31455,
+        "totalInput": 1439411,
+        "totalOutput": 58303
+      }
+    }
+  },
+  "effect": {
+    "all": {
+      "n": 50,
+      "blocks": 10,
+      "beforeOnly": 1,
+      "afterOnly": 10,
+      "both": 38,
+      "neither": 1,
+      "delta": 0.18,
+      "p": 0.1875,
+      "bootstrap95": [
+        0,
+        0.4
+      ]
+    },
+    "comparable": {
+      "n": 49,
+      "blocks": 10,
+      "beforeOnly": 1,
+      "afterOnly": 9,
+      "both": 38,
+      "neither": 1,
+      "delta": 0.16326530612244897,
+      "p": 0.25,
+      "bootstrap95": [
+        0,
+        0.3877551020408163
+      ]
+    },
+    "commonCatalog": {
+      "n": 44,
+      "blocks": 9,
+      "beforeOnly": 1,
+      "afterOnly": 4,
+      "both": 38,
+      "neither": 1,
+      "delta": 0.06818181818181818,
+      "p": 0.5,
+      "bootstrap95": [
+        -0.044444444444444446,
+        0.18604651162790697
+      ]
+    },
+    "healthy": {
+      "n": 47,
+      "blocks": 10,
+      "beforeOnly": 1,
+      "afterOnly": 8,
+      "both": 38,
+      "neither": 0,
+      "delta": 0.14893617021276595,
+      "p": 0.3125,
+      "bootstrap95": [
+        -0.02040816326530612,
+        0.37777777777777777
+      ]
+    },
+    "healthyCommonCatalog": {
+      "n": 42,
+      "blocks": 9,
+      "beforeOnly": 1,
+      "afterOnly": 3,
+      "both": 38,
+      "neither": 0,
+      "delta": 0.047619047619047616,
+      "p": 0.625,
+      "bootstrap95": [
+        -0.045454545454545456,
+        0.14285714285714285
+      ]
+    }
+  },
+  "tasks": [
+    {
+      "id": "01-route-map",
+      "kind": "repository-understanding",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 57,
+        "fit": 52,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 21,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 15488,
+        "providerStatuses": {
+          "200": 33
+        },
+        "providerDone": 33,
+        "withUsage": 33,
+        "coverage": 5,
+        "p50Input": 32894,
+        "p50Output": 1257,
+        "p50Tokens": 34133,
+        "totalInput": 155215,
+        "totalOutput": 6359,
+        "p50MsPassed": 15488,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 32894,
+          "p50Output": 1257,
+          "p50Tokens": 34133,
+          "totalInput": 155215,
+          "totalOutput": 6359
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 56,
+        "fit": 48,
+        "invalid": 8,
+        "repeats": 0,
+        "purposes": 16,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 13518,
+        "providerStatuses": {
+          "200": 32
+        },
+        "providerDone": 32,
+        "withUsage": 32,
+        "coverage": 5,
+        "p50Input": 27138,
+        "p50Output": 1099,
+        "p50Tokens": 28076,
+        "totalInput": 143451,
+        "totalOutput": 5658,
+        "p50MsPassed": 13518,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 27138,
+          "p50Output": 1099,
+          "p50Tokens": 28076,
+          "totalInput": 143451,
+          "totalOutput": 5658
+        }
+      }
+    },
+    {
+      "id": "02-config-precedence",
+      "kind": "repository-understanding",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 46,
+        "fit": 40,
+        "invalid": 6,
+        "repeats": 0,
+        "purposes": 18,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 16411,
+        "providerStatuses": {
+          "200": 29
+        },
+        "providerDone": 29,
+        "withUsage": 29,
+        "coverage": 5,
+        "p50Input": 26550,
+        "p50Output": 1561,
+        "p50Tokens": 28111,
+        "totalInput": 127446,
+        "totalOutput": 7369,
+        "p50MsPassed": 16411,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 26550,
+          "p50Output": 1561,
+          "p50Tokens": 28111,
+          "totalInput": 127446,
+          "totalOutput": 7369
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 43,
+        "fit": 37,
+        "invalid": 6,
+        "repeats": 0,
+        "purposes": 7,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 13648,
+        "providerStatuses": {
+          "200": 28
+        },
+        "providerDone": 28,
+        "withUsage": 28,
+        "coverage": 5,
+        "p50Input": 25945,
+        "p50Output": 1364,
+        "p50Tokens": 26979,
+        "totalInput": 125078,
+        "totalOutput": 6511,
+        "p50MsPassed": 13648,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 25945,
+          "p50Output": 1364,
+          "p50Tokens": 26979,
+          "totalInput": 125078,
+          "totalOutput": 6511
+        }
+      }
+    },
+    {
+      "id": "03-money-rounding",
+      "kind": "code-change",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 4,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 4,
+        "calls": 52,
+        "fit": 40,
+        "invalid": 12,
+        "repeats": 0,
+        "purposes": 28,
+        "failedAny": 5,
+        "recovered": 4,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 21414,
+        "providerStatuses": {
+          "200": 34
+        },
+        "providerDone": 34,
+        "withUsage": 34,
+        "coverage": 5,
+        "p50Input": 31225,
+        "p50Output": 2194,
+        "p50Tokens": 33419,
+        "totalInput": 154515,
+        "totalOutput": 9137,
+        "p50MsPassed": 20244,
+        "passedTokenStats": {
+          "coverage": 4,
+          "p50Input": 29255,
+          "p50Output": 1814.5,
+          "p50Tokens": 31069.5,
+          "totalInput": 112091,
+          "totalOutput": 6714
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 48,
+        "fit": 41,
+        "invalid": 7,
+        "repeats": 0,
+        "purposes": 29,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 20096,
+        "providerStatuses": {
+          "200": 32
+        },
+        "providerDone": 32,
+        "withUsage": 32,
+        "coverage": 5,
+        "p50Input": 27755,
+        "p50Output": 2146,
+        "p50Tokens": 30070,
+        "totalInput": 139749,
+        "totalOutput": 9207,
+        "p50MsPassed": 20096,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 27755,
+          "p50Output": 2146,
+          "p50Tokens": 30070,
+          "totalInput": 139749,
+          "totalOutput": 9207
+        }
+      }
+    },
+    {
+      "id": "04-csv-quotes",
+      "kind": "code-change",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 55,
+        "fit": 45,
+        "invalid": 10,
+        "repeats": 0,
+        "purposes": 28,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 18857,
+        "providerStatuses": {
+          "200": 36
+        },
+        "providerDone": 36,
+        "withUsage": 36,
+        "coverage": 5,
+        "p50Input": 32538,
+        "p50Output": 1424,
+        "p50Tokens": 34096,
+        "totalInput": 166112,
+        "totalOutput": 7114,
+        "p50MsPassed": 18857,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 32538,
+          "p50Output": 1424,
+          "p50Tokens": 34096,
+          "totalInput": 166112,
+          "totalOutput": 7114
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 4,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 4,
+        "orderAll": 4,
+        "calls": 59,
+        "fit": 48,
+        "invalid": 11,
+        "repeats": 0,
+        "purposes": 17,
+        "failedAny": 5,
+        "recovered": 4,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 16659,
+        "providerStatuses": {
+          "200": 40
+        },
+        "providerDone": 40,
+        "withUsage": 40,
+        "coverage": 5,
+        "p50Input": 35856,
+        "p50Output": 1465,
+        "p50Tokens": 37127,
+        "totalInput": 184427,
+        "totalOutput": 7915,
+        "p50MsPassed": 16601.5,
+        "passedTokenStats": {
+          "coverage": 4,
+          "p50Input": 33798.5,
+          "p50Output": 1444.5,
+          "p50Tokens": 35146,
+          "totalInput": 135957,
+          "totalOutput": 5705
+        }
+      }
+    },
+    {
+      "id": "05-negative-duration",
+      "kind": "test-repair",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 3,
+        "independent": 4,
+        "infrastructure": 0,
+        "timeOut": 1,
+        "completed": 4,
+        "orderAll": 3,
+        "calls": 50,
+        "fit": 42,
+        "invalid": 8,
+        "repeats": 0,
+        "purposes": 34,
+        "failedAny": 5,
+        "recovered": 3,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 19582,
+        "providerStatuses": {
+          "200": 34,
+          "503": 4,
+          "AbortError": 1
+        },
+        "providerDone": 34,
+        "withUsage": 34,
+        "coverage": 5,
+        "p50Input": 36916,
+        "p50Output": 1468,
+        "p50Tokens": 38931,
+        "totalInput": 160171,
+        "totalOutput": 6170,
+        "p50MsPassed": 19118,
+        "passedTokenStats": {
+          "coverage": 3,
+          "p50Input": 43384,
+          "p50Output": 1468,
+          "p50Tokens": 44852,
+          "totalInput": 119869,
+          "totalOutput": 4059
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 52,
+        "fit": 44,
+        "invalid": 8,
+        "repeats": 0,
+        "purposes": 33,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 18726,
+        "providerStatuses": {
+          "200": 38,
+          "503": 4
+        },
+        "providerDone": 38,
+        "withUsage": 38,
+        "coverage": 5,
+        "p50Input": 36795,
+        "p50Output": 1205,
+        "p50Tokens": 38528,
+        "totalInput": 178245,
+        "totalOutput": 6387,
+        "p50MsPassed": 18726,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 36795,
+          "p50Output": 1205,
+          "p50Tokens": 38528,
+          "totalInput": 178245,
+          "totalOutput": 6387
+        }
+      }
+    },
+    {
+      "id": "06-deprecated-reference",
+      "kind": "test-repair",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 3,
+        "independent": 4,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 4,
+        "orderAll": 3,
+        "calls": 43,
+        "fit": 35,
+        "invalid": 8,
+        "repeats": 0,
+        "purposes": 21,
+        "failedAny": 4,
+        "recovered": 3,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 17883,
+        "providerStatuses": {
+          "200": 32,
+          "503": 6
+        },
+        "providerDone": 32,
+        "withUsage": 32,
+        "coverage": 4,
+        "p50Input": 34554,
+        "p50Output": 1141,
+        "p50Tokens": 35695,
+        "totalInput": 140316,
+        "totalOutput": 4554,
+        "p50MsPassed": 17022,
+        "passedTokenStats": {
+          "coverage": 3,
+          "p50Input": 35209,
+          "p50Output": 1102,
+          "p50Tokens": 36311,
+          "totalInput": 106417,
+          "totalOutput": 3374
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 55,
+        "fit": 46,
+        "invalid": 9,
+        "repeats": 0,
+        "purposes": 34,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 18466,
+        "providerStatuses": {
+          "200": 39
+        },
+        "providerDone": 39,
+        "withUsage": 39,
+        "coverage": 5,
+        "p50Input": 36173,
+        "p50Output": 1409,
+        "p50Tokens": 37348,
+        "totalInput": 177708,
+        "totalOutput": 6476,
+        "p50MsPassed": 18466,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 36173,
+          "p50Output": 1409,
+          "p50Tokens": 37348,
+          "totalInput": 177708,
+          "totalOutput": 6476
+        }
+      }
+    },
+    {
+      "id": "07-normalize-refactor",
+      "kind": "multi-file-refactor",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 57,
+        "fit": 52,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 33,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 14681,
+        "providerStatuses": {
+          "200": 33
+        },
+        "providerDone": 33,
+        "withUsage": 33,
+        "coverage": 5,
+        "p50Input": 30903,
+        "p50Output": 1192,
+        "p50Tokens": 32000,
+        "totalInput": 145411,
+        "totalOutput": 6012,
+        "p50MsPassed": 14681,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 30903,
+          "p50Output": 1192,
+          "p50Tokens": 32000,
+          "totalInput": 145411,
+          "totalOutput": 6012
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 51,
+        "fit": 46,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 25,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 0,
+          "found": 0,
+          "expected": 0,
+          "calls": 0,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 17572,
+        "providerStatuses": {
+          "200": 32
+        },
+        "providerDone": 32,
+        "withUsage": 32,
+        "coverage": 5,
+        "p50Input": 26057,
+        "p50Output": 1144,
+        "p50Tokens": 27257,
+        "totalInput": 143148,
+        "totalOutput": 5700,
+        "p50MsPassed": 17572,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 26057,
+          "p50Output": 1144,
+          "p50Tokens": 27257,
+          "totalInput": 143148,
+          "totalOutput": 5700
+        }
+      }
+    },
+    {
+      "id": "08-mcp-live-stock",
+      "kind": "mcp-cooperation",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 28,
+        "fit": 23,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 11,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 5,
+          "found": 5,
+          "expected": 5,
+          "calls": 5,
+          "reportedSuccess": 5
+        },
+        "p50Ms": 11765,
+        "providerStatuses": {
+          "200": 30
+        },
+        "providerDone": 30,
+        "withUsage": 30,
+        "coverage": 5,
+        "p50Input": 22701,
+        "p50Output": 638,
+        "p50Tokens": 23339,
+        "totalInput": 115236,
+        "totalOutput": 3554,
+        "p50MsPassed": 11765,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 22701,
+          "p50Output": 638,
+          "p50Tokens": 23339,
+          "totalInput": 115236,
+          "totalOutput": 3554
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 40,
+        "fit": 35,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 19,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 5,
+          "found": 5,
+          "expected": 5,
+          "calls": 5,
+          "reportedSuccess": 5
+        },
+        "p50Ms": 12434,
+        "providerStatuses": {
+          "200": 30
+        },
+        "providerDone": 30,
+        "withUsage": 30,
+        "coverage": 5,
+        "p50Input": 24698,
+        "p50Output": 843,
+        "p50Tokens": 25607,
+        "totalInput": 123250,
+        "totalOutput": 4474,
+        "p50MsPassed": 12434,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 24698,
+          "p50Output": 843,
+          "p50Tokens": 25607,
+          "totalInput": 123250,
+          "totalOutput": 4474
+        }
+      }
+    },
+    {
+      "id": "09-mcp-log",
+      "kind": "mcp-cooperation",
+      "structural": false,
+      "before": {
+        "n": 5,
+        "pass": 4,
+        "independent": 4,
+        "infrastructure": 0,
+        "timeOut": 1,
+        "completed": 4,
+        "orderAll": 4,
+        "calls": 32,
+        "fit": 27,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 12,
+        "failedAny": 5,
+        "recovered": 4,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 5,
+          "found": 5,
+          "expected": 5,
+          "calls": 5,
+          "reportedSuccess": 0
+        },
+        "p50Ms": 12774,
+        "providerStatuses": {
+          "200": 29,
+          "503": 2,
+          "AbortError": 1
+        },
+        "providerDone": 29,
+        "withUsage": 29,
+        "coverage": 5,
+        "p50Input": 23815,
+        "p50Output": 783,
+        "p50Tokens": 24664,
+        "totalInput": 112923,
+        "totalOutput": 3615,
+        "p50MsPassed": 12059,
+        "passedTokenStats": {
+          "coverage": 4,
+          "p50Input": 23848,
+          "p50Output": 857,
+          "p50Tokens": 24705,
+          "totalInput": 102180,
+          "totalOutput": 3347
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 4,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 4,
+        "orderAll": 5,
+        "calls": 37,
+        "fit": 32,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 7,
+        "failedAny": 5,
+        "recovered": 4,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 5,
+          "found": 5,
+          "expected": 5,
+          "calls": 5,
+          "reportedSuccess": 5
+        },
+        "p50Ms": 14422,
+        "providerStatuses": {
+          "200": 36,
+          "503": 4
+        },
+        "providerDone": 36,
+        "withUsage": 36,
+        "coverage": 5,
+        "p50Input": 28077,
+        "p50Output": 770,
+        "p50Tokens": 29046,
+        "totalInput": 143346,
+        "totalOutput": 4078,
+        "p50MsPassed": 14371,
+        "passedTokenStats": {
+          "coverage": 4,
+          "p50Input": 30100.5,
+          "p50Output": 869.5,
+          "p50Tokens": 30970,
+          "totalInput": 120232,
+          "totalOutput": 3520
+        }
+      }
+    },
+    {
+      "id": "10-mcp-incident-fallback",
+      "kind": "failure-recovery",
+      "structural": true,
+      "before": {
+        "n": 5,
+        "pass": 0,
+        "independent": 0,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 4,
+        "orderAll": 0,
+        "calls": 65,
+        "fit": 53,
+        "invalid": 13,
+        "repeats": 1,
+        "purposes": 30,
+        "failedAny": 5,
+        "recovered": 0,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 5,
+          "found": 5,
+          "expected": 10,
+          "calls": 7,
+          "reportedSuccess": 7
+        },
+        "p50Ms": 25293,
+        "providerStatuses": {
+          "200": 42
+        },
+        "providerDone": 42,
+        "withUsage": 42,
+        "coverage": 5,
+        "p50Input": 35663,
+        "p50Output": 2276,
+        "p50Tokens": 37817,
+        "totalInput": 189695,
+        "totalOutput": 12135,
+        "p50MsPassed": null,
+        "passedTokenStats": {
+          "coverage": 0,
+          "p50Input": null,
+          "p50Output": null,
+          "p50Tokens": null,
+          "totalInput": null,
+          "totalOutput": null
+        }
+      },
+      "after": {
+        "n": 5,
+        "pass": 5,
+        "independent": 5,
+        "infrastructure": 0,
+        "timeOut": 0,
+        "completed": 5,
+        "orderAll": 5,
+        "calls": 43,
+        "fit": 38,
+        "invalid": 5,
+        "repeats": 0,
+        "purposes": 22,
+        "failedAny": 5,
+        "recovered": 5,
+        "repairEvents": 0,
+        "mcp": {
+          "trials": 5,
+          "found": 10,
+          "expected": 10,
+          "calls": 10,
+          "reportedSuccess": 5
+        },
+        "p50Ms": 16302,
+        "providerStatuses": {
+          "200": 36
+        },
+        "providerDone": 36,
+        "withUsage": 36,
+        "coverage": 5,
+        "p50Input": 30807,
+        "p50Output": 916,
+        "p50Tokens": 31603,
+        "totalInput": 152593,
+        "totalOutput": 4665,
+        "p50MsPassed": 16302,
+        "passedTokenStats": {
+          "coverage": 5,
+          "p50Input": 30807,
+          "p50Output": 916,
+          "p50Tokens": 31603,
+          "totalInput": 152593,
+          "totalOutput": 4665
+        }
+      }
+    }
+  ],
+  "passingPairs": {
+    "before": {
+      "n": 38,
+      "pass": 38,
+      "independent": 38,
+      "infrastructure": 0,
+      "timeOut": 0,
+      "completed": 38,
+      "orderAll": 38,
+      "calls": 368,
+      "fit": 317,
+      "invalid": 51,
+      "repeats": 0,
+      "purposes": 184,
+      "failedAny": 38,
+      "recovered": 38,
+      "repairEvents": 0,
+      "mcp": {
+        "trials": 9,
+        "found": 9,
+        "expected": 9,
+        "calls": 9,
+        "reportedSuccess": 5
+      },
+      "p50Ms": 15672.5,
+      "providerStatuses": {
+        "200": 254
+      },
+      "providerDone": 254,
+      "withUsage": 254,
+      "coverage": 38,
+      "p50Input": 28996,
+      "p50Output": 1236.5,
+      "p50Tokens": 30394.5,
+      "totalInput": 1119004,
+      "totalOutput": 46641,
+      "p50MsPassed": 15672.5,
+      "passedTokenStats": {
+        "coverage": 38,
+        "p50Input": 28996,
+        "p50Output": 1236.5,
+        "p50Tokens": 30394.5,
+        "totalInput": 1119004,
+        "totalOutput": 46641
+      }
+    },
+    "after": {
+      "n": 38,
+      "pass": 38,
+      "independent": 38,
+      "infrastructure": 0,
+      "timeOut": 0,
+      "completed": 38,
+      "orderAll": 38,
+      "calls": 371,
+      "fit": 317,
+      "invalid": 54,
+      "repeats": 0,
+      "purposes": 151,
+      "failedAny": 38,
+      "recovered": 38,
+      "repairEvents": 0,
+      "mcp": {
+        "trials": 9,
+        "found": 9,
+        "expected": 9,
+        "calls": 9,
+        "reportedSuccess": 9
+      },
+      "p50Ms": 15062,
+      "providerStatuses": {
+        "200": 255
+      },
+      "providerDone": 255,
+      "withUsage": 255,
+      "coverage": 38,
+      "p50Input": 27792,
+      "p50Output": 1187.5,
+      "p50Tokens": 29089.5,
+      "totalInput": 1125915,
+      "totalOutput": 47095,
+      "p50MsPassed": 15062,
+      "passedTokenStats": {
+        "coverage": 38,
+        "p50Input": 27792,
+        "p50Output": 1187.5,
+        "p50Tokens": 29089.5,
+        "totalInput": 1125915,
+        "totalOutput": 47095
+      }
+    }
+  }
+}
