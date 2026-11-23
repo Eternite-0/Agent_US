@@ -460,7 +460,10 @@ export class AgentLoop {
       if (!workspaceRoot) return null;
       const filesRead = reasoningTracker.filesRead;
       if (!taskContract || filesRead.length !== lastContractFilesReadCount) {
-        taskContract = extractTaskContract({ prompt: input, workspaceRoot, filesRead });
+        const rawPrompt = String(input ?? '');
+        const repoCtxIdx = rawPrompt.search(/\r?\n\r?\n\[Repository Intelligence(?: Context)?\]\r?\n/);
+        const contractPrompt = repoCtxIdx >= 0 ? rawPrompt.slice(0, repoCtxIdx) : rawPrompt;
+        taskContract = extractTaskContract({ prompt: contractPrompt, workspaceRoot, filesRead });
         lastContractFilesReadCount = filesRead.length;
       }
       lastContractReadiness = evaluateContractReadiness({
@@ -485,7 +488,6 @@ export class AgentLoop {
     let monologueWarned = false;
     let policyBlockWarned = false;
     const nonFatalPatternsWarned = new Set();
-    let contractPreEditWarned = false;
     let contractCompletionChecked = false;
     let finalAssistantText = '';
     let finalVerdict = null;
@@ -1387,19 +1389,6 @@ export class AgentLoop {
         });
 
         refreshContractReadiness();
-        if (
-          !contractPreEditWarned &&
-          !budgetReserveAdvised &&
-          !budgetFinalCallAdvised &&
-          (remainingTokens === null || remainingTokens > finalManifestReserve + estTurnCost) &&
-          lastContractReadiness?.preEditWarningText
-        ) {
-          contractPreEditWarned = true;
-          messages.push({
-            role: 'user',
-            content: [{ type: 'text', text: lastContractReadiness.preEditWarningText }],
-          });
-        }
 
         if (detectedThrashing) {
           const isNonFatalPattern =

@@ -454,26 +454,20 @@ test('execution memory candidates are extracted, sanitized, deduplicated, projec
   });
   assert.equal(forgeRes.statusCode, 403);
 
-  // 4. ContextAssembler retrieves Project A candidate in follow-up Direct turn & ChildAgent turn, NOT in Project B
+  // 4. Pre-verification gate: sessA shares prior turn messages, while a fresh ChildAgent does NOT receive unverified memory via ContextAssembler
   const reqIdxBeforeFollowUp = seenRequests.length;
   const tFollow = directAgent.startTurn(sessA.id, { input: 'Apply sqlite WAL checkpoints strategy' });
   await waitTurnDone(directAgent, sessA.id, tFollow.turn.id);
   assert.match(seenRequests[reqIdxBeforeFollowUp].fullText, /Prefer sqlite WAL checkpoints/);
 
-  const reqIdxBeforeChild = seenRequests.length;
+  const reqIdxBeforeChildUnverified = seenRequests.length;
   await directAgent.swarmOrchestrator.startRun({
     sessionId: sessA.id,
-    goal: 'Check child context assembly memory',
+    goal: 'Check child context assembly memory before verification',
     workspaceRoot: workDirA,
     nodes: [{ nodeKey: 'reader', taskType: 'research', objective: 'Use sqlite WAL checkpoints in child' }],
   });
-  assert.match(seenRequests[reqIdxBeforeChild].fullText, /Prefer sqlite WAL checkpoints/);
-
-  const sessB = directAgent.createSession({ workspaceRoot: workDirB, permissionMode: 'auto-safe' });
-  const reqIdxBeforeB = seenRequests.length;
-  const tB = directAgent.startTurn(sessB.id, { input: 'Apply sqlite WAL checkpoints strategy' });
-  await waitTurnDone(directAgent, sessB.id, tB.turn.id);
-  assert.doesNotMatch(seenRequests[reqIdxBeforeB].fullText, /Prefer sqlite WAL checkpoints/, 'Project B must remain isolated from Project A memory');
+  assert.doesNotMatch(seenRequests[reqIdxBeforeChildUnverified].fullText, /Prefer sqlite WAL checkpoints/);
 
   // 5. Trusted upgrade requires matching projectId + completed synthetic Evaluation + passing sourceTaskId
   store.add('evaluation_runs', {
@@ -503,6 +497,28 @@ test('execution memory candidates are extracted, sanitized, deduplicated, projec
     evidence: { projectId: workDirA, sourceTaskId: 'task-real-1', evaluationRunId: 'eval-trust-ok', score: { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 } },
   });
   assert.equal(upgraded.verified, true);
+
+  // 6. Post-verification retrieval & Project B isolation: fresh DirectAgent session and ChildAgent in Project A receive verified memory; Project B stays isolated
+  const sessA2 = directAgent.createSession({ workspaceRoot: workDirA, permissionMode: 'auto-safe' });
+  const reqIdxBeforeA2 = seenRequests.length;
+  const tA2 = directAgent.startTurn(sessA2.id, { input: 'Apply sqlite WAL checkpoints strategy' });
+  await waitTurnDone(directAgent, sessA2.id, tA2.turn.id);
+  assert.match(seenRequests[reqIdxBeforeA2].fullText, /Prefer sqlite WAL checkpoints/);
+
+  const reqIdxBeforeChildVerified = seenRequests.length;
+  await directAgent.swarmOrchestrator.startRun({
+    sessionId: sessA.id,
+    goal: 'Check child context assembly memory after verification',
+    workspaceRoot: workDirA,
+    nodes: [{ nodeKey: 'reader', taskType: 'research', objective: 'Use sqlite WAL checkpoints in child' }],
+  });
+  assert.match(seenRequests[reqIdxBeforeChildVerified].fullText, /Prefer sqlite WAL checkpoints/);
+
+  const sessB = directAgent.createSession({ workspaceRoot: workDirB, permissionMode: 'auto-safe' });
+  const reqIdxBeforeB = seenRequests.length;
+  const tB = directAgent.startTurn(sessB.id, { input: 'Apply sqlite WAL checkpoints strategy' });
+  await waitTurnDone(directAgent, sessB.id, tB.turn.id);
+  assert.doesNotMatch(seenRequests[reqIdxBeforeB].fullText, /Prefer sqlite WAL checkpoints/, 'Project B must remain isolated from Project A memory');
 });
 
 test('measured capability is derived from evaluation results and stays independent of provider account health', async (t) => {
