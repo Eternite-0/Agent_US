@@ -22,6 +22,106 @@ import {
   normalizeBudgetLimit,
 } from '../swarm/budget-ledger.js';
 
+function normalizeAciPath(p) {
+  return String(p ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+function aciPathsMatch(a, b) {
+  const na = normalizeAciPath(a);
+  const nb = normalizeAciPath(b);
+  if (!na || !nb) return false;
+  return na === nb || na.endsWith(`/${nb}`) || nb.endsWith(`/${na}`);
+}
+
+function extractAciSupervisorCandidates(messages = [], currentStep = 0) {
+  const toolCallsById = new Map();
+  let stepCounter = 0;
+  for (const m of messages ?? []) {
+    if (m?.role === 'assistant') {
+      stepCounter += 1;
+      for (const b of m.content ?? []) {
+        if (b?.type === 'tool-call' && b.id) {
+          let args = {};
+          if (typeof b.arguments === 'string') {
+            try {
+              const parsed = JSON.parse(b.arguments);
+              if (parsed && typeof parsed === 'object') args = parsed;
+            } catch {
+              args = {};
+            }
+          } else if (b.arguments && typeof b.arguments === 'object') {
+            args = b.arguments;
+          }
+          toolCallsById.set(b.id, { name: String(b.name ?? ''), args, step: stepCounter });
+        }
+      }
+    }
+  }
+  const candidates = [];
+  for (let i = 0; i < (messages ?? []).length; i += 1) {
+    const m = messages[i];
+    if (m?.role !== 'tool') continue;
+    const text = (m.content ?? [])
+      .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text)
+      .join('\n');
+    if (!text || text.startsWith('[ACI-REF ') || text.length < 600) continue;
+    const tc = m.toolCallId ? toolCallsById.get(m.toolCallId) : null;
+    const path = String(
+      tc?.args?.path ?? tc?.args?.filePath ?? tc?.args?.file ?? tc?.name ?? m.toolName ?? 'tool',
+    ).trim();
+    const ageSteps = Math.max(0, Number(currentStep || stepCounter) - Number(tc?.step ?? stepCounter));
+    candidates.push({
+      id: m.toolCallId || `tool_msg_${i}`,
+      refId: m.toolCallId || `tool_msg_${i}`,
+      path,
+      tokens: Math.ceil(text.length / 4),
+      ageSteps,
+      hasError: Boolean(m?.isError || /\b(error|failed|assertionerror|typeerror|syntaxerror)\b/i.test(text.slice(0, 600))),
+      excerpt: text.slice(0, 260),
+    });
+  }
+  return candidates;
+}
+
+function computeActiveCriticalContextRecall({ criticalFiles = [], reasoningTracker, aciStore = null, ledger = null } = {}) {
+  const uniqueTruth = [];
+  const seen = new Set();
+  const rawTruth =
+    Array.isArray(criticalFiles) && criticalFiles.length > 0
+      ? criticalFiles
+      : [...(reasoningTracker?._mutatedSrcSet ?? [])];
+  for (const f of rawTruth) {
+    const norm = normalizeAciPath(f);
+    if (!norm || seen.has(norm)) continue;
+    seen.add(norm);
+    uniqueTruth.push(String(f));
+  }
+  if (uniqueTruth.length === 0) return null;
+
+  const filesReadBeforeEdit = reasoningTracker?.rootCauseFilesReadBeforeEdit ?? [];
+  const keptPaths = (ledger?.kept ?? []).map((k) => k.path).filter(Boolean);
+  const expandedPaths = (ledger?.expanded ?? []).map((e) => e.path).filter(Boolean);
+  const compressedPaths = (ledger?.compressed ?? []).map((c) => c.path).filter(Boolean);
+  const restoredRefs = (aciStore?.listRefs?.() ?? []).filter((r) => Number(r.restoredCount || 0) > 0);
+
+  let activeHits = 0;
+  for (const gt of uniqueTruth) {
+    const readOrKept =
+      filesReadBeforeEdit.some((p) => aciPathsMatch(p, gt)) ||
+      keptPaths.some((p) => aciPathsMatch(p, gt)) ||
+      expandedPaths.some((p) => aciPathsMatch(p, gt));
+    const wasCompressed = compressedPaths.some((p) => aciPathsMatch(p, gt));
+    const wasRestored =
+      expandedPaths.some((p) => aciPathsMatch(p, gt)) ||
+      restoredRefs.some((r) => aciPathsMatch(r.path, gt));
+    if (readOrKept && (!wasCompressed || wasRestored)) {
+      activeHits += 1;
+    }
+  }
+  return activeHits / uniqueTruth.length;
+}
+
 /**
  * Default DecisionEngine handles premature-stop detection, verification gate,
  * repair loop policy, and thrashing circuit-breaker checks.
@@ -266,6 +366,7 @@ export class AgentLoop {
     workspaceRoot = null,
     node = null,
     execution = null,
+    aci = null,
   }) {
     const sm = new TurnStateMachine({
       store: this.store,
@@ -322,6 +423,35 @@ export class AgentLoop {
       workspaceRoot,
       baselineTestFiles: execution?.baselineTestFiles ?? node?.baselineTestFiles ?? null,
     });
+    const initialSupCfg = aci?.supervisor?.getConfig?.() ?? null;
+    let aciSupervisorCalls = 0;
+    let aciSupervisorMode = initialSupCfg ? (initialSupCfg.enabled ? initialSupCfg.mode : 'off') : null;
+    let aciSupervisorModel = aci?.supervisor?.resolveModel?.()?.effectiveModel ?? null;
+    const syncAciMetrics = () => {
+      if (!aci?.engine && !aci?.aciStore && !aci?.ledger) return;
+      const refs = aci.aciStore?.listRefs?.() ?? [];
+      const ledgerSummary = aci.ledger?.summary?.() ?? { compressedCount: 0, expandedCount: 0, totalTokensSaved: 0 };
+      const restoredCount = refs.reduce((s, r) => s + Number(r.restoredCount || 0), 0);
+      const offloadedCount = Math.max(refs.length, Number(ledgerSummary.compressedCount || 0));
+      const savedTokens = Number(ledgerSummary.totalTokensSaved || 0);
+      const epochTransitions = Number(aci.engine?.epochState?.epochCount || 0);
+      const criticalContextRecall = computeActiveCriticalContextRecall({
+        criticalFiles: aci.criticalFiles ?? execution?.evidenceContract?.requiredChangedFiles ?? [],
+        reasoningTracker,
+        aciStore: aci.aciStore ?? null,
+        ledger: aci.ledger ?? null,
+      });
+      reasoningTracker.updateAciMetrics({
+        offloadedCount,
+        savedTokens,
+        restoredCount,
+        criticalContextRecall,
+        supervisorCalls: aciSupervisorCalls,
+        supervisorMode: aciSupervisorMode,
+        supervisorModel: aciSupervisorModel,
+        epochTransitions,
+      });
+    };
     let taskContract = null;
     let lastContractFilesReadCount = -1;
     let lastContractReadiness = null;
@@ -561,6 +691,72 @@ export class AgentLoop {
           maxTokens: baseMaxOutputTokens,
           signal,
         };
+        if (aci?.engine) {
+          const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
+            currentStep: steps,
+            tools: requestOptions.tools,
+          });
+          if (epochProbe?.triggered) {
+            let keepRefs = [];
+            let compressRefs = [];
+            const candidates = extractAciSupervisorCandidates(requestOptions.messages, steps);
+            if (aci.supervisor && candidates.length > 0) {
+              const supStatus = aci.supervisor.getConfig?.() ?? null;
+              if (supStatus) {
+                aciSupervisorMode = supStatus.enabled ? supStatus.mode : 'off';
+              }
+              const lastErrFp = reasoningTracker.errorFingerprints.at(-1)?.summary ?? '';
+              const supRes = await aci.supervisor
+                .supervise({
+                  query: input,
+                  candidates,
+                  errorSummary: lastErrFp,
+                  budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (${epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
+                  signal,
+                })
+                .catch(() => null);
+              if (supRes && !supRes.bypassed) {
+                if (supRes.model) {
+                  aciSupervisorCalls += 1;
+                  aciSupervisorModel = supRes.model;
+                }
+                keepRefs = Array.isArray(supRes.keepRefs) ? supRes.keepRefs : [];
+                compressRefs = Array.isArray(supRes.compressRefs) ? supRes.compressRefs : [];
+              }
+            }
+            const compResult = aci.engine.compress(requestOptions.messages, {
+              currentStep: steps,
+              tools: requestOptions.tools,
+              keepRefs,
+              compressRefs,
+              activeMutationTargets: [...reasoningTracker.filesMutated],
+            });
+            if (compResult?.triggered && compResult.pairClosedValid !== false && Array.isArray(compResult.messages)) {
+              messages = [...compResult.messages];
+              requestOptions = { ...requestOptions, messages };
+              this.eventRouter.emitPersisted({
+                sessionId,
+                turnId,
+                type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
+                data: {
+                  stage: 'aci_dtoc',
+                  reason: compResult.reason,
+                  epoch: compResult.epoch,
+                  watermark: compResult.watermark,
+                  step: steps,
+                  compressedCount: compResult.compressedCount,
+                  tokens: {
+                    before: compResult.tokensBefore,
+                    after: compResult.tokensAfter,
+                  },
+                  pairClosedValid: compResult.pairClosedValid,
+                },
+                audit: false,
+              });
+            }
+          }
+          syncAciMetrics();
+        }
         if (contextManager) {
           sm.transition(TURN_PHASES.COMPACTING, { step: steps, persist: profile?.persistTurn !== false });
           const compacted = await contextManager.prepareRequest(requestOptions, {
@@ -1301,6 +1497,7 @@ export class AgentLoop {
         persist: profile?.persistTurn !== false,
       });
 
+      syncAciMetrics();
       const reasoningMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: outcome.status === 'completed' && outcome.verdict?.accepted !== false,
         stopReason,
@@ -1338,6 +1535,7 @@ export class AgentLoop {
         cacheWriteTokens: tm.totalCacheWrite,
         cacheEligibleInputTokens: tm.totalCacheEligible,
       };
+      syncAciMetrics();
       const catchMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: false,
         stopReason: classified.code || err?.code || 'aborted',

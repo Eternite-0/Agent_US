@@ -192,6 +192,7 @@ export function createWorkspaceTools({
   runSubagent = null,
   orchestrateSwarm = null,
   sendAgentMessage = null,
+  resolveContextRef = null,
   signal = undefined,
 }) {
   const permits = new ExecutePermitRegistry();
@@ -348,6 +349,7 @@ export function createWorkspaceTools({
       runSubagent,
       orchestrateSwarm,
       sendAgentMessage,
+      resolveContextRef,
       signal,
     }),
     createInspectRepositoryTool({

@@ -45,6 +45,7 @@ import {
   recordArmExperienceMemory,
   resolveRealTrialFirstFixSucceeded,
   runAutonomousReasoningBenchmark,
+  seedVerifiedExperienceFromJsonl,
 } from '../../scripts/benchmark-autonomous-reasoning.mjs';
 import { Store } from '../../src/store.js';
 import { compactTwoStage } from '../../src/context.js';
@@ -1106,5 +1107,165 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     assert.deepEqual(cancelDiag.reasoningMetrics?.filesMutated, ['src/recovery.js']);
     assert.equal(cancelDiag.repairRounds, 1);
     assert.equal(cancelDiag.turnErrorCode, null);
+  });
+
+  test('Stage 3: 11 metrics, cacheHitRate, 4-way context_retrieval attribution, and --experience-seed trusted verifier gate', () => {
+    assert.equal(FAILURE_ATTRIBUTIONS.CONTEXT_RETRIEVAL, 'context_retrieval');
+    assert.equal(
+      classifyAutonomousReasoningAttribution({ passed: false, errorCode: 'CONTEXT_EVICTED' }),
+      FAILURE_ATTRIBUTIONS.CONTEXT_RETRIEVAL,
+    );
+    assert.equal(
+      classifyAutonomousReasoningAttribution({ passed: false, failureCategory: 'blind_edit_without_reading' }),
+      FAILURE_ATTRIBUTIONS.CONTEXT_RETRIEVAL,
+    );
+    assert.equal(
+      classifyAutonomousReasoningAttribution({
+        passed: false,
+        rootCauseAccurate: false,
+        criticalContextRecall: 0.25,
+      }),
+      FAILURE_ATTRIBUTIONS.CONTEXT_RETRIEVAL,
+    );
+
+    const agg = computeAutonomousReasoningMetrics([
+      {
+        taskId: 'ar-01-unfamiliar-codebase',
+        status: 'passed',
+        passed: true,
+        rootCauseAccurate: true,
+        firstFixSucceeded: true,
+        regressionPassed: true,
+        contractCompliance: true,
+        criticalContextRecall: 1,
+        tokenUsage: { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 600 },
+        durationMs: 1000,
+      },
+      {
+        taskId: 'ar-02-complex-bug-root-cause',
+        status: 'failed',
+        passed: false,
+        rootCauseAccurate: false,
+        firstFixSucceeded: false,
+        regressionPassed: false,
+        contractCompliance: false,
+        criticalContextRecall: 0.5,
+        tokenUsage: { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 200 },
+        durationMs: 2000,
+      },
+    ]);
+    assert.equal(agg.contractCompliance, 0.5);
+    assert.equal(agg.criticalContextRecall, 0.75);
+    assert.equal(agg.cacheHitRate, 0.4);
+    assert.equal(agg.attributionCounts.none, 1);
+    assert.equal(agg.attributionCounts.context_retrieval, 1);
+    assert.equal(agg.attributionBreakdown.context_retrieval.count, 1);
+    assert.equal(agg.attributionBreakdown.context_retrieval.rate, 0.5);
+
+    const parsed = parseCliArgs([
+      '--mode',
+      'real',
+      '--experience-db',
+      '/tmp/exp.sqlite',
+      '--experience-seed',
+      '/tmp/seed.jsonl',
+      '--experience-arm',
+      'candidate',
+    ]);
+    assert.equal(parsed.experienceDb, '/tmp/exp.sqlite');
+    assert.equal(parsed.experienceSeed, '/tmp/seed.jsonl');
+    assert.equal(parsed.experienceArm, 'candidate');
+
+    const seedDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-seed-'));
+    const seedStore = new Store(join(seedDir, 'exp.sqlite'));
+    try {
+      const seedMemory = new ExperienceMemoryService({ store: seedStore });
+      const seedJsonl = join(seedDir, 'seed.jsonl');
+      writeFileSync(
+        seedJsonl,
+        [
+          JSON.stringify({
+            taskId: 'ar-01-unfamiliar-codebase',
+            passed: true,
+            status: 'passed',
+            assistantExcerpt: 'TRUSTED_PASS_SEED_PORT_8420',
+            judge: {
+              passed: true,
+              hardVetoed: false,
+              evidence: {
+                hiddenAcceptancePassed: true,
+                baselineTestsUntampered: true,
+                historyUntouched: true,
+                independentVerdictSource: 'trusted_server_verifier',
+                actualChangedFiles: ['src/index.js'],
+              },
+            },
+          }),
+          JSON.stringify({
+            taskId: 'ar-02-complex-bug-root-cause',
+            passed: true,
+            status: 'passed',
+            assistantExcerpt: 'FORGED_CLIENT_CLAIM_SHOULD_SKIP',
+            judge: {
+              passed: true,
+              evidence: {
+                hiddenAcceptancePassed: true,
+                independentVerdictSource: 'client_self_claim',
+              },
+            },
+          }),
+          JSON.stringify({
+            taskId: 'ar-03-multi-file-feature',
+            passed: true,
+            hardVetoed: true,
+            assistantExcerpt: 'HARD_VETOED_SHOULD_SKIP',
+            judge: {
+              passed: true,
+              hardVetoed: true,
+              evidence: { hiddenAcceptancePassed: true, independentVerdictSource: 'trusted_server_verifier' },
+            },
+          }),
+          JSON.stringify({
+            taskId: 'ar-04-cross-module-refactor',
+            passed: false,
+            status: 'failed',
+            assistantExcerpt: 'FAILED_RUN_SHOULD_SKIP',
+            judge: {
+              passed: false,
+              evidence: { hiddenAcceptancePassed: false, independentVerdictSource: 'trusted_server_verifier' },
+            },
+          }),
+        ].join('\n'),
+        'utf8',
+      );
+      const res = seedVerifiedExperienceFromJsonl({
+        jsonlPath: seedJsonl,
+        store: seedStore,
+        memory: seedMemory,
+        dataset: AUTONOMOUS_REASONING_DATASET,
+      });
+      assert.equal(res.loadedRows, 4);
+      assert.equal(res.seededCount, 1);
+      assert.equal(res.skippedCount, 3);
+
+      const okItems = seedMemory.retrieve({ projectId: 'ar-01-unfamiliar-codebase', verifiedOnly: true, tokenBudget: 4000 }).items;
+      assert.equal(okItems.length, 1);
+      assert.equal(okItems[0].verified, true);
+      assert.equal(
+        seedMemory.retrieve({ projectId: 'ar-02-complex-bug-root-cause', tokenBudget: 4000 }).items.length,
+        0,
+      );
+      assert.equal(
+        seedMemory.retrieve({ projectId: 'ar-03-multi-file-feature', tokenBudget: 4000 }).items.length,
+        0,
+      );
+      assert.equal(
+        seedMemory.retrieve({ projectId: 'ar-04-cross-module-refactor', tokenBudget: 4000 }).items.length,
+        0,
+      );
+    } finally {
+      seedStore.close();
+      rmSync(seedDir, { recursive: true, force: true });
+    }
   });
 });

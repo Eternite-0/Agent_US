@@ -109,6 +109,9 @@ export class ContextAssembler {
     skillsText = '',
     planState = null,
     hookContexts = [],
+    targetFiles = [],
+    errorSignatures = [],
+    experienceVerifiedOnly = true,
   }) {
     // 1. Static system prompt (byte-identical across turns and context changes!)
     const staticBase = buildStaticSystemPrompt(nonce);
@@ -172,9 +175,27 @@ export class ContextAssembler {
     }
 
     // 3. Build current volatile sections and compute diff-only tail notes against messages so far
-    const experienceMemory = this.experienceMemoryService && projectId
-      ? formatExperienceMemory(this.experienceMemoryService.retrieve({ projectId, query: memoryQuery, limit: 8, tokenBudget: memoryTokenBudget }))
-      : '';
+    const experienceResult = this.experienceMemoryService && projectId
+      ? this.experienceMemoryService.retrieve({
+          projectId,
+          query: memoryQuery,
+          limit: 8,
+          tokenBudget: memoryTokenBudget,
+          verifiedOnly: experienceVerifiedOnly,
+          targetFiles,
+          errorSignatures,
+        })
+      : null;
+    const retrievedExperienceItems = experienceResult?.items ?? [];
+    const experienceMemoryTelemetry = {
+      queried: Boolean(this.experienceMemoryService && projectId),
+      verifiedOnly: Boolean(experienceVerifiedOnly),
+      retrievedCount: retrievedExperienceItems.length,
+      verifiedCount: retrievedExperienceItems.filter((item) => item.verified === true).length,
+      usedTokens: Number(experienceResult?.usedTokens ?? 0),
+      sources: [...new Set(retrievedExperienceItems.map((item) => item.source).filter(Boolean))],
+    };
+    const experienceMemory = experienceResult ? formatExperienceMemory(experienceResult) : '';
     const retrievedMem = experienceMemory || this.memoryService?.retrieve({
       query: memoryQuery,
       workspaceRoot,
@@ -269,6 +290,7 @@ export class ContextAssembler {
       sections,
       deltaCount: deltas.length,
       activeCompactionId: activeCompaction?.id ?? null,
+      experienceMemoryTelemetry,
     };
   }
 }

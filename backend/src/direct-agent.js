@@ -58,6 +58,9 @@ import { TokenBudgetManager } from './context/budget.js';
 import { ProjectMemoryService } from './context/memory.js';
 import { MultiStageCompactor } from './context/compaction.js';
 import { ContextAssembler } from './context/assembler.js';
+import { ReversibleContextStore, ContextEvidenceLedger } from './context/aci-store.js';
+import { ACIEngine } from './context/aci-engine.js';
+import { ContextSupervisor } from './context/supervisor.js';
 import {
   AgentCapabilityRegistry,
   ModelCapabilityRegistry,
@@ -175,6 +178,7 @@ export class DirectAgentRuntime {
     this.steeringQueues = new Map(); // sessionId -> string[]
     this.readFileStates = new Map(); // sessionId -> Map(relPath -> { sha256, at })
     this.sessionSandboxes = new Map(); // sessionId -> { sandbox, disableWorkspaceHooks, disableWorkspaceMcp, forcedToolDeny }
+    this.sessionProjects = new Map(); // sessionId -> projectId override
 
     this.processManager = new BackgroundProcessManager();
     this.mcpHub = new McpHub({
@@ -195,6 +199,11 @@ export class DirectAgentRuntime {
       store: this.store,
       eventRouter: this.eventRouter,
       budgetManager: this.budgetManager,
+    });
+    this.contextSupervisor = new ContextSupervisor({
+      store: this.store,
+      pool: this.pool,
+      adapter: this.adapter,
     });
 
     this.recoveryWorker = new RecoveryWorker({
@@ -228,6 +237,7 @@ export class DirectAgentRuntime {
         this.steeringQueues.delete(sessionId);
         this.readFileStates.delete(sessionId);
         this.sessionSandboxes.delete(sessionId);
+        this.sessionProjects.delete(sessionId);
         this.contextAssembler.clearSession(sessionId);
       },
       onBeforeRewind: (sessionId) => {
@@ -746,6 +756,7 @@ export class DirectAgentRuntime {
       disableWorkspaceHooks = undefined,
       disableWorkspaceMcp = undefined,
       callerSessionId = null,
+      projectId = null,
       ...sessionOpts
     } = opts ?? {};
 
@@ -757,7 +768,11 @@ export class DirectAgentRuntime {
     const activeProfile = sandboxProfile ?? (inheritedCfg ? 'benchmark' : null);
     const useBenchmarkSandbox = Boolean(sandbox || inheritedCfg || activeProfile === 'benchmark');
     if (!useBenchmarkSandbox) {
-      return this.sessionRepo.createSession(sessionOpts);
+      const created = this.sessionRepo.createSession(sessionOpts);
+      if (projectId && String(projectId).trim()) {
+        this.sessionProjects.set(created.id, String(projectId).trim());
+      }
+      return created;
     }
 
     const resolvedSandbox =
@@ -780,6 +795,10 @@ export class DirectAgentRuntime {
       ...sessionOpts,
       toolDeny: mergedToolDeny,
     });
+
+    if (projectId && String(projectId).trim()) {
+      this.sessionProjects.set(created.id, String(projectId).trim());
+    }
 
     this.sessionSandboxes.set(created.id, {
       sandbox: resolvedSandbox,
@@ -1098,6 +1117,7 @@ export class DirectAgentRuntime {
 
   #finalizeTurnExperienceAndTelemetry({
     session,
+    projectId = null,
     sessionId,
     turnId,
     workspaceRoot,
@@ -1150,7 +1170,7 @@ export class DirectAgentRuntime {
     if (typeof expMemory.distillTurnExperience === 'function') {
       const distilled = safeIsolateSideEffect(() =>
         expMemory.distillTurnExperience({
-          projectId: session?.projectId ?? workspaceRoot,
+          projectId: projectId ?? session?.projectId ?? this.sessionProjects.get(sessionId) ?? workspaceRoot,
           input,
           summary,
           workspaceRoot,
@@ -1174,7 +1194,7 @@ export class DirectAgentRuntime {
     if (!turnIsSynthetic && expMemory.recordExecutionCandidates && (distilledCount === 0 || hasTaggedLines)) {
       safeIsolateSideEffect(() =>
         expMemory.recordExecutionCandidates({
-          projectId: session?.projectId ?? workspaceRoot,
+          projectId: projectId ?? session?.projectId ?? this.sessionProjects.get(sessionId) ?? workspaceRoot,
           source: 'direct_turn',
           sourceTaskId: turnId,
           sessionId,
@@ -1698,6 +1718,35 @@ export class DirectAgentRuntime {
         ? this.#scopeSandboxForWorkspace(sbxCfg.sandbox, workspaceRoot)
         : this.sandbox;
 
+      contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
+      const aciStore = new ReversibleContextStore(this.store);
+      const aciLedger = new ContextEvidenceLedger();
+      const supervisorCfg = this.contextSupervisor.getConfig();
+      const aciEngine = new ACIEngine({
+        store: this.store,
+        aciStore,
+        ledger: aciLedger,
+        maxTotalTokens: Math.min(200_000, contextWindow),
+        watermarks: supervisorCfg.epochWatermarks,
+      });
+      const resolveContextRef = (rawRef) => {
+        try {
+          const clean = String(rawRef ?? '').trim().replace(/^ref:/i, '').replace(/^aci:\/\//i, '');
+          const meta = aciStore.getRef(clean);
+          const expanded = aciEngine.expand(clean, { level: 'verbatim' });
+          if (expanded && typeof expanded.text === 'string') {
+            return { content: expanded.text, sha256: meta?.sha256 ?? null };
+          }
+          const raw = aciStore.restore(clean);
+          if (typeof raw === 'string') {
+            return { content: raw, sha256: meta?.sha256 ?? null };
+          }
+        } catch {
+          return null;
+        }
+        return null;
+      };
+
       const tools = createWorkspaceTools({
         workspaceRoot,
         dataRoot: this.dataRoot,
@@ -1711,6 +1760,7 @@ export class DirectAgentRuntime {
         processManager: this.processManager,
         sandbox: turnSandbox,
         mcpTools,
+        resolveContextRef,
         signal,
         onHookConfigMutated: ({ path, toolName }) =>
           this.hookTrust.onConfigMutated({ filePath: path, toolName }),
@@ -1769,6 +1819,7 @@ export class DirectAgentRuntime {
 
       const currentSession = this.getSession(sessionId);
       sessionObj = currentSession;
+      const sessionProjectId = currentSession.projectId ?? this.sessionProjects.get(sessionId) ?? workspaceRoot;
       const assembled = this.contextAssembler.assemble({
         session: currentSession,
         turnId,
@@ -1780,13 +1831,14 @@ export class DirectAgentRuntime {
         permissionMode: currentSession.permissionMode || effectivePermissionMode,
         projectInstructions,
         memoryQuery: input,
-        projectId: currentSession.projectId ?? workspaceRoot,
+        projectId: sessionProjectId,
         memoryTokenBudget: 1000,
         legacyMemoryText: memoryText,
         skillsText,
         planState: currentSession.plan,
         hookContexts: startHook.additionalContexts ?? [],
       });
+      const experienceMemoryTelemetry = assembled.experienceMemoryTelemetry ?? null;
 
       // Attach shared task-tree budget ledger when a ledger exists for this session tree or session has a budget
       const rootSessionId = currentSession.rootSessionId || sessionId;
@@ -1832,6 +1884,12 @@ export class DirectAgentRuntime {
         ? filterToolsByPolicy(tools, { denyTools: effectiveTurnDenyTools })
         : tools;
       contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
+      const explicitBudgetTokens = sessionBudget?.maxTokens ?? sessionBudget?.maxTotalTokens ?? null;
+      if (explicitBudgetTokens !== null && Number.isFinite(Number(explicitBudgetTokens)) && Number(explicitBudgetTokens) > 0) {
+        aciEngine.maxTotalTokens = Math.min(200_000, contextWindow, Math.max(1024, Number(explicitBudgetTokens)));
+      } else {
+        aciEngine.maxTotalTokens = Math.min(200_000, contextWindow);
+      }
       const defaultMaxOutputTokens = Math.min(
         16384,
         Math.max(4096, Number(this.pool.getModelMaxOutput?.(effectiveModel) || 16384)),
@@ -1846,6 +1904,13 @@ export class DirectAgentRuntime {
         effort,
         workspaceRoot,
         execution: evidenceContract ? { evidenceContract } : null,
+        aci: {
+          engine: aciEngine,
+          aciStore,
+          ledger: aciLedger,
+          supervisor: this.contextSupervisor,
+          criticalFiles: evidenceContract?.requiredChangedFiles ?? [],
+        },
         messages: assembled.messages,
         tools: effectiveTools,
         // Presentation only: the dispatcher still authorizes the actual arguments at execution.
@@ -2124,6 +2189,7 @@ export class DirectAgentRuntime {
               evidenceCount: Number(evidenceCount || 0),
               durationMs,
               ...(reasoningMetrics ? { reasoningMetrics } : {}),
+              ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
             },
             audit: false,
             at: finishedAt,
@@ -2305,6 +2371,7 @@ export class DirectAgentRuntime {
             evidenceCount: Number(evidenceCount || 0),
             text: excerpt(finalAssistantText, 4000),
             ...(reasoningMetrics ? { reasoningMetrics } : {}),
+            ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
           },
           audit: false,
           at: finishedAt,
@@ -2331,6 +2398,7 @@ export class DirectAgentRuntime {
             durationMs,
             evidenceCount: Number(evidenceCount || 0),
             ...(reasoningMetrics ? { reasoningMetrics } : {}),
+            ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
           }),
         );
 

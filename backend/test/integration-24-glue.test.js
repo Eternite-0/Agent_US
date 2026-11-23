@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import Fastify from 'fastify';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -8,6 +9,7 @@ import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
+import { v1Routes } from '../src/v1-routes.js';
 import { MultiStageCompactor } from '../src/context/compaction.js';
 import { AgentRuntimeKernel } from '../src/kernel/runtime.js';
 import { ExecutionReasoningTracker } from '../src/kernel/execution-reasoning.js';
@@ -37,6 +39,16 @@ class ScriptedAdapter extends LlmAdapter {
     });
     yield* this.handler(options, idx);
   }
+}
+
+async function waitTurnDone(directAgent, sessionId, turnId, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const turn = directAgent.listTurns(sessionId).find((item) => item.id === turnId);
+    if (turn && ['completed', 'failed', 'cancelled'].includes(turn.state)) return turn;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for turn ${turnId}`);
 }
 
 test('glue: AgentLoop forwards reasoningState to MultiStageCompactor preserving verification/falsified/stuck state and static system prompt', async (t) => {
@@ -942,4 +954,302 @@ test('glue: Wave 2 compute_file_digest confinement, expand_context lossless rest
   assert.equal(contractTurn.status, 'completed');
   assert.equal(sawContractNudge, true);
   assert.equal(contractTurn.reasoningMetrics?.contractComplianceSignals?.ready, true);
+});
+
+test('Step 3: DirectAgent + AgentLoop ACI Epoch DTOC, read-only Supervisor via v1Routes, KV cache invariance, and expand_context roundtrip', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-step3-aci-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-step3-aci-ws-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  const adjA = ['fast', 'safe', 'clean', 'strict', 'pure', 'lazy', 'async', 'sync', 'cold', 'warm', 'deep', 'flat'];
+  const nounB = ['Parser', 'Router', 'Ledger', 'Cache', 'Codec', 'Guard', 'Planner', 'Store', 'Broker', 'Bridge', 'Filter', 'Sorter', 'Worker', 'Client', 'Server'];
+  const verbC = ['validate', 'normalize', 'resolve', 'compute', 'dispatch', 'serialize', 'reconcile', 'compact'];
+  const linesList = [];
+  for (let i = 0; i < 125; i += 1) {
+    const fnName = `${verbC[i % verbC.length]}${nounB[Math.floor(i / verbC.length) % nounB.length]}${adjA[(i * 7) % adjA.length]}`;
+    linesList.push(`export function ${fnName}(inputPayload) { return inputPayload?.status === '${adjA[(i * 3) % adjA.length]}' ? '${nounB[(i * 5) % nounB.length]}' : null; }`);
+  }
+  const paddingBlock = linesList.join('\n');
+  const criticalSource = `${paddingBlock}\nexport function computeRate(x) { return x * 2; }\n`;
+  writeFileSync(join(workDir, 'src', 'target.js'), criticalSource, 'utf8');
+  writeFileSync(join(workDir, 'src', 'notes.txt'), `REFERENCE_NOTES\n${paddingBlock}\n`, 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.createAccount({
+    preset: 'workbuddy',
+    label: 'aci-test-pool',
+    credential: 'sk-test-aci-pool-0001',
+    protocol: 'openai',
+    endpoint: 'https://api.example.invalid/v1',
+    models: ['main-model', 'fast-supervisor'],
+  });
+  pool.setDefaultModel('main-model');
+
+  const mainSystemPrefixes = [];
+  const supervisorCalls = [];
+  let mainTurnIdx = 0;
+  let capturedRefId = null;
+
+  class AciDualAdapter extends LlmAdapter {
+    async *stream(opts) {
+      // Read-only ContextSupervisor call (`tools: []` enforced)
+      if (opts.model === 'fast-supervisor' || (Array.isArray(opts.tools) && opts.tools.length === 0 && /ContextSupervisor/i.test(String(opts.system ?? '')))) {
+        assert.deepEqual(opts.tools, [], 'Supervisor MUST execute with zero tools');
+        const payload = JSON.parse(opts.messages[0].content[0].text);
+        supervisorCalls.push(payload);
+        const notesCand = payload.candidates.find((c) => /notes\.txt/.test(c.path));
+        const targetCand = payload.candidates.find((c) => /target\.js/.test(c.path));
+        yield {
+          type: 'text-delta',
+          index: 0,
+          text: JSON.stringify({
+            keepRefs: [],
+            compressRefs: [targetCand?.id, notesCand?.id].filter(Boolean),
+            rationale: 'Offload large older read outputs into lossless stubs',
+          }),
+        };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
+
+      mainTurnIdx += 1;
+      const sysText = opts.messages?.[0]?.content?.[0]?.text ?? '';
+      mainSystemPrefixes.push(sysText);
+
+      if (mainTurnIdx === 1) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r1', name: 'read_file', arguments: JSON.stringify({ path: 'src/target.js' }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (mainTurnIdx === 2) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r2', name: 'read_file', arguments: JSON.stringify({ path: 'src/notes.txt' }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (mainTurnIdx === 3) {
+        // Trigger additional steps so age >= 1 / 3 advances cleanly without breaking epoch boundary
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r3', name: 'glob', arguments: JSON.stringify({ pattern: 'src/*' }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (mainTurnIdx === 4) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-r4', name: 'glob', arguments: JSON.stringify({ pattern: '*.txt' }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (mainTurnIdx === 5) {
+        // Find the ACI stub in messages and restore target.js verbatim via expand_context
+        const stubMsg = (opts.messages ?? []).find(
+          (m) => m.role === 'tool' && /\[ACI-REF\s+(artifact:\/\/[a-f0-9]+|aci_\d+_[a-f0-9]+)/.test(m.content?.[0]?.text ?? ''),
+        );
+        const match = stubMsg?.content?.[0]?.text?.match(/\[ACI-REF\s+(artifact:\/\/[a-f0-9]+|aci_\d+_[a-f0-9]+)/);
+        assert.ok(match, 'Expected epoch DTOC compression to replace old read output with [ACI-REF ...]');
+        capturedRefId = match[1];
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-exp', name: 'expand_context', arguments: JSON.stringify({ uri: capturedRefId, startLine: 124, endLine: 130 }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (mainTurnIdx === 6) {
+        const expMsg = (opts.messages ?? []).find((m) => m.toolCallId === 'tc-exp');
+        const expText = expMsg?.content?.[0]?.text ?? '';
+        assert.match(expText, /computeRate\(x\)/, 'expand_context must restore lossless verbatim slice from ReversibleContextStore');
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-w1', name: 'write_file', arguments: JSON.stringify({ path: 'src/target.js', content: 'export function computeRate(x) { return x * 3; }\n' }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (mainTurnIdx === 7) {
+        yield { type: 'block-end', block: { type: 'tool-call', id: 'tc-b1', name: 'bash', arguments: JSON.stringify({ command: 'node --test' }) } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      yield { type: 'text-delta', index: 0, text: 'Fixed computeRate in src/target.js and verified.' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+
+  const adapter = new AciDualAdapter();
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+
+  const app = Fastify();
+  v1Routes(app, { store, providers: { models: [] }, pool, directAgent: direct });
+  await app.ready();
+
+  t.after(async () => {
+    await app.close();
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  // Configure live ContextSupervisor through v1Routes endpoints
+  const patchRes = await app.inject({
+    method: 'PATCH',
+    url: '/v1/context/supervisor',
+    payload: {
+      enabled: true,
+      mode: 'custom',
+      model: 'fast-supervisor',
+      epochWatermarks: [0.45, 0.70, 0.85],
+    },
+  });
+  assert.equal(patchRes.statusCode, 200);
+  const statusRes = await app.inject({ method: 'GET', url: '/v1/context/supervisor' });
+  assert.equal(statusRes.statusCode, 200);
+  assert.equal(statusRes.json().effectiveModel, 'fast-supervisor');
+  assert.equal(statusRes.json().toolsAllowed.length, 0);
+
+  direct.sandbox = {
+    async run() {
+      return { exitCode: 0, stdout: 'pass 1\nfail 0', stderr: '' };
+    },
+  };
+  const session = direct.createSession({
+    workspaceRoot: workDir,
+    permissionMode: 'full-access',
+    budget: { maxTokens: 19000, maxSteps: 12 },
+  });
+  const { turn } = direct.startTurn(session.id, { input: 'Update computeRate in src/target.js', maxSteps: 12 });
+  const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
+  assert.equal(settled.state, 'completed');
+
+  // Verify static system prompt byte-identity across all steps (KV Prompt Cache invariant)
+  assert.ok(mainSystemPrefixes.length >= 6);
+  for (const prefix of mainSystemPrefixes) {
+    assert.equal(prefix, mainSystemPrefixes[0], 'Static system prompt prefix must remain byte-identical across ACI epochs');
+  }
+
+  // Verify Supervisor was only invoked at epoch crossing, not every step
+  assert.ok(supervisorCalls.length >= 1 && supervisorCalls.length <= 2);
+
+  // Verify CONTEXT_COMPACTED with stage: 'aci_dtoc' and pairClosedValid: true
+  const compactedEv = store.db
+    .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='context/compacted' ORDER BY seq ASC")
+    .all(turn.id)
+    .map((r) => JSON.parse(r.data));
+  const aciEv = compactedEv.find((d) => d.stage === 'aci_dtoc');
+  assert.ok(aciEv, 'Expected context/compacted event with stage: aci_dtoc');
+  assert.equal(aciEv.pairClosedValid, true);
+
+  // Verify ACI metrics inside turn/completed reasoningMetrics
+  const completedEv = JSON.parse(
+    store.db.prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed'").get(turn.id).data,
+  );
+  const aciMetrics = completedEv.reasoningMetrics?.aciMetrics;
+  assert.ok(aciMetrics);
+  assert.ok(aciMetrics.offloadedCount >= 1);
+  assert.ok(aciMetrics.savedTokens > 0);
+  assert.ok(aciMetrics.restoredCount >= 1);
+  assert.ok(aciMetrics.epochTransitions >= 1);
+  assert.equal(aciMetrics.supervisorCalls, supervisorCalls.length);
+  assert.equal(aciMetrics.supervisorMode, 'custom');
+  assert.equal(aciMetrics.supervisorModel, 'fast-supervisor');
+  assert.equal(aciMetrics.criticalContextRecall, 1);
+});
+
+test('Step 3: ContextAssembler & DirectAgent admit ONLY verified experience memory and record retrieval telemetry', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-step3-exp-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-step3-exp-ws-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  writeFileSync(join(workDir, 'src', 'index.js'), 'export const port = 8420;\n', 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.setDefaultModel('exp-gate-model');
+  const memory = new ExperienceMemoryService({ store });
+
+  // 1. Seed unverified and forged items
+  memory.remember(
+    {
+      type: 'lesson',
+      key: 'unverified-trap',
+      content: 'UNVERIFIED_TRAP_DO_NOT_INJECT_THIS',
+      confidence: 0.99,
+      verified: true, // stripped to false because remember() is untrusted
+    },
+    { projectId: 'ar-01-proj' },
+  );
+
+  // 2. Seed one genuine trusted_server_verifier item
+  store.add(
+    'evaluation_runs',
+    {
+      id: 'eval-trusted-run-1',
+      projectId: 'ar-01-proj',
+      synthetic: true,
+      status: 'completed',
+      score: { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 },
+      results: [{ taskId: 'ar-01-unfamiliar-codebase', status: 'passed', passed: true }],
+    },
+    null,
+    null,
+    'eval-trusted-run-1',
+  );
+  memory.distillTurnExperience({
+    projectId: 'ar-01-proj',
+    input: 'Keep server port 8420',
+    summary: 'VERIFIED_TRUSTED_SERVER_LESSON_PORT_8420',
+    verdict: { verdict: 'pass', accepted: true },
+    modifiedFiles: ['src/index.js'],
+    evaluationEvidence: {
+      sourceTaskId: 'ar-01-unfamiliar-codebase',
+      evaluationRunId: 'eval-trusted-run-1',
+      projectId: 'ar-01-proj',
+      score: { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 },
+      passed: true,
+    },
+  });
+
+  const capturedPrompts = [];
+  const adapter = new ScriptedAdapter(async function* (opts) {
+    capturedPrompts.push(JSON.stringify(opts.messages ?? []));
+    yield { type: 'text-delta', index: 0, text: 'Checked port 8420.' };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  });
+
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+  direct.attachIntelligenceServices({ memory });
+
+  t.after(async () => {
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const session = direct.createSession({
+    workspaceRoot: workDir,
+    projectId: 'ar-01-proj',
+    permissionMode: 'full-access',
+  });
+  const { turn } = direct.startTurn(session.id, { input: 'Verify port setting in src/index.js' });
+  const done = await waitTurnDone(direct, session.id, turn.id, 5000);
+  assert.equal(done.state, 'completed');
+
+  const promptText = capturedPrompts[0] ?? '';
+  assert.ok(promptText.includes('VERIFIED_TRUSTED_SERVER_LESSON_PORT_8420'));
+  assert.equal(promptText.includes('UNVERIFIED_TRAP_DO_NOT_INJECT_THIS'), false);
+
+  const completedEv = JSON.parse(
+    store.db.prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed'").get(turn.id).data,
+  );
+  assert.deepEqual(completedEv.experienceMemory, {
+    queried: true,
+    verifiedOnly: true,
+    retrievedCount: 1,
+    verifiedCount: 1,
+    usedTokens: completedEv.experienceMemory.usedTokens,
+    sources: ['evaluation'],
+  });
+  assert.ok(completedEv.experienceMemory.usedTokens > 0);
 });

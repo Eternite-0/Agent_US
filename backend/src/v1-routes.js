@@ -101,7 +101,7 @@ export function v1Routes(
     startedAt = Date.now(),
   },
 ) {
-  registerIntelligenceRoutes(app, { ...(intelligence ?? {}), directAgent });
+  registerIntelligenceRoutes(app, { ...(intelligence ?? {}), directAgent, pool, store });
   if (!pool || !directAgent) return;
 
   const streams = new Set();

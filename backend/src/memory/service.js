@@ -1072,13 +1072,21 @@ export class ExperienceMemoryService {
       return rowToMemory(this.db.prepare('SELECT * FROM experience_memory WHERE id=? AND projectId=?').get(memoryId, project));
     });
   }
-  retrieve({ projectId = this.projectId, query = '', limit = 10, tokenBudget = 1_000, now = nowValue(this.clock), includeInvalid = false, targetFiles = [], errorSignatures = [] } = {}) {
+  retrieve({ projectId = this.projectId, query = '', limit = 10, tokenBudget = 1_000, now = nowValue(this.clock), includeInvalid = false, verifiedOnly = false, targetFiles = [], errorSignatures = [] } = {}) {
     const project = assertProject(projectId);
     const budget = Math.max(0, Math.min(MAX_TOKEN_BUDGET, Number(tokenBudget) || 0));
     const statuses = includeInvalid ? ['active', 'invalid'] : ['active'];
     const placeholders = statuses.map(() => '?').join(',');
     const rows = this.db.prepare(`SELECT * FROM experience_memory WHERE projectId=? AND status IN (${placeholders})`).all(project, ...statuses);
-    const ranked = this.rank(rows.map(rowToMemory), { query, now, targetFiles, errorSignatures })
+    const candidates = rows
+      .map(rowToMemory)
+      .filter((item) => !verifiedOnly || (
+        item.verified === true &&
+        item.verificationEvidence != null &&
+        typeof item.verificationEvidence === 'object' &&
+        Boolean(item.verificationEvidence.evaluationRunId)
+      ));
+    const ranked = this.rank(candidates, { query, now, targetFiles, errorSignatures })
       .filter((item) => !String(query).trim() || item.relevance > 0 || item.pathAffinity > 0 || item.errorAffinity > 0 || item.verified);
     const picked = [];
     let usedTokens = 0;

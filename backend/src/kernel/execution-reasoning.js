@@ -519,10 +519,55 @@ export class ExecutionReasoningTracker {
     this._budgetFinalCallAdvised = false;
     this._budgetPruneCount = 0;
     this.ineffectiveActionCount = 0;
+    this._aciMetrics = {
+      offloadedCount: 0,
+      savedTokens: 0,
+      restoredCount: 0,
+      criticalContextRecall: null,
+      supervisorCalls: 0,
+      supervisorMode: null,
+      supervisorModel: null,
+      epochTransitions: 0,
+    };
   }
 
   get hasUnverifiedMutationsAfterLastPass() {
     return this._lastCodeMutationSeq > this._lastPassingVerificationSeq;
+  }
+
+  updateAciMetrics(patch = null) {
+    if (!patch || typeof patch !== 'object') return;
+    if (patch.offloadedCount != null && Number.isFinite(Number(patch.offloadedCount))) {
+      this._aciMetrics.offloadedCount = Math.max(0, Math.trunc(Number(patch.offloadedCount)));
+    }
+    if (patch.savedTokens != null && Number.isFinite(Number(patch.savedTokens))) {
+      this._aciMetrics.savedTokens = Math.max(0, Math.trunc(Number(patch.savedTokens)));
+    }
+    if (patch.restoredCount != null && Number.isFinite(Number(patch.restoredCount))) {
+      this._aciMetrics.restoredCount = Math.max(0, Math.trunc(Number(patch.restoredCount)));
+    }
+    if (patch.criticalContextRecall !== undefined) {
+      if (patch.criticalContextRecall === null) {
+        this._aciMetrics.criticalContextRecall = null;
+      } else if (Number.isFinite(Number(patch.criticalContextRecall))) {
+        this._aciMetrics.criticalContextRecall = Math.max(
+          0,
+          Math.min(1, Number(Number(patch.criticalContextRecall).toFixed(4))),
+        );
+      }
+    }
+    if (patch.supervisorCalls != null && Number.isFinite(Number(patch.supervisorCalls))) {
+      this._aciMetrics.supervisorCalls = Math.max(0, Math.trunc(Number(patch.supervisorCalls)));
+    }
+    if (patch.supervisorMode !== undefined) {
+      this._aciMetrics.supervisorMode = patch.supervisorMode ? String(patch.supervisorMode) : null;
+    }
+    if (patch.supervisorModel !== undefined) {
+      this._aciMetrics.supervisorModel = patch.supervisorModel ? String(patch.supervisorModel) : null;
+    }
+    if (patch.epochTransitions != null && Number.isFinite(Number(patch.epochTransitions))) {
+      this._aciMetrics.epochTransitions = Math.max(0, Math.trunc(Number(patch.epochTransitions)));
+    }
   }
 
   updateContractEvaluation(evalResult = null) {
@@ -1193,6 +1238,7 @@ export class ExecutionReasoningTracker {
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
       stuckDetections: this.stuckDetections.map((d) => ({ ...d })),
       repairRounds: this._repairRounds,
+      aciMetrics: { ...this._aciMetrics },
     };
   }
 
@@ -1284,6 +1330,7 @@ export class ExecutionReasoningTracker {
       ),
       circuitBroken: stopReason === 'thrashing_circuit_break',
       latestVerificationPassed: latestVerification ? latestVerification.passed : null,
+      aciMetrics: { ...this._aciMetrics },
     };
   }
 }

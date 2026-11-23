@@ -47,6 +47,9 @@ function printUsage() {
     '  --lane <idx>                  Worker shard index (default: 0)',
     '  --lanes <count>               Total worker shards (default: 1)',
     '  --sandbox <strong|docker|node-permission>  Sandbox mode (default: strong)',
+    '  --experience-db <path>        SQLite path for cross-task ExperienceMemory',
+    '  --experience-seed <jsonl>     Seed DB ONLY from trusted_server_verifier-passed JSONL runs',
+    '  --experience-arm <both|candidate|baseline>  Which arm uses experience DB (default: both)',
     '  --json                        Print JSON summary to stdout',
     '  --help                        Show this help message',
   ].join('\n'));
@@ -63,6 +66,9 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     lane: 0,
     lanes: 1,
     sandbox: process.env.AGENT_US_BENCHMARK_SANDBOX_MODE || SANDBOX_MODES.STRONG,
+    experienceDb: null,
+    experienceSeed: null,
+    experienceArm: 'both',
     json: false,
     help: false,
   };
@@ -89,6 +95,12 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--lanes=')) opts.lanes = Number(arg.slice('--lanes='.length));
     else if (arg === '--sandbox' && i + 1 < argv.length) opts.sandbox = String(argv[++i]);
     else if (arg.startsWith('--sandbox=')) opts.sandbox = arg.slice('--sandbox='.length);
+    else if (arg === '--experience-db' && i + 1 < argv.length) opts.experienceDb = argv[++i];
+    else if (arg.startsWith('--experience-db=')) opts.experienceDb = arg.slice('--experience-db='.length);
+    else if (arg === '--experience-seed' && i + 1 < argv.length) opts.experienceSeed = argv[++i];
+    else if (arg.startsWith('--experience-seed=')) opts.experienceSeed = arg.slice('--experience-seed='.length);
+    else if (arg === '--experience-arm' && i + 1 < argv.length) opts.experienceArm = String(argv[++i]);
+    else if (arg.startsWith('--experience-arm=')) opts.experienceArm = arg.slice('--experience-arm='.length);
     else if (!arg.startsWith('-')) positional.push(arg);
     else throw new Error(`Unknown CLI flag: ${arg}`);
   }
@@ -98,6 +110,9 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
 
   if (!['deterministic', 'real'].includes(opts.mode)) {
     throw new Error(`Unsupported --mode "${opts.mode}"; expected deterministic or real`);
+  }
+  if (!['both', 'candidate', 'baseline'].includes(opts.experienceArm)) {
+    throw new Error(`Unsupported --experience-arm "${opts.experienceArm}"; expected both, candidate, or baseline`);
   }
   if (!Number.isInteger(opts.repeats) || opts.repeats < 1 || opts.repeats > 20) {
     throw new Error('--repeats must be an integer between 1 and 20');
@@ -188,6 +203,9 @@ export async function loadAndProbeWorktreeArm(worktreeRoot) {
     checkpointMod,
     sandboxMod,
     execReasoningMod,
+    contractReasoningMod,
+    aciEngineMod,
+    supervisorMod,
     evalServiceMod,
   ] = await Promise.all([
     importRequired(root, 'store.js'),
@@ -209,12 +227,18 @@ export async function loadAndProbeWorktreeArm(worktreeRoot) {
     importRequired(root, 'durable/checkpoint.js'),
     importRequired(root, 'tools/benchmark-sandbox.js'),
     importOptional(root, 'kernel/execution-reasoning.js'),
+    importOptional(root, 'kernel/contract-reasoning.js'),
+    importOptional(root, 'context/aci-engine.js'),
+    importOptional(root, 'context/supervisor.js'),
     importOptional(root, 'evaluation/service.js'),
   ]);
 
   // Probe behavioral capabilities dynamically without assuming fixed file contents.
   const capabilities = {
     executionReasoningTracker: Boolean(execReasoningMod?.ExecutionReasoningTracker),
+    contractReasoning: typeof contractReasoningMod?.extractTaskContract === 'function',
+    aciEngine: typeof aciEngineMod?.ACIEngine === 'function',
+    contextSupervisor: typeof supervisorMod?.ContextSupervisor === 'function',
     postEditStaleVerifier: false,
     unresolvedFailureVerifier: false,
     smartCompactionReadDedup: false,
@@ -513,6 +537,147 @@ class DeterministicProbeAdapter extends LlmAdapter {
   }
 }
 
+export function computeTrialCriticalContextRecall({ task, reasoningMetrics = null } = {}) {
+  const criticalFiles = (
+    Array.isArray(task?.metadata?.rootCauseFiles) && task.metadata.rootCauseFiles.length
+      ? task.metadata.rootCauseFiles
+      : task?.metadata?.acceptanceCriteria?.requiredChangedFiles
+  ) ?? [];
+  const normCritical = [...new Set(
+    criticalFiles.map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase()).filter(Boolean),
+  )];
+  if (!normCritical.length) return 1;
+  const readBeforeEdit = (reasoningMetrics?.rootCauseFilesReadBeforeEdit ?? [])
+    .map((f) => String(f ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase())
+    .filter(Boolean);
+  const hits = normCritical.filter((c) =>
+    readBeforeEdit.some((r) => r === c || r.endsWith(`/${c}`) || c.endsWith(`/${r}`)),
+  ).length;
+  const readRecall = hits / normCritical.length;
+  const aciRecall = reasoningMetrics?.aciMetrics?.criticalContextRecall;
+  if (
+    aciRecall != null &&
+    Number.isFinite(Number(aciRecall)) &&
+    Number(reasoningMetrics?.aciMetrics?.epochTransitions ?? 0) > 0
+  ) {
+    return Number(Math.min(readRecall, Math.max(0, Math.min(1, Number(aciRecall)))).toFixed(4));
+  }
+  return Number(readRecall.toFixed(4));
+}
+
+export function computeTrialContractCompliance({ judgment, reasoningMetrics = null } = {}) {
+  const ev = judgment?.evidence ?? {};
+  const sig = reasoningMetrics?.contractComplianceSignals ?? null;
+  const readyOk = sig?.evaluated ? sig.ready === true : true;
+  return Boolean(
+    judgment?.passed &&
+      ev.evidenceCompliant !== false &&
+      ev.historyUntouched !== false &&
+      ev.baselineTestsUntampered !== false &&
+      ev.protectedFilesUntampered !== false &&
+      ev.dependencyPolicyPassed !== false &&
+      ev.checks?.changedFiles !== false &&
+      readyOk,
+  );
+}
+
+export function seedVerifiedExperienceFromJsonl({ jsonlPath, store, memory, dataset = [] } = {}) {
+  const raw = readFileSync(jsonlPath, 'utf8');
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const taskById = new Map((dataset ?? []).map((t) => [t.id, t]));
+  let loadedRows = 0;
+  let seededCount = 0;
+  let skippedCount = 0;
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    let row = null;
+    try {
+      row = JSON.parse(lines[idx]);
+    } catch {
+      skippedCount += 1;
+      continue;
+    }
+    loadedRows += 1;
+    const ev = row?.judge?.evidence ?? row?.evidence ?? null;
+    const isTrustedVerifiedPass = Boolean(
+      row &&
+        typeof row === 'object' &&
+        row.taskId &&
+        row.passed === true &&
+        row.hardVetoed !== true &&
+        row.judge?.hardVetoed !== true &&
+        (row.status === undefined || row.status === 'passed') &&
+        ev?.hiddenAcceptancePassed === true &&
+        ev?.baselineTestsUntampered !== false &&
+        ev?.historyUntouched !== false &&
+        ev?.independentVerdictSource === 'trusted_server_verifier',
+    );
+    if (!isTrustedVerifiedPass) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const taskId = String(row.taskId);
+    const evalRunId = `seed-eval-${idx + 1}-${taskId}`;
+    let existing = null;
+    if (typeof store?.get === 'function') {
+      try {
+        existing = store.get('evaluation_runs', evalRunId);
+      } catch {
+        existing = null;
+      }
+    }
+    if (!existing && typeof store?.add === 'function') {
+      store.add(
+        'evaluation_runs',
+        {
+          id: evalRunId,
+          benchmarkId: AUTONOMOUS_REASONING_BENCHMARK_ID,
+          benchmarkVersion: VERSION,
+          status: 'completed',
+          projectId: taskId,
+          evaluationProjectId: taskId,
+          synthetic: true,
+          score: { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 },
+          results: [{ taskId, status: 'passed', passed: true }],
+          createdAt: Date.now(),
+          finishedAt: Date.now(),
+        },
+        null,
+        null,
+        evalRunId,
+      );
+    }
+
+    const taskObj = taskById.get(taskId) ?? null;
+    const distilled = memory.distillTurnExperience({
+      projectId: taskId,
+      input: taskObj?.objective ?? taskObj?.prompt ?? taskId,
+      summary: row.assistantExcerpt || `Verified solution for ${taskId}`,
+      verdict: { verdict: 'pass', accepted: true },
+      reasoningMetrics: row.reasoningMetrics ?? null,
+      modifiedFiles: Array.isArray(ev?.actualChangedFiles) ? ev.actualChangedFiles : [],
+      source: 'evaluation',
+      sourceTaskId: taskId,
+      runId: evalRunId,
+      sourceArtifact: ev?.artifactDigest ?? null,
+      evaluationEvidence: {
+        sourceTaskId: taskId,
+        evaluationRunId: evalRunId,
+        projectId: taskId,
+        score: { total: 1, passed: 1, failed: 0, cancelled: 0, timedOut: 0 },
+        passed: true,
+      },
+    });
+    if (Array.isArray(distilled) && distilled.length > 0 && distilled.every((d) => d.verified === true)) {
+      seededCount += distilled.length;
+    } else {
+      skippedCount += 1;
+    }
+  }
+  return { loadedRows, seededCount, skippedCount };
+}
+
 export function recordArmExperienceMemory({
   store,
   memory,
@@ -802,6 +967,12 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
       emittedRepairEvents.length,
     );
 
+    const inputTok = Number(loopResult.usage?.inputTokens ?? 0);
+    const cacheReadTok = Number(loopResult.usage?.cacheReadTokens ?? 0);
+    const criticalContextRecall = computeTrialCriticalContextRecall({ task, reasoningMetrics: rm });
+    const contractCompliance = computeTrialContractCompliance({ judgment, reasoningMetrics: rm });
+    const cacheHitRate = inputTok > 0 ? Number(Math.min(1, cacheReadTok / inputTok).toFixed(4)) : 0;
+
     return {
       taskId: task.id,
       area: task.area,
@@ -815,6 +986,9 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
       rootCauseAccurate: Boolean(judgment.evidence.rootCauseMatch),
       firstFixSucceeded: Boolean(judgment.passed && repairRounds === 0 && !rm.selfCorrectionRecovered),
       regressionPassed: Boolean(judgment.evidence.regressionPassed),
+      contractCompliance,
+      criticalContextRecall,
+      cacheHitRate,
       ineffectiveActionCount: Number(rm.ineffectiveActionCount ?? (judgment.passed ? 0 : 1)),
       replanTriggered,
       replanSucceeded: replanTriggered && replanSucceeded && judgment.passed,
@@ -1021,6 +1195,7 @@ export function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], 
   const callMetaById = buildCallMetaMap(assistantMessageRows);
   const stepByCallId = new Map();
   let reasoningMetrics = null;
+  let experienceMemory = null;
   const thrashingWarnings = [];
   let repairRounds = 0;
   let turnErrorCode = null;
@@ -1039,6 +1214,9 @@ export function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], 
     } else if (type === 'turn/completed' || type === 'turn/failed' || type === 'turn/cancelled') {
       if (data.reasoningMetrics && typeof data.reasoningMetrics === 'object') {
         reasoningMetrics = safeRedactValue(data.reasoningMetrics, benchKey);
+      }
+      if (data.experienceMemory && typeof data.experienceMemory === 'object') {
+        experienceMemory = safeRedactValue(data.experienceMemory, benchKey);
       }
       if (type === 'turn/failed' && data.code) {
         turnErrorCode = String(data.code);
@@ -1067,6 +1245,7 @@ export function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], 
 
   return {
     reasoningMetrics,
+    experienceMemory,
     thrashingWarnings,
     repairRounds,
     turnErrorCode,
@@ -1074,13 +1253,13 @@ export function extractTurnDiagnosticsFromEvents(eventRows = [], receipts = [], 
   };
 }
 
-async function runRealArmTrial({ task, armName, armRuntime, rep, position, benchKey, endpoint, requestedModel, judgeSandbox }) {
+async function runRealArmTrial({ task, armName, armRuntime, rep, position, benchKey, endpoint, requestedModel, judgeSandbox, experienceDbPath = null, experienceArm = 'both' }) {
   const started = performance.now();
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-ar-real-${armName}-`));
   const workspaceRoot = await instantiateAutonomousReasoningWorkspace(task, {
     prefix: `agent-us-ar-realws-${armName}-`,
   });
-  const { Store, AccountPool, DirectAgentRuntime, BenchmarkSandbox: ArmSandbox } = armRuntime.modules;
+  const { Store, AccountPool, DirectAgentRuntime, BenchmarkSandbox: ArmSandbox, ExperienceMemoryService } = armRuntime.modules;
   const store = new Store(join(stateDir, 'eval.sqlite'));
   const pool = new AccountPool(store, { root: stateDir });
   pool.createAccount({
@@ -1097,6 +1276,14 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     dataRoot: stateDir,
     defaultWorkspace: workspaceRoot,
   });
+  const useExperience = Boolean(experienceDbPath) && (experienceArm === 'both' || experienceArm === armName);
+  let expStore = null;
+  let expMemory = null;
+  if (useExperience) {
+    expStore = new Store(experienceDbPath);
+    expMemory = new ExperienceMemoryService({ store: expStore });
+    direct.attachIntelligenceServices?.({ memory: expMemory });
+  }
   const allowWorkspaceNodeCli = Boolean(task.metadata?.sandboxIsolation?.allowWorkspaceNodeCli);
   const sessionSandbox = new ArmSandbox({
     ...buildSandboxOptions(judgeSandbox.mode),
@@ -1152,6 +1339,7 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
   try {
     const session = direct.createSession({
       workspaceRoot,
+      projectId: task.id,
       model: requestedModel,
       permissionMode: 'auto-safe',
       budget: { maxSteps: task.resourceBudget?.maxSteps ?? 20, maxOutputTokens: 8192, maxTotalTokens: 160_000 },
@@ -1264,6 +1452,42 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     }
     const durationMs = Math.round(performance.now() - started);
     const assistantExcerpt = safeRedactValue(String(assistantMsgs?.content ?? '').slice(0, 600), benchKey);
+    const criticalContextRecall = computeTrialCriticalContextRecall({
+      task,
+      reasoningMetrics: diagnostics.reasoningMetrics,
+    });
+    const contractCompliance = computeTrialContractCompliance({
+      judgment,
+      reasoningMetrics: diagnostics.reasoningMetrics,
+    });
+    const cacheHitRate = inputTokens > 0 ? Number(Math.min(1, cacheReadTokens / inputTokens).toFixed(4)) : 0;
+
+    if (
+      expStore &&
+      expMemory &&
+      judgment.passed &&
+      !timedOut &&
+      judgment.evidence?.independentVerdictSource === 'trusted_server_verifier'
+    ) {
+      try {
+        recordArmExperienceMemory({
+          store: expStore,
+          memory: expMemory,
+          task,
+          armName,
+          rep,
+          workspaceRoot,
+          verdict: { verdict: 'pass', accepted: true },
+          reasoningMetrics: diagnostics.reasoningMetrics,
+          toolReceipts: enrichedReceipts,
+          modifiedFiles: judgment.evidence.actualChangedFiles ?? [],
+          passed: true,
+          reason: judgment.reason,
+        });
+      } catch {
+        // Never allow optional experience persistence to disturb trial reporting
+      }
+    }
 
     return {
       taskId: task.id,
@@ -1285,6 +1509,9 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
         reasoningMetrics: diagnostics.reasoningMetrics,
       }),
       regressionPassed: Boolean(judgment.evidence.regressionPassed),
+      contractCompliance,
+      criticalContextRecall,
+      cacheHitRate,
       ineffectiveActionCount: enrichedReceipts.filter((r) => r.status === 'failed' || r.status === 'rejected_before_effect').length,
       replanTriggered: totalRepairRounds > 0,
       replanSucceeded: totalRepairRounds > 0 && judgment.passed,
@@ -1304,6 +1531,7 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
       toolCallTrace: diagnostics.toolCallTrace,
       thrashingWarnings: diagnostics.thrashingWarnings,
       reasoningMetrics: diagnostics.reasoningMetrics,
+      experienceMemory: diagnostics.experienceMemory,
       assistantExcerpt,
       judge: judgment,
     };
@@ -1311,6 +1539,7 @@ async function runRealArmTrial({ task, armName, armRuntime, rep, position, bench
     globalThis.fetch = originalFetch;
     unsub?.();
     await direct.close();
+    expStore?.close();
     store.close();
     rmSync(stateDir, { recursive: true, force: true });
     await removeFixtureWorkspace(workspaceRoot).catch(() => {});
@@ -1581,6 +1810,32 @@ export async function runAutonomousReasoningBenchmark(opts) {
     loadAndProbeWorktreeArm(candidateRoot),
   ]);
 
+  let tempExperienceDir = null;
+  let effectiveExperienceDb = opts.experienceDb ? resolve(opts.experienceDb) : null;
+  let experienceSeeding = null;
+  if (!effectiveExperienceDb && opts.experienceSeed) {
+    tempExperienceDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-expdb-'));
+    effectiveExperienceDb = join(tempExperienceDir, 'experience.sqlite');
+  }
+  if (effectiveExperienceDb) {
+    mkdirSync(dirname(effectiveExperienceDb), { recursive: true });
+    if (opts.experienceSeed) {
+      const seedRuntime = candidateRuntime;
+      const seedStore = new seedRuntime.modules.Store(effectiveExperienceDb);
+      try {
+        const seedMemory = new seedRuntime.modules.ExperienceMemoryService({ store: seedStore });
+        experienceSeeding = seedVerifiedExperienceFromJsonl({
+          jsonlPath: resolve(opts.experienceSeed),
+          store: seedStore,
+          memory: seedMemory,
+          dataset,
+        });
+      } finally {
+        seedStore.close();
+      }
+    }
+  }
+
   if (opts.output) {
     mkdirSync(dirname(opts.output), { recursive: true });
     writeFileSync(opts.output, '', { encoding: 'utf8', mode: 0o600 });
@@ -1589,36 +1844,44 @@ export async function runAutonomousReasoningBenchmark(opts) {
   const baselineTrials = [];
   const candidateTrials = [];
 
-  for (let rep = 0; rep < opts.repeats; rep++) {
-    for (const [idx, task] of dataset.entries()) {
-      if (idx % opts.lanes !== opts.lane) continue;
-      const order = (rep + idx) % 2 === 0 ? ['baseline', 'candidate'] : ['candidate', 'baseline'];
-      for (const [position, armName] of order.entries()) {
-        const armRuntime = armName === 'baseline' ? baselineRuntime : candidateRuntime;
-        const trial =
-          opts.mode === 'real'
-            ? await runRealArmTrial({
-                task,
-                armName,
-                armRuntime,
-                rep,
-                position,
-                benchKey,
-                endpoint,
-                requestedModel,
-                judgeSandbox,
-              })
-            : await runDeterministicArmTrial({
-                task,
-                armName,
-                armRuntime,
-                rep,
-                judgeSandbox,
-              });
-        if (armName === 'baseline') baselineTrials.push(trial);
-        else candidateTrials.push(trial);
-        writeJsonlRow(opts.output, trial, benchKey);
+  try {
+    for (let rep = 0; rep < opts.repeats; rep++) {
+      for (const [idx, task] of dataset.entries()) {
+        if (idx % opts.lanes !== opts.lane) continue;
+        const order = (rep + idx) % 2 === 0 ? ['baseline', 'candidate'] : ['candidate', 'baseline'];
+        for (const [position, armName] of order.entries()) {
+          const armRuntime = armName === 'baseline' ? baselineRuntime : candidateRuntime;
+          const trial =
+            opts.mode === 'real'
+              ? await runRealArmTrial({
+                  task,
+                  armName,
+                  armRuntime,
+                  rep,
+                  position,
+                  benchKey,
+                  endpoint,
+                  requestedModel,
+                  judgeSandbox,
+                  experienceDbPath: effectiveExperienceDb,
+                  experienceArm: opts.experienceArm ?? 'both',
+                })
+              : await runDeterministicArmTrial({
+                  task,
+                  armName,
+                  armRuntime,
+                  rep,
+                  judgeSandbox,
+                });
+          if (armName === 'baseline') baselineTrials.push(trial);
+          else candidateTrials.push(trial);
+          writeJsonlRow(opts.output, trial, benchKey);
+        }
       }
+    }
+  } finally {
+    if (tempExperienceDir) {
+      rmSync(tempExperienceDir, { recursive: true, force: true });
     }
   }
 
@@ -1656,12 +1919,16 @@ export async function runAutonomousReasoningBenchmark(opts) {
       rootCauseAccuracyDelta: Number((candidateMetrics.rootCauseAccuracy - baselineMetrics.rootCauseAccuracy).toFixed(4)),
       firstFixSuccessRateDelta: Number((candidateMetrics.firstFixSuccessRate - baselineMetrics.firstFixSuccessRate).toFixed(4)),
       regressionTestPassRateDelta: Number((candidateMetrics.regressionTestPassRate - baselineMetrics.regressionTestPassRate).toFixed(4)),
+      contractComplianceDelta: Number((candidateMetrics.contractCompliance - baselineMetrics.contractCompliance).toFixed(4)),
+      criticalContextRecallDelta: Number((candidateMetrics.criticalContextRecall - baselineMetrics.criticalContextRecall).toFixed(4)),
       ineffectiveActionCountDelta: candidateMetrics.ineffectiveActionCount - baselineMetrics.ineffectiveActionCount,
       replanEffectivenessRateDelta: Number((candidateMetrics.replanEffectivenessRate - baselineMetrics.replanEffectivenessRate).toFixed(4)),
       tokenCostDelta: candidateMetrics.tokenCost - baselineMetrics.tokenCost,
+      cacheHitRateDelta: Number((candidateMetrics.cacheHitRate - baselineMetrics.cacheHitRate).toFixed(4)),
       meanDurationMsDelta: candidateMetrics.meanDurationMs - baselineMetrics.meanDurationMs,
       recoverySuccessRateDelta: Number((candidateMetrics.recoverySuccessRate - baselineMetrics.recoverySuccessRate).toFixed(4)),
     },
+    ...(experienceSeeding ? { experienceSeeding } : {}),
   };
 
   return safeRedactValue(summary, benchKey);

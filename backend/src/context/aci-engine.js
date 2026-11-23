@@ -630,6 +630,96 @@ function normalizeIdSet(values) {
   return set;
 }
 
+function computeEpochTriggerState(
+  messages,
+  {
+    maxTotalTokens = 128000,
+    watermarks = DEFAULT_EPOCH_WATERMARKS,
+    singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
+    epochState = { lastWatermark: -1, epochCount: 0 },
+    singleStepTokens = undefined,
+    systemPrompt = '',
+    tools = [],
+  } = {},
+) {
+  const srcMessages = Array.isArray(messages) ? messages : [];
+  const sortedWatermarks = [...(watermarks ?? DEFAULT_EPOCH_WATERMARKS)]
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0 && n < 1)
+    .sort((a, b) => a - b);
+
+  const compBefore = measureRequestComposition({
+    system: systemPrompt,
+    tools,
+    messages: srcMessages,
+  });
+  const tokensBefore = compBefore.totalTokens;
+  const ratio = maxTotalTokens > 0 ? tokensBefore / maxTotalTokens : 0;
+
+  let highestCrossedWatermark = -1;
+  for (const wm of sortedWatermarks) {
+    if (ratio >= wm) highestCrossedWatermark = wm;
+  }
+
+  const hasExplicitSingleStep =
+    singleStepTokens != null && singleStepTokens !== '' && Number.isFinite(Number(singleStepTokens));
+  let measuredSingleStep = hasExplicitSingleStep ? Number(singleStepTokens) : 0;
+  if (!hasExplicitSingleStep && srcMessages.length > 0) {
+    let tailTokens = 0;
+    for (let i = srcMessages.length - 1; i >= 0; i -= 1) {
+      const m = srcMessages[i];
+      const msgTok = measureRequestComposition({ messages: [m] }).totalTokens;
+      if (m?.role === 'tool') {
+        measuredSingleStep = Math.max(measuredSingleStep, msgTok);
+        tailTokens += msgTok;
+      } else if (m?.role === 'assistant') {
+        tailTokens += msgTok;
+        measuredSingleStep = Math.max(measuredSingleStep, tailTokens);
+        break;
+      } else {
+        measuredSingleStep = Math.max(measuredSingleStep, msgTok);
+        break;
+      }
+    }
+  }
+
+  const prevWatermark = Number(epochState?.lastWatermark ?? -1);
+  const prevEpochCount = Number(epochState?.epochCount ?? 0);
+  const watermarkTriggered = highestCrossedWatermark > prevWatermark;
+  const singleStepTriggered = measuredSingleStep > singleStepBudget;
+  return {
+    srcMessages,
+    tokensBefore,
+    ratio,
+    highestCrossedWatermark,
+    measuredSingleStep,
+    prevWatermark,
+    prevEpochCount,
+    watermarkTriggered,
+    singleStepTriggered,
+    triggered: watermarkTriggered || singleStepTriggered,
+  };
+}
+
+/**
+ * Pure read-only check indicating whether an epoch watermark or single-step
+ * budget overflow would trigger DTOC compression.
+ */
+export function shouldTriggerAciEpoch(messages, options = {}) {
+  const state = computeEpochTriggerState(messages, options);
+  return {
+    triggered: state.triggered,
+    watermarkTriggered: state.watermarkTriggered,
+    singleStepTriggered: state.singleStepTriggered,
+    ratio: state.ratio,
+    tokensBefore: state.tokensBefore,
+    singleStepTokens: state.measuredSingleStep,
+    watermark: state.highestCrossedWatermark,
+    lastWatermark: state.prevWatermark,
+    epochCount: state.prevEpochCount,
+  };
+}
+
 /**
  * Epoch-based DTOC Reversible Compression:
  * Triggers ONLY when crossing budget watermarks (45%, 70%, 85% of maxTotalTokens)
@@ -657,52 +747,26 @@ export function compressMessagesEpoch(
     tools = [],
   } = {},
 ) {
-  const srcMessages = Array.isArray(messages) ? messages : [];
-  const sortedWatermarks = [...(watermarks ?? DEFAULT_EPOCH_WATERMARKS)]
-    .map(Number)
-    .filter((n) => Number.isFinite(n) && n > 0 && n < 1)
-    .sort((a, b) => a - b);
-
-  const compBefore = measureRequestComposition({
-    system: systemPrompt,
+  const trigger = computeEpochTriggerState(messages, {
+    maxTotalTokens,
+    watermarks,
+    singleStepBudget,
+    epochState,
+    singleStepTokens,
+    systemPrompt,
     tools,
-    messages: srcMessages,
   });
-  const tokensBefore = compBefore.totalTokens;
-  const ratio = maxTotalTokens > 0 ? tokensBefore / maxTotalTokens : 0;
-
-  let highestCrossedWatermark = -1;
-  for (const wm of sortedWatermarks) {
-    if (ratio >= wm) highestCrossedWatermark = wm;
-  }
-
-  // Compute max single-step input tokens from the latest step if not supplied
-  const hasExplicitSingleStep =
-    singleStepTokens != null && singleStepTokens !== '' && Number.isFinite(Number(singleStepTokens));
-  let measuredSingleStep = hasExplicitSingleStep ? Number(singleStepTokens) : 0;
-  if (!hasExplicitSingleStep && srcMessages.length > 0) {
-    let tailTokens = 0;
-    for (let i = srcMessages.length - 1; i >= 0; i -= 1) {
-      const m = srcMessages[i];
-      const msgTok = measureRequestComposition({ messages: [m] }).totalTokens;
-      if (m?.role === 'tool') {
-        measuredSingleStep = Math.max(measuredSingleStep, msgTok);
-        tailTokens += msgTok;
-      } else if (m?.role === 'assistant') {
-        tailTokens += msgTok;
-        measuredSingleStep = Math.max(measuredSingleStep, tailTokens);
-        break;
-      } else {
-        measuredSingleStep = Math.max(measuredSingleStep, msgTok);
-        break;
-      }
-    }
-  }
-
-  const prevWatermark = Number(epochState?.lastWatermark ?? -1);
-  const prevEpochCount = Number(epochState?.epochCount ?? 0);
-  const watermarkTriggered = highestCrossedWatermark > prevWatermark;
-  const singleStepTriggered = measuredSingleStep > singleStepBudget;
+  const {
+    srcMessages,
+    tokensBefore,
+    ratio,
+    highestCrossedWatermark,
+    measuredSingleStep,
+    prevWatermark,
+    prevEpochCount,
+    watermarkTriggered,
+    singleStepTriggered,
+  } = trigger;
 
   if (!watermarkTriggered && !singleStepTriggered) {
     return {
@@ -1151,6 +1215,16 @@ export class ACIEngine {
     return refineCandidates(candidates, {
       weights: this.weights,
       ledger: this.ledger,
+      ...options,
+    });
+  }
+
+  inspectEpoch(messages, options = {}) {
+    return shouldTriggerAciEpoch(messages, {
+      maxTotalTokens: this.maxTotalTokens,
+      watermarks: this.watermarks,
+      singleStepBudget: this.singleStepBudget,
+      epochState: this.epochState,
       ...options,
     });
   }

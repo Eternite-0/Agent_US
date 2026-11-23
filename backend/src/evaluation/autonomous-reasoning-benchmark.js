@@ -36,6 +36,7 @@ export const FAILURE_ATTRIBUTIONS = Object.freeze({
   TOOL_MECHANISM: 'tool_mechanism',
   MODEL_CAPABILITY: 'model_capability',
   RUNTIME_RELIABILITY: 'runtime_reliability',
+  CONTEXT_RETRIEVAL: 'context_retrieval',
 });
 
 export const AUTONOMOUS_REASONING_TASK_IDS = Object.freeze([
@@ -249,7 +250,16 @@ export function classifyAutonomousReasoningAttribution(trial = {}) {
     return FAILURE_ATTRIBUTIONS.TOOL_MECHANISM;
   }
 
-  // 2. Runtime reliability failures: timeouts, crashes, lease loss, reconciliation blocks, budget exhaustion, stale/unresolved verification gate, compaction/recovery failure
+  // 2. Explicit context-retrieval / ACI eviction failures
+  if (
+    /CONTEXT_MISS|CONTEXT_EVICTED|ACI_RESTORE_FAILED|CONTEXT_RETRIEVAL|COMPACTION_DROPPED_CRITICAL/.test(errorCode) ||
+    ['context_retrieval', 'context_miss', 'critical_context_missed', 'critical_context_evicted', 'blind_edit_without_reading'].includes(failureCategory) ||
+    /critical_context_miss|context_retrieval|context_evicted|aci_restore/.test(reason)
+  ) {
+    return FAILURE_ATTRIBUTIONS.CONTEXT_RETRIEVAL;
+  }
+
+  // 3. Runtime reliability failures: timeouts, crashes, lease loss, reconciliation blocks, budget exhaustion, stale/unresolved verification gate, compaction/recovery failure
   if (
     status === 'timeout' ||
     status === 'cancelled' ||
@@ -263,7 +273,17 @@ export function classifyAutonomousReasoningAttribution(trial = {}) {
     return FAILURE_ATTRIBUTIONS.RUNTIME_RELIABILITY;
   }
 
-  // 3. Model capability failures: root-cause missed, surface patch, incomplete/incorrect fix, baseline test tampering, constraint drop
+  // 4. Context-retrieval telemetry signal (critical files missed or evicted prior to first src/ mutation)
+  const rm = trial?.reasoningMetrics ?? trial?.telemetry?.reasoningMetrics ?? {};
+  const rawRecall = trial?.criticalContextRecall ?? ev?.criticalContextRecall ?? rm?.aciMetrics?.criticalContextRecall;
+  if (rawRecall !== undefined && rawRecall !== null && Number.isFinite(Number(rawRecall))) {
+    const recallVal = Number(rawRecall);
+    if (recallVal < 1 && (recallVal < 0.5 || !trial?.rootCauseAccurate)) {
+      return FAILURE_ATTRIBUTIONS.CONTEXT_RETRIEVAL;
+    }
+  }
+
+  // 5. Model capability failures: root-cause missed, surface patch, incomplete/incorrect fix, baseline test tampering, constraint drop
   return FAILURE_ATTRIBUTIONS.MODEL_CAPABILITY;
 }
 
@@ -2173,6 +2193,52 @@ function normalizeTrialRecord(raw) {
 
   const durationMs = Math.max(0, Number(trial.durationMs ?? trial.wallMs ?? 0) || 0);
   const tokens = extractTrialTokens(trial);
+  const cacheHitRate =
+    tokens.inputTokens > 0 && tokens.cacheReadTokens > 0
+      ? round4(Math.min(1, tokens.cacheReadTokens / tokens.inputTokens))
+      : typeof trial.cacheHitRate === 'number' && Number.isFinite(trial.cacheHitRate)
+        ? round4(Math.max(0, Math.min(1, trial.cacheHitRate)))
+        : 0;
+
+  const contractCompliance =
+    typeof trial.contractCompliance === 'boolean'
+      ? trial.contractCompliance
+      : typeof trial.contractCompliant === 'boolean'
+        ? trial.contractCompliant
+        : ev && (typeof ev.evidenceCompliant === 'boolean' || typeof ev.protectedFilesUntampered === 'boolean')
+          ? Boolean(
+              ev.evidenceCompliant !== false &&
+                ev.historyUntouched !== false &&
+                ev.baselineTestsUntampered !== false &&
+                ev.protectedFilesUntampered !== false &&
+                ev.dependencyPolicyPassed !== false &&
+                checks?.changedFiles !== false &&
+                (rm?.contractComplianceSignals?.evaluated ? rm.contractComplianceSignals.ready === true : true),
+            )
+          : rm?.contractComplianceSignals?.evaluated === true
+            ? Boolean(rm.contractComplianceSignals.ready === true)
+            : passed;
+
+  const explicitRecall =
+    trial.criticalContextRecall ?? ev?.criticalContextRecall ?? rm?.aciMetrics?.criticalContextRecall;
+  let criticalContextRecall;
+  if (explicitRecall != null && explicitRecall !== '' && Number.isFinite(Number(explicitRecall))) {
+    criticalContextRecall = round4(Math.max(0, Math.min(1, Number(explicitRecall))));
+  } else if (
+    Array.isArray(trial.criticalFiles) &&
+    trial.criticalFiles.length > 0 &&
+    Array.isArray(rm?.rootCauseFilesReadBeforeEdit)
+  ) {
+    const readNorms = rm.rootCauseFilesReadBeforeEdit.map((p) => normalizeEvidencePath(p));
+    const uniqueCritical = [...new Set(trial.criticalFiles.map((p) => normalizeEvidencePath(p)).filter(Boolean))];
+    const matchedCritical = uniqueCritical.filter((c) =>
+      readNorms.some((r) => r === c || r.endsWith(`/${c}`) || c.endsWith(`/${r}`)),
+    ).length;
+    criticalContextRecall = uniqueCritical.length ? round4(matchedCritical / uniqueCritical.length) : 1;
+  } else {
+    criticalContextRecall = rootCauseAccurate ? 1 : 0;
+  }
+
   const failureCategory = passed
     ? 'none'
     : String(trial.failureCategory ?? ev?.failureCategory ?? (status === 'timeout' ? 'timeout' : 'failed'));
@@ -2182,6 +2248,7 @@ function normalizeTrialRecord(raw) {
         ...trial,
         passed,
         status,
+        rootCauseAccurate,
         failureCategory,
         evidence: ev,
       });
@@ -2194,6 +2261,9 @@ function normalizeTrialRecord(raw) {
     rootCauseAccurate,
     firstFixSucceeded,
     regressionPassed,
+    contractCompliance,
+    criticalContextRecall,
+    cacheHitRate,
     ineffectiveActionCount,
     replanTriggered,
     replanSucceeded,
@@ -2208,8 +2278,8 @@ function normalizeTrialRecord(raw) {
 }
 
 /**
- * Computes all 9 required autonomous reasoning metrics and 3-way failure attribution
- * while retaining 100% of failed/timedOut/cancelled trials.
+ * Computes all 11 required autonomous reasoning metrics, cacheHitRate, and 4-way
+ * failure attribution while retaining 100% of failed/timedOut/cancelled trials.
  */
 export function computeAutonomousReasoningMetrics(trials = []) {
   const input = Array.isArray(trials) ? trials : [];
@@ -2235,6 +2305,7 @@ export function computeAutonomousReasoningMetrics(trials = []) {
     [FAILURE_ATTRIBUTIONS.TOOL_MECHANISM]: 0,
     [FAILURE_ATTRIBUTIONS.MODEL_CAPABILITY]: 0,
     [FAILURE_ATTRIBUTIONS.RUNTIME_RELIABILITY]: 0,
+    [FAILURE_ATTRIBUTIONS.CONTEXT_RETRIEVAL]: 0,
     [FAILURE_ATTRIBUTIONS.NONE]: 0,
   };
   const failureTaxonomy = {};
@@ -2253,13 +2324,20 @@ export function computeAutonomousReasoningMetrics(trials = []) {
     ]),
   );
 
+  const cacheHitRate =
+    totalInputTokens > 0 && totalCacheReadTokens > 0
+      ? round4(Math.min(1, totalCacheReadTokens / totalInputTokens))
+      : normalized.some((t) => t.cacheHitRate > 0)
+        ? round4(normalized.reduce((s, t) => s + t.cacheHitRate, 0) / totalTrials)
+        : 0;
+
   return {
     benchmarkId: AUTONOMOUS_REASONING_BENCHMARK_ID,
     version: VERSION,
     totalTrials,
     passedTrials,
     failedTrials,
-    // 9 required metrics:
+    // 11 required metrics + cacheHitRate:
     finalTaskSuccessRate: totalTrials ? round4(passedTrials / totalTrials) : 0,
     rootCauseAccuracy: totalTrials
       ? round4(normalized.filter((t) => t.rootCauseAccurate).length / totalTrials)
@@ -2270,16 +2348,23 @@ export function computeAutonomousReasoningMetrics(trials = []) {
     regressionTestPassRate: totalTrials
       ? round4(normalized.filter((t) => t.regressionPassed).length / totalTrials)
       : 0,
+    contractCompliance: totalTrials
+      ? round4(normalized.filter((t) => t.contractCompliance).length / totalTrials)
+      : 0,
+    criticalContextRecall: totalTrials
+      ? round4(normalized.reduce((s, t) => s + t.criticalContextRecall, 0) / totalTrials)
+      : 0,
     ineffectiveActionCount: totalIneffectiveActions,
     replanEffectivenessRate: replanTrials.length
       ? round4(replanSucceededCount / replanTrials.length)
       : 0,
     tokenCost: totalTokens,
+    cacheHitRate,
     meanDurationMs: totalTrials ? Math.round(totalDurationMs / totalTrials) : 0,
     recoverySuccessRate: recoveryTrials.length
       ? round4(recoverySucceededCount / recoveryTrials.length)
       : 0,
-    // 3-way attribution breakdown:
+    // 4-way attribution breakdown:
     attributionBreakdown,
     attributionCounts,
     tokenBreakdown: {
