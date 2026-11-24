@@ -25,6 +25,7 @@
 
 | 维度 | 核心能力与阶段 | 实测基线 vs 演进结果 | 验证环境 |
 | --- | --- | --- | --- |
+| **ACI 2.6 · 轨迹驱逐与原生体验** | **Agent_US 2.6**（`trajectory_eviction_v26` · 过期输出置换 · 局部哈希恢复 · 防死磕 · `query_symbol_graph` · Swarm 自动解冲突 · Codex 原生交互） | Arm D 通关率 **`57.1%`（`8/14`**, CI `[32.6%, 78.6%]`）领先 Arm A/C（`50.0%`, `7/14`），唯一攻克 `aci-06`<br/>成功归一化成本 **`304,125`** tok/pass（较 Arm C `370,548` 降 **`17.9%`**）· 同题配对节省 **`+11.3%`（`n=5`）** vs Arm C `+2.5%`<br/>Arm A `Sup Tok = 0` · Arm D **`21` Epochs / `45` 次过期驱逐（省 `20,972` tok，总 DTOC 省 `39,189` tok）** · **`15/15` (`100%`)** 哈希恢复（`13` 次局部）<br/>全仓 **`558/558`** 后端单测（`106` 文件）· **`69/69`** 前端单测 · `visual.spec.mjs` **`26/26`** 零失败 | `deepseek-v4.1-flash`<br/>Docker `strong`（`42` 试次 `aci26`） |
 | **ACI 2.5 · 工程闭环** | **Agent_US 2.5**（`phase_watermark_v25` · 完工宽限 · `8s` 熔断 · `apply_patch` · Swarm 三方合并） | Arm C / D 通关率 **`25.0% → 58.3%`（`+33.3 pp`** · CI `[31.9%, 80.7%]`）<br/>成功归一化成本 **`670,619 → 288,998–298,849` tok/pass（`−55.4% ~ −56.9%`）**<br/>同题双通配对节省 **`+5.22%`** · Arm D KV Hit **`81.57%`** · **`0/10`** 诱饵恢复 · 全仓 **`533/533`** 单测 | `deepseek-v4.1-flash`<br/>Docker `strong`（`36` 试次 `aci25`） |
 | **注入前上下文治理** | **Agent_US 2.4 Stage 4**（Pre-Injection Admission · Supervisor · SHA-256 恢复） | Arm C 通关率 **`33.3% → 75.0%`（`+41.7 pp`）**<br/>关键上下文召回 **`100%`** · FNR **`0`** · 注入前减负 **`54.8%–64.8%`**<br/>Arm D KV Hit **`84.78%`** · 短任务 KV 差 **`-0.64 pp`** · **`0/6`** 诱饵恢复 | `deepseek-v4.1-flash`<br/>Docker `strong`（`48 + 6` 试次） |
 | **能力感知工具选择** | **Agent_US 2.3.7**（Tool Intelligence · 动态目录与提示对齐） | Bash 拒绝次数 **`96 → 27`（`−71.9%`**, `p = 0.000122`）<br/>工具选型匹配 **`86.2% → 95.4%`** · 总 Token **`−23.6%`** | 真实 Provider<br/>`14` 题 × `5` 轮（`140` 轮） |
@@ -49,58 +50,58 @@ Agent_US 将 **Durable Agent Kernel**、**Pre-Injection ACI Governance**、**Con
 
 ## 核心创新与能力体系
 
-### 1. ACI 2.5 上下文准入与收尾治理（2.4 S4 – 2.5）
+### 1. ACI 2.5–2.6 上下文准入、轨迹驱逐与局部恢复（2.4 S4 – 2.6）
 
-> 从 2.4 Stage 4“注入前精筛 + 无损恢复”进一步升级为 2.5 的**阶段+高水位双门控 DTOC、重试账本无损拼接、8s 熔断保护与测试通过后完工保留金机制**，消除重压缩撕裂 KV Cache 与尾步误杀。
+> 从 2.4 Stage 4“注入前精筛 + 无损恢复”、2.5“双门控水位 + `8s` 熔断 + 完工保留金”演进为 **2.6 的轨迹预测双层驱逐（`trajectory_eviction_v26`）、按 Symbol/行号局部哈希恢复与防死磕自诊断闭环**，在保持 KV 前缀稳定下解决 `<28k` 场景 DTOC 零触发难题并持续压降冗余上下文。
 
 - **五级注入前准入（`PreInjectionAdmissionController`）**：[`aci-admission.js`](backend/src/context/aci-admission.js) 在工具批写入历史前结合 JS/TS 符号、`.json` 顶层键（`json_key@L...`）、调用链与诱饵特征输出 **`DIRECT`**、**`SUPPORTING`**、**`DEFER`**、**`DUPLICATE`** 与 **`IRRELEVANT`**；五大关键域（`auth`、`permission`、`persistence`、`contract`、`hidden_acceptance`）与目标/报错文件受硬护栏锁定**绝不降级至 `SUPPORTING` 以下**（FNR `= 0`）；`grep:`/`glob:` 要求全部非空采样行命中诱饵才压制。
-- **阶段与高水位双条件 DTOC（`phase_watermark_v25`）**：[`aci-engine.js`](backend/src/context/aci-engine.js) 与 [`direct-agent.js`](backend/src/direct-agent.js) 将 `full_aci` / `aci_25` 默认水位升至 **`[0.78, 0.90]`**，仅当**已过研究/首次验证阶段 + 单步高压力（`>= max(dtocMinPromptTokens, 28000)` 或 `>= 0.65`）+ 净压缩收益 `>= 1200` tokens** 时触发，并屏蔽最近 `<= 4` 步/活跃修改文件、契约与最新报错。
-- **只读 `ContextSupervisor`（`tools: []`）与 `8s` 连续超时熔断**：[`supervisor.js`](backend/src/context/supervisor.js) 将单次超时收敛至 **`8000` ms**（连续 `>= 2` 次超时开启 `60s` 熔断短路至确定性回退），支持 `auto` / `custom` / `off`（零硬编码模型名），可在 [AdaptiveContextPanel](frontend/src/components/AdaptiveContextPanel.tsx) 实时查看开关、水位与熔断状态。
-- **重试账本合流、SHA-256 无损恢复与完工保留金**：[`aci-store.js`](backend/src/context/aci-store.js) 新增 `ContextEvidenceLedger.prototype.mergeFrom` 与 `buildSharedAciSummary`，由 `DirectAgentRuntime` 在自动重试外层保留 `turnAciLedger` / `turnReadFiles`；`[ACI-SKIP]` 去诱饵桩结合 `expand_context` + `restoreVerified()` 完成 SHA-256 验签恢复；[`agent-loop.js`](backend/src/kernel/agent-loop.js) 与 [`budget-estimator.js`](backend/src/planning/budget-estimator.js) 为过测后的交付阶段预留 **`postTestReserveActive`** 并授予**唯一 1 次纯文本宽限步（`tools: []`）**；[`lease-guard.js`](backend/src/durable/lease-guard.js) 每 `5000ms` 自动调用 `renewTurnLease` 续租防止长流式丢租约。
+- **预算轨迹预测与过期输出主动置换（`trajectory_eviction_v26`）**：[`aci-engine.js`](backend/src/context/aci-engine.js)、[`agent-loop.js`](backend/src/kernel/agent-loop.js) 与 [`direct-agent.js`](backend/src/direct-agent.js) 将 `full_aci` 升级为 **`trajectory_eviction_v26`**（完整兼容 `aci_25 -> phase_watermark_v25` 与 2.4 `adaptive_single_step`）：**Tier 1**（`supersededTriggered`，`step >= 4`、净省 `>= 450` tok）在低于 `28k` 时即可确定性置换被后续修改/重读覆盖的旧读取、多行 `SUPPORTING` 片段以及已被后续验证解决的旧失败日志；**Tier 2**（`trajectoryTriggered`，`[0.78, 0.90]` 预测轨迹水位）在存在真实改动或 `>= 72%` 累计用量时触发，同时严格保护头部 KV Cache 前缀（`<3` 消息）、契约文档（`SPEC.md`/`CONTRACT.json`/`CONSTRAINTS.md`/`AGENTS.md`）、近 2 步活跃读写及最新未解决报错 `latestUnresolvedErrorIndex`。
+- **只读 `ContextSupervisor`（`tools: []`）与 `8s` 连续超时熔断**：[`supervisor.js`](backend/src/context/supervisor.js) 将单次超时收敛至 **`8000` ms**（`maxOutputTokens = 2048` 避免长 JSON 截断，连续 `>= 2` 次超时开启 `60s` 熔断短路至确定性回退），并对纯确定性 `onlySuperseded` Tier 1 驱逐免于额外 Supervisor LLM 调用；可在 [AdaptiveContextPanel](frontend/src/components/AdaptiveContextPanel.tsx) 与会话流 `aciTelemetry` 实时观测五级准入分布、水位与熔断状态。
+- **局部 SHA-256 校验恢复、防死磕守卫与完工保留金**：[`aci-store.js`](backend/src/context/aci-store.js) 与 [`meta-tools.js`](backend/src/tools/builtin/meta-tools.js) 扩展 `expand_context` 支持 `symbol` / `symbols` / `startLine..endLine` 按块精准恢复（`extractBoundedSymbolSpans`），同步校验父 `sha256` 与切片 `sliceSha256` 并统计 `partialRecoveries` / `recoveryTokensSaved`；[`execution-reasoning.js`](backend/src/kernel/execution-reasoning.js) 对同一文件连续失败修改 `>= 2` 次触发 **Anti-Thrashing** 尾部根因与调用链引导；[`budget-estimator.js`](backend/src/planning/budget-estimator.js) 为过测交付预留 **`postTestReserveActive`** 与唯一纯文本宽限步（`tools: []`），[`lease-guard.js`](backend/src/durable/lease-guard.js) 每 `5000ms` 续租。
 
-### 2. 核心编码原语与增量仓库智能（2.5）
+### 2. 核心编码原语、符号图谱与增量诊断（2.5–2.6）
 
-- **双格式乐观锁精确补丁（`apply_patch`）**：[`patch-and-diagnostics.js`](backend/src/patch-and-diagnostics.js) 与 [`fs-tools.js`](backend/src/tools/builtin/fs-tools.js) 扩展 `apply_patch` 同时透明解析 Codex 补丁与标准 unified diff（`--- a/` / `+++ b/` / `@@`），写盘前执行 `expectedHashes` / `readFileState` SHA-256 **原子乐观并发锁**（`OPTIMISTIC_LOCK_CONFLICT`）与 `.js/.mjs/.cjs/.json` **原子语法预校验**，返回精简 diff 摘要并透传 `unifiedDiff`/`+add`/`-del`/`sha256After` 至前端 [FileChangeCard](frontend/src/components/FileChangeCard.tsx)。
-- **千行日志压缩诊断（`run_diagnostics`）**：新增受沙箱约束的只读工具 `run_diagnostics`（`syntax`/`typecheck`/`test`/`lint`/`auto`），将千行原始构建与测试输出去重压缩为紧凑 `{ ok, kind, diagnostics, failingTests, compression }`，并在 [`tools/selection.js`](backend/src/tools/selection.js) 中与 `apply_patch` 联动优先推荐。
-- **增量符号缓存与关联测试检索**：[`repo-intelligence.js`](backend/src/repo-intelligence.js) 与 [`repo-symbols.js`](backend/src/repo-symbols.js) 基于 `(size, mtimeMs, sha256)` 缓存未变文件符号解析，新增 `findCrossFileReferences` 与 `findRelatedTests` 并接入 `inspect_repository`（`relatedTo` / `includeRelatedTests`）。
+- **双格式乐观锁精确补丁（`apply_patch`）**：[`patch-and-diagnostics.js`](backend/src/patch-and-diagnostics.js) 与 [`fs-tools.js`](backend/src/tools/builtin/fs-tools.js) 扩展 `apply_patch` 透明解析 Codex 补丁与标准 unified diff（`--- a/` / `+++ b/` / `@@`），写盘前执行 SHA-256 **原子乐观并发锁**与 `.js/.mjs/.cjs/.json` **原子语法预校验**，并将结构化 `hunks`、`+add`/`-del` 与 `sha256After` 透传至前端 [FileChangeCard](frontend/src/components/FileChangeCard.tsx) 与 [InspectorDrawer](frontend/src/components/InspectorDrawer.tsx)（支持 **`Alt+↑/↓`** hunk 快捷键跳转与 **`>6` 行无变更上下文按需折叠展开**）。
+- **增量 TypeScript 类型检查与结构化测试诊断（`run_diagnostics`）**：`run_diagnostics`（`syntax`/`typecheck`/`test`/`lint`/`auto`）自动定位最近 `tsconfig.json` 执行 `tsc --noEmit --pretty false` 提取 `source: 'tsc'` 报错，精准解析 `node --test` `AssertionError` 的 `expected` vs `actual` / `operator` / `file:line:column` 并压平千行噪声；前端 [DirectActivity](frontend/src/components/DirectActivity.tsx) 支持点击诊断条直达 `InspectorDrawer` 目标行高亮。
+- **增量符号缓存与直调符号图谱（`query_symbol_graph`）**：[`repo-intelligence.js`](backend/src/repo-intelligence.js) 与 [`repo-symbols.js`](backend/src/repo-symbols.js) 基于 `(size, mtimeMs, sha256)` 缓存未变文件符号解析；[`workspace-tools.js`](backend/src/workspace-tools.js) 新增只读工具 **`query_symbol_graph`**，单次调用即可联合返回符号定义、`findCrossFileReferences` 跨文件调用/导入方与 `findRelatedTests` 关联单测，并在 [`tools/selection.js`](backend/src/tools/selection.js) 联动优先推荐。
 
 ### 3. 自主推理、根因台账与可信经验记忆（2.4 Stage 1–3）
 
-- **契约感知推理（`Contract-Aware Reasoning`）**：[`contract-reasoning.js`](backend/src/kernel/contract-reasoning.js) 抽取 `SPEC.md` / `CONTRACT.json` / `CONSTRAINTS.md` 中的交付清单、禁用修改列表、`C1..Rn` 约束与优先级规则，保持系统提示词逐字节静态以维护 KV Prompt Cache。
-- **根因验证与免 Shell 校验**：[`execution-reasoning.js`](backend/src/kernel/execution-reasoning.js) 核对修复前报错指纹消退与 `doc` 免重验 / `self_test` 校准容忍；[`meta-tools.js`](backend/src/tools/builtin/meta-tools.js) 提供零 Shell 的 `compute_file_digest` 与 `expand_context`；[`ExperienceMemoryService`](backend/src/memory/service.js) 仅吸纳经 `trusted_server_verifier` 验证的经验。
+- **契约感知推理（`Contract-Aware Reasoning`）**：[`contract-reasoning.js`](backend/src/kernel/contract-reasoning.js) 抽取 `SPEC.md` / `CONTRACT.json` / `CONSTRAINTS.md` 中的交付清单、禁用修改列表、`C1..Rn` 约束与优先级规则（过滤反引号语法示例避免误报），保持系统提示词逐字节静态以维护 KV Prompt Cache。
+- **根因验证与免 Shell 校验**：[`execution-reasoning.js`](backend/src/kernel/execution-reasoning.js) 核对修复前报错指纹消退、Anti-Thrashing 连续失败拦截与 `doc` 免重验；[`meta-tools.js`](backend/src/tools/builtin/meta-tools.js) 提供零 Shell 的 `compute_file_digest` 与局部 `expand_context`；[`ExperienceMemoryService`](backend/src/memory/service.js) 仅吸纳经 `trusted_server_verifier` 验证的经验。
 
-### 4. Swarm 协同加固与三域强隔离沙箱（2.3.1 & 2.5）
+### 4. Swarm 协同硬化、自动冲突消解与三域强隔离沙箱（2.3.1 – 2.6）
 
-- **Swarm 协同硬化（2.5）**：[`planner.js`](backend/src/swarm/planner.js) 实施同级写路径冲突预检（自动串行注边或 `WRITE_PATH_CONFLICT` 阻断）；[`mailbox.js`](backend/src/swarm/mailbox.js) 与 [`orchestrator.js`](backend/src/swarm/orchestrator.js) 跨 Worker 传递 `<=1600` 字符 `[Shared Swarm ACI Digest]`；[`artifacts.js`](backend/src/swarm/artifacts.js) 基于基准快照通过 **`git merge-file` 三方合并**并保留/恢复 `100755` 可执行权限；[`node-state-machine.js`](backend/src/swarm/node-state-machine.js) 与 [`run-deadline.js`](backend/src/swarm/run-deadline.js) 落实 SQLite 终态原子 CAS 与超时保留已验证产物的优雅降级；[`reviewer.js`](backend/src/swarm/reviewer.js) 通过 `evaluateReviewerHardGate` 强制校验真实 `git diff` 与测试退出码 `exitCode === 0`（在 [AutonomousRunPanel](frontend/src/components/AutonomousRunPanel.tsx) 展示 `reviewerVerification` 徽章）。
+- **Swarm 协同硬化与自动冲突修复闭环（2.5–2.6）**：[`planner.js`](backend/src/swarm/planner.js) 实施同级写路径冲突预检；[`mailbox.js`](backend/src/swarm/mailbox.js) 跨 Worker 传递 `<=1600` 字符 `[Shared Swarm ACI Digest]`；[`artifacts.js`](backend/src/swarm/artifacts.js) 通过 `mergeFileThreeWay`（`git merge-file` 三方合并，保留 `100755` 权限）识别同行冲突并提取结构化 `conflictBlocks`，由 [`orchestrator.js`](backend/src/swarm/orchestrator.js) 自动派发至多 1 次受控 `conflict_resolution` 修复步（仅携带冲突 hunk 与双方节点目标）并经 [`reviewer.js`](backend/src/swarm/reviewer.js) `evaluateConflictResolutionGate` / `evaluateReviewerHardGate`（零冲突标记 + 真实 `git diff` + 测试 `exitCode === 0`）验真放行；[`node-state-machine.js`](backend/src/swarm/node-state-machine.js) 与 [`run-deadline.js`](backend/src/swarm/run-deadline.js) 落实 SQLite 终态 CAS 与超时优雅降级（[AutonomousRunPanel](frontend/src/components/AutonomousRunPanel.tsx) 展示 `reviewerVerification` 硬门禁状态）。
 - **OS 级强隔离与三域隐藏验收（2.3.1）**：[`benchmark-sandbox.js`](backend/src/tools/benchmark-sandbox.js) 与 [`Dockerfile.benchmark`](backend/sandbox/Dockerfile.benchmark) 提供 `--network=none`、非 root `65534:65534`、`--ipc=none` 的 Docker `STRONG` Fail-Closed 隔离（无 Docker 时显式走受限 `NODE_PERMISSION`）；[`hidden-acceptance.js`](backend/src/evaluation/hidden-acceptance.js) 与 [`hidden-acceptance-supervisor.mjs`](backend/src/tools/hidden-acceptance-supervisor.mjs) 配合 Stdin 单次 `hmacKey` 与 [`judge.js`](backend/src/evaluation/judge.js) Hard Veto 彻底阻断 `7/7` 绕过向量。
 
-### 5. 能力感知工具治理、评估器与统一网关（2.3.7 & Core）
+### 5. 能力感知工具治理、评估器 2.6 与 Codex 原生工作台（2.3.7 – 2.6）
 
 - **工具治理与权限模式**：[`tools/selection.js`](backend/src/tools/selection.js)、[`tools/policy.js`](backend/src/tools/policy.js)、[`tools/auto-approval.js`](backend/src/tools/auto-approval.js) 与 [`dispatcher.js`](backend/src/tools/dispatcher.js) 约束工具目录对齐与 Composer 分级审批；[`prompt-cache.js`](backend/src/observability/prompt-cache.js) 监测缓存稳定性。
-- **可扩展评估器 2.5**：[`aci-governance-benchmark.js`](backend/src/evaluation/aci-governance-benchmark.js) 与 [`benchmark-aci-governance.mjs`](backend/scripts/benchmark-aci-governance.mjs) 支持 `--resume` 断点续跑、请求作用域隔离的 `--concurrency 1..16`、`aci25` 六题集、Wilson 95% 置信区间、成功归一化 Token、`pairedPassTokenReduction` 与 Markdown/LaTeX 论文导出。
+- **论文评估器 2.6 与原生消融界面**：[`aci-governance-benchmark.js`](backend/src/evaluation/aci-governance-benchmark.js) 与 [`benchmark-aci-governance.mjs`](backend/scripts/benchmark-aci-governance.mjs) 修复 `isAciSupervisorWireRequest` 使 Arm A/B `Sup Tok` 严格归零，将 `aci-06` 校准为 `240k` 并新增 21 文件高压力跨模块演进题 `aci-07-cross-module-evolution`（`--suite aci26`），支持 `--resume`、请求隔离 `--concurrency 1..16` 与 `--archive-dir` 自动归档；[`intelligence-routes.js`](backend/src/routes/intelligence-routes.js) 提供只读 `GET /v1/evaluations/aci-ablation`，前端 [EvaluationView](frontend/src/components/EvaluationView.tsx) 原生展示 A/C/D 通过率置信区间、同题配对省 Token 率与一键复制 LaTeX 论文表（严守 [`NATIVE-VISUAL.md`](frontend/NATIVE-VISUAL.md) 扁平无阴影与 `reduced-motion` 规范）。
 - **多账号网关**：[`AccountPool`](backend/src/pool.js) 与 [`GatewayProxy`](backend/src/gateway-proxy.js) 维护多账号路由与 OAuth 原生登录，提供 OpenAI (`/v1/chat/completions`) 与 Anthropic (`/v1/messages`) 兼容端点。
 
 ---
 
 ## Adaptive Context Intelligence 流程
 
-> 注入前拦截噪声与诱饵、保护关键域不漏召、压缩后基于 SHA-256 无损按需恢复，并以 2.5 双门控水位、8s 熔断与完工宽限步保护长短任务 KV Cache 与最终交付。
+> 注入前拦截噪声与诱饵、保护关键域不漏召，在 2.6 通过 `trajectory_eviction_v26` 确定性驱逐过期读取与已解决报错、按 symbol/行号进行 `sliceSha256` 局部无损恢复，并用 Anti-Thrashing 与完工宽限步保护长短任务 KV Cache 与最终交付。
 
 ```mermaid
 flowchart LR
-    TOOLS["工具执行批次\nread_file · apply_patch · run_diagnostics · grep"] --> PARSE["结构与信号解析\n增量符号缓存 · JSON 键 · 调用链 · 诱饵特征"]
+    TOOLS["工具执行批次\nread_file · apply_patch · run_diagnostics · query_symbol_graph"] --> PARSE["结构与信号解析\n增量符号缓存 · JSON 键 · 调用链 · 诱饵特征"]
     PARSE --> GUARD["关键域护栏\nauth · permission · persistence\ncontract · hidden_acceptance"]
     GUARD -->|"确定性快通 ≤2600 chars · 报错或已改文件"| DIRECT["DIRECT · 原文放行"]
     GUARD -->|"确定性无信号或重复"| SKIP["[ACI-SKIP] DUPLICATE / IRRELEVANT\n单行跳过 · 无恢复诱饵"]
-    GUARD -->|"≥2600 chars 多段文件或诱饵冲突"| SUP["只读 ContextSupervisor\ntools: [] · 8s 超时 · 2 次熔断短路"]
+    GUARD -->|"≥2600 chars 多段文件或诱饵冲突"| SUP["只读 ContextSupervisor\ntools: [] · 8s 超时 · maxOut=2048 · 2 次熔断"]
     SUP -->|"保留焦点 hunks + 大纲"| SUPPORT["SUPPORTING\n压缩注入 · 护栏保底"]
     SUP -->|"延迟正文 + 符号索引"| DEFER["DEFER\n导入 + 行号映射"]
     SUP -->|"确认非目标旧档或样本"| SKIP
 
-    DIRECT & SUPPORT & DEFER & SKIP --> LOOP["主对话前缀与 2.5 调度\nphase_watermark_v25 [0.78, 0.90] · ≥1200 tok 才压\npostTestReserveActive + 唯一纯文本宽限步"]
-    LOOP -.->|"按需 expand_context 校验"| STORE[("ReversibleContextStore\nartifact://sha256 + restoreVerified()")]
-    STORE -.->|"SHA-256 校验无损回注"| LOOP
-    GUARD & SUP & STORE -.->|"mergeFrom 跨重试合流 & 共享摘要"| LEDGER[("ContextEvidenceLedger\nRecall · Precision · Paired-Pass · Recovery")]
+    DIRECT & SUPPORT & DEFER & SKIP --> LOOP["主对话前缀与 2.6 轨迹调度\ntrajectory_eviction_v26 (Tier 1 过期驱逐 · Tier 2 0.78/0.90)\nAnti-Thrashing ≥2次死磕提示 · postTestReserveActive"]
+    LOOP -.->|"expand_context (symbol / startLine..endLine)"| STORE[("ReversibleContextStore\nartifact://sha256 + sliceSha256 校验")]
+    STORE -.->|"局部切片无损回注"| LOOP
+    GUARD & SUP & STORE -.->|"mergeFrom 合流 · telemetry 透传"| LEDGER[("ContextEvidenceLedger\n5级准入 · 局部恢复 · 过期节省 · Paired-Pass")]
 
     classDef safe fill:#ecfdf5,stroke:#10b981,color:#064e3b;
     classDef sup fill:#eff6ff,stroke:#3b82f6,color:#1e3a8a;
@@ -121,31 +122,31 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph L1["1 · Application & Client Host"]
-        CLIENT["React 19 Web Workbench · Electron 35 Windows Desktop\nAdaptiveContextPanel · FileChangeCard Diff · AutonomousRunPanel · SSE"]
+        CLIENT["React 19 Web Workbench · Electron 35 Windows Desktop\nInspectorDrawer (Alt+↑/↓ · 上下文折叠 · 诊断跳行) · AciTurnTelemetryStrip · EvaluationView"]
     end
 
     subgraph L2["2 · Control Plane & Model Infrastructure"]
-        API["Fastify /v1 API Gateway · Chat Command /swarm\nSession · Workspace · Permission Modes · /v1/context/supervisor"]
+        API["Fastify /v1 API Gateway · Chat Command /swarm\nSession · Approvals · /v1/context/supervisor · /v1/evaluations/aci-ablation"]
         POOL["AccountPool · 动态模型能力路由 · GatewayProxy\nOpenAI (/v1/chat/completions) & Anthropic (/v1/messages)"]
     end
 
-    subgraph L3["3 · Runtime Kernel & ACI 2.5 Governance"]
-        KERNEL["DirectAgentRuntime · AgentLoop · Contract & Root-Cause Ledger\npostTestReserveActive · 唯一交付宽限步 · Retry Ledger Merge"]
-        ACI["PreInjectionAdmission · phase_watermark_v25 DTOC ([0.78, 0.90])\nContextSupervisor (tools: [], 8s 熔断) · ContextEvidenceLedger · Verifier"]
+    subgraph L3["3 · Runtime Kernel & ACI 2.6 Governance"]
+        KERNEL["DirectAgentRuntime · AgentLoop · Anti-Thrashing 自诊断守卫\npostTestReserveActive · 唯一交付宽限步 · Retry Ledger Merge"]
+        ACI["PreInjectionAdmission · trajectory_eviction_v26 ([0.78, 0.90])\nContextSupervisor (8s 熔断) · ContextEvidenceLedger · Verifier"]
     end
 
     subgraph L4["4 · Swarm Hardening & Shared Intelligence"]
-        SWARM["Conflict Preflight · Shared ACI Digest · Git 3-Way Merge (100755)\nTerminal Atomic CAS · Timeout Degradation · Reviewer Hard Gate"]
-        SHARED["Incremental Repository Index · Cross-File & Related Tests\nExperience Memory (trusted_server_verifier) · Evaluator 2.5 (--resume)"]
+        SWARM["Conflict Preflight · Shared ACI Digest · Git 3-Way Merge (100755)\nBounded conflict_resolution 自动修复 · Terminal CAS · Reviewer Hard Gate"]
+        SHARED["Incremental Repository Index · query_symbol_graph (调用链与关联单测)\nExperience Memory (trusted_server_verifier) · Evaluator 2.6 (aci-01..07)"]
     end
 
     subgraph L5["5 · Security, Coding Primitives & Sandbox"]
-        TOOLING["Dual-Format apply_patch (乐观锁 + 语法预检) · run_diagnostics\nCapability Tool Selection · Policy / Auto-Approval · compute_file_digest"]
+        TOOLING["apply_patch (乐观锁+语法预检) · run_diagnostics (tsc+Assertion 提取)\nCapability Tool Selection · Policy / Auto-Approval · compute_file_digest"]
         SANDBOX["Three-Domain Benchmark Sandbox (Docker STRONG Fail-Closed)\nHost Trusted Judge · RO Supervisor · Per-Test Worker · Stdin HMAC"]
     end
 
     subgraph L6["6 · Durable Persistence & Telemetry"]
-        STORE[("SQLite WAL · Durable Job Queue · 5s Lease Renewal & Checkpoints\nReversibleContextStore (artifact://sha256) · Prompt Cache Telemetry")]
+        STORE[("SQLite WAL · Durable Job Queue · 5s Lease Renewal & Checkpoints\nReversibleContextStore (sha256 + sliceSha256) · Prompt Cache Telemetry")]
     end
 
     CLIENT <-->|"REST / SSE"| API
@@ -169,7 +170,24 @@ flowchart TB
 
 > 所有真实模型测试均完整保留失败与超时样本（**零剔除、零樱桃采摘**），并在每次修改后于独立隔离沙箱与真实 Provider 上实测产出。
 
-### 1. Agent_US 2.5 — ACI 2.5 三臂平行对照实证（`aci25` 六题 · `36` 试次）
+### 1. Agent_US 2.6 — `trajectory_eviction_v26` 与跨模块演进三臂实证（`aci26` 七题 · `42` 试次）
+
+- **测试条件**：冻结集成分支 `feat/2.6`（`f60b7065` 前同代码快照），`deepseek-v4.1-flash`（本地 AccountPool/Gateway），Docker **`strong`**（`agent-us/benchmark:node24`），`--suite aci26`（`aci-01`..`06` 含 `aci-06=240k` + 新增 21 文件高压力跨模块演进 `aci-07=220k`）× **Arm A / C / D × 2 轮重复 = 42 试次**（`--concurrency 12` + `--resume`）。完整逐试次数据、根因校准与 LaTeX/Markdown 导表见 [2.6 — ACI 2.6、工程诊断与 UI 实证报告](backend/docs/2.6-aci-agent-ui-report.md) 及 [论文归档表格](backend/docs/evidence/aci-26-ablation-paper-tables.md)（[LaTeX 源码](backend/docs/evidence/aci-26-ablation-paper-tables.tex)）。
+
+| 指标 | Arm A (`raw_full`) | Arm C (`retrieval_supervisor`, `phase_watermark_v25`) | Arm D (`full_aci`, `trajectory_eviction_v26`) | 核心发现 |
+| --- | ---: | ---: | ---: | --- |
+| **Pass Rate (`passed / 14`)** | `50.0%` (`7/14`) | `50.0%` (`7/14`) | **`57.1%` (`8/14`)** | **Arm D 领先 Arm A/C `+7.1 pp`**，且唯一攻克 **`aci-06`（`1/2`）** |
+| **Pass Rate Wilson 95% CI** | `[26.8%, 73.2%]` | `[26.8%, 73.2%]` | **`[32.6%, 78.6%]`** | — |
+| **Critical Recall / Precision** | `100.0%` / `85.1%` | `100.0%` / `97.4%` | **`100.0%` / `97.6%`** | **关键上下文零漏召**，精确率全场最高 |
+| **Useful Token Ratio** | `61.8%` | `92.7%` | **`97.3%`** | 较基线 A 抬升 **`+35.5 pp`** |
+| **Tokens per Completed Pass** | `327,339` | `370,548` | **`304,125`** | **全场最低成功交付成本（较 C 降 `−17.9%`）** |
+| **Mean Tokens (Passed Trials)** | `161,944` | `184,804` | **`154,568`** | 成功样本平均总消耗最优 |
+| **Paired-Pass Token Reduction** | `0.0%` (`n=7`) | `+2.5%` (`n=3`) | **`+11.3%` (`n=5`, 最优)** | 同题同轮双通配对净省 **`+11.3%`**（C 为 `+2.5%`） |
+| **Supervisor Tokens (`Sup Tok`)** | **`0`** | `87,415` | `86,943` | 修复 `isAciSupervisorWireRequest` 后 **Arm A 严格归零** |
+| **DTOC Epochs / Superseded Evictions** | `0` / `0` | `0` / `0` | **`21` Epochs / `45` 次（省 `20,972` tok）** | 打破 2.5 `ep=0`，**总 DTOC 节省 `39,189` tok** |
+| **Partial Recoveries / Assisted Pass** | `0` / `0.0%` | `13`（省 `8,782` tok）/ `28.6%` | **`13`（省 `2,232` tok）/ `62.5%`** | `15/15` (`100.0%`) 哈希验签恢复，恢复辅助通关率 **`62.5%`** |
+
+### 2. Agent_US 2.5 — ACI 2.5 三臂平行对照实证（`aci25` 六题 · `36` 试次）
 
 - **测试条件**：冻结代码提交 `9459b5b`，`deepseek-v4.1-flash`（`http://127.0.0.1:3065/v1`），Docker **`strong`**（`agent-us/benchmark:node24`），`--suite aci25`（原 4 题 + 新增多模块补丁 `aci-05` 与 Swarm 契约 `aci-06`）× **Arm A / C / D × 2 轮重复 = 36 试次**（`--concurrency 12` + `--resume`）。完整逐细胞矩阵、LaTeX/Markdown 导出表及机制轨迹见 [2.5 — ACI 2.5 与工程能力实证报告](backend/docs/2.5-aci-and-engineering-report.md)。
 
@@ -187,7 +205,7 @@ flowchart TB
 
 - **关键 2.5 机制真实轨迹实证**：`aci-01 D rep=0` 触发 `postTestReserveActive` + Stage-1 裁剪 + **唯一 1 次 `tools: []` 宽限步**，在 `usedTokens = 162,490 > 160,000` 时免于 `TOKEN_BUDGET` 并成功 `PASS`；`aci-03 C rep=1` 两次在 `8s`（`8,001 / 8,112 ms`）精确超时后熔断器开启（`supervisorCircuitOpen: true`），后续准入 **`durationMs = 0` 瞬时旁路** 并借助 `expand_context` + `apply_patch` 顺利通关；`aci-05 D rep=1` 由 Supervisor 拦截 3 份旧档后经 `run_diagnostics(kind: "syntax")` 检查并一次 `PASS`。
 
-### 2. Agent_US 2.4 Stage 4 — ACI 注入前治理四臂消融对比（冻结实测 · `48 + 6` 试次）
+### 3. Agent_US 2.4 Stage 4 — ACI 注入前治理四臂消融对比（冻结实测 · `48 + 6` 试次）
 
 - **测试条件**：冻结代码提交 `2bce1db6`，`deepseek-v4.1-flash`（主模型与 Supervisor 一致，本地代理 `127.0.0.1:3065/v1`），Docker **`strong`**（`agent-us/benchmark:node24`），4 项高噪声复杂多文件工程任务（每项含 17–18 个文件、7–8 个高干扰诱饵、Docker 隐藏验收与防篡改 Veto）× **4 臂 × 3 轮重复 = 48 试次**。详表与逐试次原始轨日志见 [2.4 Stage 4 实证评估报告](backend/docs/2.4-stage4-aci-governance-report.md)。
 
@@ -207,7 +225,7 @@ flowchart TB
 - **短任务 KV Cache 无损回归（Run 4B-2，`ar-06/08/09` × `A, D` = 6 试次，`dtocMinPromptTokens=24000`）**：Arm A `2/3`（KV 命中率 **`89.53%`**）vs Arm D `2/3`（全程 **`epochTransitions = 0`**，KV 命中率 **`88.89%`**，仅差 `-0.64 pp`），验证短任务零撕裂。
 - **Supervisor 与无损恢复真实链路实证**：在 `aci-04 C rep=2` 中，只读 Supervisor 将 3,860 字符的核心鉴权策略 `policy-engine.js` 压缩为聚焦关键导出符号的 `SUPPORTING` 视图（`1,002 → 614 tok`），精准把 `COMPLIANCE-APPENDIX.md` 等 4 份高混淆诱饵压至 `[ACI-SKIP]`（单轮净省 `7,149 tok`），随后主 Agent 通过 `expand_context` 经 SHA-256 验签精准恢复 `policy-engine.js` 片段（`195 tok`, `verified=true`）一次通关；在 `aci-03 D rep=0/1` 与 `aci-01 D rep=0/1` 中，主模型亦精准从 `SUPPORTING` 视图无损恢复 `CONTRACT.json` 与 `runtime-options.js` 并全部 `PASS`。
 
-### 3. 多阶段里程碑验收快照 (2.3 – 2.4 S3)
+### 4. 多阶段里程碑验收快照 (2.3 – 2.4 S3)
 
 | 版本 / 阶段 | 评测对象与规模 | 核心实测结果 | 详细报告 |
 | --- | --- | --- | --- |
@@ -219,9 +237,9 @@ flowchart TB
 <details>
 <summary><b>📌 评测局限与诚实边界说明（点击展开）</b></summary>
 
-1. **端到端均值 `tokenReduction` 与成功归一化指标对比**：Stage 4 与 2.5 中，原始基线 Arm A 分别有 `8/12` 与 `9/12` 试次过早因 `TOKEN_BUDGET` 或长尾超时截断从而压低了简单算术均分母；为此 2.5 引入 **`tokensPerCompletedPass`**（C/D 实降 `55.4%–56.9%`）与 **`pairedPassTokenReduction`**（同题双通配对 Arm D 净省 `+5.22%`）以剔除早停偏差。
-2. **`aci-06-swarm-contract-integration` 天花板与样本量（2.5）**：2.5 实测中三臂在 `aci-06` 上均为 `0/2`（多模块高耦合与 `200k` 限额限制），且双通配对基数较少（`n=2`，总体通关率 Wilson 95% CI 为 `[31.95%, 80.67%]` vs Arm A `[8.89%, 53.23%]`）；另因单步 prompt 均未达 `>=28k` / `0.78`，`phase_watermark_v25` 高压触发与跨重试 `mergeFrom` 主要由 `aci-25` 与 `integration-25-e2e` 确定性测试验证。
-3. **网关抓包启发式与上游缓存波动**：2.5 运行期评估器 `wireSup` 因仅按 `tools.length === 0` 识别 Supervisor，将 Arm A 两次 `tools: []` 宽限/压缩步计入 `27,507` tok（内部 `aciSupCalls = 0`）；同时观测到 2.5 有 `5/36`、Stage 4 有 `8/48` 上游 SSE `cacheReadTokens ≈ 0` 偶发波动，Supervisor 超时 calls 均安全回退至确定性规则。
+1. **端到端均值 `tokenReduction` 与成功归一化指标对比**：Stage 4 与 2.5 中，原始基线 Arm A 分别有 `8/12` 与 `9/12` 试次过早因 `TOKEN_BUDGET` 或长尾超时截断从而压低了简单算术均分母；为此 2.5 引入 **`tokensPerCompletedPass`** 与 **`pairedPassTokenReduction`**。在 2.6 `aci26` 42 试次下，Arm D 取得 **`+11.3%`** 配对节省与 **`304,125`** tok/pass（双项优于 Arm C 的 `+2.5%` / `370,548`）。
+2. **`ep=0`、`aci-06` 与 `wireSup` 痛点在 2.6 的消解与剩余长程边界**：2.5 遗留的三项关键痛点均在 2.6 实证闭环解决——Arm D `epochTransitions` 从 `0 → 21`（`45` 次过期驱逐省 `20,972` tok，总 DTOC 省 `39,189` tok），Arm D 首次唯一攻克 `aci-06`（`0/2 → 1/2`），Arm A `wireSup` 经 `isAciSupervisorWireRequest` 精确归零（`27,507 → 0`）。与此同时，高压长程任务 `aci-04`（D `0/2` vs C `1/2`）与新增 21 文件 `aci-07`（D `0/2` vs A/C `1/2`，Arm D 两轮均已触发 2 次过期驱逐但仍在 220k 限额下超时/超预算）及部分样本 `cacheHitRate` 波动仍是有待继续优化的前沿空间。
+3. **上游缓存波动与 `Supervisor` 超时回退**：真实网关观测到 Stage 4（`8/48`）、2.5（`5/36`）与 2.6 个别请求存在上游 `cacheReadTokens ≈ 0` 波动，Arm D 平均耗时与长程 `220k` 限额受模型多轮推理波动影响；所有 Supervisor `8s` 超时均触发熔断并安全回退至确定性策略。
 4. **2.3 外部开源 Benchmark 样本说明**：早期 2.3 OSS 四仓库（`nanoid` 等）样本规模较小，Capability Profile 仍按 `provisional_low_sample` 标注；缺少目标仓库外置依赖时，`tsc`/`tsd` 等需在具备依赖的隔离环境中补验。
 
 </details>
@@ -283,8 +301,8 @@ flowchart TB
 | 接口面 | 代表路由 | 用途 |
 | --- | --- | --- |
 | **模型兼容网关** | `POST /v1/chat/completions` · `GET /v1/models` · `POST /v1/messages` | OpenAI 与 Anthropic 兼容端点（经 `GatewayProxy` 与 `AccountPool` 转发） |
-| **ACI 与自主运行时** | `/v1/sessions/*` · `/v1/stream` · `/v1/context/supervisor` · `/v1/approvals` | Direct 会话、SSE 事件流、ContextSupervisor 与 ACI 开关 (`admissionEnabled` / `dtocMinPromptTokens`)、工具审批 |
-| **Swarm 与自治 API** | `/v1/swarm/*` · `/v1/autonomous/*` · `/v1/accounts` · `/v1/auth/*` | 自主任务提交、多智能体状态、多账号健康路由与登录状态 *(旧 `/api/v1/*` 仅保留兼容)* |
+| **ACI 与自主运行时** | `/v1/sessions/*` · `/v1/stream` · `/v1/context/supervisor` · `/v1/approvals` | Direct 会话、SSE 事件流（含 `aciTelemetry`/`budgetWatermarks`）、ContextSupervisor 与 ACI 开关、工具审批 |
+| **Swarm 与自治 API** | `/v1/swarm/*` · `/v1/autonomous/*` · `/v1/evaluations/aci-ablation` · `/v1/accounts` · `/v1/auth/*` | 自主任务与冲突自动修复、多智能体状态、归档消融查询、多账号健康路由 *(旧 `/api/v1/*` 仅保留兼容)* |
 
 ---
 
@@ -322,19 +340,21 @@ npm --prefix desktop run build    # 生成 Windows 安装包 / 便携版
 ### 验证命令
 
 ```powershell
-# 后端语法与类型检查 + 2.5 核心回归套件
+# 后端语法与类型检查 + 2.6 核心回归与 E2E 套件
 Set-Location backend
 npm run check
-node --test --test-concurrency=1 test/context/aci-25.test.js test/tools/coding-primitives-25.test.js test/swarm/swarm-hardening-25.test.js test/evaluation/eval-25.test.js test/integration-25-e2e.test.js
+node --test --test-concurrency=1 test/context/aci-26.test.js test/tools/coding-diagnostics-26.test.js test/swarm/conflict-resolution-26.test.js test/evaluation/eval-26.test.js test/integration-26-e2e.test.js
 
 # 评测沙箱（本地具备 Docker 时用 strong；Docker-less CI 自动/显式走 node-permission）
 $env:AGENT_US_BENCHMARK_SANDBOX_MODE = 'strong'
 node --test --test-concurrency=1 --test-timeout=180000 test/evaluation/aci-governance-benchmark.test.js test/evaluation/docker-sandbox-acceptance.test.js
 
-# 前端与桌面端校验
+# 前端与桌面端校验（含 2.6 UI 单测与 Playwright 视觉门禁）
 Set-Location ..\frontend
 npx tsc --noEmit
+node --test test/*.test.js
 npm run build
+npm run test:e2e:visual
 Set-Location ..
 Get-ChildItem desktop\*.mjs | ForEach-Object { node --check $_.FullName }
 ```
@@ -352,34 +372,36 @@ Get-ChildItem desktop\*.mjs | ForEach-Object { node --check $_.FullName }
 Agent_US/
 ├─ backend/
 │  ├─ src/
-│  │  ├─ context/                # aci-admission / aci-engine / aci-store / supervisor / compaction / memory
-│  │  ├─ kernel/                 # agent-loop / contract-reasoning / execution-reasoning / runtime / events
+│  │  ├─ context/                # aci-admission / aci-engine (trajectory_eviction_v26) / aci-store / supervisor / memory
+│  │  ├─ kernel/                 # agent-loop / contract-reasoning / execution-reasoning (Anti-Thrashing) / runtime
 │  │  ├─ tools/                  # selection / policy / auto-approval / dispatcher / benchmark-sandbox / builtin/
 │  │  ├─ durable/                # DurableJobQueue / CheckpointStore / Recovery / lease-guard (renewTurnLease)
-│  │  ├─ evaluation/             # aci-governance-benchmark / external-benchmark / hidden-acceptance / judge / service
+│  │  ├─ evaluation/             # aci-governance-benchmark (aci26 / aci-07) / external-benchmark / judge / service
 │  │  ├─ governance/             # EvidenceVerifier / Audit / Policy Control Plane
 │  │  ├─ planning/               # AdaptivePlanner / AdaptiveReplanner / budget-estimator / Validator
-│  │  ├─ swarm/                  # Orchestrator / Mailbox / Conflict Preflight / 3-Way Artifacts / Reviewer Hard Gate
+│  │  ├─ swarm/                  # Orchestrator (conflict_resolution) / Artifacts (mergeFileThreeWay) / Reviewer Hard Gate
 │  │  ├─ communication/          # Inter-Agent Communication Bus & Store Adapters
 │  │  ├─ memory/                 # Verified-only ExperienceMemoryService
 │  │  ├─ observability/          # Prompt Cache Telemetry / Metrics / Traces / Structured Logs
-│  │  ├─ routes/                 # chat-command (/swarm) / intelligence-routes / workspace-git
-│  │  ├─ patch-and-diagnostics.js # 双格式 apply_patch (乐观锁 + 语法预检) & run_diagnostics 千行压缩
-│  │  ├─ direct-agent.js         # DirectAgentRuntime 主编排引擎 (Static Prompt + ACI 2.5 + Durable)
+│  │  ├─ routes/                 # chat-command (/swarm) / intelligence-routes (/v1/evaluations/aci-ablation) / workspace-git
+│  │  ├─ patch-and-diagnostics.js # 双格式 apply_patch & run_diagnostics (增量 tsc + node --test expected/actual)
+│  │  ├─ direct-agent.js         # DirectAgentRuntime 主编排引擎 (Static Prompt + ACI 2.6 + Durable)
+│  │  ├─ workspace-tools.js      # query_symbol_graph 直调符号图谱 / inspect_repository
 │  │  ├─ repo-intelligence.js    # 增量符号缓存、跨文件引用与关联测试定位
 │  │  ├─ pool.js & gateway-proxy.js # AccountPool 多账号路由与 OpenAI/Anthropic 协议适配
 │  │  └─ v1-routes.js            # 主 REST / SSE API (/v1/*；legacy /api/v1/* 仅兼容)
 │  ├─ sandbox/                   # Dockerfile.benchmark (agent-us/benchmark:node24)
-│  ├─ scripts/                   # check.js · benchmark-aci-governance.mjs (--resume / --concurrency / --export-paper)
-│  ├─ test/                      # 101+ 串行单测、端到端集成、Docker 安全隔离与消融套件
-│  └─ docs/                      # 2.3–2.5 全阶段技术与实证报告
+│  ├─ scripts/                   # check.js · benchmark-aci-governance.mjs (--suite aci26 / --archive-dir / wireSup fix)
+│  ├─ test/                      # 106+ 串行单测、2.6 端到端集成、Docker 安全隔离与消融套件
+│  └─ docs/                      # 2.3–2.6 全阶段技术与实证报告 + evidence/ 归档实验数据
 ├─ frontend/
 │  ├─ src/
-│  │  ├─ components/             # AdaptiveContextPanel · FileChangeCard · AutonomousRunPanel · Composer · InspectorDrawer
-│  │  ├─ api/                    # REST / SSE Client · Simulator
+│  │  ├─ components/             # AdaptiveContextPanel · FileChangeCard · InspectorDrawer · EvaluationView · ThreadView
+│  │  ├─ utils/                  # aciTelemetry.ts · diagnostics.ts · diff.ts (折叠上下文/hunk)
+│  │  ├─ api/                    # REST / SSE Client (getAciAblationSummary) · Simulator
 │  │  └─ App.tsx
 │  ├─ NATIVE-VISUAL.md           # 前端视觉设计与交互规范
-│  └─ test/                      # UI 单测 (eval-25-ui) 与 Playwright 浏览器运行时测试
+│  └─ test/                      # UI 单测 (ux-26 / eval-25-ui 等) 与 Playwright visual.spec.mjs / browser-runtime
 ├─ desktop/
 │  ├─ main.mjs                   # Electron Desktop Host
 │  ├─ extension-hub.mjs          # 桌面插件扩展宿主
@@ -399,7 +421,8 @@ Agent_US/
 
 | 类别 | 文档 | 说明 |
 | --- | --- | --- |
-| **最新 2.5 实证** | [2.5 — ACI 2.5 与工程能力实证报告](backend/docs/2.5-aci-and-engineering-report.md) | 双门控 `phase_watermark_v25`、`8s` 熔断、完工宽限步、`apply_patch`/`run_diagnostics`、Swarm 三方合并/Hard Gate 与 `36` 试次 3-Arm 实证 |
+| **最新 2.6 实证** | [2.6 — ACI 2.6、工程诊断与 UI 实证报告](backend/docs/2.6-aci-agent-ui-report.md) · [论文导出表](backend/docs/evidence/aci-26-ablation-paper-tables.md) | `trajectory_eviction_v26`、`sliceSha256` 局部恢复、Anti-Thrashing、`query_symbol_graph`、Swarm 自动解冲突、`wireSup` 归零与 `42` 试次 `aci26` 实证 |
+| **2.5 实证归档** | [2.5 — ACI 2.5 与工程能力实证报告](backend/docs/2.5-aci-and-engineering-report.md) | 双门控 `phase_watermark_v25`、`8s` 熔断、完工宽限步、`apply_patch`/`run_diagnostics`、Swarm 三方合并/Hard Gate 与 `36` 试次 3-Arm 实证 |
 | **2.4 Stage 4 实证** | [2.4 Stage 4 — ACI 上下文准入治理报告](backend/docs/2.4-stage4-aci-governance-report.md) | 注入前五级准入、`ContextSupervisor`、`expand_context` SHA-256 恢复、KV 保真与 4 臂 48 试次完整记录 |
 | **2.4 Stage 1–3 演进** | [2.4 Stage 3 实证报告](backend/docs/2.4-stage3-autonomous-intelligence-report.md) · [Stage 2 报告](backend/docs/2.4-stage2-real-provider-benchmark-report.md) · [Stage 1 报告](backend/docs/2.4-stage1-autonomous-reasoning-report.md) | 契约推理、根因台账、零 Shell 摘要、Verified Experience 与双 CI 验证 |
 | **2.3.7 工具智能** | [2.3.7 Capability-Aware Tool Selection 报告](backend/docs/2.3.7-capability-aware-tool-selection-report.md) | 14 题配对真实 Provider 实验、`−71.9%` Bash 拒绝与 `−23.6%` Token 消耗 |
