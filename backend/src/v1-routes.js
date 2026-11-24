@@ -174,6 +174,8 @@ export function v1Routes(
       workspaceRoot: body.workspaceRoot,
       mode: body.mode,
       permissionMode: body.permissionMode,
+      ...(body.aciProfile !== undefined ? { aciProfile: body.aciProfile } : {}),
+      ...(body.aciOptions !== undefined ? { aciOptions: body.aciOptions } : {}),
       trafficSource: traffic.trafficSource,
       isSynthetic: traffic.isSynthetic,
     });
@@ -220,6 +222,8 @@ export function v1Routes(
       effort: body.effort,
       maxSteps: body.maxSteps,
       files: body.files,
+      ...(body.aciProfile !== undefined ? { aciProfile: body.aciProfile } : {}),
+      ...(body.aciOptions !== undefined ? { aciOptions: body.aciOptions } : {}),
       ...(traffic ? { trafficSource: traffic.trafficSource, isSynthetic: traffic.isSynthetic } : {}),
     });
   });

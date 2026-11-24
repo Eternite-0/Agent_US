@@ -3,6 +3,9 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { z } from 'zod';
 import { canonicalJson, sha256Hex } from '../../integrity.js';
+import { estimateTokens } from '../../context.js';
+import { extractSymbolsFromText } from '../../context/aci-engine.js';
+import { Fault } from '../../store.js';
 import { PolicyError } from '../../kernel/errors.js';
 import { normalizeProtectedSegment, resolveConfinedPath } from '../sandbox.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
@@ -363,20 +366,21 @@ export function createMetaTools({
     defineTool({
       name: 'expand_context',
       readOnly: true,
-      description:
-        '无损恢复被折叠的 artifact://<sha256> 或 ACI refId 原始上下文内容，支持按起止行号（startLine/endLine）或字符偏移（offset/limit）精确展开。',
+      description: '无损恢复 artifact://<sha256> 或 ACI refId 原文（支持行号/字符/大纲/符号片段）。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
       riskLevel: RISK_LEVELS.LOW,
       replayable: true,
       outward: false,
       zodSchema: z.object({
-        ref: z.string().min(1).optional().describe('artifact://<sha256> URI 或 ACI refId'),
-        uri: z.string().min(1).optional().describe('artifact://<sha256> URI 别名'),
-        refId: z.string().min(1).optional().describe('ACI refId 别名'),
-        startLine: z.number().int().min(1).optional().describe('起始行号（1-based，含）'),
-        endLine: z.number().int().min(1).optional().describe('结束行号（1-based，含）'),
-        offset: z.number().int().min(0).optional().describe('起始字符偏移（0-based）'),
-        limit: z.number().int().min(1).max(32768).optional().describe('最大返回字符数（默认 16384）'),
+        ref: z.string().min(1).optional().describe('artifact:// URI 或 refId'),
+        uri: z.string().min(1).optional().describe('URI 别名'),
+        refId: z.string().min(1).optional().describe('refId 别名'),
+        level: z.enum(['verbatim', 'hunk', 'outline']).optional(),
+        symbols: z.array(z.string().min(1)).max(20).optional(),
+        startLine: z.number().int().min(1).optional().describe('起始行'),
+        endLine: z.number().int().min(1).optional().describe('结束行'),
+        offset: z.number().int().min(0).optional().describe('字符偏移'),
+        limit: z.number().int().min(1).max(32768).optional().describe('字符上限'),
       }),
       async execute(args, ctx) {
         await guardFallback('expand_context', args, ctx);
@@ -384,13 +388,32 @@ export function createMetaTools({
         if (!rawRef) {
           throw new Error('expand_context requires ref, uri, or refId');
         }
+        const level =
+          args.level === 'hunk' || args.level === 'outline' ? args.level : 'verbatim';
+
         let blob = null;
+        let resolvedMeta = null;
         if (typeof resolveContextRef === 'function') {
-          const resolved = await resolveContextRef(rawRef);
+          const resolved = await resolveContextRef(rawRef, {
+            level,
+            symbols: args.symbols,
+            startLine: args.startLine,
+            endLine: args.endLine,
+            offset: args.offset,
+            limit: args.limit,
+            recordLedger: false,
+          });
           if (resolved && typeof resolved.content === 'string') {
+            if (resolved.verified === false) {
+              throw new Fault('ARTIFACT_HASH_MISMATCH', 500, {
+                message: `Artifact hash verification failed for ${rawRef}`,
+              });
+            }
+            resolvedMeta = resolved;
             blob = {
               sha256: resolved.sha256 ?? sha256Hex(resolved.content),
               content: resolved.content,
+              path: resolved.path ?? '',
             };
           } else if (resolved && typeof resolved.uri === 'string') {
             blob = store.getBlob(resolved.uri);
@@ -398,39 +421,139 @@ export function createMetaTools({
         }
         if (!blob) {
           const clean = rawRef.replace(/^ref:/i, '').replace(/^aci:\/\//i, '');
+          let lookupUri = clean;
           if (!/^artifact:\/\//i.test(clean) && !/^[0-9a-f]{64}$/i.test(clean) && typeof store?.getSetting === 'function') {
             const mapped =
               store.getSetting(`aci.ref:${clean}`) ??
               store.getSetting(`aci_ref:${clean}`);
             const mappedUri = typeof mapped === 'string' ? mapped : mapped?.uri;
             if (mappedUri) {
+              lookupUri = mappedUri;
               blob = store.getBlob(mappedUri);
             }
           }
           if (!blob) {
             blob = store.getBlob(clean);
           }
+          const actual = sha256Hex(String(blob.content ?? ''));
+          const uriHashMatch = String(lookupUri).match(/^(?:artifact:\/\/)?([0-9a-f]{64})$/i);
+          const expectedFromUri = uriHashMatch?.[1]?.toLowerCase() ?? null;
+          if (
+            (blob.sha256 && actual !== String(blob.sha256).toLowerCase()) ||
+            (expectedFromUri && actual !== expectedFromUri)
+          ) {
+            throw new Fault('ARTIFACT_HASH_MISMATCH', 500, {
+              message: `Artifact SHA-256 mismatch for ${rawRef}`,
+              expectedSha256: expectedFromUri ?? blob.sha256 ?? null,
+              actualSha256: actual,
+            });
+          }
+          blob = { ...blob, sha256: actual };
         }
+
         const fullText = String(blob.content ?? '');
+        const actualSha256 = sha256Hex(fullText);
+        if (blob.sha256 && actualSha256 !== String(blob.sha256).toLowerCase()) {
+          throw new Fault('ARTIFACT_HASH_MISMATCH', 500, {
+            message: `Artifact SHA-256 mismatch for ${rawRef}`,
+            expectedSha256: blob.sha256,
+            actualSha256,
+          });
+        }
+
         const lines = fullText.split('\n');
+        const maxChars = Math.min(32768, Math.max(1, Number(args.limit ?? 16384)));
         let slice = fullText;
         let rangeDesc = '';
-        if (args.startLine !== undefined || args.endLine !== undefined) {
+
+        if (level === 'outline') {
+          const pathForParse = blob.path || 'file.js';
+          const extracted = extractSymbolsFromText(pathForParse, fullText);
+          const imports = lines
+            .map((line, i) => ({ line, num: i + 1 }))
+            .filter((x) => /^\s*(?:import|export\s+.*from|from\s+\S+\s+import|use\s+)/.test(x.line))
+            .slice(0, 16)
+            .map((x) => `L${x.num}: ${x.line.trim()}`);
+          const symbolLines = (extracted.definitions ?? [])
+            .slice(0, 40)
+            .map((d) => `L${d.line}: [${d.kind}] ${d.name}`);
+          const sections = [`[ACI-OUTLINE ${pathForParse} | ${lines.length} lines]`];
+          if (imports.length) sections.push(`Imports:\n${imports.join('\n')}`);
+          if (symbolLines.length) sections.push(`Symbols:\n${symbolLines.join('\n')}`);
+          if (!imports.length && !symbolLines.length) {
+            sections.push(lines.slice(0, 20).map((l, idx) => `L${idx + 1}: ${l}`).join('\n'));
+          }
+          slice = sections.join('\n\n').slice(0, maxChars);
+          rangeDesc = `outline (${lines.length} lines)`;
+        } else if (level === 'hunk') {
+          if (args.startLine !== undefined || args.endLine !== undefined) {
+            const sLine = Math.max(1, Number(args.startLine ?? 1));
+            const eLine = Math.min(lines.length, Math.max(sLine, Number(args.endLine ?? lines.length)));
+            slice = lines
+              .slice(sLine - 1, eLine)
+              .map((l, idx) => `L${sLine + idx}: ${l}`)
+              .join('\n')
+              .slice(0, maxChars);
+            rangeDesc = `hunk lines ${sLine}-${eLine}/${lines.length}`;
+          } else {
+            const needles = (args.symbols ?? [])
+              .map((s) => String(s || '').trim())
+              .filter(Boolean);
+            const matchLines = [];
+            if (needles.length > 0) {
+              for (let i = 0; i < lines.length; i += 1) {
+                const lower = lines[i].toLowerCase();
+                if (needles.some((n) => lower.includes(n.toLowerCase()))) {
+                  matchLines.push(i + 1);
+                  if (matchLines.length >= 16) break;
+                }
+              }
+            }
+            const windows = [];
+            for (const ln of matchLines) {
+              const from = Math.max(1, ln - 8);
+              const to = Math.min(lines.length, ln + 8);
+              if (windows.length && from <= windows.at(-1).to + 2) {
+                windows.at(-1).to = Math.max(windows.at(-1).to, to);
+              } else {
+                windows.push({ from, to });
+              }
+            }
+            if (windows.length === 0) {
+              windows.push({ from: 1, to: Math.min(lines.length, 30) });
+            }
+            const hunkBlocks = windows.map((w) => {
+              const chunk = [];
+              for (let ln = w.from; ln <= w.to; ln += 1) {
+                chunk.push(`L${ln}: ${lines[ln - 1] ?? ''}`);
+              }
+              return `@@ L${w.from}-${w.to} @@\n${chunk.join('\n')}`;
+            });
+            slice = hunkBlocks.join('\n...\n').slice(0, maxChars);
+            rangeDesc = `hunk (${windows.map((w) => `L${w.from}-${w.to}`).join(',')}/${lines.length})`;
+          }
+        } else if (args.startLine !== undefined || args.endLine !== undefined) {
           const sLine = Math.max(1, Number(args.startLine ?? 1));
           const eLine = Math.min(lines.length, Math.max(sLine, Number(args.endLine ?? lines.length)));
           const selected = lines.slice(sLine - 1, eLine).join('\n');
-          const maxChars = Math.min(32768, Math.max(1, Number(args.limit ?? 32768)));
-          slice = selected.slice(0, maxChars);
+          const lineMaxChars = Math.min(32768, Math.max(1, Number(args.limit ?? 32768)));
+          slice = selected.slice(0, lineMaxChars);
           rangeDesc = `lines ${sLine}-${eLine}/${lines.length}`;
         } else {
           const offset = Math.max(0, Number(args.offset ?? 0));
-          const limit = Math.min(32768, Math.max(1, Number(args.limit ?? 16384)));
-          slice = fullText.slice(offset, offset + limit);
+          slice = fullText.slice(offset, offset + maxChars);
           rangeDesc = `chars ${offset}-${offset + slice.length}/${fullText.length}`;
         }
+
+        resolvedMeta?.recordRecovery?.({
+          level,
+          tokensRestored: estimateTokens(slice),
+          path: blob.path || '',
+        });
+
         return wrapResult(
           'expand_context',
-          `[expand_context ${String(blob.sha256 || '').slice(0, 12)} ${rangeDesc}]\n${slice}`,
+          `[expand_context sha256:${actualSha256.slice(0, 12)} verified=true ${rangeDesc}]\n${slice}`,
         );
       },
     }),

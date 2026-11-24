@@ -101,20 +101,40 @@ function computeActiveCriticalContextRecall({ criticalFiles = [], reasoningTrack
   const filesReadBeforeEdit = reasoningTracker?.rootCauseFilesReadBeforeEdit ?? [];
   const keptPaths = (ledger?.kept ?? []).map((k) => k.path).filter(Boolean);
   const expandedPaths = (ledger?.expanded ?? []).map((e) => e.path).filter(Boolean);
+  const recoveredPaths = (ledger?.recoveries ?? [])
+    .filter((r) => r.verified !== false)
+    .map((r) => r.path)
+    .filter(Boolean);
+  const admittedActivePaths = (ledger?.admissions ?? [])
+    .filter((a) => a.decision === 'DIRECT' || a.decision === 'SUPPORTING')
+    .map((a) => a.path)
+    .filter(Boolean);
+  const admittedStubPaths = (ledger?.admissions ?? [])
+    .filter((a) => a.decision === 'DEFER' || a.decision === 'IRRELEVANT')
+    .map((a) => a.path)
+    .filter(Boolean);
   const compressedPaths = (ledger?.compressed ?? []).map((c) => c.path).filter(Boolean);
   const restoredRefs = (aciStore?.listRefs?.() ?? []).filter((r) => Number(r.restoredCount || 0) > 0);
 
   let activeHits = 0;
   for (const gt of uniqueTruth) {
+    const hasAdmissions = (ledger?.admissions ?? []).length > 0;
+    const admittedActive = admittedActivePaths.some((p) => aciPathsMatch(p, gt));
+    const admittedOnlyStub = admittedStubPaths.some((p) => aciPathsMatch(p, gt)) && !admittedActive;
     const readOrKept =
-      filesReadBeforeEdit.some((p) => aciPathsMatch(p, gt)) ||
+      admittedActive ||
+      (!admittedOnlyStub && filesReadBeforeEdit.some((p) => aciPathsMatch(p, gt))) ||
       keptPaths.some((p) => aciPathsMatch(p, gt)) ||
-      expandedPaths.some((p) => aciPathsMatch(p, gt));
-    const wasCompressed = compressedPaths.some((p) => aciPathsMatch(p, gt));
+      expandedPaths.some((p) => aciPathsMatch(p, gt)) ||
+      recoveredPaths.some((p) => aciPathsMatch(p, gt));
+    const wasCompressed = compressedPaths.some((p) => aciPathsMatch(p, gt)) || (hasAdmissions && admittedOnlyStub);
     const wasRestored =
       expandedPaths.some((p) => aciPathsMatch(p, gt)) ||
+      recoveredPaths.some((p) => aciPathsMatch(p, gt)) ||
       restoredRefs.some((r) => aciPathsMatch(r.path, gt));
     if (readOrKept && (!wasCompressed || wasRestored)) {
+      activeHits += 1;
+    } else if (wasRestored) {
       activeHits += 1;
     }
   }
@@ -422,35 +442,134 @@ export class AgentLoop {
       workspaceRoot,
       baselineTestFiles: execution?.baselineTestFiles ?? node?.baselineTestFiles ?? null,
     });
-    const initialSupCfg = aci?.supervisor?.getConfig?.() ?? null;
+    const aciProfile = aci?.aciProfile ?? 'full_aci';
+    const aciAdmissionEnabled =
+      Boolean(aci?.engine) &&
+      aci?.admissionEnabled !== false &&
+      typeof aci?.engine?.admitToolBatch === 'function';
+    const aciDtocEnabled = Boolean(aci?.engine) && aci?.dtocEnabled !== false;
+    const aciSupervisorEnabled = aci?.supervisorEnabled !== false;
+    const aciSupervisorConfigOverride = aci?.supervisorConfigOverride ?? null;
+    const resolvedInitialSup = aci?.supervisor
+      ? aciSupervisorConfigOverride
+        ? aci.supervisor.resolveModel?.(aciSupervisorConfigOverride)
+        : {
+            config: aci.supervisor.getConfig?.() ?? null,
+            effectiveModel: aci.supervisor.resolveModel?.()?.effectiveModel ?? null,
+          }
+      : null;
+    const initialSupCfg = resolvedInitialSup?.config ?? null;
+    let dtocSupervisorCalls = 0;
     let aciSupervisorCalls = 0;
-    let aciSupervisorMode = initialSupCfg ? (initialSupCfg.enabled ? initialSupCfg.mode : 'off') : null;
-    let aciSupervisorModel = aci?.supervisor?.resolveModel?.()?.effectiveModel ?? null;
+    let aciSupervisorMode = !aciSupervisorEnabled
+      ? 'off'
+      : initialSupCfg
+        ? initialSupCfg.enabled
+          ? initialSupCfg.mode
+          : 'off'
+        : null;
+    let aciSupervisorModel = !aciSupervisorEnabled
+      ? null
+      : resolvedInitialSup?.effectiveModel ?? null;
     const rawAciCritical = aci?.criticalFiles ?? execution?.evidenceContract?.requiredChangedFiles ?? [];
     const resolvedAciCriticalFiles = resolveBaselineCriticalFiles(workspaceRoot, rawAciCritical);
     const syncAciMetrics = () => {
       if (!aci?.engine && !aci?.aciStore && !aci?.ledger) return;
       const refs = aci.aciStore?.listRefs?.() ?? [];
-      const ledgerSummary = aci.ledger?.summary?.() ?? { compressedCount: 0, expandedCount: 0, totalTokensSaved: 0 };
-      const restoredCount = refs.reduce((s, r) => s + Number(r.restoredCount || 0), 0);
+      const ledgerSummary = aci.ledger?.summary?.() ?? {
+        compressedCount: 0,
+        expandedCount: 0,
+        totalTokensSaved: 0,
+        admissionTokensSaved: 0,
+      };
+      const admissions = aci.ledger?.admissions ?? [];
+      const admissionDecisions = { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 };
+      let admissionOriginalTokens = 0;
+      let admissionInjectedTokens = 0;
+      let admissionSavedTokens = 0;
+      for (const a of admissions) {
+        if (a?.decision && Object.hasOwn(admissionDecisions, a.decision)) {
+          admissionDecisions[a.decision] += 1;
+        }
+        admissionOriginalTokens += Number(a?.originalTokens || 0);
+        admissionInjectedTokens += Number(a?.injectedTokens || 0);
+        admissionSavedTokens += Number(a?.tokensSaved || 0);
+      }
+      const recoveries = aci.ledger?.recoveries ?? [];
+      const hashVerifiedRestores = recoveries.filter((r) => r?.verified).length;
+      const refsRestoredCount = refs.reduce((s, r) => s + Number(r.restoredCount || 0), 0);
+      const restoredCount = Math.max(refsRestoredCount, recoveries.length);
       const offloadedCount = Math.max(refs.length, Number(ledgerSummary.compressedCount || 0));
       const savedTokens = Number(ledgerSummary.totalTokensSaved || 0);
+      const totalAciSavedTokens = savedTokens + admissionSavedTokens;
       const epochTransitions = Number(aci.engine?.epochState?.epochCount || 0);
+      const supLog = aci.ledger?.supervisorCalls ?? [];
+      const effectiveSupCalls = Math.max(aciSupervisorCalls, supLog.length);
+      const supervisorCost = {
+        calls: effectiveSupCalls,
+        inputTokens: supLog.reduce((s, c) => s + Number(c.inputTokens || 0), 0),
+        outputTokens: supLog.reduce((s, c) => s + Number(c.outputTokens || 0), 0),
+        totalTokens: supLog.reduce((s, c) => s + Number(c.totalTokens || 0), 0),
+        durationMs: supLog.reduce((s, c) => s + Number(c.durationMs || 0), 0),
+        fallbackCount: supLog.filter((c) => Boolean(c.fallback)).length,
+      };
+      const recoveryStats = {
+        totalRecoveries: recoveries.length,
+        hashVerifiedCount: hashVerifiedRestores,
+        tokensRestored: recoveries.reduce((s, r) => s + Number(r.tokensRestored || 0), 0),
+      };
       const criticalContextRecall = computeActiveCriticalContextRecall({
         criticalFiles: resolvedAciCriticalFiles,
         reasoningTracker,
         aciStore: aci.aciStore ?? null,
         ledger: aci.ledger ?? null,
       });
+      const governance =
+        aci.ledger?.computeGovernanceMetrics?.({
+          groundTruthCriticalFiles: resolvedAciCriticalFiles,
+        }) ?? null;
       reasoningTracker.updateAciMetrics({
+        aciProfile,
+        admissionEnabled: aciAdmissionEnabled,
+        dtocEnabled: aciDtocEnabled,
+        dtocPolicy: aci.engine?.dtocPolicy ?? 'adaptive_single_step',
+        dtocMinPromptTokens: aci.engine?.dtocMinPromptTokens ?? 24000,
+        admissionDecisions,
+        admissionOriginalTokens,
+        admissionInjectedTokens,
+        admissionSavedTokens,
         offloadedCount,
         savedTokens,
+        totalAciSavedTokens,
         restoredCount,
+        hashVerifiedRestores,
         criticalContextRecall,
-        supervisorCalls: aciSupervisorCalls,
+        supervisorCalls: effectiveSupCalls,
         supervisorMode: aciSupervisorMode,
         supervisorModel: aciSupervisorModel,
+        supervisorCost,
+        recoveryStats,
         epochTransitions,
+        ledger: {
+          summary: ledgerSummary,
+          governance,
+          admissions: admissions.map((a) => ({
+            path: a.path,
+            toolName: a.toolName,
+            decision: a.decision,
+            criticalDomains: a.criticalDomains,
+            score: a.score,
+            originalTokens: a.originalTokens,
+            injectedTokens: a.injectedTokens,
+            tokensSaved: a.tokensSaved,
+            step: a.step,
+            reason: a.reason,
+            uri: a.uri,
+            sha256: a.sha256,
+          })),
+          supervisorCalls: supLog,
+          recoveries,
+        },
       });
     };
     let taskContract = null;
@@ -695,89 +814,113 @@ export class AgentLoop {
           signal,
         };
         if (aci?.engine) {
-          const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
-          const epochContextWindow = aci.engine.contextWindow ?? 128000;
-          const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
-            currentStep: steps,
-            tools: requestOptions.tools,
-            cumulativeUsedTokens,
-            contextWindow: epochContextWindow,
-          });
-          if (epochProbe?.triggered) {
-            const activeMutationTargets = [...reasoningTracker.filesMutated];
-            const eligibleCandidates = selectOffloadableAciCandidates(requestOptions.messages, {
+          if (aciDtocEnabled) {
+            const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
+            const epochContextWindow = aci.engine.contextWindow ?? 128000;
+            const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
               currentStep: steps,
-              singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
-              singleStepBudget: aci.engine.singleStepBudget,
-              activeMutationTargets,
+              tools: requestOptions.tools,
+              cumulativeUsedTokens,
+              contextWindow: epochContextWindow,
             });
-            if (eligibleCandidates.length > 0) {
-              let keepRefs = [];
-              let compressRefs = [];
-              const totalEligibleChars = eligibleCandidates.reduce(
-                (sum, c) => sum + (Number(c.chars) || 0),
-                0,
-              );
-              if (
-                aci.supervisor &&
-                eligibleCandidates.length >= 2 &&
-                totalEligibleChars >= 2400 &&
-                aciSupervisorCalls < 2
-              ) {
-                const supStatus = aci.supervisor.getConfig?.() ?? null;
-                if (supStatus) {
-                  aciSupervisorMode = supStatus.enabled ? supStatus.mode : 'off';
-                }
-                const lastErrFp = reasoningTracker.errorFingerprints.at(-1)?.summary ?? '';
-                const supRes = await aci.supervisor
-                  .supervise({
-                    query: input,
-                    candidates: eligibleCandidates,
-                    errorSummary: lastErrFp,
-                    budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
-                    signal,
-                  })
-                  .catch(() => null);
-                if (supRes && !supRes.bypassed) {
-                  if (supRes.model) {
-                    aciSupervisorCalls += 1;
-                    aciSupervisorModel = supRes.model;
-                  }
-                  keepRefs = Array.isArray(supRes.keepRefs) ? supRes.keepRefs : [];
-                  compressRefs = Array.isArray(supRes.compressRefs) ? supRes.compressRefs : [];
-                }
-              }
-              const compResult = aci.engine.compress(requestOptions.messages, {
+            if (epochProbe?.triggered) {
+              const activeMutationTargets = [...reasoningTracker.filesMutated];
+              const eligibleCandidates = selectOffloadableAciCandidates(requestOptions.messages, {
                 currentStep: steps,
-                tools: requestOptions.tools,
-                cumulativeUsedTokens,
-                contextWindow: epochContextWindow,
-                keepRefs,
-                compressRefs,
+                singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
+                singleStepBudget: aci.engine.singleStepBudget,
                 activeMutationTargets,
               });
-              if (compResult?.triggered && compResult.pairClosedValid !== false && Array.isArray(compResult.messages)) {
-                messages = [...compResult.messages];
-                requestOptions = { ...requestOptions, messages };
-                this.eventRouter.emitPersisted({
-                  sessionId,
-                  turnId,
-                  type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
-                  data: {
-                    stage: 'aci_dtoc',
-                    reason: compResult.reason,
-                    epoch: compResult.epoch,
-                    watermark: compResult.watermark,
-                    step: steps,
-                    compressedCount: compResult.compressedCount,
-                    tokens: {
-                      before: compResult.tokensBefore,
-                      after: compResult.tokensAfter,
-                    },
-                    pairClosedValid: compResult.pairClosedValid,
-                  },
-                  audit: false,
+              if (eligibleCandidates.length > 0) {
+                let keepRefs = [];
+                let compressRefs = [];
+                const totalEligibleChars = eligibleCandidates.reduce(
+                  (sum, c) => sum + (Number(c.chars) || 0),
+                  0,
+                );
+                if (
+                  aciSupervisorEnabled &&
+                  aci.supervisor &&
+                  eligibleCandidates.length >= 2 &&
+                  totalEligibleChars >= 2400 &&
+                  dtocSupervisorCalls < 2
+                ) {
+                  const supStatus = aciSupervisorConfigOverride
+                    ? aci.supervisor.resolveModel?.(aciSupervisorConfigOverride)?.config
+                    : aci.supervisor.getConfig?.() ?? null;
+                  if (supStatus) {
+                    aciSupervisorMode = supStatus.enabled ? supStatus.mode : 'off';
+                  }
+                  const lastErrFp = reasoningTracker.errorFingerprints.at(-1)?.summary ?? '';
+                  const supRes = await aci.supervisor
+                    .supervise({
+                      query: input,
+                      candidates: eligibleCandidates,
+                      errorSummary: lastErrFp,
+                      budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
+                      learnedGuidelines: aci.engine.getGuidelines?.() ?? [],
+                      signal,
+                      configOverride: aciSupervisorConfigOverride,
+                    })
+                    .catch(() => null);
+                  if (supRes && !supRes.bypassed) {
+                    if (supRes.model) {
+                      dtocSupervisorCalls += 1;
+                      aciSupervisorCalls += 1;
+                      aciSupervisorModel = supRes.model;
+                    }
+                    aci.ledger?.recordSupervisorCall?.({
+                      stage: 'dtoc',
+                      model: supRes.model ?? aciSupervisorModel,
+                      candidateCount: eligibleCandidates.length,
+                      decisions: {
+                        keepRefs: supRes.keepRefs ?? [],
+                        compressRefs: supRes.compressRefs ?? [],
+                      },
+                      inputTokens: supRes.inputTokens ?? 0,
+                      outputTokens: supRes.outputTokens ?? 0,
+                      totalTokens: supRes.totalTokens ?? 0,
+                      durationMs: supRes.durationMs ?? 0,
+                      ok: supRes.ok !== false,
+                      fallback: supRes.fallback ?? null,
+                      step: steps,
+                    });
+                    keepRefs = Array.isArray(supRes.keepRefs) ? supRes.keepRefs : [];
+                    compressRefs = Array.isArray(supRes.compressRefs) ? supRes.compressRefs : [];
+                  }
+                }
+                const compResult = aci.engine.compress(requestOptions.messages, {
+                  currentStep: steps,
+                  tools: requestOptions.tools,
+                  cumulativeUsedTokens,
+                  contextWindow: epochContextWindow,
+                  keepRefs,
+                  compressRefs,
+                  activeMutationTargets,
                 });
+                if (compResult?.triggered && compResult.pairClosedValid !== false && Array.isArray(compResult.messages)) {
+                  messages = [...compResult.messages];
+                  requestOptions = { ...requestOptions, messages };
+                  this.eventRouter.emitPersisted({
+                    sessionId,
+                    turnId,
+                    type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
+                    data: {
+                      stage: 'aci_dtoc',
+                      reason: compResult.reason,
+                      epoch: compResult.epoch,
+                      watermark: compResult.watermark,
+                      step: steps,
+                      compressedCount: compResult.compressedCount,
+                      tokens: {
+                        before: compResult.tokensBefore,
+                        after: compResult.tokensAfter,
+                      },
+                      pairClosedValid: compResult.pairClosedValid,
+                    },
+                    audit: false,
+                  });
+                }
               }
             }
           }
@@ -1304,12 +1447,52 @@ export class AgentLoop {
         parentGuard?.();
         leaseGuard?.();
 
-        let detectedThrashing = false;
-        let batchTrigger = null;
-        for (const item of executedBatch) {
-          const { tc, isError, durationMs, receipt } = item;
+        const preparedBatch = executedBatch.map((item) => {
           const hint = selectionRecoveryHint?.(item, getModelTools);
           const output = hint ? `${item.output}\n${hint}` : item.output;
+          return { ...item, output };
+        });
+
+        let admittedOutputs = preparedBatch.map((b) => b.output);
+        if (aciAdmissionEnabled) {
+          const lastErrFp = reasoningTracker.errorFingerprints.at(-1)?.summary ?? '';
+          const errorFiles = (reasoningTracker.errorFingerprints ?? [])
+            .map((fp) => String(fp.location || '').split(':')[0])
+            .filter(Boolean);
+          const errorSymbols = (reasoningTracker.errorFingerprints ?? [])
+            .flatMap((fp) => [fp.errorType, fp.failingTarget])
+            .filter(Boolean);
+          const admitResult = await aci.engine.admitToolBatch(preparedBatch, {
+            query: input,
+            step: steps,
+            errorFiles,
+            errorSymbols,
+            mutatedFiles: [...reasoningTracker.filesMutated],
+            errorSummary: lastErrFp,
+            contractHints: lastContractReadiness?.missingContractReads ?? [],
+            supervisor: aci.supervisor ?? null,
+            supervisorEnabled: aciSupervisorEnabled,
+            supervisorConfigOverride: aciSupervisorConfigOverride,
+            signal,
+          });
+          if (Array.isArray(admitResult?.admittedItems)) {
+            admittedOutputs = admitResult.admittedItems.map(
+              (it, idx) => it.admittedOutput ?? preparedBatch[idx].output,
+            );
+          }
+          if (admitResult?.supervisorRes && !admitResult.supervisorRes.bypassed && admitResult.supervisorRes.model) {
+            aciSupervisorCalls += 1;
+            aciSupervisorModel = admitResult.supervisorRes.model;
+          }
+          syncAciMetrics();
+        }
+
+        let detectedThrashing = false;
+        let batchTrigger = null;
+        for (let batchIdx = 0; batchIdx < preparedBatch.length; batchIdx += 1) {
+          const item = preparedBatch[batchIdx];
+          const { tc, isError, durationMs, receipt, output } = item;
+          const promptOutput = admittedOutputs[batchIdx] ?? output;
           await onToolResult?.({
             tc,
             output,
@@ -1321,7 +1504,7 @@ export class AgentLoop {
           messages.push({
             role: 'tool',
             toolCallId: tc.id,
-            content: [{ type: 'text', text: output }],
+            content: [{ type: 'text', text: promptOutput }],
           });
           verifierEvents.push({
             type: 'tool/result',
@@ -1513,6 +1696,12 @@ export class AgentLoop {
         persist: profile?.persistTurn !== false,
       });
 
+      aci?.ledger?.recordOutcome?.({
+        status: outcome.status,
+        verifiedPass: outcome.verifiedPass,
+        stopReason,
+        steps,
+      });
       syncAciMetrics();
       const reasoningMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: outcome.status === 'completed' && outcome.verdict?.accepted !== false,
@@ -1551,6 +1740,12 @@ export class AgentLoop {
         cacheWriteTokens: tm.totalCacheWrite,
         cacheEligibleInputTokens: tm.totalCacheEligible,
       };
+      aci?.ledger?.recordOutcome?.({
+        status: 'failed',
+        verifiedPass: false,
+        stopReason: classified.code || err?.code || 'aborted',
+        steps,
+      });
       syncAciMetrics();
       const catchMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: false,
