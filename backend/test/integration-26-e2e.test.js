@@ -443,7 +443,7 @@ test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol e
     workspaceRoot: workDir,
     model: 'main-model-26',
     permissionMode: 'full-access',
-    aciProfile: 'full_aci',
+    aciProfile: 'aci_26',
     budget: { maxSteps: 16, maxTotalTokens: 160000 },
   });
   offSub = direct.subscribe(sess.id, (ev) => {

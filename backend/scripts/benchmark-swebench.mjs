@@ -493,14 +493,14 @@ export function createDryRunRepository({ baseDir = null } = {}) {
     'utf8',
   );
 
-  // Unrelated historical changelog (>2600 chars) so full_aci admission demonstrates concrete token reduction.
+  // Unrelated historical changelog (>2600 chars) marked with explicit archived-decoy banner so full_aci admission demonstrates concrete token reduction.
   const legacySections = Array.from({ length: 32 }, (_, idx) => {
     const rev = idx + 1;
     return `### Legacy Batch v0.${rev}\nArchived regional wholesale tariff snapshot #${rev}: flat rebate matrix row=${rev * 12}bp, region=EMEA-${rev % 4}, sunset=2021-01-01.\n`;
   }).join('\n');
   writeFileSync(
     join(repoDir, 'docs', 'legacy_pricing_changelog.md'),
-    `# Legacy Pricing Archive\n\nDeprecated historical batch schedule retained for audit reference only.\n\n${legacySections}`,
+    `<!-- DO NOT EDIT - ARCHIVED DECOY -->\n# Legacy Pricing Archive\n\nDeprecated historical batch schedule retained for audit reference only.\n\n${legacySections}`,
     'utf8',
   );
 

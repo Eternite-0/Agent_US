@@ -2522,7 +2522,8 @@ export class DirectAgentRuntime {
       if (explicitBudgetTokens !== null && Number.isFinite(Number(explicitBudgetTokens)) && Number(explicitBudgetTokens) > 0) {
         aciEngine.maxTotalTokens = Math.max(1024, Number(explicitBudgetTokens));
       } else {
-        aciEngine.maxTotalTokens = clampedWindow;
+        aciEngine.maxTotalTokens =
+          aciResolved.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY_NAME ? null : clampedWindow;
       }
       const defaultMaxOutputTokens = Math.min(
         16384,

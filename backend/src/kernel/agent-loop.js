@@ -1112,7 +1112,10 @@ export class AgentLoop {
             const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
             const epochContextWindow = aci.engine.contextWindow ?? 128000;
             const epochMaxTotalTokens =
-              effectiveWatermarkMaxTokens ?? aci.engine.maxTotalTokens ?? epochContextWindow;
+              effectiveWatermarkMaxTokens ??
+              (aci.engine.dtocPolicy === 'cache_aware_v31'
+                ? null
+                : (aci.engine.maxTotalTokens ?? epochContextWindow));
             // Only shield genuine spec/contract docs (SPEC.md, CONTRACT.json, etc.), never target src/ files to be edited.
             const strictContractDocRe =
               /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
@@ -1179,7 +1182,7 @@ export class AgentLoop {
                       query: input,
                       candidates: supervisorCandidates,
                       errorSummary: lastErrFp,
-                      budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
+                      budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens ?? 'unbounded'})`,
                       learnedGuidelines: aci.engine.getGuidelines?.() ?? [],
                       signal,
                       configOverride: aciSupervisorConfigOverride,
