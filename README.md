@@ -2,415 +2,381 @@
 
 <img src="desktop/assets/icon.png" alt="Agent_US Logo" width="96" height="96" />
 
-# Agent_US — General-Purpose Autonomous Agent Framework
+# Agent_US
 
-**面向复杂软件工程任务的本地优先自主智能体平台**
+**Local-First Autonomous Engineering Platform · Adaptive Context Intelligence · Fail-Closed Docker Sandbox**
 
-[![Release](https://img.shields.io/github/v/release/Eternite-0/Agent_US?display_name=tag&style=flat-square&color=0ea5e9&label=Latest%20Release)](https://github.com/Eternite-0/Agent_US/releases/latest)
-[![CI](https://github.com/Eternite-0/Agent_US/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Eternite-0/Agent_US/actions/workflows/ci.yml)
-[![Node.js](https://img.shields.io/badge/Node.js-24%2B%20ESM-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
+面向复杂软件工程任务的本地优先自主智能体框架
+
+[![Latest Release](https://img.shields.io/github/v/release/Eternite-0/Agent_US?display_name=tag&style=flat-square&color=0ea5e9&label=Release)](https://github.com/Eternite-0/Agent_US/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Eternite-0/Agent_US/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Eternite-0/Agent_US/actions/workflows/ci.yml)
+[![Node.js](https://img.shields.io/badge/Node.js-24%2B%20ESM-16a34a?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Electron](https://img.shields.io/badge/Electron-35%20Desktop-47848F?style=flat-square&logo=electron&logoColor=white)](https://www.electronjs.org/)
-[![React](https://img.shields.io/badge/React-19%20%2B%20TypeScript-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
-[![Fastify](https://img.shields.io/badge/Fastify-5%20%2B%20SQLite%20WAL-000000?style=flat-square&logo=fastify&logoColor=white)](https://fastify.dev/)
+[![React](https://img.shields.io/badge/React-19%20%2B%20TypeScript-0284c7?style=flat-square&logo=react&logoColor=white)](https://react.dev/)
+[![Docker Sandbox](https://img.shields.io/badge/Sandbox-Docker%20STRONG-1d4ed8?style=flat-square&logo=docker&logoColor=white)](backend/sandbox/Dockerfile.benchmark)
 
-[下载 Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest) · [Swarm 命令](#swarm-命令) · [系统架构](#系统架构) · [自主开发流程](#autonomous-software-engineering-workflow) · [核心能力](#核心能力) · [界面预览](#界面预览) · [本地开发](#本地开发与构建) · [配套文档](#配套文档)
+[核心创新](#核心创新与能力体系) · [ACI 治理流程](#adaptive-context-intelligence-流程) · [系统架构](#系统架构) · [实证 Benchmark](#实证-benchmark-结果) · [界面预览](#界面预览) · [Swarm 与网关](#swarm-命令与外部网关) · [本地开发](#本地开发与验证) · [文档与报告](#文档与实证报告索引)
 
 </div>
 
 ---
 
-## 项目定位
+## 关键实证指标总览
 
-Agent_US 是一套 **Local-First Autonomous Agent Framework**。它将 **Agent Runtime Kernel**、**Adaptive Planner**、**Dynamic Swarm**、**Repository Intelligence**、**Agent Communication**、**Experience Memory** 和 **Evaluation Engine** 组合为一条可验证的工程执行链路，使系统能够理解陌生代码库、规划复杂任务、按任务需求组建 Agent 团队、并行开发、恢复中断、验证证据并完成交付。
-
-模型网关、多供应商 `AccountPool`、MCP 和 Skills 为 Agent Runtime 与外部客户端提供模型接入和工具扩展。
-
-### Why Agent_US
-
-| 普通 AI 应用 | Agent_US |
-| --- | --- |
-| 用户手动拆分任务 | 从仓库事实出发自主规划，并支持有限重规划 |
-| 单 Agent 串行执行 | 根据能力和工作流动态组建团队，支持并行子 Agent |
-| 只返回文字答案 | 交付真实代码、测试结果和可追溯 Artifact |
-| 进程退出后任务丢失 | Durable Execution、Checkpoint、Recovery 和 outcome reconciliation |
-
-用户目标不需要预先提供固定 DAG。任务规模、仓库结构、依赖关系和能力画像共同影响规划与团队形成。
+| 维度 | 核心能力与阶段 | 实测基线 vs 演进结果 | 验证环境 |
+| --- | --- | --- | --- |
+| **注入前上下文治理** | **Agent_US 2.4 Stage 4**（Pre-Injection Admission · Supervisor · SHA-256 恢复） | Arm C 通关率 **`33.3% → 75.0%`（`+41.7 pp`）**<br/>关键上下文召回 **`100%`** · FNR **`0`** · 注入前减负 **`54.8%–64.8%`**<br/>Arm D KV Hit **`84.78%`** · 短任务 KV 差 **`-0.64 pp`** · **`0/6`** 诱饵恢复 | `deepseek-v4.1-flash`<br/>Docker `strong`（`48 + 6` 试次） |
+| **能力感知工具选择** | **Agent_US 2.3.7**（Tool Intelligence · 动态目录与提示对齐） | Bash 拒绝次数 **`96 → 27`（`−71.9%`**, `p = 0.000122`）<br/>工具选型匹配 **`86.2% → 95.4%`** · 总 Token **`−23.6%`** | 真实 Provider<br/>`14` 题 × `5` 轮（`140` 轮） |
+| **三域强隔离沙箱** | **Agent_US 2.3.1**（Trusted Judge · RO Supervisor · Worker + Stdin HMAC） | 阻断 **`7/7`** 隐藏验收绕过向量（`exit(0)` / `SIGTERM` / 伪造信封等）<br/>`STRONG` / `DOCKER` 无 Docker 时严格 **Fail-Closed** | Windows 11 + Docker Desktop<br/>`agent-us/benchmark:node24` |
+| **自主推理与经验闭环** | **Agent_US 2.3–2.4 S3**（契约感知 · 根因台账 · 只读校验 · 可信经验） | `compute_file_digest` 使 `ar-09` **`0/3 → 2/3`**（`65.1s` Pass）<br/>可信经验闭环（`ar-03,05,09`）Pass **`+33.3 pp`** · 耗时 **`−45.9%`**<br/>OSS 外部基准 **`4/4`** · `tj/commander.js` **`1393/0/2`** | `deepseek-v4.1-flash`<br/>Docker `strong` 实测 |
 
 ---
 
-## Swarm 命令
+## 项目定位：Why Agent_US
 
-在 **Web 或桌面端的聊天输入框**发送以下命令，不是在终端运行。普通消息默认走 Direct 对话；只有显式发送 `/swarm <任务>` 才会从聊天启动 Swarm。
+Agent_US 将 **Durable Agent Kernel**、**Pre-Injection ACI Governance**、**Contract-Aware Reasoning**、**Shared Repository Intelligence**、**Explicit `/swarm` Orchestration** 与 **Three-Domain OS Sandbox** 融合为端到端可审计的自主软件工程运行时，同时通过内置 `AccountPool` 与 `GatewayProxy` 向外部 OpenAI / Anthropic 兼容客户端暴露统一基础设施。
 
-| 命令 | 行为 |
-| --- | --- |
-| `/swarm 检查前后端的测试覆盖并汇总缺口` | 在当前根会话提交一个新的 Swarm Run，后台分析仓库、生成并校验计划，再调度子 Agent。任务可以写成多行。 |
-| `/swarm status` | 查询当前会话的 Swarm Run；优先显示未结束的运行，否则显示最近一次运行。 |
-| `/swarm stop` | 停止当前会话未结束的 Swarm Run，不会取消普通 Direct turn。 |
-| `/swarm` | 查看命令帮助，不启动任务。 |
+| 维度 | 普通 AI 编程助手 | Agent_US |
+| --- | --- | --- |
+| **上下文供给** | 盲目全量读取文件、诱饵/旧档污染前缀 | 五级注入前准入（`DIRECT`/`SUPPORTING`/`DEFER`/`DUPLICATE`/`IRRELEVANT`）、五大关键域硬护栏、`[ACI-SKIP]` 噪点拦截与 SHA-256 `expand_context` 无损按需恢复 |
+| **推理与修改** | 凭直觉改代码、手算哈希/盲猜需求 | `extractTaskContract` 提取硬约束与排序规则、前置失败复现、根因消退验证与零 Shell 安全校验原语 `compute_file_digest` |
+| **多智能体协同** | 固定角色模板、手动复制上下文 | 显式 `/swarm` 驱动动态编排、共享渐进式代码索引、独立 Git Worktree 并行执行与只读 Independent Reviewer |
+| **安全性与验收** | 同进程跑测试、易被 `process.exit(0)` 欺骗 | Trusted Judge + 只读容器 Supervisor + 每用例独立 Worker、Stdin HMAC 验签、Docker `network=none` + Hard Veto |
+| **容错与持续学习** | 进程崩溃丢状态、经验混入未验证噪声 | SQLite WAL + Checkpoint 崩溃恢复、`ContextEvidenceLedger` 全链审计、`trusted_server_verifier` 可信经验冷暖闭环 |
 
-命令不支持附件。启动时沿用会话工作区，不能通过命令放宽会话权限或预算。同一会话有未结束的 Direct turn 或 Swarm Run 时，不能再启动一个 Swarm；结束或取消 Direct turn 后，可在原会话中发送 `/swarm <任务>`。运行进度、计划、子任务与交付可在「自主任务」面板查看。
+---
+
+## 核心创新与能力体系
+
+### 1. 自适应上下文准入治理（ACI Governance · 2.4 Stage 4）
+
+> 将原先仅在历史增长后触发压缩的 DTOC，升级为**在信息进入主模型上下文之前**实施精筛、护栏保护、可逆省略与在线学习的完整上下文控制系统。
+
+- **五级注入前准入（`PreInjectionAdmissionController`）**：工具批次执行后、写入消息历史前先经 [`aci-admission.js`](backend/src/context/aci-admission.js) 结合 JS/TS 符号、`.json` 顶层键（`json_key@L...`）、调用链、报错堆栈与文件路径进行确定性初筛，输出 **`DIRECT`**、**`SUPPORTING`**（大纲 + 焦点 hunks + 恢复提示）、**`DEFER`**（导入 + 符号行号表 + 恢复提示）、**`DUPLICATE`** 与 **`IRRELEVANT`**；针对 `>2600` 字符或存在诱饵冲突的候选文件交由单批次选择性决策；对 `grep:`/`glob:` 搜索结果要求**全部采样非空行**命中诱饵特征方判定 `isDecoy`，防止混合搜索结果被整批压制。
+- **五大关键域硬护栏（Critical Protection Guardrail）**：覆盖 **`auth`**、**`permission`**、**`persistence`**、**`contract`**、**`hidden_acceptance`**。非诱饵关键域文件以及 Prompt 明确指定、报错堆栈关联、近期编辑修改的文件在运行时受保护护栏强制锁定——**绝不允许被模型降级至 `SUPPORTING` 以下**（零漏召回，FNR `= 0`）。
+- **只读零特权 `ContextSupervisor`**：[`supervisor.js`](backend/src/context/supervisor.js) 支持 `auto` / `custom` / `off`（默认开启，可由前端 [AdaptiveContextPanel](frontend/src/components/AdaptiveContextPanel.tsx) 与 `/v1/context/supervisor` 动态切换），经 `AccountPool` 目录解析模型（**生产代码零硬编码模型名**），严格强制 **`tools: []`**（零命令执行/写文件/审批权）、`25s` 超时 Fail-Closed 回退与单请求 `mergeUsageSnapshot` 用量去重。
+- **去诱饵 `[ACI-SKIP]` 桩与 SHA-256 无损恢复**：[`aci-store.js`](backend/src/context/aci-store.js) 与 [`meta-tools.js`](backend/src/tools/builtin/meta-tools.js) 将 `IRRELEVANT` / `DUPLICATE` 映射为不带恢复调用诱饵的 `[ACI-SKIP ...]` 桩，保留 `DEFER` / `SUPPORTING` 的 `artifact://<sha256>` 引用；主 Agent 调用 `expand_context`（支持 `outline` / `hunk` / `verbatim`）经 `restoreVerified()` 现场重算校验 SHA-256（篡改即抛 `ARTIFACT_HASH_MISMATCH`），全链行为记入 `ContextEvidenceLedger`。
+- **短任务 KV Cache 无损保护（`adaptive_single_step` DTOC）**：[`aci-engine.js`](backend/src/context/aci-engine.js) 将 `[0.60, 0.82]` DTOC 水位线门控于 `dtocMinPromptTokens = 24000`，`emergency_budget` 采用单次 `emergencyUsed` 门控且 [`agent-loop.js`](backend/src/kernel/agent-loop.js) 仅在 `compressedCount > 0` 时更新上下文前缀，避免短任务误压缩撕裂 KV Cache。
+
+### 2. 自主推理与可信执行闭环（2.4 Stage 1–3）
+
+- **契约感知推理（`Contract-Aware Reasoning`）**：[`contract-reasoning.js`](backend/src/kernel/contract-reasoning.js) 确定性抽取用户需求及工作区 `SPEC.md` / `CONTRACT.json` / `CONSTRAINTS.md` 中的交付产物、禁止改动列表、约束编号（`C1..Rn`）、优先级规则（如 `ordering_precedence`）及预期命令，在交付停机前完成就绪核验，同时保持系统提示词逐字节静态以维护 KV Prompt Cache。
+- **根因验证与完工防误杀**：[`execution-reasoning.js`](backend/src/kernel/execution-reasoning.js) 维护结构化根因消退台账，仅在修复前失败指纹消失且测试通过后标记 `rootCauseVerified`；新增 **`doc` 变更免重验**与 **`self_test` 校准容忍**（`STUCK_PATTERNS.SELF_TEST_CALIBRATION`），避免纯文档收尾或调优自写测试触发虚假死循环熔断。
+- **免 Shell 只读工具原语 & 可信经验记忆**：`compute_file_digest` 在禁止 Shell 时直接在工作区边界内计算确定性 SHA-256 与规范化 JSON 摘要；[`ExperienceMemoryService`](backend/src/memory/service.js) 严格过滤仅来自 `trusted_server_verifier` 的已验证经验参与跨任务上下文注入。
+
+### 3. 三域信任边界隔离沙箱与防绕过验收（2.3.1）
+
+- **OS 级强隔离执行环境**：[`benchmark-sandbox.js`](backend/src/tools/benchmark-sandbox.js) 依托 [`Dockerfile.benchmark`](backend/sandbox/Dockerfile.benchmark) 构建的隔离镜像（Node 24 + Git + Python 3、`--network=none`、非 root `65534:65534`、`--ipc=none`、`--cap-drop=ALL`、Pids/内存/CPU/输出限额），在 `STRONG` / `DOCKER` 模式下容器不可用时严格 **Fail-Closed**（抛 `SandboxUnavailableError`），绝不静默降级至宿主机；同时在 Docker-less CI（如 `windows-latest`）保留显式 `NODE_PERMISSION` 受限验证通道。
+- **三域隐藏验收协议**：[`hidden-acceptance.js`](backend/src/evaluation/hidden-acceptance.js)（Host Trusted Judge）与 [`hidden-acceptance-supervisor.mjs`](backend/src/tools/hidden-acceptance-supervisor.mjs)（Read-Only Container Supervisor）按测试项派生独立短期 Worker 子进程，单次 `hmacKey` 仅通过短寿命容器 `stdin` 投递；常时间 `timingSafeEqual` 验签并联动 [`judge.js`](backend/src/evaluation/judge.js) 与 [`EvaluationService`](backend/src/evaluation/service.js) **Hard Veto**，彻底封堵 `process.exit(0)`、`SIGTERM`、跳用例与伪造信封绕过。
+
+### 4. 能力感知工具选择、分级审批与统一网关（2.3.7 & Core）
+
+- **能力感知工具治理与 Composer 权限模式**：[`tools/selection.js`](backend/src/tools/selection.js)、[`tools/policy.js`](backend/src/tools/policy.js)、[`tools/auto-approval.js`](backend/src/tools/auto-approval.js) 与 [`dispatcher.js`](backend/src/tools/dispatcher.js) 共同约束工具目录选择与分级自动审批（Direct Composer 权限菜单直连工具策略），[`prompt-cache.js`](backend/src/observability/prompt-cache.js) 持续监测工具与前缀缓存稳定性。
+- **显式 `/swarm` 编排与渐进仓库智能**：聊天框发送 `/swarm <任务>` 即经 [`chat-command.js`](backend/src/routes/chat-command.js) 与 [`orchestrator.js`](backend/src/swarm/orchestrator.js) 动态组建多智能体团队，复用进程内渐进式索引 [`repo-intelligence.js`](backend/src/repo-intelligence.js)、[`DurableJobQueue`](backend/src/durable/job-queue.js) 与只读 [`EvidenceVerifier`](backend/src/governance/verifier.js)。
+- **多账号路由与兼容协议网关**：[`AccountPool`](backend/src/pool.js) 与 [`GatewayProxy`](backend/src/gateway-proxy.js) 提供健康探测、能力路由与原生网页 OAuth 登录，并在本地同时暴露 OpenAI (`/v1/chat/completions`) 与 Anthropic (`/v1/messages`) 兼容端点。
+
+---
+
+## Adaptive Context Intelligence 流程
+
+> 注入前拦截噪声与诱饵、保护关键域不漏召、压缩后基于 SHA-256 无损按需恢复，同时保证短任务 KV Prefix 零损伤。
+
+```mermaid
+flowchart LR
+    TOOLS["工具执行批次\nread_file · grep · inspect_repository"] --> PARSE["结构与信号解析\n符号 · JSON 键 · 调用链 · 诱饵特征"]
+    PARSE --> GUARD["关键域护栏\nauth · permission · persistence\ncontract · hidden_acceptance"]
+    GUARD -->|"确定性快通 ≤2600 chars · 报错或已改文件"| DIRECT["DIRECT · 原文放行"]
+    GUARD -->|"确定性无信号或重复"| SKIP["[ACI-SKIP] DUPLICATE / IRRELEVANT\n单行跳过 · 无恢复诱饵"]
+    GUARD -->|"≥2600 chars 多段文件或诱饵冲突"| SUP["只读 ContextSupervisor\ntools: [] · 单批 1 次 · 25s Fail-Closed"]
+    SUP -->|"保留焦点 hunks + 大纲"| SUPPORT["SUPPORTING\n压缩注入 · 护栏保底"]
+    SUP -->|"延迟正文 + 符号索引"| DEFER["DEFER\n导入 + 行号映射"]
+    SUP -->|"确认非目标旧档或样本"| SKIP
+
+    DIRECT & SUPPORT & DEFER & SKIP --> LOOP["主对话 Prompt 前缀\nPrompt Cache + adaptive_single_step DTOC (≥24k)"]
+    LOOP -.->|"按需 expand_context 校验"| STORE[("ReversibleContextStore\nartifact://sha256 + restoreVerified()")]
+    STORE -.->|"SHA-256 校验无损回注"| LOOP
+    GUARD & SUP & STORE -.->|"审计事件流"| LEDGER[("ContextEvidenceLedger\nRecall · Precision · UsefulTok · Recovery")]
+
+    classDef safe fill:#ecfdf5,stroke:#10b981,color:#064e3b;
+    classDef sup fill:#eff6ff,stroke:#3b82f6,color:#1e3a8a;
+    classDef store fill:#fffbeb,stroke:#f59e0b,color:#78350f;
+    classDef skip fill:#f8fafc,stroke:#94a3b8,color:#334155;
+    class GUARD,SUPPORT,DIRECT safe;
+    class SUP,DEFER,LOOP sup;
+    class STORE,LEDGER store;
+    class SKIP skip;
+```
 
 ---
 
 ## 系统架构
 
-七层按职责划分。实线表示请求、调用或持久化，虚线表示评测与记忆的读写关系。
+> 清晰分层的六层 Local-First 架构：以 `/v1/*` 为唯一主控制面，`Direct` 会话与显式 `/swarm` 共享同一内核、工具安全边界与持久化底座（legacy `/api/v1/*` 仅作历史兼容挂载）。
 
 ```mermaid
----
-config:
-  flowchart:
-    wrappingWidth: 390
-    nodeSpacing: 25
-    rankSpacing: 30
----
 flowchart TB
-    subgraph L1["1 · Application / Client"]
-        CLIENT["React 19 · Electron 35 Desktop Host<br/>REST API · SSE Streaming · Typed SDK · External Clients"]
-    end
-    subgraph L2["2 · Control Plane"]
-        API["API Gateway /v1 · Chat Command Routing · Event Router<br/>Session / Workspace Managers · Approval Center"]
-        MODEL["AccountPool · Model Router<br/>Gateway Proxy · 兼容协议"]
-    end
-    subgraph L3["3 · Agent Runtime Kernel"]
-        KERNEL["Agent Loop · Turn Manager · Inference Engine<br/>Tool Dispatcher · State Machine · Cancellation Manager<br/>Context Manager · Evidence Verification"]
-    end
-    subgraph L4["4 · Adaptive Intelligence"]
-        INTEL["Adaptive Planner · Plan Validator · Capability Registry<br/>Dynamic Team Optimizer · Agent Communication<br/>Experience Memory · Evaluation Engine"]
-        INDEX["Repository Intelligence · 共享渐进索引"]
-    end
-    subgraph L5["5 · Execution & Orchestration"]
-        SWARM["Adaptive Swarm Orchestrator · Child Agent Lifecycle<br/>DAG Scheduler · Dynamic Replanner · Artifact Manager<br/>Independent Reviewer · Result Aggregation"]
-    end
-    subgraph L6["6 · Tool & Runtime Infrastructure"]
-        TOOLING["Workspace Tools · MCP · Skills · Plugins<br/>Sandbox · Git Worktree · Approval / Permit · Process Manager"]
-    end
-    subgraph L7["7 · Persistence & Observability"]
-        DURABLE["SQLite WAL · Durable Job Queue · Checkpoint<br/>Recovery Worker · Event Ledger · Memory Store · Artifact Store<br/>Metrics · Trace · Structured Logs"]
-    end
-    subgraph EXT["External Ecosystem"]
-        PROVIDERS["OpenAI / Anthropic-compatible Providers<br/>DeepSeek · Gemini · OpenRouter"]
-        INTEGRATIONS["GitHub · External MCP Servers"]
+    subgraph L1["1 · Application & Client Host"]
+        CLIENT["React 19 Web Workbench · Electron 35 Windows Desktop\nAdaptiveContextPanel · Approval Center · Inspector Drawer · SSE Streaming"]
     end
 
-    CLIENT <-->|REST / SSE| API
-    CLIENT -->|模型兼容端点| MODEL
-    API -->|普通消息 · Direct turn| KERNEL
-    API -->|显式 /swarm 命令| SWARM
-    API -->|自治目标 API| INTEL
-    MODEL <-->|AccountPool 推理| KERNEL
-    MODEL --> PROVIDERS
-    INTEL <-->|计划、能力与执行反馈| SWARM
-    KERNEL <-->|运行子 turn| SWARM
-    KERNEL -->|工具调用| TOOLING
-    TOOLING -->|inspect_repository| INDEX
-    SWARM -->|规划时分析仓库| INDEX
-    TOOLING -->|MCP 与扩展| INTEGRATIONS
-    KERNEL <--> DURABLE
-    SWARM <--> DURABLE
-    INTEL -.评测与记忆读写.-> DURABLE
+    subgraph L2["2 · Control Plane & Model Infrastructure"]
+        API["Fastify /v1 API Gateway · Chat Command /swarm\nSession · Workspace · Permission Modes · /v1/context/supervisor"]
+        POOL["AccountPool · 动态模型能力路由 · GatewayProxy\nOpenAI (/v1/chat/completions) & Anthropic (/v1/messages)"]
+    end
+
+    subgraph L3["3 · Runtime Kernel & ACI Governance"]
+        KERNEL["DirectAgentRuntime · AgentLoop · TurnStateMachine\nContract Reasoning · Root-Cause Ledger · Execution Reasoning Tracker"]
+        ACI["PreInjectionAdmissionController · adaptive_single_step DTOC\nContextSupervisor (tools: []) · ContextEvidenceLedger · EvidenceVerifier"]
+    end
+
+    subgraph L4["4 · Adaptive Intelligence & Dynamic Swarm"]
+        SWARM["Adaptive Planner & Replanner · Dynamic Team Optimizer\nExplicit Swarm Orchestrator · Inter-Agent Mailbox · Independent Reviewer"]
+        SHARED["Shared Repository Intelligence · 渐进符号与调用索引\nExperience Memory (trusted_server_verifier) · Evaluation Service"]
+    end
+
+    subgraph L5["5 · Security, Tooling & Isolation"]
+        TOOLING["Capability-Aware Tool Selection · Policy & Auto-Approval · Permits\nMCP Hub · compute_file_digest · expand_context · Git Worktree"]
+        SANDBOX["Three-Domain Benchmark Sandbox (Docker STRONG Fail-Closed)\nHost Trusted Judge · RO Supervisor · Per-Test Worker · Stdin HMAC"]
+    end
+
+    subgraph L6["6 · Durable Persistence & Telemetry"]
+        STORE[("SQLite WAL · Durable Job Queue · Checkpoints & Leases\nReversibleContextStore (artifact://sha256) · Prompt Cache & Trace Telemetry")]
+    end
+
+    CLIENT <-->|"REST / SSE"| API
+    CLIENT -->|"兼容协议请求"| POOL
+    API -->|"普通对话 Direct"| KERNEL
+    API -->|"显式 /swarm"| SWARM
+    API -->|"ACI 配置 · 评测 · 记忆"| SHARED
+    KERNEL <--> ACI
+    KERNEL <-->|"AccountPool 推理"| POOL
+    ACI -.->|"只读 tools 分类"| POOL
+    KERNEL <--> SWARM
+    KERNEL & SWARM -->|"只读渐进索引"| SHARED
+    KERNEL & SWARM -->|"受控执行"| TOOLING
+    TOOLING -->|"强隔离验收"| SANDBOX
+    KERNEL & ACI & SWARM & SANDBOX <--> STORE
 ```
 
-- [`DirectAgentRuntime`](backend/src/direct-agent.js) 装配 `AgentRuntimeKernel`、上下文、工具、Durable、Swarm 和治理组件。普通消息在父会话里运行 Direct turn；聊天入口的 [`handleChatCommand`](backend/src/routes/chat-command.js) 在创建 Direct turn 前识别 `/swarm`，提交独立的 Swarm Run。Swarm 由持久化队列驱动，子 Agent 在子会话里沿用同一套推理与工具运行时。
-- `GatewayProxy` 负责协议兼容和模型请求转发。Agent Loop 的推理使用 AccountPool，外部模型客户端的协议转换由 GatewayProxy 处理。
-- `Evaluation`、`Memory` 和 `Planner` 通过服务、事件和持久化状态互相反馈。评测由独立入口调度，经验检索按上下文和任务需要执行。
-- `Control Plane` 的 `/v1` 路由是当前主 API 面。旧 `/api/v1/*` DAG 路由仍挂载于 [`routes.js`](backend/src/routes.js) 和 [`engine.js`](backend/src/engine.js)，仅用于 legacy / compatibility。
-
 ---
 
-## Autonomous Software Engineering Workflow
+## 实证 Benchmark 结果
 
-```mermaid
----
-config:
-  flowchart:
-    curve: linear
-    nodeSpacing: 20
-    rankSpacing: 24
-    wrappingWidth: 220
----
-flowchart TB
-    accTitle: 自主软件工程流程
-    accDescr: 从用户目标、仓库分析与规划到动态组队，再并行执行、验证并交付。
+> 所有真实模型测试均完整保留失败与超时样本（**零剔除、零樱桃采摘**），并在每次修改后于独立隔离沙箱与真实 Provider 上实测产出。
 
-    subgraph PREP["规划与组队"]
-        direction LR
-        GOAL("<b>用户目标</b><br/>仓库分析") --> PLAN("<b>自适应规划</b><br/>DAG 与计划校验") --> TEAM("<b>动态组队</b><br/>能力与模型路由")
-    end
+### 1. Agent_US 2.4 Stage 4 — ACI 注入前治理四臂消融对比（冻结实测 · `48 + 6` 试次）
 
-    subgraph RUN["执行与交付"]
-        direction LR
-        BUILD("<b>Swarm 并行执行</b><br/>Agent 通信与产物交接") --> VERIFY("<b>独立验证</b><br/>测试 · Reviewer · 证据") --> SHIP("<b>交付</b><br/>代码与 Artifact")
-    end
+- **测试条件**：冻结代码提交 `2bce1db6`，`deepseek-v4.1-flash`（主模型与 Supervisor 一致，本地代理 `127.0.0.1:3065/v1`），Docker **`strong`**（`agent-us/benchmark:node24`），4 项高噪声复杂多文件工程任务（每项含 17–18 个文件、7–8 个高干扰诱饵、Docker 隐藏验收与防篡改 Veto）× **4 臂 × 3 轮重复 = 48 试次**。详表与逐试次原始轨日志见 [2.4 Stage 4 实证评估报告](backend/docs/2.4-stage4-aci-governance-report.md)。
 
-    PREP --> RUN
+| 评估指标 | Arm A (`raw_full`) | Arm B (`deterministic_progressive`) | Arm C (`retrieval_supervisor`) | Arm D (`full_aci`) | 核心发现 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **Final Task Success Rate** (`pass / 12`) | `33.3%` (`4/12`) | `58.3%` (`7/12`, `+25.0pp`) | **`75.0%` (`9/12`, `+41.7pp`)** | `50.0%` (`6/12`, `+16.7pp`) | B / C / D 全部显著优于原文基线 A；**C 较 A 相对提升 +125%** |
+| **Critical Context Recall** | `1.0000` | `1.0000` | `1.0000` | **`1.0000`** | 全 48 试次关键上下文**零漏召** |
+| **Context Precision** (`filePrecision`) | `0.8301` | **`0.9765`** | `0.9319` | `0.9534` | 较基线 A 提升 **`+10.2 pp` ~ `+14.6 pp`** |
+| **False Negative Rate** (`误标 IRREL`) | `0` (`0`) | `0` (`0`) | `0` (`0`) | **`0` (`0`)`** | 关键域保护护栏实现**零误杀** |
+| **Useful Token Ratio** (`tokenPrecision`) | `0.5385` | **`0.9211`** | `0.7600` | `0.8987` | 将有效载体 Token 占比从 `53.9%` 抬升至 **`76.0%–92.1%`** |
+| **Admission Token Reduction** (注入前) | `0` | `54.78%` (`52,963` tok) | **`64.83%` (`82,310` tok)** | `64.23%` (`77,360` tok) | 注入主上下文前直接省下 **`54.8%–64.8%`** 工具冗余载体 |
+| **Cache Hit Rate** (`cacheRead / in`) | `67.84%` | `51.57%` | `79.00%` (`12/12` SSE) | **`84.78%` (`12/12` SSE)** | **Arm D 取得全场最高 KV Cache 命中率**（较 A **`+16.9 pp`**） |
+| **Supervisor Cost** (`调用 / tok / 占比`) | `0` | `0` | `33` 次 / `107,398` (`5.24%`) | `35` 次 / `51,021` (`2.62%`) | 全程 `tools: []`，Ledger 与 Summary 账本 100% 吻合 |
+| **Recovery Success / Assisted Pass** | `0` | `5/5` (`1.0` · `60.0%`) | `11/11` (`1.0` · `50.0%`) | **`6/6` (`1.0` · `66.7%`, `0/6` 诱饵)** | `22/22` 恢复 **100% SHA-256 校验通过**；Arm D 彻底消除诱饵恢复 |
+| **端到端 `aci-04` 长程审计通关** | `0/3` (`TOKEN_BUDGET`) | `0/3` (`2` 超预算) | **`2/3` PASS** | `0/3`（**`3/3` 完整跑完未撞预算**） | 仅 Arm C 两次贯通最难 5 文件审计与 digest 导出任务 |
 
-    classDef planning fill:#eff6ff,stroke:#93b4e8,color:#152f53;
-    classDef execution fill:#ecfdf5,stroke:#7cbca6,color:#143b32;
-    classDef delivery fill:#d1fae5,stroke:#48a688,color:#103d31;
-    class GOAL,PLAN,TEAM planning;
-    class BUILD,VERIFY execution;
-    class SHIP delivery;
-    style PREP fill:transparent,stroke:#94a3b8
-    style RUN fill:transparent,stroke:#94a3b8
-    linkStyle default stroke:#64748b,stroke-width:1.5px
-```
+- **短任务 KV Cache 无损回归（Run 4B-2，`ar-06/08/09` × `A, D` = 6 试次，`dtocMinPromptTokens=24000`）**：Arm A `2/3`（KV 命中率 **`89.53%`**）vs Arm D `2/3`（全程 **`epochTransitions = 0`**，KV 命中率 **`88.89%`**，仅差 `-0.64 pp`），验证短任务零撕裂。
+- **Supervisor 与无损恢复真实链路实证**：在 `aci-04 C rep=2` 中，只读 Supervisor 将 3,860 字符的核心鉴权策略 `policy-engine.js` 压缩为聚焦关键导出符号的 `SUPPORTING` 视图（`1,002 → 614 tok`），精准把 `COMPLIANCE-APPENDIX.md` 等 4 份高混淆诱饵压至 `[ACI-SKIP]`（单轮净省 `7,149 tok`），随后主 Agent 通过 `expand_context` 经 SHA-256 验签精准恢复 `policy-engine.js` 片段（`195 tok`, `verified=true`）一次通关；在 `aci-03 D rep=0/1` 与 `aci-01 D rep=0/1` 中，主模型亦精准从 `SUPPORTING` 视图无损恢复 `CONTRACT.json` 与 `runtime-options.js` 并全部 `PASS`。
 
-| 反馈 | 下一步 |
-| --- | --- |
-| 工具调用需要审批 | 放行后继续执行 |
-| 进程中断或副作用结果未知 | 从 Checkpoint 恢复，必要时先人工核对 |
-| 测试、审查或证据检查未通过 | 在预算内重规划，再执行与验证 |
-| 交付后的评测与验证经验 | 为后续任务提供能力画像与经验参考 |
+### 2. 多阶段里程碑验收快照 (2.3 – 2.4 S3)
 
-- 聊天中用 `/swarm <任务>` 启动此流程：聊天入口返回 `runId`，后台再规划和执行。程序化调用可通过 `POST /v1/autonomous/runs` 提交目标和工作区信息；普通聊天不自动进入该流程。
-- Agent 数量由任务复杂度、独立工作流、能力画像、成本和验证要求共同决定。
-- 可并行的子 Agent 使用独立 worktree 或受控共享路径执行。
-- 失败可以触发有预算上限的 `repair_and_reverify` 或其他有限重规划。
-- 已完成节点产生的 Artifact 会进入后续 Overlay、Review、Verify 和 Delivery。
-- 文件写入、命令执行、Hook、MCP 和外部副作用受工具策略、Permit、Sandbox 或人工审批控制。
-- 带独立验证要求的计划在交付前执行测试、只读 Reviewer 审查和 Evidence Verification。检查项随计划与证据契约变化。
+| 版本 / 阶段 | 评测对象与规模 | 核心实测结果 | 详细报告 |
+| --- | --- | --- | --- |
+| **2.4 Stage 3** | 10 题自主开发基准（3 轮 A/B × `10` 题）+ `ar-03,05,09` 经验探针（`deepseek-v4.1-flash`） | 确定性双模（Docker `strong` `31/31` + 模拟无 Docker `31/31`）；Verified Experience 探针通关率 **`+33.3 pp`**（`0.3333 → 0.6667`）、`ar-03` 耗时 **`−45.9%`**；`compute_file_digest` 使 `ar-09` 由 `0/3` 升至 `2/3` | [Stage 3 实证报告](backend/docs/2.4-stage3-autonomous-intelligence-report.md) |
+| **2.3.7 Tool Intelligence** | 14 项工程任务 × 5 轮配对实验（140 轮，1,316 次调用，真实 Provider） | Bash 被拒 **`96 → 27`（`−71.9%`**, 精确符号翻转 `p = 0.000122`），工具用途匹配 `605/702 (86.2%) → 586/614 (95.4%)`，首调合规 **`17/70 → 57/70`**，总实测 Token `2,225,106 → 1,700,360`（**`−23.6%`**），严格通过保持 `68/70` | [2.3.7 实测报告](backend/docs/2.3.7-capability-aware-tool-selection-report.md) |
+| **2.3.1 Sandbox Security** | Windows 11 + Docker Desktop 4.81.0 + 双平台 CI | 隐藏验收 **`7/7` 绕过向量拦截通过**，Hard Veto + Stdin HMAC + `STRONG` Fail-Closed 验证全部通过（`agent-us/benchmark:node24`） | [2.3.1 安全验收报告](backend/docs/2.3.1-windows-docker-security-acceptance.md) |
+| **2.3 Benchmark & E2E** | 4 个 MIT 开源仓库 (`nanoid`, `trough`, `fast-content-type-parse`, `nanoevents`) + `tj/commander.js` | OSS Run 4 **`4/4 PASS`**（并发 1 / 480s）；`tj/commander.js` 动态生成 5 规划节点与 2 并行分支，经历真实 `SIGKILL` 恢复后独立重跑 **`1393 PASS / 0 FAIL / 2 SKIP`** | [2.3 验收报告](backend/docs/2.3-general-autonomous-agent-report.md) |
 
----
+<details>
+<summary><b>📌 评测局限与诚实边界说明（点击展开）</b></summary>
 
-## 核心能力
+1. **端到端总 `tokenReduction` 统计口径说明**：Stage 4 Phase 4B 中 Arm B/C/D 相对 Arm A 的端到端总 Token 表现为 `-5.83%` / `-13.81%` / `-8.18%`，并非准入压缩失效（注入前 `admissionTokenReduction` 实际省下 `54.78%` / `64.83%` / `64.23%` 工具载体），而是因为基线 **Arm A 有 `8/12` 试次过早因 `TOKEN_BUDGET` 或长尾超时截断**压低了分母均值，使 Arm C/D 得以深入完成多轮修复与导出。
+2. **Arm C (`75.0%`) 与 Arm D (`50.0%`) 差异原因**：在最难的 `aci-04` 上，Arm D 实际 **`3/3` 全部完整运行至 `completed`**（未发生任何 `TOKEN_BUDGET` 截断），仅各差 1 条隐藏安全断言归属 `model_capability`；另在 `aci-01..03` 中触发的 `4` 次单步 DTOC 使多轮后逼近 `160k` 上限。
+3. **网关长尾与异常观测**：Phase 4B 共观测到 `8/48` 试次上游 SSE 返回 `cacheReadTokens = 0`（Arm C/D `12/12` 稳定获得 `79.00%` / `84.78%`）、`3` 次 Arm C Supervisor 请求出现网关侧 `~20k prompt_tokens` 上报峰值、`12/68` 次 Supervisor 调用因 `25s` 超时安全回退至确定性规则，以及 Arm C 仍有 `5/12` 次模型主动忽略 `[ACI-SKIP]` 重读诱饵（Arm D 严格保持 **`0/6`**）。
+4. **2.3 外部开源 Benchmark 样本说明**：早期 2.3 OSS 四仓库（`nanoid` 等）样本规模较小，Capability Profile 仍按 `provisional_low_sample` 标注；缺少目标仓库外置依赖时，`tsc`/`tsd` 等需在具备依赖的隔离环境中补验。
 
-仓库分析、动态团队、子 turn、恢复和交付已接入自治运行。计划创建与提案修订、团队优化、通信、经验反馈和评测也有独立 API，可通过后端文档按需调用。
-
-### 1. Autonomous Repository Intelligence
-
-[`analyzeRepository()`](backend/src/repo-intelligence.js) 为 `inspect_repository` 只读工具和 Swarm 规划提供代码、测试、入口、符号、调用关系、依赖与 Git 信息。两者对同一实际工作区路径共用进程内渐进索引，默认每次最多扫描 120 个新文件；后续调用可继续推进，已扫描内容变化时会重建快照。Git 分支、HEAD、近期提交以及**已索引路径**的脏状态每次都会重新读取，提交或切分支不需要手动刷新文件索引。
-
-### 2. Adaptive Planning
-
-[`AdaptivePlanner`](backend/src/planning/planner.js)、[`AdaptiveReplanner`](backend/src/planning/replanner.js) 和 [`validatePlan`](backend/src/planning/validator.js) 提供计划创建、验证和提案修订 API。线上自治路径由 [`swarm/planner.js`](backend/src/swarm/planner.js) 结合仓库摘要生成执行节点，再执行结构化计划校验。运行期修复由 [`swarm/replan.js`](backend/src/swarm/replan.js) 处理。
-
-### 3. Dynamic Multi-Agent Swarm
-
-[`AdaptiveSwarmOrchestrator`](backend/src/swarm/orchestrator.js) 负责运行树、子 Agent、依赖调度、并行 worktree、Artifact Overlay、Reviewer 和交付状态。`TeamOptimizer` 根据工作流和模型能力选择单 Agent 或团队规模，运行时不固定为五种角色。
-
-### 4. Durable Agent Runtime
-
-[`AgentRuntimeKernel`](backend/src/kernel/runtime.js) 和 [`AgentLoop`](backend/src/kernel/agent-loop.js) 统一推理、工具调用、状态转换、取消、预算与证据收口。Durable 层提供 [`DurableJobQueue`](backend/src/durable/job-queue.js)、[`CheckpointStore`](backend/src/durable/checkpoint.js)、Recovery Worker 和未知结果核对。
-
-### 5. Inter-Agent Communication
-
-[`CommunicationBus`](backend/src/communication/bus.js) 提供持久化消息通道，Swarm 内部的 [`InterAgentMailbox`](backend/src/swarm/mailbox.js) 负责子 Agent 间的消息收取与投递。消息会在节点边界进入后续上下文，并受运行状态和权限约束。
-
-### 6. Experience Memory
-
-[`ExperienceMemoryService`](backend/src/memory/service.js) 记录可复用的执行经验和反馈。[`ProjectMemoryService`](backend/src/context/memory.js) 服务于项目上下文。经验记录支持候选、验证与反馈，项目记忆用于组装会话上下文。
-
-### 7. Evaluation & Benchmark
-
-[`EvaluationService`](backend/src/evaluation/service.js)、[`external-benchmark.js`](backend/src/evaluation/external-benchmark.js) 和 [`EvidenceVerifier`](backend/src/governance/verifier.js) 将实现、测试、历史、Artifact 和证据分开检查。Benchmark 数据见 [2.3 验收报告](backend/docs/2.3-general-autonomous-agent-report.md)。
-
-### 8. Secure Tool Runtime
-
-[`ToolDispatcher`](backend/src/tools/dispatcher.js)、[`ToolPermissionPolicy`](backend/src/tools/policy.js)、[`sandbox.js`](backend/src/tools/sandbox.js)、[`permits.js`](backend/src/permits.js) 和 Hook Trust 组件共同控制文件、终端、网络、MCP、工作树和外部副作用。工具收据、审批决定和审计事件进入持久化账本。
-
-### 9. Multi-Provider Gateway
-
-[`AccountPool`](backend/src/pool.js) 维护供应商账号、模型目录、能力元数据、健康度和路由信息。[`GatewayProxy`](backend/src/gateway-proxy.js) 通过 `POST /v1/chat/completions` 和 `POST /v1/messages` 提供 OpenAI / Anthropic 兼容协议。外部兼容请求经过 GatewayProxy，Agent Runtime 则通过 AccountPool 的推理适配器使用同一模型基础设施。
-
----
-
-## 2.3 验收与 Benchmark
-
-以下是固定任务、模型与运行配置下的结果。详见 [2.3 General-Purpose Autonomous Agent 验收报告](backend/docs/2.3-general-autonomous-agent-report.md)。
-
-### 外部开源 Benchmark
-
-- Benchmark 契约为 `agent-us-oss-benchmark@1.0.0`。
-- 数据集覆盖 4 个 MIT 开源仓库，分别为 `ai/nanoid`、`wooorm/trough`、`fastify/fast-content-type-parse` 和 `ai/nanoevents`。
-- 真实 Provider 运行通过 OpenAI-compatible 端点调用 `deepseek-v4.1-flash`。
-
-| 轮次 | 结果 | 主要发现 |
-| --- | --- | --- |
-| Run 1 | 3/4 PASS | 临时校验脚本已清理，证据检查误判文件缺失。 |
-| Run 2 | 2/4 PASS | 固定输出上限造成两项任务的模型输出截断。 |
-| Run 3 | 3/4 PASS | 两路请求竞争本地代理，一项任务超时。 |
-| Run 4 | **4/4 PASS** | 并发设为 1，超时设为 480 秒。无失败、超时或重试。 |
-
-该模型的外部 Benchmark 能力画像只有四个样本，状态为 `provisional_low_sample`。
-
-### 陌生代码库端到端任务
-
-- 仓库为 [`tj/commander.js`](https://github.com/tj/commander.js)，固定 Commit 为 `a5a7dc084d4d2b7932e85ca049c5204e50a2c721`。
-- 运行时自主生成 5 个规划节点和 2 个并行开发分支，节点数量由任务规划产生，不是系统固定角色数。
-- 验收过程覆盖真实进程 `SIGKILL`、已完成节点去重、`outcome_unknown` 人工核对恢复、Artifact 交付与只读独立 Reviewer。Reviewer 检查产物后给出 `pass`。
-- 应用交付后独立重跑目标仓库测试，结果为 `1393 PASS / 0 FAIL / 2 SKIP`。
-- 该结果只代表这一次特定仓库和特定任务的实测。
-
-### 离线控制与验证边界
-
-- 确定性测试使用 `ScriptedAdapter`、故障注入或参考解验证状态机、预算、迁移、产物冲突与证据门禁。报告中的离线负对照为 `0/1`，如预期被拒绝，单独计入离线结果。
-- 外部 Benchmark 的四个样本不足以推断通用成功率。大型仓库需按子目录进一步扫描。缺少目标仓库依赖时，`tsc`、`tsd` 等外置工具链需在具备依赖的环境中补验。
-- Benchmark Sandbox 和依赖策略已提供独立实现，当前 `EvaluationService` 与自治入口尚未接入该路径。见 [后端架构](backend/docs/architecture.md#工具与审批边界)。
-- [前端 simulator](frontend/src/api/simulator.ts) 提供演示数据。实际执行、审批与交付结果由 `/v1` 后端返回。
+</details>
 
 ---
 
 ## 界面预览
 
+<div align="center">
+  <img src="docs/images/workbench.png" alt="Agent_US 主工作台" width="90%" />
+  <br />
+  <sub><b>主工作台</b>（会话流、AdaptiveContextPanel、权限模式控制、工作区审阅、审批与交付状态）</sub>
+</div>
+
+<br />
+
 <table>
   <tr>
     <td width="50%" align="center">
-      <img src="docs/images/workbench.png" alt="Agent_US 主工作台" />
-      <br /><sub><b>主工作台</b>（会话流、工作区、审批和交付状态）</sub>
-    </td>
-    <td width="50%" align="center">
       <img src="docs/images/accounts-pool.png" alt="多供应商账号号池管理" />
-      <br /><sub><b>账号号池</b>（供应商账号、模型和健康度）</sub>
+      <br /><sub><b>多账号号池</b>（账号目录、模型能力标签与健康度路由）</sub>
     </td>
-  </tr>
-  <tr>
     <td width="50%" align="center">
       <img src="docs/images/add-account.png" alt="供应商接入面板" />
-      <br /><sub><b>供应商接入</b>（协议和凭证配置）</sub>
-    </td>
-    <td width="50%" align="center">
-      <img src="docs/images/native-oauth.png" alt="原生网页登录与 OAuth 授权" />
-      <br /><sub><b>网页登录与 OAuth</b></sub>
+      <br /><sub><b>供应商接入</b>（多协议接入、网关配置与凭据管理）</sub>
     </td>
   </tr>
   <tr>
-    <td colspan="2" align="center">
-      <img src="docs/images/model-gateway.png" alt="模型管理与统一网关" width="76%" />
-      <br /><sub><b>模型管理与统一网关</b>（模型目录、映射和兼容端点）</sub>
+    <td width="50%" align="center">
+      <img src="docs/images/native-oauth.png" alt="原生网页登录与 OAuth 授权" />
+      <br /><sub><b>原生网页登录与 OAuth</b>（内置安全登录流与状态同步）</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/images/model-gateway.png" alt="模型管理与统一网关" />
+      <br /><sub><b>模型管理与统一网关</b>（OpenAI / Anthropic 兼容协议与模型映射）</sub>
     </td>
   </tr>
 </table>
 
 ---
 
-## 外部客户端与模型网关
+## Swarm 命令与外部网关
 
-后端在本地服务启动后提供兼容端点。常用入口如下。
+### 在聊天框使用 `/swarm`
 
-- OpenAI 兼容客户端的 Base URL 为 `http://127.0.0.1:8787/v1`（采用源码后端默认端口），调用 `POST /v1/chat/completions` 和 `GET /v1/models`。
-- Anthropic 兼容客户端使用服务根地址并调用 `POST /v1/messages`。客户端鉴权使用本地服务的 `BACKEND_TOKEN`，可通过 Bearer 或 `x-api-key` 请求头传递。
-- 多供应商账号和模型配置使用 `/v1/accounts`、`/v1/models/*` 与 `/v1/auth/*`。
-- 运行时会话、SSE、审批、自治运行和交付使用 `/v1/sessions/*`、`/v1/stream`、`/v1/approvals`、`/v1/autonomous/*` 和 `/v1/swarm/*`。
-- 旧 `/api/v1/*` DAG 路由仍用于兼容旧客户端，新的功能说明和集成应以 `/v1/*` 为准。
+在 **Web 或桌面端聊天输入框**发送（非终端命令）；普通消息默认进入 Direct 多轮自主流，显式发送 `/swarm` 才创建独立 Swarm Run：
+
+| 命令 | 行为 |
+| --- | --- |
+| `/swarm <多行任务描述>` | 在当前会话工作区与权限边界下提交 Swarm Run：后台执行仓库渐进分析、规划与校验后动态组队调度子 Agent |
+| `/swarm status` | 查询当前会话正在运行或最近一次完成的 Swarm Run 状态与子任务进展 |
+| `/swarm stop` | 安全停止当前会话未结束的 Swarm Run（不会取消普通 Direct turn） |
+| `/swarm` | 显示内置 `/swarm` 命令用法说明 |
+
+### 本地 REST / SSE 与模型兼容端点
+
+后端默认监听 `http://127.0.0.1:8787`，鉴权使用 `BACKEND_TOKEN`（`Authorization: Bearer ...` 或 `x-api-key`）：
+
+| 接口面 | 代表路由 | 用途 |
+| --- | --- | --- |
+| **模型兼容网关** | `POST /v1/chat/completions` · `GET /v1/models` · `POST /v1/messages` | OpenAI 与 Anthropic 兼容端点（经 `GatewayProxy` 与 `AccountPool` 转发） |
+| **ACI 与自主运行时** | `/v1/sessions/*` · `/v1/stream` · `/v1/context/supervisor` · `/v1/approvals` | Direct 会话、SSE 事件流、ContextSupervisor 与 ACI 开关 (`admissionEnabled` / `dtocMinPromptTokens`)、工具审批 |
+| **Swarm 与自治 API** | `/v1/swarm/*` · `/v1/autonomous/*` · `/v1/accounts` · `/v1/auth/*` | 自主任务提交、多智能体状态、多账号健康路由与登录状态 *(旧 `/api/v1/*` 仅保留兼容)* |
 
 ---
 
-## 本地开发与构建
+## 本地开发与验证
 
 ### 环境要求
 
-- Windows、macOS 或 Linux
-- Node.js `>=24.9.0`
-- npm
-- Git
-- 外部 Provider 或本地 OpenAI-compatible Provider
+- **OS**：Windows 11 / macOS / Linux
+- **Runtime**：Node.js `>= 24.9.0`（ESM）· npm · Git
+- **可选（强隔离实测）**：Docker Desktop / Docker Engine（用于 `agent-us/benchmark:node24` `STRONG` 沙箱评测）
 
-### 启动后端
+### 快速启动
 
 ```powershell
-Set-Location D:\Agent_US\backend
+# 1. 启动后端 (默认 http://127.0.0.1:8787，数据目录可用 BACKEND_DATA 覆盖)
+Set-Location backend
 npm ci
 $env:BACKEND_TOKEN = node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 npm start
-```
 
-默认地址为 `http://127.0.0.1:8787`。数据目录默认是 `backend/var`，可以通过 `BACKEND_DATA` 覆盖。工作区可以通过 `AGENT_WORKSPACE` 或 `PUT /v1/workspace` 设置。
-
-### 启动前端
-
-```powershell
-Set-Location D:\Agent_US\frontend
+# 2. 启动前端 (另开终端，访问 http://127.0.0.1:5173，自动代理 /v1)
+Set-Location frontend
 npm ci
 $env:BACKEND_URL = "http://127.0.0.1:8787"
 $env:BACKEND_TOKEN = "<与 backend 相同的 BACKEND_TOKEN>"
 npm run dev
-```
 
-浏览器访问 `http://127.0.0.1:5173`。Vite 开发服务器代理 `/v1` 和 `/api/v1`。
-
-### 桌面端预览与打包
-
-```powershell
-# 从仓库根目录执行，先按上文安装后端和前端依赖
+# 3. 启动 / 打包 Electron 桌面端 (从仓库根目录执行)
 npm --prefix frontend run build
 npm --prefix desktop ci
-npm --prefix desktop start
+npm --prefix desktop start        # 本地开发预览
+npm --prefix desktop run build    # 生成 Windows 安装包 / 便携版
 ```
-
-Electron Host 管理本地后端与同源通信。Windows x64 安装版和便携版可从 [Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest) 下载，具体资产以发布页为准。本地执行 `npm --prefix desktop run build` 会生成 Windows 包。见 [桌面端入口](desktop/main.mjs)和[发布工作流](.github/workflows/release-windows.yml)。
 
 ### 验证命令
 
 ```powershell
-Set-Location D:\Agent_US\backend
+# 后端语法与类型检查 + Stage 3/4 与核心集成回归
+Set-Location backend
 npm run check
-node --test test/explicit-swarm-command.test.js test/repo-progressive-index.test.js test/repo-intelligence.test.js test/swarm/autonomous-generalization.test.js
+node --test --test-concurrency=1 test/context/aci.test.js test/intelligence-routes.test.js test/integration-24-glue.test.js test/direct-auto-approval.test.js test/workspace-git.test.js
 
-Set-Location D:\Agent_US\frontend
+# 评测沙箱（本地具备 Docker 时用 strong；Docker-less CI 自动/显式走 node-permission）
+$env:AGENT_US_BENCHMARK_SANDBOX_MODE = 'strong'
+node --test --test-concurrency=1 --test-timeout=180000 test/evaluation/aci-governance-benchmark.test.js test/evaluation/docker-sandbox-acceptance.test.js
+
+# 前端与桌面端校验
+Set-Location ..\frontend
 npx tsc --noEmit
 npm run build
-
-Set-Location D:\Agent_US
-node --check desktop/main.mjs
+Set-Location ..
+Get-ChildItem desktop\*.mjs | ForEach-Object { node --check $_.FullName }
 ```
 
-CI 的实际矩阵见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。它在 Ubuntu 和 Windows 上使用 Node 24，后端核心回归步骤按工作流排除三个环境依赖套件。
+> CI 完整双平台矩阵见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)（Ubuntu 24 + Windows 24）；Windows 桌面发行流程见 [`.github/workflows/release-windows.yml`](.github/workflows/release-windows.yml)。
 
 ---
 
 ## 目录结构
 
+<details>
+<summary><b>展开查看完整仓库模块分布 (`backend/` · `frontend/` · `desktop/`)</b></summary>
+
 ```text
 Agent_US/
 ├─ backend/
 │  ├─ src/
-│  │  ├─ kernel/                 # Agent Loop、推理、状态机、取消和事件
-│  │  ├─ runtime/                # 会话仓库、审批管理、关闭协调
-│  │  ├─ durable/                # Job Queue、Checkpoint、恢复和租约
-│  │  ├─ governance/             # Control Plane、调度、审计和证据验证
-│  │  ├─ tools/                  # 工具注册、分发、策略、Sandbox 和 MCP 生命周期
-│  │  ├─ context/                # 上下文组装、预算、压缩和项目记忆
-│  │  ├─ planning/               # Adaptive Planner、验证和重规划
-│  │  ├─ swarm/                  # 团队优化、编排、子 Agent、消息和 Artifact
-│  │  ├─ communication/          # Agent Communication Bus 和持久化适配器
-│  │  ├─ memory/                 # Experience Memory
-│  │  ├─ evaluation/             # Benchmark、评测、记录和评分
-│  │  ├─ observability/          # Metrics、Trace 和 Structured Logs
-│  │  ├─ direct-agent.js         # DirectAgentRuntime 主编排入口
-│  │  ├─ intelligence-services.js # Planner、Evaluation、Memory、Communication 装配
-│  │  ├─ repo-intelligence.js    # 仓库结构和调用关系分析
-│  │  ├─ pool.js                 # AccountPool 与模型能力路由
-│  │  ├─ gateway-proxy.js        # OpenAI / Anthropic 协议适配
-│  │  ├─ service.js              # Store、Pool、Runtime、Control Plane 装配
-│  │  ├─ v1-routes.js            # 主 REST / SSE API 注册
-│  │  └─ main.js                 # 后端进程入口
-│  ├─ test/                      # 后端单元、集成、恢复、安全和评测测试
-│  └─ docs/
+│  │  ├─ context/                # aci-admission / aci-engine / aci-store / supervisor / compaction / memory
+│  │  ├─ kernel/                 # agent-loop / contract-reasoning / execution-reasoning / runtime / events
+│  │  ├─ tools/                  # selection / policy / auto-approval / dispatcher / benchmark-sandbox / builtin/
+│  │  ├─ durable/                # DurableJobQueue / CheckpointStore / Recovery Worker / Leases
+│  │  ├─ evaluation/             # aci-governance-benchmark / external-benchmark / hidden-acceptance / judge / service
+│  │  ├─ governance/             # EvidenceVerifier / Audit / Policy Control Plane
+│  │  ├─ planning/               # AdaptivePlanner / AdaptiveReplanner / Validator
+│  │  ├─ swarm/                  # Orchestrator / Mailbox / TeamOptimizer / Replan / Overlay
+│  │  ├─ communication/          # Inter-Agent Communication Bus & Store Adapters
+│  │  ├─ memory/                 # Verified-only ExperienceMemoryService
+│  │  ├─ observability/          # Prompt Cache Telemetry / Metrics / Traces / Structured Logs
+│  │  ├─ routes/                 # chat-command (/swarm) / intelligence-routes / workspace-git
+│  │  ├─ direct-agent.js         # DirectAgentRuntime 主编排引擎 (Static Prompt + ACI + Durable)
+│  │  ├─ repo-intelligence.js    # 进程内共享渐进仓库符号与调用分析
+│  │  ├─ pool.js & gateway-proxy.js # AccountPool 多账号路由与 OpenAI/Anthropic 协议适配
+│  │  └─ v1-routes.js            # 主 REST / SSE API (/v1/*；legacy /api/v1/* 仅兼容)
+│  ├─ sandbox/                   # Dockerfile.benchmark (agent-us/benchmark:node24)
+│  ├─ scripts/                   # check.js · benchmark-aci-governance.mjs 等实测脚手架
+│  ├─ test/                      # 93+ 串行单测、集成、Docker 安全隔离与消融套件
+│  └─ docs/                      # 2.3–2.4 全阶段技术与实证报告
 ├─ frontend/
 │  ├─ src/
-│  │  ├─ api/                    # REST、SSE 和运行时客户端
-│  │  ├─ components/             # 会话、Swarm、交付、审批和设置界面
-│  │  └─ App.tsx                 # React 应用入口
-│  ├─ test/
-│  └─ README.md
+│  │  ├─ components/             # AdaptiveContextPanel · Composer · ThreadView · InspectorDrawer 等
+│  │  ├─ api/                    # REST / SSE Client · Simulator
+│  │  └─ App.tsx
+│  ├─ NATIVE-VISUAL.md           # 前端视觉设计与交互规范
+│  └─ test/                      # UI 视觉与 Playwright 浏览器运行时测试
 ├─ desktop/
 │  ├─ main.mjs                   # Electron Desktop Host
-│  ├─ preload.cjs
-│  └─ pack-win.mjs               # Windows 打包入口
-├─ docs/images/                  # README 使用的真实 UI 截图
-├─ README.md
-└─ AGENTS.md
+│  ├─ extension-hub.mjs          # 桌面插件扩展宿主
+│  ├─ office-skills.mjs          # Office Skills 支持
+│  ├─ pack-win.mjs               # Windows x64 安装包与便携版构建入口
+│  └─ preload.cjs
+├─ docs/images/                  # 真实工作台截图资源
+├─ AGENTS.md
+└─ README.md
 ```
+
+</details>
 
 ---
 
-## 配套文档
+## 文档与实证报告索引
 
-- [后端启动、API 和测试](backend/README.md)
-- [2.3 真实验收报告](backend/docs/2.3-general-autonomous-agent-report.md)
-- [后端 2.3 架构说明](backend/docs/architecture.md)
-- [前端启动与界面能力](frontend/README.md)
-- [CI 工作流](.github/workflows/ci.yml)
-- [GitHub Latest Release](https://github.com/Eternite-0/Agent_US/releases/latest)
+| 类别 | 文档 | 说明 |
+| --- | --- | --- |
+| **最新 Stage 4 实证** | [2.4 Stage 4 — ACI 上下文准入治理报告](backend/docs/2.4-stage4-aci-governance-report.md) | 注入前五级准入、`ContextSupervisor`、`expand_context` SHA-256 恢复、KV 保真与 4 臂 48 试次完整记录 |
+| **2.4 Stage 1–3 演进** | [2.4 Stage 3 实证报告](backend/docs/2.4-stage3-autonomous-intelligence-report.md) · [Stage 2 报告](backend/docs/2.4-stage2-real-provider-benchmark-report.md) · [Stage 1 报告](backend/docs/2.4-stage1-autonomous-reasoning-report.md) | 契约推理、根因台账、零 Shell 摘要、Verified Experience 与双 CI 验证 |
+| **2.3.7 工具智能** | [2.3.7 Capability-Aware Tool Selection 报告](backend/docs/2.3.7-capability-aware-tool-selection-report.md) | 14 题配对真实 Provider 实验、`−71.9%` Bash 拒绝与 `−23.6%` Token 消耗 |
+| **2.3.1 安全隔离** | [2.3.1 Windows Docker 安全验收报告](backend/docs/2.3.1-windows-docker-security-acceptance.md) · [2.3.1 隔离报告](backend/docs/2.3.1-benchmark-isolation-report.md) | 三域信任边界、7 种逃逸/绕过拦截实测与 Docker `STRONG` Fail-Closed |
+| **基础架构与运行** | [后端架构说明](backend/docs/architecture.md) · [2.3 综合验收报告](backend/docs/2.3-general-autonomous-agent-report.md) · [后端指南](backend/README.md) · [前端指南](frontend/README.md) · [视觉规范](frontend/NATIVE-VISUAL.md) | 系统设计、API 说明、启动调试与 UI 视觉规范 |
