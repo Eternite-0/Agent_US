@@ -6,6 +6,11 @@ import {
   ReversibleContextStore,
   normalizeContextPath,
 } from './aci-store.js';
+import {
+  DEFAULT_ADMISSION_MIN_CHARS,
+  DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
+  PreInjectionAdmissionController,
+} from './aci-admission.js';
 
 export const DEFAULT_ACI_WEIGHTS = Object.freeze({
   errorTrace: 0.35,
@@ -19,6 +24,8 @@ export const DEFAULT_EPOCH_WATERMARKS = Object.freeze([0.6, 0.82]);
 export const DEFAULT_SINGLE_STEP_BUDGET = 8000;
 export const DEFAULT_DTOC_MIN_CHARS = 700;
 export const DEFAULT_DTOC_SUPERSEDED_MIN_CHARS = 600;
+export const DEFAULT_DTOC_POLICY = 'adaptive_single_step';
+export const DEFAULT_DTOC_MIN_PROMPT_TOKENS = 24000;
 export const ACON_SETTINGS_KEY = 'aci.learned_guidelines';
 export const ACON_MAX_GUIDELINES = 12;
 
@@ -702,6 +709,8 @@ function computeEpochTriggerState(
     cumulativeUsedTokens = null,
     watermarks = DEFAULT_EPOCH_WATERMARKS,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
+    dtocPolicy = DEFAULT_DTOC_POLICY,
+    dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
     epochState = { lastWatermark: -1, epochCount: 0 },
     singleStepTokens = undefined,
     systemPrompt = '',
@@ -709,6 +718,11 @@ function computeEpochTriggerState(
   } = {},
 ) {
   const srcMessages = Array.isArray(messages) ? messages : [];
+  const policy = dtocPolicy === 'cumulative' ? 'cumulative' : DEFAULT_DTOC_POLICY;
+  const minPromptTokens = Math.max(
+    1000,
+    Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
+  );
   const sortedWatermarks = [...(watermarks ?? DEFAULT_EPOCH_WATERMARKS)]
     .map(Number)
     .filter((n) => Number.isFinite(n) && n > 0 && n < 1)
@@ -725,18 +739,13 @@ function computeEpochTriggerState(
     cumulativeUsedTokens != null &&
     cumulativeUsedTokens !== '' &&
     Number.isFinite(Number(cumulativeUsedTokens));
+  const usedCumulative = hasCumulative ? Math.max(0, Number(cumulativeUsedTokens)) : 0;
   const cumulativeRatio =
     hasCumulative && maxTotalTokens > 0
-      ? (Math.max(0, Number(cumulativeUsedTokens)) + tokensBefore) / maxTotalTokens
+      ? (usedCumulative + tokensBefore) / maxTotalTokens
       : maxTotalTokens > 0
         ? tokensBefore / maxTotalTokens
         : 0;
-  const ratio = Math.max(singleStepRatio, cumulativeRatio);
-
-  let highestCrossedWatermark = -1;
-  for (const wm of sortedWatermarks) {
-    if (ratio >= wm) highestCrossedWatermark = wm;
-  }
 
   const hasExplicitSingleStep =
     singleStepTokens != null && singleStepTokens !== '' && Number.isFinite(Number(singleStepTokens));
@@ -760,12 +769,42 @@ function computeEpochTriggerState(
     }
   }
 
+  let ratio = singleStepRatio;
+  let highestCrossedWatermark = -1;
+  let emergencyTriggered = false;
+
+  if (policy === 'cumulative') {
+    ratio = Math.max(singleStepRatio, cumulativeRatio);
+    for (const wm of sortedWatermarks) {
+      if (ratio >= wm) highestCrossedWatermark = wm;
+    }
+  } else {
+    const promptWatermarkGate = Math.min(
+      minPromptTokens,
+      Math.floor(contextWindow * 0.45),
+    );
+    if (tokensBefore >= promptWatermarkGate) {
+      for (const wm of sortedWatermarks) {
+        if (singleStepRatio >= wm) highestCrossedWatermark = wm;
+      }
+    }
+    const emergencyGate = Math.min(12000, Math.floor(contextWindow * 0.2));
+    if (hasCumulative && maxTotalTokens > 0 && tokensBefore >= emergencyGate) {
+      const remainingBudget = Math.max(0, maxTotalTokens - usedCumulative);
+      if (remainingBudget <= 2.5 * tokensBefore) {
+        emergencyTriggered = true;
+      }
+    }
+  }
+
   const prevWatermark = Number(epochState?.lastWatermark ?? -1);
   const prevEpochCount = Number(epochState?.epochCount ?? 0);
   const watermarkTriggered = highestCrossedWatermark > prevWatermark;
   const singleStepTriggered = measuredSingleStep > singleStepBudget;
   return {
     srcMessages,
+    dtocPolicy: policy,
+    dtocMinPromptTokens: minPromptTokens,
     tokensBefore,
     singleStepRatio,
     cumulativeRatio,
@@ -776,13 +815,14 @@ function computeEpochTriggerState(
     prevEpochCount,
     watermarkTriggered,
     singleStepTriggered,
-    triggered: watermarkTriggered || singleStepTriggered,
+    emergencyTriggered,
+    triggered: watermarkTriggered || singleStepTriggered || emergencyTriggered,
   };
 }
 
 /**
- * Pure read-only check indicating whether an epoch watermark or single-step
- * budget overflow would trigger DTOC compression.
+ * Pure read-only check indicating whether an epoch watermark, emergency remaining
+ * budget, or single-step budget overflow would trigger DTOC compression.
  */
 export function shouldTriggerAciEpoch(messages, options = {}) {
   const state = computeEpochTriggerState(messages, options);
@@ -790,6 +830,9 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
     triggered: state.triggered,
     watermarkTriggered: state.watermarkTriggered,
     singleStepTriggered: state.singleStepTriggered,
+    emergencyTriggered: state.emergencyTriggered,
+    dtocPolicy: state.dtocPolicy,
+    dtocMinPromptTokens: state.dtocMinPromptTokens,
     singleStepRatio: state.singleStepRatio,
     cumulativeRatio: state.cumulativeRatio,
     ratio: state.ratio,
@@ -1004,6 +1047,8 @@ export function compressMessagesEpoch(
     cumulativeUsedTokens = null,
     watermarks = DEFAULT_EPOCH_WATERMARKS,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
+    dtocPolicy = DEFAULT_DTOC_POLICY,
+    dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
     epochState = { lastWatermark: -1, epochCount: 0 },
     minAgeSteps = 3,
     minChars = DEFAULT_DTOC_MIN_CHARS,
@@ -1025,6 +1070,8 @@ export function compressMessagesEpoch(
     cumulativeUsedTokens,
     watermarks,
     singleStepBudget,
+    dtocPolicy,
+    dtocMinPromptTokens,
     epochState,
     singleStepTokens,
     systemPrompt,
@@ -1040,12 +1087,14 @@ export function compressMessagesEpoch(
     prevEpochCount,
     watermarkTriggered,
     singleStepTriggered,
+    emergencyTriggered,
   } = trigger;
 
-  if (!watermarkTriggered && !singleStepTriggered) {
+  if (!watermarkTriggered && !singleStepTriggered && !emergencyTriggered) {
     return {
       triggered: false,
       reason: 'between_epochs',
+      dtocPolicy: trigger.dtocPolicy,
       epoch: prevEpochCount,
       lastWatermark: prevWatermark,
       ratio,
@@ -1117,13 +1166,17 @@ export function compressMessagesEpoch(
     }
 
     const extracted = extractSymbolsFromText(ev.rawFilePath || ev.targetPath, ev.rawText);
+    const outlineWithLines = extracted.definitions.length
+      ? extracted.definitions.slice(0, 12).map((d) => (d.line ? `${d.name}@L${d.line}` : d.name))
+      : extracted.names;
     const ref = aciStore.put(ev.rawText, {
       toolName: ev.toolName,
       path: ev.rawFilePath || ev.targetPath,
       lineRange: extractLineRangeLabel(ev.args, ev.rawText),
-      symbolOutline: extracted.names,
+      symbolOutline: outlineWithLines,
       originalTokens: ev.rawTokens,
       step: ev.msgStep,
+      decision: 'DEFER',
     });
 
     const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
@@ -1158,7 +1211,12 @@ export function compressMessagesEpoch(
 
   return {
     triggered: true,
-    reason: watermarkTriggered ? 'watermark_crossed' : 'single_step_budget',
+    reason: watermarkTriggered
+      ? 'watermark_crossed'
+      : singleStepTriggered
+        ? 'single_step_budget'
+        : 'emergency_budget',
+    dtocPolicy: trigger.dtocPolicy,
     epoch: nextEpoch,
     watermark: highestCrossedWatermark,
     lastWatermark: nextState.lastWatermark,
@@ -1189,12 +1247,16 @@ export function expandContext(
     contextLines = 15,
     maxChars = 6000,
     step = 0,
+    expectedSha256 = undefined,
     ledger = null,
   } = {},
 ) {
-  const raw = aciStore.restore(uriOrRefId);
+  const verified = typeof aciStore.restoreVerified === 'function'
+    ? aciStore.restoreVerified(uriOrRefId, { expectedSha256 })
+    : { content: aciStore.restore(uriOrRefId), sha256: null, verified: false, refId: null, uri: null, path: '' };
+  const raw = verified.content;
   const ref = aciStore.getRef(uriOrRefId);
-  const path = ref?.path || 'unknown';
+  const path = verified.path || ref?.path || 'unknown';
   const normalizedLevel =
     level === 'relevant_hunk' ? 'hunk' : level === 'verbatim' || level === 'hunk' ? level : 'outline';
 
@@ -1413,21 +1475,46 @@ export class ACIEngine {
     store = null,
     aciStore = null,
     ledger = null,
+    supervisor = null,
     maxTotalTokens = 128000,
     contextWindow = 128000,
     watermarks = DEFAULT_EPOCH_WATERMARKS,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
+    dtocPolicy = DEFAULT_DTOC_POLICY,
+    dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    admissionMinChars = DEFAULT_ADMISSION_MIN_CHARS,
+    maxSupervisorAdmissionCalls = DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
     weights = DEFAULT_ACI_WEIGHTS,
   } = {}) {
     this.store = store;
     this.aciStore = aciStore ?? new ReversibleContextStore(store);
     this.ledger = ledger;
+    this.supervisor = supervisor;
     this.maxTotalTokens = maxTotalTokens;
     this.contextWindow = contextWindow;
     this.watermarks = [...watermarks];
     this.singleStepBudget = singleStepBudget;
+    this.dtocPolicy = dtocPolicy === 'cumulative' ? 'cumulative' : DEFAULT_DTOC_POLICY;
+    this.dtocMinPromptTokens = Math.max(
+      1000,
+      Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
+    );
+    this.admissionMinChars = Math.max(
+      200,
+      Number(admissionMinChars ?? DEFAULT_ADMISSION_MIN_CHARS),
+    );
+    this.maxSupervisorAdmissionCalls = Math.max(
+      0,
+      Number(maxSupervisorAdmissionCalls ?? DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS),
+    );
     this.weights = { ...DEFAULT_ACI_WEIGHTS, ...weights };
     this.epochState = { lastWatermark: -1, epochCount: 0 };
+    this.admissionController = new PreInjectionAdmissionController({
+      aciStore: this.aciStore,
+      ledger: this.ledger,
+      admissionMinChars: this.admissionMinChars,
+      maxSupervisorAdmissionCalls: this.maxSupervisorAdmissionCalls,
+    });
   }
 
   evaluateGate(options) {
@@ -1442,12 +1529,25 @@ export class ACIEngine {
     });
   }
 
+  async admitToolBatch(executedBatch, options = {}) {
+    return this.admissionController.admitBatch(executedBatch, {
+      supervisor: options.supervisor ?? this.supervisor,
+      learnedGuidelines: options.learnedGuidelines ?? this.getGuidelines(),
+      admissionMinChars: options.admissionMinChars ?? this.admissionMinChars,
+      maxSupervisorAdmissionCalls:
+        options.maxSupervisorAdmissionCalls ?? this.maxSupervisorAdmissionCalls,
+      ...options,
+    });
+  }
+
   inspectEpoch(messages, options = {}) {
     return shouldTriggerAciEpoch(messages, {
       maxTotalTokens: this.maxTotalTokens,
       contextWindow: this.contextWindow,
       watermarks: this.watermarks,
       singleStepBudget: this.singleStepBudget,
+      dtocPolicy: this.dtocPolicy,
+      dtocMinPromptTokens: this.dtocMinPromptTokens,
       epochState: this.epochState,
       ...options,
     });
@@ -1461,6 +1561,8 @@ export class ACIEngine {
       contextWindow: this.contextWindow,
       watermarks: this.watermarks,
       singleStepBudget: this.singleStepBudget,
+      dtocPolicy: this.dtocPolicy,
+      dtocMinPromptTokens: this.dtocMinPromptTokens,
       epochState: this.epochState,
       ...options,
     });
@@ -1477,6 +1579,26 @@ export class ACIEngine {
 
   restore(uriOrRefId) {
     return this.aciStore.restore(uriOrRefId);
+  }
+
+  restoreVerified(uriOrRefId, options = {}) {
+    const res = this.aciStore.restoreVerified(uriOrRefId, {
+      expectedSha256: options.expectedSha256,
+    });
+    if (options.recordLedger !== false) {
+      this.ledger?.recordRecovery?.({
+        refId: res.refId,
+        uri: res.uri,
+        sha256: res.sha256,
+        path: res.path,
+        level: options.level || 'verbatim',
+        verified: res.verified,
+        tokensRestored: options.tokensRestored ?? estimateTokens(res.content),
+        triggeredBy: options.triggeredBy || 'expand_context',
+        step: options.step ?? 0,
+      });
+    }
+    return res;
   }
 
   getGuidelines() {

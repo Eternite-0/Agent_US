@@ -701,6 +701,7 @@ test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers f
   const session = direct.createSession({
     workspaceRoot: workDir,
     permissionMode: 'full-access',
+    aciProfile: 'raw_full',
     budget: { maxSteps: 10, maxTotalTokens: 160_000, maxOutputTokens: 4096 },
   });
   const { turn } = direct.startTurn(session.id, {
@@ -790,6 +791,7 @@ test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers f
     const s2 = directT2.createSession({
       workspaceRoot: workDir,
       permissionMode: 'full-access',
+      aciProfile: 'raw_full',
       budget: { maxSteps: 8, maxTotalTokens: 60_000, maxOutputTokens: 2048 },
     });
     const t2 = directT2.startTurn(s2.id, {
@@ -1130,6 +1132,7 @@ test('Step 3: DirectAgent + AgentLoop ACI Epoch DTOC, read-only Supervisor via v
     workspaceRoot: workDir,
     permissionMode: 'full-access',
     budget: { maxTokens: 19000, maxSteps: 12 },
+    aciOptions: { dtocPolicy: 'cumulative', admissionEnabled: false },
   });
   const { turn } = direct.startTurn(session.id, { input: 'Update computeRate in src/target.js', maxSteps: 12 });
   const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
@@ -1398,6 +1401,7 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
     workspaceRoot: workDir,
     permissionMode: 'full-access',
     budget: { maxTokens: 160000, maxSteps: 12 },
+    aciOptions: { dtocPolicy: 'cumulative', admissionEnabled: false },
   });
   const { turn } = direct.startTurn(session.id, {
     input: 'Inspect src/index.js precedence rules and write CONTRACT.json (`precedence`).',
@@ -1557,6 +1561,7 @@ test('Round 3: Repoformer abstains when 0 eligible (< 2 / < 2400 chars), while s
     workspaceRoot: workDir,
     permissionMode: 'full-access',
     budget: { maxTokens: 160000, maxSteps: 14 },
+    aciOptions: { dtocPolicy: 'cumulative', admissionEnabled: false },
   });
   const { turn } = direct.startTurn(session.id, { input: 'Update src/a.js after inspecting src/b.js', maxSteps: 14 });
   const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
@@ -1571,4 +1576,256 @@ test('Round 3: Repoformer abstains when 0 eligible (< 2 / < 2400 chars), while s
   assert.ok(am.savedTokens > 0);
   assert.ok(am.restoredCount >= 1);
   assert.equal(am.supervisorCalls, 1);
+});
+
+test('Stage 4: expand_context verifies SHA-256 across outline/hunk/verbatim and rejects tampered SQLite blobs', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-s4-expand-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-s4-expand-ws-'));
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  t.after(() => {
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const tools = createWorkspaceTools({
+    workspaceRoot: workDir,
+    store,
+    permissionMode: 'auto-safe',
+  });
+  const expandTool = tools.find((tool) => tool.name === 'expand_context');
+  assert.ok(expandTool);
+
+  const sampleCode = [
+    'import { verifyHash } from "./crypto.js";',
+    '',
+    'export function processOrder(order) {',
+    '  return verifyHash(order.id);',
+    '}',
+    '',
+    'export function auditPersistence(db) {',
+    '  return db.prepare("SELECT 1");',
+    '}',
+  ].join('\n');
+  const put = store.putBlob(sampleCode);
+
+  const outlineOut = await expandTool.execute({ ref: put.uri, level: 'outline' }, {});
+  assert.match(outlineOut, /\[expand_context sha256:[a-f0-9]{12} verified=true outline/);
+  assert.match(outlineOut, /Imports:/);
+  assert.match(outlineOut, /processOrder/);
+
+  const hunkOut = await expandTool.execute({ ref: put.uri, level: 'hunk', symbols: ['auditPersistence'] }, {});
+  assert.match(hunkOut, /\[expand_context sha256:[a-f0-9]{12} verified=true hunk/);
+  assert.match(hunkOut, /auditPersistence/);
+
+  const verbatimOut = await expandTool.execute({ ref: put.uri, level: 'verbatim', startLine: 3, endLine: 5 }, {});
+  assert.match(verbatimOut, /\[expand_context sha256:[a-f0-9]{12} verified=true lines 3-5\/9\]/);
+  assert.match(verbatimOut, /export function processOrder/);
+
+  // Tamper SQLite blob content -> ARTIFACT_HASH_MISMATCH
+  store.db.prepare('UPDATE blobs SET content=? WHERE sha256=?').run('tampered blob!', put.sha256);
+  await assert.rejects(
+    () => expandTool.execute({ ref: put.uri, level: 'verbatim' }, {}),
+    (err) => err?.code === 'ARTIFACT_HASH_MISMATCH',
+  );
+});
+
+test('Stage 4: DirectAgent supports all 4 aciProfiles, short-task DTOC KV preservation, pre-injection admission, and hash-verified expand_context', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-s4-profiles-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-s4-profiles-ws-'));
+  mkdirSync(join(workDir, 'src', 'auth'), { recursive: true });
+  mkdirSync(join(workDir, 'src', 'noise'), { recursive: true });
+
+  const adj = ['fast', 'safe', 'clean', 'strict', 'pure', 'lazy', 'async', 'sync', 'cold', 'warm', 'deep', 'flat'];
+  const noun = ['Parser', 'Router', 'Ledger', 'Cache', 'Codec', 'Guard', 'Planner', 'Store', 'Broker', 'Bridge', 'Filter', 'Sorter'];
+  const verb = ['validate', 'normalize', 'resolve', 'compute', 'dispatch', 'serialize', 'reconcile', 'compact'];
+  const tagWord = (i) => [0, 4, 8].map((s) => String.fromCharCode(97 + ((i * 7 + s) % 26))).join('');
+  const authFile =
+    Array.from({ length: 50 }, (_, i) => `export function auth${verb[i % verb.length]}${noun[i % noun.length]}_${tagWord(i)}(v) { return v ? '${adj[i % adj.length]}' : null; }`).join('\n') +
+    '\nexport function verifySessionToken(tok) {\n  return typeof tok === "string" && tok.startsWith("valid_");\n}\n';
+  const noiseFile = Array.from(
+    { length: 80 },
+    (_, i) => `export const banner_${adj[i % adj.length]}_${noun[i % noun.length]}_${tagWord(i)} = "static marketing blurb ${verb[i % verb.length]} ${adj[(i * 3) % adj.length]}";`,
+  ).join('\n');
+  const largeHelperFile =
+    'import { authvalidateParser_aei } from "../auth/token.js";\n' +
+    Array.from({ length: 85 }, (_, i) => `export function helper${verb[i % verb.length]}${noun[(i * 3) % noun.length]}_${tagWord(i)}(x) { return authvalidateParser_aei(x) ? '${adj[i % adj.length]}' : ''; }`).join('\n') +
+    '\nexport function extraHelper80(x) { return authvalidateParser_aei(x); }\n';
+
+  writeFileSync(join(workDir, 'src', 'auth', 'token.js'), authFile, 'utf8');
+  writeFileSync(join(workDir, 'src', 'noise', 'marketing.js'), noiseFile, 'utf8');
+  writeFileSync(join(workDir, 'src', 'extra.js'), largeHelperFile, 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.createAccount({
+    preset: 'workbuddy',
+    label: 's4-test-pool',
+    credential: 'sk-test-s4-pool-0001',
+    protocol: 'openai',
+    endpoint: 'https://api.example.invalid/v1',
+    models: ['main-model', 'fast-supervisor'],
+  });
+  pool.setDefaultModel('main-model');
+
+  let stepCounter = 0;
+  let supAdmissionCalls = 0;
+  let capturedToolMessages = [];
+  let sysPrefixes = [];
+
+  class Stage4Adapter extends LlmAdapter {
+    async *stream(opts) {
+      const sysText = String(opts.system ?? opts.messages?.[0]?.content?.[0]?.text ?? '');
+      if (
+        opts.model === 'fast-supervisor' ||
+        (Array.isArray(opts.tools) && opts.tools.length === 0 && /Pre-Injection Context Admission Supervisor/i.test(sysText))
+      ) {
+        assert.deepEqual(opts.tools, []);
+        supAdmissionCalls += 1;
+        const payload = JSON.parse(opts.messages[0].content[0].text);
+        const decisions = payload.candidates.map((c) => {
+          if (c.path.includes('auth/token.js')) {
+            return { id: c.id, decision: 'IRRELEVANT', focusSymbols: ['verifySessionToken'], reason: 'test guardrail' };
+          }
+          return { id: c.id, decision: 'DEFER', reason: 'defer large extra helper' };
+        });
+        yield { type: 'text-delta', index: 0, text: JSON.stringify({ decisions, contractHints: [] }) };
+        yield { type: 'usage', usage: { inputTokens: 250, outputTokens: 50 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
+
+      stepCounter += 1;
+      sysPrefixes.push(opts.messages?.[0]?.content?.[0]?.text ?? '');
+
+      if (stepCounter === 1) {
+        yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 's4-r-auth', name: 'read_file', arguments: JSON.stringify({ path: 'src/auth/token.js' }) } };
+        yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: 's4-r-noise', name: 'read_file', arguments: JSON.stringify({ path: 'src/noise/marketing.js' }) } };
+        yield { type: 'block-end', index: 2, block: { type: 'tool-call', id: 's4-r-extra', name: 'read_file', arguments: JSON.stringify({ path: 'src/extra.js' }) } };
+        yield { type: 'usage', usage: { inputTokens: 52000, outputTokens: 200 } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      if (stepCounter === 2) {
+        capturedToolMessages = (opts.messages ?? []).filter((m) => m.role === 'tool');
+        const extraMsg = capturedToolMessages.find((m) => m.toolCallId === 's4-r-extra')?.content?.[0]?.text ?? '';
+        const match = extraMsg.match(/artifact:\/\/[a-f0-9]{64}/);
+        if (match) {
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: {
+              type: 'tool-call',
+              id: 's4-exp',
+              name: 'expand_context',
+              arguments: JSON.stringify({ ref: match[0], level: 'hunk', symbols: ['extraHelper80'] }),
+            },
+          };
+          yield { type: 'usage', usage: { inputTokens: 52000, outputTokens: 200 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+          return;
+        }
+      }
+      if (stepCounter === 3) {
+        const expToolMsg = (opts.messages ?? []).find((m) => m.toolCallId === 's4-exp')?.content?.[0]?.text ?? '';
+        assert.match(expToolMsg, /verified=true/);
+        assert.match(expToolMsg, /extraHelper80/);
+      }
+      yield { type: 'text-delta', index: 0, text: 'Completed Stage 4 check.' };
+      yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 100 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+
+  const adapter = new Stage4Adapter();
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter,
+    enableHeartbeat: false,
+  });
+
+  t.after(async () => {
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const runProfile = async (aciProfile) => {
+    stepCounter = 0;
+    supAdmissionCalls = 0;
+    capturedToolMessages = [];
+    sysPrefixes = [];
+    const sess = direct.createSession({
+      workspaceRoot: workDir,
+      permissionMode: 'full-access',
+      aciProfile,
+      budget: { maxTokens: 160000, maxSteps: 10 },
+    });
+    const { turn } = direct.startTurn(sess.id, {
+      input: 'Check verifySessionToken and extraHelper80',
+      maxSteps: 10,
+    });
+    const settled = await waitTurnDone(direct, sess.id, turn.id, 8000);
+    assert.equal(settled.state, 'completed');
+    const ev = JSON.parse(
+      store.db.prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed'").get(turn.id).data,
+    );
+    return {
+      aciMetrics: ev.reasoningMetrics?.aciMetrics,
+      supAdmissionCalls,
+      capturedToolMessages,
+      sysPrefixes,
+    };
+  };
+
+  // 1. raw_full: admission=false, dtoc=false, supervisor=0, saved=0
+  const rawRes = await runProfile('raw_full');
+  assert.equal(rawRes.aciMetrics.aciProfile, 'raw_full');
+  assert.equal(rawRes.aciMetrics.admissionEnabled, false);
+  assert.equal(rawRes.aciMetrics.dtocEnabled, false);
+  assert.equal(rawRes.supAdmissionCalls, 0);
+  assert.equal(rawRes.aciMetrics.admissionSavedTokens, 0);
+  assert.equal(rawRes.aciMetrics.epochTransitions, 0);
+  const rawNoiseText = rawRes.capturedToolMessages.find((m) => m.toolCallId === 's4-r-noise')?.content?.[0]?.text ?? '';
+  assert.match(rawNoiseText, /banner_sync_Store_hlp/, 'raw_full must inject full un-stubbed noise');
+
+  // 2. deterministic_progressive: admission=true, supervisor=0, dtoc=false, admissionSavedTokens > 0
+  const detRes = await runProfile('deterministic_progressive');
+  assert.equal(detRes.aciMetrics.aciProfile, 'deterministic_progressive');
+  assert.equal(detRes.aciMetrics.admissionEnabled, true);
+  assert.equal(detRes.aciMetrics.dtocEnabled, false);
+  assert.equal(detRes.supAdmissionCalls, 0);
+  assert.ok(detRes.aciMetrics.admissionSavedTokens > 0);
+  assert.equal(detRes.aciMetrics.epochTransitions, 0);
+
+  // 3. retrieval_supervisor: admission=true, supervisor >= 1, dtoc=false
+  const retRes = await runProfile('retrieval_supervisor');
+  assert.equal(retRes.aciMetrics.aciProfile, 'retrieval_supervisor');
+  assert.equal(retRes.aciMetrics.admissionEnabled, true);
+  assert.equal(retRes.aciMetrics.dtocEnabled, false);
+  assert.ok(retRes.supAdmissionCalls >= 1);
+  assert.ok(retRes.aciMetrics.supervisorCalls >= 1);
+  assert.ok(retRes.aciMetrics.supervisorCost.totalTokens > 0);
+  assert.ok(retRes.aciMetrics.admissionSavedTokens > 0);
+  assert.ok(retRes.aciMetrics.hashVerifiedRestores >= 1);
+
+  // 4. full_aci: admission=true, dtoc=true (adaptive_single_step), short task cumulative ~104k SKIPS DTOC (epochTransitions === 0)!
+  const fullRes = await runProfile('full_aci');
+  assert.equal(fullRes.aciMetrics.aciProfile, 'full_aci');
+  assert.equal(fullRes.aciMetrics.admissionEnabled, true);
+  assert.equal(fullRes.aciMetrics.dtocEnabled, true);
+  assert.equal(fullRes.aciMetrics.dtocPolicy, 'adaptive_single_step');
+  assert.equal(fullRes.aciMetrics.epochTransitions, 0, 'Short task (~5k prompt tokens) must skip DTOC even at 104k cumulative');
+  assert.ok(fullRes.aciMetrics.admissionSavedTokens > 0);
+  assert.ok(fullRes.aciMetrics.totalAciSavedTokens >= fullRes.aciMetrics.admissionSavedTokens);
+  assert.ok(fullRes.aciMetrics.hashVerifiedRestores >= 1);
+  assert.ok(fullRes.aciMetrics.recoveryStats.hashVerifiedCount >= 1);
+  assert.ok(fullRes.aciMetrics.ledger?.admissions?.length >= 3);
+  assert.equal(fullRes.aciMetrics.admissionDecisions.IRRELEVANT >= 1, true);
+  assert.equal(fullRes.aciMetrics.admissionDecisions.SUPPORTING >= 1, true);
+  for (const p of fullRes.sysPrefixes) {
+    assert.equal(p, fullRes.sysPrefixes[0], 'System prompt prefix must stay byte-identical');
+  }
 });
