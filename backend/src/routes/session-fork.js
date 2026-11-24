@@ -3,6 +3,24 @@ import { dirname, join } from 'node:path';
 import { Fault, id } from '../store.js';
 import { redactSecrets } from '../envelope.js';
 
+export function forkBranchName(forkId) {
+  return `agent-us/chat-${forkId}`;
+}
+
+export async function resolveForkBranchForSession({ directAgent, runGit }, sourceSessionId) {
+  const session = directAgent.getSession(sourceSessionId);
+  if (session.workspaceRoot) {
+    try {
+      const head = await runGit(session.workspaceRoot, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+      const branch = String(head?.stdout ?? '').trim();
+      if (branch) return branch;
+    } catch {
+      // Fallback to deterministic fork branch naming if worktree is unavailable
+    }
+  }
+  return forkBranchName(sourceSessionId);
+}
+
 export async function forkChatSession({ store, directAgent, runGit }, sourceId, workspaceMode) {
   if (workspaceMode !== 'same-workspace' && workspaceMode !== 'new-worktree') {
     throw new Fault('INVALID_FORK_WORKSPACE_MODE', 400);
@@ -15,7 +33,7 @@ export async function forkChatSession({ store, directAgent, runGit }, sourceId, 
   };
   const source = readSource();
   const forkId = id();
-  const branch = `agent-us/chat-${forkId}`;
+  const branch = forkBranchName(forkId);
   let worktree = null;
   if (workspaceMode === 'new-worktree') {
     if (store.dbPath === ':memory:' || !source.workspaceRoot) throw new Fault('CHAT_WORKTREE_UNAVAILABLE', 409);
