@@ -17,6 +17,7 @@ import {
   assertLeaseInTx,
   checkLeaseHeld,
   isLeaseLostError,
+  renewTurnLease,
 } from './durable/lease-guard.js';
 import {
   classifyTrafficSource,
@@ -60,8 +61,16 @@ import { ProjectMemoryService } from './context/memory.js';
 import { MultiStageCompactor } from './context/compaction.js';
 import { ContextAssembler } from './context/assembler.js';
 import { ReversibleContextStore, ContextEvidenceLedger } from './context/aci-store.js';
-import { ACIEngine } from './context/aci-engine.js';
-import { ContextSupervisor, normalizeSupervisorConfig } from './context/supervisor.js';
+import {
+  ACIEngine,
+  PHASE_WATERMARK_V25_DTOC_POLICY,
+  resolveWatermarksForPolicy,
+} from './context/aci-engine.js';
+import {
+  ACI_CONFIG_KEY,
+  ContextSupervisor,
+  normalizeSupervisorConfig,
+} from './context/supervisor.js';
 import {
   AgentCapabilityRegistry,
   ModelCapabilityRegistry,
@@ -98,6 +107,24 @@ async function detectGitBranch(cwd) {
 }
 
 /**
+ * Builds persisted `file/changed` event payload while preserving additive diff metadata
+ * (`action`, `unifiedDiff`, `additions`, `deletions`, `sha256After`) when provided.
+ */
+export function buildFileChangedEventData(sessionId, turnId, change = {}) {
+  const c = change && typeof change === 'object' ? change : {};
+  return {
+    turnId,
+    sessionId,
+    ...c,
+    ...(c.action !== undefined ? { action: c.action } : {}),
+    ...(c.unifiedDiff !== undefined ? { unifiedDiff: c.unifiedDiff } : {}),
+    ...(c.additions !== undefined ? { additions: c.additions } : {}),
+    ...(c.deletions !== undefined ? { deletions: c.deletions } : {}),
+    ...(c.sha256After !== undefined ? { sha256After: c.sha256After } : {}),
+  };
+}
+
+/**
  * DirectAgentRuntime orchestrates interactive & autonomous turns over:
  * - Layer 3: AgentRuntimeKernel + CancellationManager + EventRouter
  * - Layer 4: ToolDispatcher + ToolPermissionPolicy + HostSandboxAdapter + McpLifecycleManager
@@ -116,6 +143,7 @@ export class DirectAgentRuntime {
       staticMcp = {},
       workerId = null,
       leaseMs = 15000,
+      leaseRenewalIntervalMs = 5000,
       enableHeartbeat = true,
       artifactStoreDir = null,
       metrics = null,
@@ -133,6 +161,8 @@ export class DirectAgentRuntime {
     this.defaultWorkspace = resolve(defaultWorkspace);
     this.dataRoot = dataRoot ? resolve(dataRoot) : null;
     this.closed = false;
+    this.leaseMs = Math.max(500, Number(leaseMs || 15000));
+    this.leaseRenewalIntervalMs = Math.max(50, Number(leaseRenewalIntervalMs ?? 5000));
 
     this.jobQueue = new DurableJobQueue(this.store, { defaultLeaseMs: leaseMs });
     this.checkpointStore = new CheckpointStore(this.store);
@@ -182,6 +212,7 @@ export class DirectAgentRuntime {
     this.sessionSandboxes = new Map(); // sessionId -> { sandbox, disableWorkspaceHooks, disableWorkspaceMcp, forcedToolDeny }
     this.sessionProjects = new Map(); // sessionId -> projectId override
     this.sessionAciConfigs = new Map(); // sessionId -> { aciProfile, aciOptions }
+    this.turnAciStates = new Map(); // turnId -> { sessionId, turnAciLedger, turnReadFiles, turnAciStore }
 
     this.processManager = new BackgroundProcessManager();
     this.mcpHub = new McpHub({
@@ -242,6 +273,9 @@ export class DirectAgentRuntime {
         this.sessionSandboxes.delete(sessionId);
         this.sessionProjects.delete(sessionId);
         this.sessionAciConfigs.delete(sessionId);
+        for (const [tid, st] of this.turnAciStates.entries()) {
+          if (st?.sessionId === sessionId) this.turnAciStates.delete(tid);
+        }
         this.contextAssembler.clearSession(sessionId);
       },
       onBeforeRewind: (sessionId) => {
@@ -374,6 +408,7 @@ export class DirectAgentRuntime {
       }
       this.activeTurns.clear();
       this.activeSessionTurn.clear();
+      this.turnAciStates.clear();
       this.recoveryWorker.stopping = true;
       this.recoveryWorker.started = false;
       if (this.recoveryWorker.unsubWake) {
@@ -759,6 +794,7 @@ export class DirectAgentRuntime {
       'deterministic_progressive',
       'retrieval_supervisor',
       'full_aci',
+      'aci_25',
     ]);
     const sessionCfg = this.sessionAciConfigs.get(sessionId) ?? {};
     const rawProfile = turnAciProfile ?? sessionCfg.aciProfile ?? 'full_aci';
@@ -824,7 +860,19 @@ export class DirectAgentRuntime {
       supervisorConfigOverride = supCfg;
     }
 
-    const dtocPolicy = mergedOptions.dtocPolicy === 'cumulative' ? 'cumulative' : 'adaptive_single_step';
+    let dtocPolicy;
+    if (
+      mergedOptions.dtocPolicy === 'cumulative' ||
+      mergedOptions.dtocPolicy === 'adaptive_single_step' ||
+      mergedOptions.dtocPolicy === 'phase_watermark_v25'
+    ) {
+      dtocPolicy = mergedOptions.dtocPolicy;
+    } else {
+      dtocPolicy =
+        aciProfile === 'full_aci' || aciProfile === 'aci_25'
+          ? PHASE_WATERMARK_V25_DTOC_POLICY
+          : 'adaptive_single_step';
+    }
     const dtocMinPromptTokens =
       mergedOptions.dtocMinPromptTokens != null &&
       Number.isFinite(Number(mergedOptions.dtocMinPromptTokens))
@@ -844,6 +892,23 @@ export class DirectAgentRuntime {
       Number.isFinite(Number(mergedOptions.admissionMinChars))
         ? Math.max(200, Math.trunc(Number(mergedOptions.admissionMinChars)))
         : undefined;
+    const storedSupRaw =
+      this.store && typeof this.store.getSetting === 'function'
+        ? this.store.getSetting(ACI_CONFIG_KEY, null)
+        : null;
+    const hasCustomWatermarks =
+      dtocPolicy !== PHASE_WATERMARK_V25_DTOC_POLICY ||
+      (Array.isArray(mergedOptions.watermarks) && mergedOptions.watermarks.length > 0) ||
+      (Array.isArray(mergedOptions.epochWatermarks) && mergedOptions.epochWatermarks.length > 0) ||
+      (Array.isArray(mergedOptions.supervisorConfigOverride?.epochWatermarks) &&
+        mergedOptions.supervisorConfigOverride.epochWatermarks.length > 0) ||
+      (Array.isArray(storedSupRaw?.epochWatermarks) && storedSupRaw.epochWatermarks.length > 0);
+    const engineWatermarks = hasCustomWatermarks
+      ? resolveWatermarksForPolicy(
+          dtocPolicy,
+          mergedOptions.watermarks ?? mergedOptions.epochWatermarks ?? supCfg.epochWatermarks,
+        )
+      : resolveWatermarksForPolicy(dtocPolicy);
 
     return {
       aciProfile,
@@ -855,6 +920,7 @@ export class DirectAgentRuntime {
       singleStepBudget,
       maxSupervisorAdmissionCalls,
       admissionMinChars,
+      engineWatermarks,
       supervisorConfigOverride,
     };
   }
@@ -1617,6 +1683,26 @@ export class DirectAgentRuntime {
           });
         }
 
+        let turnAciState = this.turnAciStates.get(turnId);
+        if (!turnAciState) {
+          turnAciState = {
+            sessionId,
+            turnAciLedger: new ContextEvidenceLedger(),
+            turnReadFiles: new Set(),
+            turnAciStore: new ReversibleContextStore(this.store),
+          };
+          if (checkpoint?.state?.aciLedger) {
+            turnAciState.turnAciLedger.mergeFrom(checkpoint.state.aciLedger);
+          }
+          if (Array.isArray(checkpoint?.state?.filesRead)) {
+            for (const p of checkpoint.state.filesRead) {
+              const clean = String(p ?? '').trim();
+              if (clean) turnAciState.turnReadFiles.add(clean);
+            }
+          }
+          this.turnAciStates.set(turnId, turnAciState);
+        }
+
         try {
           await this.#runTurnLoop({
             sessionId,
@@ -1632,6 +1718,9 @@ export class DirectAgentRuntime {
             evidenceContract: payload.evidenceContract ?? null,
             aciProfile: payload.aciProfile,
             aciOptions: payload.aciOptions,
+            turnAciLedger: turnAciState.turnAciLedger,
+            turnReadFiles: turnAciState.turnReadFiles,
+            turnAciStore: turnAciState.turnAciStore,
             initialStep: checkpoint?.step ?? payload.resumedFromStep ?? 0,
             isRecovery: Boolean(job.reclaimedFromCrash || checkpoint?.step > 0 || job.attempts > 1),
             canRetry: job.attempts < job.maxAttempts,
@@ -1760,6 +1849,9 @@ export class DirectAgentRuntime {
     evidenceContract = null,
     aciProfile = undefined,
     aciOptions = undefined,
+    turnAciLedger = null,
+    turnReadFiles = null,
+    turnAciStore = null,
     initialStep = 0,
     isRecovery = false,
     canRetry = false,
@@ -1815,6 +1907,14 @@ export class DirectAgentRuntime {
       this.readFileStates.set(sessionId, readFileState);
     }
 
+    const aciStore = turnAciStore ?? new ReversibleContextStore(this.store);
+    const aciLedger = new ContextEvidenceLedger();
+    if (turnAciLedger) {
+      aciLedger.mergeFrom(turnAciLedger);
+    }
+    let leaseRenewalTimer = null;
+    let turnFencedOrTerminal = false;
+
     if (!isRecovery) {
       this.#emitPersisted(sessionId, turnId, 'turn/started', {
         turnId,
@@ -1827,6 +1927,26 @@ export class DirectAgentRuntime {
     }
 
     try {
+      if (leaseGuard) {
+        const renewalIntervalMs = Math.max(50, Number(this.leaseRenewalIntervalMs || 5000));
+        const renewalExtendMs = Math.max(500, Number(this.leaseMs || 15000));
+        const leaseOwner = leaseGuard.workerId ?? this.recoveryWorker?.workerId ?? null;
+        leaseRenewalTimer = setInterval(() => {
+          try {
+            renewTurnLease(leaseGuard, {
+              sessionId,
+              turnId,
+              owner: leaseOwner,
+              extendMs: renewalExtendMs,
+              store: this.store,
+            });
+          } catch {
+            // Keep background heartbeat non-throwing; active lease guards enforce fencing synchronously.
+          }
+        }, renewalIntervalMs);
+        leaseRenewalTimer.unref?.();
+      }
+
       effectiveModel = model || this.pool.getDefaultModel() || null;
       if (!effectiveModel) {
         throw new Fault('NO_MODEL_CONFIGURED', 400, {
@@ -1862,8 +1982,6 @@ export class DirectAgentRuntime {
         : this.sandbox;
 
       contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
-      const aciStore = new ReversibleContextStore(this.store);
-      const aciLedger = new ContextEvidenceLedger();
       const aciResolved = this.#resolveAciTurnConfig(sessionId, aciProfile, aciOptions);
       const aciEngine = new ACIEngine({
         store: this.store,
@@ -1872,7 +1990,7 @@ export class DirectAgentRuntime {
         supervisor: this.contextSupervisor,
         maxTotalTokens: Math.min(200_000, contextWindow),
         contextWindow: Math.min(200_000, contextWindow),
-        watermarks: aciResolved.supervisorConfigOverride.epochWatermarks,
+        watermarks: aciResolved.engineWatermarks,
         dtocPolicy: aciResolved.dtocPolicy,
         dtocMinPromptTokens: aciResolved.dtocMinPromptTokens,
         ...(aciResolved.singleStepBudget !== undefined
@@ -1956,7 +2074,12 @@ export class DirectAgentRuntime {
           this.sessionRepo.capturePreMutationSnapshot(sessionId, turnId, rel, full),
         onFileChanged: (change) => {
           if (change?.path) turnModifiedFiles.add(String(change.path));
-          this.#emitPersisted(sessionId, turnId, 'file/changed', { turnId, sessionId, ...change });
+          this.#emitPersisted(
+            sessionId,
+            turnId,
+            'file/changed',
+            buildFileChangedEventData(sessionId, turnId, change),
+          );
         },
         onToolOutput: (chunk) => {
           this.#emitLiveDelta(sessionId, turnId, 'tool/output', { turnId, sessionId, ...chunk });
@@ -2087,6 +2210,7 @@ export class DirectAgentRuntime {
           ledger: aciLedger,
           supervisor: this.contextSupervisor,
           criticalFiles: evidenceContract?.requiredChangedFiles ?? [],
+          priorReadFiles: turnReadFiles ? [...turnReadFiles] : [],
           aciProfile: aciResolved.aciProfile,
           admissionEnabled: aciResolved.admissionEnabled,
           dtocEnabled: aciResolved.dtocEnabled,
@@ -2167,6 +2291,22 @@ export class DirectAgentRuntime {
           });
         },
         onToolResult: ({ tc, output, isError, durationMs }) => {
+          if (!isError && (tc?.name === 'read_file' || tc?.name === 'read_blob')) {
+            try {
+              const parsed =
+                typeof tc.arguments === 'string'
+                  ? JSON.parse(tc.arguments || '{}')
+                  : tc.arguments && typeof tc.arguments === 'object'
+                    ? tc.arguments
+                    : {};
+              const readPath = String(parsed.path ?? parsed.filePath ?? parsed.file_path ?? '').trim();
+              if (readPath && turnReadFiles instanceof Set) {
+                turnReadFiles.add(readPath);
+              }
+            } catch {
+              // ignore malformed tool arguments
+            }
+          }
           this.store.tx(() => {
             assertLeaseInTx(leaseGuard, { sessionId, turnId });
             this.store.db
@@ -2199,6 +2339,16 @@ export class DirectAgentRuntime {
       const finalAssistantText = loopResult.text || '';
       const finalVerdict = loopResult.verdict ?? null;
       const reasoningMetrics = loopResult.reasoningMetrics ?? null;
+      const budgetWatermarks = loopResult.budgetWatermarks ?? reasoningMetrics?.budgetWatermarks ?? null;
+      if (turnAciLedger) {
+        turnAciLedger.mergeFrom(aciLedger);
+      }
+      if (turnReadFiles instanceof Set && Array.isArray(reasoningMetrics?.filesRead)) {
+        for (const p of reasoningMetrics.filesRead) {
+          const clean = String(p ?? '').trim();
+          if (clean) turnReadFiles.add(clean);
+        }
+      }
       const evidenceCount =
         finalVerdict?.evidenceCount ??
         this.store.db
@@ -2371,6 +2521,7 @@ export class DirectAgentRuntime {
               evidenceCount: Number(evidenceCount || 0),
               durationMs,
               ...(reasoningMetrics ? { reasoningMetrics } : {}),
+              ...(budgetWatermarks ? { budgetWatermarks } : {}),
               ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
             },
             audit: false,
@@ -2392,6 +2543,7 @@ export class DirectAgentRuntime {
               code: errorCode,
               durationMs,
               ...(reasoningMetrics ? { reasoningMetrics } : {}),
+              ...(budgetWatermarks ? { budgetWatermarks } : {}),
             }),
           );
           safeIsolateSideEffect(() =>
@@ -2553,6 +2705,7 @@ export class DirectAgentRuntime {
             evidenceCount: Number(evidenceCount || 0),
             text: excerpt(finalAssistantText, 4000),
             ...(reasoningMetrics ? { reasoningMetrics } : {}),
+            ...(budgetWatermarks ? { budgetWatermarks } : {}),
             ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
           },
           audit: false,
@@ -2580,6 +2733,7 @@ export class DirectAgentRuntime {
             durationMs,
             evidenceCount: Number(evidenceCount || 0),
             ...(reasoningMetrics ? { reasoningMetrics } : {}),
+            ...(budgetWatermarks ? { budgetWatermarks } : {}),
             ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
           }),
         );
@@ -2681,9 +2835,24 @@ export class DirectAgentRuntime {
       }
 
       const catchReasoningMetrics = err?.reasoningMetrics ?? classified?.reasoningMetrics ?? null;
+      const catchBudgetWatermarks =
+        err?.budgetWatermarks ??
+        classified?.budgetWatermarks ??
+        catchReasoningMetrics?.budgetWatermarks ??
+        null;
+      if (turnAciLedger) {
+        turnAciLedger.mergeFrom(aciLedger);
+      }
+      if (turnReadFiles instanceof Set && Array.isArray(catchReasoningMetrics?.filesRead)) {
+        for (const p of catchReasoningMetrics.filesRead) {
+          const clean = String(p ?? '').trim();
+          if (clean) turnReadFiles.add(clean);
+        }
+      }
 
       // Fix D6 / D7 / P0-1: NEVER swallow LEASE_LOST before RecoveryWorker.#runJob sees it!
       if (isLeaseLostError(classified)) {
+        turnFencedOrTerminal = true;
         if (signal?.aborted && catchReasoningMetrics) {
           this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
         }
@@ -2703,6 +2872,7 @@ export class DirectAgentRuntime {
         throw classified;
       }
       if (!checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
+        turnFencedOrTerminal = true;
         if (signal?.aborted && catchReasoningMetrics) {
           this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
         }
@@ -2825,6 +2995,7 @@ export class DirectAgentRuntime {
                   cacheEligibleInputTokens: totalCacheEligible,
                   durationMs,
                   ...(catchReasoningMetrics ? { reasoningMetrics: catchReasoningMetrics } : {}),
+                  ...(catchBudgetWatermarks ? { budgetWatermarks: catchBudgetWatermarks } : {}),
                 }
               : {
                   turnId,
@@ -2840,6 +3011,7 @@ export class DirectAgentRuntime {
                   code: classified.code,
                   durationMs,
                   ...(catchReasoningMetrics ? { reasoningMetrics: catchReasoningMetrics } : {}),
+                  ...(catchBudgetWatermarks ? { budgetWatermarks: catchBudgetWatermarks } : {}),
                 },
             audit: false,
             at: finishedAt,
@@ -2930,9 +3102,23 @@ export class DirectAgentRuntime {
         }
       }
     } finally {
+      if (leaseRenewalTimer) {
+        clearInterval(leaseRenewalTimer);
+        leaseRenewalTimer = null;
+      }
       this.activeTurns.delete(turnId);
       if (this.activeSessionTurn.get(sessionId) === turnId) {
         this.activeSessionTurn.delete(sessionId);
+      }
+      try {
+        const turnFinalRow = this.store?.db?.isOpen
+          ? this.store.db.prepare('SELECT state FROM direct_turns WHERE id=?').get(turnId)
+          : null;
+        if (turnFencedOrTerminal || !turnFinalRow || ['completed', 'failed', 'cancelled'].includes(turnFinalRow.state)) {
+          this.turnAciStates.delete(turnId);
+        }
+      } catch {
+        // ignore cleanup read errors while DB is closing
       }
     }
   }

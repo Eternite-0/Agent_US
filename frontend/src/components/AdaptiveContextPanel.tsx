@@ -141,6 +141,18 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
     .map((w) => `${Math.round(w * 100)}%`)
     .join(' / ');
   const currentDtocMinTokens = config?.dtocMinPromptTokens ?? 24000;
+  const watermarks = status?.budgetWatermarks ?? null;
+  const circuitOpen = Boolean(
+    status?.supervisorCircuitOpen ?? status?.circuitOpen ?? watermarks?.supervisorCircuitOpen,
+  );
+  const circuitTimeoutSec =
+    Math.round((((config?.circuitTimeoutMs ?? config?.timeoutMs ?? 8000) || 8000) / 1000) * 10) / 10;
+  const formatDtocWatermarkValue = (val: number): string =>
+    val >= 0 && val <= 2 ? `${Math.round(val * 100)}%` : `${val.toLocaleString()} tok`;
+  const usedTok = watermarks?.usedTokens;
+  const maxTok = watermarks?.maxTokens;
+  const dtocWatermarkTok = watermarks?.dtocWatermark;
+  const postTestReserveActive = Boolean(watermarks?.postTestReserveActive);
   const parsedDtocMinDraft = Number(dtocMinDraft);
   const dtocMinDraftValid =
     Number.isInteger(parsedDtocMinDraft) && parsedDtocMinDraft >= 1000 && parsedDtocMinDraft <= 200000;
@@ -365,6 +377,40 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
             </div>
             <span className="codex-status-chip" style={{ fontFamily: 'var(--font-mono)' }}>
               {watermarkLabel} · 上限 {Math.round((config?.maxBudgetRatio ?? 0.72) * 100)}%
+            </span>
+          </div>
+
+          <div className="codex-settings-row">
+            <div className="codex-settings-row-info">
+              <span className="codex-settings-row-label">ACI 2.5 预算水位与完工保留金</span>
+              <span className="codex-settings-row-desc">
+                {usedTok !== undefined && maxTok !== undefined
+                  ? `活跃预算占用 ${usedTok.toLocaleString()} / ${maxTok.toLocaleString()} tokens`
+                  : '单步 DTOC 水位门限与验证后收尾保留金（防止长任务写完未交卷时提前耗尽上下文）'}
+                {dtocWatermarkTok !== undefined ? ` · 单步 DTOC 水位 ${formatDtocWatermarkValue(dtocWatermarkTok)}` : ''}
+              </span>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end' }}>
+              <span className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
+                {usedTok !== undefined && maxTok !== undefined
+                  ? `${usedTok.toLocaleString()} / ${maxTok.toLocaleString()}`
+                  : `单步水位 ${formatDtocWatermarkValue(dtocWatermarkTok ?? currentDtocMinTokens)}`}
+              </span>
+              <span className="codex-status-chip" data-tone={postTestReserveActive ? 'warning' : undefined}>
+                {postTestReserveActive ? '完工保留金已激活' : '完工保留就绪'}
+              </span>
+            </div>
+          </div>
+
+          <div className="codex-settings-row">
+            <div className="codex-settings-row-info">
+              <span className="codex-settings-row-label">Supervisor {circuitTimeoutSec}s 熔断器</span>
+              <span className="codex-settings-row-desc">
+                单次只读 Supervisor 超时超过 {circuitTimeoutSec}s 自动 Fail-Closed 并打开短时熔断，直接回退至确定性 ACI。
+              </span>
+            </div>
+            <span className="codex-status-chip" data-tone={circuitOpen ? 'warning' : 'success'}>
+              {circuitOpen ? `熔断已开启 · 回退确定性 (${circuitTimeoutSec}s)` : `正常闭合 (${circuitTimeoutSec}s)`}
             </span>
           </div>
 

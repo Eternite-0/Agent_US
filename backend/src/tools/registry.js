@@ -68,11 +68,10 @@ export function defineTool(spec) {
     ),
   });
 
-  return {
+  const def = {
     name: spec.name,
     description: String(spec.description ?? spec.name),
     parameters,
-    zodSchema,
     meta,
     isConcurrencySafe:
       typeof spec.isConcurrencySafe === 'function'
@@ -84,6 +83,20 @@ export function defineTool(spec) {
     },
     execute: spec.execute,
   };
+  const existingZodDesc = Object.getOwnPropertyDescriptor(spec, 'zodSchema');
+  const serializeZod =
+    spec.serializeZodSchema !== undefined
+      ? spec.serializeZodSchema !== false
+      : existingZodDesc
+        ? existingZodDesc.enumerable !== false
+        : true;
+  Object.defineProperty(def, 'zodSchema', {
+    value: zodSchema,
+    enumerable: serializeZod,
+    configurable: true,
+    writable: true,
+  });
+  return def;
 }
 
 /**

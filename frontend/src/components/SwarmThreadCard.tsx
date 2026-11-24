@@ -1,5 +1,6 @@
 import type { SwarmRunRecord } from '../types/backend';
 import { IconChevronRight } from './Icons';
+import { collectSwarmReviewerVerification } from '../api/client';
 import { summarizeSwarmRun } from '../utils/swarmCommand';
 import { swarmWorkerStatus } from '../utils/subagentProgress';
 import { LayeredWorkerStatusMark } from './SubagentProgress';
@@ -18,12 +19,25 @@ export function SwarmThreadCard({ run, onOpen }: { run?: SwarmRunRecord; onOpen?
   const progress = run && summarizeSwarmRun(run);
   const status = progress?.label ?? '等待同步';
   const nodes = progress && progress.total > 0 ? ` · ${progress.completed}/${progress.total} 个节点完成` : '';
+  const verification = collectSwarmReviewerVerification(run);
+  const gateBadge = verification
+    ? ` · ${verification.hardGatePassed ? '硬门禁通过' : '硬门禁拦截'} (${verification.diffFileCount} 文件)`
+    : '';
   const heading = (
     <>
       <LayeredWorkerStatusMark status={runMark(run?.status)} />
       <span className="codex-direct-activity-label">
         <span className="swarm-thread-title">Swarm 协作</span>
         <span className="swarm-thread-status tabular-nums" data-tone={progress?.tone}> · {status}{nodes}</span>
+        {verification && (
+          <span
+            className="swarm-thread-status tabular-nums"
+            data-tone={verification.hardGatePassed ? 'done' : 'error'}
+            title={`Git Diff: ${verification.verifiedGitDiff ? '已核验' : '未核验'} · 文件数: ${verification.diffFileCount} · 测试退出码: ${verification.verifiedTestExitCode ?? '无'}`}
+          >
+            {gateBadge}
+          </span>
+        )}
       </span>
       {onOpen && <IconChevronRight size={13} aria-hidden="true" className="codex-direct-chevron" />}
     </>
@@ -32,6 +46,6 @@ export function SwarmThreadCard({ run, onOpen }: { run?: SwarmRunRecord; onOpen?
   const running = progress?.tone === 'active';
   return onOpen
     ? <button type="button" className={className} data-running={running} onClick={onOpen}
-        title={`查看 Swarm 计划和节点 · ${status}${nodes}`}>{heading}</button>
+        title={`查看 Swarm 计划和节点 · ${status}${nodes}${gateBadge}`}>{heading}</button>
     : <div className={className} data-running={running}>{heading}</div>;
 }

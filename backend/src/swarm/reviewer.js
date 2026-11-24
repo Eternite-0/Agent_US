@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 export const REVIEWER_SCHEMA_VERSION = '1.0.0';
 export const MAX_REVIEWER_FORMAT_RETRIES = 2;
@@ -10,6 +13,21 @@ const MUTATING_TOOLS = new Set([
   'delete_file',
   'bash',
   'start_process',
+]);
+
+const CODE_MUTATING_TOOLS = new Set([
+  'write_file',
+  'edit_file',
+  'apply_patch',
+  'delete_file',
+]);
+
+const TEST_EXECUTION_TOOLS = new Set([
+  'bash',
+  'start_process',
+  'run_command',
+  'run_tests',
+  'test',
 ]);
 
 const VERDICT_MAP = new Map([
@@ -260,16 +278,411 @@ function hasExplicitNegativeVerdictSignal(text) {
   return false;
 }
 
+function claimsCodeMutation(text) {
+  const s = String(text ?? '');
+  if (!s.trim()) return false;
+  return /\b(?:implement(?:ed)?|fix(?:ed)?|patch(?:ed)?|edit(?:ed)?|modif(?:y|ied)|updat(?:e|ed)|refactor(?:ed)?|wrote|written|added|created|deleted|changed|diff|commit)\b|修复|修改|实现|重构|补丁/i.test(
+    s,
+  );
+}
+
+function claimsTestPass(text) {
+  const s = String(text ?? '');
+  if (!s.trim()) return false;
+  return /\b(?:tests?\s+(?:passed|pass|passing|succeeded|green)|exit\s*code\s*[:=]?\s*0|all\s+\d+\s+tests?\s+pass)\b|测试通过/i.test(
+    s,
+  );
+}
+
 /**
- * Validates a Reviewer turn output together with actual SQLite tool_receipts
- * and upstream evidence manifest to enforce schema compliance, read-only
- * behavior, mandatory artifact reads, and zero evidence tampering.
+ * Computes real workspace `git diff` file count and SHA-256 digest via hardened git
+ * (including staged, unstaged, and untracked files outside `.agent-us-handoff`).
+ */
+export function inspectWorkspaceGitDiff(workspaceRoot) {
+  if (!workspaceRoot || !existsSync(workspaceRoot)) {
+    return { isGitRepo: false, diffFileCount: 0, diffDigest: null, files: [] };
+  }
+  const cwd = resolve(workspaceRoot);
+  try {
+    const inside = execFileSync('git', ['-C', cwd, 'rev-parse', '--is-inside-work-tree'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 10000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (inside !== 'true') {
+      return { isGitRepo: false, diffFileCount: 0, diffDigest: null, files: [] };
+    }
+  } catch {
+    return { isGitRepo: false, diffFileCount: 0, diffDigest: null, files: [] };
+  }
+
+  const changedFiles = [];
+  const untrackedFiles = [];
+  const seen = new Set();
+  try {
+    const statusBuf = execFileSync('git', ['-C', cwd, 'status', '--porcelain=v1', '-z'], {
+      encoding: 'buffer',
+      windowsHide: true,
+      timeout: 10000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const tokens = statusBuf.toString('utf8').split('\0');
+    for (let i = 0; i < tokens.length; i += 1) {
+      const rec = tokens[i];
+      if (!rec || rec.length < 4) continue;
+      const xy = rec.slice(0, 2);
+      const pathA = rec.slice(3);
+      if (xy[0] === 'R' || xy[0] === 'C') {
+        i += 1;
+      }
+      const norm = pathA.replace(/\\/g, '/').replace(/^\/+/, '');
+      if (
+        !norm ||
+        norm === '.agent-us-handoff' ||
+        norm.startsWith('.agent-us-handoff/')
+      ) {
+        continue;
+      }
+      if (!seen.has(norm)) {
+        seen.add(norm);
+        changedFiles.push(norm);
+        if (xy === '??') untrackedFiles.push(norm);
+      }
+    }
+  } catch {
+    return { isGitRepo: true, diffFileCount: 0, diffDigest: null, files: [] };
+  }
+
+  if (changedFiles.length === 0) {
+    return { isGitRepo: true, diffFileCount: 0, diffDigest: null, files: [] };
+  }
+
+  let diffBuf = Buffer.alloc(0);
+  try {
+    diffBuf = execFileSync('git', ['-C', cwd, 'diff', '--binary', 'HEAD', '--', '.', ':(exclude).agent-us-handoff'], {
+      encoding: 'buffer',
+      windowsHide: true,
+      timeout: 10000,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  } catch {
+    try {
+      const unstaged = execFileSync('git', ['-C', cwd, 'diff', '--binary'], {
+        encoding: 'buffer',
+        windowsHide: true,
+        timeout: 10000,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      const staged = execFileSync('git', ['-C', cwd, 'diff', '--cached', '--binary'], {
+        encoding: 'buffer',
+        windowsHide: true,
+        timeout: 10000,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      diffBuf = Buffer.concat([staged, unstaged]);
+    } catch {
+      diffBuf = Buffer.alloc(0);
+    }
+  }
+
+  const hash = createHash('sha256');
+  hash.update(changedFiles.slice().sort().join('\n'));
+  hash.update('\n---\n');
+  hash.update(diffBuf);
+  for (const uf of untrackedFiles.slice().sort()) {
+    try {
+      const full = join(cwd, uf);
+      if (existsSync(full)) {
+        const bytes = readFileSync(full);
+        hash.update(`\n??:${uf}:${bytes.length}:`);
+        hash.update(bytes.subarray(0, 65536));
+      }
+    } catch {
+      hash.update(`\n??:${uf}`);
+    }
+  }
+
+  return {
+    isGitRepo: true,
+    diffFileCount: changedFiles.length,
+    diffDigest: hash.digest('hex'),
+    files: changedFiles,
+  };
+}
+
+export function inspectArtifactDiffEvidence(reviewerEvidence = null, artifactManager = null) {
+  const rawArtifacts = Array.isArray(reviewerEvidence?.artifacts) ? reviewerEvidence.artifacts : [];
+  if (rawArtifacts.length === 0) {
+    return { artifactDiffCount: 0, artifactDiffDigest: null, files: [], hasOpaqueStubArtifact: false };
+  }
+
+  const files = [];
+  const seen = new Set();
+  const patchChunks = [];
+  let explicitFileCount = 0;
+  let hasOpaqueStubArtifact = false;
+
+  for (const item of rawArtifacts) {
+    if (!item || item.verified === false) continue;
+    const loaded =
+      artifactManager?.getArtifact && (item.artifactId || item.id || item.uri)
+        ? artifactManager.getArtifact(item.artifactId || item.id || item.uri)
+        : null;
+    const art = loaded ?? item;
+    const entryList = Array.isArray(art.files) ? art.files : null;
+    if (entryList) {
+      const effectiveEntries = entryList.filter((e) => !e.overlaidDeleted && !e.overlaidReverted);
+      explicitFileCount = Math.max(explicitFileCount, effectiveEntries.length);
+      for (const e of effectiveEntries) {
+        if (e?.path && !seen.has(e.path)) {
+          seen.add(e.path);
+          files.push(e.path);
+        }
+      }
+      if (art.storagePath) {
+        const patchFile = join(art.storagePath, art.manifest?.patchFile || 'changes.patch');
+        if (existsSync(patchFile)) {
+          try {
+            const p = readFileSync(patchFile);
+            if (p.length > 0) patchChunks.push(p);
+          } catch {
+            // fallback to entry hashes below
+          }
+        }
+      }
+      if (patchChunks.length === 0 && effectiveEntries.length > 0) {
+        patchChunks.push(
+          Buffer.from(
+            effectiveEntries
+              .map((e) => `${e.changeType || 'modified'}:${e.path}:${e.sha256 || ''}:${e.mode || '100644'}`)
+              .join('\n'),
+            'utf8',
+          ),
+        );
+      }
+    } else if (Number.isFinite(Number(art.fileCount))) {
+      explicitFileCount += Number(art.fileCount);
+    } else if (art.bundleSha256) {
+      hasOpaqueStubArtifact = true;
+    }
+  }
+
+  const count = Math.max(files.length, explicitFileCount);
+  if (count === 0) {
+    return { artifactDiffCount: 0, artifactDiffDigest: null, files: [], hasOpaqueStubArtifact };
+  }
+
+  const hash = createHash('sha256');
+  hash.update(files.slice().sort().join('\n'));
+  for (const c of patchChunks) {
+    hash.update('\n');
+    hash.update(c);
+  }
+  return {
+    artifactDiffCount: count,
+    artifactDiffDigest: hash.digest('hex'),
+    files,
+    hasOpaqueStubArtifact: false,
+  };
+}
+
+export function inspectTestExecutionReceipts(reviewerEvidence = null) {
+  const verificationResults = Array.isArray(reviewerEvidence?.verificationResults)
+    ? reviewerEvidence.verificationResults
+    : [];
+  const receipts = Array.isArray(reviewerEvidence?.receipts) ? reviewerEvidence.receipts : [];
+
+  for (const vr of verificationResults) {
+    if (!vr || typeof vr !== 'object') continue;
+    const exitCode = vr.exitCode !== undefined && vr.exitCode !== null ? Number(vr.exitCode) : null;
+    if (vr.status === 'failed' || (exitCode !== null && exitCode !== 0)) {
+      return { hasTestReceipt: true, passed: false, verifiedTestExitCode: exitCode ?? 1 };
+    }
+  }
+
+  const shellReceipts = receipts.filter((r) => TEST_EXECUTION_TOOLS.has(String(r?.toolName ?? '')));
+  if (shellReceipts.length > 0) {
+    const latestByTurn = new Map();
+    for (const r of shellReceipts) {
+      const key = String(r.turnId ?? r.sessionId ?? '_default');
+      latestByTurn.set(key, r);
+    }
+    let anyPassedZero = false;
+    for (const r of latestByTurn.values()) {
+      const code = r.exitCode !== undefined && r.exitCode !== null ? Number(r.exitCode) : null;
+      if (r.status === 'failed' || (code !== null && code !== 0)) {
+        return { hasTestReceipt: true, passed: false, verifiedTestExitCode: code ?? 1 };
+      }
+      if (r.status === 'finished' && code === 0) {
+        anyPassedZero = true;
+      }
+    }
+    if (anyPassedZero) {
+      return { hasTestReceipt: true, passed: true, verifiedTestExitCode: 0 };
+    }
+  }
+
+  for (const vr of verificationResults) {
+    if (!vr || typeof vr !== 'object') continue;
+    const exitCode = vr.exitCode !== undefined && vr.exitCode !== null ? Number(vr.exitCode) : null;
+    if (vr.status === 'passed' && exitCode === 0) {
+      return { hasTestReceipt: true, passed: true, verifiedTestExitCode: 0 };
+    }
+  }
+
+  if (
+    reviewerEvidence &&
+    reviewerEvidence.testExitCode !== undefined &&
+    reviewerEvidence.testExitCode !== null
+  ) {
+    const code = Number(reviewerEvidence.testExitCode);
+    return { hasTestReceipt: true, passed: code === 0, verifiedTestExitCode: code };
+  }
+
+  return { hasTestReceipt: false, passed: false, verifiedTestExitCode: null };
+}
+
+/**
+ * Evaluates hard verification gates on real `git diff` (workspace or verified artifacts)
+ * and test execution receipt (`exitCode === 0`). Refuses/downgrades any synthetic/LLM `'pass'`
+ * verdict when claimed mutations have 0 real `git diff` or missing/non-zero test `exitCode`.
+ */
+export function evaluateReviewerHardGate({
+  parsedVerdict = null,
+  reviewerEvidence = null,
+  workspaceRoot = null,
+  artifactManager = null,
+  gitDiff = null,
+  claimedMutations = undefined,
+  requireGitDiff = undefined,
+  requireTestExecution = undefined,
+  hardGate = undefined,
+} = {}) {
+  const wsDiff =
+    gitDiff && typeof gitDiff === 'object'
+      ? {
+          isGitRepo: true,
+          diffFileCount: Math.max(0, Number(gitDiff.diffFileCount ?? 0)),
+          diffDigest: gitDiff.diffDigest ?? null,
+          files: Array.isArray(gitDiff.files) ? gitDiff.files : [],
+        }
+      : workspaceRoot
+        ? inspectWorkspaceGitDiff(workspaceRoot)
+        : null;
+
+  const artDiff = inspectArtifactDiffEvidence(reviewerEvidence, artifactManager);
+  const mergedFiles = [...new Set([...(wsDiff?.files ?? []), ...(artDiff?.files ?? [])])];
+  const diffFileCount = Math.max(
+    Number(wsDiff?.diffFileCount ?? 0),
+    Number(artDiff?.artifactDiffCount ?? 0),
+    mergedFiles.length,
+  );
+  const diffDigest =
+    diffFileCount > 0
+      ? wsDiff?.diffDigest && artDiff?.artifactDiffDigest
+        ? createHash('sha256')
+            .update(`${wsDiff.diffDigest}:${artDiff.artifactDiffDigest}`)
+            .digest('hex')
+        : wsDiff?.diffDigest ||
+          artDiff?.artifactDiffDigest ||
+          createHash('sha256').update(mergedFiles.slice().sort().join('\n')).digest('hex')
+      : null;
+  const verifiedGitDiff = diffFileCount > 0 && Boolean(diffDigest);
+
+  const testInfo = inspectTestExecutionReceipts(reviewerEvidence);
+  const verifiedTestExitCode = testInfo.verifiedTestExitCode;
+
+  const hasUpstreamCodeReceipt = (reviewerEvidence?.receipts ?? []).some((r) =>
+    CODE_MUTATING_TOOLS.has(String(r?.toolName ?? '')),
+  );
+  const hasMutatingSourceNode = (reviewerEvidence?.sourceNodes ?? []).some(
+    (n) => n?.taskType === 'implementation' || n?.isolationMode === 'worktree',
+  );
+  const hasArtifactClaim =
+    (reviewerEvidence?.artifacts?.length ?? 0) > 0 ||
+    (parsedVerdict?.checkedArtifacts?.length ?? 0) > 0;
+  const summaryClaimsMutation = claimsCodeMutation(parsedVerdict?.summary);
+  const isPureOpaqueUnitStub =
+    hardGate !== true &&
+    !workspaceRoot &&
+    !gitDiff &&
+    artDiff.hasOpaqueStubArtifact &&
+    diffFileCount === 0;
+
+  const effRequireGitDiff =
+    requireGitDiff !== undefined
+      ? Boolean(requireGitDiff)
+      : claimedMutations !== undefined
+        ? Boolean(claimedMutations)
+        : !isPureOpaqueUnitStub &&
+          Boolean(
+            hardGate === true ||
+              workspaceRoot ||
+              gitDiff ||
+              hasUpstreamCodeReceipt ||
+              hasMutatingSourceNode ||
+              hasArtifactClaim ||
+              summaryClaimsMutation,
+          );
+
+  const effRequireTestExecution =
+    requireTestExecution !== undefined
+      ? Boolean(requireTestExecution)
+      : Boolean(
+          hardGate === true ||
+            workspaceRoot != null ||
+            gitDiff != null ||
+            testInfo.hasTestReceipt ||
+            claimsTestPass(parsedVerdict?.summary),
+        );
+
+  const reasons = [];
+  if (effRequireGitDiff && !verifiedGitDiff) {
+    reasons.push('MISSING_REAL_GIT_DIFF');
+  }
+  if (testInfo.hasTestReceipt && !testInfo.passed) {
+    reasons.push(`TEST_EXIT_CODE_FAILED:${verifiedTestExitCode}`);
+  } else if (effRequireTestExecution && (!testInfo.hasTestReceipt || verifiedTestExitCode !== 0)) {
+    reasons.push('MISSING_VERIFIED_TEST_EXIT_CODE');
+  }
+
+  const rawVerdict = parsedVerdict?.verdict ?? null;
+  const hardGatePassed = reasons.length === 0;
+  const downgraded = rawVerdict === 'pass' && !hardGatePassed;
+  const finalVerdict = downgraded ? 'fail' : (rawVerdict ?? (hardGatePassed ? 'pass' : 'fail'));
+
+  return {
+    verifiedGitDiff,
+    diffFileCount,
+    diffDigest,
+    verifiedTestExitCode,
+    hardGatePassed,
+    verdict: finalVerdict,
+    reasons,
+    downgraded,
+    originalVerdict: rawVerdict,
+  };
+}
+
+/**
+ * Validates a Reviewer turn output together with actual SQLite tool_receipts,
+ * upstream evidence manifest, real git diff, and test execution receipts to enforce
+ * schema compliance, read-only behavior, mandatory artifact reads, zero evidence tampering,
+ * and hard verification gates.
  */
 export function validateReviewerExecution({
   rawText,
   reviewerEvidence = null,
   toolReceipts = [],
   originalRawText = null,
+  workspaceRoot = null,
+  artifactManager = null,
+  gitDiff = null,
+  claimedMutations = undefined,
+  requireGitDiff = undefined,
+  requireTestExecution = undefined,
+  hardGate = undefined,
 } = {}) {
   const receipts = Array.isArray(toolReceipts) ? toolReceipts : [];
   const writeViolations = receipts.filter(
@@ -373,16 +786,54 @@ export function validateReviewerExecution({
     }
   }
 
+  const reviewerVerification = evaluateReviewerHardGate({
+    parsedVerdict: parsed.normalized,
+    reviewerEvidence,
+    workspaceRoot,
+    artifactManager,
+    gitDiff,
+    claimedMutations,
+    requireGitDiff,
+    requireTestExecution,
+    hardGate,
+  });
+
+  if (parsed.status === 'pass' && !reviewerVerification.hardGatePassed) {
+    const downgradedVerdict = {
+      ...parsed.normalized,
+      verdict: reviewerVerification.verdict,
+      decision: 'rejected',
+      downgradedFrom: 'pass',
+      reviewerVerification,
+    };
+    return {
+      valid: false,
+      code: 'REVIEWER_HARD_GATE_FAILED',
+      status: reviewerVerification.verdict,
+      verdict: downgradedVerdict,
+      rawJsonText: JSON.stringify(downgradedVerdict),
+      errors: reviewerVerification.reasons,
+      readArtifactCount: readArtifactReceipts.length,
+      writeViolationCount: 0,
+      evidenceDigest: expectedDigest,
+      reviewerVerification,
+    };
+  }
+
   return {
     valid: true,
     code: null,
     status: parsed.status,
-    verdict: parsed.normalized,
+    verdict: {
+      ...parsed.normalized,
+      reviewerVerification,
+    },
     rawJsonText: parsed.rawJsonText,
     errors: [],
     readArtifactCount: readArtifactReceipts.length,
     writeViolationCount: 0,
     evidenceDigest: expectedDigest,
+    reviewerVerification,
   };
 }
 

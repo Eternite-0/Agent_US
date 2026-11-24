@@ -134,6 +134,7 @@ export function extractMutatedFilesFromToolCall(toolName, rawArgs, workspaceRoot
       const lines = patchText.replace(/\r\n/g, '\n').split('\n');
       for (const line of lines) {
         const trimmed = line.trim();
+        let matchedCodex = false;
         for (const prefix of [
           '*** Add File: ',
           '*** Update File: ',
@@ -142,6 +143,16 @@ export function extractMutatedFilesFromToolCall(toolName, rawArgs, workspaceRoot
         ]) {
           if (trimmed.startsWith(prefix)) {
             addPath(trimmed.slice(prefix.length));
+            matchedCodex = true;
+          }
+        }
+        if (!matchedCodex) {
+          const uniMatch = /^(?:\+\+\+|---)\s+(?:a\/|b\/)?(.+?)(?:\t.*)?$/.exec(trimmed);
+          if (uniMatch) {
+            const candidate = uniMatch[1].trim();
+            if (candidate && candidate !== '/dev/null' && candidate !== 'dev/null') {
+              addPath(candidate);
+            }
           }
         }
       }
@@ -451,6 +462,7 @@ export class ExecutionReasoningTracker {
     this.filesMutated = [];
     this._filesMutatedSet = new Set();
     this._mutatedSrcSet = new Set();
+    this._srcMutationSeqByPath = new Map();
     this._mutatedDocSet = new Set();
     this._mutatedSelfTestSet = new Set();
     this._mutatedBaselineTestSet = new Set();
@@ -543,10 +555,65 @@ export class ExecutionReasoningTracker {
       epochTransitions: 0,
       ledger: null,
     };
+    this._budgetWatermarks = null;
   }
 
   get hasUnverifiedMutationsAfterLastPass() {
     return this._lastCodeMutationSeq > this._lastPassingVerificationSeq;
+  }
+
+  get verificationCount() {
+    return this.verifications.length;
+  }
+
+  get lastRunTestsPassed() {
+    return this.verifications.length > 0 && this.verifications.at(-1)?.passed === true;
+  }
+
+  get unverifiedSrcMutations() {
+    let count = 0;
+    for (const seq of this._srcMutationSeqByPath.values()) {
+      if (seq > this._lastPassingVerificationSeq) count += 1;
+    }
+    return count;
+  }
+
+  seedReadFiles(paths = []) {
+    for (const rawPath of paths ?? []) {
+      const normPath = normalizeReasoningPath(rawPath, this.workspaceRoot);
+      if (!normPath) continue;
+      if (!this._filesReadSet.has(normPath)) {
+        this._filesReadSet.add(normPath);
+        this.filesRead.push(normPath);
+      }
+      if (this._firstCodeMutationSeq === -1 && !this.rootCauseFilesReadBeforeEdit.includes(normPath)) {
+        this.rootCauseFilesReadBeforeEdit.push(normPath);
+      }
+    }
+  }
+
+  updateBudgetWatermarks(watermarks = null) {
+    if (!watermarks || typeof watermarks !== 'object') {
+      this._budgetWatermarks = null;
+      return;
+    }
+    this._budgetWatermarks = {
+      usedTokens: Math.max(0, Math.trunc(Number(watermarks.usedTokens ?? 0))),
+      maxTokens:
+        watermarks.maxTokens != null && Number.isFinite(Number(watermarks.maxTokens))
+          ? Math.max(0, Math.trunc(Number(watermarks.maxTokens)))
+          : null,
+      ratio: Number.isFinite(Number(watermarks.ratio))
+        ? Number(Math.max(0, Number(watermarks.ratio)).toFixed(4))
+        : 0,
+      reserveTokens: Math.max(0, Math.trunc(Number(watermarks.reserveTokens ?? 0))),
+      postTestReserveActive: Boolean(watermarks.postTestReserveActive),
+      dtocWatermark:
+        watermarks.dtocWatermark != null && Number.isFinite(Number(watermarks.dtocWatermark))
+          ? Number(Math.max(0, Number(watermarks.dtocWatermark)).toFixed(4))
+          : 0,
+      supervisorCircuitOpen: Boolean(watermarks.supervisorCircuitOpen),
+    };
   }
 
   updateAciMetrics(patch = null) {
@@ -763,10 +830,14 @@ export class ExecutionReasoningTracker {
       receipt?.errorCode === 'APPROVAL_DENIED' ||
       receipt?.errorCode === 'POLICY_DENIED' ||
       /^(?:安全策略拦截：|用户拒绝了\s+.+\s+操作$|审批(?:超时|已被撤销)，拒绝执行\s+|\[(?:APPROVAL_DENIED|POLICY_DENIED)\])/.test(trimmedOut);
+    const isRunDiagFail =
+      toolName === 'run_diagnostics' &&
+      (/\[run_diagnostics\s+[^\]]*\bok=false\b/i.test(trimmedOut) || /"ok"\s*:\s*false\b/.test(trimmedOut));
     const effectiveIsError =
       Boolean(isError) ||
       isPolicyRejection ||
       status === 'failed' ||
+      isRunDiagFail ||
       (typeof exitCode === 'number' && exitCode !== 0);
 
     // Reset identical-idle assistant tracker when an actual tool runs
@@ -871,7 +942,10 @@ export class ExecutionReasoningTracker {
         if (kind === 'doc') this._mutatedDocSet.add(f);
         else if (kind === 'self_test') this._mutatedSelfTestSet.add(f);
         else if (kind === 'baseline_test') this._mutatedBaselineTestSet.add(f);
-        else this._mutatedSrcSet.add(f);
+        else {
+          this._mutatedSrcSet.add(f);
+          this._srcMutationSeqByPath.set(f, seq);
+        }
 
         if (kind !== 'doc') {
           touchesNonDoc = true;
@@ -895,11 +969,19 @@ export class ExecutionReasoningTracker {
       }
     }
 
-    // 3. Track verification commands (bash / start_process)
+    // 3. Track verification commands (bash / start_process / run_diagnostics tests)
     let verificationRecord = null;
     const cmd = typeof parsedArgs.command === 'string' ? parsedArgs.command.trim() : '';
     const isBashLike = toolName === 'bash' || toolName === 'start_process';
-    const isVerifCmd = isBashLike && isVerificationCommand(cmd);
+    const isRunDiagnosticsVerif =
+      toolName === 'run_diagnostics' &&
+      (parsedArgs.kind === 'test' ||
+        ((!parsedArgs.kind || parsedArgs.kind === 'auto') &&
+          /\btest:\d+\s+files\s+\((?:pass|fail)\)/i.test(trimmedOut)));
+    const isVerifCmd = (isBashLike && isVerificationCommand(cmd)) || isRunDiagnosticsVerif;
+    const verifCmdLabel = isRunDiagnosticsVerif
+      ? `run_diagnostics:${parsedArgs.kind || 'auto'}`
+      : cmd;
     const isTestFailHint = isBashLike && effectiveIsError && TEST_BIN_FAIL_RE.test(cmd);
 
     if (isVerifCmd && !isPolicyRejection) {
@@ -908,7 +990,7 @@ export class ExecutionReasoningTracker {
         step,
         seq,
         callId: tc?.id ?? receipt?.callId ?? null,
-        command: cmd,
+        command: verifCmdLabel,
         cwd: normalizeReasoningPath(parsedArgs.cwd || '.', this.workspaceRoot) || '.',
         passed,
         exitCode: exitCode ?? (passed ? 0 : 1),
@@ -932,12 +1014,12 @@ export class ExecutionReasoningTracker {
           this.rootCauseLedger.resolvedSignatures = [...this.rootCauseLedger.preEditFailureSignatures];
           this.rootCauseLedger.rootCause = {
             suspectedFiles: [...this.rootCauseFilesReadBeforeEdit],
-            verifiedCommand: cmd,
+            verifiedCommand: verifCmdLabel,
             resolvedPreEditFailures: this.rootCauseLedger.resolvedSignatures.length,
           };
         }
       } else {
-        this.#recordVerificationFailure({ fingerprint, command: cmd, step, seq });
+        this.#recordVerificationFailure({ fingerprint, command: verifCmdLabel, step, seq });
       }
     } else if (isTestFailHint && !isPolicyRejection) {
       this.#recordVerificationFailure({ fingerprint, command: cmd, step, seq });
@@ -953,7 +1035,7 @@ export class ExecutionReasoningTracker {
       const priorEdit = this._lastEditPendingVerification;
       const hypothesisSummary =
         (isVerifCmd || isTestFailHint) && priorEdit
-          ? `Edited ${priorEdit.files.join(', ') || priorEdit.toolName}, then verification (${cmd}) failed with ${fingerprint.summary}`
+          ? `Edited ${priorEdit.files.join(', ') || priorEdit.toolName}, then verification (${verifCmdLabel}) failed with ${fingerprint.summary}`
           : `${toolName}(${summarizeArgsCompact(toolName, parsedArgs, this.workspaceRoot)}) failed with ${fingerprint.summary}`;
       this.falsifiedAttempts.push({
         seq,
@@ -1315,6 +1397,7 @@ export class ExecutionReasoningTracker {
       stuckDetections: this.stuckDetections.map((d) => ({ ...d })),
       repairRounds: this._repairRounds,
       aciMetrics: structuredClone(this._aciMetrics),
+      budgetWatermarks: this._budgetWatermarks ? { ...this._budgetWatermarks } : null,
     };
   }
 
@@ -1407,6 +1490,7 @@ export class ExecutionReasoningTracker {
       circuitBroken: stopReason === 'thrashing_circuit_break',
       latestVerificationPassed: latestVerification ? latestVerification.passed : null,
       aciMetrics: structuredClone(this._aciMetrics),
+      budgetWatermarks: this._budgetWatermarks ? { ...this._budgetWatermarks } : null,
     };
   }
 }

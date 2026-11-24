@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -6,6 +6,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -100,14 +101,146 @@ function sortArtifactsTopologically(artifacts, dependenciesByNodeKey = null) {
   return result;
 }
 
+export function normalizeArtifactFileMode(mode) {
+  if (mode === 0o755 || mode === '0755' || mode === '755' || mode === '100755') return '100755';
+  if (mode === 0o120000 || mode === '120000') return '120000';
+  return '100644';
+}
+
+export function entryPosixMode(entry) {
+  const norm = normalizeArtifactFileMode(entry?.mode ?? (entry?.executable ? '100755' : entry?.posixMode));
+  if (norm === '100755') return 0o755;
+  if (norm === '120000') return 0o120000;
+  return 0o644;
+}
+
+export function isExecutableEntry(entry) {
+  return (
+    entry?.mode === '100755' ||
+    entry?.posixMode === 0o755 ||
+    entry?.executable === true
+  );
+}
+
 function isIdenticalOverlayEntry(a, b) {
   if (!a || !b) return false;
   return (
     a.changeType === b.changeType &&
     (a.sha256 ?? null) === (b.sha256 ?? null) &&
-    (a.mode ?? '100644') === (b.mode ?? '100644') &&
+    normalizeArtifactFileMode(a.mode) === normalizeArtifactFileMode(b.mode) &&
     (a.previousPath ?? null) === (b.previousPath ?? null)
   );
+}
+
+function mergeFileModesThreeWay({ currentMode, baseMode = null, incomingMode }) {
+  const cur = normalizeArtifactFileMode(currentMode);
+  const inc = normalizeArtifactFileMode(incomingMode);
+  const base = baseMode ? normalizeArtifactFileMode(baseMode) : null;
+  if (cur === inc) return { ok: true, mode: inc };
+  if (base && cur === base) return { ok: true, mode: inc };
+  if (base && inc === base) return { ok: true, mode: cur };
+  if (cur === '100755' || inc === '100755') {
+    if (!base) return { ok: false, reason: 'mode_conflict', mode: cur };
+  }
+  return { ok: false, reason: 'mode_conflict', mode: cur };
+}
+
+/**
+ * True Git 3-way merge (`git merge-file -p`) using base snapshot, current working copy,
+ * and incoming artifact blob. Never mutates target workspace on conflict.
+ */
+export function mergeFileThreeWay({
+  currentBuf,
+  baseBuf,
+  incomingBuf,
+  labelCurrent = 'current',
+  labelBase = 'base',
+  labelIncoming = 'incoming',
+} = {}) {
+  const cur = Buffer.isBuffer(currentBuf) ? currentBuf : Buffer.from(String(currentBuf ?? ''), 'utf8');
+  const base = Buffer.isBuffer(baseBuf) ? baseBuf : Buffer.from(String(baseBuf ?? ''), 'utf8');
+  const inc = Buffer.isBuffer(incomingBuf) ? incomingBuf : Buffer.from(String(incomingBuf ?? ''), 'utf8');
+
+  if (cur.equals(inc)) {
+    return { ok: true, mergedBuffer: cur, conflictCount: 0, conflictPreview: null };
+  }
+  if (cur.equals(base)) {
+    return { ok: true, mergedBuffer: inc, conflictCount: 0, conflictPreview: null };
+  }
+  if (inc.equals(base)) {
+    return { ok: true, mergedBuffer: cur, conflictCount: 0, conflictPreview: null };
+  }
+  if (isBinaryBuffer(cur) || isBinaryBuffer(base) || isBinaryBuffer(inc)) {
+    return { ok: false, binaryConflict: true, conflictCount: 1, mergedBuffer: null, conflictPreview: null };
+  }
+
+  const runMerge = (cBuf, bBuf, iBuf) => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'agent-us-merge3-'));
+    try {
+      const curPath = join(tmpDir, 'current');
+      const basePath = join(tmpDir, 'base');
+      const incPath = join(tmpDir, 'incoming');
+      writeFileSync(curPath, cBuf);
+      writeFileSync(basePath, bBuf);
+      writeFileSync(incPath, iBuf);
+      const merged = execFileSync(
+        'git',
+        [
+          'merge-file',
+          '-p',
+          '-L',
+          String(labelCurrent || 'current'),
+          '-L',
+          String(labelBase || 'base'),
+          '-L',
+          String(labelIncoming || 'incoming'),
+          curPath,
+          basePath,
+          incPath,
+        ],
+        {
+          encoding: 'buffer',
+          windowsHide: true,
+          timeout: 15000,
+          maxBuffer: 32 * 1024 * 1024,
+        },
+      );
+      return { ok: true, mergedBuffer: merged, conflictCount: 0, conflictPreview: null };
+    } catch (err) {
+      const status = Number(err?.status ?? -1);
+      if (status > 0 && status <= 127) {
+        const preview = Buffer.isBuffer(err?.stdout)
+          ? err.stdout.toString('utf8').slice(0, 2000)
+          : String(err?.stdout ?? '').slice(0, 2000);
+        return {
+          ok: false,
+          conflictCount: status,
+          mergedBuffer: null,
+          conflictPreview: preview || null,
+        };
+      }
+      throw err;
+    } finally {
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        // ignore temp cleanup failure
+      }
+    }
+  };
+
+  const direct = runMerge(cur, base, inc);
+  if (direct.ok) return direct;
+
+  // Retry LF-normalized merge if CRLF vs LF line endings caused a spurious full-file conflict
+  const curLf = normalizeLineEndingsToLf(cur);
+  const baseLf = normalizeLineEndingsToLf(base);
+  const incLf = normalizeLineEndingsToLf(inc);
+  if (curLf !== cur || baseLf !== base || incLf !== inc) {
+    const lfAttempt = runMerge(curLf, baseLf, incLf);
+    if (lfAttempt.ok) return lfAttempt;
+  }
+  return direct;
 }
 
 function parseJsonSafe(str, fallback) {
@@ -406,12 +539,14 @@ export class SwarmArtifactManager {
         const safeRunDir = String(runId).replace(/[^a-zA-Z0-9._-]/g, '_');
         const artifactDir = join(this.storageRoot, safeRunDir, artifactId);
         const filesDir = join(artifactDir, 'files');
+        const baseDir = join(artifactDir, 'base');
         const tmpIndex = join(tmpdir(), `agent-us-art-idx-${artifactId}`);
 
         let committed = false;
         try {
           this.#ensureStorageRoot();
           mkdirSync(filesDir, { recursive: true });
+          mkdirSync(baseDir, { recursive: true });
 
           const resolvedBaseCommit =
             baseCommit ||
@@ -548,6 +683,7 @@ export class SwarmArtifactManager {
             if (normPrev) seenRawPaths.add(normPrev);
 
             let baseSha256 = null;
+            let baseFile = null;
             if (item.oldHash && !/^0+$/.test(item.oldHash)) {
               try {
                 const baseBlob = await runGitRaw(
@@ -556,20 +692,30 @@ export class SwarmArtifactManager {
                   { encoding: 'buffer' },
                 );
                 baseSha256 = sha256Buffer(baseBlob);
+                const baseDst = resolveInsideDir(baseDir, normPath);
+                mkdirSync(dirname(baseDst.full), { recursive: true });
+                writeFileSync(baseDst.full, baseBlob);
+                baseFile = `base/${normPath}`;
               } catch {
                 baseSha256 = null;
+                baseFile = null;
               }
             }
 
             if (item.changeType === 'deleted') {
+              const delMode = normalizeArtifactFileMode(item.oldMode || '100644');
               const delEntry = {
                 path: normPath,
                 changeType: 'deleted',
                 previousPath: null,
                 binary: false,
-                mode: item.oldMode || '100644',
+                mode: delMode,
+                oldMode: delMode,
+                posixMode: entryPosixMode({ mode: delMode }),
+                executable: delMode === '100755',
                 size: 0,
                 baseSha256,
+                baseFile,
                 sha256: null,
                 contentFile: null,
               };
@@ -622,6 +768,18 @@ export class SwarmArtifactManager {
               }
             }
 
+            const overlaidPrev = overlaidEntriesMap?.[normPath];
+            if (
+              process.platform === 'win32' &&
+              !isSymlink &&
+              effectiveMode === '100644' &&
+              overlaidPrev?.mode === '100755' &&
+              !explicitNoExecPaths.includes(normPath)
+            ) {
+              effectiveMode = '100755';
+            }
+            effectiveMode = normalizeArtifactFileMode(effectiveMode);
+            const oldModeNorm = item.oldMode ? normalizeArtifactFileMode(item.oldMode) : '100644';
             const contentSha = sha256Buffer(contentBuf);
             const candidateEntry = {
               path: normPath,
@@ -629,13 +787,16 @@ export class SwarmArtifactManager {
               previousPath: normPrev,
               binary,
               mode: effectiveMode,
+              oldMode: oldModeNorm,
+              posixMode: entryPosixMode({ mode: effectiveMode }),
+              executable: effectiveMode === '100755',
               size: contentBuf.length,
               baseSha256,
+              baseFile,
               sha256: contentSha,
               contentFile: `files/${normPath}`,
             };
 
-            const overlaidPrev = overlaidEntriesMap?.[normPath];
             if (overlaidPrev && isIdenticalOverlayEntry(overlaidPrev, candidateEntry)) {
               skippedOverlaidCount++;
               continue;
@@ -1013,9 +1174,9 @@ export class SwarmArtifactManager {
         symlinkSync(linkTarget, target.full);
       } else {
         writeFileSync(target.full, readRes.buffer);
-        if (process.platform !== 'win32' && entry.mode === '100755') {
+        if (process.platform !== 'win32') {
           try {
-            chmodSync(target.full, 0o755);
+            chmodSync(target.full, isExecutableEntry(entry) ? 0o755 : 0o644);
           } catch {
             // ignore
           }
@@ -1310,6 +1471,44 @@ export class SwarmArtifactManager {
     return lines.join('\n');
   }
 
+  #readArtifactBaseBuffer(artifact, entry) {
+    if (!entry) return null;
+    if (entry.changeType === 'added' && !entry.baseSha256) {
+      return Buffer.alloc(0);
+    }
+    if (entry.baseFile && artifact?.storagePath) {
+      try {
+        const basePath = resolveInsideDir(artifact.storagePath, entry.baseFile).full;
+        if (existsSync(basePath)) {
+          const buf = readFileSync(basePath);
+          if (!entry.baseSha256 || matchesBaseContent(buf, entry.baseSha256, Boolean(entry.binary))) {
+            return buf;
+          }
+        }
+      } catch {
+        // fall through to git show fallback
+      }
+    }
+    if (artifact?.baseCommit && artifact?.workspaceRoot && existsSync(join(artifact.workspaceRoot, '.git'))) {
+      const lookupPath = entry.previousPath || entry.path;
+      try {
+        const buf = execFileSync('git', ['show', `${artifact.baseCommit}:${lookupPath}`], {
+          cwd: artifact.workspaceRoot,
+          encoding: 'buffer',
+          windowsHide: true,
+          timeout: 10000,
+          maxBuffer: 32 * 1024 * 1024,
+        });
+        if (!entry.baseSha256 || matchesBaseContent(buf, entry.baseSha256, Boolean(entry.binary))) {
+          return buf;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
   #evaluateEntryAgainstTarget(targetRoot, artifact, entry) {
     const target =
       entry.mode === '120000'
@@ -1324,15 +1523,32 @@ export class SwarmArtifactManager {
       if (existsSync(target.full)) {
         const parentBuf = readFileSync(target.full);
         const parentSha = sha256Buffer(parentBuf);
-        if (parentSha === entry.sha256) {
+        const modeMatches =
+          process.platform === 'win32' ||
+          (((statSync(target.full).mode & 0o111) !== 0) === isExecutableEntry(entry));
+        if (parentSha === entry.sha256 && modeMatches) {
           return { kind: 'skip', skip: { path: entry.path, reason: 'already_identical', artifactId: artifact.id, nodeKey: artifact.nodeKey } };
         }
+        const incomingRes = this.readArtifactFile(artifact.id, entry.path);
+        const mergePreview =
+          entry.mode !== '120000' && !entry.binary && !isBinaryBuffer(parentBuf)
+            ? mergeFileThreeWay({
+                currentBuf: parentBuf,
+                baseBuf: Buffer.alloc(0),
+                incomingBuf: incomingRes.buffer,
+                labelCurrent: 'current',
+                labelBase: 'base',
+                labelIncoming: artifact.nodeKey || 'incoming',
+              })
+            : { ok: false, conflictPreview: null };
         return {
           kind: 'conflict',
           conflict: {
             path: entry.path,
             changeType: entry.changeType,
             reason: 'target_exists_diverged',
+            mergeConflict: true,
+            conflictMarkers: mergePreview.conflictPreview ?? null,
             baseSha256: null,
             parentSha256: parentSha,
             artifactSha256: entry.sha256,
@@ -1368,9 +1584,10 @@ export class SwarmArtifactManager {
       }
       const parentBuf = readFileSync(target.full);
       const parentSha = sha256Buffer(parentBuf);
+      const parentIsExec = process.platform !== 'win32' ? (statSync(target.full).mode & 0o111) !== 0 : null;
       const modeMatches =
         process.platform === 'win32' ||
-        (((statSync(target.full).mode & 0o111) !== 0) === (entry.mode === '100755'));
+        (parentIsExec === isExecutableEntry(entry));
       if (parentSha === entry.sha256 && modeMatches) {
         return { kind: 'skip', skip: { path: entry.path, reason: 'already_applied', artifactId: artifact.id, nodeKey: artifact.nodeKey } };
       }
@@ -1378,12 +1595,76 @@ export class SwarmArtifactManager {
         entry.baseSha256 &&
         !matchesBaseContent(parentBuf, entry.baseSha256, Boolean(entry.binary))
       ) {
+        const baseBuf = this.#readArtifactBaseBuffer(artifact, entry);
+        const incomingRes = this.readArtifactFile(artifact.id, entry.path);
+        if (
+          baseBuf !== null &&
+          entry.mode !== '120000' &&
+          !entry.binary &&
+          !isBinaryBuffer(parentBuf)
+        ) {
+          const mergeRes = mergeFileThreeWay({
+            currentBuf: parentBuf,
+            baseBuf,
+            incomingBuf: incomingRes.buffer,
+            labelCurrent: 'current',
+            labelBase: 'base',
+            labelIncoming: artifact.nodeKey || 'incoming',
+          });
+          const curMode =
+            process.platform === 'win32'
+              ? (entry.oldMode || '100644')
+              : (parentIsExec ? '100755' : '100644');
+          const modeMerge = mergeFileModesThreeWay({
+            currentMode: curMode,
+            baseMode: entry.oldMode || '100644',
+            incomingMode: entry.mode || '100644',
+          });
+          if (mergeRes.ok && modeMerge.ok) {
+            return {
+              kind: 'plan',
+              op: {
+                artifactId: artifact.id,
+                nodeKey: artifact.nodeKey,
+                entry: {
+                  ...entry,
+                  mode: modeMerge.mode,
+                  posixMode: entryPosixMode({ mode: modeMerge.mode }),
+                  executable: modeMerge.mode === '100755',
+                },
+                target,
+                mergedBuffer: mergeRes.mergedBuffer,
+                threeWayMerged: true,
+              },
+            };
+          }
+          return {
+            kind: 'conflict',
+            conflict: {
+              path: entry.path,
+              changeType: entry.changeType,
+              reason: 'parent_modified_concurrently',
+              mergeConflict: true,
+              conflictMarkers: mergeRes.conflictPreview ?? null,
+              baseSha256: entry.baseSha256,
+              parentSha256: parentSha,
+              artifactSha256: entry.sha256,
+              parentPreserved: true,
+              artifactPreserved: true,
+              artifactFilePath,
+              nodeKeys: [artifact.nodeKey],
+              artifactIds: [artifact.id],
+            },
+          };
+        }
         return {
           kind: 'conflict',
           conflict: {
             path: entry.path,
             changeType: entry.changeType,
             reason: 'parent_modified_concurrently',
+            mergeConflict: true,
+            conflictMarkers: null,
             baseSha256: entry.baseSha256,
             parentSha256: parentSha,
             artifactSha256: entry.sha256,
@@ -1493,7 +1774,7 @@ export class SwarmArtifactManager {
   }
 
   #applySinglePreparedOp(op, mutatedPaths = null) {
-    const { entry, target, prevTarget, caseOnlyRename, readRes } = op;
+    const { entry, target, prevTarget, caseOnlyRename, readRes, mergedBuffer = null, threeWayMerged = false } = op;
     if (entry.changeType === 'deleted') {
       if (existsSync(target.full)) {
         mutatedPaths?.push(target.full);
@@ -1509,8 +1790,11 @@ export class SwarmArtifactManager {
     }
     mkdirSync(dirname(target.full), { recursive: true });
     mutatedPaths?.push(target.full);
-    if (entry.mode === '120000') {
-      const linkTarget = readRes.buffer.toString('utf8');
+    const outBuffer = mergedBuffer ?? readRes.buffer;
+    const isExec = isExecutableEntry(entry);
+    const normMode = normalizeArtifactFileMode(entry.mode ?? (isExec ? '100755' : '100644'));
+    if (normMode === '120000') {
+      const linkTarget = outBuffer.toString('utf8');
       try {
         if (lstatSync(target.full)) unlinkSync(target.full);
       } catch {
@@ -1518,10 +1802,10 @@ export class SwarmArtifactManager {
       }
       symlinkSync(linkTarget, target.full);
     } else {
-      writeFileSync(target.full, readRes.buffer);
-      if (entry.mode === '100755') {
+      writeFileSync(target.full, outBuffer);
+      if (process.platform !== 'win32') {
         try {
-          chmodSync(target.full, 0o755);
+          chmodSync(target.full, isExec ? 0o755 : 0o644);
         } catch {
           // ignore
         }
@@ -1541,7 +1825,11 @@ export class SwarmArtifactManager {
       path: entry.path,
       changeType: entry.changeType,
       ...(entry.previousPath ? { previousPath: entry.previousPath } : {}),
-      sha256: entry.sha256,
+      sha256: mergedBuffer ? sha256Buffer(outBuffer) : entry.sha256,
+      mode: normMode,
+      posixMode: isExec ? 0o755 : normMode === '120000' ? 0o120000 : 0o644,
+      executable: isExec,
+      ...(threeWayMerged ? { threeWayMerged: true } : {}),
       artifactId: op.artifactId,
       nodeKey: op.nodeKey,
     };
@@ -1648,7 +1936,7 @@ export class SwarmArtifactManager {
       });
     }
     if (!Array.isArray(artifacts) || artifacts.length === 0) {
-      return { ok: true, applied: [], conflicts: [], skipped: [] };
+      return { ok: true, applied: [], conflicts: [], mergeConflicts: [], skipped: [] };
     }
 
     const targetRoot = resolve(worktreePath);
@@ -1675,6 +1963,7 @@ export class SwarmArtifactManager {
     const applied = [];
     const skipped = [];
     const conflicts = [];
+    const mergeConflicts = [];
 
     for (const art of ordered) {
       for (const entry of art.files) {
@@ -1692,6 +1981,7 @@ export class SwarmArtifactManager {
         }
 
         let causalOverride = false;
+        let evalPlanOp = null;
         const existingTouch = touched.get(entry.path);
         if (existingTouch) {
           if (isIdenticalOverlayEntry(existingTouch, entry)) {
@@ -1706,14 +1996,117 @@ export class SwarmArtifactManager {
           if (isCausalArtifactOverride(existingTouch, art, dependenciesByNodeKey)) {
             causalOverride = true;
           } else {
-            conflicts.push({
+            // Attempt true Git 3-way merge across non-causal sibling artifacts before rejecting
+            if (
+              existingTouch.changeType !== 'deleted' &&
+              entry.changeType !== 'deleted' &&
+              existingTouch.mode !== '120000' &&
+              entry.mode !== '120000' &&
+              !existingTouch.binary &&
+              !entry.binary &&
+              readRes &&
+              existsSync(target.full)
+            ) {
+              const currentBuf = readFileSync(target.full);
+              const baseBuf =
+                this.#readArtifactBaseBuffer(art, entry) ??
+                (existingTouch.artifact ? this.#readArtifactBaseBuffer(existingTouch.artifact, existingTouch.entry) : null);
+              if (baseBuf !== null && !isBinaryBuffer(currentBuf)) {
+                const mergeRes = mergeFileThreeWay({
+                  currentBuf,
+                  baseBuf,
+                  incomingBuf: readRes.buffer,
+                  labelCurrent: existingTouch.nodeKey || 'current',
+                  labelBase: 'base',
+                  labelIncoming: art.nodeKey || 'incoming',
+                });
+                const modeMerge = mergeFileModesThreeWay({
+                  currentMode: existingTouch.mode,
+                  baseMode: entry.oldMode ?? existingTouch.oldMode ?? '100644',
+                  incomingMode: entry.mode,
+                });
+                if (mergeRes.ok && modeMerge.ok) {
+                  const mergedEntry = {
+                    ...entry,
+                    mode: modeMerge.mode,
+                    posixMode: entryPosixMode({ mode: modeMerge.mode }),
+                    executable: modeMerge.mode === '100755',
+                  };
+                  const appliedItem = this.#applySinglePreparedOp({
+                    artifactId: art.id,
+                    nodeKey: art.nodeKey,
+                    entry: mergedEntry,
+                    target,
+                    prevTarget,
+                    caseOnlyRename: false,
+                    readRes,
+                    mergedBuffer: mergeRes.mergedBuffer,
+                    threeWayMerged: true,
+                  });
+                  applied.push(appliedItem);
+                  const mergedSha = sha256Buffer(mergeRes.mergedBuffer);
+                  const touchRecord = {
+                    path: entry.path,
+                    artifactId: art.id,
+                    uri: art.uri,
+                    nodeKey: art.nodeKey,
+                    changeType: entry.changeType,
+                    sha256: mergedSha,
+                    mode: modeMerge.mode,
+                    oldMode: entry.oldMode ?? existingTouch.oldMode ?? '100644',
+                    posixMode: entryPosixMode({ mode: modeMerge.mode }),
+                    executable: modeMerge.mode === '100755',
+                    previousPath: entry.previousPath ?? null,
+                    binary: false,
+                    artifact: art,
+                    entry: mergedEntry,
+                  };
+                  touched.set(entry.path, touchRecord);
+                  overlayEntries[entry.path] = {
+                    path: touchRecord.path,
+                    artifactId: touchRecord.artifactId,
+                    uri: touchRecord.uri,
+                    nodeKey: touchRecord.nodeKey,
+                    changeType: touchRecord.changeType,
+                    sha256: touchRecord.sha256,
+                    mode: touchRecord.mode,
+                    posixMode: touchRecord.posixMode,
+                    executable: touchRecord.executable,
+                    previousPath: touchRecord.previousPath,
+                    binary: touchRecord.binary,
+                  };
+                  continue;
+                }
+                const conflictObj = {
+                  path: entry.path,
+                  reason: 'cross_branch_collision',
+                  mergeConflict: true,
+                  conflictMarkers: mergeRes.conflictPreview ?? null,
+                  nodeKeys: [existingTouch.nodeKey, art.nodeKey],
+                  artifactIds: [existingTouch.artifactId, art.id],
+                  existingChangeType: existingTouch.changeType,
+                  incomingChangeType: entry.changeType,
+                  parentPreserved: true,
+                  artifactPreserved: true,
+                };
+                conflicts.push(conflictObj);
+                mergeConflicts.push(conflictObj);
+                continue;
+              }
+            }
+            const conflictObj = {
               path: entry.path,
               reason: 'cross_branch_collision',
+              mergeConflict: true,
               nodeKeys: [existingTouch.nodeKey, art.nodeKey],
               artifactIds: [existingTouch.artifactId, art.id],
               existingChangeType: existingTouch.changeType,
               incomingChangeType: entry.changeType,
-            });
+              parentPreserved: true,
+              artifactPreserved: true,
+            };
+            conflicts.push(conflictObj);
+            mergeConflicts.push(conflictObj);
             continue;
           }
         }
@@ -1752,6 +2145,7 @@ export class SwarmArtifactManager {
           const evalRes = this.#evaluateEntryAgainstTarget(targetRoot, art, entry);
           if (evalRes.kind === 'skip') {
             skipped.push(evalRes.skip);
+            const normMode = normalizeArtifactFileMode(entry.mode);
             const touchRecord = {
               path: entry.path,
               artifactId: art.id,
@@ -1759,65 +2153,105 @@ export class SwarmArtifactManager {
               nodeKey: art.nodeKey,
               changeType: entry.changeType,
               sha256: entry.sha256 ?? null,
-              mode: entry.mode ?? '100644',
+              mode: normMode,
+              oldMode: entry.oldMode ?? '100644',
+              posixMode: entryPosixMode({ mode: normMode }),
+              executable: normMode === '100755',
               previousPath: entry.previousPath ?? null,
               binary: Boolean(entry.binary),
+              artifact: art,
+              entry,
             };
             touched.set(entry.path, touchRecord);
-            overlayEntries[entry.path] = touchRecord;
+            overlayEntries[entry.path] = {
+              path: touchRecord.path,
+              artifactId: touchRecord.artifactId,
+              uri: touchRecord.uri,
+              nodeKey: touchRecord.nodeKey,
+              changeType: touchRecord.changeType,
+              sha256: touchRecord.sha256,
+              mode: touchRecord.mode,
+              posixMode: touchRecord.posixMode,
+              executable: touchRecord.executable,
+              previousPath: touchRecord.previousPath,
+              binary: touchRecord.binary,
+            };
             continue;
           }
           if (evalRes.kind === 'conflict') {
             conflicts.push(evalRes.conflict);
+            if (evalRes.conflict.mergeConflict) mergeConflicts.push(evalRes.conflict);
             continue;
           }
+          evalPlanOp = evalRes.op ?? null;
         }
 
+        const effectiveEntry = evalPlanOp?.entry ?? entry;
         const caseOnlyRename = Boolean(
-          entry.changeType === 'renamed' &&
+          effectiveEntry.changeType === 'renamed' &&
             prevTarget &&
             isCaseOnlyRenamePath(prevTarget.full, target.full),
         );
         const appliedItem = this.#applySinglePreparedOp({
           artifactId: art.id,
           nodeKey: art.nodeKey,
-          entry,
+          entry: effectiveEntry,
           target,
           prevTarget,
           caseOnlyRename,
           readRes,
+          mergedBuffer: evalPlanOp?.mergedBuffer ?? null,
+          threeWayMerged: Boolean(evalPlanOp?.threeWayMerged),
         });
         applied.push(appliedItem);
 
+        const normMode = normalizeArtifactFileMode(effectiveEntry.mode);
         const touchRecord = {
-          path: entry.path,
+          path: effectiveEntry.path,
           artifactId: art.id,
           uri: art.uri,
           nodeKey: art.nodeKey,
-          changeType: entry.changeType,
-          sha256: entry.sha256 ?? null,
-          mode: entry.mode ?? '100644',
-          previousPath: entry.previousPath ?? null,
-          binary: Boolean(entry.binary),
+          changeType: effectiveEntry.changeType,
+          sha256: evalPlanOp?.mergedBuffer ? sha256Buffer(evalPlanOp.mergedBuffer) : (effectiveEntry.sha256 ?? null),
+          mode: normMode,
+          oldMode: effectiveEntry.oldMode ?? '100644',
+          posixMode: entryPosixMode({ mode: normMode }),
+          executable: normMode === '100755',
+          previousPath: effectiveEntry.previousPath ?? null,
+          binary: Boolean(effectiveEntry.binary),
+          artifact: art,
+          entry: effectiveEntry,
         };
-        if (entry.changeType === 'renamed' && entry.previousPath) {
-          touched.set(entry.previousPath, {
-            path: entry.previousPath,
+        if (effectiveEntry.changeType === 'renamed' && effectiveEntry.previousPath) {
+          touched.set(effectiveEntry.previousPath, {
+            path: effectiveEntry.previousPath,
             artifactId: art.id,
             uri: art.uri,
             nodeKey: art.nodeKey,
             changeType: 'deleted',
             sha256: null,
-            mode: entry.mode ?? '100644',
+            mode: normMode,
             previousPath: null,
           });
-          delete overlayEntries[entry.previousPath];
+          delete overlayEntries[effectiveEntry.previousPath];
         }
-        touched.set(entry.path, touchRecord);
-        if (entry.overlaidDeleted || entry.overlaidReverted) {
-          delete overlayEntries[entry.path];
+        touched.set(effectiveEntry.path, touchRecord);
+        if (effectiveEntry.overlaidDeleted || effectiveEntry.overlaidReverted) {
+          delete overlayEntries[effectiveEntry.path];
         } else {
-          overlayEntries[entry.path] = touchRecord;
+          overlayEntries[effectiveEntry.path] = {
+            path: touchRecord.path,
+            artifactId: touchRecord.artifactId,
+            uri: touchRecord.uri,
+            nodeKey: touchRecord.nodeKey,
+            changeType: touchRecord.changeType,
+            sha256: touchRecord.sha256,
+            mode: touchRecord.mode,
+            posixMode: touchRecord.posixMode,
+            executable: touchRecord.executable,
+            previousPath: touchRecord.previousPath,
+            binary: touchRecord.binary,
+          };
         }
       }
     }
@@ -1840,6 +2274,7 @@ export class SwarmArtifactManager {
       ok: conflicts.length === 0,
       applied,
       conflicts,
+      mergeConflicts,
       skipped,
       overlayState,
     };
@@ -1920,11 +2355,76 @@ export class SwarmArtifactManager {
             });
             continue;
           }
+          // Attempt true Git 3-way merge across non-causal sibling artifacts
+          if (
+            prevWin.entry.changeType !== 'deleted' &&
+            entry.changeType !== 'deleted' &&
+            prevWin.entry.mode !== '120000' &&
+            entry.mode !== '120000' &&
+            !prevWin.entry.binary &&
+            !entry.binary
+          ) {
+            const prevBuf = prevWin.mergedBuffer ?? this.readArtifactFile(prevWin.artifactId, prevWin.entry.path).buffer;
+            const nextBuf = this.readArtifactFile(art.id, entry.path).buffer;
+            const baseBuf =
+              this.#readArtifactBaseBuffer(art, entry) ??
+              this.#readArtifactBaseBuffer(prevWin.art, prevWin.entry);
+            if (baseBuf !== null && !isBinaryBuffer(prevBuf) && !isBinaryBuffer(nextBuf)) {
+              const mergeRes = mergeFileThreeWay({
+                currentBuf: prevBuf,
+                baseBuf,
+                incomingBuf: nextBuf,
+                labelCurrent: prevWin.nodeKey || 'current',
+                labelBase: 'base',
+                labelIncoming: art.nodeKey || 'incoming',
+              });
+              const modeMerge = mergeFileModesThreeWay({
+                currentMode: prevWin.entry.mode,
+                baseMode: entry.oldMode ?? prevWin.entry.oldMode ?? '100644',
+                incomingMode: entry.mode,
+              });
+              if (mergeRes.ok && modeMerge.ok) {
+                const mergedSha = sha256Buffer(mergeRes.mergedBuffer);
+                const mergedEntry = {
+                  ...entry,
+                  mode: modeMerge.mode,
+                  posixMode: entryPosixMode({ mode: modeMerge.mode }),
+                  executable: modeMerge.mode === '100755',
+                  sha256: mergedSha,
+                  size: mergeRes.mergedBuffer.length,
+                };
+                winningByPath.set(entry.path, {
+                  artifactId: art.id,
+                  uri: art.uri,
+                  nodeKey: art.nodeKey,
+                  art,
+                  entry: mergedEntry,
+                  mergedBuffer: mergeRes.mergedBuffer,
+                  threeWayMerged: true,
+                });
+                continue;
+              }
+              pushConflict({
+                path: entry.path,
+                nodeKeys: [prevWin.nodeKey, art.nodeKey],
+                artifactIds: [prevWin.artifactId, art.id],
+                reason: 'cross_branch_collision',
+                mergeConflict: true,
+                conflictMarkers: mergeRes.conflictPreview ?? null,
+                parentPreserved: true,
+                artifactPreserved: true,
+              });
+              continue;
+            }
+          }
           pushConflict({
             path: entry.path,
             nodeKeys: [prevWin.nodeKey, art.nodeKey],
             artifactIds: [prevWin.artifactId, art.id],
             reason: 'cross_branch_collision',
+            mergeConflict: true,
+            parentPreserved: true,
+            artifactPreserved: true,
           });
           continue;
         }
@@ -1985,15 +2485,99 @@ export class SwarmArtifactManager {
           });
           continue;
         }
+        if (rec.mergedBuffer) {
+          const target = resolveConfinedPath(targetRoot, rec.entry.path);
+          if (!existsSync(target.full)) {
+            if (rec.entry.changeType === 'added') {
+              plan.push({
+                artifactId: rec.artifactId,
+                nodeKey: rec.nodeKey,
+                entry: rec.entry,
+                target,
+                mergedBuffer: rec.mergedBuffer,
+                threeWayMerged: true,
+              });
+            } else {
+              pushConflict({
+                path: rec.entry.path,
+                nodeKeys: [rec.nodeKey],
+                artifactIds: [rec.artifactId],
+                reason: 'target_deleted_in_parent',
+              });
+            }
+            continue;
+          }
+          const parentBuf = readFileSync(target.full);
+          const parentSha = sha256Buffer(parentBuf);
+          const parentModeMatches =
+            process.platform === 'win32' ||
+            (((statSync(target.full).mode & 0o111) !== 0) === isExecutableEntry(rec.entry));
+          if (parentSha === rec.entry.sha256 && parentModeMatches) {
+            skipped.push({
+              path: rec.entry.path,
+              reason: 'already_applied',
+              artifactId: rec.artifactId,
+              nodeKey: rec.nodeKey,
+            });
+            continue;
+          }
+          if (
+            !rec.entry.baseSha256 ||
+            matchesBaseContent(parentBuf, rec.entry.baseSha256, Boolean(rec.entry.binary))
+          ) {
+            plan.push({
+              artifactId: rec.artifactId,
+              nodeKey: rec.nodeKey,
+              entry: rec.entry,
+              target,
+              mergedBuffer: rec.mergedBuffer,
+              threeWayMerged: true,
+            });
+            continue;
+          }
+          const baseBuf = this.#readArtifactBaseBuffer(rec.art, rec.entry);
+          const finalMerge =
+            baseBuf !== null
+              ? mergeFileThreeWay({
+                  currentBuf: parentBuf,
+                  baseBuf,
+                  incomingBuf: rec.mergedBuffer,
+                  labelCurrent: 'current',
+                  labelBase: 'base',
+                  labelIncoming: rec.nodeKey || 'incoming',
+                })
+              : { ok: false, conflictPreview: null };
+          if (finalMerge.ok) {
+            plan.push({
+              artifactId: rec.artifactId,
+              nodeKey: rec.nodeKey,
+              entry: rec.entry,
+              target,
+              mergedBuffer: finalMerge.mergedBuffer,
+              threeWayMerged: true,
+            });
+          } else {
+            pushConflict({
+              path: rec.entry.path,
+              nodeKeys: [rec.nodeKey],
+              artifactIds: [rec.artifactId],
+              reason: 'parent_modified_concurrently',
+              mergeConflict: true,
+              conflictMarkers: finalMerge.conflictPreview ?? null,
+              parentPreserved: true,
+              artifactPreserved: true,
+            });
+          }
+          continue;
+        }
         const evalRes = this.#evaluateEntryAgainstTarget(targetRoot, rec.art, rec.entry);
         if (evalRes.kind === 'skip') {
           skipped.push(evalRes.skip);
         } else if (evalRes.kind === 'conflict') {
           pushConflict({
-            path: evalRes.conflict.path,
+            ...evalRes.conflict,
             nodeKeys: evalRes.conflict.nodeKeys ?? [rec.nodeKey],
             artifactIds: evalRes.conflict.artifactIds ?? [rec.artifactId],
-            reason: evalRes.conflict.reason,
           });
         } else {
           plan.push(evalRes.op);
@@ -2041,10 +2625,12 @@ export class SwarmArtifactManager {
       diffBytes += section.length;
     }
 
+    const mergeConflicts = conflicts.filter((c) => c.mergeConflict);
     return {
       verifiedArtifacts,
       changedFiles,
       conflicts,
+      mergeConflicts,
       plan,
       skipped,
       verificationErrors,
@@ -2120,6 +2706,7 @@ export class SwarmArtifactManager {
           appliedArtifacts: [],
           appliedFiles: [],
           conflicts: analysis.conflicts,
+          mergeConflicts: analysis.mergeConflicts ?? [],
           errors: analysis.verificationErrors,
         };
       }
@@ -2131,6 +2718,7 @@ export class SwarmArtifactManager {
           appliedArtifacts: [],
           appliedFiles: [],
           conflicts: analysis.conflicts,
+          mergeConflicts: analysis.mergeConflicts ?? [],
           errors: [],
         };
       }
@@ -2210,6 +2798,7 @@ export class SwarmArtifactManager {
         appliedArtifacts,
         appliedFiles,
         conflicts: [],
+        mergeConflicts: [],
         errors: [],
       };
     } finally {
@@ -2295,6 +2884,7 @@ export class SwarmArtifactManager {
       }
 
       if (conflicts.length > 0) {
+        const mergeConflicts = conflicts.filter((c) => c.mergeConflict);
         const conflictResult = {
           ok: false,
           status: 'conflict',
@@ -2303,6 +2893,7 @@ export class SwarmArtifactManager {
           applied: [],
           skipped,
           conflicts,
+          mergeConflicts,
         };
         if (this.store?.db?.isOpen) {
           const now = Date.now();
@@ -2321,9 +2912,15 @@ export class SwarmArtifactManager {
           status: 'dry_run_clean',
           artifactId: artifact.id,
           uri: artifact.uri,
-          applied: plan.map((p) => ({ path: p.entry.path, changeType: p.entry.changeType })),
+          applied: plan.map((p) => ({
+            path: p.entry.path,
+            changeType: p.entry.changeType,
+            mode: normalizeArtifactFileMode(p.entry.mode),
+            threeWayMerged: Boolean(p.threeWayMerged),
+          })),
           skipped,
           conflicts: [],
+          mergeConflicts: [],
         };
       }
 
@@ -2338,6 +2935,7 @@ export class SwarmArtifactManager {
         applied,
         skipped,
         conflicts: [],
+        mergeConflicts: [],
       };
       if (this.store?.db?.isOpen) {
         this.store.tx(() => {

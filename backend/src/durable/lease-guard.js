@@ -362,6 +362,7 @@ export function createLeaseGuard({
     });
 
   const guard = (override = {}) => assertInTx(override);
+  guard.store = store;
   guard.jobId = jobId;
   guard.fence = fence;
   guard.workerId = workerId;
@@ -416,5 +417,145 @@ export function checkLeaseHeld(leaseGuard, override = {}) {
   } catch (err) {
     if (isLeaseLostError(err)) return false;
     throw err;
+  }
+}
+
+/**
+ * Renews the active job lease expiry and owning worker's `heartbeatAt` in SQLite
+ * so long-running LLM SSE streams and tool calls stay protected from premature takeover.
+ * Returns `{ ok, extended, reason?, jobId?, workerId?, leaseExpiresAt?, heartbeatAt? }`.
+ */
+export function renewTurnLease(
+  leaseGuard,
+  {
+    sessionId = null,
+    turnId = null,
+    owner = null,
+    extendMs = 15000,
+    store = null,
+    nowMs = null,
+  } = {},
+) {
+  const effectiveStore = store ?? leaseGuard?.store ?? null;
+  if (!effectiveStore?.db?.isOpen) {
+    return { ok: false, extended: false, reason: 'store_closed' };
+  }
+  const jobId = leaseGuard?.jobId ?? null;
+  const fence = leaseGuard?.fence ?? null;
+  const effectiveSessionId = sessionId ?? leaseGuard?.sessionId ?? null;
+  const effectiveTurnId = turnId ?? leaseGuard?.turnId ?? null;
+  const requestedOwner = owner ?? leaseGuard?.workerId ?? null;
+  if (!jobId && !effectiveTurnId) {
+    return { ok: false, extended: false, reason: 'missing_target' };
+  }
+
+  const ttl = Math.max(1000, Number(extendMs || 15000));
+  const now =
+    nowMs !== null && nowMs !== undefined && Number.isFinite(Number(nowMs))
+      ? Math.trunc(Number(nowMs))
+      : Date.now();
+  const candidateExpiry = now + ttl;
+
+  try {
+    return effectiveStore.tx(() => {
+      const db = effectiveStore.db;
+      const job = jobId
+        ? db
+            .prepare('SELECT id, workerId, status, fence, leaseExpiresAt, sessionId, turnId FROM runtime_jobs WHERE id=?')
+            .get(jobId)
+        : db
+            .prepare(
+              "SELECT id, workerId, status, fence, leaseExpiresAt, sessionId, turnId FROM runtime_jobs WHERE turnId=? AND status='active' ORDER BY updatedAt DESC, rowid DESC LIMIT 1",
+            )
+            .get(effectiveTurnId);
+
+      if (!job || job.status !== 'active') {
+        return { ok: false, extended: false, reason: 'job_not_active' };
+      }
+      if (fence !== null && fence !== undefined && job.fence !== fence) {
+        return { ok: false, extended: false, reason: 'fence_mismatch' };
+      }
+      if (
+        job.leaseExpiresAt !== null &&
+        job.leaseExpiresAt !== undefined &&
+        Number(job.leaseExpiresAt) < now
+      ) {
+        return { ok: false, extended: false, reason: 'lease_expired' };
+      }
+      if (effectiveSessionId && job.sessionId && job.sessionId !== effectiveSessionId) {
+        return { ok: false, extended: false, reason: 'session_mismatch' };
+      }
+      if (effectiveTurnId && job.turnId && job.turnId !== effectiveTurnId) {
+        return { ok: false, extended: false, reason: 'turn_mismatch' };
+      }
+      if (requestedOwner && job.workerId && job.workerId !== requestedOwner) {
+        return { ok: false, extended: false, reason: 'owner_mismatch' };
+      }
+
+      const targetTurnId = effectiveTurnId ?? (job.turnId && !String(job.turnId).startsWith('swarm:') ? job.turnId : null);
+      if (targetTurnId) {
+        const turn = db.prepare('SELECT state, activeFence FROM direct_turns WHERE id=?').get(targetTurnId);
+        if (turn) {
+          if (TERMINAL_TURN_STATES.has(turn.state)) {
+            return { ok: false, extended: false, reason: 'turn_terminal' };
+          }
+          if (fence && turn.activeFence && turn.activeFence !== fence) {
+            return { ok: false, extended: false, reason: 'turn_fence_mismatch' };
+          }
+        }
+      }
+
+      const targetSessionId = effectiveSessionId ?? job.sessionId ?? null;
+      if (targetSessionId) {
+        const sess = db.prepare('SELECT state FROM direct_sessions WHERE id=?').get(targetSessionId);
+        if (sess && sess.state === 'cancelled') {
+          return { ok: false, extended: false, reason: 'session_cancelled' };
+        }
+      }
+
+      const targetWorkerId = job.workerId || requestedOwner || null;
+      if (targetWorkerId) {
+        const worker = getWorkerRecord(effectiveStore, targetWorkerId);
+        if (worker && worker.status !== 'active') {
+          return { ok: false, extended: false, reason: 'worker_inactive' };
+        }
+      }
+
+      const nextExpires = Math.max(Number(job.leaseExpiresAt || 0), candidateExpiry);
+      const jobRes = db
+        .prepare(
+          `UPDATE runtime_jobs
+           SET leaseExpiresAt=?, updatedAt=?
+           WHERE id=? AND status='active'
+             AND (? IS NULL OR fence=?)
+             AND (leaseExpiresAt IS NULL OR leaseExpiresAt >= ?)`,
+        )
+        .run(nextExpires, now, job.id, fence ?? null, fence ?? null, now);
+
+      if ((jobRes.changes ?? 0) === 0) {
+        return { ok: false, extended: false, reason: 'update_conflict' };
+      }
+
+      if (targetWorkerId) {
+        db.prepare("UPDATE runtime_workers SET heartbeatAt=? WHERE workerId=? AND status='active'").run(
+          now,
+          targetWorkerId,
+        );
+      }
+      return {
+        ok: true,
+        extended: true,
+        jobId: job.id,
+        workerId: targetWorkerId,
+        leaseExpiresAt: nextExpires,
+        heartbeatAt: now,
+      };
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      extended: false,
+      reason: err?.message || 'renewal_error',
+    };
   }
 }

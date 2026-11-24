@@ -159,8 +159,15 @@ export function classifyError(err) {
   }
 
   const msg = String(err?.message ?? err);
+  const errCodeStr = String(err?.code ?? '');
   const status = Number(err?.status ?? err?.statusCode ?? 0) || 500;
-  const retryable = status === 429 || status === 502 || status === 503 || status === 504 || TRANSIENT_MSG_RE.test(msg);
+  const retryable =
+    status === 429 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    TRANSIENT_MSG_RE.test(msg) ||
+    TRANSIENT_MSG_RE.test(errCodeStr);
   if (retryable) {
     return new InferenceError('TRANSIENT_UPSTREAM_ERROR', {
       status,

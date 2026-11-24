@@ -7,9 +7,11 @@ import {
   SWARM_RUN_STATES,
   isTerminalNodeState,
   isTerminalRunState,
+  transitionNodeTerminalCas,
   transitionSwarmNode,
   transitionSwarmRun,
 } from './node-state-machine.js';
+import { isRunDeadlineExpired } from './run-deadline.js';
 
 export function parseJsonSafe(str, fallback) {
   if (!str) return fallback;
@@ -277,6 +279,7 @@ export function recoverInterruptedSwarmRuns({
     replayedReconciliations: 0,
     reconcilingNodes: [],
     skippedTerminal: 0,
+    timedOutRuns: 0,
     skippedLiveOwners: 0,
     budgetReconciliation: null,
     orphanArtifacts: null,
@@ -321,6 +324,14 @@ export function recoverInterruptedSwarmRuns({
         .get(runRow.sessionId);
       if (!parentSess || parentSess.state === 'cancelled') {
         cancelRun(runRow.id);
+        report.skippedTerminal++;
+        continue;
+      }
+
+      const parsedRunBudget = parseJsonSafe(runRow.budgetJson, {});
+      if (isRunDeadlineExpired({ ...runRow, budget: parsedRunBudget })) {
+        cancelRun(runRow.id, { deadlineExpired: true });
+        report.timedOutRuns++;
         report.skippedTerminal++;
         continue;
       }
@@ -529,7 +540,7 @@ export function recoverInterruptedSwarmRuns({
                       ...extractArtifactUris(resultText),
                     ]),
                   ];
-                  const updated = transitionSwarmNode(store, null, n.id, SWARM_NODE_STATES.COMPLETED, {
+                  const updated = transitionNodeTerminalCas(store, null, n.id, SWARM_NODE_STATES.COMPLETED, {
                     emitEvent: false,
                     patch: {
                       resultText,
@@ -539,6 +550,7 @@ export function recoverInterruptedSwarmRuns({
                       activeJobId: null,
                     },
                   });
+                  if (!updated.changed) continue;
                   postTxEvents.push({
                     sessionId: run.sessionId,
                     turnId: run.rootTurnId,
@@ -741,7 +753,7 @@ export function applyReconciliationResolution({ store, jobQueue, eventRouter, ge
 
     let updatedNode;
     if (result.outcome === 'abort') {
-      updatedNode = transitionSwarmNode(store, null, node.id, SWARM_NODE_STATES.FAILED, {
+      updatedNode = transitionNodeTerminalCas(store, null, node.id, SWARM_NODE_STATES.FAILED, {
         emitEvent: false,
         patch: {
           reconcileApprovalId: null,

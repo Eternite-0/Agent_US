@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { useCallback, useEffect, useState } from 'react';
 import {
   type AgentBackendClient,
+  collectSwarmReviewerVerification,
   collectSwarmReviewerVerdicts,
   extractSwarmTelemetry,
   formatSwarmApplyAllFeedback,
@@ -16,6 +17,7 @@ import type {
   SwarmMessageRecord,
   SwarmReplanRecord,
   SwarmReviewerVerdict,
+  SwarmReviewerVerification,
   SwarmRunRecord,
   SwarmBudgetSnapshot,
   SwarmCommandReceipt,
@@ -277,6 +279,7 @@ function RunDetail({ run, client, approvals, revision, onRefresh, sectionRequest
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0];
   const effectiveVerdict = current.verdict ?? deliveryState.data?.verdict ?? null;
   const reviewerVerdicts = collectSwarmReviewerVerdicts(current, deliveryState.data);
+  const reviewerVerification = collectSwarmReviewerVerification(current, deliveryState.data);
 
   async function change(action: 'cancel' | 'resume') {
     if (pending) return;
@@ -331,18 +334,23 @@ function RunDetail({ run, client, approvals, revision, onRefresh, sectionRequest
           </div>}
         </details>
       )}
-      {(effectiveVerdict || reviewerVerdicts.length > 0) ? <details className="autonomous-verdict">
+      {(effectiveVerdict || reviewerVerdicts.length > 0 || reviewerVerification) ? <details className="autonomous-verdict">
         <summary className="codex-subagent-list-row swarm-row">
           <RowContents
             icon={effectiveVerdict ? (effectiveVerdict.accepted ? <IconShieldCheck size={15} /> : <IconCircleClose size={15} />) : <IconShieldCheck size={15} />}
             title={effectiveVerdict ? (effectiveVerdict.accepted ? '验收通过' : '验收未通过') : '独立审查记录'}
-            detail={effectiveVerdict?.verificationMode || (reviewerVerdicts.length ? `${reviewerVerdicts.length} 项独立审查` : undefined)}
+            detail={[
+              effectiveVerdict?.verificationMode,
+              reviewerVerification ? (reviewerVerification.hardGatePassed ? '硬门禁通过' : '硬门禁拦截') : '',
+              !effectiveVerdict?.verificationMode && reviewerVerdicts.length ? `${reviewerVerdicts.length} 项独立审查` : '',
+            ].filter(Boolean).join(' · ') || undefined}
             expandable
           />
         </summary>
         <div className="swarm-row-detail">
+          <ReviewerVerificationSummary verification={reviewerVerification} />
           {effectiveVerdict?.reasons?.length ? <ul>{effectiveVerdict.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>
-            : !reviewerVerdicts.length && <p>未记录验收说明。</p>}
+            : !reviewerVerdicts.length && !reviewerVerification && <p>未记录验收说明。</p>}
           <ReviewerVerdictList verdicts={reviewerVerdicts} />
         </div>
       </details> : !active && <p><small>无验收记录</small></p>}
@@ -372,6 +380,36 @@ function RunDetail({ run, client, approvals, revision, onRefresh, sectionRequest
       ? <DeliveryReviewSection client={client} run={current} state={deliveryState} onRefresh={onRefresh} onReloadDelivery={reloadDelivery} />
       : <RunSection key={section} client={client} run={current} section={section} revision={revision} onRefresh={onRefresh} />}
   </>;
+}
+
+function ReviewerVerificationSummary({ verification }: { verification: SwarmReviewerVerification | null }) {
+  if (!verification) return null;
+  const exitText =
+    verification.verifiedTestExitCode !== null && verification.verifiedTestExitCode !== undefined
+      ? `exit ${verification.verifiedTestExitCode}`
+      : '未运行';
+  return (
+    <div className="swarm-dependencies" aria-label="Reviewer 硬门禁校验">
+      <span
+        className="codex-status-chip"
+        data-tone={verification.hardGatePassed ? 'success' : 'danger'}
+      >
+        {verification.hardGatePassed ? '硬门禁通过' : '硬门禁拦截'}
+      </span>
+      <small>
+        Git Diff <code>{verification.verifiedGitDiff ? '已核验' : '未核验'}</code> ·{' '}
+        <code>{verification.diffFileCount}</code> 个文件
+      </small>
+      <small>
+        测试退出码 <code>{exitText}</code>
+      </small>
+      {verification.diffDigest ? (
+        <small>
+          摘要 <code>{verification.diffDigest.slice(0, 8)}</code>
+        </small>
+      ) : null}
+    </div>
+  );
 }
 
 function ReviewerVerdictList({ verdicts }: { verdicts: SwarmReviewerVerdict[] }) {
@@ -428,6 +466,7 @@ function DeliveryReviewSection({ client, run, state, onRefresh, onReloadDelivery
   const changedFiles = delivery.changedFiles ?? [];
   const testResults = delivery.testResults ?? [];
   const reviewerVerdicts = collectSwarmReviewerVerdicts(run, delivery);
+  const reviewerVerification = collectSwarmReviewerVerification(run, delivery);
   const diffPreview = delivery.unifiedDiffPreview ?? '';
 
   async function handleApplyAll() {
@@ -516,10 +555,11 @@ function DeliveryReviewSection({ client, run, state, onRefresh, onReloadDelivery
       </li>)}
     </ul> : <p><small>暂无测试执行记录。</small></p>}
 
-    {reviewerVerdicts.length > 0 && <>
+    {(reviewerVerification || reviewerVerdicts.length > 0) && <>
       <h3 className="codex-subagent-section-head swarm-section-heading">
         <IconShieldCheck size={14} aria-hidden="true" />独立审查 · {reviewerVerdicts.length}
       </h3>
+      <ReviewerVerificationSummary verification={reviewerVerification} />
       <ReviewerVerdictList verdicts={reviewerVerdicts} />
     </>}
 

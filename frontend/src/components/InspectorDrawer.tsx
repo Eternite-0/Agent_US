@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { Approval, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
+import type { AciBudgetWatermarks, Approval, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
 import { aggregateFileChanges, buildDiffPresentation, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
 import { fmtClock, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
 import {
@@ -380,6 +380,58 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     () => buildDiffPresentation(activeFileDiff?.lines ?? []),
     [activeFileDiff?.lines],
   );
+
+  const latestAciWatermarks = useMemo<AciBudgetWatermarks | null>(() => {
+    const events = bundle?.events ?? [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      const p = (events[i]?.payload ?? {}) as Record<string, unknown>;
+      const nested = (
+        p.budgetWatermarks && typeof p.budgetWatermarks === 'object'
+          ? p.budgetWatermarks
+          : p.watermarks && typeof p.watermarks === 'object'
+            ? p.watermarks
+            : null
+      ) as Record<string, unknown> | null;
+      const src = nested ?? p;
+      const usedTokens = typeof src.usedTokens === 'number' ? src.usedTokens : undefined;
+      const maxTokens = typeof src.maxTokens === 'number' ? src.maxTokens : undefined;
+      const dtocWatermark =
+        typeof src.dtocWatermark === 'number'
+          ? src.dtocWatermark
+          : typeof src.dtocMinPromptTokens === 'number'
+            ? src.dtocMinPromptTokens
+            : undefined;
+      const postTestReserveActive =
+        typeof src.postTestReserveActive === 'boolean' ? src.postTestReserveActive : undefined;
+      const supervisorCircuitOpen =
+        typeof src.supervisorCircuitOpen === 'boolean'
+          ? src.supervisorCircuitOpen
+          : typeof src.circuitOpen === 'boolean'
+            ? src.circuitOpen
+            : undefined;
+      if (
+        nested ||
+        usedTokens !== undefined ||
+        maxTokens !== undefined ||
+        dtocWatermark !== undefined ||
+        postTestReserveActive !== undefined ||
+        supervisorCircuitOpen !== undefined
+      ) {
+        return {
+          usedTokens,
+          maxTokens,
+          utilizationRatio: typeof src.utilizationRatio === 'number' ? src.utilizationRatio : undefined,
+          reserveTokens: typeof src.reserveTokens === 'number' ? src.reserveTokens : undefined,
+          postTestReserveActive,
+          dtocWatermark,
+          dtocMinPromptTokens: typeof src.dtocMinPromptTokens === 'number' ? src.dtocMinPromptTokens : undefined,
+          dtocPolicy: typeof src.dtocPolicy === 'string' ? src.dtocPolicy : null,
+          supervisorCircuitOpen,
+        };
+      }
+    }
+    return null;
+  }, [bundle?.events]);
 
   const stopResize = (pointerId: number) => {
     if (resizeDrag.current?.pointerId !== pointerId) return;
@@ -1211,6 +1263,58 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                     {fmtTokens(bundle.usage.reduce((s, u) => s + u.inputTokens + u.outputTokens, 0))} tokens ·{' '}
                     {fmtUSD(bundle.usage.reduce((s, u) => s + u.estimatedUSD, 0))}
                   </span>
+                </div>
+              )}
+
+              {/* ACI 2.5 Budget Watermarks & 8s Breaker */}
+              {latestAciWatermarks && (
+                <div
+                  aria-label="ACI 2.5 预算水位"
+                  style={{
+                    padding: 10,
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-subtle)',
+                    background: 'var(--bg-surface-secondary)',
+                    fontSize: 12,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                    <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>ACI 2.5 预算水位</span>
+                    {latestAciWatermarks.usedTokens !== undefined && latestAciWatermarks.maxTokens !== undefined && (
+                      <span className="tabular-nums" style={{ fontFamily: 'var(--font-mono)', fontWeight: 500 }}>
+                        {fmtTokens(latestAciWatermarks.usedTokens)} / {fmtTokens(latestAciWatermarks.maxTokens)} tokens
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                    {latestAciWatermarks.dtocWatermark !== undefined && (
+                      <span className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
+                        单步 DTOC 水位{' '}
+                        {latestAciWatermarks.dtocWatermark <= 2
+                          ? `${Math.round(latestAciWatermarks.dtocWatermark * 100)}%`
+                          : `${fmtTokens(latestAciWatermarks.dtocWatermark)} tok`}
+                      </span>
+                    )}
+                    {latestAciWatermarks.postTestReserveActive !== undefined && (
+                      <span
+                        className="codex-status-chip"
+                        data-tone={latestAciWatermarks.postTestReserveActive ? 'warning' : undefined}
+                      >
+                        {latestAciWatermarks.postTestReserveActive ? '完工保留金已激活' : '完工保留就绪'}
+                      </span>
+                    )}
+                    {latestAciWatermarks.supervisorCircuitOpen !== undefined && (
+                      <span
+                        className="codex-status-chip"
+                        data-tone={latestAciWatermarks.supervisorCircuitOpen ? 'warning' : 'success'}
+                      >
+                        {latestAciWatermarks.supervisorCircuitOpen ? 'Supervisor 8s 熔断已开启' : 'Supervisor 8s 熔断正常'}
+                      </span>
+                    )}
+                  </div>
                 </div>
               )}
 

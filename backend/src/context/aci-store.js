@@ -704,6 +704,199 @@ export class ContextEvidenceLedger {
     this.taskOutcome = { ...outcome, recordedAt: Date.now() };
   }
 
+  /**
+   * Idempotently merges another ContextEvidenceLedger (or serialized ledger snapshot)
+   * into this ledger without duplicating items across mid-turn automatic retries.
+   */
+  mergeFrom(other) {
+    if (!other || other === this || typeof other !== 'object') return this;
+
+    const mergeUnique = (target, incoming, keyFn, cloneFn) => {
+      if (!Array.isArray(incoming) || incoming.length === 0) return;
+      const seen = new Set(target.map(keyFn));
+      for (const item of incoming) {
+        if (!item || typeof item !== 'object') continue;
+        const cloned = cloneFn(item);
+        const key = keyFn(cloned);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        target.push(cloned);
+      }
+    };
+
+    mergeUnique(
+      this.discovered,
+      other.discovered,
+      (x) => `${x.refId ?? ''}|${normalizeContextPath(x.path)}|${x.source ?? ''}|${x.step ?? 0}`,
+      (x) => ({
+        refId: x.refId ?? null,
+        path: x.path ? String(x.path) : '',
+        score: Number.isFinite(Number(x.score)) ? Number(x.score) : 0,
+        source: String(x.source || 'candidate'),
+        step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+        symbols: Array.isArray(x.symbols) ? [...x.symbols] : [],
+        at: x.at ?? 0,
+      }),
+    );
+
+    mergeUnique(
+      this.kept,
+      other.kept,
+      (x) => `${x.refId ?? ''}|${normalizeContextPath(x.path)}|${x.reason ?? ''}|${x.tokens ?? 0}|${x.step ?? 0}`,
+      (x) => ({
+        refId: x.refId ?? null,
+        path: x.path ? String(x.path) : '',
+        reason: String(x.reason || 'relevant'),
+        tokens: Number(x.tokens ?? x.originalTokens ?? 0),
+        step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+        at: x.at ?? 0,
+      }),
+    );
+
+    mergeUnique(
+      this.compressed,
+      other.compressed,
+      (x) => `${x.refId ?? ''}|${x.uri ?? ''}|${normalizeContextPath(x.path)}|${x.step ?? 0}|${x.epoch ?? ''}`,
+      (x) => {
+        const originalTokens = Number(x.originalTokens ?? 0);
+        const stubTokens = Number(x.stubTokens ?? 0);
+        return {
+          refId: x.refId ?? null,
+          uri: x.uri ?? null,
+          path: x.path ? String(x.path) : '',
+          originalTokens,
+          stubTokens,
+          tokensSaved:
+            x.tokensSaved != null && Number.isFinite(Number(x.tokensSaved))
+              ? Math.max(0, Number(x.tokensSaved))
+              : Math.max(0, originalTokens - stubTokens),
+          step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+          epoch: Number.isFinite(Number(x.epoch)) ? Number(x.epoch) : null,
+          at: x.at ?? 0,
+        };
+      },
+    );
+
+    mergeUnique(
+      this.expanded,
+      other.expanded,
+      (x) => `${x.refId ?? ''}|${x.uri ?? ''}|${normalizeContextPath(x.path)}|${x.level ?? ''}|${x.tokens ?? 0}|${x.step ?? 0}`,
+      (x) => ({
+        refId: x.refId ?? null,
+        uri: x.uri ?? null,
+        path: x.path ? String(x.path) : '',
+        level: String(x.level || 'outline'),
+        tokens: Number(x.tokens ?? 0),
+        step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+        at: x.at ?? 0,
+      }),
+    );
+
+    mergeUnique(
+      this.abstained,
+      other.abstained,
+      (x) => `${x.query ?? ''}|${x.reason ?? ''}|${x.step ?? 0}`,
+      (x) => ({
+        query: String(x.query || '').slice(0, 200),
+        reason: String(x.reason || 'local_context_sufficient'),
+        coverage: Number.isFinite(Number(x.coverage)) ? Number(x.coverage) : 1,
+        step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+        at: x.at ?? 0,
+      }),
+    );
+
+    mergeUnique(
+      this.admissions,
+      other.admissions,
+      (x) =>
+        `${x.refId ?? ''}|${x.uri ?? ''}|${x.sha256 ?? ''}|${normalizeContextPath(x.path)}|${x.toolName ?? ''}|${x.decision ?? ''}|${x.step ?? 0}`,
+      (x) => {
+        const originalTokens = Math.max(0, Number(x.originalTokens ?? 0));
+        const injectedTokens = Math.max(0, Number(x.injectedTokens ?? 0));
+        const tokensSaved =
+          x.tokensSaved != null && Number.isFinite(Number(x.tokensSaved))
+            ? Math.max(0, Number(x.tokensSaved))
+            : Math.max(0, originalTokens - injectedTokens);
+        return {
+          refId: x.refId ?? null,
+          uri: x.uri ?? null,
+          sha256: x.sha256 ?? null,
+          path: x.path ? String(x.path) : '',
+          toolName: String(x.toolName || 'tool'),
+          decision: String(x.decision || 'DIRECT').toUpperCase(),
+          criticalDomains: Array.isArray(x.criticalDomains) ? [...x.criticalDomains] : [],
+          score: Number.isFinite(Number(x.score)) ? Number(x.score) : 0,
+          originalTokens,
+          injectedTokens,
+          tokensSaved,
+          step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+          reason: String(x.reason || ''),
+          at: x.at ?? 0,
+        };
+      },
+    );
+
+    mergeUnique(
+      this.supervisorCalls,
+      other.supervisorCalls,
+      (x) =>
+        `${x.stage ?? ''}|${x.model ?? ''}|${x.step ?? 0}|${x.candidateCount ?? 0}|${x.inputTokens ?? 0}|${x.outputTokens ?? 0}|${x.durationMs ?? 0}|${x.at ?? ''}`,
+      (x) => {
+        const inputTokens = Math.max(0, Number(x.inputTokens ?? 0));
+        const outputTokens = Math.max(0, Number(x.outputTokens ?? 0));
+        const totalTokens =
+          x.totalTokens != null && Number.isFinite(Number(x.totalTokens))
+            ? Math.max(0, Number(x.totalTokens))
+            : inputTokens + outputTokens;
+        return {
+          stage: String(x.stage || 'admission'),
+          model: x.model ? String(x.model) : null,
+          candidateCount: Math.max(0, Number(x.candidateCount ?? 0)),
+          decisions: x.decisions ? structuredClone(x.decisions) : null,
+          inputTokens,
+          outputTokens,
+          totalTokens,
+          durationMs: Math.max(0, Number(x.durationMs ?? 0)),
+          ok: x.ok !== false,
+          fallback: x.fallback ?? null,
+          step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+          at: x.at ?? 0,
+        };
+      },
+    );
+
+    mergeUnique(
+      this.recoveries,
+      other.recoveries,
+      (x) =>
+        `${x.refId ?? ''}|${x.uri ?? ''}|${x.sha256 ?? ''}|${normalizeContextPath(x.path)}|${x.level ?? ''}|${x.tokensRestored ?? 0}|${x.step ?? 0}|${x.at ?? ''}`,
+      (x) => ({
+        refId: x.refId ?? null,
+        uri: x.uri ?? null,
+        sha256: x.sha256 ?? null,
+        path: x.path ? String(x.path) : '',
+        level: String(x.level || 'verbatim'),
+        verified: Boolean(x.verified),
+        tokensRestored: Math.max(0, Number(x.tokensRestored ?? 0)),
+        triggeredBy: String(x.triggeredBy || 'expand_context'),
+        step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+        at: x.at ?? 0,
+      }),
+    );
+
+    if (!this.taskOutcome && other.taskOutcome && typeof other.taskOutcome === 'object') {
+      this.taskOutcome = { ...other.taskOutcome };
+    }
+    return this;
+  }
+
+  /**
+   * Formats a bounded cross-worker shared ACI summary digest (`<= maxChars`).
+   */
+  toSharedDigest({ maxChars = 1600, header = '[Shared Swarm ACI Digest]' } = {}) {
+    return buildSharedAciSummary(this, { maxChars, header });
+  }
+
   computeCriticalContextRecall(groundTruthFiles = []) {
     const truth = dedupePaths(groundTruthFiles);
 
@@ -952,4 +1145,194 @@ export class ContextEvidenceLedger {
       recoveriesCount: this.recoveries.length,
     };
   }
+
+  toJSON() {
+    return {
+      discovered: [...this.discovered],
+      kept: [...this.kept],
+      compressed: [...this.compressed],
+      expanded: [...this.expanded],
+      abstained: [...this.abstained],
+      admissions: [...this.admissions],
+      supervisorCalls: [...this.supervisorCalls],
+      recoveries: [...this.recoveries],
+      taskOutcome: this.taskOutcome ? { ...this.taskOutcome } : null,
+      summary: this.summary(),
+    };
+  }
+}
+
+function cleanDigestToken(value, limit = 120) {
+  return String(value ?? '')
+    .replace(/[\r\n\t|]+/g, ' ')
+    .replace(/<\/?untrusted[^>]*>/gi, '')
+    .trim()
+    .slice(0, limit);
+}
+
+/**
+ * Builds a bounded cross-worker `[Shared Swarm ACI Digest]` string (`<= maxChars`)
+ * from one or more `ContextEvidenceLedger` instances, `aciMetrics` objects, or child turn records.
+ */
+export function buildSharedAciSummary(aciMetricsOrLedger, opts = {}) {
+  const rawMaxChars = opts?.maxChars ?? 1600;
+  const maxChars = Number.isFinite(Number(rawMaxChars))
+    ? Math.max(0, Math.trunc(Number(rawMaxChars)))
+    : 1600;
+  if (maxChars === 0) return '';
+
+  const header = cleanDigestToken(opts?.header || '[Shared Swarm ACI Digest]', 80) || '[Shared Swarm ACI Digest]';
+  const inputs = Array.isArray(aciMetricsOrLedger) ? aciMetricsOrLedger : [aciMetricsOrLedger];
+
+  const criticalMap = new Map(); // normPath -> { path, domains: Set }
+  const irrelevantMap = new Map(); // normPath -> path
+  const deferredMap = new Map(); // key -> label
+  const symbolSet = new Set();
+
+  for (const sym of opts?.activeSymbols ?? []) {
+    const clean = cleanDigestToken(sym, 64);
+    if (clean) symbolSet.add(clean);
+  }
+
+  for (const src of inputs) {
+    if (!src || typeof src !== 'object') continue;
+    const rm = src.reasoningMetrics ?? src;
+    const aci = rm.aciMetrics ?? src;
+    const ledger = aci.ledger ?? src.ledger ?? aci;
+
+    for (const sym of aci.activeSymbols ?? src.activeSymbols ?? []) {
+      const clean = cleanDigestToken(sym, 64);
+      if (clean) symbolSet.add(clean);
+    }
+
+    const admissions = Array.isArray(ledger?.admissions)
+      ? ledger.admissions
+      : Array.isArray(src.admissions)
+        ? src.admissions
+        : [];
+    for (const adm of admissions) {
+      if (!adm || typeof adm !== 'object') continue;
+      const rawPath = cleanDigestToken(adm.path, 140);
+      const norm = normalizeContextPath(rawPath);
+      const decision = String(adm.decision || '').toUpperCase();
+      if (decision === 'IRRELEVANT') {
+        if (norm && !criticalMap.has(norm) && !irrelevantMap.has(norm)) {
+          irrelevantMap.set(norm, rawPath || norm);
+        }
+      } else if (decision === 'DIRECT' || decision === 'SUPPORTING') {
+        if (norm) {
+          let entry = criticalMap.get(norm);
+          if (!entry) {
+            entry = { path: rawPath || norm, domains: new Set() };
+            criticalMap.set(norm, entry);
+          }
+          for (const d of adm.criticalDomains ?? []) {
+            const cleanD = cleanDigestToken(d, 32);
+            if (cleanD) entry.domains.add(cleanD);
+          }
+          irrelevantMap.delete(norm);
+        }
+      } else if (decision === 'DEFER') {
+        const uri = cleanDigestToken(adm.uri || adm.refId, 96);
+        if (uri) {
+          const key = `${uri}|${norm || rawPath}`;
+          if (!deferredMap.has(key)) {
+            deferredMap.set(key, rawPath ? `${uri} (${rawPath})` : uri);
+          }
+        }
+      }
+      if (decision === 'SUPPORTING' && adm.uri) {
+        const uri = cleanDigestToken(adm.uri, 96);
+        const key = `${uri}|${norm || rawPath}`;
+        if (uri && !deferredMap.has(key)) {
+          deferredMap.set(key, rawPath ? `${uri} (${rawPath})` : uri);
+        }
+      }
+    }
+
+    for (const k of ledger?.kept ?? []) {
+      const rawPath = cleanDigestToken(k?.path, 140);
+      const norm = normalizeContextPath(rawPath);
+      if (norm && !criticalMap.has(norm)) {
+        criticalMap.set(norm, { path: rawPath || norm, domains: new Set() });
+      }
+      irrelevantMap.delete(norm);
+    }
+
+    for (const r of ledger?.recoveries ?? []) {
+      if (r?.verified === false) continue;
+      const rawPath = cleanDigestToken(r?.path, 140);
+      const norm = normalizeContextPath(rawPath);
+      if (norm && !criticalMap.has(norm)) {
+        criticalMap.set(norm, { path: rawPath || norm, domains: new Set() });
+      }
+      irrelevantMap.delete(norm);
+    }
+
+    for (const d of ledger?.discovered ?? []) {
+      for (const sym of d?.symbols ?? []) {
+        const clean = cleanDigestToken(sym, 64);
+        if (clean) symbolSet.add(clean);
+        if (symbolSet.size >= 24) break;
+      }
+    }
+
+    for (const c of ledger?.compressed ?? []) {
+      const uri = cleanDigestToken(c?.uri || c?.refId, 96);
+      const rawPath = cleanDigestToken(c?.path, 140);
+      const norm = normalizeContextPath(rawPath);
+      if (uri) {
+        const key = `${uri}|${norm || rawPath}`;
+        if (!deferredMap.has(key)) {
+          const range = cleanDigestToken(c?.lineRange, 24);
+          const suffix = [rawPath, range].filter(Boolean).join(' ');
+          deferredMap.set(key, suffix ? `${uri} (${suffix})` : uri);
+        }
+      }
+    }
+  }
+
+  const criticalItems = [...criticalMap.values()].map((entry) => {
+    const doms = [...entry.domains];
+    return doms.length ? `${entry.path} [${doms.join(',')}]` : entry.path;
+  });
+  const symbolItems = [...symbolSet].slice(0, 16);
+  const decoyItems = [...irrelevantMap.values()];
+  const deferredItems = [...deferredMap.values()];
+
+  if (
+    criticalItems.length === 0 &&
+    symbolItems.length === 0 &&
+    decoyItems.length === 0 &&
+    deferredItems.length === 0
+  ) {
+    return '';
+  }
+
+  const renderLines = (capPerSection) => {
+    const lines = [header];
+    if (criticalItems.length) {
+      lines.push(`- Critical/Active Files: ${criticalItems.slice(0, capPerSection).join(', ')}`);
+    }
+    if (symbolItems.length) {
+      lines.push(`- Active Symbols: ${symbolItems.slice(0, capPerSection).join(', ')}`);
+    }
+    if (decoyItems.length) {
+      lines.push(`- IRRELEVANT Decoys (skip): ${decoyItems.slice(0, capPerSection).join(', ')}`);
+    }
+    if (deferredItems.length) {
+      lines.push(`- Deferred Refs: ${deferredItems.slice(0, capPerSection).join(', ')}`);
+    }
+    return lines.join('\n');
+  };
+
+  for (const cap of [12, 8, 5, 3, 2, 1]) {
+    const candidate = renderLines(cap);
+    if (candidate.length <= maxChars) return candidate;
+  }
+
+  const minimal = renderLines(1);
+  if (minimal.length <= maxChars) return minimal;
+  if (maxChars <= 3) return minimal.slice(0, maxChars);
+  return `${minimal.slice(0, maxChars - 3).trimEnd()}...`.slice(0, maxChars);
 }

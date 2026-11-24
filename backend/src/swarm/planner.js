@@ -3,7 +3,12 @@ import { BudgetError } from '../kernel/errors.js';
 import { assertLeaseInTx } from '../durable/lease-guard.js';
 import { allocatePlanBudgets } from '../planning/budget-estimator.js';
 import { BUDGET_SCOPES, estimateRequestInputTokens } from './budget-ledger.js';
-import { SWARM_NODE_STATES, isTerminalNodeState, transitionSwarmNode } from './node-state-machine.js';
+import {
+  SWARM_NODE_STATES,
+  isTerminalNodeState,
+  transitionNodeTerminalCas,
+  transitionSwarmNode,
+} from './node-state-machine.js';
 
 let repoIntelligenceLoader = null;
 async function loadRepoIntelligence() {
@@ -189,6 +194,379 @@ function sanitizeNodeKey(raw, idx, seen) {
   return unique;
 }
 
+function normalizePathList(raw) {
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw.map((p) => String(p ?? '').trim()).filter(Boolean))].slice(0, 64);
+}
+
+export function normalizeWriteScopePath(rawPath) {
+  let s = String(rawPath ?? '').trim().replace(/\\/g, '/');
+  if (!s) return '';
+  s = s.replace(/^\.\/+/, '').replace(/^\/+/, '').replace(/\/+/g, '/');
+  if (!s || s === '.' || s === '*') return '*';
+  s = s.replace(/\/\*\*$/, '').replace(/\/\*$/, '').replace(/\/+$/, '');
+  if (!s || s === '.') return '*';
+  return s;
+}
+
+function comparableWritePath(normPath) {
+  return process.platform === 'win32' ? normPath.toLowerCase() : normPath;
+}
+
+export function writePathsOverlap(rawA, rawB) {
+  const normA = normalizeWriteScopePath(rawA);
+  const normB = normalizeWriteScopePath(rawB);
+  if (!normA || !normB) return false;
+  const a = comparableWritePath(normA);
+  const b = comparableWritePath(normB);
+  if (a === '*' || b === '*') return true;
+  if (a === b) return true;
+  return b.startsWith(`${a}/`) || a.startsWith(`${b}/`);
+}
+
+function extractNodeWritePaths(node) {
+  if (!node || typeof node !== 'object') return [];
+  const taskType = String(node.taskType ?? '').trim().toLowerCase();
+  const perm = String(node.permissionMode ?? '').trim().toLowerCase();
+  if (
+    taskType === 'review' ||
+    taskType === 'research' ||
+    perm === 'read-only' ||
+    perm === 'readonly' ||
+    isTerminalNodeState(node.status) ||
+    node.status === 'superseded'
+  ) {
+    return [];
+  }
+  const budgetObj =
+    node.budget && typeof node.budget === 'object'
+      ? node.budget
+      : parseJsonSafe(node.budgetJson, {});
+  const roleMeta = budgetObj?.roleMetadata ?? node.metadata ?? {};
+  const raw = [
+    ...(Array.isArray(node.writePaths) ? node.writePaths : []),
+    ...(Array.isArray(node.targetFiles) ? node.targetFiles : []),
+    ...(Array.isArray(node.files) ? node.files : []),
+    ...(Array.isArray(node.ownedPaths) ? node.ownedPaths : []),
+    ...(Array.isArray(budgetObj?.writePaths) ? budgetObj.writePaths : []),
+    ...(Array.isArray(budgetObj?.targetFiles) ? budgetObj.targetFiles : []),
+    ...(Array.isArray(budgetObj?.files) ? budgetObj.files : []),
+    ...(Array.isArray(budgetObj?.ownedPaths) ? budgetObj.ownedPaths : []),
+    ...(Array.isArray(node.metadata?.writePaths) ? node.metadata.writePaths : []),
+    ...(Array.isArray(node.metadata?.targetFiles) ? node.metadata.targetFiles : []),
+    ...(Array.isArray(node.metadata?.files) ? node.metadata.files : []),
+    ...(Array.isArray(node.metadata?.ownedPaths) ? node.metadata.ownedPaths : []),
+    ...(Array.isArray(roleMeta?.writePaths) ? roleMeta.writePaths : []),
+    ...(Array.isArray(roleMeta?.targetFiles) ? roleMeta.targetFiles : []),
+    ...(Array.isArray(roleMeta?.files) ? roleMeta.files : []),
+    ...(Array.isArray(roleMeta?.ownedPaths) ? roleMeta.ownedPaths : []),
+  ];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const norm = normalizeWriteScopePath(item);
+    if (!norm) continue;
+    const cmp = comparableWritePath(norm);
+    if (!seen.has(cmp)) {
+      seen.add(cmp);
+      out.push(norm);
+    }
+  }
+  return out;
+}
+
+function computeAncestorMap(nodeEntries) {
+  const depsByKey = new Map(nodeEntries.map((e) => [e.key, new Set(e.dependencies)]));
+  const ancestorsByKey = new Map();
+  const resolveAncestors = (key, stack = new Set()) => {
+    if (ancestorsByKey.has(key)) return ancestorsByKey.get(key);
+    if (stack.has(key)) return new Set();
+    stack.add(key);
+    const acc = new Set();
+    for (const dep of depsByKey.get(key) ?? []) {
+      acc.add(dep);
+      for (const anc of resolveAncestors(dep, stack)) {
+        acc.add(anc);
+      }
+    }
+    stack.delete(key);
+    ancestorsByKey.set(key, acc);
+    return acc;
+  };
+  for (const e of nodeEntries) {
+    resolveAncestors(e.key);
+  }
+  return ancestorsByKey;
+}
+
+function computeDeterministicTopoOrder(nodeEntries) {
+  const byKey = new Map(nodeEntries.map((e) => [e.key, e]));
+  const indegree = new Map(nodeEntries.map((e) => [e.key, 0]));
+  const dependents = new Map(nodeEntries.map((e) => [e.key, []]));
+  for (const e of nodeEntries) {
+    for (const dep of e.dependencies) {
+      if (!byKey.has(dep) || dep === e.key) continue;
+      indegree.set(e.key, (indegree.get(e.key) ?? 0) + 1);
+      dependents.get(dep).push(e.key);
+    }
+  }
+  const sortReady = (a, b) =>
+    Number(b.priority ?? 0) - Number(a.priority ?? 0) ||
+    a.index - b.index ||
+    a.key.localeCompare(b.key);
+  const ready = nodeEntries.filter((e) => (indegree.get(e.key) ?? 0) === 0).sort(sortReady);
+  const ordered = [];
+  while (ready.length > 0) {
+    const cur = ready.shift();
+    ordered.push(cur);
+    for (const nxtKey of dependents.get(cur.key) ?? []) {
+      const nextDeg = (indegree.get(nxtKey) ?? 0) - 1;
+      indegree.set(nxtKey, nextDeg);
+      if (nextDeg === 0) {
+        ready.push(byKey.get(nxtKey));
+        ready.sort(sortReady);
+      }
+    }
+  }
+  if (ordered.length < nodeEntries.length) {
+    const seen = new Set(ordered.map((e) => e.key));
+    const rest = nodeEntries.filter((e) => !seen.has(e.key)).sort(sortReady);
+    ordered.push(...rest);
+  }
+  return ordered;
+}
+
+/**
+ * Pure preflight detector & resolver for concurrent non-causally-ordered sibling nodes
+ * sharing overlapping writePaths / targetFiles / files / ownedPaths.
+ */
+export function detectSiblingWritePathConflicts(nodes = [], options = {}) {
+  const list = Array.isArray(nodes) ? nodes : [];
+  const conflictPolicy =
+    options?.conflictPolicy === 'block' || options?.autoSerialize === false
+      ? 'block'
+      : 'serialize';
+
+  const clonedNodes = list.map((n) => {
+    const deps = Array.isArray(n?.dependencies)
+      ? [...new Set(n.dependencies.map(String))]
+      : parseJsonSafe(n?.dependenciesJson, []);
+    return {
+      ...n,
+      dependencies: deps,
+      ...(n?.budget && typeof n.budget === 'object' ? { budget: { ...n.budget } } : {}),
+    };
+  });
+
+  const entries = clonedNodes.map((n, index) => ({
+    key: String(n?.nodeKey ?? n?.taskKey ?? n?.id ?? `node-${index + 1}`),
+    index,
+    priority: Number(n?.priority ?? 0),
+    dependencies: n.dependencies,
+    writePaths: extractNodeWritePaths(n),
+    node: n,
+  }));
+
+  const initialAncestors = computeAncestorMap(entries);
+  const conflicts = [];
+  const conflictPairs = new Map();
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const a = entries[i];
+    if (a.writePaths.length === 0) continue;
+    for (let j = i + 1; j < entries.length; j += 1) {
+      const b = entries[j];
+      if (b.writePaths.length === 0) continue;
+      const aAncOfB = initialAncestors.get(b.key)?.has(a.key);
+      const bAncOfA = initialAncestors.get(a.key)?.has(b.key);
+      if (aAncOfB || bAncOfA) continue;
+
+      const overlapping = [];
+      const seenOverlap = new Set();
+      for (const pa of a.writePaths) {
+        for (const pb of b.writePaths) {
+          if (writePathsOverlap(pa, pb)) {
+            const label =
+              comparableWritePath(pa) === comparableWritePath(pb)
+                ? pa
+                : pa.length >= pb.length
+                  ? pa
+                  : pb;
+            const cmp = comparableWritePath(label);
+            if (!seenOverlap.has(cmp)) {
+              seenOverlap.add(cmp);
+              overlapping.push(label);
+            }
+          }
+        }
+      }
+      if (overlapping.length > 0) {
+        const pairKey = `${a.key}::${b.key}`;
+        const revKey = `${b.key}::${a.key}`;
+        conflictPairs.set(pairKey, overlapping);
+        conflictPairs.set(revKey, overlapping);
+        conflicts.push({
+          code: 'WRITE_PATH_CONFLICT',
+          nodes: [a.key, b.key],
+          nodeKeys: [a.key, b.key],
+          overlappingPaths: overlapping,
+        });
+      }
+    }
+  }
+
+  if (conflicts.length === 0) {
+    return {
+      hasConflicts: false,
+      conflictPolicy,
+      blocked: false,
+      code: null,
+      message: null,
+      conflicts: [],
+      nodes: clonedNodes,
+      addedEdges: [],
+      writeConflictResolution: null,
+    };
+  }
+
+  if (conflictPolicy === 'block') {
+    const summary = conflicts
+      .map((c) => `${c.nodeKeys.join(' <-> ')} (${c.overlappingPaths.join(', ')})`)
+      .join('; ');
+    return {
+      hasConflicts: true,
+      conflictPolicy: 'block',
+      blocked: true,
+      code: 'WRITE_PATH_CONFLICT',
+      message: `Sibling write-path conflict detected: ${summary}`,
+      conflicts,
+      nodes: clonedNodes,
+      addedEdges: [],
+      writeConflictResolution: {
+        mode: 'block',
+        policy: 'block',
+        hasConflicts: true,
+        code: 'WRITE_PATH_CONFLICT',
+        blocked: true,
+        resolved: false,
+        conflicts,
+        serializedEdges: [],
+      },
+    };
+  }
+
+  // Deterministic acyclic auto-serialization along topological order
+  const topo = computeDeterministicTopoOrder(entries);
+  const liveAncestors = computeAncestorMap(entries);
+  const dependentsMap = new Map(entries.map((e) => [e.key, new Set()]));
+  for (const e of entries) {
+    for (const dep of e.dependencies) {
+      dependentsMap.get(dep)?.add(e.key);
+    }
+  }
+  const addDependencyEdge = (fromKey, toKey) => {
+    const ancTo = liveAncestors.get(toKey) ?? new Set();
+    const ancFrom = liveAncestors.get(fromKey) ?? new Set();
+    const addedSet = new Set([fromKey, ...ancFrom]);
+    for (const k of addedSet) ancTo.add(k);
+    liveAncestors.set(toKey, ancTo);
+    dependentsMap.get(fromKey)?.add(toKey);
+    // Propagate new ancestors transitively to all descendants of toKey
+    const queue = [...(dependentsMap.get(toKey) ?? [])];
+    const visited = new Set([toKey]);
+    while (queue.length > 0) {
+      const desc = queue.shift();
+      if (!desc || visited.has(desc)) continue;
+      visited.add(desc);
+      const descAnc = liveAncestors.get(desc) ?? new Set();
+      let changed = false;
+      for (const k of addedSet) {
+        if (!descAnc.has(k)) {
+          descAnc.add(k);
+          changed = true;
+        }
+      }
+      if (changed) {
+        liveAncestors.set(desc, descAnc);
+        for (const nxt of dependentsMap.get(desc) ?? []) {
+          queue.push(nxt);
+        }
+      }
+    }
+  };
+
+  const addedEdges = [];
+  const perNodeSerializedAfter = new Map();
+  for (let vIdx = 1; vIdx < topo.length; vIdx += 1) {
+    const v = topo[vIdx];
+    for (let uIdx = vIdx - 1; uIdx >= 0; uIdx -= 1) {
+      const u = topo[uIdx];
+      const overlapping = conflictPairs.get(`${u.key}::${v.key}`);
+      if (!overlapping) continue;
+      if (liveAncestors.get(v.key)?.has(u.key)) continue;
+
+      if (!v.node.dependencies.includes(u.key)) {
+        v.node.dependencies = [...v.node.dependencies, u.key];
+      }
+      addDependencyEdge(u.key, v.key);
+      const edge = {
+        from: u.key,
+        to: v.key,
+        overlappingPaths: overlapping,
+        reason: 'WRITE_PATH_CONFLICT_SERIALIZED',
+      };
+      addedEdges.push(edge);
+      if (!perNodeSerializedAfter.has(v.key)) {
+        perNodeSerializedAfter.set(v.key, {
+          policy: 'serialize',
+          serializedAfter: [],
+          overlappingPaths: new Set(),
+        });
+      }
+      const rec = perNodeSerializedAfter.get(v.key);
+      rec.serializedAfter.push(u.key);
+      for (const p of overlapping) rec.overlappingPaths.add(p);
+    }
+  }
+
+  for (const e of entries) {
+    const rec = perNodeSerializedAfter.get(e.key);
+    if (!rec) continue;
+    const nodeMeta = {
+      policy: 'serialize',
+      serializedAfter: rec.serializedAfter,
+      overlappingPaths: [...rec.overlappingPaths],
+    };
+    e.node.writeConflictResolution = nodeMeta;
+    if (e.node.budget && typeof e.node.budget === 'object') {
+      e.node.budget = { ...e.node.budget, writeConflictResolution: nodeMeta };
+    }
+  }
+
+  const writeConflictResolution = {
+    mode: 'serialize',
+    policy: 'serialize',
+    hasConflicts: true,
+    code: 'WRITE_PATH_CONFLICT',
+    blocked: false,
+    resolved: true,
+    conflicts,
+    serializedEdges: addedEdges,
+  };
+
+  return {
+    hasConflicts: true,
+    conflictPolicy: 'serialize',
+    blocked: false,
+    code: 'WRITE_PATH_CONFLICT',
+    message: null,
+    conflicts,
+    nodes: clonedNodes,
+    addedEdges,
+    writeConflictResolution,
+  };
+}
+
 /**
  * Layer 6 DynamicTaskPlanner:
  * - Validates acyclic DAGs using Kahn topological sort
@@ -258,6 +636,10 @@ export class DynamicTaskPlanner {
       const rawKey = String(n.nodeKey || n.key || `node-${idx + 1}`).trim();
       const nodeKey = sanitizeNodeKey(rawKey, idx, seen);
       if (rawKey && !keyMap.has(rawKey)) keyMap.set(rawKey, nodeKey);
+      const ownedPaths = normalizePathList(n.ownedPaths ?? n.metadata?.ownedPaths);
+      const writePaths = normalizePathList(n.writePaths ?? n.metadata?.writePaths);
+      const targetFiles = normalizePathList(n.targetFiles ?? n.metadata?.targetFiles);
+      const files = normalizePathList(n.files ?? n.metadata?.files);
       return {
         nodeKey,
         objective: String(n.objective || '').trim() || `Subtask ${idx + 1}`,
@@ -272,9 +654,10 @@ export class DynamicTaskPlanner {
         allowIsolationFallback: Boolean(n.allowIsolationFallback),
         roleTitle: n.roleTitle ? String(n.roleTitle).trim().slice(0, 120) : null,
         focus: n.focus ? String(n.focus).trim().slice(0, 240) : null,
-        ownedPaths: Array.isArray(n.ownedPaths)
-          ? [...new Set(n.ownedPaths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 32)
-          : [],
+        ownedPaths: ownedPaths.slice(0, 32),
+        ...(writePaths.length ? { writePaths } : {}),
+        ...(targetFiles.length ? { targetFiles } : {}),
+        ...(files.length ? { files } : {}),
         priority: Number(n.priority ?? 0),
         budget: n.budget && typeof n.budget === 'object' ? { ...n.budget } : {},
       };
@@ -329,6 +712,7 @@ export class DynamicTaskPlanner {
     treeId = null,
     sessionId = null,
     leaseGuard = null,
+    conflictPolicy = undefined,
   }) {
     if (budgetLedger && treeId && budgetLedger.isExhausted(treeId)) {
       throw new BudgetError('BUDGET_EXCEEDED', {
@@ -431,9 +815,28 @@ export class DynamicTaskPlanner {
         if (Array.isArray(rawList) && rawList.length > 0 && rawList.every((x) => x?.objective)) {
           const normalized = this.normalizeNodes(rawList.slice(0, maxNodes));
           this.validateDag(normalized);
-          const nodes = attachRepoContext(this.#applyAdaptiveBudgets(normalized, {
+          const effectiveConflictPolicy = conflictPolicy ?? budget?.conflictPolicy ?? 'serialize';
+          const preflight = detectSiblingWritePathConflicts(normalized, {
+            conflictPolicy: effectiveConflictPolicy,
+          });
+          if (preflight.blocked) {
+            throw new Fault('WRITE_PATH_CONFLICT', 409, {
+              message: preflight.message,
+              ...preflight.writeConflictResolution,
+            });
+          }
+          const resolved = preflight.nodes;
+          this.validateDag(resolved);
+          const nodes = attachRepoContext(this.#applyAdaptiveBudgets(resolved, {
             budget, store, model: picked, repoContext: compactRepoContext,
           }));
+          if (preflight.writeConflictResolution) {
+            Object.defineProperty(nodes, 'writeConflictResolution', {
+              value: preflight.writeConflictResolution,
+              enumerable: false,
+              configurable: true,
+            });
+          }
           if (nodes.length === 1 && typeof parsed.teamRationale === 'string') {
             nodes.teamRationale = parsed.teamRationale.trim().slice(0, 500);
           }
@@ -455,7 +858,13 @@ export class DynamicTaskPlanner {
           }
         }
         signal?.throwIfAborted();
-        if (err?.category === 'cancellation' || err?.code === 'LEASE_LOST' || err instanceof BudgetError || err?.category === 'budget') {
+        if (
+          err?.category === 'cancellation' ||
+          err?.code === 'LEASE_LOST' ||
+          err?.code === 'WRITE_PATH_CONFLICT' ||
+          err instanceof BudgetError ||
+          err?.category === 'budget'
+        ) {
           throw err;
         }
         // Fall through to deterministic heuristic decomposition
@@ -537,14 +946,34 @@ export class DynamicTaskPlanner {
     }] : lookup ? fallback.slice(0, 1) : fallback;
     const normalized = this.normalizeNodes(nodes);
     this.validateDag(normalized);
-    return attachRepoContext(
-      this.#applyAdaptiveBudgets(normalized, {
+    const effectiveConflictPolicy = conflictPolicy ?? budget?.conflictPolicy ?? 'serialize';
+    const preflight = detectSiblingWritePathConflicts(normalized, {
+      conflictPolicy: effectiveConflictPolicy,
+    });
+    if (preflight.blocked) {
+      throw new Fault('WRITE_PATH_CONFLICT', 409, {
+        message: preflight.message,
+        ...preflight.writeConflictResolution,
+      });
+    }
+    const resolved = preflight.nodes;
+    this.validateDag(resolved);
+    const budgeted = attachRepoContext(
+      this.#applyAdaptiveBudgets(resolved, {
         budget,
         store,
         model: picked,
         repoContext: compactRepoContext,
       }),
     );
+    if (preflight.writeConflictResolution) {
+      Object.defineProperty(budgeted, 'writeConflictResolution', {
+        value: preflight.writeConflictResolution,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    return budgeted;
   }
 
   addNode(store, runId, nodeSpec, { leaseGuard = null } = {}) {
@@ -601,7 +1030,7 @@ export class DynamicTaskPlanner {
       .get(runId, nodeKey);
     if (!row) return null;
     if (isTerminalNodeState(row.status)) return row;
-    return transitionSwarmNode(store, eventRouter, row.id, SWARM_NODE_STATES.CANCELLED, {
+    return transitionNodeTerminalCas(store, eventRouter, row.id, SWARM_NODE_STATES.CANCELLED, {
       sessionId,
       rootTurnId,
       leaseGuard,

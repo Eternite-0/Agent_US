@@ -30,15 +30,82 @@ export interface DiffLine {
   text: string;
 }
 
+export interface UnifiedDiffHunk {
+  header: string;
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: DiffLine[];
+}
+
 export interface ComputedFileDiff {
   path: string;
   added: number;
   deleted: number;
   isNew: boolean;
   isDeleted: boolean;
+  action?: string;
+  unifiedDiff?: string;
+  hunks?: UnifiedDiffHunk[];
+  sha256After?: string | null;
   beforeText: string;
   afterText: string;
   lines: DiffLine[];
+}
+
+export function parseUnifiedDiff(unifiedDiff: string): {
+  hunks: UnifiedDiffHunk[];
+  lines: DiffLine[];
+  added: number;
+  deleted: number;
+} {
+  const hunks: UnifiedDiffHunk[] = [];
+  const lines: DiffLine[] = [];
+  let added = 0;
+  let deleted = 0;
+  let current: UnifiedDiffHunk | null = null;
+  let oldLine = 1;
+  let newLine = 1;
+
+  for (const rawLine of String(unifiedDiff ?? '').replace(/\r\n/g, '\n').split('\n')) {
+    const hunkMatch = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(.*)$/.exec(rawLine);
+    if (hunkMatch) {
+      oldLine = Number(hunkMatch[1]);
+      newLine = Number(hunkMatch[3]);
+      current = {
+        header: rawLine,
+        oldStart: oldLine,
+        oldCount: hunkMatch[2] !== undefined ? Number(hunkMatch[2]) : 1,
+        newStart: newLine,
+        newCount: hunkMatch[4] !== undefined ? Number(hunkMatch[4]) : 1,
+        lines: [],
+      };
+      hunks.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (rawLine.startsWith('+++') || rawLine.startsWith('---') || rawLine === '\\ No newline at end of file') {
+      continue;
+    }
+    if (rawLine.startsWith('+')) {
+      const dl: DiffLine = { kind: 'add', oldLine: null, newLine: newLine++, text: rawLine.slice(1) };
+      current.lines.push(dl);
+      lines.push(dl);
+      added++;
+    } else if (rawLine.startsWith('-')) {
+      const dl: DiffLine = { kind: 'del', oldLine: oldLine++, newLine: null, text: rawLine.slice(1) };
+      current.lines.push(dl);
+      lines.push(dl);
+      deleted++;
+    } else if (rawLine.startsWith(' ')) {
+      const dl: DiffLine = { kind: 'context', oldLine: oldLine++, newLine: newLine++, text: rawLine.slice(1) };
+      current.lines.push(dl);
+      lines.push(dl);
+    }
+  }
+
+  return { hunks, lines, added, deleted };
 }
 
 export function computeDiff(beforeText: string, afterText: string): {
@@ -122,14 +189,41 @@ export function aggregateFileChanges(
   artifactFiles?: Record<string, string>,
   baselineFiles?: Record<string, string>,
 ): ComputedFileDiff[] {
-  const byPath = new Map<string, { before: string | null; after: string | null }>();
+  const byPath = new Map<
+    string,
+    {
+      before: string | null;
+      after: string | null;
+      action?: string;
+      unifiedDiff?: string;
+      additions?: number;
+      deletions?: number;
+      sha256After?: string | null;
+      deltaCount: number;
+    }
+  >();
 
   for (const ch of changesList) {
     const existing = byPath.get(ch.path);
     if (!existing) {
-      byPath.set(ch.path, { before: ch.before, after: ch.after });
+      byPath.set(ch.path, {
+        before: ch.before,
+        after: ch.after,
+        action: ch.action,
+        unifiedDiff: ch.unifiedDiff,
+        additions: ch.additions,
+        deletions: ch.deletions,
+        sha256After: ch.sha256After,
+        deltaCount: 1,
+      });
     } else {
       existing.after = ch.after;
+      existing.action = ch.action ?? existing.action;
+      existing.unifiedDiff = ch.unifiedDiff ?? existing.unifiedDiff;
+      existing.sha256After = ch.sha256After ?? existing.sha256After;
+      existing.additions = undefined;
+      existing.deletions = undefined;
+      existing.deltaCount += 1;
     }
   }
 
@@ -141,7 +235,7 @@ export function aggregateFileChanges(
         const base = baselineFiles?.[path] ?? null;
         // If identical to original attached input file and no actual edit happened, skip as "edited"
         if (base !== null && base === b64) continue;
-        byPath.set(path, { before: base, after: b64 });
+        byPath.set(path, { before: base, after: b64, deltaCount: 1 });
       }
     }
   }
@@ -150,16 +244,28 @@ export function aggregateFileChanges(
   for (const [path, delta] of byPath.entries()) {
     const beforeText = decodeBase64Utf8(delta.before);
     const afterText = decodeBase64Utf8(delta.after);
-    const { lines, added, deleted } = computeDiff(beforeText, afterText);
+    const parsedPatch = delta.unifiedDiff ? parseUnifiedDiff(delta.unifiedDiff) : null;
+    const useParsedPatch = Boolean(
+      parsedPatch && parsedPatch.hunks.length > 0 && (delta.deltaCount === 1 || (!delta.before && !delta.after)),
+    );
+    const computed = useParsedPatch
+      ? { lines: parsedPatch!.lines, added: parsedPatch!.added, deleted: parsedPatch!.deleted }
+      : computeDiff(beforeText, afterText);
+    const added = typeof delta.additions === 'number' ? delta.additions : computed.added;
+    const deleted = typeof delta.deletions === 'number' ? delta.deletions : computed.deleted;
     results.push({
       path,
       added,
       deleted,
-      isNew: delta.before === null && delta.after !== null,
-      isDeleted: delta.before !== null && delta.after === null,
+      isNew: delta.action === 'create' || (delta.before === null && delta.after !== null),
+      isDeleted: delta.action === 'delete' || (delta.before !== null && delta.after === null),
+      ...(delta.action ? { action: delta.action } : {}),
+      ...(delta.unifiedDiff ? { unifiedDiff: delta.unifiedDiff } : {}),
+      ...(useParsedPatch && parsedPatch ? { hunks: parsedPatch.hunks } : {}),
+      ...(delta.sha256After !== undefined ? { sha256After: delta.sha256After } : {}),
       beforeText,
       afterText,
-      lines,
+      lines: computed.lines,
     });
   }
 
