@@ -1,7 +1,8 @@
 import { CopyFeedbackIcon } from './CopyFeedbackIcon';
 import { SwarmThreadCard } from './SwarmThreadCard';
 import { groupDirectMessages, isDirectTurnEnd, type DirectLiveStream, type DirectLiveToolOutput, type DirectTimelineBlock } from '../utils/directMessages';
-import { ActivityDisclosureScope, DirectActivityGroup, DirectTurnProcess } from './DirectActivity';
+import { extractTurnAciTelemetry } from '../utils/aciTelemetry.ts';
+import { AciTurnTelemetryStrip, ActivityDisclosureScope, DirectActivityGroup, DirectTurnProcess } from './DirectActivity';
 import type { CommandAvailability, MentionExtension, SlashCommand } from './slashCommands';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
@@ -183,7 +184,7 @@ interface ThreadViewProps {
     scope?: 'once' | 'session',
     outcome?: 'happened' | 'not_applied' | 'abort',
   ) => Promise<void>;
-  onOpenInspector: (tab: InspectorTab, filePath?: string, targetTaskId?: string) => void;
+  onOpenInspector: (tab: InspectorTab, filePath?: string, targetTaskId?: string, line?: number) => void;
   onOpenSubagent: (workerId: string | null, targetTaskId?: string) => void;
   onToggleInspector: () => void;
   onClearFocusWorker: () => void;
@@ -517,6 +518,16 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       visibleEvidence.length || task.plan || isLive || workers.length > 0 || hasRuntimeActivity,
     );
 
+    const combinedEvents = recentEvents?.length ? [...events, ...recentEvents] : events;
+    const aciTelemetry = extractTurnAciTelemetry(combinedEvents);
+    const aciTelemetryByTurn = new Map<string, ReturnType<typeof extractTurnAciTelemetry>>();
+    for (const ex of directExchanges) {
+      if (ex.turnId) {
+        const t = extractTurnAciTelemetry(combinedEvents, ex.turnId);
+        if (t) aciTelemetryByTurn.set(ex.turnId, t);
+      }
+    }
+
     return {
       bundle: b,
       imageFiles: { ...task.files, ...artFiles },
@@ -537,6 +548,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       hasProcess,
       isDirectSession,
       directExchanges,
+      aciTelemetry,
+      aciTelemetryByTurn,
     };
   }, [focusWorkerId, isLiveBackend, routerReady]);
   const turnModelCache = useMemo(() => new WeakMap<TaskBundle, {
@@ -549,10 +562,13 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
     const stream = liveStreams[bundle.task.id];
     const output = liveToolOutputs[bundle.task.id];
     const snapshotSeq = bundle.events.at(-1)?.seq ?? 0;
-    const recent = recentRuntimeEvents?.filter((event) => event.seq > snapshotSeq &&
+    const recent = recentRuntimeEvents?.filter((event) =>
+      (event.seq > snapshotSeq || (event.seq === 0 && event.type === 'aci/telemetry')) &&
       (event.taskId === bundle.task.id || event.payload?.sessionId === bundle.task.id) &&
       (event.type === 'assistant/message' || event.type === 'tool/call' || event.type === 'tool/result' ||
-        event.type === 'tool/receipt' || event.type === 'turn/started' || isDirectTurnEnd(event.type) || event.type === 'session/rewound')) ?? [];
+        event.type === 'tool/receipt' || event.type === 'turn/started' || isDirectTurnEnd(event.type) ||
+        event.type === 'session/rewound' || event.type === 'aci/telemetry' || event.type === 'context/compacted' ||
+        event.type === 'loop/thrashing_warning')) ?? [];
     const cached = turnModelCache.get(bundle);
     if (cached && cached.stream === stream && cached.output === output &&
         cached.recent.length === recent.length && cached.recent.every((event, index) => event === recent[index])) return cached.model;
@@ -1336,11 +1352,16 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       const tail = ex.blocks.at(-1);
                       const final = !ex.active && tail?.kind === 'message' ? tail : undefined;
                       const renderBlock = (block: DirectTimelineBlock) => block.kind === 'activity'
-                        ? <DirectActivityGroup block={block} onInspectFile={(path) => onOpenInspector('diff', path, tid)} onCopy={onToast} />
+                        ? <DirectActivityGroup block={block} onInspectFile={(path, line) => onOpenInspector('diff', path, tid, line)} onCopy={onToast} />
                         : <DirectProse
                           text={block.text} live={Boolean(block.live)} animate={Boolean(block.live || block.justArrived)} taskId={tid} imageFiles={tm.imageFiles}
                           onInspect={onOpenInspector} onOpenImage={openThreadImage} onCopy={onToast}
                         />;
+                      const exAci = ex.turnId
+                        ? tm.aciTelemetryByTurn.get(ex.turnId) ?? null
+                        : ex === directExchanges.at(-1)
+                          ? tm.aciTelemetry
+                          : null;
                       return (
                         <div key={ex.key} className="codex-direct-exchange" data-scroll-anchor={ex.key}>
                           {ex.userText && (
@@ -1366,8 +1387,11 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                             <SwarmThreadCard run={runsById.get(ex.swarmRunId!)}
                               onOpen={onOpenSwarmRun ? () => onOpenSwarmRun(tid, ex.swarmRunId!) : undefined} />
                           ) : (
-                            <DirectTurnProcess activityId={ex.key} active={ex.active} timing={ex.timing}
-                              blocks={ex.blocks} finalBlockId={final?.id} renderBlock={renderBlock} />
+                            <>
+                              <DirectTurnProcess activityId={ex.key} active={ex.active} timing={ex.timing}
+                                blocks={ex.blocks} finalBlockId={final?.id} renderBlock={renderBlock} />
+                              {exAci && <AciTurnTelemetryStrip telemetry={exAci} />}
+                            </>
                           )}
                         </div>
                       );
@@ -1983,6 +2007,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       )}
                     </div>
                   )}
+                  {tm.aciTelemetry && <AciTurnTelemetryStrip telemetry={tm.aciTelemetry} />}
                   {progress}
                 </div>
               </React.Fragment>

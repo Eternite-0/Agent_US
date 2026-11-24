@@ -1,6 +1,18 @@
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { AciBudgetWatermarks, Approval, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
-import { aggregateFileChanges, buildDiffPresentation, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
+import {
+  aggregateFileChanges,
+  buildDiffPresentation,
+  decodeBase64Utf8,
+  extractDiffHunks,
+  foldDiffLines,
+  foldSplitDiffRows,
+  scrollIntoViewSafe,
+  stepHunkIndex,
+  type ComputedFileDiff,
+} from '../utils/diff';
+import { collectBundleDiagnostics, resolveMatchingFilePath } from '../utils/diagnostics.ts';
+import { extractTurnAciTelemetry, sumAdmissionDecisions } from '../utils/aciTelemetry.ts';
 import { fmtClock, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
 import {
   eventMatchesWorker,
@@ -52,6 +64,8 @@ interface InspectorDrawerProps {
   width: number;
   tab: InspectorTab;
   selectedFile: string | null;
+  selectedLine?: number | null;
+  lineRequest?: number;
   selectedSubagentId: string | null;
   projectName?: string;
   bundle: TaskBundle | null;
@@ -164,6 +178,8 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   width,
   tab,
   selectedFile,
+  selectedLine = null,
+  lineRequest,
   selectedSubagentId,
   projectName = 'Agent_US',
   bundle,
@@ -185,21 +201,40 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 }) => {
   const [resizing, setResizing] = useState(false);
   const resizeDrag = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
-  const [openTabs, setOpenTabs] = useState<OpenPaneTab[]>([
-    { id: 'subagents', kind: 'subagents', label: '子智能体' },
-  ]);
-  const [activeTabId, setActiveTabId] = useState<string>('subagents');
+  const initialTargetTab = (): OpenPaneTab | null => {
+    if (!open || tab === 'subagents') return null;
+    if (tab === 'autonomous') return { id: 'autonomous', kind: 'autonomous', label: '自主任务' };
+    if (tab === 'events') return { id: 'events', kind: 'events', label: '事件与版本' };
+    const p = selectedFile || '__all__';
+    const label = p === '__all__' ? '变更' : p.replace(/\\/g, '/').split('/').pop() || p;
+    return { id: `file:${p}`, kind: 'file', path: p, label };
+  };
+  const [openTabs, setOpenTabs] = useState<OpenPaneTab[]>(() => {
+    const base: OpenPaneTab[] = [{ id: 'subagents', kind: 'subagents', label: '子智能体' }];
+    const extra = initialTargetTab();
+    return extra ? [...base, extra] : base;
+  });
+  const [activeTabId, setActiveTabId] = useState<string>(() => initialTargetTab()?.id ?? 'subagents');
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
 
   // File IDE tab states
-  const [showChanges, setShowChanges] = useState(false);
+  const [showChanges, setShowChanges] = useState(() => Boolean(open && tab === 'diff'));
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [treeFilter, setTreeFilter] = useState('');
   const [collapsedDirs, setCollapsedDirs] = useState<Record<string, boolean>>({});
+  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<string>>(() => new Set());
+  const [activeHunkIndex, setActiveHunkIndex] = useState(0);
+  const [hunkJumpSeq, setHunkJumpSeq] = useState(0);
+  const [jumpTarget, setJumpTarget] = useState<{ path: string; line: number; seq: number } | null>(() =>
+    open && typeof selectedLine === 'number' && selectedLine > 0 && selectedFile
+      ? { path: selectedFile, line: selectedLine, seq: (tabRequest ?? 0) + (lineRequest ?? 0) + 1 }
+      : null,
+  );
   const [copiedFile, setCopiedFile] = useState(false);
   const [showAllSubagents, setShowAllSubagents] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [lightbox, setLightbox] = useState<{ images: PreviewImageItem[]; index: number } | null>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
 
   // Version snapshot state
   const [loadedVersion, setLoadedVersion] = useState<Task | null>(null);
@@ -287,6 +322,11 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     setActiveTabId(next.id);
   };
 
+  const { diagnostics: bundleDiagnostics, failingTests: bundleFailingTests, readFiles: bundleReadFiles } = useMemo(
+    () => collectBundleDiagnostics(bundle),
+    [bundle],
+  );
+
   // Sync external tab/file/subagent triggers cleanly into our multi-tab bar
   useEffect(() => {
     if (!open) return;
@@ -297,11 +337,16 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     } else if (tab === 'events') {
       ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
     } else if (tab === 'diff' || tab === 'artifacts') {
-      const targetPath = selectedFile || diffs[0]?.path;
+      const requested = selectedFile
+        ? resolveMatchingFilePath(selectedFile, diffs.map((d) => d.path)) ??
+          resolveMatchingFilePath(selectedFile, [...bundleReadFiles.keys()]) ??
+          selectedFile
+        : undefined;
+      const targetPath = requested || diffs[0]?.path;
       const targetDiff = diffs.find((d) => d.path === targetPath) ?? diffs[0];
       if (tab === 'diff' && targetDiff && (targetDiff.added > 0 || targetDiff.deleted > 0)) {
         setShowChanges(true);
-      } else if (tab === 'artifacts') {
+      } else if (tab === 'artifacts' || (targetPath && targetDiff?.path !== targetPath)) {
         setShowChanges(false);
       }
       if (targetPath) {
@@ -311,7 +356,20 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
         ensureTab({ id: 'file:__all__', kind: 'file', path: '__all__', label: '变更' });
       }
     }
-  }, [open, tab, tabRequest, selectedFile, diffs.length]);
+  }, [open, tab, tabRequest, selectedFile, diffs.length, bundleReadFiles]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (typeof selectedLine === 'number' && selectedLine > 0 && selectedFile) {
+      const resolved =
+        resolveMatchingFilePath(selectedFile, diffs.map((d) => d.path)) ??
+        resolveMatchingFilePath(selectedFile, [...bundleReadFiles.keys()]) ??
+        selectedFile;
+      setJumpTarget({ path: resolved, line: selectedLine, seq: (tabRequest ?? 0) + (lineRequest ?? 0) + 1 });
+    } else if (selectedLine === null) {
+      setJumpTarget(null);
+    }
+  }, [open, selectedLine, selectedFile, tabRequest, lineRequest, diffs, bundleReadFiles]);
 
   const activePaneTab = openTabs.find((t) => t.id === activeTabId) ?? openTabs[0] ?? null;
 
@@ -353,11 +411,58 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   }, [open, activePaneTab?.kind, selectedSubagentId]);
 
   const activeFileDiff = useMemo(() => {
-    if (activePaneTab?.kind === 'file' && activePaneTab.path !== '__all__') {
-      return diffs.find((d) => d.path === activePaneTab.path) ?? diffs[0] ?? null;
+    const requestedPath =
+      activePaneTab?.kind === 'file' && activePaneTab.path !== '__all__' ? activePaneTab.path : selectedFile;
+    if (requestedPath) {
+      const matched = resolveMatchingFilePath(requestedPath, diffs.map((d) => d.path));
+      if (matched) return diffs.find((d) => d.path === matched) ?? null;
+      const readMatch = resolveMatchingFilePath(requestedPath, [...bundleReadFiles.keys()]);
+      if (readMatch) {
+        const text = bundleReadFiles.get(readMatch) ?? '';
+        return {
+          path: readMatch,
+          added: 0,
+          deleted: 0,
+          isNew: false,
+          isDeleted: false,
+          beforeText: text,
+          afterText: text,
+          lines: text
+            .replace(/\r\n/g, '\n')
+            .split('\n')
+            .map((line, i) => ({ kind: 'context' as const, oldLine: i + 1, newLine: i + 1, text: line })),
+        };
+      }
+      if (activePaneTab?.kind === 'file' && activePaneTab.path !== '__all__') {
+        return null;
+      }
     }
-    return diffs.find((d) => d.path === selectedFile) ?? diffs[0] ?? null;
-  }, [activePaneTab, diffs, selectedFile]);
+    return diffs[0] ?? null;
+  }, [activePaneTab, diffs, selectedFile, bundleReadFiles]);
+
+  const effectiveSelectedLine = useMemo(() => {
+    if (!jumpTarget || jumpTarget.line <= 0) return null;
+    if (activeFileDiff) {
+      const matched = resolveMatchingFilePath(jumpTarget.path, [activeFileDiff.path]);
+      return matched === activeFileDiff.path ? jumpTarget.line : null;
+    }
+    if (activePaneTab?.kind === 'file' && activePaneTab.path === jumpTarget.path) {
+      return jumpTarget.line;
+    }
+    return null;
+  }, [jumpTarget, activeFileDiff, activePaneTab]);
+
+  const diffHunks = useMemo(() => extractDiffHunks(activeFileDiff?.lines ?? []), [activeFileDiff?.lines]);
+  const hunkStartByLineRef = useMemo(
+    () => new Map(diffHunks.map((h) => [h.firstLine, h.index])),
+    [diffHunks],
+  );
+
+  useEffect(() => {
+    setExpandedFolds(new Set());
+    setActiveHunkIndex(0);
+    setHunkJumpSeq(0);
+  }, [activeFileDiff?.path]);
 
   const filteredDiffs = useMemo(() => {
     const q = treeFilter.trim().toLowerCase();
@@ -380,6 +485,49 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     () => buildDiffPresentation(activeFileDiff?.lines ?? []),
     [activeFileDiff?.lines],
   );
+
+  const foldedUnifiedEntries = useMemo(
+    () =>
+      foldDiffLines(activeFileDiff?.lines ?? [], expandedFolds, {
+        revealLine: effectiveSelectedLine,
+      }),
+    [activeFileDiff?.lines, expandedFolds, effectiveSelectedLine],
+  );
+
+  const foldedSplitEntries = useMemo(
+    () =>
+      foldSplitDiffRows(splitRows, expandedFolds, {
+        revealLine: effectiveSelectedLine,
+      }),
+    [splitRows, expandedFolds, effectiveSelectedLine],
+  );
+
+  const jumpToHunk = (delta: number) => {
+    if (!diffHunks.length) return;
+    const nextIdx = stepHunkIndex(activeHunkIndex, delta, diffHunks.length);
+    setActiveHunkIndex(nextIdx);
+    setHunkJumpSeq((s) => s + 1);
+  };
+
+  useEffect(() => {
+    if (!open || activePaneTab?.kind !== 'file' || !showChanges || hunkJumpSeq === 0) return;
+    const el = editorRef.current?.querySelector<HTMLElement>(`[data-hunk-index="${activeHunkIndex}"]`);
+    scrollIntoViewSafe(el, 'center');
+  }, [open, activePaneTab?.kind, showChanges, diffMode, activeHunkIndex, hunkJumpSeq]);
+
+  useEffect(() => {
+    if (!open || activePaneTab?.kind !== 'file' || !effectiveSelectedLine) return;
+    const el = editorRef.current?.querySelector<HTMLElement>('[data-selected="true"]');
+    scrollIntoViewSafe(el, 'center');
+  }, [open, activePaneTab?.kind, activeFileDiff?.path, effectiveSelectedLine, jumpTarget?.seq, showChanges, diffMode]);
+
+  const expandFold = (foldId: string) => {
+    setExpandedFolds((prev) => {
+      const next = new Set(prev);
+      next.add(foldId);
+      return next;
+    });
+  };
 
   const latestAciWatermarks = useMemo<AciBudgetWatermarks | null>(() => {
     const events = bundle?.events ?? [];
@@ -432,6 +580,11 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     }
     return null;
   }, [bundle?.events]);
+
+  const latestTurnAci = useMemo(
+    () => extractTurnAciTelemetry(bundle?.events),
+    [bundle?.events],
+  );
 
   const stopResize = (pointerId: number) => {
     if (resizeDrag.current?.pointerId !== pointerId) return;
@@ -492,11 +645,28 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     pendingTabFocus.current = null;
   }, [openTabs]);
 
-  const openFileInPane = (path: string) => {
-    const base = path.replace(/\\/g, '/').split('/').pop() || path;
-    onSelectFile(path);
+  const openFileInPane = (path: string, line?: number) => {
+    const resolved =
+      resolveMatchingFilePath(path, diffs.map((d) => d.path)) ??
+      resolveMatchingFilePath(path, [...bundleReadFiles.keys()]) ??
+      path;
+    const base = resolved.replace(/\\/g, '/').split('/').pop() || resolved;
+    onSelectFile(resolved);
     onChangeTab('diff');
-    ensureTab({ id: `file:${path}`, kind: 'file', path, label: base });
+    const matchedDiff = diffs.find((d) => d.path === resolved);
+    if (matchedDiff && (matchedDiff.added > 0 || matchedDiff.deleted > 0)) {
+      if (typeof line === 'number' && line > 0 && !matchedDiff.lines.some((ln) => ln.newLine === line || ln.oldLine === line)) {
+        setShowChanges(false);
+      }
+    } else {
+      setShowChanges(false);
+    }
+    if (typeof line === 'number' && line > 0) {
+      setJumpTarget({ path: resolved, line, seq: Date.now() });
+    } else {
+      setJumpTarget(null);
+    }
+    ensureTab({ id: `file:${resolved}`, kind: 'file', path: resolved, label: base });
   };
 
   const copyActiveFile = async () => {
@@ -629,6 +799,24 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
           event.stopPropagation();
           if (plusMenuOpen) closePlusMenu();
           else onClose();
+          return;
+        }
+        if (
+          activePaneTab?.kind === 'file' &&
+          showChanges &&
+          diffHunks.length > 0 &&
+          event.altKey &&
+          !event.ctrlKey &&
+          !event.metaKey &&
+          !event.shiftKey
+        ) {
+          if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            jumpToHunk(-1);
+          } else if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            jumpToHunk(1);
+          }
         }
       }}
       className="codex-drawer codex-inspector-drawer"
@@ -1022,6 +1210,37 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                         <span>{diffMode === 'unified' ? '双栏' : '单栏'}</span>
                       </button>
                     )}
+                    {showChanges && diffHunks.length > 0 && (
+                      <span className="codex-diff-hunk-nav" role="group" aria-label="变更块导航">
+                        <button
+                          type="button"
+                          className="codex-icon-btn"
+                          style={{ width: 24, height: 24 }}
+                          aria-label="上一个变更块"
+                          title="上一个变更块 (Alt+↑)"
+                          onClick={() => jumpToHunk(-1)}
+                        >
+                          <IconChevronDown size={12} style={{ transform: 'rotate(180deg)' }} />
+                        </button>
+                        <span
+                          className="codex-diff-hunk-indicator tabular-nums"
+                          data-active-hunk={activeHunkIndex + 1}
+                          aria-live="polite"
+                        >
+                          {activeHunkIndex + 1}/{diffHunks.length}
+                        </span>
+                        <button
+                          type="button"
+                          className="codex-icon-btn"
+                          style={{ width: 24, height: 24 }}
+                          aria-label="下一个变更块"
+                          title="下一个变更块 (Alt+↓)"
+                          onClick={() => jumpToHunk(1)}
+                        >
+                          <IconChevronDown size={12} />
+                        </button>
+                      </span>
+                    )}
                     <button
                       type="button"
                       className="codex-icon-btn"
@@ -1046,12 +1265,73 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
               </div>
             </div>
 
+            {(bundleDiagnostics.length > 0 || bundleFailingTests.length > 0) && (
+              <div className="codex-ide-diagnostics" aria-label="诊断与测试失败定位">
+                {bundleDiagnostics.map((d, idx) => {
+                  const loc = `${d.file}:${d.line}${d.column ? `:${d.column}` : ''}`;
+                  return (
+                    <div key={`diag-${loc}-${idx}`} className="codex-diag-test-item">
+                      <button
+                        type="button"
+                        className="codex-diag-row"
+                        data-severity={d.severity}
+                        onClick={() => openFileInPane(d.file, d.line)}
+                      >
+                        <code className="codex-diag-loc">{loc}</code>
+                        {d.code && <span className="codex-diag-code">{d.code}</span>}
+                        <span className="codex-diag-msg">{d.testName ? `${d.testName}: ${d.message}` : d.message}</span>
+                      </button>
+                      {(d.expected !== undefined || d.actual !== undefined) && (
+                        <div className="codex-diag-diff">
+                          <span data-kind="expected">预期: <code>{d.expected ?? '—'}</code></span>
+                          <span data-kind="actual">实际: <code>{d.actual ?? '—'}</code></span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {bundleFailingTests.map((t, idx) => {
+                  const title = t.testName || t.name;
+                  const loc = t.file ? `${t.file}${t.line ? `:${t.line}` : ''}` : '';
+                  return (
+                    <div key={`test-${title}-${idx}`} className="codex-diag-test-item">
+                      {t.file ? (
+                        <button
+                          type="button"
+                          className="codex-diag-row"
+                          data-severity="error"
+                          onClick={() => openFileInPane(t.file!, t.line)}
+                        >
+                          <span className="codex-diag-code">FAIL</span>
+                          <span className="codex-diag-msg">{title}</span>
+                          <code className="codex-diag-loc">{loc}</code>
+                        </button>
+                      ) : (
+                        <div className="codex-diag-row" data-severity="error">
+                          <span className="codex-diag-code">FAIL</span>
+                          <span className="codex-diag-msg">{title}</span>
+                        </div>
+                      )}
+                      {(t.expected !== undefined || t.actual !== undefined) && (
+                        <div className="codex-diag-diff">
+                          <span data-kind="expected">预期: <code>{t.expected ?? '—'}</code></span>
+                          <span data-kind="actual">实际: <code>{t.actual ?? '—'}</code></span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
             {/* Split Body: Left Code/Diff Viewer + Right Changed Files Tree */}
             <div className="codex-ide-body">
-              <div className="codex-ide-editor" role="region" aria-label={showChanges ? '文件差异' : '文件预览'} tabIndex={0}>
+              <div ref={editorRef} className="codex-ide-editor" role="region" aria-label={showChanges ? '文件差异' : '文件预览'} tabIndex={0}>
                 {!activeFileDiff ? (
                   <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>
-                    当前任务暂无文件变更或产物。
+                    {activePaneTab?.kind === 'file' && activePaneTab.path !== '__all__'
+                      ? `${activePaneTab.path}${effectiveSelectedLine ? `:${effectiveSelectedLine}` : ''} 暂无可预览源码快照。`
+                      : '当前任务暂无文件变更或产物。'}
                   </div>
                 ) : isImagePath(activeFileDiff.path) ? (
                   (() => {
@@ -1101,11 +1381,14 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   <div>
                     {activeFileDiff.afterText.replace(/\r\n/g, '\n').split('\n').map((line, i) => {
                       const ln = i + 1;
+                      const isSelected = effectiveSelectedLine === ln;
                       return (
                         <div
                           key={ln}
                           className="codex-code-line"
+                          data-line={ln}
                           data-change={addedLineNumbers.has(ln) ? 'add' : undefined}
+                          data-selected={isSelected ? 'true' : undefined}
                         >
                           <span className="codex-code-ln">{ln}</span>
                           <span className="codex-code-src">{highlightCodeLine(line)}</span>
@@ -1115,28 +1398,87 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   </div>
                 ) : diffMode === 'unified' ? (
                   <div className="codex-diff-table">
-                    {activeFileDiff.lines.map((line, idx) => (
-                      <div key={idx} className="codex-diff-line" data-kind={line.kind}>
-                        <span className="codex-diff-ln">{line.oldLine ?? ''}</span>
-                        <span className="codex-diff-ln">{line.newLine ?? ''}</span>
-                        <DiffLineSign kind={line.kind} />
-                        <DiffLineText line={line} spans={spansByLine.get(line)} />
-                      </div>
-                    ))}
+                    {foldedUnifiedEntries.map((entry) => {
+                      if (entry.kind === 'fold') {
+                        return (
+                          <button
+                            key={entry.id}
+                            type="button"
+                            className="codex-diff-fold-btn"
+                            aria-expanded={false}
+                            onClick={() => expandFold(entry.id)}
+                          >
+                            展开 {entry.count} 行上下文
+                          </button>
+                        );
+                      }
+                      const line = entry.item;
+                      const hunkIdx = hunkStartByLineRef.get(line);
+                      const targetNo = line.newLine ?? line.oldLine;
+                      const isSelected = Boolean(effectiveSelectedLine && targetNo === effectiveSelectedLine);
+                      return (
+                        <div
+                          key={entry.index}
+                          className="codex-diff-line"
+                          data-kind={line.kind}
+                          data-line={targetNo ?? undefined}
+                          data-selected={isSelected ? 'true' : undefined}
+                          data-hunk-index={hunkIdx !== undefined ? hunkIdx : undefined}
+                          data-hunk-active={hunkIdx !== undefined && hunkIdx === activeHunkIndex ? 'true' : undefined}
+                        >
+                          <span className="codex-diff-ln">{line.oldLine ?? ''}</span>
+                          <span className="codex-diff-ln">{line.newLine ?? ''}</span>
+                          <DiffLineSign kind={line.kind} />
+                          <DiffLineText line={line} spans={spansByLine.get(line)} />
+                        </div>
+                      );
+                    })}
                   </div>
                 ) : (
                   <div className="codex-diff-split">
-                    {splitRows.map((row, idx) => (
-                      <React.Fragment key={idx}>
-                        {[row.left, row.right].map((line, side) => (
-                          <div key={side} className="codex-diff-split-cell" data-kind={line?.kind ?? 'empty'} aria-hidden={!line}>
-                            <span className="codex-diff-ln">{(side === 0 ? line?.oldLine : line?.newLine) ?? ''}</span>
-                            <DiffLineSign kind={line?.kind} />
-                            <DiffLineText line={line} spans={line ? spansByLine.get(line) : undefined} />
-                          </div>
-                        ))}
-                      </React.Fragment>
-                    ))}
+                    {foldedSplitEntries.map((entry) => {
+                      if (entry.kind === 'fold') {
+                        return (
+                          <button
+                            key={entry.id}
+                            type="button"
+                            className="codex-diff-fold-btn codex-diff-split-fold"
+                            aria-expanded={false}
+                            onClick={() => expandFold(entry.id)}
+                          >
+                            展开 {entry.count} 行上下文
+                          </button>
+                        );
+                      }
+                      const row = entry.item;
+                      const hunkIdx =
+                        (row.left ? hunkStartByLineRef.get(row.left) : undefined) ??
+                        (row.right ? hunkStartByLineRef.get(row.right) : undefined);
+                      return (
+                        <React.Fragment key={entry.index}>
+                          {[row.left, row.right].map((line, side) => {
+                            const lineNo = side === 0 ? line?.oldLine : line?.newLine;
+                            const isSelected = Boolean(effectiveSelectedLine && lineNo === effectiveSelectedLine);
+                            return (
+                              <div
+                                key={side}
+                                className="codex-diff-split-cell"
+                                data-kind={line?.kind ?? 'empty'}
+                                data-line={lineNo ?? undefined}
+                                data-selected={isSelected ? 'true' : undefined}
+                                data-hunk-index={side === 0 && hunkIdx !== undefined ? hunkIdx : undefined}
+                                data-hunk-active={hunkIdx !== undefined && hunkIdx === activeHunkIndex ? 'true' : undefined}
+                                aria-hidden={!line}
+                              >
+                                <span className="codex-diff-ln">{lineNo ?? ''}</span>
+                                <DiffLineSign kind={line?.kind} />
+                                <DiffLineText line={line} spans={line ? spansByLine.get(line) : undefined} />
+                              </div>
+                            );
+                          })}
+                        </React.Fragment>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1266,10 +1608,10 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                 </div>
               )}
 
-              {/* ACI 2.5 Budget Watermarks & 8s Breaker */}
-              {latestAciWatermarks && (
+              {/* ACI 2.5 / 2.6 Budget Watermarks, Admission, Partial Recovery & Eviction */}
+              {(latestAciWatermarks || latestTurnAci) && (
                 <div
-                  aria-label="ACI 2.5 预算水位"
+                  aria-label="ACI 上下文治理水位与遥测"
                   style={{
                     padding: 10,
                     borderRadius: 'var(--radius-md)',
@@ -1282,15 +1624,15 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   }}
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
-                    <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>ACI 2.5 预算水位</span>
-                    {latestAciWatermarks.usedTokens !== undefined && latestAciWatermarks.maxTokens !== undefined && (
+                    <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>ACI 上下文治理水位</span>
+                    {latestAciWatermarks?.usedTokens !== undefined && latestAciWatermarks?.maxTokens !== undefined && (
                       <span className="tabular-nums" style={{ fontFamily: 'var(--font-mono)', fontWeight: 500 }}>
                         {fmtTokens(latestAciWatermarks.usedTokens)} / {fmtTokens(latestAciWatermarks.maxTokens)} tokens
                       </span>
                     )}
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
-                    {latestAciWatermarks.dtocWatermark !== undefined && (
+                    {latestAciWatermarks?.dtocWatermark !== undefined && (
                       <span className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
                         单步 DTOC 水位{' '}
                         {latestAciWatermarks.dtocWatermark <= 2
@@ -1298,7 +1640,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                           : `${fmtTokens(latestAciWatermarks.dtocWatermark)} tok`}
                       </span>
                     )}
-                    {latestAciWatermarks.postTestReserveActive !== undefined && (
+                    {latestAciWatermarks?.postTestReserveActive !== undefined && (
                       <span
                         className="codex-status-chip"
                         data-tone={latestAciWatermarks.postTestReserveActive ? 'warning' : undefined}
@@ -1306,12 +1648,33 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                         {latestAciWatermarks.postTestReserveActive ? '完工保留金已激活' : '完工保留就绪'}
                       </span>
                     )}
-                    {latestAciWatermarks.supervisorCircuitOpen !== undefined && (
+                    {latestAciWatermarks?.supervisorCircuitOpen !== undefined && (
                       <span
                         className="codex-status-chip"
                         data-tone={latestAciWatermarks.supervisorCircuitOpen ? 'warning' : 'success'}
                       >
                         {latestAciWatermarks.supervisorCircuitOpen ? 'Supervisor 8s 熔断已开启' : 'Supervisor 8s 熔断正常'}
+                      </span>
+                    )}
+                    {latestTurnAci && sumAdmissionDecisions(latestTurnAci.admissionDecisions) > 0 && (
+                      <span className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
+                        DIRECT {latestTurnAci.admissionDecisions.DIRECT} · SUPPORTING {latestTurnAci.admissionDecisions.SUPPORTING} · DEFER {latestTurnAci.admissionDecisions.DEFER} · DUP {latestTurnAci.admissionDecisions.DUPLICATE} · IRR {latestTurnAci.admissionDecisions.IRRELEVANT}
+                      </span>
+                    )}
+                    {latestTurnAci && latestTurnAci.partialRecoveries > 0 && (
+                      <span className="codex-status-chip tabular-nums" data-tone="success">
+                        局部恢复 {latestTurnAci.partialRecoveries} 次 · 省 {fmtTokens(latestTurnAci.recoveryTokensSaved)} tok
+                      </span>
+                    )}
+                    {latestTurnAci && latestTurnAci.fullRecoveries > 0 && (
+                      <span className="codex-status-chip tabular-nums">
+                        全量恢复 {latestTurnAci.fullRecoveries} 次
+                      </span>
+                    )}
+                    {latestTurnAci && latestTurnAci.supersededEvictions > 0 && (
+                      <span className="codex-status-chip tabular-nums">
+                        过期驱逐 {latestTurnAci.supersededEvictions} 次
+                        {latestTurnAci.supersededTokensSaved > 0 ? ` · 省 ${fmtTokens(latestTurnAci.supersededTokensSaved)} tok` : ''}
                       </span>
                     )}
                   </div>

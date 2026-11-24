@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError } from '../api/client';
+import { normalizeAdmissionDecisions, sumAdmissionDecisions } from '../utils/aciTelemetry.ts';
 import { IconRefresh } from './Icons';
 import type {
   AgentBackendClient,
@@ -152,7 +153,19 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
   const usedTok = watermarks?.usedTokens;
   const maxTok = watermarks?.maxTokens;
   const dtocWatermarkTok = watermarks?.dtocWatermark;
+  const projectedTotalTok = watermarks?.projectedTotalTokens;
   const postTestReserveActive = Boolean(watermarks?.postTestReserveActive);
+  const aciTelemetry = status?.aciTelemetry ?? null;
+  const admissionDecisions = normalizeAdmissionDecisions(
+    aciTelemetry?.admissionDecisions ?? aciTelemetry?.decisions,
+  );
+  const totalAdmissions = sumAdmissionDecisions(admissionDecisions);
+  const partialRecoveries = Math.max(0, Math.trunc(Number(aciTelemetry?.partialRecoveries ?? 0) || 0));
+  const fullRecoveries = Math.max(0, Math.trunc(Number(aciTelemetry?.fullRecoveries ?? 0) || 0));
+  const recoveryTokensSaved = Math.max(0, Math.trunc(Number(aciTelemetry?.recoveryTokensSaved ?? 0) || 0));
+  const supersededEvictions = Math.max(0, Math.trunc(Number(aciTelemetry?.supersededEvictions ?? 0) || 0));
+  const supersededTokensSaved = Math.max(0, Math.trunc(Number(aciTelemetry?.supersededTokensSaved ?? 0) || 0));
+  const dtocPolicyLabel = aciTelemetry?.dtocPolicy ?? watermarks?.dtocPolicy ?? 'trajectory_eviction_v26';
   const parsedDtocMinDraft = Number(dtocMinDraft);
   const dtocMinDraftValid =
     Number.isInteger(parsedDtocMinDraft) && parsedDtocMinDraft >= 1000 && parsedDtocMinDraft <= 200000;
@@ -382,15 +395,16 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
 
           <div className="codex-settings-row">
             <div className="codex-settings-row-info">
-              <span className="codex-settings-row-label">ACI 2.5 预算水位与完工保留金</span>
+              <span className="codex-settings-row-label">ACI 2.6 预算轨迹水位与完工保留金</span>
               <span className="codex-settings-row-desc">
                 {usedTok !== undefined && maxTok !== undefined
                   ? `活跃预算占用 ${usedTok.toLocaleString()} / ${maxTok.toLocaleString()} tokens`
-                  : '单步 DTOC 水位门限与验证后收尾保留金（防止长任务写完未交卷时提前耗尽上下文）'}
+                  : '单步轨迹预测水位门限与验证后收尾保留金（防止长任务写完未交卷时提前耗尽上下文）'}
+                {projectedTotalTok !== undefined ? ` · 轨迹预测 ${projectedTotalTok.toLocaleString()} tok` : ''}
                 {dtocWatermarkTok !== undefined ? ` · 单步 DTOC 水位 ${formatDtocWatermarkValue(dtocWatermarkTok)}` : ''}
               </span>
             </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end' }}>
+            <div className="codex-settings-actions" style={{ justifyContent: 'flex-end' }}>
               <span className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
                 {usedTok !== undefined && maxTok !== undefined
                   ? `${usedTok.toLocaleString()} / ${maxTok.toLocaleString()}`
@@ -398,6 +412,37 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
               </span>
               <span className="codex-status-chip" data-tone={postTestReserveActive ? 'warning' : undefined}>
                 {postTestReserveActive ? '完工保留金已激活' : '完工保留就绪'}
+              </span>
+            </div>
+          </div>
+
+          <div className="codex-settings-row">
+            <div className="codex-settings-row-info">
+              <span className="codex-settings-row-label">5 级准入分布 · 局部恢复 · 过期输出驱逐</span>
+              <span className="codex-settings-row-desc">
+                策略 <code>{dtocPolicyLabel}</code>：按 DIRECT / SUPPORTING / DEFER / DUPLICATE / IRRELEVANT 分级准入，支持哈希校验局部恢复与过期输出轨迹驱逐。
+              </span>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 4 }}>
+                {(['DIRECT', 'SUPPORTING', 'DEFER', 'DUPLICATE', 'IRRELEVANT'] as const).map((lvl) => (
+                  <span key={lvl} className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
+                    {lvl}{totalAdmissions > 0 ? ` ${admissionDecisions[lvl]}` : ''}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <div className="codex-settings-actions" style={{ justifyContent: 'flex-end' }}>
+              <span className="codex-status-chip tabular-nums" data-tone={partialRecoveries > 0 ? 'success' : undefined}>
+                {partialRecoveries > 0
+                  ? `局部恢复 ${partialRecoveries} 次 · 省 ${recoveryTokensSaved.toLocaleString()} tok`
+                  : '局部恢复就绪'}
+              </span>
+              {fullRecoveries > 0 && (
+                <span className="codex-status-chip tabular-nums">全量恢复 {fullRecoveries} 次</span>
+              )}
+              <span className="codex-status-chip tabular-nums">
+                {supersededEvictions > 0
+                  ? `过期驱逐 ${supersededEvictions} 次 · 省 ${supersededTokensSaved.toLocaleString()} tok`
+                  : '过期驱逐 0 次'}
               </span>
             </div>
           </div>
