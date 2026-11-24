@@ -8,6 +8,7 @@ import type {
   EffortLevel,
   ModelSpec,
   PermissionMode,
+  SessionPermissionMode,
   WorkspaceEntryKind,
   Project,
 } from '../types/backend';
@@ -51,8 +52,10 @@ interface ComposerProps {
   models: ModelSpec[];
   selectedModel: string;
   effort: EffortLevel;
-  permissionMode: PermissionMode;
+  permissionMode: SessionPermissionMode;
   gitStatus?: GitStatus | null;
+  gitError?: string;
+  permissionPending?: boolean;
   mentionFiles?: string[];
   mentionPlugins?: MentionExtension[];
   mentionSkills?: MentionExtension[];
@@ -67,6 +70,7 @@ interface ComposerProps {
   onRefreshGitStatus?: () => Promise<void>;
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
+  onStartReview?: (baseBranch?: string) => Promise<void>;
   onSlashCommand?: (command: SlashCommand) => void;
   commandAvailability?: CommandAvailability;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
@@ -95,6 +99,8 @@ export const Composer: React.FC<ComposerProps> = ({
   effort,
   permissionMode,
   gitStatus = null,
+  gitError,
+  permissionPending = false,
   mentionFiles = [],
   mentionPlugins = [],
   mentionSkills = [],
@@ -109,6 +115,7 @@ export const Composer: React.FC<ComposerProps> = ({
   onRefreshGitStatus,
   onCheckoutGitBranch,
   onInitGitRepo,
+  onStartReview,
   onSlashCommand,
   commandAvailability,
   searchMentionFiles,
@@ -134,6 +141,8 @@ export const Composer: React.FC<ComposerProps> = ({
   const [commandError, setCommandError] = useState('');
   const [dialog, setDialog] = useState<'sketch' | 'files' | 'review' | null>(null);
   const [reviewBranch, setReviewBranch] = useState('');
+  const [reviewError, setReviewError] = useState('');
+  const [reviewBusy, setReviewBusy] = useState(false);
   const canCaptureWindow = Boolean(window.codexDesktop?.captureWindow);
   const [caret, setCaret] = useState(0);
   const [addContextOpen, setAddContextOpen] = useState(false);
@@ -184,10 +193,13 @@ ${draftInjection.text}`
   const firstMatch = exactSlash ? slashMatches.indexOf(exactSlash) : 0;
   const commandBlock = ({ cmd, threadOnly }: SlashCommand) => {
     if (threadOnly && variant !== 'thread') return '请先打开一个会话';
+    if (permissionMode === 'read-only' && ['/swarm', '/goal', '/plan'].includes(cmd)) return '请在普通会话中启动执行任务';
     if (cmd === '/goal' && !onSubmitGoal) return '当前连接未提供自主任务';
     if ((isRunning || submitting) && ['/goal', '/compact', '/rewind'].includes(cmd)) return '请等待当前对话执行结束';
     if (cmd === '/stop' && (!isRunning || !onStop)) return '当前没有运行中的对话任务';
-    if (cmd === '/review' && !gitStatus?.available) return '当前工作区不是 Git 仓库';
+    if (cmd === '/review') return !onStartReview ? '当前连接未提供代码审查'
+      : gitError || (!gitStatus ? '正在读取 Git 状态' : !gitStatus.available ? '当前工作区不是 Git 仓库'
+        : (isRunning || submitting) ? '请等待当前对话执行结束' : undefined);
     if (cmd === '/branch' && !gitStatus?.available) return '当前项目没有 Git 状态';
     if (cmd === '/folder' && !searchMentionFiles) return '当前连接未提供工作区文件夹搜索';
     if (cmd === '/file' && !searchMentionFiles && !mentionFiles.length) return '当前连接未提供工作区文件搜索';
@@ -417,6 +429,7 @@ ${draftInjection.text}`
       fileInputRef.current?.click();
     } else if (cmd === '/review') {
       setReviewBranch('');
+      setReviewError('');
       setDialog('review');
     } else if (cmd === '/sketch') {
       setDialog('sketch');
@@ -477,14 +490,18 @@ ${draftInjection.text}`
     placeCaret(caret + start.length);
   };
 
-  const applyReview = () => {
-    const scope = reviewBranch
-      ? `请对比当前工作区与本地 Git 分支 ${JSON.stringify(reviewBranch)} 的差异。`
-      : '请审查当前工作区的未提交变更，包括暂存区与工作区。';
-    const draft = `${scope} 按严重程度列出发现，给出文件与行号。仅执行审查，请勿改动文件。`;
-    setText(draft);
-    setDialog(null);
-    placeCaret(draft.length);
+  const applyReview = async () => {
+    if (!onStartReview || reviewBusy) return;
+    setReviewBusy(true);
+    setReviewError('');
+    try {
+      await onStartReview(reviewBranch || undefined);
+      setDialog(null);
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : '启动代码审查失败');
+    } finally {
+      setReviewBusy(false);
+    }
   };
 
   const clearDraft = () => {
@@ -496,7 +513,7 @@ ${draftInjection.text}`
   };
 
   const handleSend = async () => {
-    if (submitting || sendingRef.current) return;
+    if (submitting || permissionPending || sendingRef.current) return;
     const draft = resolveComposerDraft(text, activeMode);
     if (draft.kind === 'empty') return;
     if (slashQuery !== null && slashMatches.length > 0 && !exactSlash) {
@@ -528,11 +545,8 @@ ${draftInjection.text}`
     try {
       if (draft.kind === 'goal') {
         if (await onSubmitGoal?.(draft.body, attached)) clearDraft();
-      } else if (swarm) {
-        if (await onSubmit(draft.body, attached) !== false) clearDraft();
-      } else {
+      } else if (await onSubmit(draft.body, attached) !== false) {
         clearDraft();
-        await onSubmit(draft.body, attached);
       }
     } finally {
       sendingRef.current = false;
@@ -605,6 +619,11 @@ ${draftInjection.text}`
 
   const hasGitRepo = Boolean(gitStatus?.available);
   const branchText = hasGitRepo ? (gitStatus?.branch?.trim() || 'HEAD') : '无 Git 分支';
+  const permissionLabel = permissionMode === 'read-only' ? '只读'
+    : permissionMode === 'workspace-write' ? '工作区写入'
+    : permissionMode === 'auto-review' ? '自动审查'
+    : permissionMode === 'full-access' ? '完全访问'
+    : permissionMode === 'auto-safe' ? '帮我批准' : '默认权限';
   const isDirty = Boolean(hasGitRepo && gitStatus?.dirty);
   const uncommittedCount =
     typeof gitStatus?.uncommittedCount === 'number' ? gitStatus.uncommittedCount : undefined;
@@ -681,6 +700,13 @@ ${draftInjection.text}`
   };
 
   const renderBranchBadge = (inFooter = false) => {
+    if (gitError) return (
+      <button type="button" className="codex-composer-pill codex-git-init-btn" title={gitError}
+        aria-label={`Git 状态不可用：${gitError}，点击重试`} onClick={() => void onRefreshGitStatus?.()}>
+        <IconBranch size={14} /><span>Git 状态不可用</span>
+      </button>
+    );
+    if (!gitStatus) return null;
     if (!hasGitRepo) {
       return (
         <button
@@ -690,7 +716,7 @@ ${draftInjection.text}`
               ? 'codex-composer-pill codex-git-init-btn'
               : 'codex-tray-item codex-git-init-btn'
           }
-          disabled={initGitBusy}
+          disabled={initGitBusy || !onInitGitRepo || permissionMode === 'read-only'}
           title={branchTitle}
           aria-label={initGitBusy ? '正在创建 Git 存储库' : '创建 Git 存储库'}
           onClick={() => void handleInitGit()}
@@ -1209,13 +1235,10 @@ ${draftInjection.text}`
                 className="codex-composer-pill"
                 data-warning={permissionMode === 'full-access' ? 'true' : undefined}
                 data-open={popover === 'permission' ? 'true' : undefined}
-                aria-label={
-                  permissionMode === 'full-access'
-                    ? '完全访问'
-                    : permissionMode === 'auto-safe'
-                      ? '帮我批准'
-                      : '请求批准'
-                }
+                aria-expanded={popover === 'permission'}
+                aria-label={permissionLabel}
+                disabled={permissionPending || permissionMode === 'read-only'}
+                title={permissionMode === 'read-only' ? '审查会话或只读会话不修改文件' : undefined}
                 onClick={() => setPopover((p) => (p === 'permission' ? null : 'permission'))}
               >
                 {permissionMode === 'full-access' ? (
@@ -1226,11 +1249,7 @@ ${draftInjection.text}`
                   <IconHand size={15} />
                 )}
                 <span>
-                  {permissionMode === 'full-access'
-                    ? '完全访问'
-                    : permissionMode === 'auto-safe'
-                      ? '帮我批准'
-                      : '请求批准'}
+                  {permissionLabel}
                 </span>
               </button>
 
@@ -1263,7 +1282,7 @@ ${draftInjection.text}`
                       <div>
                         <div className="codex-perm-option-title">请求批准</div>
                         <div className="codex-perm-option-desc">
-                          编辑外部文件和使用互联网时始终询问
+                          修改文件或执行命令前需要批准
                         </div>
                       </div>
                     </div>
@@ -1283,7 +1302,7 @@ ${draftInjection.text}`
                       <div>
                         <div className="codex-perm-option-title">帮我批准</div>
                         <div className="codex-perm-option-desc">
-                          仅对检测到的风险操作请求批准
+                          允许工作区内普通文件修改；非只读命令需批准
                         </div>
                       </div>
                     </div>
@@ -1304,7 +1323,7 @@ ${draftInjection.text}`
                       <div>
                         <div className="codex-perm-option-title">完全访问权限</div>
                         <div className="codex-perm-option-desc">
-                          可不受限制地访问互联网和你电脑上的任何文件
+                          工作区内常规工具自动批准；系统权限、安全规则及外部工具审批仍有效
                         </div>
                       </div>
                     </div>
@@ -1513,7 +1532,7 @@ ${draftInjection.text}`
                 className="codex-send-btn"
                 aria-label={sendLabel}
                 title={sendLabel}
-                disabled={!text.trim() || submitting}
+                disabled={!text.trim() || submitting || permissionPending}
                 onClick={() => void handleSend()}
               >
                 <IconArrowUp size={17} />
@@ -1537,17 +1556,19 @@ ${draftInjection.text}`
         <button type="button" className="composer-dialog-option" disabled={!searchMentionFiles}
           onClick={() => openWorkspacePicker('folder')}><IconFolder />引用工作区文件夹</button>
       </ComposerDialog>}
-      {dialog === 'review' && <ComposerDialog title="代码审查" onClose={closeDialog}>
+      {dialog === 'review' && <ComposerDialog title="代码审查" onClose={() => { if (!reviewBusy) closeDialog(); }}>
         <label className="composer-dialog-field">审查范围
-          <select className="codex-select" value={reviewBranch} onChange={(event) => setReviewBranch(event.currentTarget.value)}>
+          <select className="codex-select" disabled={reviewBusy} value={reviewBranch} onChange={(event) => setReviewBranch(event.currentTarget.value)}>
             <option value="">未提交的变更</option>
             {gitStatus?.branches?.filter((branch) => branch !== gitStatus.branch).map((branch) => (
               <option key={branch} value={branch}>与 {branch} 对比</option>
             ))}
           </select>
         </label>
+        <p className="composer-dialog-note">变更差异会发送给所选模型。在独立只读会话中审查，不修改工作区文件。</p>
+        {reviewError && <p role="alert" className="codex-inline-error">{reviewError}</p>}
         <div className="composer-dialog-actions">
-          <button type="button" className="codex-toolbar-btn" data-variant="primary" onClick={applyReview}>填入审查请求</button>
+          <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={reviewBusy} onClick={() => void applyReview()}>{reviewBusy ? '正在启动…' : '替我审查'}</button>
         </div>
       </ComposerDialog>}
     </div>

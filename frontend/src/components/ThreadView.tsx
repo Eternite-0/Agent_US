@@ -11,6 +11,7 @@ import type {
   InspectorTab,
   ModelSpec,
   PermissionMode,
+  SessionPermissionMode,
   WorkspaceEntryKind,
   Project,
   Task,
@@ -142,8 +143,10 @@ interface ThreadViewProps {
   models: ModelSpec[];
   selectedModel: string;
   effort: EffortLevel;
-  permissionMode: PermissionMode;
+  permissionMode: SessionPermissionMode;
   gitStatus?: GitStatus | null;
+  gitError?: string;
+  permissionPending?: boolean;
   mentionFiles: string[];
   mentionPlugins?: MentionExtension[];
   mentionSkills?: MentionExtension[];
@@ -161,6 +164,7 @@ interface ThreadViewProps {
   onRefreshGitStatus?: () => Promise<void>;
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
+  onStartReview?: (baseBranch?: string) => Promise<void>;
   onSlashCommand: (command: SlashCommand) => void;
   commandAvailability?: CommandAvailability;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
@@ -231,6 +235,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   effort,
   permissionMode,
   gitStatus = null,
+  gitError,
+  permissionPending = false,
   mentionFiles,
   mentionPlugins = [],
   mentionSkills = [],
@@ -248,6 +254,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   onRefreshGitStatus,
   onCheckoutGitBranch,
   onInitGitRepo,
+  onStartReview,
   onSlashCommand,
   commandAvailability,
   searchMentionFiles,
@@ -1991,6 +1998,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
           effort={effort}
           permissionMode={permissionMode}
           gitStatus={gitStatus}
+          gitError={gitError}
+          permissionPending={permissionPending}
           mentionFiles={mentionFiles}
           mentionPlugins={mentionPlugins}
           mentionSkills={mentionSkills}
@@ -2005,6 +2014,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
           onRefreshGitStatus={onRefreshGitStatus}
           onCheckoutGitBranch={onCheckoutGitBranch}
           onInitGitRepo={onInitGitRepo}
+          onStartReview={onStartReview}
           onSlashCommand={(command) => {
             if (command.cmd === '/companion') {
               if (inspectorOpen) onToggleInspector();

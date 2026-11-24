@@ -9,7 +9,7 @@ if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Inv
 const baseURL = `http://127.0.0.1:${port}`;
 export default defineConfig({
   testDir: '.',
-  testMatch: 'double-command.spec.mjs',
+  testMatch: '*.spec.mjs',
   workers: 1,
   timeout: 60_000,
   expect: { timeout: 10_000 },

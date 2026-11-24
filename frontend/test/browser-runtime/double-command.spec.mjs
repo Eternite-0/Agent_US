@@ -39,6 +39,9 @@ test('an open real terminal command stays mounted through the next command and f
   await expect(cacheDetails).toBeHidden();
   await page.getByRole('button', { name: '帮我批准', exact: true }).click();
   await page.getByRole('button', { name: /完全访问权限/ }).click();
+  await expect(page.getByRole('button', { name: '完全访问', exact: true })).toBeEnabled();
+  await page.reload();
+  await expect(page.getByRole('button', { name: '完全访问', exact: true })).toBeEnabled();
 
   const prompt = 'Run the two isolated browser regression scripts';
   await sendMessage(page, prompt);

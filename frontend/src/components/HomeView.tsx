@@ -6,6 +6,7 @@ import type {
   EffortLevel,
   ModelSpec,
   PermissionMode,
+  SessionPermissionMode,
   WorkspaceEntryKind,
   Project,
 } from '../types/backend';
@@ -26,8 +27,10 @@ interface HomeViewProps {
   models: ModelSpec[];
   selectedModel: string;
   effort: EffortLevel;
-  permissionMode: PermissionMode;
+  permissionMode: SessionPermissionMode;
   gitStatus?: GitStatus | null;
+  gitError?: string;
+  permissionPending?: boolean;
   mentionPlugins?: MentionExtension[];
   mentionSkills?: MentionExtension[];
   draftInjection?: { id: number; text: string; mode: 'replace' | 'append' } | null;
@@ -43,6 +46,7 @@ interface HomeViewProps {
   onRefreshGitStatus?: () => Promise<void>;
   onCheckoutGitBranch?: (branch: string, create?: boolean) => Promise<void>;
   onInitGitRepo?: () => Promise<void>;
+  onStartReview?: (baseBranch?: string) => Promise<void>;
   onSlashCommand: (command: SlashCommand) => void;
   commandAvailability?: CommandAvailability;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
@@ -61,6 +65,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
   effort,
   permissionMode,
   gitStatus = null,
+  gitError,
+  permissionPending = false,
   mentionPlugins = [],
   mentionSkills = [],
   draftInjection = null,
@@ -76,6 +82,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onRefreshGitStatus,
   onCheckoutGitBranch,
   onInitGitRepo,
+  onStartReview,
   onSlashCommand,
   commandAvailability,
   searchMentionFiles,
@@ -243,6 +250,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
           effort={effort}
           permissionMode={permissionMode}
           gitStatus={gitStatus}
+          gitError={gitError}
+          permissionPending={permissionPending}
           mentionPlugins={mentionPlugins}
           mentionSkills={mentionSkills}
           draftInjection={draftInjection}
@@ -255,6 +264,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
           onRefreshGitStatus={onRefreshGitStatus}
           onCheckoutGitBranch={onCheckoutGitBranch}
           onInitGitRepo={onInitGitRepo}
+          onStartReview={onStartReview}
           onSlashCommand={onSlashCommand}
           commandAvailability={commandAvailability}
           searchMentionFiles={searchMentionFiles}

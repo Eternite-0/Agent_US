@@ -5709,6 +5709,7 @@ button:focus-visible {
 .composer-command-text strong { flex: 0 1 auto; }
 .composer-command-text small { flex: 0 2 auto; margin: 0; }
 .composer-picker-state { padding: 8px 9px; color: var(--text-secondary); font-size: 12px; }
+.codex-inline-error { margin: 8px 0; font-size: 12px; color: var(--color-danger); overflow-wrap: anywhere; }
 .composer-command-error { margin: 0 10px 6px; font-size: 12px; color: var(--color-warning); }
 
 /* Session-scoped autonomous execution inspector */

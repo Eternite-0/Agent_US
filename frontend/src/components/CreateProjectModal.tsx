@@ -32,15 +32,16 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
   const [folders, setFolders] = useState<string[]>([]);
   const [manualPath, setManualPath] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
 
   const nameInputRef = useRef<HTMLInputElement>(null);
-  const dirInputRef = useRef<HTMLInputElement>(null);
   const modeRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
     setName('');
-    setSourceMode('local');
+    setSourceMode(window.codexDesktop?.pickDirectory ? 'local' : 'manual');
+    setError('');
     setModeMenuOpen(false);
     setFolders([]);
     setManualPath('');
@@ -90,28 +91,19 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
   };
 
   const handlePickLocalFolder = async () => {
-    // 1. Native Electron folder dialog when running as Desktop App
-    if (window.codexDesktop?.pickDirectory) {
-      const picked = await window.codexDesktop.pickDirectory();
-      if (picked) addFolderEntry(picked.path, picked.name);
-      return;
-    }
-
-    // 2. Modern Chromium File System Access API
-    if (typeof window.showDirectoryPicker === 'function') {
-      try {
-        const handle = await window.showDirectoryPicker();
-        if (handle?.name) {
-          addFolderEntry(handle.name, handle.name);
-          return;
-        }
-      } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') return;
+    setError('');
+    try {
+      if (window.codexDesktop?.pickDirectory) {
+        const picked = await window.codexDesktop.pickDirectory();
+        if (picked) addFolderEntry(picked.path, picked.name);
+      } else {
+        // A browser folder handle does not grant the backend access or expose an absolute path.
+        setSourceMode('manual');
+        setError('浏览器无法授权后端访问本地文件夹。请输入后端所在电脑上的绝对路径，或使用桌面应用选择目录。');
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '无法选择目录');
     }
-
-    // 3. Fallback webkitdirectory input
-    dirInputRef.current?.click();
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -119,9 +111,14 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
     const trimmed = name.trim();
     if (!trimmed || submitting) return;
     setSubmitting(true);
+    setError('');
     try {
-      await onCreate(trimmed, folders);
+      const source = sourceMode === 'manual' && manualPath.trim() && !folders.includes(manualPath.trim())
+        ? [...folders, manualPath.trim()] : folders;
+      await onCreate(trimmed, sourceMode === 'blank' ? [] : source);
       onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '创建项目失败');
     } finally {
       setSubmitting(false);
     }
@@ -209,20 +206,6 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
 
           {sourceMode === 'local' && (
             <>
-              <input
-                ref={dirInputRef}
-                type="file"
-                style={{ display: 'none' }}
-                {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
-                onChange={(e) => {
-                  const first = e.target.files?.[0] as (File & { webkitRelativePath?: string }) | undefined;
-                  if (first?.webkitRelativePath) {
-                    const top = first.webkitRelativePath.split('/')[0];
-                    if (top) addFolderEntry(top, top);
-                  }
-                  e.target.value = '';
-                }}
-              />
               <button
                 type="button"
                 className="codex-source-add-btn"
@@ -239,7 +222,8 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
               <input
                 value={manualPath}
                 onChange={(e) => setManualPath(e.target.value)}
-                placeholder="输入路径，如 D:\Agent_US"
+                aria-label="后端工作区绝对路径"
+                placeholder="输入后端电脑上的绝对路径"
                 style={{
                   flex: 1,
                   height: 32,
@@ -316,6 +300,8 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
             </div>
           )}
         </div>
+
+        {error && <p role="alert" className="codex-inline-error">{error}</p>}
 
         {/* Footer: 取消 + 创建项目 pill */}
         <div className="codex-modal-footer">

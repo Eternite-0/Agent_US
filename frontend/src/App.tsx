@@ -134,6 +134,9 @@ export const App: React.FC = () => {
   const refreshScope = useMemo(() => ({
     id: ++nextConnectionId,
     workspaceRequests: createLatestRequests<void>(),
+    gitRequests: createLatestRequests<string>(),
+    permissionUpdates: new Set<string>(),
+    workspaceChanging: false,
     bundleRequests: createLatestRequests<string>(),
     archiveRequests: new Set<string>(),
     taskWrites: new Map<string, number>(),
@@ -151,7 +154,6 @@ export const App: React.FC = () => {
     index: 0,
   }));
   const view = nav.stack[nav.index] ?? { kind: 'home' };
-  const gitSessionId = view.kind === 'thread' ? view.taskId : undefined;
 
   const navigate = useCallback((next: AppView) => {
     setNav((prev) => {
@@ -270,8 +272,15 @@ export const App: React.FC = () => {
   const [workspaceRoot, setWorkspaceRoot] = useState('');
   const [liveStreams, setLiveStreams] = useState<Record<string, DirectLiveStream>>({});
   const [liveToolOutputs, setLiveToolOutputs] = useState<Record<string, DirectLiveToolOutput[]>>({});
-  const [gitState, setGitState] = useState<{ sessionId?: string; status: GitStatus } | null>(null);
-  const gitStatus = gitState?.sessionId === gitSessionId ? gitState?.status ?? null : null;
+  const [gitState, setGitState] = useState<{ key: string; status?: GitStatus; error?: string } | null>(null);
+  const activeRootTaskId = view.kind === 'thread' ? threadRootFor(view.taskId, threadChains) : null;
+  const gitSessionId = activeRootTaskId ?? (view.kind === 'home' && sideProject?.startsWith('session:') ? sideProject.slice(8) : undefined);
+  const gitKey = JSON.stringify([refreshScope.id, gitSessionId, gitSessionId ? null : workspaceRoot]);
+  const currentGitKey = useRef(gitKey);
+  useLayoutEffect(() => { currentGitKey.current = gitKey; }, [gitKey]);
+  const gitStatus = gitState?.key === gitKey ? gitState.status ?? null : null;
+  const gitError = gitState?.key === gitKey ? gitState.error : undefined;
+  const [permissionPendingIds, setPermissionPendingIds] = useState<ReadonlySet<string>>(() => new Set());
 
   // Domain Data
   const [projects, setProjects] = useState<Project[]>([]);
@@ -389,6 +398,8 @@ export const App: React.FC = () => {
     setBackendHealthy(null);
     setSseState('reconnecting');
     setWorkspaceRoot('');
+    setGitState(null);
+    setPermissionPendingIds(new Set());
     setProjects([]);
     setTasks([]);
     setApprovals([]);
@@ -449,7 +460,7 @@ export const App: React.FC = () => {
         if (currentRefreshScope.current !== refreshScope || !request.claim()) return;
 
         setBackendHealthy(health.ok ?? health.status === 'ok');
-        if (health.workspaceRoot) setWorkspaceRoot(health.workspaceRoot);
+        if (health.workspaceRoot && !refreshScope.workspaceChanging) setWorkspaceRoot(health.workspaceRoot);
         setProjects((prev) => shareSnapshot(prev, projList));
         const protectedIds = new Set([...refreshScope.taskWrites]
           .filter(([, clock]) => clock > taskClock).map(([id]) => id));
@@ -493,48 +504,47 @@ export const App: React.FC = () => {
 
   const handleRefreshGitStatus = useCallback(async () => {
     if (!client.getGitStatus) return;
+    const request = refreshScope.gitRequests.start(gitKey);
+    const commit = (next: { status?: GitStatus; error?: string }) => {
+      if (currentGitKey.current === gitKey && request.claim()) setGitState({ key: gitKey, ...next });
+    };
     try {
-      const next = await client.getGitStatus(gitSessionId);
-      setGitState({ sessionId: gitSessionId, status: next });
-    } catch {
-      // Keep previous status silently on transient poll error
+      commit({ status: await client.getGitStatus(gitSessionId) });
+    } catch (error) {
+      commit({ error: error instanceof Error ? error.message : '无法读取 Git 状态' });
     }
-  }, [client, gitSessionId]);
+  }, [client, gitSessionId, gitKey, refreshScope]);
 
   useEffect(() => {
     void handleRefreshGitStatus();
-  }, [handleRefreshGitStatus, workspaceRoot]);
+  }, [handleRefreshGitStatus]);
 
-  const handleCheckoutGitBranch = useCallback(
-    async (branch: string, create = false) => {
-      if (!client.checkoutGitBranch) {
-        pushToast('当前连接暂不支持切换 Git 分支', 'warning');
-        throw new Error('当前连接暂不支持切换 Git 分支');
-      }
-      const next = await client.checkoutGitBranch(branch, create, gitSessionId);
-      setGitState({ sessionId: gitSessionId, status: next });
-      pushToast(
-        create ? `已创建并检出分支 ${next.branch || branch}` : `已切换到分支 ${next.branch || branch}`,
-        'success',
-      );
-    },
-    [client, gitSessionId, pushToast],
-  );
+  const handleCheckoutGitBranch = useCallback(async (branch: string, create = false) => {
+    if (!client.checkoutGitBranch) throw new Error('当前连接暂不支持切换 Git 分支');
+    if (refreshScope.workspaceChanging || !gitStatus?.available) throw new Error('请等待工作区 Git 状态就绪');
+    const request = refreshScope.gitRequests.start(gitKey);
+    try {
+      const next = await client.checkoutGitBranch(branch, create, gitSessionId, gitStatus.workspaceRoot);
+      if (currentGitKey.current === gitKey && request.claim()) setGitState({ key: gitKey, status: next });
+      pushToast(create ? `已创建并检出分支 ${next.branch || branch}` : `已切换到分支 ${next.branch || branch}`, 'success');
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'WORKSPACE_CHANGED') void handleRefreshGitStatus();
+      throw error;
+    }
+  }, [client, gitSessionId, gitKey, gitStatus, refreshScope, pushToast, handleRefreshGitStatus]);
 
   const handleInitGitRepo = useCallback(async () => {
-    if (!client.initGitRepo) {
-      pushToast('当前连接暂不支持创建 Git 存储库', 'warning');
-      return;
-    }
+    if (!client.initGitRepo || !gitStatus || gitStatus.available || refreshScope.workspaceChanging) return;
+    const request = refreshScope.gitRequests.start(gitKey);
     try {
-      const next = await client.initGitRepo('main', gitSessionId);
-      setGitState({ sessionId: gitSessionId, status: next });
-      pushToast(`已创建 Git 存储库（当前分支：${next.branch || 'main'}）`, 'success');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '创建 Git 存储库失败';
-      pushToast(msg, 'danger');
+      const next = await client.initGitRepo('main', gitSessionId, gitStatus.workspaceRoot);
+      if (currentGitKey.current === gitKey && request.claim()) setGitState({ key: gitKey, status: next });
+      pushToast(`Git 存储库已就绪${next.branch ? `（当前分支：${next.branch}）` : ''}`, 'success');
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'WORKSPACE_CHANGED') void handleRefreshGitStatus();
+      pushToast(error instanceof Error ? error.message : '创建 Git 存储库失败', 'danger');
     }
-  }, [client, gitSessionId, pushToast]);
+  }, [client, gitSessionId, gitKey, gitStatus, refreshScope, pushToast, handleRefreshGitStatus]);
 
   const refreshProviderAccounts = useCallback(async () => {
     if (connection.mode === 'demo' || !client.providerPresets || !client.listAccounts) {
@@ -617,12 +627,20 @@ export const App: React.FC = () => {
   }, [client, pushToast, refreshProviderAccounts]);
 
   const handleChangeWorkspaceRoot = useCallback(async (dirPath: string) => {
-    if (!client.setWorkspace || !dirPath) return;
-    const res = await client.setWorkspace(dirPath);
-    setWorkspaceRoot(res.workspaceRoot);
-    await refreshWorkspace(false);
-    pushToast(`已切换本地工作区目录：${res.workspaceRoot}`, 'success');
-  }, [client, pushToast, refreshWorkspace]);
+    if (!client.setWorkspace) throw new Error('当前连接不支持切换工作区');
+    if (refreshScope.workspaceChanging) throw new Error('正在切换工作区，请稍后重试');
+    refreshScope.workspaceChanging = true;
+    try {
+      const res = await client.setWorkspace(dirPath);
+      if (currentRefreshScope.current !== refreshScope) return;
+      refreshScope.workspaceRequests.invalidate(undefined);
+      setWorkspaceRoot(res.workspaceRoot);
+      pushToast(`新会话工作区：${res.workspaceRoot}。已有会话保留原目录。`, 'success');
+    } finally {
+      refreshScope.workspaceChanging = false;
+      if (currentRefreshScope.current === refreshScope) void refreshWorkspace(false);
+    }
+  }, [client, pushToast, refreshScope, refreshWorkspace]);
 
   const updateProviderAccount = useCallback(async (id: string, patch: Partial<ProviderAccountInput>) => {
     if (!client.updateAccount) throw new Error('当前数据源不支持供应商账号管理。');
@@ -726,7 +744,6 @@ export const App: React.FC = () => {
   }, []);
 
   // Resolve the true chain before rendering so navigating to a child keeps the same thread instance.
-  const activeRootTaskId = view.kind === 'thread' ? threadRootFor(view.taskId, threadChains) : null;
   const activeChainIds = useMemo(() => {
     if (!activeRootTaskId) return [];
     const children = Object.hasOwn(threadChains, activeRootTaskId) ? threadChains[activeRootTaskId] : [];
@@ -756,6 +773,53 @@ export const App: React.FC = () => {
     },
     [client, refreshScope],
   );
+
+  const sessionTask = activeBundles.find(({ task }) => task.id === activeRootTaskId)?.task
+    ?? tasks.find(({ id }) => id === activeRootTaskId);
+  const sessionPermission = sessionTask?.permissionMode ?? permissionMode;
+  const permissionPending = activeRootTaskId !== null && (permissionPendingIds.has(activeRootTaskId) || !sessionTask);
+  const changeThreadPermission = async (mode: PermissionMode) => {
+    const id = activeRootTaskId;
+    if (!id || sessionPermission === 'read-only' || permissionPending || refreshScope.permissionUpdates.has(id)) return;
+    if (!client.updateSessionPermission) { setPermissionMode(mode); return; }
+    refreshScope.permissionUpdates.add(id);
+    setPermissionPendingIds(new Set(refreshScope.permissionUpdates));
+    try {
+      const saved = await client.updateSessionPermission(id, mode);
+      if (currentRefreshScope.current !== refreshScope) return;
+      refreshScope.taskWrites.set(id, ++refreshScope.taskClock);
+      refreshScope.bundleRequests.invalidate(id);
+      setTasks((prev) => prev.map((task) => task.id === id ? { ...task, permissionMode: saved } : task));
+      setBundleState((prev) => {
+        const bundle = prev.cache.get(id);
+        if (prev.scope !== refreshScope || !bundle) return prev;
+        const cache = new Map(prev.cache);
+        cache.set(id, { ...bundle, task: { ...bundle.task, permissionMode: saved } });
+        return { scope: refreshScope, cache };
+      });
+    } catch (error) {
+      if (currentRefreshScope.current === refreshScope) pushToast(`权限未更改：${error instanceof Error ? error.message : '更新失败'}`, 'danger');
+    } finally {
+      refreshScope.permissionUpdates.delete(id);
+      if (currentRefreshScope.current === refreshScope) setPermissionPendingIds(new Set(refreshScope.permissionUpdates));
+    }
+  };
+
+  const handleStartReview = async (baseBranch?: string) => {
+    if (!client.startGitReview || !gitStatus?.available || refreshScope.workspaceChanging) throw new Error('请等待工作区 Git 状态就绪');
+    setSubmitting(true);
+    try {
+      const task = await client.startGitReview({ sessionId: gitSessionId, expectedWorkspaceRoot: gitStatus.workspaceRoot, baseBranch, model: selectedModel || undefined, effort });
+      if (currentRefreshScope.current !== refreshScope) return;
+      writeTask(task);
+      if (currentGitKey.current === gitKey) navigate({ kind: 'thread', taskId: task.id });
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'WORKSPACE_CHANGED') void handleRefreshGitStatus();
+      throw error;
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   // Switching engines leaves task IDs from the previous engine behind. Reconfiguring a live
   // endpoint keeps the URL but loads it against a clean connection-scoped cache.
@@ -874,24 +938,12 @@ export const App: React.FC = () => {
   }, []);
 
   const handleCreateProject = async (name: string, sourceFolders: string[] = []) => {
-    try {
-      if (sourceFolders.length > 0 && client.setWorkspace) {
-        const ws = await client.setWorkspace(sourceFolders[0]);
-        setWorkspaceRoot(ws.workspaceRoot);
-      }
-      const p = await client.createProject(name);
-      setProjects((prev) => [...prev, p]);
-      setSelectedProjectId(p.id);
-      setWorkedOutsideProject(false);
-      pushToast(
-        sourceFolders.length
-          ? `已创建项目 ${p.name}（已关联 ${sourceFolders.length} 个源文件夹）`
-          : `已创建项目 ${p.name}`,
-        'success',
-      );
-    } catch (e) {
-      pushToast(`创建项目失败：${e instanceof Error ? e.message : '未知错误'}`, 'danger');
-    }
+    if (sourceFolders.length > 0 && client.setWorkspace) await handleChangeWorkspaceRoot(sourceFolders[0]);
+    const project = await client.createProject(name);
+    setProjects((prev) => [...prev, project]);
+    setSelectedProjectId(project.id);
+    setWorkedOutsideProject(false);
+    pushToast(`已创建项目 ${project.name}`, 'success');
   };
 
   const handleRenameProject = async (project: Project, newName: string) => {
@@ -914,6 +966,7 @@ export const App: React.FC = () => {
   };
 
   const handleSubmitNewTask = async (text: string, files: Record<string, string>): Promise<boolean> => {
+    if (refreshScope.workspaceChanging) { pushToast('请等待工作区切换完成', 'warning'); return false; }
     setSubmitting(true);
     try {
       const sideSource = sideProject?.startsWith('session:') ? await client.getTask(sideProject.slice(8)) : null;
@@ -958,6 +1011,10 @@ export const App: React.FC = () => {
     if (!activeRootTaskId) {
       return handleSubmitNewTask(text, files);
     }
+    if (refreshScope.permissionUpdates.has(activeRootTaskId)) {
+      pushToast('请等待会话权限更新完成', 'warning');
+      return false;
+    }
     setSubmitting(true);
     try {
       const currentRoot = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
@@ -971,7 +1028,9 @@ export const App: React.FC = () => {
       if (client.submitFollowupTurn) {
         const updated = await client.submitFollowupTurn(activeRootTaskId, text, {
           model: selectedModel || undefined,
-          permissionMode,
+          // The backend already holds this session's live policy; don't overwrite it
+          // with preferences from Home, another thread, or an older snapshot.
+          ...(!client.updateSessionPermission ? { permissionMode } : {}),
           ...(Object.keys(files).length ? { files } : {}),
           effort,
           clientTurnId: randomIdempotencyKey(),
@@ -1188,6 +1247,10 @@ export const App: React.FC = () => {
   };
 
   const handleSubmitGoal = async (goal: string, files: Record<string, string>): Promise<boolean> => {
+    if (activeRootTaskId && (sessionPermission === 'read-only' || refreshScope.permissionUpdates.has(activeRootTaskId))) {
+      pushToast(sessionPermission === 'read-only' ? '请在普通会话中启动自主任务' : '请等待会话权限更新完成', 'warning');
+      return false;
+    }
     if (!client.submitAutonomousGoal) {
       pushToast('当前连接不支持自主任务。', 'warning');
       return false;
@@ -1199,7 +1262,8 @@ export const App: React.FC = () => {
     setSubmitting(true);
     try {
       const result = await client.submitAutonomousGoal({
-        goal, permissionMode, ...(activeRootTaskId ? { sessionId: activeRootTaskId } : { workspaceRoot: workspaceRoot || undefined }),
+        goal,
+        ...(activeRootTaskId ? { sessionId: activeRootTaskId } : { workspaceRoot: workspaceRoot || undefined, permissionMode }),
       });
       if (currentRefreshScope.current !== refreshScope) return true;
       navigate({ kind: 'thread', taskId: result.sessionId });
@@ -1223,8 +1287,8 @@ export const App: React.FC = () => {
 
   const searchMentionFiles = useMemo(() => {
     if (!client.searchWorkspaceFiles) return undefined;
-    return (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => client.searchWorkspaceFiles!(query, activeRootTaskId ?? undefined, signal, kind);
-  }, [client, activeRootTaskId, workspaceRoot]);
+    return (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => client.searchWorkspaceFiles!(query, gitSessionId, signal, kind);
+  }, [client, gitSessionId, workspaceRoot]);
 
   const slashTask = activeBundles.find(({ task }) => task.id === activeRootTaskId)?.task
     ?? tasks.find(({ id }) => id === activeRootTaskId);
@@ -1294,7 +1358,8 @@ export const App: React.FC = () => {
           pushToast('已退出计划模式');
         } else {
           setCodexMode('Work');
-          setPermissionMode('approval');
+          if (activeRootTaskId) void changeThreadPermission('approval');
+          else setPermissionMode('approval');
           pushToast('已开启计划模式');
         }
         break;
@@ -1346,7 +1411,6 @@ export const App: React.FC = () => {
       const task = await client.forkTask(forkSource, workspaceMode);
       if (currentRefreshScope.current !== refreshScope) return;
       writeTask(task);
-      setPermissionMode('approval');
       setForkSource(null);
       navigate({ kind: 'thread', taskId: task.id });
       pushToast('已创建聊天分支', 'success');
@@ -1612,6 +1676,7 @@ export const App: React.FC = () => {
                 effort={effort}
                 permissionMode={permissionMode}
                 gitStatus={gitStatus}
+                gitError={gitError}
                 mentionPlugins={mentionPlugins}
                 mentionSkills={mentionSkills}
                 draftInjection={homeDraft}
@@ -1626,7 +1691,8 @@ export const App: React.FC = () => {
                 onChangePermission={setPermissionMode}
                 onRefreshGitStatus={handleRefreshGitStatus}
                 onCheckoutGitBranch={handleCheckoutGitBranch}
-                onInitGitRepo={handleInitGitRepo}
+                onInitGitRepo={client.initGitRepo ? handleInitGitRepo : undefined}
+                onStartReview={client.startGitReview ? handleStartReview : undefined}
                 onSlashCommand={handleSlashCommand}
                 commandAvailability={commandAvailability}
                 searchMentionFiles={searchMentionFiles}
@@ -1670,8 +1736,10 @@ export const App: React.FC = () => {
                 models={models}
                 selectedModel={selectedModel}
                 effort={effort}
-                permissionMode={permissionMode}
+                permissionMode={sessionPermission}
+                permissionPending={permissionPending}
                 gitStatus={gitStatus}
+                gitError={gitError}
                 mentionFiles={mentionFiles}
                 mentionPlugins={mentionPlugins}
                 mentionSkills={mentionSkills}
@@ -1685,10 +1753,11 @@ export const App: React.FC = () => {
                 onOpenCreateProject={() => setCreateProjectOpen(true)}
                 onSelectModel={setSelectedModel}
                 onChangeEffort={setEffort}
-                onChangePermission={setPermissionMode}
+                onChangePermission={changeThreadPermission}
                 onRefreshGitStatus={handleRefreshGitStatus}
                 onCheckoutGitBranch={handleCheckoutGitBranch}
-                onInitGitRepo={handleInitGitRepo}
+                onInitGitRepo={client.initGitRepo ? handleInitGitRepo : undefined}
+                onStartReview={client.startGitReview ? handleStartReview : undefined}
                 onSlashCommand={handleSlashCommand}
                 commandAvailability={commandAvailability}
                 searchMentionFiles={searchMentionFiles}
@@ -2052,7 +2121,7 @@ export const App: React.FC = () => {
                 onQueryAccountBalance={queryAccountBalance}
                 onQueryAllBalances={queryAllBalances}
                 onModelsChanged={() => refreshWorkspace(false)}
-                onChangeWorkspaceRoot={handleChangeWorkspaceRoot}
+                onChangeWorkspaceRoot={client.setWorkspace ? handleChangeWorkspaceRoot : undefined}
                 onToast={pushToast}
                 themeMode={themeMode}
                 preset={preset}

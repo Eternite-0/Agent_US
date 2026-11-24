@@ -16,7 +16,9 @@ import { MetricsCollector } from '../../../backend/src/observability/metrics.js'
 
 const root = await mkdtemp(join(tmpdir(), 'agent-us-runtime-browser-'));
 const workspace = join(root, 'workspace');
-await mkdir(workspace);
+const reviewWorkspace = join(root, 'review workspace');
+await Promise.all([mkdir(workspace), mkdir(reviewWorkspace)]);
+await writeFile(join(reviewWorkspace, 'review-fixture.js'), 'export const example = 1;\n');
 const first = 'run-first.mjs';
 const second = 'run-second.mjs';
 await writeFile(join(workspace, first), 'await new Promise(r => setTimeout(r, 400)); console.log("RUNTIME-FIRST-OUTPUT");');
@@ -30,8 +32,17 @@ const pool = new AccountPool(store, { root, legacyProviders: providers, metrics 
 const gates = [Promise.withResolvers(), Promise.withResolvers()];
 let step = 0;
 const upstream = createHttpServer(async (req, res) => {
-  req.resume();
-  if (req.method !== 'POST' || req.url !== '/v1/chat/completions') return res.writeHead(404).end();
+  if (req.method !== 'POST' || req.url !== '/v1/chat/completions') { req.resume(); return res.writeHead(404).end(); }
+  const buffers = [];
+  for await (const chunk of req) buffers.push(chunk);
+  const body = JSON.parse(Buffer.concat(buffers).toString('utf8'));
+  const messages = JSON.stringify(body.messages);
+  if (messages.includes('替我审查未提交的变更')) {
+    const content = messages.includes('review-fixture.js') && messages.includes('review-evidence-')
+      ? 'REVIEW EVIDENCE RECEIVED' : 'REVIEW EVIDENCE MISSING';
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    return res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  }
   const index = step++;
   if (index < 2) await gates[index].promise;
   const delta = index < 2 ? { tool_calls: [{
@@ -54,6 +65,7 @@ pool.setDefaultModel(model);
 const agent = new DirectAgentRuntime(store, pool, { defaultWorkspace: workspace, dataRoot: root, metrics });
 const token = randomBytes(32).toString('hex');
 const backend = api(store, token, providers, { pool, directAgent: agent });
+backend.get('/v1/_e2e/review-workspace', async () => ({ workspaceRoot: reviewWorkspace }));
 backend.post('/v1/_e2e/gates/:index', async (request, reply) => {
   const gate = gates[Number(request.params.index)];
   if (!gate) return reply.code(404).send({ ok: false });

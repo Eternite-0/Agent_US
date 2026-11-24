@@ -1636,8 +1636,10 @@ export class DirectAgentRuntime {
     if (sbxCfg?.sandbox) {
       sbxCfg.sandbox.resolveBackend();
     }
-    const disableWorkspaceHooks = Boolean(sbxCfg?.disableWorkspaceHooks);
-    const disableWorkspaceMcp = Boolean(sbxCfg?.disableWorkspaceMcp);
+    // A Git review is observational: even pre-trusted hooks and external MCP
+    // connectors must not start processes or modify the workspace on its behalf.
+    const disableWorkspaceHooks = mode === 'review' || Boolean(sbxCfg?.disableWorkspaceHooks);
+    const disableWorkspaceMcp = mode === 'review' || Boolean(sbxCfg?.disableWorkspaceMcp);
     const hooks = disableWorkspaceHooks
       ? {
           run: async () => ({

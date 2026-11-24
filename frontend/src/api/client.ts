@@ -22,6 +22,8 @@ import type {
   Evidence,
   FileChangeDelta,
   GitStatus,
+  GitReviewInput,
+  SessionPermissionMode,
   MemoryItem,
   ModelSpec,
   ModelTestResult,
@@ -163,7 +165,7 @@ export interface AgentBackendClient {
     goal: string;
     sessionId?: string;
     workspaceRoot?: string;
-    permissionMode: PermissionMode;
+    permissionMode?: PermissionMode;
   }) => Promise<{ runId: string; sessionId: string }>;
   setWorkspace?: (workspaceRoot: string) => Promise<{ workspaceRoot: string }>;
   listProjects(): Promise<Project[]>;
@@ -304,8 +306,10 @@ export interface AgentBackendClient {
   listProviders(): Promise<ProviderDirectory>;
   providersHealth(): Promise<ProvidersHealth>;
   getGitStatus?: (sessionId?: string) => Promise<GitStatus>;
-  checkoutGitBranch?: (branch: string, create?: boolean, sessionId?: string) => Promise<GitStatus>;
-  initGitRepo?: (initialBranch?: string, sessionId?: string) => Promise<GitStatus>;
+  checkoutGitBranch?: (branch: string, create?: boolean, sessionId?: string, expectedWorkspaceRoot?: string) => Promise<GitStatus>;
+  initGitRepo?: (initialBranch?: string, sessionId?: string, expectedWorkspaceRoot?: string) => Promise<GitStatus>;
+  startGitReview?: (input: GitReviewInput) => Promise<Task>;
+  updateSessionPermission?: (sessionId: string, mode: PermissionMode) => Promise<SessionPermissionMode>;
   // Account Pool
   providerPresets?: () => Promise<ProviderPresetCatalog>;
   listAccounts?: (params?: {
@@ -661,6 +665,7 @@ export class LiveBackendClient implements AgentBackendClient {
   private token: string;
   private defaultModel = '';
   private workspaceRoot = '';
+  private workspaceRevision = 0;
   private readonly rt = createRuntimeClient((m, p, o) => this.req(m, p, o));
 
   constructor(settings: ConnectionSettings) {
@@ -730,6 +735,7 @@ export class LiveBackendClient implements AgentBackendClient {
   }
 
   async health() {
+    const revision = this.workspaceRevision;
     const data = await this.req<{
       ok?: boolean;
       status?: string;
@@ -739,13 +745,14 @@ export class LiveBackendClient implements AgentBackendClient {
       routerReady?: boolean;
       gateway?: { running: boolean; port: number; endpoint: string };
     }>('GET', '/v1/health');
-    if (data.workspaceRoot) this.workspaceRoot = data.workspaceRoot;
+    if (data.workspaceRoot && revision === this.workspaceRevision) this.workspaceRoot = data.workspaceRoot;
     return { ...data, ok: data.ok ?? data.status === 'ok' };
   }
 
   async getWorkspace() {
+    const revision = this.workspaceRevision;
     const data = await this.req<{ workspaceRoot: string }>('GET', '/v1/workspace');
-    this.workspaceRoot = data.workspaceRoot;
+    if (revision === this.workspaceRevision) this.workspaceRoot = data.workspaceRoot;
     return data;
   }
 
@@ -756,7 +763,7 @@ export class LiveBackendClient implements AgentBackendClient {
     return items;
   }
 
-  async submitAutonomousGoal(input: { goal: string; sessionId?: string; workspaceRoot?: string; permissionMode: PermissionMode }) {
+  async submitAutonomousGoal(input: { goal: string; sessionId?: string; workspaceRoot?: string; permissionMode?: PermissionMode }) {
     try {
       return await this.req<{ runId: string; sessionId: string }>('POST', '/v1/autonomous/runs', { body: input });
     } catch (error) {
@@ -770,6 +777,7 @@ export class LiveBackendClient implements AgentBackendClient {
     const data = await this.req<{ workspaceRoot: string }>('PUT', '/v1/workspace', {
       body: { workspaceRoot },
     });
+    this.workspaceRevision += 1;
     this.workspaceRoot = data.workspaceRoot;
     return data;
   }
@@ -854,6 +862,7 @@ export class LiveBackendClient implements AgentBackendClient {
       code: typeof turn?.id === 'string' ? turn.id : undefined,
       model: typeof session.model === 'string' ? session.model : undefined,
       workspaceRoot: typeof session.workspaceRoot === 'string' ? session.workspaceRoot : undefined,
+      permissionMode: typeof session.permissionMode === 'string' ? session.permissionMode as SessionPermissionMode : undefined,
       livePlan:
         session.plan && typeof session.plan === 'object'
           ? (session.plan as Task['livePlan'])
@@ -941,7 +950,7 @@ export class LiveBackendClient implements AgentBackendClient {
       },
     );
     if (turnRes.mode === 'swarm') return { ...turnRes, id: String(session.id) };
-    return this.taskFromSession(session, turnRes.turn ?? null);
+    return this.taskFromSession(turnRes.session ?? session, turnRes.turn ?? null);
   }
 
   async submitFollowupTurn(
@@ -1244,12 +1253,22 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.req('GET', '/v1/git/status', { query: { sessionId } });
   }
 
-  checkoutGitBranch(branch: string, create = false, sessionId?: string): Promise<GitStatus> {
-    return this.req('POST', '/v1/git/checkout', { body: { branch, create, sessionId } });
+  checkoutGitBranch(branch: string, create = false, sessionId?: string, expectedWorkspaceRoot?: string): Promise<GitStatus> {
+    return this.req('POST', '/v1/git/checkout', { body: { branch, create, sessionId, expectedWorkspaceRoot } });
   }
 
-  initGitRepo(initialBranch = 'main', sessionId?: string): Promise<GitStatus> {
-    return this.req('POST', '/v1/git/init', { body: { initialBranch, sessionId } });
+  initGitRepo(initialBranch = 'main', sessionId?: string, expectedWorkspaceRoot?: string): Promise<GitStatus> {
+    return this.req('POST', '/v1/git/init', { body: { initialBranch, sessionId, expectedWorkspaceRoot } });
+  }
+
+  async startGitReview(input: GitReviewInput): Promise<Task> {
+    const result = await this.req<{ session: Record<string, unknown>; turn: Record<string, unknown> }>('POST', '/v1/git/review', { body: input });
+    return this.taskFromSession(result.session, result.turn);
+  }
+
+  async updateSessionPermission(sessionId: string, mode: PermissionMode): Promise<SessionPermissionMode> {
+    const result = await this.req<{ permissionMode: SessionPermissionMode }>('PATCH', `/v1/sessions/${encodeURIComponent(sessionId)}`, { body: { permissionMode: mode } });
+    return result.permissionMode;
   }
 
   // ---- Account Pool ----

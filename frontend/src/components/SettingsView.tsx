@@ -224,7 +224,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [memoryScope, setMemoryScope] = useState<'global' | 'workspace' | 'session'>('global');
   const [draftBaseUrl, setDraftBaseUrl] = useState(connection.baseUrl);
   const [draftToken, setDraftToken] = useState(connection.token);
-  const [draftWorkspace, setDraftWorkspace] = useState(workspaceRoot);
+  const [draftWorkspace, setDraftWorkspace] = useState<string | null>(null);
+  const [workspaceSaving, setWorkspaceSaving] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState('');
+  const pickWorkspace = async () => {
+    try {
+      const picked = await window.codexDesktop?.pickDirectory?.();
+      if (picked) {
+        setDraftWorkspace(picked.path);
+        setWorkspaceError('');
+      }
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : '无法选择目录');
+    }
+  };
+  const applyWorkspace = async () => {
+    if (!onChangeWorkspaceRoot || workspaceSaving) return;
+    setWorkspaceSaving(true);
+    setWorkspaceError('');
+    try {
+      await onChangeWorkspaceRoot((draftWorkspace ?? workspaceRoot).trim());
+      setDraftWorkspace(null);
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : '无法切换工作区目录');
+    } finally {
+      setWorkspaceSaving(false);
+    }
+  };
   const [testing, setTesting] = useState(false);
   const [memorySearching, setMemorySearching] = useState(false);
 
@@ -390,42 +416,49 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="codex-settings-card">
                 <div className="codex-settings-row">
                   <div className="codex-settings-row-info">
-                    <span className="codex-settings-row-label">Agent 操作的真实项目根目录</span>
+                    <span className="codex-settings-row-label">新会话默认工作区</span>
                     <span className="codex-settings-row-desc">
-                      read_file / edit_file / write_file / glob / grep / bash 均严格限定在此目录内。
+                      已有会话继续使用创建时的目录。工具审批与操作系统的目录权限相互独立。
                     </span>
                   </div>
                   <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                     <input
                       className="codex-input"
                       style={{ width: 280 }}
-                      value={draftWorkspace || workspaceRoot}
+                      aria-label="新会话默认工作区"
+                      value={draftWorkspace ?? workspaceRoot}
+                      disabled={workspaceSaving}
                       onChange={(e) => setDraftWorkspace(e.target.value)}
                       placeholder="例如：D:\Agent_US"
                     />
+                    {onChangeWorkspaceRoot && window.codexDesktop?.pickDirectory && (
+                      <button type="button" className="codex-toolbar-btn" disabled={workspaceSaving} onClick={() => void pickWorkspace()}>
+                        选择目录
+                      </button>
+                    )}
                     {onChangeWorkspaceRoot && (
                       <button
                         type="button"
                         className="codex-toolbar-btn"
                         data-variant="primary"
-                        onClick={() =>
-                          void onChangeWorkspaceRoot((draftWorkspace || workspaceRoot).trim())
-                        }
+                        disabled={workspaceSaving || !(draftWorkspace ?? workspaceRoot).trim()}
+                        onClick={() => void applyWorkspace()}
                       >
-                        应用目录
+                        {workspaceSaving ? '正在应用…' : '应用目录'}
                       </button>
                     )}
                   </div>
                 </div>
               </div>
 
-              <div className="codex-settings-section-title">执行权限策略</div>
+              {workspaceError && <p role="alert" className="codex-inline-error">{workspaceError}</p>}
+              <div className="codex-settings-section-title">新会话默认工具权限</div>
               <div className="codex-settings-card">
                 <div className="codex-settings-row">
                   <div className="codex-settings-row-info">
                     <span className="codex-settings-row-label">工具审批级别</span>
                     <span className="codex-settings-row-desc">
-                      只读工具始终免审；高危破坏性命令（如 rm -rf /、写块设备）受底层红线硬封锁。
+                      现有会话可以在输入框旁单独更改工具权限。权限模式不会绕过系统限制或安全规则。
                     </span>
                   </div>
                   <select
