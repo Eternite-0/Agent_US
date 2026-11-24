@@ -49,6 +49,7 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [dtocMinDraft, setDtocMinDraft] = useState('24000');
 
   const loadStatus = useCallback(
     async (signal?: AbortSignal) => {
@@ -59,6 +60,7 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
         const res = await client.getContextSupervisor(signal);
         if (!signal?.aborted) {
           setStatus(res);
+          setDtocMinDraft(String(res?.config?.dtocMinPromptTokens ?? 24000));
         }
       } catch (err) {
         if (!signal?.aborted) {
@@ -85,6 +87,7 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
     try {
       const updated = await client.updateContextSupervisor(patch);
       setStatus(updated);
+      setDtocMinDraft(String(updated?.config?.dtocMinPromptTokens ?? 24000));
       setError('');
       if (successMsg) onToast(successMsg, 'success');
     } catch (err) {
@@ -126,9 +129,14 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
   const effectiveMode: ContextSupervisorMode = config?.mode ?? 'auto';
   const selectedCustomModel =
     config?.model ?? status?.recommendedModel ?? candidates.find((c) => c.healthy)?.alias ?? '';
-  const watermarkLabel = (config?.epochWatermarks ?? [0.45, 0.7, 0.85])
+  const watermarkLabel = (config?.epochWatermarks ?? [0.6, 0.82])
     .map((w) => `${Math.round(w * 100)}%`)
     .join(' / ');
+  const currentDtocMinTokens = config?.dtocMinPromptTokens ?? 24000;
+  const parsedDtocMinDraft = Number(dtocMinDraft);
+  const dtocMinDraftValid =
+    Number.isInteger(parsedDtocMinDraft) && parsedDtocMinDraft >= 1000 && parsedDtocMinDraft <= 200000;
+  const dtocMinDirty = dtocMinDraftValid && parsedDtocMinDraft !== currentDtocMinTokens;
 
   const handleModeChange = (nextMode: ContextSupervisorMode) => {
     if (nextMode === 'custom') {
@@ -209,6 +217,32 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
               void applyPatch(
                 { enabled: next },
                 next ? '已开启自适应上下文' : '已关闭自适应上下文',
+              );
+            }}
+          >
+            <span className="codex-switch-thumb" />
+          </button>
+        </div>
+
+        <div className="codex-settings-row">
+          <div className="codex-settings-row-info">
+            <span className="codex-settings-row-label">启用注入前上下文准入治理 (Pre-Injection Admission)</span>
+            <span className="codex-settings-row-desc">
+              在工具输出写入主对话前按 DIRECT / SUPPORTING / DEFER / DUPLICATE / IRRELEVANT 渐进分级，保护关键领域并减少噪声注入。
+            </span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-label="启用注入前上下文准入治理"
+            aria-checked={Boolean(config?.admissionEnabled ?? true)}
+            disabled={saving || !status}
+            className="codex-switch"
+            onClick={() => {
+              const next = !(config?.admissionEnabled ?? true);
+              void applyPatch(
+                { admissionEnabled: next },
+                next ? '已开启注入前准入治理' : '已关闭注入前准入治理',
               );
             }}
           >
@@ -328,6 +362,44 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
           <span className="codex-status-chip" style={{ fontFamily: 'var(--font-mono)' }}>
             {watermarkLabel} · 上限 {Math.round((config?.maxBudgetRatio ?? 0.72) * 100)}%
           </span>
+        </div>
+
+        <div className="codex-settings-row">
+          <div className="codex-settings-row-info">
+            <span className="codex-settings-row-label">DTOC 最小单步提示词阈值 (tokens)</span>
+            <span className="codex-settings-row-desc">
+              单步提示词低于此门限时跳过常规 Epoch DTOC 折叠，保护短任务前缀缓存（范围 1,000 – 200,000，默认 24,000）。
+            </span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="number"
+              aria-label="DTOC 最小单步提示词阈值"
+              className="codex-input"
+              style={{ width: 112, fontFamily: 'var(--font-mono)' }}
+              min={1000}
+              max={200000}
+              step={1000}
+              disabled={saving || !status}
+              value={dtocMinDraft}
+              onChange={(e) => setDtocMinDraft(e.target.value)}
+            />
+            <button
+              type="button"
+              className="codex-toolbar-btn"
+              data-variant="outline"
+              disabled={saving || !status || !dtocMinDirty}
+              onClick={() => {
+                if (!dtocMinDraftValid) return;
+                void applyPatch(
+                  { dtocMinPromptTokens: parsedDtocMinDraft },
+                  `已更新 DTOC 最小单步提示词阈值为 ${parsedDtocMinDraft} tokens`,
+                );
+              }}
+            >
+              应用
+            </button>
+          </div>
         </div>
 
         <div className="codex-settings-row">

@@ -106,6 +106,8 @@ export interface ContextSupervisorConfig {
   epochWatermarks: number[];
   maxOutputTokens: number;
   timeoutMs: number;
+  admissionEnabled?: boolean;
+  dtocMinPromptTokens?: number;
 }
 
 export interface ContextSupervisorCandidate {
@@ -143,7 +145,15 @@ export interface ContextSupervisorStatus {
 export type ContextSupervisorUpdate = Partial<
   Pick<
     ContextSupervisorConfig,
-    'enabled' | 'mode' | 'model' | 'maxBudgetRatio' | 'epochWatermarks' | 'maxOutputTokens' | 'timeoutMs'
+    | 'enabled'
+    | 'mode'
+    | 'model'
+    | 'maxBudgetRatio'
+    | 'epochWatermarks'
+    | 'maxOutputTokens'
+    | 'timeoutMs'
+    | 'admissionEnabled'
+    | 'dtocMinPromptTokens'
   >
 >;
 

@@ -10,11 +10,20 @@ import { pairClosed } from '../../src/context.js';
 import {
   ContextEvidenceLedger,
   ReversibleContextStore,
+  formatAciRefStub,
 } from '../../src/context/aci-store.js';
+import {
+  ADMISSION_DECISIONS,
+  PreInjectionAdmissionController,
+  admitToolBatch,
+  classifyCriticalDomains,
+  isDecoyCue,
+} from '../../src/context/aci-admission.js';
 import {
   ACIEngine,
   ACON_MAX_GUIDELINES,
   ACON_SETTINGS_KEY,
+  DEFAULT_DTOC_POLICY,
   DEFAULT_EPOCH_WATERMARKS,
   compressMessagesEpoch,
   evaluateRetrievalGate,
@@ -27,6 +36,7 @@ import {
 } from '../../src/context/aci-engine.js';
 import {
   ContextSupervisor,
+  DEFAULT_ACI_SUPERVISOR_CONFIG,
 } from '../../src/context/supervisor.js';
 import { registerIntelligenceRoutes } from '../../src/routes/intelligence-routes.js';
 
@@ -279,6 +289,7 @@ test('Epoch-based DTOC compression triggers only at watermarks or single-step ov
     aciStore,
     ledger,
     maxTotalTokens: 20000,
+    dtocPolicy: 'cumulative',
     epochState: { lastWatermark: -1, epochCount: 0 },
   });
   assert.equal(r0.triggered, false);
@@ -290,6 +301,7 @@ test('Epoch-based DTOC compression triggers only at watermarks or single-step ov
     aciStore,
     ledger,
     maxTotalTokens: 3000,
+    dtocPolicy: 'cumulative',
     epochState: r0.epochState,
   });
   assert.equal(r1.triggered, true);
@@ -323,6 +335,7 @@ test('Epoch-based DTOC compression triggers only at watermarks or single-step ov
     aciStore,
     ledger,
     maxTotalTokens: 3000,
+    dtocPolicy: 'cumulative',
     epochState: r1.epochState,
   });
   assert.equal(rBetween.triggered, false);
@@ -638,7 +651,14 @@ test('Round 2: cumulativeUsedTokens triggers 160k epoch watermarks when single-s
       { role: 'assistant', content: [{ type: 'tool-call', id: 'c4', name: 'glob', arguments: '{"pattern":"*.json"}' }] },
       { role: 'tool', toolCallId: 'c4', content: [{ type: 'text', text: 'package.json' }] },
     ];
-    const engine = new ACIEngine({ store, aciStore, ledger, maxTotalTokens: 160000, contextWindow: 128000 });
+    const engine = new ACIEngine({
+      store,
+      aciStore,
+      ledger,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      dtocPolicy: 'cumulative',
+    });
 
     const lowProbe = engine.inspectEpoch(msgs, { cumulativeUsedTokens: 20000, contextWindow: 128000 });
     assert.equal(lowProbe.triggered, false);
@@ -699,7 +719,14 @@ test('Round 3: default [0.60, 0.82] watermarks, superseded pre-edit read offload
     assert.equal(candidates[0].superseded, true);
     assert.ok(candidates[0].chars >= 600);
 
-    const engine = new ACIEngine({ store, aciStore, ledger, maxTotalTokens: 160000, contextWindow: 128000 });
+    const engine = new ACIEngine({
+      store,
+      aciStore,
+      ledger,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      dtocPolicy: 'cumulative',
+    });
     const comp = engine.compress(msgs, { cumulativeUsedTokens: 97000, activeMutationTargets: ['src/calc.js'] });
     assert.equal(comp.triggered, true);
     assert.equal(comp.compressedCount, 1);
@@ -710,4 +737,722 @@ test('Round 3: default [0.60, 0.82] watermarks, superseded pre-edit read offload
   } finally {
     store.close();
   }
+});
+
+test('Stage 4: ReversibleContextStore restoreVerified checks SHA-256, throws ARTIFACT_HASH_MISMATCH on tamper, and ContextEvidenceLedger computes governance metrics', (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+
+  const aciStore = new ReversibleContextStore(store);
+  const ledger = new ContextEvidenceLedger();
+  const payload = 'export function verifyJwt(token) {\n  return token.startsWith("valid_");\n}\n';
+  const ref = aciStore.put(payload, {
+    toolName: 'read_file',
+    path: 'src/auth/jwt.js',
+    lineRange: 'L1-3',
+    symbolOutline: ['verifyJwt@L1'],
+    step: 1,
+    decision: 'SUPPORTING',
+  });
+
+  // Enhanced formatAciRefStub checks
+  assert.ok(ref.stubText.includes('SUPPORTING'));
+  assert.ok(ref.stubText.includes(ref.uri));
+  assert.ok(ref.stubText.includes('src/auth/jwt.js'));
+  assert.ok(ref.stubText.includes('L1-3'));
+  assert.ok(ref.stubText.includes('verifyJwt@L1'));
+  assert.ok(ref.stubText.includes(`~${ref.originalTokens} tok`));
+  assert.ok(ref.stubText.includes(`expand_context({ ref: "${ref.uri}", startLine, endLine })`));
+
+  const customStub = formatAciRefStub(ref, { decision: 'DUPLICATE', priorStep: 2 });
+  assert.ok(customStub.includes('DUPLICATE'));
+  assert.ok(customStub.includes('prior step=2'));
+
+  // findByPathAndHash & findActiveByHash
+  assert.equal(aciStore.findByPathAndHash('./src/auth/jwt.js', ref.sha256)?.refId, ref.refId);
+  assert.equal(aciStore.findActiveByHash(ref.sha256)?.refId, ref.refId);
+
+  // Valid restoreVerified
+  const verified = aciStore.restoreVerified(ref.refId, { expectedSha256: ref.sha256 });
+  assert.equal(verified.content, payload);
+  assert.equal(verified.sha256, ref.sha256);
+  assert.equal(verified.verified, true);
+  assert.equal(verified.refId, ref.refId);
+  assert.equal(verified.uri, ref.uri);
+  assert.equal(verified.path, 'src/auth/jwt.js');
+  assert.equal(aciStore.getRef(ref.refId).restoredCount, 1);
+
+  // Wrong expectedSha256 -> ARTIFACT_HASH_MISMATCH without incrementing restoredCount
+  assert.throws(
+    () => aciStore.restoreVerified(ref.refId, { expectedSha256: '0'.repeat(64) }),
+    (err) => err?.code === 'ARTIFACT_HASH_MISMATCH' && err?.status === 500,
+  );
+  assert.equal(aciStore.getRef(ref.refId).restoredCount, 1);
+
+  // Tamper SQLite blob content -> ARTIFACT_HASH_MISMATCH
+  store.db.prepare('UPDATE blobs SET content=? WHERE sha256=?').run('tampered content!', ref.sha256);
+  assert.throws(
+    () => aciStore.restoreVerified(ref.uri),
+    (err) => err?.code === 'ARTIFACT_HASH_MISMATCH' && err?.status === 500,
+  );
+  assert.equal(aciStore.getRef(ref.refId).restoredCount, 1);
+
+  // invalidatePath clears active hash lookup
+  aciStore.invalidatePath('src/auth/jwt.js');
+  assert.equal(aciStore.findByPathAndHash('src/auth/jwt.js', ref.sha256), null);
+
+  // ContextEvidenceLedger Stage 4 governance metrics
+  ledger.recordAdmission({
+    refId: null,
+    uri: 'artifact://' + 'a'.repeat(64),
+    sha256: 'a'.repeat(64),
+    path: 'src/auth/jwt.js',
+    toolName: 'read_file',
+    decision: 'DIRECT',
+    criticalDomains: ['auth'],
+    score: 0.95,
+    originalTokens: 800,
+    injectedTokens: 800,
+    step: 1,
+    reason: 'prompt_target',
+  });
+  ledger.recordAdmission({
+    refId: 'aci_defer',
+    uri: 'artifact://' + 'b'.repeat(64),
+    sha256: 'b'.repeat(64),
+    path: 'src/persistence/repo.js',
+    toolName: 'read_file',
+    decision: 'DEFER',
+    criticalDomains: ['persistence'],
+    score: 0.45,
+    originalTokens: 1200,
+    injectedTokens: 120,
+    step: 1,
+    reason: 'deferred_outline',
+  });
+  ledger.recordAdmission({
+    refId: 'aci_noise',
+    uri: 'artifact://' + 'c'.repeat(64),
+    sha256: 'c'.repeat(64),
+    path: 'src/utils/noise.js',
+    toolName: 'read_file',
+    decision: 'IRRELEVANT',
+    criticalDomains: [],
+    score: 0,
+    originalTokens: 2000,
+    injectedTokens: 40,
+    step: 1,
+    reason: 'zero_signal_noise',
+  });
+  ledger.recordRecovery({
+    refId: 'aci_defer',
+    uri: 'artifact://' + 'b'.repeat(64),
+    sha256: 'b'.repeat(64),
+    path: 'src/persistence/repo.js',
+    level: 'hunk',
+    verified: true,
+    tokensRestored: 300,
+    triggeredBy: 'expand_context',
+    step: 2,
+  });
+  ledger.recordSupervisorCall({
+    stage: 'admission',
+    model: 'fast-test-model',
+    candidateCount: 2,
+    decisions: [{ id: 'tc1', decision: 'DEFER' }],
+    inputTokens: 400,
+    outputTokens: 60,
+    durationMs: 25,
+    ok: true,
+    step: 1,
+  });
+  ledger.recordOutcome({ status: 'completed', verifiedPass: true, steps: 2 });
+
+  const gov = ledger.computeGovernanceMetrics({
+    groundTruthCriticalFiles: ['src/auth/jwt.js', 'src/persistence/repo.js'],
+    groundTruthRelevantFiles: ['src/auth/jwt.js', 'src/persistence/repo.js'],
+    groundTruthNoiseFiles: ['src/utils/noise.js'],
+  });
+  assert.equal(gov.criticalContextRecall, 1);
+  assert.equal(gov.falseNegativeRate, 0);
+  assert.equal(gov.contextPrecision, 1);
+  assert.ok(gov.usefulTokenRatio > 0.95);
+  assert.ok(gov.admissionTokenReduction > 0.7);
+  assert.deepEqual(gov.decisionCounts, {
+    DIRECT: 1,
+    SUPPORTING: 0,
+    DEFER: 1,
+    DUPLICATE: 0,
+    IRRELEVANT: 1,
+  });
+  assert.equal(gov.supervisorCost.calls, 1);
+  assert.equal(gov.supervisorCost.totalTokens, 460);
+  assert.equal(gov.recoveryStats.totalRecoveries, 1);
+  assert.equal(gov.recoveryStats.hashVerifiedCount, 1);
+  assert.equal(ledger.taskOutcome.status, 'completed');
+});
+
+test('Stage 4: classifyCriticalDomains detects 5 protected domains, suppresses decoys, and admission handles all 5 decisions + batched Supervisor guardrail', async (t) => {
+  await makeTempPool(t, async ({ store, pool }) => {
+    pool.createAccount({
+      preset: 'deepseek',
+      apiKey: 'sk-test-placeholder-1234567890',
+      models: ['main-model', 'fast-supervisor'],
+    });
+    pool.setDefaultModel('main-model');
+
+    // 1. Critical domains & decoy cues
+    const authRes = classifyCriticalDomains({
+      path: 'src/auth/session.js',
+      content: 'export function verifyToken(jwt) { return true; }',
+    });
+    assert.ok(authRes.domains.includes('auth'));
+    assert.equal(authRes.isDecoy, false);
+
+    const permRes = classifyCriticalDomains({
+      path: 'src/policy/rbac.js',
+      content: 'export function checkPermission(role) { return role === "admin"; }',
+    });
+    assert.ok(permRes.domains.includes('permission'));
+
+    const persistRes = classifyCriticalDomains({
+      path: 'src/db/sqlite-store.js',
+      content: 'const db = new DatabaseSync(); db.prepare("SELECT 1");',
+    });
+    assert.ok(persistRes.domains.includes('persistence'));
+
+    const contractRes = classifyCriticalDomains({
+      path: 'src/api/routes/users-schema.ts',
+      content: 'export interface UserContract { id: string; }',
+    });
+    assert.ok(contractRes.domains.includes('contract'));
+
+    const hiddenRes = classifyCriticalDomains({
+      path: 'test/acceptance/invariants.test.js',
+      content: 'assert.equal(1, 1);',
+    });
+    assert.ok(hiddenRes.domains.includes('hidden_acceptance'));
+
+    assert.equal(isDecoyCue('src/legacy/auth-v0.js', ''), true);
+    assert.equal(isDecoyCue('docs/CHANGELOG.md', '# Changelog'), true);
+    assert.equal(isDecoyCue('src/notes.js', '// @deprecated v1-compat shim'), true);
+    const decoyAuth = classifyCriticalDomains({
+      path: 'src/legacy/auth-v0.js',
+      content: 'export function verifyToken() { return false; }',
+    });
+    assert.equal(decoyAuth.isDecoy, true);
+    assert.deepEqual(decoyAuth.domains, []);
+    assert.ok(decoyAuth.rawDomains.includes('auth'));
+
+    // 2. Admission fast-paths, DUPLICATE with wrapped envelopes, batched Supervisor, and Critical Protection Guardrail
+    let supAdmitCalls = 0;
+    const adapter = {
+      async *stream(opts) {
+        assert.deepEqual(opts.tools, [], 'Admission supervisor must run with tools: []');
+        supAdmitCalls += 1;
+        const payload = JSON.parse(opts.messages[0].content[0].text);
+        const decisions = payload.candidates.map((c) => {
+          if (c.path.includes('auth/guard.js')) {
+            // Attempt malicious/mistaken downgrade of a non-decoy auth critical file to IRRELEVANT -> guardrail must clamp!
+            return {
+              id: c.id,
+              decision: 'IRRELEVANT',
+              focusSymbols: ['verifySignature'],
+              reason: 'mistaken downgrade attempt',
+            };
+          }
+          if (c.path.includes('legacy/')) {
+            return { id: c.id, decision: 'IRRELEVANT', reason: 'legacy decoy' };
+          }
+          return { id: c.id, decision: 'DEFER', reason: 'large secondary helper' };
+        });
+        decisions.push({ id: 'hallucinated_id', decision: 'DIRECT', reason: 'ignore' });
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({ decisions, contractHints: ['Keep auth verifySignature'] }),
+        };
+        yield { type: 'usage', usage: { inputTokens: 320, outputTokens: 85 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+
+    const supervisor = new ContextSupervisor({ store, pool, adapter });
+    const aciStore = new ReversibleContextStore(store);
+    const ledger = new ContextEvidenceLedger();
+    const controller = new PreInjectionAdmissionController({ aciStore, ledger });
+
+    const authGuardCode =
+      Array.from({ length: 55 }, (_, i) => `export function helperAuth${i}(x) { return x + ${i}; }`).join('\n') +
+      '\nexport function verifySignature(token) {\n  if (!token) throw new Error("BAD_SIG");\n  return token.startsWith("sig_");\n}\n';
+    const largeHelperCode =
+      'import { targetEntry } from "./target.js";\n' +
+      Array.from({ length: 85 }, (_, i) => `export function utilTask${i}(v) { return targetEntry(v) + ${i}; }`).join('\n');
+    const largeNoiseCode = Array.from(
+      { length: 80 },
+      (_, i) => `export const staticBannerLine${i} = "completely unrelated lorem ipsum payload ${i}";`,
+    ).join('\n');
+    const legacyDecoyCode =
+      '// @deprecated legacy v0 auth shim\n' +
+      Array.from({ length: 45 }, (_, i) => `export function legacyAuth${i}() { return ${i}; }`).join('\n');
+    const promptTargetCode =
+      'export function targetEntry(x) {\n  return x * 2;\n}\n' + '// target padding line for duplicate test\n'.repeat(42);
+
+    const wrapWithSeq = (seq, body) =>
+      `<untrusted id="deadbeef000011112222333344445555-tool-read_file-${seq}" bytes="${Buffer.byteLength(body, 'utf8')}">${body}</untrusted id="deadbeef000011112222333344445555-tool-read_file-${seq}">`;
+
+    const batch1 = [
+      // Small payload -> fast-path DIRECT (0 supervisor cost)
+      {
+        tc: { id: 'tc-small', name: 'read_file', arguments: JSON.stringify({ path: 'src/small.js' }) },
+        parsedArgs: { path: 'src/small.js' },
+        output: 'export const tiny = 1;',
+        isError: false,
+      },
+      // Error output -> fast-path DIRECT
+      {
+        tc: { id: 'tc-err', name: 'bash', arguments: JSON.stringify({ command: 'node --test' }) },
+        parsedArgs: { command: 'node --test' },
+        output: 'exitCode: 1\nAssertionError: failed\n' + 'stack\n'.repeat(150),
+        isError: true,
+      },
+      // Narrow slice <= 120 lines -> fast-path DIRECT
+      {
+        tc: { id: 'tc-slice', name: 'read_file', arguments: JSON.stringify({ path: 'src/sliced.js', startLine: 10, endLine: 50 }) },
+        parsedArgs: { path: 'src/sliced.js', startLine: 10, endLine: 50 },
+        output: wrapWithSeq(1, `File: src/sliced.js (lines 10-50 of 200)\n${'10: const a = 1;\n'.repeat(90)}`),
+        isError: false,
+      },
+      // Prompt-cited target <= 6000 chars -> fast-path DIRECT
+      {
+        tc: { id: 'tc-prompt', name: 'read_file', arguments: JSON.stringify({ path: 'src/target.js' }) },
+        parsedArgs: { path: 'src/target.js' },
+        output: wrapWithSeq(2, promptTargetCode),
+        isError: false,
+      },
+      // Zero-signal noise -> fast-path IRRELEVANT (1-line stub, zero supervisor cost)
+      {
+        tc: { id: 'tc-noise', name: 'read_file', arguments: JSON.stringify({ path: 'src/unrelated/banner.js' }) },
+        parsedArgs: { path: 'src/unrelated/banner.js' },
+        output: wrapWithSeq(3, largeNoiseCode),
+        isError: false,
+      },
+      // Ambiguous/large candidates sent in ONE batched supervisor call:
+      // 1) Non-decoy auth file -> supervisor tries IRRELEVANT -> Critical Guardrail upgrades to SUPPORTING!
+      {
+        tc: { id: 'tc-auth', name: 'read_file', arguments: JSON.stringify({ path: 'src/auth/guard.js' }) },
+        parsedArgs: { path: 'src/auth/guard.js' },
+        output: wrapWithSeq(4, authGuardCode),
+        isError: false,
+      },
+      // 2) Large multi-section helper -> supervisor returns DEFER
+      {
+        tc: { id: 'tc-helper', name: 'read_file', arguments: JSON.stringify({ path: 'src/utils/helpers.js' }) },
+        parsedArgs: { path: 'src/utils/helpers.js' },
+        output: wrapWithSeq(5, largeHelperCode),
+        isError: false,
+      },
+      // 3) Legacy auth decoy -> supervisor returns IRRELEVANT
+      {
+        tc: { id: 'tc-decoy', name: 'read_file', arguments: JSON.stringify({ path: 'src/legacy/auth-v0.js' }) },
+        parsedArgs: { path: 'src/legacy/auth-v0.js' },
+        output: wrapWithSeq(6, legacyDecoyCode),
+        isError: false,
+      },
+    ];
+
+    const res1 = await controller.admitBatch(batch1, {
+      query: 'Fix targetEntry in src/target.js and verifySignature',
+      step: 1,
+      supervisor,
+      supervisorEnabled: true,
+    });
+
+    assert.equal(supAdmitCalls, 1, 'Batch with multiple ambiguous candidates must trigger at most 1 Supervisor call');
+    const byId = Object.fromEntries(res1.admittedItems.map((it) => [it.tc.id, it]));
+    assert.equal(byId['tc-small'].admission.decision, ADMISSION_DECISIONS.DIRECT);
+    assert.equal(byId['tc-err'].admission.decision, ADMISSION_DECISIONS.DIRECT);
+    assert.equal(byId['tc-slice'].admission.decision, ADMISSION_DECISIONS.DIRECT);
+    assert.equal(byId['tc-prompt'].admission.decision, ADMISSION_DECISIONS.DIRECT);
+    assert.equal(byId['tc-noise'].admission.decision, ADMISSION_DECISIONS.IRRELEVANT);
+    assert.ok(!byId['tc-noise'].admittedOutput.includes('\n'));
+    assert.ok(byId['tc-noise'].admittedOutput.length < batch1[4].output.length);
+
+    // Critical guardrail protected src/auth/guard.js -> SUPPORTING with verifySignature hunk + outline + artifact://
+    assert.equal(byId['tc-auth'].admission.decision, ADMISSION_DECISIONS.SUPPORTING);
+    assert.match(byId['tc-auth'].admittedOutput, /verifySignature/);
+    assert.match(byId['tc-auth'].admittedOutput, /artifact:\/\//);
+    assert.ok(byId['tc-auth'].admittedOutput.length < batch1[5].output.length);
+
+    // DEFER keeps imports + symbol map + expand_context hint
+    assert.equal(byId['tc-helper'].admission.decision, ADMISSION_DECISIONS.DEFER);
+    assert.match(byId['tc-helper'].admittedOutput, /Imports:/);
+    assert.match(byId['tc-helper'].admittedOutput, /Symbols:/);
+    assert.match(byId['tc-helper'].admittedOutput, /expand_context/);
+    assert.ok(byId['tc-helper'].admittedOutput.length < batch1[6].output.length);
+
+    // Decoy suppressed to IRRELEVANT
+    assert.equal(byId['tc-decoy'].admission.decision, ADMISSION_DECISIONS.IRRELEVANT);
+    assert.ok(byId['tc-decoy'].admittedOutput.length < batch1[7].output.length);
+
+    // Supervisor cost recorded accurately
+    assert.equal(ledger.supervisorCalls.length, 1);
+    assert.equal(ledger.supervisorCalls[0].inputTokens, 320);
+    assert.equal(ledger.supervisorCalls[0].outputTokens, 85);
+
+    // 3. Re-reading unchanged src/target.js with a DIFFERENT wrapper seq -> DUPLICATE!
+    const res2 = await controller.admitBatch(
+      [
+        {
+          tc: { id: 'tc-dup', name: 'read_file', arguments: JSON.stringify({ path: 'src/target.js' }) },
+          parsedArgs: { path: 'src/target.js' },
+          output: wrapWithSeq(99, promptTargetCode),
+          isError: false,
+        },
+      ],
+      { query: 'Fix targetEntry in src/target.js', step: 2, supervisor, supervisorEnabled: true },
+    );
+    assert.equal(res2.admittedItems[0].admission.decision, ADMISSION_DECISIONS.DUPLICATE);
+    assert.match(res2.admittedItems[0].admittedOutput, /prior step=1/);
+    assert.ok(res2.admittedItems[0].admittedOutput.length < wrapWithSeq(99, promptTargetCode).length);
+
+    // 4. After edit_file invalidates src/target.js, re-reading is NOT DUPLICATE!
+    const res3 = await controller.admitBatch(
+      [
+        {
+          tc: { id: 'tc-edit', name: 'edit_file', arguments: JSON.stringify({ path: 'src/target.js' }) },
+          parsedArgs: { path: 'src/target.js' },
+          output: '已成功编辑 src/target.js',
+          isError: false,
+        },
+        {
+          tc: { id: 'tc-reread', name: 'read_file', arguments: JSON.stringify({ path: 'src/target.js' }) },
+          parsedArgs: { path: 'src/target.js' },
+          output: wrapWithSeq(105, promptTargetCode.replace('x * 2', 'x * 3')),
+          isError: false,
+        },
+      ],
+      { query: 'Fix targetEntry in src/target.js', step: 3, supervisor, supervisorEnabled: true },
+    );
+    assert.equal(res3.admittedItems[0].admission.decision, ADMISSION_DECISIONS.DIRECT);
+    assert.equal(res3.admittedItems[1].admission.decision, ADMISSION_DECISIONS.DIRECT);
+
+    // 5. Supervisor Fail-Closed (malformed JSON + tool-call attempt) falls back deterministically
+    const badJsonSup = new ContextSupervisor({
+      store,
+      pool,
+      adapter: {
+        async *stream() {
+          yield { type: 'text-delta', text: 'not valid json {{{' };
+        },
+      },
+    });
+    const badRes = await badJsonSup.admitCandidates({
+      query: 'test',
+      candidates: [{ id: 'c1', path: 'src/a.js', chars: 2000 }],
+    });
+    assert.equal(badRes.ok, false);
+    assert.equal(badRes.fallback, 'deterministic');
+    assert.ok(badRes.inputTokens > 0);
+
+    const toolCallSup = new ContextSupervisor({
+      store,
+      pool,
+      adapter: {
+        async *stream() {
+          yield { type: 'tool-call', id: 'bad', name: 'bash', arguments: '{}' };
+        },
+      },
+    });
+    const toolRes = await toolCallSup.admitCandidates({
+      query: 'test',
+      candidates: [{ id: 'c1', path: 'src/a.js', chars: 2000 }],
+    });
+    assert.equal(toolRes.ok, false);
+    assert.equal(toolRes.fallback, 'deterministic');
+    assert.match(toolRes.error, /tool invocation/i);
+  });
+});
+
+test('Stage 4: adaptive_single_step DTOC preserves short-task KV cache at tokensBefore ~5k even when cumulativeUsedTokens=100k', () => {
+  assert.equal(DEFAULT_DTOC_POLICY, 'adaptive_single_step');
+  const store = new Store(':memory:');
+  try {
+    const fillerRead = 'export const payloadItem = "short task module data";\n'.repeat(65); // ~3500 chars (~900 tok)
+    const msgs = [
+      { role: 'system', content: [{ type: 'text', text: 'static system prompt' }] },
+      { role: 'user', content: [{ type: 'text', text: 'inspect workspace' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read_file', arguments: JSON.stringify({ path: 'src/a.js' }) }] },
+      { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: fillerRead }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c2', name: 'glob', arguments: '{"pattern":"src/*.js"}' }] },
+      { role: 'tool', toolCallId: 'c2', content: [{ type: 'text', text: 'src/a.js' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c3', name: 'glob', arguments: '{"pattern":"test/*.js"}' }] },
+      { role: 'tool', toolCallId: 'c3', content: [{ type: 'text', text: 'test/a.test.js' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c4', name: 'glob', arguments: '{"pattern":"*.json"}' }] },
+      { role: 'tool', toolCallId: 'c4', content: [{ type: 'text', text: 'package.json' }] },
+    ];
+
+    const engine = new ACIEngine({
+      store,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      dtocMinPromptTokens: 24000,
+    });
+
+    // Short task (~1k-5k prompt tokens) with cumulativeUsedTokens=100k MUST NOT trigger DTOC!
+    const shortProbe = engine.inspectEpoch(msgs, { cumulativeUsedTokens: 100000 });
+    assert.equal(shortProbe.dtocPolicy, 'adaptive_single_step');
+    assert.equal(shortProbe.triggered, false);
+    assert.equal(shortProbe.watermarkTriggered, false);
+    assert.equal(shortProbe.emergencyTriggered, false);
+
+    const shortComp = engine.compress(msgs, { cumulativeUsedTokens: 100000 });
+    assert.equal(shortComp.triggered, false);
+    assert.equal(shortComp.compressedCount, 0);
+    assert.equal(shortComp.messages, msgs);
+
+    // True high single-step pressure (>= min(24000, 0.45*contextWindow) and >= 0.60 * contextWindow) DOES trigger!
+    const hugeTool = 'const largeEntry = "long module line";\n'.repeat(2100);
+    const heavyMsgs = [
+      { role: 'system', content: [{ type: 'text', text: 'static system prompt' }] },
+      { role: 'user', content: [{ type: 'text', text: 'analyze huge file' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'big1', name: 'read_file', arguments: JSON.stringify({ path: 'src/huge.js' }) }] },
+      { role: 'tool', toolCallId: 'big1', content: [{ type: 'text', text: hugeTool }] },
+    ];
+    const heavyEngine = new ACIEngine({
+      store,
+      maxTotalTokens: 200000,
+      contextWindow: 32000,
+      dtocMinPromptTokens: 24000,
+      singleStepBudget: 50000,
+    });
+    const heavyProbe = heavyEngine.inspectEpoch(heavyMsgs, { cumulativeUsedTokens: 0 });
+    assert.ok(heavyProbe.tokensBefore >= 14400);
+    assert.equal(heavyProbe.watermarkTriggered, true);
+    assert.equal(heavyProbe.triggered, true);
+
+    // Emergency remaining budget branch (>= 12k tokensBefore & remaining <= 2.5 * tokensBefore) triggers!
+    const mediumTool = 'export const medItem = "medium chunk data for emergency budget test";\n'.repeat(800);
+    const mediumMsgs = [
+      { role: 'system', content: [{ type: 'text', text: 'static system prompt' }] },
+      { role: 'user', content: [{ type: 'text', text: 'check medium file' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm1', name: 'read_file', arguments: JSON.stringify({ path: 'src/med.js' }) }] },
+      { role: 'tool', toolCallId: 'm1', content: [{ type: 'text', text: mediumTool }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm2', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm2', content: [{ type: 'text', text: 'src/med.js' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm3', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm3', content: [{ type: 'text', text: 'package.json' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm4', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm4', content: [{ type: 'text', text: 'README.md' }] },
+    ];
+    const emergencyEngine = new ACIEngine({
+      store,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      singleStepBudget: 50000,
+    });
+    const emProbe = emergencyEngine.inspectEpoch(mediumMsgs, { cumulativeUsedTokens: 135000 });
+    assert.ok(emProbe.tokensBefore >= 12000);
+    assert.equal(emProbe.emergencyTriggered, true);
+    assert.equal(emProbe.triggered, true);
+
+    const emComp = emergencyEngine.compress(mediumMsgs, { cumulativeUsedTokens: 135000 });
+    assert.equal(emComp.triggered, true);
+    assert.equal(emComp.reason, 'emergency_budget');
+    assert.equal(emComp.compressedCount, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test('Stage 4 calibration: ACI-SKIP stubs, json_key outline + >2600 CONTRACT.json SUPPORTING, mixed grep decoy, one-shot emergencyUsed, and supervisor stream usage dedupe', async (t) => {
+  assert.equal(DEFAULT_ACI_SUPERVISOR_CONFIG.timeoutMs, 25000);
+
+  await makeTempPool(t, async ({ store, pool }) => {
+    pool.createAccount({
+      preset: 'deepseek',
+      apiKey: 'sk-test-placeholder-1234567890',
+      models: ['main-model', 'calib-flash-model'],
+    });
+    pool.setDefaultModel('calib-flash-model');
+
+    const aciStore = new ReversibleContextStore(store);
+    const ledger = new ContextEvidenceLedger();
+
+    // (a) ACI-SKIP stubs omit expand_context bait on IRRELEVANT & DUPLICATE while preserving ACI-REF on DEFER/SUPPORTING
+    const sampleRef = aciStore.put('export const a = 1;\n', {
+      path: 'src/noise.js',
+      toolName: 'read_file',
+      lineRange: 'L1-2',
+      symbolOutline: ['a@L1'],
+      step: 1,
+    });
+    const irrStd = formatAciRefStub(sampleRef, { decision: 'IRRELEVANT' });
+    const irrCmp = formatAciRefStub(sampleRef, { decision: 'IRRELEVANT', compact: true });
+    assert.ok(irrStd.startsWith('[ACI-SKIP '));
+    assert.ok(irrCmp.startsWith('[ACI-SKIP '));
+    assert.ok(!irrStd.includes('expand_context'));
+    assert.ok(!irrCmp.includes('expand_context'));
+
+    const dupStd = formatAciRefStub(sampleRef, { decision: 'DUPLICATE', priorStep: 3 });
+    const dupCmp = formatAciRefStub(sampleRef, { decision: 'DUPLICATE', priorStep: 3, compact: true });
+    assert.ok(dupStd.startsWith('[ACI-SKIP '));
+    assert.ok(dupCmp.startsWith('[ACI-SKIP '));
+    assert.ok(dupStd.includes('prior step=3'));
+    assert.ok(dupCmp.includes('prior step=3'));
+    assert.ok(!dupStd.includes('expand_context'));
+    assert.ok(!dupCmp.includes('expand_context'));
+
+    const defStub = formatAciRefStub(sampleRef, { decision: 'DEFER' });
+    const supStub = formatAciRefStub(sampleRef, { decision: 'SUPPORTING' });
+    assert.ok(defStub.startsWith('[ACI-REF '));
+    assert.ok(defStub.includes('expand_context('));
+    assert.ok(supStub.startsWith('[ACI-REF '));
+    assert.ok(supStub.includes('expand_context('));
+
+    // (b) JSON key outline extraction + >2600 prompt-cited CONTRACT.json enters SUPPORTING with compressed body & verbatim recovery
+    // (e) Multiple usage chunks across distinct usageRequestId values must NOT multiply inputTokens
+    let observedSupTokens = null;
+    const calibAdapter = {
+      async *stream(opts) {
+        const payload = JSON.parse(opts.messages[0].content[0].text);
+        const decisions = payload.candidates.map((c) => ({
+          id: c.id,
+          // Supervisor attempts IRRELEVANT on CONTRACT.json -> Critical Guardrail clamps to SUPPORTING
+          decision: 'IRRELEVANT',
+          focusSymbols: ['precedence', 'normalizationRules'],
+          reason: 'calibration test',
+        }));
+        for (let idx = 0; idx < 4; idx += 1) {
+          yield {
+            type: 'usage',
+            usageRequestId: `sup-chunk-${idx}`,
+            usage: { inputTokens: 756, outputTokens: 80 + idx * 15 },
+          };
+        }
+        yield { type: 'text-delta', text: JSON.stringify({ decisions, contractHints: [] }) };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+    const supervisor = new ContextSupervisor({ store, pool, adapter: calibAdapter });
+    const controller = new PreInjectionAdmissionController({ aciStore, ledger });
+
+    const contractObj = {
+      contractVersion: '2.4.0',
+      precedence: ['schema', 'normalizer', 'overrides', 'defaults'],
+      normalizationRules: Array.from({ length: 35 }, (_, i) => ({
+        ruleId: `rule_${i}`,
+        field: `field_${i}`,
+        description: `Deterministic normalization step ${i} requiring exact precedence order`,
+      })),
+    };
+    const contractText = JSON.stringify(contractObj, null, 2);
+    assert.ok(contractText.length > 2600);
+    const shortSpec = '# SPEC\nKeep normalizer precedence.\n' + '- Rule item\n'.repeat(120); // ~1850 chars <= 2600
+    assert.ok(shortSpec.length <= 2600);
+
+    const wrap = (seq, body) =>
+      `<untrusted id="deadbeef000011112222333344445555-tool-read_file-${seq}" bytes="${Buffer.byteLength(body, 'utf8')}">${body}</untrusted id="deadbeef000011112222333344445555-tool-read_file-${seq}">`;
+
+    const admitRes = await controller.admitBatch(
+      [
+        {
+          tc: { id: 'tc-spec', name: 'read_file', arguments: JSON.stringify({ path: 'SPEC.md' }) },
+          parsedArgs: { path: 'SPEC.md' },
+          output: wrap(1, shortSpec),
+          isError: false,
+        },
+        {
+          tc: { id: 'tc-contract', name: 'read_file', arguments: JSON.stringify({ path: 'CONTRACT.json' }) },
+          parsedArgs: { path: 'CONTRACT.json' },
+          output: wrap(2, contractText),
+          isError: false,
+        },
+      ],
+      { query: 'Update CONTRACT.json precedence per SPEC.md', step: 1, supervisor, supervisorEnabled: true },
+    );
+
+    const byId = Object.fromEntries(admitRes.admittedItems.map((it) => [it.tc.id, it]));
+    assert.equal(byId['tc-spec'].admission.decision, ADMISSION_DECISIONS.DIRECT);
+    assert.equal(byId['tc-contract'].admission.decision, ADMISSION_DECISIONS.SUPPORTING);
+    assert.match(byId['tc-contract'].admittedOutput, /\[json_key\]/);
+    assert.match(byId['tc-contract'].admittedOutput, /Expand omitted lines: expand_context\(/);
+    assert.ok(byId['tc-contract'].admittedOutput.length < wrap(2, contractText).length);
+
+    const uriMatch = byId['tc-contract'].admittedOutput.match(/artifact:\/\/[0-9a-f]{64}/);
+    assert.ok(uriMatch);
+    const restored = aciStore.restoreVerified(uriMatch[0]);
+    assert.equal(restored.verified, true);
+    assert.ok(restored.content.includes('"contractVersion": "2.4.0"'));
+
+    observedSupTokens = ledger.supervisorCalls[0];
+    assert.equal(observedSupTokens.inputTokens, 756, 'must deduplicate cumulative usage across usageRequestId chunks');
+    assert.equal(observedSupTokens.outputTokens, 125);
+    assert.equal(observedSupTokens.totalTokens, 881);
+
+    // (c) Mixed active+legacy grep: output must not be marked decoy; pure legacy grep: output is decoy
+    assert.equal(
+      isDecoyCue(
+        'grep:precedence',
+        'src/pipeline/normalizer.js:12: const precedence = [];\nsrc/legacy/v0-normalizer.js:4: // @deprecated',
+      ),
+      false,
+    );
+    assert.equal(
+      isDecoyCue(
+        'grep:legacy',
+        'src/legacy/v0-normalizer.js:4: // @deprecated\nsrc/v1-compat/shim.js:2: // legacy fallback',
+      ),
+      true,
+    );
+    assert.equal(isDecoyCue('glob:**/*.js', '   \n  '), false);
+
+    // (d) One-shot emergencyUsed prevents consecutive-step emergency_budget thrashing,
+    // and 0-compressed compressMessagesEpoch preserves epochCount while marking emergencyUsed
+    const mediumTool = 'export const medItem = "medium chunk data for emergency budget test";\n'.repeat(800);
+    const emergencyMsgs = [
+      { role: 'system', content: [{ type: 'text', text: 'static system prompt' }] },
+      { role: 'user', content: [{ type: 'text', text: 'check medium file' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm1', name: 'read_file', arguments: JSON.stringify({ path: 'src/med.js' }) }] },
+      { role: 'tool', toolCallId: 'm1', content: [{ type: 'text', text: mediumTool }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm2', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm2', content: [{ type: 'text', text: 'src/med.js' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm3', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm3', content: [{ type: 'text', text: 'package.json' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm4', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm4', content: [{ type: 'text', text: 'README.md' }] },
+    ];
+    const emEngine = new ACIEngine({
+      store,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      singleStepBudget: 50000,
+    });
+    const comp1 = emEngine.compress(emergencyMsgs, { cumulativeUsedTokens: 135000 });
+    assert.equal(comp1.triggered, true);
+    assert.equal(comp1.reason, 'emergency_budget');
+    assert.equal(comp1.epoch, 1);
+    assert.equal(emEngine.epochState.emergencyUsed, true);
+
+    const probe2 = emEngine.inspectEpoch(emergencyMsgs, { cumulativeUsedTokens: 138000 });
+    assert.equal(probe2.emergencyTriggered, false);
+    assert.equal(probe2.triggered, false);
+
+    // 0-eligible emergency compress leaves epochCount=0 while setting emergencyUsed=true
+    const emptyComp = compressMessagesEpoch(emergencyMsgs, {
+      aciStore,
+      ledger,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      singleStepBudget: 50000,
+      cumulativeUsedTokens: 135000,
+      minAgeSteps: 99,
+      supersededMinAgeSteps: 99,
+      epochState: { lastWatermark: -1, epochCount: 0, emergencyUsed: false },
+    });
+    assert.equal(emptyComp.triggered, true);
+    assert.equal(emptyComp.compressedCount, 0);
+    assert.equal(emptyComp.epoch, 0);
+    assert.equal(emptyComp.epochState.epochCount, 0);
+    assert.equal(emptyComp.epochState.emergencyUsed, true);
+  });
 });

@@ -344,6 +344,23 @@ export function registerIntelligenceRoutes(app, {
       }
       patch.timeoutMs = ms;
     }
+    if (body.admissionEnabled !== undefined) {
+      if (typeof body.admissionEnabled !== 'boolean') {
+        fail('INVALID_SUPERVISOR_CONFIG', 400, 'admissionEnabled must be a boolean');
+      }
+      patch.admissionEnabled = body.admissionEnabled;
+    }
+    if (body.dtocMinPromptTokens !== undefined) {
+      const tok = Number(body.dtocMinPromptTokens);
+      if (!Number.isInteger(tok) || tok < 1000 || tok > 200000) {
+        fail(
+          'INVALID_SUPERVISOR_CONFIG',
+          400,
+          'dtocMinPromptTokens must be an integer between 1000 and 200000',
+        );
+      }
+      patch.dtocMinPromptTokens = tok;
+    }
 
     const current = contextSupervisor.getConfig();
     const nextMode = patch.mode ?? current.mode;

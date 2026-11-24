@@ -1,4 +1,6 @@
+import { estimateTokens } from '../context.js';
 import { redactSecrets, sanitize } from '../envelope.js';
+import { mergeUsageSnapshot } from '../observability/prompt-cache.js';
 import { getLearnedGuidelines, sanitizeGuidelineText } from './aci-engine.js';
 
 export const ACI_CONFIG_KEY = 'aci.config';
@@ -10,13 +12,23 @@ export const DEFAULT_ACI_SUPERVISOR_CONFIG = Object.freeze({
   maxBudgetRatio: 0.72,
   epochWatermarks: [0.6, 0.82],
   maxOutputTokens: 1200,
-  timeoutMs: 12000,
+  timeoutMs: 25000,
+  admissionEnabled: true,
+  dtocMinPromptTokens: 24000,
 });
 
 const FAST_TIER_RE = /(?:^|[-_./\s])(?:flash|lite|nano|micro|instant|fast)(?:$|[-_./\s0-9])/i;
 const LIGHT_TIER_RE = /(?:^|[-_./\s])(?:mini|haiku|small|turbo|air|quick)(?:$|[-_./\s0-9])/i;
 const HEAVY_TIER_RE = /(?:^|[-_./\s])(?:opus|pro|max|ultra|reasoner|thinking|r1|heavy|xhigh)(?:$|[-_./\s0-9])/i;
 const UTILITY_MODEL_RE = /(?:^|[-_./\s])(?:embed|embedding|whisper|tts|dall|flux|image|rerank|moderation)(?:$|[-_./\s0-9])/i;
+
+const VALID_ADMISSION_DECISIONS = new Set([
+  'DIRECT',
+  'SUPPORTING',
+  'DEFER',
+  'DUPLICATE',
+  'IRRELEVANT',
+]);
 
 const SUPERVISOR_SYSTEM_PROMPT = [
   'You are a strictly read-only Context Supervisor for Adaptive Context Intelligence (ACI).',
@@ -28,6 +40,19 @@ const SUPERVISOR_SYSTEM_PROMPT = [
   '  contractHints: string[] (short architectural/interface contract reminders)',
   '  summary: string (concise read-only context guidance, <= 600 chars)',
   'Only cite candidate IDs explicitly listed in the prompt. Output valid JSON only.',
+].join('\n');
+
+const ADMISSION_SUPERVISOR_SYSTEM_PROMPT = [
+  'You are a strictly read-only Pre-Injection Context Admission Supervisor for Adaptive Context Intelligence (ACI).',
+  'You have ZERO tool privileges, cannot execute commands, cannot edit files, and cannot approve actions.',
+  'Classify each ambiguous candidate output into one of:',
+  '  DIRECT (keep verbatim), SUPPORTING (focused hunks + outline), DEFER (imports + symbol line map + restore ref), DUPLICATE (unchanged duplicate stub), IRRELEVANT (1-line stub).',
+  'Never drop prompt-cited, error-trace, active-mutation, or genuine auth/permission/persistence/contract/hidden_acceptance files as IRRELEVANT.',
+  'For large (>2600 chars) multi-section active/config/contract files, prefer SUPPORTING (with key focusSymbols) or DEFER over DIRECT unless every line is immediately required; reserve IRRELEVANT strictly for unrelated/legacy/archived/sample decoys.',
+  'Reject legacy/deprecated/archive/changelog/fixture/sample/mock-data decoys unless explicitly targeted.',
+  'Return ONLY valid JSON with shape:',
+  '  { "decisions": [{ "id": string, "decision": "DIRECT"|"SUPPORTING"|"DEFER"|"DUPLICATE"|"IRRELEVANT", "focusSymbols": string[], "reason": string }], "contractHints": string[] }',
+  'Only cite candidate IDs explicitly listed in the prompt.',
 ].join('\n');
 
 function isHealthyRouteList(routes, now = Date.now()) {
@@ -175,6 +200,16 @@ export function normalizeSupervisorConfig(raw = {}) {
       ? Math.min(60000, Math.max(500, Math.trunc(Number(input.timeoutMs))))
       : base.timeoutMs;
 
+  const admissionEnabled =
+    input.admissionEnabled !== undefined ? Boolean(input.admissionEnabled) : base.admissionEnabled;
+
+  const dtocMinPromptTokens =
+    input.dtocMinPromptTokens != null &&
+    input.dtocMinPromptTokens !== '' &&
+    Number.isFinite(Number(input.dtocMinPromptTokens))
+      ? Math.min(200000, Math.max(1000, Math.trunc(Number(input.dtocMinPromptTokens))))
+      : base.dtocMinPromptTokens;
+
   return {
     enabled,
     mode,
@@ -183,6 +218,8 @@ export function normalizeSupervisorConfig(raw = {}) {
     epochWatermarks,
     maxOutputTokens,
     timeoutMs,
+    admissionEnabled,
+    dtocMinPromptTokens,
   };
 }
 
@@ -378,6 +415,107 @@ export class ContextSupervisor {
     };
   }
 
+  async #invokeReadOnlyStream({
+    effectiveAdapter,
+    model,
+    system,
+    userPayload,
+    maxTokens,
+    timeoutMs,
+    signal,
+  }) {
+    const startedAt = Date.now();
+    const userText = JSON.stringify(userPayload);
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => {
+      timeoutController.abort(new Error('ACI supervisor timeout'));
+    }, timeoutMs);
+    const onExternalAbort = () => timeoutController.abort(signal?.reason ?? new Error('Aborted'));
+    if (signal) {
+      if (signal.aborted) onExternalAbort();
+      else signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
+    let rawOutput = '';
+    const usage = { inputTokens: 0, outputTokens: 0 };
+
+    const finalizeUsage = () => {
+      const hasReportedIn = usage.inputTokens > 0;
+      const hasReportedOut = usage.outputTokens > 0;
+      const inputTokens = hasReportedIn
+        ? usage.inputTokens
+        : estimateTokens(`${system}\n${userText}`);
+      const outputTokens = hasReportedOut
+        ? usage.outputTokens
+        : rawOutput
+          ? estimateTokens(rawOutput)
+          : 0;
+      return {
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        estimated: !(hasReportedIn && hasReportedOut),
+        durationMs: Math.max(0, Date.now() - startedAt),
+      };
+    };
+
+    try {
+      for await (const chunk of effectiveAdapter.stream({
+        provider: 'pool',
+        model,
+        system,
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: userText }],
+          },
+        ],
+        tools: [], // STRICT READ-ONLY BOUNDARY: zero tool privileges
+        maxTokens,
+        signal: timeoutController.signal,
+      })) {
+        if (timeoutController.signal.aborted) {
+          throw new Error('ACI supervisor aborted/timed out');
+        }
+        if (chunk?.type === 'tool-call' || chunk?.block?.type === 'tool-call') {
+          throw new Error('Read-only supervisor attempted tool invocation');
+        }
+        if (chunk?.type === 'usage' && chunk.usage) {
+          Object.assign(usage, mergeUsageSnapshot({ ...usage }, chunk.usage));
+        } else if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
+          rawOutput += chunk.text;
+        } else if (
+          chunk?.type === 'block-end' &&
+          chunk?.block?.type === 'text' &&
+          !rawOutput &&
+          typeof chunk.block.text === 'string'
+        ) {
+          rawOutput = chunk.block.text;
+        }
+      }
+
+      return {
+        ok: true,
+        rawOutput,
+        parsed: parseJsonObjectFromText(rawOutput),
+        ...finalizeUsage(),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        rawOutput,
+        parsed: null,
+        error: String(error?.message || error || 'supervisor_failed'),
+        ...finalizeUsage(),
+      };
+    } finally {
+      clearTimeout(timer);
+      if (signal) {
+        signal.removeEventListener('abort', onExternalAbort);
+      }
+    }
+  }
+
   /**
    * Executes a strictly read-only (`tools: []`) side-model context supervision
    * call, validating every returned ref against known candidate IDs and failing
@@ -388,9 +526,11 @@ export class ContextSupervisor {
     candidates = [],
     errorSummary = '',
     budgetSummary = '',
+    learnedGuidelines = [],
     signal = null,
+    configOverride = null,
   } = {}) {
-    const resolved = this.resolveModel();
+    const resolved = this.resolveModel(configOverride);
     const config = resolved.config;
 
     if (!config.enabled || config.mode === 'off') {
@@ -407,6 +547,10 @@ export class ContextSupervisor {
         contractHints: [],
         summary: '',
         rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
       };
     }
 
@@ -425,6 +569,10 @@ export class ContextSupervisor {
         contractHints: [],
         summary: '',
         rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
       };
     }
 
@@ -449,128 +597,30 @@ export class ContextSupervisor {
       });
     }
 
+    const guidelinesList = (Array.isArray(learnedGuidelines) ? learnedGuidelines : [])
+      .map((g) => sanitizeGuidelineText(typeof g === 'string' ? g : g?.text ?? ''))
+      .filter(Boolean)
+      .slice(0, 8);
+
     const userPayload = {
       query: sanitize(redactSecrets(String(query ?? ''))).slice(0, 800),
       errorSummary: sanitize(redactSecrets(String(errorSummary ?? ''))).slice(0, 800),
       budgetSummary: sanitize(redactSecrets(String(budgetSummary ?? ''))).slice(0, 300),
+      ...(guidelinesList.length ? { learnedGuidelines: guidelinesList } : {}),
       candidates: promptCandidates,
     };
 
-    const timeoutController = new AbortController();
-    const timer = setTimeout(() => {
-      timeoutController.abort(new Error('ACI supervisor timeout'));
-    }, config.timeoutMs);
-    const onExternalAbort = () => timeoutController.abort(signal?.reason ?? new Error('Aborted'));
-    if (signal) {
-      if (signal.aborted) onExternalAbort();
-      else signal.addEventListener('abort', onExternalAbort, { once: true });
-    }
+    const callRes = await this.#invokeReadOnlyStream({
+      effectiveAdapter,
+      model: resolved.effectiveModel,
+      system: SUPERVISOR_SYSTEM_PROMPT,
+      userPayload,
+      maxTokens: config.maxOutputTokens,
+      timeoutMs: config.timeoutMs,
+      signal,
+    });
 
-    let rawOutput = '';
-    try {
-      for await (const chunk of effectiveAdapter.stream({
-        provider: 'pool',
-        model: resolved.effectiveModel,
-        system: SUPERVISOR_SYSTEM_PROMPT,
-        messages: [
-          {
-            role: 'user',
-            content: [{ type: 'text', text: JSON.stringify(userPayload) }],
-          },
-        ],
-        tools: [], // STRICT READ-ONLY BOUNDARY: zero tool privileges
-        maxTokens: config.maxOutputTokens,
-        signal: timeoutController.signal,
-      })) {
-        if (timeoutController.signal.aborted) {
-          throw new Error('ACI supervisor aborted/timed out');
-        }
-        if (chunk?.type === 'tool-call' || chunk?.block?.type === 'tool-call') {
-          throw new Error('Read-only supervisor attempted tool invocation');
-        }
-        if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
-          rawOutput += chunk.text;
-        } else if (
-          chunk?.type === 'block-end' &&
-          chunk?.block?.type === 'text' &&
-          !rawOutput &&
-          typeof chunk.block.text === 'string'
-        ) {
-          rawOutput = chunk.block.text;
-        }
-      }
-
-      const parsed = parseJsonObjectFromText(rawOutput);
-      if (!parsed) {
-        return {
-          ok: false,
-          bypassed: false,
-          usedLlm: false,
-          fallback: 'deterministic',
-          model: resolved.effectiveModel,
-          rationale: 'invalid_json_deterministic_fallback',
-          keepRefs: [],
-          compressRefs: [],
-          expandSuggestions: [],
-          contractHints: [],
-          summary: '',
-          rejectedRefs: [],
-        };
-      }
-
-      const rejectedRefs = [];
-      const filterRefs = (arr, excludeSet = null) => {
-        if (!Array.isArray(arr)) return [];
-        const out = [];
-        const seen = new Set();
-        for (const item of arr) {
-          const rawId = String(item ?? '').trim();
-          if (!rawId) continue;
-          const mapped = validIdMap.get(rawId);
-          if (!mapped) {
-            rejectedRefs.push(rawId);
-            continue;
-          }
-          if (excludeSet?.has(mapped) || seen.has(mapped)) continue;
-          seen.add(mapped);
-          out.push(mapped);
-          if (out.length >= 20) break;
-        }
-        return out;
-      };
-
-      const keepRefs = filterRefs(parsed.keepRefs);
-      const keepSet = new Set(keepRefs);
-      const compressRefs = filterRefs(parsed.compressRefs, keepSet);
-      const expandSuggestions = filterRefs(parsed.expandSuggestions);
-
-      const contractHints = Array.isArray(parsed.contractHints)
-        ? parsed.contractHints
-            .map((h) => sanitizeGuidelineText(String(h ?? '')))
-            .filter(Boolean)
-            .slice(0, 10)
-        : [];
-
-      const summary = sanitize(redactSecrets(String(parsed.summary ?? '')))
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 1200);
-
-      return {
-        ok: true,
-        bypassed: false,
-        usedLlm: true,
-        fallback: null,
-        model: resolved.effectiveModel,
-        rationale: resolved.rationale,
-        keepRefs,
-        compressRefs,
-        expandSuggestions,
-        contractHints,
-        summary,
-        rejectedRefs,
-      };
-    } catch (error) {
+    if (!callRes.ok) {
       return {
         ok: false,
         bypassed: false,
@@ -584,13 +634,310 @@ export class ContextSupervisor {
         contractHints: [],
         summary: '',
         rejectedRefs: [],
-        error: String(error?.message || error || 'supervisor_failed'),
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+        durationMs: callRes.durationMs,
+        error: callRes.error,
       };
-    } finally {
-      clearTimeout(timer);
-      if (signal) {
-        signal.removeEventListener('abort', onExternalAbort);
-      }
     }
+
+    const parsed = callRes.parsed;
+    if (!parsed) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        model: resolved.effectiveModel,
+        rationale: 'invalid_json_deterministic_fallback',
+        keepRefs: [],
+        compressRefs: [],
+        expandSuggestions: [],
+        contractHints: [],
+        summary: '',
+        rejectedRefs: [],
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+        durationMs: callRes.durationMs,
+      };
+    }
+
+    const rejectedRefs = [];
+    const filterRefs = (arr, excludeSet = null) => {
+      if (!Array.isArray(arr)) return [];
+      const out = [];
+      const seen = new Set();
+      for (const item of arr) {
+        const rawId = String(item ?? '').trim();
+        if (!rawId) continue;
+        const mapped = validIdMap.get(rawId);
+        if (!mapped) {
+          rejectedRefs.push(rawId);
+          continue;
+        }
+        if (excludeSet?.has(mapped) || seen.has(mapped)) continue;
+        seen.add(mapped);
+        out.push(mapped);
+        if (out.length >= 20) break;
+      }
+      return out;
+    };
+
+    const keepRefs = filterRefs(parsed.keepRefs);
+    const keepSet = new Set(keepRefs);
+    const compressRefs = filterRefs(parsed.compressRefs, keepSet);
+    const expandSuggestions = filterRefs(parsed.expandSuggestions);
+
+    const contractHints = Array.isArray(parsed.contractHints)
+      ? parsed.contractHints
+          .map((h) => sanitizeGuidelineText(String(h ?? '')))
+          .filter(Boolean)
+          .slice(0, 10)
+      : [];
+
+    const summary = sanitize(redactSecrets(String(parsed.summary ?? '')))
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 1200);
+
+    return {
+      ok: true,
+      bypassed: false,
+      usedLlm: true,
+      fallback: null,
+      model: resolved.effectiveModel,
+      rationale: resolved.rationale,
+      keepRefs,
+      compressRefs,
+      expandSuggestions,
+      contractHints,
+      summary,
+      rejectedRefs,
+      inputTokens: callRes.inputTokens,
+      outputTokens: callRes.outputTokens,
+      totalTokens: callRes.totalTokens,
+      durationMs: callRes.durationMs,
+      usage: {
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+      },
+    };
+  }
+
+  /**
+   * Executes a strictly read-only (`tools: []`) batched pre-injection admission
+   * decision over ambiguous tool output candidates. Fails closed to deterministic
+   * rules on timeout, error, tool-call attempt, or malformed JSON.
+   */
+  async admitCandidates({
+    query = '',
+    candidates = [],
+    activeContextSummary = '',
+    errorSummary = '',
+    contractHints = [],
+    learnedGuidelines = [],
+    signal = null,
+    configOverride = null,
+  } = {}) {
+    const resolved = this.resolveModel(configOverride);
+    const config = resolved.config;
+
+    if (!config.enabled || config.mode === 'off') {
+      return {
+        ok: true,
+        bypassed: true,
+        usedLlm: false,
+        fallback: null,
+        model: null,
+        rationale: resolved.rationale,
+        decisions: [],
+        contractHints: [],
+        rejectedIds: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    const effectiveAdapter = this.adapter ?? this.pool?.adapter ?? null;
+    if (!resolved.active || !resolved.effectiveModel || typeof effectiveAdapter?.stream !== 'function') {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        model: resolved.effectiveModel ?? null,
+        rationale: !resolved.effectiveModel ? resolved.rationale : 'adapter_unavailable_deterministic_fallback',
+        decisions: [],
+        contractHints: [],
+        rejectedIds: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    const candidateList = Array.isArray(candidates) ? candidates.slice(0, 30) : [];
+    const validIdMap = new Map();
+    const promptCandidates = [];
+
+    for (const c of candidateList) {
+      if (!c || typeof c !== 'object') continue;
+      const canonicalId = String(c.id ?? c.refId ?? c.uri ?? '').trim();
+      if (!canonicalId) continue;
+      validIdMap.set(canonicalId, canonicalId);
+      promptCandidates.push({
+        id: canonicalId,
+        path: sanitize(redactSecrets(String(c.path ?? ''))).slice(0, 140),
+        toolName: String(c.toolName ?? 'tool').slice(0, 40),
+        chars: Number(c.chars ?? 0),
+        tokens: Number(c.tokens ?? 0),
+        score: Number.isFinite(Number(c.score)) ? Number(Number(c.score).toFixed(3)) : 0,
+        criticalDomains: Array.isArray(c.criticalDomains) ? c.criticalDomains.slice(0, 5) : [],
+        rawDomains: Array.isArray(c.rawDomains) ? c.rawDomains.slice(0, 5) : [],
+        isDecoy: Boolean(c.isDecoy),
+        promptTarget: Boolean(c.promptTarget),
+        errorTarget: Boolean(c.errorTarget),
+        mutatedTarget: Boolean(c.mutatedTarget),
+        symbols: Array.isArray(c.symbols) ? c.symbols.slice(0, 10).map((s) => sanitize(String(s)).slice(0, 60)) : [],
+        excerpt: sanitize(redactSecrets(String(c.excerpt ?? ''))).slice(0, 320),
+      });
+    }
+
+    const safeHints = (Array.isArray(contractHints) ? contractHints : [])
+      .map((h) => sanitizeGuidelineText(String(h ?? '')))
+      .filter(Boolean)
+      .slice(0, 8);
+    const safeGuidelines = (Array.isArray(learnedGuidelines) ? learnedGuidelines : [])
+      .map((g) => sanitizeGuidelineText(typeof g === 'string' ? g : g?.text ?? ''))
+      .filter(Boolean)
+      .slice(0, 8);
+
+    const userPayload = {
+      query: sanitize(redactSecrets(String(query ?? ''))).slice(0, 800),
+      activeContextSummary: sanitize(redactSecrets(String(activeContextSummary ?? ''))).slice(0, 500),
+      errorSummary: sanitize(redactSecrets(String(errorSummary ?? ''))).slice(0, 800),
+      ...(safeHints.length ? { contractHints: safeHints } : {}),
+      ...(safeGuidelines.length ? { learnedGuidelines: safeGuidelines } : {}),
+      candidates: promptCandidates,
+    };
+
+    const callRes = await this.#invokeReadOnlyStream({
+      effectiveAdapter,
+      model: resolved.effectiveModel,
+      system: ADMISSION_SUPERVISOR_SYSTEM_PROMPT,
+      userPayload,
+      maxTokens: config.maxOutputTokens,
+      timeoutMs: config.timeoutMs,
+      signal,
+    });
+
+    if (!callRes.ok) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        model: resolved.effectiveModel,
+        rationale: 'supervisor_error_deterministic_fallback',
+        decisions: [],
+        contractHints: [],
+        rejectedIds: [],
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+        durationMs: callRes.durationMs,
+        error: callRes.error,
+      };
+    }
+
+    const parsed = callRes.parsed;
+    if (!parsed || !Array.isArray(parsed.decisions)) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        model: resolved.effectiveModel,
+        rationale: 'invalid_json_deterministic_fallback',
+        decisions: [],
+        contractHints: [],
+        rejectedIds: [],
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+        durationMs: callRes.durationMs,
+      };
+    }
+
+    const decisions = [];
+    const rejectedIds = [];
+    const seenIds = new Set();
+
+    for (const entry of parsed.decisions) {
+      if (!entry || typeof entry !== 'object') continue;
+      const rawId = String(entry.id ?? '').trim();
+      const canonicalId = validIdMap.get(rawId);
+      if (!canonicalId) {
+        if (rawId) rejectedIds.push(rawId);
+        continue;
+      }
+      if (seenIds.has(canonicalId)) continue;
+      const rawDec = String(entry.decision ?? '').trim().toUpperCase();
+      if (!VALID_ADMISSION_DECISIONS.has(rawDec)) {
+        rejectedIds.push(canonicalId);
+        continue;
+      }
+      seenIds.add(canonicalId);
+      const focusSymbols = Array.isArray(entry.focusSymbols)
+        ? entry.focusSymbols
+            .map((s) => sanitize(redactSecrets(String(s ?? ''))).trim().slice(0, 64))
+            .filter(Boolean)
+            .slice(0, 12)
+        : [];
+      const reason = sanitize(redactSecrets(String(entry.reason ?? '')))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200);
+      decisions.push({
+        id: canonicalId,
+        decision: rawDec,
+        focusSymbols,
+        reason,
+      });
+    }
+
+    const returnedHints = Array.isArray(parsed.contractHints)
+      ? parsed.contractHints
+          .map((h) => sanitizeGuidelineText(String(h ?? '')))
+          .filter(Boolean)
+          .slice(0, 10)
+      : [];
+
+    return {
+      ok: true,
+      bypassed: false,
+      usedLlm: true,
+      fallback: null,
+      model: resolved.effectiveModel,
+      rationale: resolved.rationale,
+      decisions,
+      contractHints: returnedHints,
+      rejectedIds,
+      inputTokens: callRes.inputTokens,
+      outputTokens: callRes.outputTokens,
+      totalTokens: callRes.totalTokens,
+      durationMs: callRes.durationMs,
+      usage: {
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+      },
+    };
   }
 }

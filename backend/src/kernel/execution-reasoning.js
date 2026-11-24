@@ -520,14 +520,28 @@ export class ExecutionReasoningTracker {
     this._budgetPruneCount = 0;
     this.ineffectiveActionCount = 0;
     this._aciMetrics = {
+      aciProfile: null,
+      admissionEnabled: null,
+      dtocEnabled: null,
+      dtocPolicy: null,
+      dtocMinPromptTokens: null,
+      admissionDecisions: { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 },
+      admissionOriginalTokens: 0,
+      admissionInjectedTokens: 0,
+      admissionSavedTokens: 0,
       offloadedCount: 0,
       savedTokens: 0,
+      totalAciSavedTokens: 0,
       restoredCount: 0,
+      hashVerifiedRestores: 0,
       criticalContextRecall: null,
       supervisorCalls: 0,
       supervisorMode: null,
       supervisorModel: null,
+      supervisorCost: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 0, fallbackCount: 0 },
+      recoveryStats: { totalRecoveries: 0, hashVerifiedCount: 0, tokensRestored: 0 },
       epochTransitions: 0,
+      ledger: null,
     };
   }
 
@@ -537,14 +551,56 @@ export class ExecutionReasoningTracker {
 
   updateAciMetrics(patch = null) {
     if (!patch || typeof patch !== 'object') return;
+    if (patch.aciProfile !== undefined) {
+      this._aciMetrics.aciProfile = patch.aciProfile ? String(patch.aciProfile) : null;
+    }
+    if (patch.admissionEnabled !== undefined) {
+      this._aciMetrics.admissionEnabled = patch.admissionEnabled === null ? null : Boolean(patch.admissionEnabled);
+    }
+    if (patch.dtocEnabled !== undefined) {
+      this._aciMetrics.dtocEnabled = patch.dtocEnabled === null ? null : Boolean(patch.dtocEnabled);
+    }
+    if (patch.dtocPolicy !== undefined) {
+      this._aciMetrics.dtocPolicy = patch.dtocPolicy ? String(patch.dtocPolicy) : null;
+    }
+    if (patch.dtocMinPromptTokens !== undefined) {
+      this._aciMetrics.dtocMinPromptTokens =
+        patch.dtocMinPromptTokens != null && Number.isFinite(Number(patch.dtocMinPromptTokens))
+          ? Math.max(0, Math.trunc(Number(patch.dtocMinPromptTokens)))
+          : null;
+    }
+    if (patch.admissionDecisions && typeof patch.admissionDecisions === 'object') {
+      this._aciMetrics.admissionDecisions = {
+        DIRECT: Number(patch.admissionDecisions.DIRECT || 0),
+        SUPPORTING: Number(patch.admissionDecisions.SUPPORTING || 0),
+        DEFER: Number(patch.admissionDecisions.DEFER || 0),
+        DUPLICATE: Number(patch.admissionDecisions.DUPLICATE || 0),
+        IRRELEVANT: Number(patch.admissionDecisions.IRRELEVANT || 0),
+      };
+    }
+    if (patch.admissionOriginalTokens != null && Number.isFinite(Number(patch.admissionOriginalTokens))) {
+      this._aciMetrics.admissionOriginalTokens = Math.max(0, Math.trunc(Number(patch.admissionOriginalTokens)));
+    }
+    if (patch.admissionInjectedTokens != null && Number.isFinite(Number(patch.admissionInjectedTokens))) {
+      this._aciMetrics.admissionInjectedTokens = Math.max(0, Math.trunc(Number(patch.admissionInjectedTokens)));
+    }
+    if (patch.admissionSavedTokens != null && Number.isFinite(Number(patch.admissionSavedTokens))) {
+      this._aciMetrics.admissionSavedTokens = Math.max(0, Math.trunc(Number(patch.admissionSavedTokens)));
+    }
     if (patch.offloadedCount != null && Number.isFinite(Number(patch.offloadedCount))) {
       this._aciMetrics.offloadedCount = Math.max(0, Math.trunc(Number(patch.offloadedCount)));
     }
     if (patch.savedTokens != null && Number.isFinite(Number(patch.savedTokens))) {
       this._aciMetrics.savedTokens = Math.max(0, Math.trunc(Number(patch.savedTokens)));
     }
+    if (patch.totalAciSavedTokens != null && Number.isFinite(Number(patch.totalAciSavedTokens))) {
+      this._aciMetrics.totalAciSavedTokens = Math.max(0, Math.trunc(Number(patch.totalAciSavedTokens)));
+    }
     if (patch.restoredCount != null && Number.isFinite(Number(patch.restoredCount))) {
       this._aciMetrics.restoredCount = Math.max(0, Math.trunc(Number(patch.restoredCount)));
+    }
+    if (patch.hashVerifiedRestores != null && Number.isFinite(Number(patch.hashVerifiedRestores))) {
+      this._aciMetrics.hashVerifiedRestores = Math.max(0, Math.trunc(Number(patch.hashVerifiedRestores)));
     }
     if (patch.criticalContextRecall !== undefined) {
       if (patch.criticalContextRecall === null) {
@@ -565,8 +621,28 @@ export class ExecutionReasoningTracker {
     if (patch.supervisorModel !== undefined) {
       this._aciMetrics.supervisorModel = patch.supervisorModel ? String(patch.supervisorModel) : null;
     }
+    if (patch.supervisorCost && typeof patch.supervisorCost === 'object') {
+      this._aciMetrics.supervisorCost = {
+        calls: Number(patch.supervisorCost.calls || 0),
+        inputTokens: Number(patch.supervisorCost.inputTokens || 0),
+        outputTokens: Number(patch.supervisorCost.outputTokens || 0),
+        totalTokens: Number(patch.supervisorCost.totalTokens || 0),
+        durationMs: Number(patch.supervisorCost.durationMs || 0),
+        fallbackCount: Number(patch.supervisorCost.fallbackCount || 0),
+      };
+    }
+    if (patch.recoveryStats && typeof patch.recoveryStats === 'object') {
+      this._aciMetrics.recoveryStats = {
+        totalRecoveries: Number(patch.recoveryStats.totalRecoveries || 0),
+        hashVerifiedCount: Number(patch.recoveryStats.hashVerifiedCount || 0),
+        tokensRestored: Number(patch.recoveryStats.tokensRestored || 0),
+      };
+    }
     if (patch.epochTransitions != null && Number.isFinite(Number(patch.epochTransitions))) {
       this._aciMetrics.epochTransitions = Math.max(0, Math.trunc(Number(patch.epochTransitions)));
+    }
+    if (patch.ledger !== undefined) {
+      this._aciMetrics.ledger = patch.ledger ? structuredClone(patch.ledger) : null;
     }
   }
 
@@ -1238,7 +1314,7 @@ export class ExecutionReasoningTracker {
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
       stuckDetections: this.stuckDetections.map((d) => ({ ...d })),
       repairRounds: this._repairRounds,
-      aciMetrics: { ...this._aciMetrics },
+      aciMetrics: structuredClone(this._aciMetrics),
     };
   }
 
@@ -1330,7 +1406,7 @@ export class ExecutionReasoningTracker {
       ),
       circuitBroken: stopReason === 'thrashing_circuit_break',
       latestVerificationPassed: latestVerification ? latestVerification.passed : null,
-      aciMetrics: { ...this._aciMetrics },
+      aciMetrics: structuredClone(this._aciMetrics),
     };
   }
 }

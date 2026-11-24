@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Fastify from 'fastify';
 import { Store } from '../src/store.js';
+import { AccountPool } from '../src/pool.js';
 import { registerIntelligenceRoutes } from '../src/routes/intelligence-routes.js';
 import { AdaptivePlanner } from '../src/planning/planner.js';
 import { EvaluationService } from '../src/evaluation/service.js';
@@ -152,4 +153,65 @@ test('evaluation traffic is recorded synthetic and excluded from production KPI 
     evaluation.close();
     store.close();
   }
+});
+
+test('Stage 4: GET and PATCH /v1/context/supervisor expose and validate admissionEnabled and dtocMinPromptTokens', async (t) => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'agent-us-intel-sup-'));
+  const store = new Store(join(dir, 'test.sqlite'));
+  const pool = new AccountPool(store, { root: dir });
+  pool.createAccount({
+    preset: 'deepseek',
+    apiKey: 'sk-test-placeholder-1234567890',
+    models: ['main-model', 'fast-flash'],
+  });
+  pool.setDefaultModel('main-model');
+
+  const app = Fastify();
+  registerIntelligenceRoutes(app, { store, pool });
+  await app.ready();
+
+  t.after(async () => {
+    await app.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const initial = await app.inject({ method: 'GET', url: '/v1/context/supervisor' });
+  assert.equal(initial.statusCode, 200);
+  const initBody = initial.json();
+  assert.equal(initBody.config.admissionEnabled, true);
+  assert.equal(initBody.config.dtocMinPromptTokens, 24000);
+  assert.deepEqual(initBody.config.epochWatermarks, [0.6, 0.82]);
+
+  const invalidAdmission = await app.inject({
+    method: 'PATCH',
+    url: '/v1/context/supervisor',
+    payload: { admissionEnabled: 'yes' },
+  });
+  assert.equal(invalidAdmission.statusCode, 400);
+
+  const invalidDtocMin = await app.inject({
+    method: 'PATCH',
+    url: '/v1/context/supervisor',
+    payload: { dtocMinPromptTokens: 500 },
+  });
+  assert.equal(invalidDtocMin.statusCode, 400);
+
+  const updated = await app.inject({
+    method: 'PATCH',
+    url: '/v1/context/supervisor',
+    payload: { admissionEnabled: false, dtocMinPromptTokens: 32000 },
+  });
+  assert.equal(updated.statusCode, 200);
+  const updBody = updated.json();
+  assert.equal(updBody.config.admissionEnabled, false);
+  assert.equal(updBody.config.dtocMinPromptTokens, 32000);
+
+  const reloaded = await app.inject({ method: 'GET', url: '/v1/context/supervisor' });
+  assert.equal(reloaded.statusCode, 200);
+  assert.equal(reloaded.json().config.admissionEnabled, false);
+  assert.equal(reloaded.json().config.dtocMinPromptTokens, 32000);
 });

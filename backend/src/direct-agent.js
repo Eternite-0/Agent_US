@@ -61,7 +61,7 @@ import { MultiStageCompactor } from './context/compaction.js';
 import { ContextAssembler } from './context/assembler.js';
 import { ReversibleContextStore, ContextEvidenceLedger } from './context/aci-store.js';
 import { ACIEngine } from './context/aci-engine.js';
-import { ContextSupervisor } from './context/supervisor.js';
+import { ContextSupervisor, normalizeSupervisorConfig } from './context/supervisor.js';
 import {
   AgentCapabilityRegistry,
   ModelCapabilityRegistry,
@@ -181,6 +181,7 @@ export class DirectAgentRuntime {
     this.readFileStates = new Map(); // sessionId -> Map(relPath -> { sha256, at })
     this.sessionSandboxes = new Map(); // sessionId -> { sandbox, disableWorkspaceHooks, disableWorkspaceMcp, forcedToolDeny }
     this.sessionProjects = new Map(); // sessionId -> projectId override
+    this.sessionAciConfigs = new Map(); // sessionId -> { aciProfile, aciOptions }
 
     this.processManager = new BackgroundProcessManager();
     this.mcpHub = new McpHub({
@@ -240,6 +241,7 @@ export class DirectAgentRuntime {
         this.readFileStates.delete(sessionId);
         this.sessionSandboxes.delete(sessionId);
         this.sessionProjects.delete(sessionId);
+        this.sessionAciConfigs.delete(sessionId);
         this.contextAssembler.clearSession(sessionId);
       },
       onBeforeRewind: (sessionId) => {
@@ -751,6 +753,112 @@ export class DirectAgentRuntime {
     });
   }
 
+  #resolveAciTurnConfig(sessionId, turnAciProfile = undefined, turnAciOptions = undefined) {
+    const VALID_PROFILES = new Set([
+      'raw_full',
+      'deterministic_progressive',
+      'retrieval_supervisor',
+      'full_aci',
+    ]);
+    const sessionCfg = this.sessionAciConfigs.get(sessionId) ?? {};
+    const rawProfile = turnAciProfile ?? sessionCfg.aciProfile ?? 'full_aci';
+    const aciProfile = VALID_PROFILES.has(rawProfile) ? rawProfile : 'full_aci';
+    const mergedOptions = {
+      ...(sessionCfg.aciOptions && typeof sessionCfg.aciOptions === 'object' ? sessionCfg.aciOptions : {}),
+      ...(turnAciOptions && typeof turnAciOptions === 'object' ? turnAciOptions : {}),
+    };
+
+    const baseSupCfg = this.contextSupervisor.getConfig();
+    const supCfg = mergedOptions.supervisorConfigOverride
+      ? normalizeSupervisorConfig({
+          ...baseSupCfg,
+          ...mergedOptions.supervisorConfigOverride,
+        })
+      : baseSupCfg;
+
+    let admissionEnabled = true;
+    let supervisorEnabled = true;
+    let dtocEnabled = true;
+    let supervisorConfigOverride = supCfg;
+
+    if (aciProfile === 'raw_full') {
+      admissionEnabled = false;
+      supervisorEnabled = false;
+      dtocEnabled = false;
+      supervisorConfigOverride = {
+        ...supCfg,
+        enabled: false,
+        mode: 'off',
+        admissionEnabled: false,
+      };
+    } else if (aciProfile === 'deterministic_progressive') {
+      admissionEnabled = true;
+      supervisorEnabled = false;
+      dtocEnabled = false;
+      supervisorConfigOverride = {
+        ...supCfg,
+        enabled: false,
+        mode: 'off',
+        admissionEnabled: true,
+      };
+    } else if (aciProfile === 'retrieval_supervisor') {
+      admissionEnabled = true;
+      dtocEnabled = false;
+      const effectiveCfg = mergedOptions.supervisorConfigOverride
+        ? supCfg
+        : {
+            ...supCfg,
+            enabled: true,
+            mode: supCfg.mode === 'off' ? 'auto' : supCfg.mode,
+          };
+      supervisorEnabled = Boolean(effectiveCfg.enabled && effectiveCfg.mode !== 'off');
+      supervisorConfigOverride = { ...effectiveCfg, admissionEnabled: true };
+    } else {
+      admissionEnabled =
+        mergedOptions.admissionEnabled !== undefined
+          ? Boolean(mergedOptions.admissionEnabled)
+          : supCfg.admissionEnabled !== false;
+      supervisorEnabled = Boolean(supCfg.enabled && supCfg.mode !== 'off');
+      dtocEnabled =
+        mergedOptions.dtocEnabled !== undefined ? Boolean(mergedOptions.dtocEnabled) : true;
+      supervisorConfigOverride = supCfg;
+    }
+
+    const dtocPolicy = mergedOptions.dtocPolicy === 'cumulative' ? 'cumulative' : 'adaptive_single_step';
+    const dtocMinPromptTokens =
+      mergedOptions.dtocMinPromptTokens != null &&
+      Number.isFinite(Number(mergedOptions.dtocMinPromptTokens))
+        ? Math.max(1000, Math.trunc(Number(mergedOptions.dtocMinPromptTokens)))
+        : supCfg.dtocMinPromptTokens;
+    const singleStepBudget =
+      mergedOptions.singleStepBudget != null && Number.isFinite(Number(mergedOptions.singleStepBudget))
+        ? Math.max(500, Math.trunc(Number(mergedOptions.singleStepBudget)))
+        : undefined;
+    const maxSupervisorAdmissionCalls =
+      mergedOptions.maxSupervisorAdmissionCalls != null &&
+      Number.isFinite(Number(mergedOptions.maxSupervisorAdmissionCalls))
+        ? Math.max(0, Math.trunc(Number(mergedOptions.maxSupervisorAdmissionCalls)))
+        : undefined;
+    const admissionMinChars =
+      mergedOptions.admissionMinChars != null &&
+      Number.isFinite(Number(mergedOptions.admissionMinChars))
+        ? Math.max(200, Math.trunc(Number(mergedOptions.admissionMinChars)))
+        : undefined;
+
+    return {
+      aciProfile,
+      admissionEnabled,
+      supervisorEnabled,
+      dtocEnabled,
+      dtocPolicy,
+      dtocMinPromptTokens,
+      singleStepBudget,
+      maxSupervisorAdmissionCalls,
+      admissionMinChars,
+      supervisorConfigOverride,
+    };
+  }
+
   createSession(opts = {}) {
     const {
       sandbox = null,
@@ -759,8 +867,29 @@ export class DirectAgentRuntime {
       disableWorkspaceMcp = undefined,
       callerSessionId = null,
       projectId = null,
+      aciProfile = undefined,
+      aciOptions = undefined,
       ...sessionOpts
     } = opts ?? {};
+
+    const saveSessionAci = (createdSession) => {
+      const inheritedAci =
+        this.sessionAciConfigs.get(sessionOpts.parentSessionId) ??
+        this.sessionAciConfigs.get(sessionOpts.rootSessionId) ??
+        this.sessionAciConfigs.get(callerSessionId) ??
+        null;
+      if (aciProfile !== undefined || aciOptions !== undefined || inheritedAci) {
+        this.sessionAciConfigs.set(createdSession.id, {
+          aciProfile: aciProfile ?? inheritedAci?.aciProfile,
+          aciOptions:
+            aciOptions !== undefined
+              ? { ...(inheritedAci?.aciOptions ?? {}), ...(aciOptions ?? {}) }
+              : inheritedAci?.aciOptions
+                ? { ...inheritedAci.aciOptions }
+                : undefined,
+        });
+      }
+    };
 
     const inheritedCfg =
       this.#resolveSessionSandboxConfig(sessionOpts.parentSessionId) ??
@@ -774,6 +903,7 @@ export class DirectAgentRuntime {
       if (projectId && String(projectId).trim()) {
         this.sessionProjects.set(created.id, String(projectId).trim());
       }
+      saveSessionAci(created);
       return created;
     }
 
@@ -801,6 +931,7 @@ export class DirectAgentRuntime {
     if (projectId && String(projectId).trim()) {
       this.sessionProjects.set(created.id, String(projectId).trim());
     }
+    saveSessionAci(created);
 
     this.sessionSandboxes.set(created.id, {
       sandbox: resolvedSandbox,
@@ -1225,6 +1356,8 @@ export class DirectAgentRuntime {
       finalVerificationReserve = null,
       files = null,
       evidenceContract = null,
+      aciProfile = undefined,
+      aciOptions = undefined,
       trafficSource = undefined,
       isSynthetic = undefined,
       distillSyntheticTurns = undefined,
@@ -1284,6 +1417,8 @@ export class DirectAgentRuntime {
           ? Math.max(0, Math.floor(Number(finalVerificationReserve)))
           : null,
       evidenceContract: evidenceContract && typeof evidenceContract === 'object' ? evidenceContract : null,
+      ...(aciProfile !== undefined ? { aciProfile } : {}),
+      ...(aciOptions !== undefined && aciOptions && typeof aciOptions === 'object' ? { aciOptions } : {}),
       trafficSource: classifiedTraffic.trafficSource,
       isSynthetic: classifiedTraffic.isSynthetic,
       ...(distillSyntheticTurns !== undefined ? { distillSyntheticTurns: Boolean(distillSyntheticTurns) } : {}),
@@ -1495,6 +1630,8 @@ export class DirectAgentRuntime {
             maxSteps: Number(payload.maxSteps ?? 24),
             finalVerificationReserve: payload.finalVerificationReserve ?? null,
             evidenceContract: payload.evidenceContract ?? null,
+            aciProfile: payload.aciProfile,
+            aciOptions: payload.aciOptions,
             initialStep: checkpoint?.step ?? payload.resumedFromStep ?? 0,
             isRecovery: Boolean(job.reclaimedFromCrash || checkpoint?.step > 0 || job.attempts > 1),
             canRetry: job.attempts < job.maxAttempts,
@@ -1621,6 +1758,8 @@ export class DirectAgentRuntime {
     maxSteps,
     finalVerificationReserve = null,
     evidenceContract = null,
+    aciProfile = undefined,
+    aciOptions = undefined,
     initialStep = 0,
     isRecovery = false,
     canRetry = false,
@@ -1725,31 +1864,62 @@ export class DirectAgentRuntime {
       contextWindow = this.pool.getModelContextWindow(effectiveModel) || 128_000;
       const aciStore = new ReversibleContextStore(this.store);
       const aciLedger = new ContextEvidenceLedger();
-      const supervisorCfg = this.contextSupervisor.getConfig();
+      const aciResolved = this.#resolveAciTurnConfig(sessionId, aciProfile, aciOptions);
       const aciEngine = new ACIEngine({
         store: this.store,
         aciStore,
         ledger: aciLedger,
+        supervisor: this.contextSupervisor,
         maxTotalTokens: Math.min(200_000, contextWindow),
         contextWindow: Math.min(200_000, contextWindow),
-        watermarks: supervisorCfg.epochWatermarks,
+        watermarks: aciResolved.supervisorConfigOverride.epochWatermarks,
+        dtocPolicy: aciResolved.dtocPolicy,
+        dtocMinPromptTokens: aciResolved.dtocMinPromptTokens,
+        ...(aciResolved.singleStepBudget !== undefined
+          ? { singleStepBudget: aciResolved.singleStepBudget }
+          : {}),
+        ...(aciResolved.admissionMinChars !== undefined
+          ? { admissionMinChars: aciResolved.admissionMinChars }
+          : {}),
+        ...(aciResolved.maxSupervisorAdmissionCalls !== undefined
+          ? { maxSupervisorAdmissionCalls: aciResolved.maxSupervisorAdmissionCalls }
+          : {}),
       });
-      const resolveContextRef = (rawRef) => {
+      const resolveContextRef = (rawRef, opts = {}) => {
+        const clean = String(rawRef ?? '').trim().replace(/^ref:/i, '').replace(/^aci:\/\//i, '');
+        if (!clean) return null;
         try {
-          const clean = String(rawRef ?? '').trim().replace(/^ref:/i, '').replace(/^aci:\/\//i, '');
-          const meta = aciStore.getRef(clean);
-          const expanded = aciEngine.expand(clean, { level: 'verbatim' });
-          if (expanded && typeof expanded.text === 'string') {
-            return { content: expanded.text, sha256: meta?.sha256 ?? null };
+          const restored = aciEngine.restoreVerified(clean, {
+            expectedSha256: opts.expectedSha256,
+            recordLedger: false,
+          });
+          return {
+            content: restored.content,
+            sha256: restored.sha256,
+            verified: restored.verified,
+            uri: restored.uri,
+            refId: restored.refId,
+            path: restored.path,
+            recordRecovery: ({ level = 'verbatim', tokensRestored = 0, path = '' } = {}) => {
+              aciLedger.recordRecovery({
+                refId: restored.refId,
+                uri: restored.uri,
+                sha256: restored.sha256,
+                path: path || restored.path,
+                level,
+                verified: restored.verified,
+                tokensRestored,
+                triggeredBy: 'expand_context',
+                step: 0,
+              });
+            },
+          };
+        } catch (err) {
+          if (err?.code === 'ARTIFACT_HASH_MISMATCH') {
+            throw err;
           }
-          const raw = aciStore.restore(clean);
-          if (typeof raw === 'string') {
-            return { content: raw, sha256: meta?.sha256 ?? null };
-          }
-        } catch {
           return null;
         }
-        return null;
       };
 
       const tools = createWorkspaceTools({
@@ -1917,6 +2087,11 @@ export class DirectAgentRuntime {
           ledger: aciLedger,
           supervisor: this.contextSupervisor,
           criticalFiles: evidenceContract?.requiredChangedFiles ?? [],
+          aciProfile: aciResolved.aciProfile,
+          admissionEnabled: aciResolved.admissionEnabled,
+          dtocEnabled: aciResolved.dtocEnabled,
+          supervisorEnabled: aciResolved.supervisorEnabled,
+          supervisorConfigOverride: aciResolved.supervisorConfigOverride,
         },
         messages: assembled.messages,
         tools: effectiveTools,
