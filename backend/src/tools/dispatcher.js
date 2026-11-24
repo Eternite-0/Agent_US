@@ -71,6 +71,7 @@ export class ToolDispatcher {
     permits = null,
     approvalManager = null,
     getLivePolicy = null,
+    reviewApproval = null,
   } = {}) {
     this.store = store;
     this.eventRouter = eventRouter;
@@ -79,6 +80,7 @@ export class ToolDispatcher {
     this.permits = permits ?? new ExecutePermitRegistry();
     this.approvalManager = approvalManager ?? null;
     this.getLivePolicy = typeof getLivePolicy === 'function' ? getLivePolicy : null;
+    this.reviewApproval = typeof reviewApproval === 'function' ? reviewApproval : null;
   }
 
   #safeEmit(payload) {
@@ -470,15 +472,41 @@ export class ToolDispatcher {
     parentGuard?.();
     const finalArgsDigest = computeArgsDigest(tc.name, effectiveArgs);
 
-    // 4. Policy Evaluation + Fail-Closed Human Approval Gate
+    // 4. The hard policy remains authoritative. A reviewer can satisfy only
+    // discretionary asks that the existing safe policy would already allow.
+    const evaluate = (live, mode = live.permissionMode, approvedPrefixes = getApprovedPrefixes()) =>
+      this.policy.evaluate(toolImpl, effectiveArgs, {
+        approvedPrefixes,
+        tainted,
+        permissionMode: mode,
+        allowTools: live.allowTools,
+        denyTools: live.denyTools,
+      });
     const curPolicy = readLivePolicy();
-    const policyVerdict = this.policy.evaluate(toolImpl, effectiveArgs, {
-      approvedPrefixes: getApprovedPrefixes(),
-      tainted,
-      permissionMode: curPolicy.permissionMode,
-      allowTools: curPolicy.allowTools,
-      denyTools: curPolicy.denyTools,
-    });
+    let policyVerdict = evaluate(curPolicy);
+    let autoReview = null;
+    let reviewedApproval = false;
+    if (policyVerdict.decision === 'ask' && curPolicy.permissionMode === 'auto-review' &&
+        this.reviewApproval && !tainted && !meta.outward &&
+        evaluate(curPolicy, 'auto-safe', []).decision === 'allow') {
+      try {
+        autoReview = await this.reviewApproval({
+          tool: tc.name,
+          args: { command: effectiveArgs.command, cwd: effectiveArgs.cwd },
+          signal,
+        });
+      } catch {
+        autoReview = { allow: false, source: 'unavailable' };
+      }
+      signal?.throwIfAborted?.();
+      leaseGuard?.();
+      parentGuard?.();
+      const live = readLivePolicy();
+      policyVerdict = evaluate(live);
+      reviewedApproval = autoReview?.allow === true && live.permissionMode === 'auto-review' &&
+        policyVerdict.decision === 'ask' && evaluate(live, 'auto-safe', []).decision === 'allow' &&
+        computeArgsDigest(tc.name, effectiveArgs) === finalArgsDigest;
+    }
 
     if (policyVerdict.decision === 'deny') {
       const receipt = this.#recordPreEffectRejection({
@@ -505,7 +533,11 @@ export class ToolDispatcher {
 
     let approvalId = null;
     let approvedArgsDigest = null;
-    if (policyVerdict.decision === 'ask') {
+    if (autoReview && !reviewedApproval) {
+      this.#safeEmit({ sessionId, turnId, type: RUNTIME_EVENTS.TOOL_APPROVAL_REVIEWED,
+        data: { callId: tc.id, tool: tc.name, source: autoReview.source, decision: 'deferred' } });
+    }
+    if (policyVerdict.decision === 'ask' && !reviewedApproval) {
       if (typeof requestApproval !== 'function') {
         const receipt = this.#recordPreEffectRejection({
           sessionId,
@@ -774,6 +806,11 @@ export class ToolDispatcher {
       attempt: 1,
     };
     const permit = this.permits.issue(binding);
+
+    if (reviewedApproval) {
+      this.#safeEmit({ sessionId, turnId, type: RUNTIME_EVENTS.TOOL_APPROVAL_REVIEWED,
+        data: { callId: tc.id, tool: tc.name, source: autoReview.source, decision: 'allow', argsDigest: finalArgsDigest } });
+    }
 
     let output = '';
     let isError = false;

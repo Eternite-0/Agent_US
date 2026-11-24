@@ -17,7 +17,7 @@ async function expectClearTail(page, exchange) {
 // Acceptance A: REST + real DirectAgentRuntime + real terminal + real SSE.
 // The two read-only Node scripts run in a temporary workspace, not the repo.
 test('an open real terminal command stays mounted through the next command and final history', async ({ page, request, context }) => {
-  const sessionResponse = await request.post('/v1/sessions', { data: { title: 'Direct runtime regression' } });
+  const sessionResponse = await request.post('/v1/sessions', { data: { title: 'Direct runtime regression', permissionMode: 'approval' } });
   expect(sessionResponse.ok()).toBe(true);
   const { id } = await sessionResponse.json();
   const stream = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/stream' && response.ok());
@@ -37,7 +37,7 @@ test('an open real terminal command stays mounted through the next command and f
   await page.unroute(metricsRoute);
   await page.keyboard.press('Escape');
   await expect(cacheDetails).toBeHidden();
-  await page.getByRole('button', { name: '帮我批准', exact: true }).click();
+  await page.getByRole('button', { name: '请我批准', exact: true }).click();
   await page.getByRole('button', { name: /完全访问权限/ }).click();
   await expect(page.getByRole('button', { name: '完全访问', exact: true })).toBeEnabled();
   await page.reload();

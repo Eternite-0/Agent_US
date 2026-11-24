@@ -629,9 +629,9 @@ ${draftInjection.text}`
   const branchText = hasGitRepo ? (gitStatus?.branch?.trim() || 'HEAD') : '无 Git 分支';
   const permissionLabel = permissionMode === 'read-only' ? '只读'
     : permissionMode === 'workspace-write' ? '工作区写入'
-    : permissionMode === 'auto-review' ? '自动审查'
+    : permissionMode === 'auto-review' ? '替我审查'
     : permissionMode === 'full-access' ? '完全访问'
-    : permissionMode === 'auto-safe' ? '帮我批准' : '默认权限';
+    : permissionMode === 'auto-safe' ? '智能放行' : '请我批准';
   const isDirty = Boolean(hasGitRepo && gitStatus?.dirty);
   const uncommittedCount =
     typeof gitStatus?.uncommittedCount === 'number' ? gitStatus.uncommittedCount : undefined;
@@ -1252,7 +1252,7 @@ ${draftInjection.text}`
               >
                 {permissionMode === 'full-access' ? (
                   <IconShieldAlert size={15} />
-                ) : permissionMode === 'auto-safe' ? (
+                ) : permissionMode === 'auto-review' || permissionMode === 'auto-safe' ? (
                   <IconShieldTerminal size={15} />
                 ) : (
                   <IconHand size={15} />
@@ -1265,7 +1265,7 @@ ${draftInjection.text}`
               {popover === 'permission' && (
                 <div className="codex-popover codex-perm-popover" data-side="top" style={{ left: 0 }}>
                   <div className="codex-perm-header">
-                    <span>应如何批准 Codex 操作?</span>
+                    <span>工具操作如何审批？</span>
                     <button
                       type="button"
                       className="codex-perm-learn-link"
@@ -1289,7 +1289,7 @@ ${draftInjection.text}`
                     <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
                       <IconHand size={16} style={{ marginTop: 2, flex: 'none', color: 'var(--text-secondary)' }} />
                       <div>
-                        <div className="codex-perm-option-title">请求批准</div>
+                        <div className="codex-perm-option-title">请我批准</div>
                         <div className="codex-perm-option-desc">
                           修改文件或执行命令前需要批准
                         </div>
@@ -1302,20 +1302,20 @@ ${draftInjection.text}`
                     type="button"
                     className="codex-perm-option"
                     onClick={() => {
-                      onChangePermission('auto-safe');
+                      onChangePermission('auto-review');
                       setPopover(null);
                     }}
                   >
                     <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
                       <IconShieldTerminal size={16} style={{ marginTop: 2, flex: 'none', color: 'var(--text-secondary)' }} />
                       <div>
-                        <div className="codex-perm-option-title">帮我批准</div>
+                        <div className="codex-perm-option-title">替我审查</div>
                         <div className="codex-perm-option-desc">
-                          允许工作区内普通文件修改；非只读命令需批准
+                          自动审查低风险的只读命令；修改文件、运行脚本及其他需人工确认的操作仍会询问
                         </div>
                       </div>
                     </div>
-                    {permissionMode === 'auto-safe' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
+                    {permissionMode === 'auto-review' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
                   </button>
 
                   <button
@@ -1580,7 +1580,7 @@ ${draftInjection.text}`
         <p className="composer-dialog-note">变更差异会发送给所选模型。在独立只读会话中审查，不修改工作区文件。</p>
         {reviewError && <p role="alert" className="codex-inline-error">{reviewError}</p>}
         <div className="composer-dialog-actions">
-          <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={reviewBusy} onClick={() => void applyReview()}>{reviewBusy ? '正在启动…' : '替我审查'}</button>
+          <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={reviewBusy} onClick={() => void applyReview()}>{reviewBusy ? '正在启动…' : '开始代码审查'}</button>
         </div>
       </ComposerDialog>}
     </div>

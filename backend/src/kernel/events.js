@@ -17,6 +17,7 @@ export const RUNTIME_EVENTS = Object.freeze({
   TOOL_OUTPUT: 'tool/output',
   TOOL_RESULT: 'tool/result',
   TOOL_RECEIPT: 'tool/receipt',
+  TOOL_APPROVAL_REVIEWED: 'tool/approval_reviewed',
   CONTEXT_COMPACTED: 'context/compacted',
   SESSION_COMPACTED: 'session/compacted',
   SESSION_REWOUND: 'session/rewound',

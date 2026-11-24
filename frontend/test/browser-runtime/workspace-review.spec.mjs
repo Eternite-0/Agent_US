@@ -23,7 +23,7 @@ test('Git initialization and review use the current session directory, and revie
   const dialog = page.getByRole('dialog', { name: '代码审查', exact: true });
   await expect(dialog).toBeVisible();
   const review = page.waitForResponse(res => new URL(res.url()).pathname === '/v1/git/review');
-  await dialog.getByRole('button', { name: '替我审查', exact: true }).click();
+  await dialog.getByRole('button', { name: '开始代码审查', exact: true }).click();
   const started = await review;
   expect(started.ok()).toBe(true);
   const { session: reviewSession } = await started.json();

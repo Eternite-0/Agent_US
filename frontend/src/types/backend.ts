@@ -659,8 +659,8 @@ export type AppearancePreset =
 
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-export type PermissionMode = 'approval' | 'auto-safe' | 'full-access';
-export type SessionPermissionMode = PermissionMode | 'read-only' | 'workspace-write' | 'auto-review';
+export type PermissionMode = 'approval' | 'auto-review' | 'full-access' | 'auto-safe';
+export type SessionPermissionMode = PermissionMode | 'read-only' | 'workspace-write';
 export type GitReviewInput = { sessionId?: string; expectedWorkspaceRoot?: string; baseBranch?: string; model?: string; effort?: EffortLevel };
 
 export type AppView =

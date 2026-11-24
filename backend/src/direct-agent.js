@@ -36,6 +36,7 @@ import {
 } from './workspace-tools.js';
 import { McpHub } from './mcp-client.js';
 import { ToolDispatcher } from './tools/dispatcher.js';
+import { createDirectAutoReviewer } from './tools/auto-approval.js';
 import {
   ToolPermissionPolicy,
   filterToolsByPolicy,
@@ -170,6 +171,7 @@ export class DirectAgentRuntime {
         reconciler: this.reconciler,
         policy: this.toolPolicy,
         approvalManager: this.approvalManager,
+        reviewApproval: createDirectAutoReviewer(this.judgment),
       }),
     );
 

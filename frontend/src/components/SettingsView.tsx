@@ -466,9 +466,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     value={permissionMode}
                     onChange={(e) => onChangePermissionMode(e.target.value as PermissionMode)}
                   >
-                    <option value="auto-safe">智能放行（推荐：读/改文件免审，Shell 询问）</option>
-                    <option value="approval">严格询问（修改文件与命令均需批准）</option>
-                    <option value="full-access">完全访问权限（工作区内全部自动放行）</option>
+                    <option value="approval">请我批准（修改文件和命令需确认）</option>
+                    <option value="auto-review">替我审查（低风险只读命令自动审查）</option>
+                    <option value="full-access">完全访问权限（仍遵守安全规则）</option>
+                    <option value="auto-safe">智能放行（兼容模式）</option>
                   </select>
                 </div>
               </div>

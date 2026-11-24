@@ -19,9 +19,9 @@ export {
 export const PERMISSION_RANK = Object.freeze({
   'read-only': 0,
   approval: 1,
-  'auto-safe': 2,
-  'workspace-write': 3,
-  'auto-review': 4,
+  'auto-review': 2,
+  'auto-safe': 3,
+  'workspace-write': 4,
   'full-access': 5,
 });
 
@@ -80,7 +80,11 @@ export function intersectPolicies(parentPolicy = {}, childPolicy = {}) {
   const childMode = childValid ? rawChildMode : 'read-only';
   const pRank = parentValid ? PERMISSION_RANK[parentMode] : 0;
   const cRank = childValid ? PERMISSION_RANK[childMode] : 0;
-  const effectiveMode = pRank <= cRank ? parentMode : childMode;
+  // A workspace-write policy still asks for terminal probes, while auto-review
+  // asks for writes. Neither may grant its own exemption to the other.
+  const incomparable = (parentMode === 'workspace-write' && childMode === 'auto-review') ||
+    (parentMode === 'auto-review' && childMode === 'workspace-write');
+  const effectiveMode = incomparable ? 'approval' : pRank <= cRank ? parentMode : childMode;
 
   const denyTools = [
     ...new Set([...(parentPolicy.denyTools ?? []), ...(childPolicy.denyTools ?? [])]),

@@ -268,7 +268,7 @@ export const App: React.FC = () => {
   const [workedOutsideProject, setWorkedOutsideProject] = useState(false);
   const [selectedModel, setSelectedModel] = useState('');
   const [effort, setEffort] = useState<EffortLevel>('xhigh');
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>('auto-safe');
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>('approval');
   const [workspaceRoot, setWorkspaceRoot] = useState('');
   const [liveStreams, setLiveStreams] = useState<Record<string, DirectLiveStream>>({});
   const [liveToolOutputs, setLiveToolOutputs] = useState<Record<string, DirectLiveToolOutput[]>>({});

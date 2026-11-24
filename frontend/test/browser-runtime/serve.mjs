@@ -43,6 +43,16 @@ const upstream = createHttpServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     return res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
   }
+  if (messages.includes('Runtime permission menu check')) {
+    const progress = body.messages.filter(message => message.role === 'tool').length;
+    const delta = progress < 2 ? { tool_calls: [{
+      index: 0, id: `permission-probe-${progress}`, type: 'function', function: {
+        name: 'bash', arguments: JSON.stringify({ command: progress === 0 ? 'pwd' : `node ${second}` }),
+      },
+    }] } : { content: 'PERMISSION CHECK COMPLETE' };
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    return res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: progress < 2 ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  }
   const index = step++;
   if (index < 2) await gates[index].promise;
   const delta = index < 2 ? { tool_calls: [{

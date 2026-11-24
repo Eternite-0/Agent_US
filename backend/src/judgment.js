@@ -277,6 +277,7 @@ export class JudgmentService {
     meta = {},
     action,
     tainted = false,
+    executionContext = null,
     reviewCount = 0,
     signal,
     onUsage,
@@ -315,8 +316,10 @@ export class JudgmentService {
     }
     const question = {
       id: 'tool_approval_review',
-      prompt:
-        'Assess risk of this in-sandbox tool call (networkless read-only container with tmpfs workspace). Return JSON {"decision":"allow"|"ask","risk":"low"|"medium"|"high","reason":"short explanation"}. Only allow low-risk routine actions.',
+      prompt: (executionContext === 'direct_read_only_probe'
+        ? 'Assess this restricted, read-only terminal probe in the current workspace. '
+        : 'Assess risk of this in-sandbox tool call (networkless read-only container with tmpfs workspace). ') +
+        'Return JSON {"decision":"allow"|"ask","risk":"low"|"medium"|"high","reason":"short explanation"}. Only allow low-risk routine actions.',
       options: ['allow', 'ask'],
       responseSchema: {
         decision: 'allow|ask',
