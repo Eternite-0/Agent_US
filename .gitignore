@@ -2,6 +2,7 @@
 node_modules/
 /frontend/dist/
 /backend/var/
+/backend/data/benchmarks/
 /desktop/release/
 /promo-video/out/
 *.log

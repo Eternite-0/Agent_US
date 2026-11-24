@@ -11,23 +11,58 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { estimateTokens } from '../src/context.js';
+import { ACI_CONFIG_KEY } from '../src/context/supervisor.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { redactSecrets } from '../src/envelope.js';
+import {
+  computePairedResolutionMetrics,
+  evaluateSweBenchPredictions,
+  fetchSweBenchVerifiedDataset,
+  getDefaultSweBenchCachePath,
+  mergeEvalResultsIntoTelemetry,
+  normalizeSweBenchExtendedFields,
+  parseTestTargetList,
+  renderPaperLatexTable,
+  selectSweBenchSubset,
+} from '../src/evaluation/swebench-dataset-eval.js';
+import {
+  SweBenchDockerAdapter,
+  ensureDockerImage,
+  extractTestbedFromImage,
+  isAuthorizedSweBenchCommand,
+  resolveSweBenchDockerImage,
+  scrubAntiCheatGitRefs,
+} from '../src/evaluation/swebench-docker.js';
+import {
+  hasExplicitEnvProviderKey,
+  isThinkingOrReasoningModel,
+  loadAppPoolReadOnly,
+  resolveAppDataDir,
+  resolveLiveProviderConfig,
+  resolveSupervisorExecutionConfig,
+} from '../src/evaluation/swebench-pool.js';
 import { stableTools } from '../src/observability/prompt-cache.js';
 import { AccountPool } from '../src/pool.js';
 import { Store } from '../src/store.js';
 import {
-  BenchmarkSandbox,
-  SANDBOX_MODES,
   runHardenedGit,
   runHardenedGitSync,
 } from '../src/tools/benchmark-sandbox.js';
+
+export {
+  resolveAppDataDir,
+  loadAppPoolReadOnly,
+  hasExplicitEnvProviderKey,
+  resolveLiveProviderConfig,
+  isThinkingOrReasoningModel,
+  resolveSupervisorExecutionConfig,
+};
 
 export const SWEBENCH_BENCHMARK_ID = 'agent-us-swebench-verified';
 export const SWEBENCH_BENCHMARK_VERSION = '1.0.0';
@@ -55,8 +90,6 @@ const TEMP_CACHE_DIR_NAMES = new Set([
   '.tox',
 ]);
 const TEMP_CACHE_FILE_RE = /\.(?:pyc|pyo)$/i;
-const SAFE_TEST_CMD_RE =
-  /^(?:pytest|python(?:\s+-m\s+(?:pytest|unittest))?|git\s+(?:diff|status|log|show)|npm\s+test|node\s+--test)\b/i;
 
 function printSweBenchUsage() {
   console.log(
@@ -64,20 +97,47 @@ function printSweBenchUsage() {
       'Usage: node backend/scripts/benchmark-swebench.mjs [options]',
       '',
       'Options:',
-      '  --dataset <path>           Local .jsonl or .json SWE-bench Verified dataset',
-      '  --dry-run                  Run deterministic offline Python bug trajectory with 64-tok KV sim',
-      '  --arms <csv>               Comma-separated ACI arms (default: raw_full,full_aci)',
-      '  --model <model>            Model alias / name for predictions & inference',
-      '  --max-steps <n>            Max agent steps per instance (default: 60, max: 80)',
-      '  --output-dir <dir>         Directory for predictions.<arm>.jsonl, telemetry.<arm>.jsonl, summary.md',
-      '  --workspace-root <dir>     Base directory containing checked-out target repositories',
-      '  --docker-image <pattern>   Optional Docker image pattern (supports {instance_id}, {repo})',
-      '  --instance-ids <csv>       Comma-separated subset of instance_id values to run',
-      '  --limit <n>                Maximum number of instances to run after filtering',
-      '  --concurrency <n>          Concurrent isolated instance workers (default: 1)',
-      '  --resume                   Skip instance_ids already present in predictions/telemetry files',
-      '  --json                     Print JSON summary to stdout',
-      '  --help                     Show this help message',
+      '  --dataset <path|hf:verified>   Local .jsonl/.json dataset or "hf:verified" cache',
+      '  --fetch-dataset [path]         Download SWE-bench Verified from HuggingFace',
+      '  --subset <smoke-5|paper-50>    Deterministic stratified benchmark subset',
+      '  --seed <n>                     PRNG seed for --subset (default: 42)',
+      '  --dry-run                      Run deterministic offline Python bug trajectory with 64-tok KV sim',
+      '  --arms <csv>                   Comma-separated ACI arms (default: raw_full,full_aci)',
+      '  --model <model>                Model alias / name for predictions & inference',
+      '  --supervisor-model <model|off> Explicit ACI supervisor model or "off"/"deterministic"',
+      '  --deterministic-admission      Disable supervisor LLM calls and use deterministic admission',
+      '  --use-app-pool                 Clone enabled accounts read-only from App engine.sqlite',
+      '  --no-use-app-pool              Require explicit API key env var instead of App Pool',
+      '  --app-data-dir <dir>           Explicit App data directory containing engine.sqlite',
+      '  --max-steps <n>                Max agent steps per instance (default: 60, max: 80)',
+      '  --output-dir <dir>             Directory for predictions, telemetry, eval, summary.md, .tex',
+      '  --workspace-root <dir>         Base directory containing checked-out target repositories',
+      '  --docker-preset <epoch|official> Official or Epoch SWE-bench container image preset',
+      '  --docker-image <pattern>       Custom Docker image pattern ({instance_id}, {repo}, {repo_slug})',
+      '  --pull <missing|always|never>  Docker image pull policy (default: missing)',
+      '  --instance-ids <csv>           Comma-separated subset of instance_id values to run',
+      '  --limit <n>                    Maximum number of instances to run after filtering',
+      '  --concurrency <n>              Concurrent isolated instance workers (default: 1)',
+      '  --resume                       Skip instance_ids already present in predictions/telemetry files',
+      '  --evaluate                     Run in-container FAIL_TO_PASS / PASS_TO_PASS grader after predictions',
+      '  --eval-only                    Grade existing --predictions file without running agent inference',
+      '  --predictions <path>           Existing predictions JSONL file for --eval-only',
+      '  --export-latex [path]          Export booktabs LaTeX table (default: <output-dir>/swebench-paper-table.tex)',
+      '  --json                         Print JSON summary to stdout',
+      '  --help                         Show this help message',
+      '',
+      'Examples:',
+      '  # 1. Fetch & cache HuggingFace SWE-bench Verified dataset',
+      '  node backend/scripts/benchmark-swebench.mjs --fetch-dataset',
+      '',
+      '  # 2. Fast 5-repo container smoke test with automated FAIL_TO_PASS evaluation',
+      '  node backend/scripts/benchmark-swebench.mjs --dataset hf:verified --subset smoke-5 --docker-preset epoch --evaluate',
+      '',
+      '  # 3. Full 50-instance paired paper run using configured App AccountPool + LaTeX export',
+      '  node backend/scripts/benchmark-swebench.mjs --dataset hf:verified --subset paper-50 --arms raw_full,full_aci --docker-preset epoch --use-app-pool --evaluate --export-latex',
+      '',
+      '  # 4. Offline deterministic KV-cache simulation',
+      '  node backend/scripts/benchmark-swebench.mjs --dry-run',
     ].join('\n'),
   );
 }
@@ -95,6 +155,21 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     outputDir: null,
     workspaceRoot: null,
     dockerImage: null,
+    dockerPreset: null,
+    pull: 'missing',
+    useAppPool: null,
+    appDataDir: null,
+    supervisorModel: null,
+    deterministicAdmission: false,
+    fetchDataset: false,
+    fetchDatasetPath: null,
+    subset: null,
+    seed: 42,
+    evaluate: false,
+    evalOnly: false,
+    predictions: null,
+    exportLatex: false,
+    exportLatexPath: null,
     instanceIds: null,
     limit: null,
     concurrency: 1,
@@ -109,13 +184,40 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
       if (i + 1 >= argv.length) throw new Error(`Missing value for ${arg}`);
       return argv[++i];
     };
+    const nextOptionalVal = () => {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith('--') && argv[i + 1] !== '-h') {
+        return argv[++i];
+      }
+      return null;
+    };
     const splitEq = (flag) => arg.slice(flag.length + 1);
 
     if (arg === '--help' || arg === '-h') opts.help = true;
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--resume') opts.resume = true;
     else if (arg === '--json') opts.json = true;
-    else if (arg === '--dataset') opts.dataset = String(nextVal());
+    else if (arg === '--use-app-pool') opts.useAppPool = true;
+    else if (arg === '--no-use-app-pool') opts.useAppPool = false;
+    else if (arg === '--deterministic-admission') opts.deterministicAdmission = true;
+    else if (arg === '--evaluate') opts.evaluate = true;
+    else if (arg === '--eval-only') opts.evalOnly = true;
+    else if (arg === '--fetch-dataset') {
+      opts.fetchDataset = true;
+      const optPath = nextOptionalVal();
+      if (optPath) opts.fetchDatasetPath = String(optPath);
+    } else if (arg.startsWith('--fetch-dataset=')) {
+      opts.fetchDataset = true;
+      const val = splitEq('--fetch-dataset').trim();
+      if (val) opts.fetchDatasetPath = val;
+    } else if (arg === '--export-latex') {
+      opts.exportLatex = true;
+      const optPath = nextOptionalVal();
+      if (optPath) opts.exportLatexPath = String(optPath);
+    } else if (arg.startsWith('--export-latex=')) {
+      opts.exportLatex = true;
+      const val = splitEq('--export-latex').trim();
+      if (val) opts.exportLatexPath = val;
+    } else if (arg === '--dataset') opts.dataset = String(nextVal());
     else if (arg.startsWith('--dataset=')) opts.dataset = splitEq('--dataset');
     else if (arg === '--arms') {
       opts.arms = String(nextVal())
@@ -129,6 +231,10 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
         .filter(Boolean);
     } else if (arg === '--model') opts.model = String(nextVal()).trim();
     else if (arg.startsWith('--model=')) opts.model = splitEq('--model').trim();
+    else if (arg === '--supervisor-model') opts.supervisorModel = String(nextVal()).trim();
+    else if (arg.startsWith('--supervisor-model=')) opts.supervisorModel = splitEq('--supervisor-model').trim();
+    else if (arg === '--app-data-dir') opts.appDataDir = String(nextVal()).trim();
+    else if (arg.startsWith('--app-data-dir=')) opts.appDataDir = splitEq('--app-data-dir').trim();
     else if (arg === '--max-steps') opts.maxSteps = Number(nextVal());
     else if (arg.startsWith('--max-steps=')) opts.maxSteps = Number(splitEq('--max-steps'));
     else if (arg === '--output-dir') opts.outputDir = String(nextVal());
@@ -137,6 +243,16 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--workspace-root=')) opts.workspaceRoot = splitEq('--workspace-root');
     else if (arg === '--docker-image') opts.dockerImage = String(nextVal());
     else if (arg.startsWith('--docker-image=')) opts.dockerImage = splitEq('--docker-image');
+    else if (arg === '--docker-preset') opts.dockerPreset = String(nextVal()).trim().toLowerCase();
+    else if (arg.startsWith('--docker-preset=')) opts.dockerPreset = splitEq('--docker-preset').trim().toLowerCase();
+    else if (arg === '--pull') opts.pull = String(nextVal()).trim().toLowerCase();
+    else if (arg.startsWith('--pull=')) opts.pull = splitEq('--pull').trim().toLowerCase();
+    else if (arg === '--subset') opts.subset = String(nextVal()).trim().toLowerCase();
+    else if (arg.startsWith('--subset=')) opts.subset = splitEq('--subset').trim().toLowerCase();
+    else if (arg === '--seed') opts.seed = Number(nextVal());
+    else if (arg.startsWith('--seed=')) opts.seed = Number(splitEq('--seed'));
+    else if (arg === '--predictions') opts.predictions = String(nextVal());
+    else if (arg.startsWith('--predictions=')) opts.predictions = splitEq('--predictions');
     else if (arg === '--instance-ids') {
       opts.instanceIds = String(nextVal())
         .split(',')
@@ -172,11 +288,26 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
   if (!Number.isInteger(opts.concurrency) || opts.concurrency < 1 || opts.concurrency > 32) {
     throw new Error('--concurrency must be an integer between 1 and 32');
   }
+  if (!Number.isInteger(opts.seed)) {
+    throw new Error('--seed must be an integer');
+  }
+  if (opts.dockerPreset !== null && !['epoch', 'official'].includes(opts.dockerPreset)) {
+    throw new Error(`Invalid --docker-preset "${opts.dockerPreset}"; expected "epoch" or "official"`);
+  }
+  if (!['missing', 'always', 'never'].includes(opts.pull)) {
+    throw new Error(`Invalid --pull "${opts.pull}"; expected "missing", "always", or "never"`);
+  }
+  if (opts.subset !== null && !['smoke-5', 'paper-50'].includes(opts.subset)) {
+    throw new Error(`Invalid --subset "${opts.subset}"; expected "smoke-5" or "paper-50"`);
+  }
   if (opts.instanceIds && opts.instanceIds.length === 0) {
     opts.instanceIds = null;
   }
-  if (!opts.help && !opts.dryRun && !opts.dataset) {
-    throw new Error('Provide --dataset <path> or --dry-run');
+  if (opts.evalOnly && (!opts.predictions || !opts.dataset)) {
+    throw new Error('--eval-only requires both --predictions <path> and --dataset <path>');
+  }
+  if (!opts.help && !opts.dryRun && !opts.dataset && !opts.fetchDataset && !opts.evalOnly) {
+    throw new Error('Provide --dataset <path> or --dry-run (or --fetch-dataset / --eval-only)');
   }
 
   return opts;
@@ -206,6 +337,8 @@ export function normalizeSweBenchInstance(raw, index = 0) {
     throw new Error(`Dataset entry "${instanceId}" is missing base_commit`);
   }
 
+  const extended = normalizeSweBenchExtendedFields(raw);
+
   return {
     instance_id: instanceId,
     repo,
@@ -214,6 +347,9 @@ export function normalizeSweBenchInstance(raw, index = 0) {
     hints_text: hintsText,
     workspace_path: workspacePath,
     test_cmd: testCmd,
+    ...extended,
+    FAIL_TO_PASS: parseTestTargetList(extended?.FAIL_TO_PASS ?? raw.FAIL_TO_PASS),
+    PASS_TO_PASS: parseTestTargetList(extended?.PASS_TO_PASS ?? raw.PASS_TO_PASS),
   };
 }
 
@@ -274,7 +410,7 @@ export function loadSweBenchDataset(datasetPath, { instanceIds = null, limit = n
 /**
  * Formats a SWE-bench instance prompt with problem description, hints, and verification rules.
  */
-export function buildSweBenchPrompt(instance) {
+export function buildSweBenchPrompt(instance, { containerMode = false } = {}) {
   const parts = [
     `Repository: ${instance.repo || 'local'}`,
     `Instance ID: ${instance.instance_id}`,
@@ -291,7 +427,9 @@ export function buildSweBenchPrompt(instance) {
   }
   parts.push(
     '',
-    'Locate the root cause using grep and read_file, apply a minimal targeted fix, run the relevant test suite to confirm all tests pass, and verify the resulting git diff.',
+    containerMode
+      ? 'Locate the root cause using grep and read_file, apply a minimal targeted fix with edit_file or apply_patch, run the relevant Python/repository test suite inside /testbed using bash (e.g., pytest, ./tests/runtests.py, or bin/test — do NOT rely on host diagnostics), and verify the resulting git diff.'
+      : 'Locate the root cause using grep and read_file, apply a minimal targeted fix, run the relevant test suite to confirm all tests pass, and verify the resulting git diff.',
   );
   return parts.join('\n');
 }
@@ -906,6 +1044,12 @@ function appendJsonlRecord(filePath, record) {
   appendFileSync(filePath, JSON.stringify(record) + '\n', { encoding: 'utf8', mode: 0o600 });
 }
 
+function writeJsonlRecords(filePath, records = []) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const body = records.map((r) => JSON.stringify(r)).join('\n');
+  writeFileSync(filePath, body ? `${body}\n` : '', { encoding: 'utf8', mode: 0o600 });
+}
+
 function round4(value) {
   return Number((Number(value) || 0).toFixed(4));
 }
@@ -927,6 +1071,8 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
   let totalWallClockMs = 0;
   let nonEmptyPatches = 0;
   let completedInstances = 0;
+  let evaluatedInstances = 0;
+  let resolvedInstances = 0;
   let admissionOriginalTokens = 0;
   let admissionInjectedTokens = 0;
   let admissionSavedTokens = 0;
@@ -953,6 +1099,10 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
     totalWallClockMs += Number(row?.wallClockMs ?? 0) || 0;
 
     if (row?.status === 'completed') completedInstances += 1;
+    if (typeof row?.resolved === 'boolean') {
+      evaluatedInstances += 1;
+      if (row.resolved) resolvedInstances += 1;
+    }
     const predPatch = predsById.get(id)?.model_patch ?? '';
     const isNonEmpty = Boolean(row?.nonEmptyPatch) || String(predPatch).trim().length > 0;
     if (isNonEmpty) nonEmptyPatches += 1;
@@ -980,6 +1130,7 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
   }
 
   const count = rows.length + predOnlyCount;
+  const totalTokens = totalInputTokens + totalOutputTokens;
   const cacheHitRate =
     totalCacheEligibleInputTokens > 0
       ? round4(Math.min(1, totalCacheReadTokens / totalCacheEligibleInputTokens))
@@ -989,14 +1140,22 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
     admissionOriginalTokens > 0
       ? round4(Math.max(0, Math.min(1, admissionSavedTokens / admissionOriginalTokens)))
       : 0;
+  const resolvedRate =
+    evaluatedInstances > 0 ? round4(resolvedInstances / evaluatedInstances) : null;
+  const tokensPerResolved =
+    resolvedInstances > 0 ? Math.round(totalTokens / resolvedInstances) : null;
 
   return {
     arm,
     totalInstances: count,
     completedInstances,
+    evaluatedInstances,
+    resolvedInstances,
+    resolvedRate,
+    tokensPerResolved,
     totalInputTokens,
     totalOutputTokens,
-    totalTokens: totalInputTokens + totalOutputTokens,
+    totalTokens,
     totalCacheReadTokens,
     totalCacheEligibleInputTokens,
     cacheHitRate,
@@ -1021,12 +1180,23 @@ function formatPct(rate) {
 /**
  * Renders `summary.md` reporting per-arm SWE-bench and ACI telemetry metrics.
  */
-export function renderSummaryMarkdown({ arms, metricsByArm, telemetryByArm = {}, meta = {} }) {
+export function renderSummaryMarkdown({
+  arms,
+  metricsByArm,
+  telemetryByArm = {},
+  pairedByArm = null,
+  meta = {},
+}) {
+  const effectivePaired =
+    pairedByArm && typeof pairedByArm === 'object' && Object.keys(pairedByArm).length > 0
+      ? pairedByArm
+      : computePairedResolutionMetrics(arms, telemetryByArm, arms[0]);
+
   const lines = [
     '# SWE-bench Verified Benchmark Summary',
     '',
     `- **Benchmark**: ${SWEBENCH_BENCHMARK_ID} v${SWEBENCH_BENCHMARK_VERSION}`,
-    `- **Mode**: ${meta.dryRun ? 'dry-run (64-token prefix-block KV simulator)' : 'dataset'}`,
+    `- **Mode**: ${meta.dryRun ? 'dry-run (64-token prefix-block KV simulator)' : meta.evalOnly ? 'eval-only' : 'dataset'}`,
     `- **Model**: ${meta.model ?? 'default'}`,
     `- **Max Steps**: ${meta.maxSteps ?? DEFAULT_MAX_STEPS}`,
     `- **Arms**: ${arms.join(', ')}`,
@@ -1035,29 +1205,46 @@ export function renderSummaryMarkdown({ arms, metricsByArm, telemetryByArm = {},
     '',
     '## Per-Arm Metrics',
     '',
-    '| Arm | Instances | Total Input Tokens | Total Output Tokens | Real Provider Cache Hit Rate | Steps (Mean) | Wall-Clock Time (ms) | Non-Empty Patch Rate | ACI Admission Token Reduction Rate | DTOC Epoch Transitions |',
-    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| Arm | Instances | Resolved Rate (%) | Tokens / Resolved | Paired Resolved Token Reduction | Total Input Tokens | Total Output Tokens | Real Provider Cache Hit Rate | Steps (Mean) | Wall-Clock Time (ms) | Non-Empty Patch Rate | ACI Admission Token Reduction Rate | DTOC Epoch Transitions |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
 
   for (const arm of arms) {
     const m = metricsByArm[arm] ?? computeArmAggregateMetrics(arm, [], []);
+    const p = effectivePaired?.[arm] ?? null;
+    const resolvedCell =
+      m.evaluatedInstances > 0
+        ? `${formatPct(m.resolvedRate)} (${m.resolvedInstances}/${m.evaluatedInstances})`
+        : 'N/A';
+    const tokPerResCell =
+      m.tokensPerResolved != null
+        ? String(m.tokensPerResolved)
+        : p?.tokensPerResolved != null
+          ? String(Math.round(p.tokensPerResolved))
+          : 'N/A';
+    const pairedCell =
+      p?.pairedResolvedTokenReduction != null && (p?.pairedResolvedCount ?? 0) > 0
+        ? `${formatPct(p.pairedResolvedTokenReduction)} (n=${p.pairedResolvedCount})`
+        : 'N/A';
     lines.push(
-      `| \`${arm}\` | ${m.completedInstances}/${m.totalInstances} | ${m.totalInputTokens} | ${m.totalOutputTokens} | ${formatPct(m.cacheHitRate)} (${m.totalCacheReadTokens}/${m.totalCacheEligibleInputTokens}) | ${m.totalSteps} (${m.meanSteps}) | ${m.totalWallClockMs} | ${formatPct(m.nonEmptyPatchRate)} (${m.nonEmptyPatches}/${m.totalInstances}) | ${formatPct(m.admissionTokenReductionRate)} (${m.admissionSavedTokens}/${m.admissionOriginalTokens}) | ${m.epochTransitions} |`,
+      `| \`${arm}\` | ${m.completedInstances}/${m.totalInstances} | ${resolvedCell} | ${tokPerResCell} | ${pairedCell} | ${m.totalInputTokens} | ${m.totalOutputTokens} | ${formatPct(m.cacheHitRate)} (${m.totalCacheReadTokens}/${m.totalCacheEligibleInputTokens}) | ${m.totalSteps} (${m.meanSteps}) | ${m.totalWallClockMs} | ${formatPct(m.nonEmptyPatchRate)} (${m.nonEmptyPatches}/${m.totalInstances}) | ${formatPct(m.admissionTokenReductionRate)} (${m.admissionSavedTokens}/${m.admissionOriginalTokens}) | ${m.epochTransitions} |`,
     );
   }
 
   lines.push('', '## Instance Telemetry', '');
   lines.push(
-    '| Arm | Instance ID | Status | Steps | Input Tokens | Output Tokens | Cache Hit Rate | Wall-Clock (ms) | Non-Empty Patch | Admission Reduction | Epoch Transitions |',
+    '| Arm | Instance ID | Status | Resolved | Steps | Input Tokens | Output Tokens | Cache Hit Rate | Wall-Clock (ms) | Non-Empty Patch | Admission Reduction | Epoch Transitions |',
   );
   lines.push(
-    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |',
+    '| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |',
   );
 
   for (const arm of arms) {
     for (const row of telemetryByArm[arm] ?? []) {
+      const resolvedLabel =
+        row.resolved === true ? 'yes' : row.resolved === false ? 'no' : '-';
       lines.push(
-        `| \`${arm}\` | \`${row.instance_id}\` | ${row.status} | ${row.steps} | ${row.inputTokens} | ${row.outputTokens} | ${formatPct(row.cacheHitRate)} | ${row.wallClockMs} | ${row.nonEmptyPatch ? 'yes' : 'no'} | ${formatPct(row.admissionTokenReductionRate)} | ${row.epochTransitions} |`,
+        `| \`${arm}\` | \`${row.instance_id}\` | ${row.status} | ${resolvedLabel} | ${row.steps} | ${row.inputTokens} | ${row.outputTokens} | ${formatPct(row.cacheHitRate)} | ${row.wallClockMs} | ${row.nonEmptyPatch ? 'yes' : 'no'} | ${formatPct(row.admissionTokenReductionRate)} | ${row.epochTransitions} |`,
       );
     }
   }
@@ -1066,8 +1253,15 @@ export function renderSummaryMarkdown({ arms, metricsByArm, telemetryByArm = {},
   return lines.join('\n');
 }
 
-function isAuthorizedBenchmarkToolCall(toolName, args, { customTestCmd = null } = {}) {
+export function isAuthorizedBenchmarkToolCall(
+  toolName,
+  args,
+  { customTestCmd = null, containerMode = false } = {},
+) {
   const name = String(toolName ?? '').trim();
+  if (containerMode && name === 'run_diagnostics') {
+    return false;
+  }
   if (
     [
       'read_file',
@@ -1085,21 +1279,9 @@ function isAuthorizedBenchmarkToolCall(toolName, args, { customTestCmd = null } 
     return true;
   }
   if (name === 'bash') {
-    const cmd = String(args?.command ?? '').trim();
-    if (!cmd) return false;
-    if (customTestCmd && cmd === String(customTestCmd).trim()) return true;
-    return SAFE_TEST_CMD_RE.test(cmd);
+    return isAuthorizedSweBenchCommand(args?.command, { customTestCmd, containerMode });
   }
   return false;
-}
-
-function resolveDockerImageForInstance(pattern, instance) {
-  if (!pattern) return null;
-  const slug = String(instance.repo || 'repo').replace(/\//g, '__');
-  return String(pattern)
-    .replace(/\{instance_id\}/g, instance.instance_id)
-    .replace(/\{repo\}/g, instance.repo || 'repo')
-    .replace(/\{repo_slug\}/g, slug);
 }
 
 function resolveSourceWorkspaceForInstance(instance, opts) {
@@ -1115,7 +1297,7 @@ function resolveSourceWorkspaceForInstance(instance, opts) {
   }
   if (!opts.workspaceRoot) {
     throw new Error(
-      `Instance "${instance.instance_id}" requires workspace_path or --workspace-root`,
+      `Instance "${instance.instance_id}" requires workspace_path, --workspace-root, or --docker-preset/--docker-image`,
     );
   }
   const root = resolve(opts.workspaceRoot);
@@ -1243,30 +1425,93 @@ function extractTurnTelemetryRow({
   };
 }
 
-function resolveLiveProviderConfig(opts) {
-  const apiKey =
-    process.env.SWEBENCH_API_KEY ||
-    process.env.TI_BENCH_KEY ||
-    process.env.AGENT_US_BENCH_KEY ||
-    process.env.DEEPSEEK_API_KEY ||
-    process.env.OPENAI_API_KEY ||
-    '';
-  const endpoint =
-    process.env.SWEBENCH_ENDPOINT ||
-    process.env.TI_BENCH_ENDPOINT ||
-    process.env.AGENT_US_BENCH_ENDPOINT ||
-    'https://api.openai.com/v1';
-  const protocol =
-    process.env.SWEBENCH_PROTOCOL ||
-    process.env.TI_BENCH_PROTOCOL ||
-    'openai';
-  const model =
-    opts.model ||
-    process.env.SWEBENCH_MODEL ||
-    process.env.TI_BENCH_MODEL ||
-    process.env.AGENT_US_BENCH_MODEL ||
-    'deepseek-chat';
-  return { apiKey, endpoint, protocol, model };
+function shouldUseAppPool(opts, runtimeDeps = {}) {
+  if (opts.dryRun || runtimeDeps.adapter || runtimeDeps.createAdapter) return false;
+  if (opts.useAppPool === true) return true;
+  if (opts.useAppPool === false) return false;
+  if (opts.appDataDir) return true;
+  return !hasExplicitEnvProviderKey(runtimeDeps.env ?? process.env);
+}
+
+function buildEvalImageResolver(opts, runtimeDeps = {}) {
+  if (typeof runtimeDeps.imageResolver === 'function') {
+    return runtimeDeps.imageResolver;
+  }
+  const effectivePreset = opts.dockerPreset ?? (opts.dockerImage ? null : 'epoch');
+  return (instance) =>
+    resolveSweBenchDockerImage({
+      dockerImage: opts.dockerImage,
+      dockerPreset: effectivePreset,
+      instance,
+    });
+}
+
+function buildEvalDockerSessionFactory(opts, runtimeDeps = {}) {
+  if (typeof runtimeDeps.createDockerSession === 'function') {
+    return runtimeDeps.createDockerSession;
+  }
+  return async ({ instance, image, pull }) => {
+    const evalWs = mkdtempSync(join(tmpdir(), 'agent-us-swe-eval-'));
+    const extractFn = runtimeDeps.extractTestbedFromImage ?? extractTestbedFromImage;
+    await extractFn({
+      image,
+      targetDir: evalWs,
+      baseCommit: instance.base_commit,
+      pull: pull ?? opts.pull ?? 'missing',
+    });
+    const dockerAdapter =
+      typeof runtimeDeps.createDockerAdapter === 'function'
+        ? runtimeDeps.createDockerAdapter({
+            image,
+            workspaceRoot: evalWs,
+            pull: pull === 'always' ? 'missing' : (pull ?? opts.pull ?? 'missing'),
+            timeoutMs: 300_000,
+            instance,
+          })
+        : new SweBenchDockerAdapter({
+            image,
+            workspaceRoot: evalWs,
+            pull: pull === 'always' ? 'missing' : (pull ?? opts.pull ?? 'missing'),
+            timeoutMs: 300_000,
+          });
+    await dockerAdapter.start?.();
+    return {
+      workspaceRoot: evalWs,
+      exec: (cmd, execOpts = {}) =>
+        dockerAdapter.exec(cmd, { ...execOpts, skipAntiCheatGuard: true }),
+      destroy: async () => {
+        try {
+          await dockerAdapter.destroy?.();
+        } finally {
+          rmSync(evalWs, { recursive: true, force: true });
+        }
+      },
+    };
+  };
+}
+
+async function resolveDatasetInputPath(opts, runtimeDeps = {}) {
+  const rawDs = String(opts.dataset ?? '').trim();
+  const isHfAlias = /^hf:(?:\/\/)?verified$/i.test(rawDs);
+  if (isHfAlias) {
+    const cachePath = opts.fetchDatasetPath
+      ? resolve(String(opts.fetchDatasetPath))
+      : getDefaultSweBenchCachePath();
+    if (opts.fetchDataset || !existsSync(cachePath)) {
+      const fetchFn = runtimeDeps.fetchSweBenchVerifiedDataset ?? fetchSweBenchVerifiedDataset;
+      await fetchFn({ outputPath: cachePath });
+    }
+    return cachePath;
+  }
+  if (opts.fetchDataset && rawDs) {
+    const targetPath = opts.fetchDatasetPath
+      ? resolve(String(opts.fetchDatasetPath))
+      : resolve(rawDs);
+    const fetchFn = runtimeDeps.fetchSweBenchVerifiedDataset ?? fetchSweBenchVerifiedDataset;
+    await fetchFn({ outputPath: targetPath });
+    return targetPath;
+  }
+  return resolve(rawDs);
 }
 
 /**
@@ -1279,23 +1524,26 @@ async function runSweBenchInstanceArm({
   opts,
   adapter = null,
   providerConfig = null,
+  runtimeDeps = {},
+  extractedFromImage = false,
 }) {
   const started = performance.now();
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-swe-state-${arm}-`));
   const store = new Store(join(stateDir, 'swebench.sqlite'));
   const pool = new AccountPool(store, { root: stateDir });
 
-  const resolvedModel =
-    opts.model ||
-    providerConfig?.model ||
-    (opts.dryRun ? `swebench-dry-run-sim` : 'agent-us-swebench');
-  const modelNameForPrediction = opts.model
-    ? opts.model
-    : opts.dryRun
-      ? `agent-us-dry-run-${arm}`
-      : `agent-us-${arm}`;
+  const containerMode = Boolean(!opts.dryRun && (opts.dockerImage || opts.dockerPreset));
+  let resolvedModel = opts.model || null;
+  let modelNameForPrediction = opts.model || null;
+  let availableModels = [];
 
   if (adapter || opts.dryRun) {
+    resolvedModel = opts.model || providerConfig?.model || 'swebench-dry-run-sim';
+    modelNameForPrediction = opts.model
+      ? opts.model
+      : opts.dryRun
+        ? `agent-us-dry-run-${arm}`
+        : `agent-us-${arm}`;
     pool.createAccount({
       preset: 'custom-openai',
       label: 'swebench-sim',
@@ -1305,36 +1553,74 @@ async function runSweBenchInstanceArm({
       models: [resolvedModel],
     });
     pool.setDefaultModel(resolvedModel);
-  } else {
-    if (!providerConfig?.apiKey) {
+    availableModels = [resolvedModel];
+  } else if (shouldUseAppPool(opts, runtimeDeps)) {
+    const cloneFn = runtimeDeps.loadAppPoolReadOnly ?? loadAppPoolReadOnly;
+    const cloned = cloneFn({
+      appDataDir: opts.appDataDir ?? null,
+      explicitDir: opts.appDataDir ?? null,
+      targetStore: store,
+      targetPool: pool,
+      model: opts.model ?? null,
+      supervisorModel: opts.supervisorModel ?? null,
+      env: runtimeDeps.env ?? process.env,
+    });
+    if (!cloned || cloned.accountsCloned <= 0) {
       throw new Error(
-        'Live SWE-bench execution requires SWEBENCH_API_KEY, TI_BENCH_KEY, DEEPSEEK_API_KEY, or OPENAI_API_KEY (or use --dry-run)',
+        `No enabled provider accounts found in App Pool (${cloned?.sourceDataDir ?? 'unknown'}). Configure an account in the app or pass an API key env var (DEEPSEEK_API_KEY, OPENAI_API_KEY, SWEBENCH_API_KEY).`,
       );
     }
+    resolvedModel = opts.model || cloned.defaultModel || cloned.availableModels?.[0] || null;
+    if (!resolvedModel) {
+      throw new Error(
+        `No default model found in App Pool (${cloned.sourceDataDir}); pass --model <model>.`,
+      );
+    }
+    pool.setDefaultModel(resolvedModel);
+    availableModels = Array.isArray(cloned.availableModels) ? cloned.availableModels : [resolvedModel];
+    modelNameForPrediction = opts.model || resolvedModel || `agent-us-${arm}`;
+  } else {
+    const liveCfg = providerConfig ?? resolveLiveProviderConfig(opts);
+    if (!liveCfg?.apiKey) {
+      throw new Error(
+        'Live SWE-bench execution requires an enabled App Pool account (--use-app-pool) or SWEBENCH_API_KEY / TI_BENCH_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY (or use --dry-run)',
+      );
+    }
+    resolvedModel = opts.model || liveCfg.model || 'deepseek-chat';
+    const supExplicit =
+      typeof opts.supervisorModel === 'string' &&
+      opts.supervisorModel.trim() &&
+      !['off', 'deterministic', 'auto'].includes(opts.supervisorModel.trim().toLowerCase())
+        ? opts.supervisorModel.trim()
+        : null;
+    const accountModels = [...new Set([resolvedModel, ...(supExplicit ? [supExplicit] : [])])];
     pool.createAccount({
-      preset: 'custom-openai',
+      preset: liveCfg.preset || (liveCfg.protocol === 'anthropic' ? 'custom-anthropic' : 'custom-openai'),
       label: 'swebench-live',
-      credential: providerConfig.apiKey,
-      protocol: providerConfig.protocol || 'openai',
-      endpoint: providerConfig.endpoint,
-      models: [resolvedModel],
+      credential: liveCfg.apiKey,
+      protocol: liveCfg.protocol || 'openai',
+      endpoint: liveCfg.endpoint,
+      models: accountModels,
     });
     pool.setDefaultModel(resolvedModel);
+    availableModels = accountModels;
+    modelNameForPrediction = opts.model || resolvedModel || `agent-us-${arm}`;
   }
 
-  if (arm === 'raw_full' || arm === 'deterministic_progressive') {
-    store.setSetting?.('aci.config', {
-      enabled: false,
-      mode: 'off',
-      admissionEnabled: arm !== 'raw_full',
-    });
-  } else {
-    store.setSetting?.('aci.config', {
-      enabled: true,
-      mode: 'auto',
-      admissionEnabled: true,
-    });
-  }
+  const supExec = resolveSupervisorExecutionConfig({
+    arm,
+    mainModel: resolvedModel,
+    supervisorModel: opts.supervisorModel ?? null,
+    deterministicAdmission: Boolean(opts.deterministicAdmission),
+    availableModels,
+    targetPool: pool,
+  });
+  store.setSetting?.(ACI_CONFIG_KEY, {
+    enabled: Boolean(supExec.enabled),
+    mode: supExec.mode,
+    model: supExec.model ?? null,
+    admissionEnabled: Boolean(supExec.admissionEnabled),
+  });
 
   const effectiveAdapter =
     adapter ?? (opts.dryRun ? new PrefixBlockCacheSimulatorAdapter() : null);
@@ -1346,16 +1632,36 @@ async function runSweBenchInstanceArm({
   });
 
   let unsub = null;
+  let sessionSandbox = null;
   try {
-    let sessionSandbox = null;
-    if (!opts.dryRun && opts.dockerImage) {
-      const dockerImage = resolveDockerImageForInstance(opts.dockerImage, instance);
-      sessionSandbox = new BenchmarkSandbox({
-        mode: SANDBOX_MODES.DOCKER,
-        workspaceRoot,
-        dockerImage,
-        timeoutMs: 60_000,
+    if (!opts.dryRun) {
+      const scrubFn = runtimeDeps.scrubAntiCheatGitRefs ?? scrubAntiCheatGitRefs;
+      await scrubFn(workspaceRoot, instance.base_commit);
+    }
+
+    if (containerMode) {
+      const dockerImage = resolveSweBenchDockerImage({
+        dockerImage: opts.dockerImage,
+        dockerPreset: opts.dockerPreset,
+        instance,
       });
+      const adapterPull =
+        extractedFromImage && opts.pull === 'always' ? 'missing' : (opts.pull ?? 'missing');
+      sessionSandbox =
+        typeof runtimeDeps.createDockerAdapter === 'function'
+          ? runtimeDeps.createDockerAdapter({
+              image: dockerImage,
+              workspaceRoot,
+              pull: adapterPull,
+              timeoutMs: 120_000,
+              instance,
+            })
+          : new SweBenchDockerAdapter({
+              image: dockerImage,
+              workspaceRoot,
+              pull: adapterPull,
+              timeoutMs: 120_000,
+            });
     }
 
     const session = direct.createSession({
@@ -1365,6 +1671,7 @@ async function runSweBenchInstanceArm({
       permissionMode: 'auto-safe',
       aciProfile: arm,
       budget: { maxSteps: opts.maxSteps },
+      ...(containerMode ? { toolDeny: ['run_diagnostics'] } : {}),
       ...(sessionSandbox ? { sandbox: sessionSandbox, sandboxProfile: 'benchmark' } : {}),
       trafficSource: 'benchmark',
       isSynthetic: Boolean(opts.dryRun),
@@ -1375,6 +1682,7 @@ async function runSweBenchInstanceArm({
       const item = evt.data;
       const allowed = isAuthorizedBenchmarkToolCall(item.tool, item.arguments, {
         customTestCmd: instance.test_cmd,
+        containerMode,
       });
       queueMicrotask(() => {
         try {
@@ -1391,7 +1699,7 @@ async function runSweBenchInstanceArm({
       });
     });
 
-    const prompt = buildSweBenchPrompt(instance);
+    const prompt = buildSweBenchPrompt(instance, { containerMode });
     const { turn } = direct.startTurn(session.id, {
       input: prompt,
       model: resolvedModel,
@@ -1440,10 +1748,14 @@ async function runSweBenchInstanceArm({
 
     return { prediction, telemetry };
   } finally {
-    unsub?.();
-    await direct.close();
-    store.close();
-    rmSync(stateDir, { recursive: true, force: true });
+    try {
+      unsub?.();
+      await direct.close();
+    } finally {
+      await sessionSandbox?.destroy?.().catch(() => {});
+      store.close();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -1464,7 +1776,8 @@ async function runWithConcurrency(items, concurrency, fn) {
 
 /**
  * Executes the SWE-bench Verified benchmark across requested ACI arms and writes
- * `predictions.<arm>.jsonl`, `telemetry.<arm>.jsonl`, and `summary.md`.
+ * `predictions.<arm>.jsonl`, `telemetry.<arm>.jsonl`, `eval.<arm>.jsonl`,
+ * `summary.md`, and optional `swebench-paper-table.tex`.
  */
 export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
   const opts = {
@@ -1476,11 +1789,183 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     outputDir: rawOpts.outputDir ?? null,
     workspaceRoot: rawOpts.workspaceRoot ?? null,
     dockerImage: rawOpts.dockerImage ?? null,
+    dockerPreset: rawOpts.dockerPreset ?? null,
+    pull: rawOpts.pull ?? 'missing',
+    useAppPool: rawOpts.useAppPool !== undefined ? rawOpts.useAppPool : null,
+    appDataDir: rawOpts.appDataDir ?? null,
+    supervisorModel: rawOpts.supervisorModel ?? null,
+    deterministicAdmission: Boolean(rawOpts.deterministicAdmission),
+    fetchDataset: Boolean(rawOpts.fetchDataset),
+    fetchDatasetPath: rawOpts.fetchDatasetPath ?? null,
+    subset: rawOpts.subset ?? null,
+    seed: rawOpts.seed != null && Number.isInteger(Number(rawOpts.seed)) ? Number(rawOpts.seed) : 42,
+    evaluate: Boolean(rawOpts.evaluate),
+    evalOnly: Boolean(rawOpts.evalOnly),
+    predictions: rawOpts.predictions ?? null,
+    exportLatex: Boolean(rawOpts.exportLatex),
+    exportLatexPath: rawOpts.exportLatexPath ?? null,
     instanceIds: rawOpts.instanceIds ?? null,
     limit: rawOpts.limit ?? null,
     concurrency: Math.max(1, Number(rawOpts.concurrency ?? 1)),
     resume: Boolean(rawOpts.resume),
   };
+
+  // Standalone --fetch-dataset mode
+  if (opts.fetchDataset && !opts.dataset && !opts.dryRun && !opts.evalOnly) {
+    const targetPath = opts.fetchDatasetPath
+      ? resolve(String(opts.fetchDatasetPath))
+      : getDefaultSweBenchCachePath();
+    const fetchFn = runtimeDeps.fetchSweBenchVerifiedDataset ?? fetchSweBenchVerifiedDataset;
+    const fetched = await fetchFn({ outputPath: targetPath });
+    return {
+      benchmarkId: SWEBENCH_BENCHMARK_ID,
+      version: SWEBENCH_BENCHMARK_VERSION,
+      action: 'fetch-dataset',
+      outputPath: fetched.outputPath,
+      count: fetched.count,
+    };
+  }
+
+  // Standalone --eval-only mode
+  if (opts.evalOnly) {
+    if (!opts.predictions || !opts.dataset) {
+      throw new Error('--eval-only requires both --predictions <path> and --dataset <path>');
+    }
+    const predPath = resolve(String(opts.predictions));
+    if (!existsSync(predPath)) {
+      throw new Error(`Predictions file not found: ${predPath}`);
+    }
+    const outputDir = opts.outputDir ? resolve(String(opts.outputDir)) : dirname(predPath);
+    mkdirSync(outputDir, { recursive: true });
+
+    const dsPath = await resolveDatasetInputPath(opts, runtimeDeps);
+    let instances = loadSweBenchDataset(dsPath, {
+      instanceIds: opts.instanceIds,
+      limit: opts.subset ? null : opts.limit,
+    });
+    if (opts.subset) {
+      const subRes = selectSweBenchSubset(instances, {
+        preset: opts.subset,
+        seed: opts.seed,
+        outputDir,
+      });
+      instances = subRes.instances;
+      if (opts.limit != null && opts.limit > 0) {
+        instances = instances.slice(0, opts.limit);
+      }
+    }
+
+    const predMatch = /^predictions\.([a-z0-9_-]+)\.jsonl$/i.exec(basename(predPath));
+    const armsExplicit = Array.isArray(rawOpts.arms) && rawOpts.arms.length > 0;
+    const arm = predMatch?.[1] ?? (armsExplicit ? opts.arms[0] : 'eval');
+    const evalOutPath = join(outputDir, `eval.${arm}.jsonl`);
+    const imageResolver = buildEvalImageResolver(opts, runtimeDeps);
+    const createDockerSession = buildEvalDockerSessionFactory(opts, runtimeDeps);
+    const evalFn = runtimeDeps.evaluateSweBenchPredictions ?? evaluateSweBenchPredictions;
+    const evalRes = await evalFn({
+      instances,
+      predictionsPath: predPath,
+      imageResolver,
+      createDockerSession,
+      pull: opts.pull,
+      concurrency: opts.concurrency,
+      outputPath: evalOutPath,
+    });
+
+    const predMap = readJsonlRecords(predPath, 'instance_id');
+    const predictions = [...predMap.values()];
+    const telePath = join(outputDir, `telemetry.${arm}.jsonl`);
+    const existingTeleMap = readJsonlRecords(telePath, 'instance_id');
+    let baseTelemetry = [...existingTeleMap.values()];
+    if (baseTelemetry.length === 0) {
+      const predById = new Map(predictions.map((p) => [p.instance_id, p]));
+      baseTelemetry = (evalRes.results ?? []).map((er) => ({
+        instance_id: er.instance_id,
+        arm,
+        model: predById.get(er.instance_id)?.model_name_or_path ?? opts.model ?? 'eval',
+        status: 'completed',
+        wallClockMs: 0,
+        steps: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheEligibleInputTokens: 0,
+        cacheHitRate: 0,
+        nonEmptyPatch: Boolean(predById.get(er.instance_id)?.model_patch?.trim()),
+        admissionOriginalTokens: 0,
+        admissionInjectedTokens: 0,
+        admissionSavedTokens: 0,
+        admissionTokenReductionRate: 0,
+        epochTransitions: 0,
+      }));
+    }
+    const mergedTelemetry = mergeEvalResultsIntoTelemetry(baseTelemetry, evalRes.results ?? []);
+    if (existsSync(telePath) || mergedTelemetry.length > 0) {
+      writeJsonlRecords(telePath, mergedTelemetry);
+    }
+
+    const arms = [arm];
+    const telemetryByArm = { [arm]: mergedTelemetry };
+    const predictionsByArm = { [arm]: predictions };
+    const metricsByArm = {
+      [arm]: computeArmAggregateMetrics(arm, mergedTelemetry, predictions),
+    };
+    const pairedByArm = computePairedResolutionMetrics(arms, telemetryByArm, arm);
+
+    const summaryPath = join(outputDir, 'summary.md');
+    const md = renderSummaryMarkdown({
+      arms,
+      metricsByArm,
+      telemetryByArm,
+      pairedByArm,
+      meta: {
+        dryRun: false,
+        evalOnly: true,
+        model: opts.model || predictions[0]?.model_name_or_path || 'eval',
+        maxSteps: opts.maxSteps,
+        resumed: false,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+    writeFileSync(summaryPath, md, { encoding: 'utf8', mode: 0o600 });
+
+    let latexPath = null;
+    if (opts.exportLatex || opts.evalOnly) {
+      latexPath = opts.exportLatexPath
+        ? resolve(String(opts.exportLatexPath))
+        : join(outputDir, 'swebench-paper-table.tex');
+      mkdirSync(dirname(latexPath), { recursive: true });
+      const tex = renderPaperLatexTable({
+        arms,
+        metricsByArm,
+        pairedByArm,
+        meta: {
+          subset: opts.subset ?? 'custom',
+          model: opts.model || predictions[0]?.model_name_or_path || 'eval',
+        },
+      });
+      writeFileSync(latexPath, tex, { encoding: 'utf8', mode: 0o600 });
+    }
+
+    return {
+      benchmarkId: SWEBENCH_BENCHMARK_ID,
+      version: SWEBENCH_BENCHMARK_VERSION,
+      evalOnly: true,
+      outputDir,
+      arms,
+      instancesCount: instances.length,
+      summaryPath,
+      evalFiles: { [arm]: evalOutPath },
+      evalByArm: { [arm]: evalRes },
+      latexPath,
+      metricsByArm,
+      pairedByArm,
+      predictionsByArm,
+      telemetryByArm,
+    };
+  }
 
   let createdTempOutput = false;
   const outputDir = opts.outputDir
@@ -1490,7 +1975,11 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       : resolve(process.cwd(), 'swebench-results');
   mkdirSync(outputDir, { recursive: true });
 
-  const providerConfig = !opts.dryRun && !runtimeDeps.adapter ? resolveLiveProviderConfig(opts) : null;
+  const useAppPoolMode = shouldUseAppPool(opts, runtimeDeps);
+  const providerConfig =
+    !opts.dryRun && !runtimeDeps.adapter && !runtimeDeps.createAdapter && !useAppPoolMode
+      ? resolveLiveProviderConfig(opts, runtimeDeps.env ?? process.env)
+      : null;
   let dryRunRepoDir = null;
 
   try {
@@ -1507,10 +1996,22 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         instances = instances.slice(0, opts.limit);
       }
     } else {
-      instances = loadSweBenchDataset(opts.dataset, {
+      const dsPath = await resolveDatasetInputPath(opts, runtimeDeps);
+      instances = loadSweBenchDataset(dsPath, {
         instanceIds: opts.instanceIds,
-        limit: opts.limit,
+        limit: opts.subset ? null : opts.limit,
       });
+      if (opts.subset) {
+        const subRes = selectSweBenchSubset(instances, {
+          preset: opts.subset,
+          seed: opts.seed,
+          outputDir,
+        });
+        instances = subRes.instances;
+        if (opts.limit != null && opts.limit > 0) {
+          instances = instances.slice(0, opts.limit);
+        }
+      }
     }
 
     const predictionsByArm = {};
@@ -1539,6 +2040,8 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     }
 
     const summaryPath = join(outputDir, 'summary.md');
+    let evalByArm = {};
+    let pairedByArm = {};
     const writeIncrementalSummary = () => {
       const metricsByArm = {};
       for (const arm of opts.arms) {
@@ -1548,13 +2051,19 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
           predictionsByArm[arm],
         );
       }
+      pairedByArm = computePairedResolutionMetrics(opts.arms, telemetryByArm, opts.arms[0]);
       const md = renderSummaryMarkdown({
         arms: opts.arms,
         metricsByArm,
         telemetryByArm,
+        pairedByArm,
         meta: {
           dryRun: opts.dryRun,
-          model: opts.model || providerConfig?.model || (opts.dryRun ? 'swebench-dry-run-sim' : 'default'),
+          model:
+            opts.model ||
+            providerConfig?.model ||
+            telemetryByArm[opts.arms[0]]?.[0]?.model ||
+            (opts.dryRun ? 'swebench-dry-run-sim' : 'default'),
           maxSteps: opts.maxSteps,
           resumed: opts.resume,
           updatedAt: new Date().toISOString(),
@@ -1588,6 +2097,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
             opts,
             adapter,
             providerConfig,
+            runtimeDeps,
           });
           persistResult(arm, result);
           await resetGitWorktreeToCommit(dryRunRepoDir, instance.base_commit);
@@ -1602,9 +2112,41 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         }
       }
 
+      if (planned.length > 0 && useAppPoolMode && !runtimeDeps.loadAppPoolReadOnly) {
+        const preDir = resolveAppDataDir(opts.appDataDir, {
+          env: runtimeDeps.env ?? process.env,
+        });
+        if (!preDir || !existsSync(join(preDir, 'engine.sqlite'))) {
+          throw new Error(
+            `No App AccountPool database (engine.sqlite) found${preDir ? ` in ${preDir}` : ''}. ` +
+              'Configure an enabled provider account in the app, pass --app-data-dir <dir>, or set an API key env var (DEEPSEEK_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, SWEBENCH_API_KEY).',
+          );
+        }
+      }
+
       await runWithConcurrency(planned, opts.concurrency, async ({ arm, instance }) => {
-        const sourceRepo = resolveSourceWorkspaceForInstance(instance, opts);
-        const trialWs = await createIsolatedTrialWorkspace(sourceRepo, instance.base_commit);
+        const hasLocalWorkspace = Boolean(instance.workspace_path || opts.workspaceRoot);
+        let trialWs;
+        let extractedFromImage = false;
+        if (!hasLocalWorkspace && (opts.dockerImage || opts.dockerPreset)) {
+          trialWs = mkdtempSync(join(tmpdir(), 'agent-us-swe-ws-'));
+          const dockerImage = resolveSweBenchDockerImage({
+            dockerImage: opts.dockerImage,
+            dockerPreset: opts.dockerPreset,
+            instance,
+          });
+          const extractFn = runtimeDeps.extractTestbedFromImage ?? extractTestbedFromImage;
+          await extractFn({
+            image: dockerImage,
+            targetDir: trialWs,
+            baseCommit: instance.base_commit,
+            pull: opts.pull ?? 'missing',
+          });
+          extractedFromImage = true;
+        } else {
+          const sourceRepo = resolveSourceWorkspaceForInstance(instance, opts);
+          trialWs = await createIsolatedTrialWorkspace(sourceRepo, instance.base_commit);
+        }
         try {
           const adapter = runtimeDeps.createAdapter
             ? runtimeDeps.createAdapter({ arm, instance })
@@ -1616,6 +2158,8 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
             opts,
             adapter,
             providerConfig,
+            runtimeDeps,
+            extractedFromImage,
           });
           persistResult(arm, result);
         } finally {
@@ -1624,7 +2168,53 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       });
     }
 
+    const evalFiles = {};
+    if (opts.evaluate) {
+      const imageResolver = buildEvalImageResolver(opts, runtimeDeps);
+      const createDockerSession = buildEvalDockerSessionFactory(opts, runtimeDeps);
+      const evalFn = runtimeDeps.evaluateSweBenchPredictions ?? evaluateSweBenchPredictions;
+      for (const arm of opts.arms) {
+        const evalOutPath = join(outputDir, `eval.${arm}.jsonl`);
+        const evalRes = await evalFn({
+          instances,
+          predictions: predictionsByArm[arm],
+          predictionsPath: filePathsByArm[arm].predPath,
+          imageResolver,
+          createDockerSession,
+          pull: opts.pull,
+          concurrency: opts.concurrency,
+          outputPath: evalOutPath,
+        });
+        evalFiles[arm] = evalOutPath;
+        evalByArm[arm] = evalRes;
+        telemetryByArm[arm] = mergeEvalResultsIntoTelemetry(
+          telemetryByArm[arm],
+          evalRes.results ?? [],
+        );
+        writeJsonlRecords(filePathsByArm[arm].telePath, telemetryByArm[arm]);
+      }
+    }
+
     const metricsByArm = writeIncrementalSummary();
+
+    let latexPath = null;
+    if (opts.exportLatex || opts.evaluate) {
+      latexPath = opts.exportLatexPath
+        ? resolve(String(opts.exportLatexPath))
+        : join(outputDir, 'swebench-paper-table.tex');
+      mkdirSync(dirname(latexPath), { recursive: true });
+      const tex = renderPaperLatexTable({
+        arms: opts.arms,
+        metricsByArm,
+        pairedByArm,
+        meta: {
+          dryRun: opts.dryRun,
+          subset: opts.subset ?? null,
+          model: opts.model || providerConfig?.model || (opts.dryRun ? 'swebench-dry-run-sim' : 'default'),
+        },
+      });
+      writeFileSync(latexPath, tex, { encoding: 'utf8', mode: 0o600 });
+    }
 
     return {
       benchmarkId: SWEBENCH_BENCHMARK_ID,
@@ -1638,7 +2228,11 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       summaryPath,
       predictionsFiles: Object.fromEntries(opts.arms.map((a) => [a, filePathsByArm[a].predPath])),
       telemetryFiles: Object.fromEntries(opts.arms.map((a) => [a, filePathsByArm[a].telePath])),
+      evalFiles,
+      evalByArm,
+      latexPath,
       metricsByArm,
+      pairedByArm,
       predictionsByArm,
       telemetryByArm,
     };
@@ -1667,15 +2261,26 @@ if (isMain) {
   const result = await runSweBenchBenchmark(opts);
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2));
+  } else if (result.action === 'fetch-dataset') {
+    console.log(
+      `[${result.benchmarkId} v${result.version}] fetched ${result.count} instances -> ${result.outputPath}`,
+    );
   } else {
     console.log(
-      `[${result.benchmarkId} v${result.version}] dryRun=${result.dryRun} instances=${result.instancesCount} outputDir=${result.outputDir}`,
+      `[${result.benchmarkId} v${result.version}] dryRun=${Boolean(result.dryRun)} evalOnly=${Boolean(result.evalOnly)} instances=${result.instancesCount} outputDir=${result.outputDir}`,
     );
     for (const arm of result.arms) {
       const m = result.metricsByArm[arm];
+      const resStr =
+        m.evaluatedInstances > 0
+          ? ` resolved=${(m.resolvedRate * 100).toFixed(2)}% (${m.resolvedInstances}/${m.evaluatedInstances})`
+          : '';
       console.log(
-        `Arm ${arm}: completed=${m.completedInstances}/${m.totalInstances} inTok=${m.totalInputTokens} outTok=${m.totalOutputTokens} cacheHit=${(m.cacheHitRate * 100).toFixed(2)}% steps=${m.totalSteps} ms=${m.totalWallClockMs} patchRate=${(m.nonEmptyPatchRate * 100).toFixed(2)}% admRed=${(m.admissionTokenReductionRate * 100).toFixed(2)}% epochs=${m.epochTransitions}`,
+        `Arm ${arm}: completed=${m.completedInstances}/${m.totalInstances}${resStr} inTok=${m.totalInputTokens} outTok=${m.totalOutputTokens} cacheHit=${(m.cacheHitRate * 100).toFixed(2)}% steps=${m.totalSteps} ms=${m.totalWallClockMs} patchRate=${(m.nonEmptyPatchRate * 100).toFixed(2)}% admRed=${(m.admissionTokenReductionRate * 100).toFixed(2)}% epochs=${m.epochTransitions}`,
       );
+    }
+    if (result.latexPath) {
+      console.log(`LaTeX table written -> ${result.latexPath}`);
     }
   }
 }
