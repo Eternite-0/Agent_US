@@ -568,6 +568,38 @@ export function buildUnifiedActivityTimeline(input: UnifiedTimelineInput): Unifi
       continue;
     }
 
+    if (ev.type === 'turn/steer_injected') {
+      const step = typeof payload.step === 'number' ? ` · 第 ${payload.step} 步` : '';
+      const texts = Array.isArray(payload.texts) ? payload.texts.map(String).filter(Boolean).join(' / ') : '';
+      items.push({
+        kind: 'commentary',
+        id: `steer-${seq || idx}`,
+        seq,
+        timestamp,
+        order: nextOrder(),
+        role: '实时引导',
+        text: `已实时注入插话引导${step}${texts ? `：${texts}` : ''}`,
+      });
+      continue;
+    }
+
+    if (ev.type === 'turn/route_failover') {
+      const code = payload.statusCode ? ` (${payload.statusCode})` : '';
+      const arrow = payload.fromAccountId || payload.toAccountId
+        ? ` ${payload.fromAccountId || '?'} → ${payload.toAccountId || '?'}`
+        : '';
+      items.push({
+        kind: 'commentary',
+        id: `failover-${seq || idx}`,
+        seq,
+        timestamp,
+        order: nextOrder(),
+        role: '路由切换',
+        text: `路由容灾切换${code}${arrow}${payload.reason ? ` · ${payload.reason}` : ''}`,
+      });
+      continue;
+    }
+
     // Plan-level / node queue / acceptance events are already reflected in planSummary
     if (
       ev.type === 'session.created'

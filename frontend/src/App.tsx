@@ -16,6 +16,7 @@ import { ArchivedChats } from './components/ArchivedChats';
 import { ComposerDialog } from './components/ComposerDialog';
 import { CreateProjectModal } from './components/CreateProjectModal';
 import { EvaluationView } from './components/EvaluationView';
+import { ExternalImportModal } from './components/ExternalImportModal';
 import { McpStatusPanel } from './components/McpStatusPanel';
 import { HomeView } from './components/HomeView';
 import { DEFAULT_INSPECTOR_WIDTH, InspectorDrawer } from './components/InspectorDrawer';
@@ -29,7 +30,7 @@ import {
   hydrateScheduleItem,
 } from './utils/schedulePayload';
 import type { CommandAvailability, SlashCommand, SwarmSection } from './components/slashCommands';
-import { ThreadView } from './components/ThreadView';
+import { ThreadView, type RewindNoticeState } from './components/ThreadView';
 import { ToastHost } from './components/ToastHost';
 import { TopBar } from './components/TopBar';
 import type {
@@ -41,6 +42,7 @@ import type {
   ConnectionSettings,
   EffortLevel,
   EventEnvelope,
+  ExternalConfigDetectResult,
   InspectorTab,
   MemoryItem,
   ModelSpec,
@@ -50,11 +52,13 @@ import type {
   ProviderAccountInput,
   ProviderPresetCatalog,
   ProvidersHealth,
+  RewindScope,
   Task,
   SwarmCommandReceipt,
   ThemeMode,
   ToastItem,
   UsageItem,
+  WorkspaceCustomizations,
   WorkspaceEntryKind,
 } from './types/backend';
 import { isDirectTurnEnd, type DirectLiveStream, type DirectLiveToolOutput } from './utils/directMessages';
@@ -283,6 +287,15 @@ export const App: React.FC = () => {
   const [forkSource, setForkSource] = useState<string | null>(null);
   const [forkPending, setForkPending] = useState(false);
   const [feedbackDraft, setFeedbackDraft] = useState<string | null>(null);
+  const [rewindNotice, setRewindNotice] = useState<RewindNoticeState | null>(null);
+  const [rewindConfirmSessionId, setRewindConfirmSessionId] = useState<string | null>(null);
+  const [externalDetect, setExternalDetect] = useState<ExternalConfigDetectResult | null>(null);
+  const [importWizardOpen, setImportWizardOpen] = useState(false);
+  const [importWizardLoading, setImportWizardLoading] = useState(false);
+  const [importWizardBusy, setImportWizardBusy] = useState(false);
+  const [importWizardError, setImportWizardError] = useState('');
+  const [workspaceCustomizations, setWorkspaceCustomizations] = useState<WorkspaceCustomizations | null>(null);
+  const probedOnboardingScopeRef = useRef('');
   const sideProject = new URLSearchParams(window.location.search).get('side-project');
   const [homeDraft, setHomeDraft] = useState<{
     id: number;
@@ -458,6 +471,13 @@ export const App: React.FC = () => {
     setDeleteTarget(null);
     setDeletePending(false);
     setDeleteError('');
+    setRewindNotice(null);
+    setRewindConfirmSessionId(null);
+    setExternalDetect(null);
+    setImportWizardOpen(false);
+    setImportWizardError('');
+    setWorkspaceCustomizations(null);
+    probedOnboardingScopeRef.current = '';
   }, [refreshScope]);
 
   // Mark local task writes independently so a racing list snapshot cannot undo them or
@@ -565,6 +585,147 @@ export const App: React.FC = () => {
   useEffect(() => {
     void handleRefreshGitStatus();
   }, [handleRefreshGitStatus]);
+
+  const refreshCustomizations = useCallback(async () => {
+    if (currentRefreshScope.current !== refreshScope || !client.getWorkspaceCustomizations) return;
+    try {
+      const next = await client.getWorkspaceCustomizations({
+        sessionId: activeRootTaskId ?? undefined,
+      });
+      if (currentRefreshScope.current !== refreshScope) return;
+      setWorkspaceCustomizations(next);
+    } catch {
+      // Non-blocking: older/mocked servers may return 404
+    }
+  }, [client, refreshScope, activeRootTaskId]);
+
+  const openExternalImportWizard = useCallback(async (force = true) => {
+    setImportWizardOpen(true);
+    setImportWizardError('');
+    if (!client.detectExternalConfigs) {
+      setExternalDetect(null);
+      setImportWizardLoading(false);
+      setImportWizardError('当前数据源不支持扫描外部配置（请切换实时后端）');
+      return;
+    }
+    setImportWizardLoading(true);
+    try {
+      const detected = await client.detectExternalConfigs({
+        sessionId: gitSessionId,
+        force,
+      });
+      if (currentRefreshScope.current !== refreshScope) return;
+      setExternalDetect(detected);
+    } catch (err) {
+      if (currentRefreshScope.current === refreshScope) {
+        setImportWizardError(err instanceof Error ? err.message : '扫描外部配置失败');
+      }
+    } finally {
+      if (currentRefreshScope.current === refreshScope) {
+        setImportWizardLoading(false);
+      }
+    }
+  }, [client, gitSessionId, refreshScope]);
+
+  const handleImportExternal = useCallback(async (
+    itemIds: string[],
+    targetScope: 'auto' | 'user' | 'workspace',
+  ) => {
+    if (!client.importExternalConfigs) {
+      setImportWizardError('当前数据源暂不支持导入外部配置');
+      return;
+    }
+    setImportWizardBusy(true);
+    setImportWizardError('');
+    try {
+      const res = await client.importExternalConfigs({
+        sessionId: gitSessionId,
+        action: 'import',
+        itemIds,
+        targetScope,
+      });
+      if (currentRefreshScope.current !== refreshScope) return;
+      if (res.customizations) {
+        setWorkspaceCustomizations(res.customizations);
+      } else {
+        await refreshCustomizations();
+      }
+      setImportWizardOpen(false);
+      pushToast(
+        res.importedCount > 0
+          ? `已导入 ${res.importedCount} 项外部配置，动态命令与技能已就绪`
+          : '外部配置导入已完成',
+        'success',
+      );
+    } catch (err) {
+      if (currentRefreshScope.current === refreshScope) {
+        setImportWizardError(err instanceof Error ? err.message : '导入外部配置失败');
+      }
+    } finally {
+      if (currentRefreshScope.current === refreshScope) {
+        setImportWizardBusy(false);
+      }
+    }
+  }, [client, gitSessionId, refreshScope, refreshCustomizations, pushToast]);
+
+  const handleSkipExternal = useCallback(async () => {
+    if (!client.importExternalConfigs) {
+      setImportWizardOpen(false);
+      return;
+    }
+    setImportWizardBusy(true);
+    setImportWizardError('');
+    try {
+      await client.importExternalConfigs({
+        sessionId: gitSessionId,
+        action: 'skip',
+      });
+      if (currentRefreshScope.current !== refreshScope) return;
+      setImportWizardOpen(false);
+      pushToast('已跳过本次外部配置导入，稍后可通过 /import 或 设置 重新打开');
+    } catch (err) {
+      if (currentRefreshScope.current === refreshScope) {
+        setImportWizardError(err instanceof Error ? err.message : '操作失败');
+      }
+    } finally {
+      if (currentRefreshScope.current === refreshScope) {
+        setImportWizardBusy(false);
+      }
+    }
+  }, [client, gitSessionId, refreshScope, pushToast]);
+
+  useEffect(() => {
+    if (connection.mode === 'live' && backendHealthy === true) {
+      void refreshCustomizations();
+    } else if (connection.mode === 'demo') {
+      setWorkspaceCustomizations(null);
+    }
+  }, [connection.mode, backendHealthy, workspaceRoot, activeRootTaskId, refreshCustomizations]);
+
+  useEffect(() => {
+    if (connection.mode !== 'live' || backendHealthy !== true || !client.detectExternalConfigs) return;
+    const probeKey = `${refreshScope.id}:${workspaceRoot}`;
+    if (probedOnboardingScopeRef.current === probeKey) return;
+    probedOnboardingScopeRef.current = probeKey;
+    let cancelled = false;
+    void client.detectExternalConfigs({ sessionId: gitSessionId, force: false })
+      .then((detected) => {
+        if (cancelled || currentRefreshScope.current !== refreshScope) return;
+        setExternalDetect(detected);
+        if (detected.promptNeeded && detected.items.length > 0) {
+          setImportWizardOpen(true);
+        }
+      })
+      .catch(() => {
+        // Silently ignore 404/network errors on passive startup probe
+      });
+    return () => { cancelled = true; };
+  }, [connection.mode, backendHealthy, workspaceRoot, client, refreshScope, gitSessionId]);
+
+  const refreshCustomizationsRef = useRef(refreshCustomizations);
+  useLayoutEffect(() => { refreshCustomizationsRef.current = refreshCustomizations; }, [refreshCustomizations]);
+  const refreshGitStatusRef = useRef(handleRefreshGitStatus);
+  useLayoutEffect(() => { refreshGitStatusRef.current = handleRefreshGitStatus; }, [handleRefreshGitStatus]);
 
   const handleCheckoutGitBranch = useCallback(async (branch: string, create = false) => {
     if (!client.checkoutGitBranch) throw new Error('当前连接暂不支持切换 Git 分支');
@@ -975,6 +1136,10 @@ export const App: React.FC = () => {
           pushToast('检测到待人工核对的外部操作 (outcome_unknown)', 'warning');
         } else if (ev.type === 'session/recovered') {
           pushToast('已从检查点恢复中断会话', 'success');
+        } else if (ev.type === 'onboarding/imported') {
+          void refreshCustomizationsRef.current();
+        } else if (ev.type === 'session/rewound' || ev.type === 'file/reverted' || ev.type === 'session/rewind_redone') {
+          void refreshGitStatusRef.current();
         }
         setRecentEvents((prev) => appendRecentEvent(prev, ev));
         scheduler.event(ev);
@@ -1079,10 +1244,12 @@ export const App: React.FC = () => {
     }
     try {
       const currentRoot = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
-      if (currentRoot?.status === 'running' && client.steerSession && !isSwarmCommand(text) && !text.startsWith('/plan ') && Object.keys(files).length === 0) {
-        const steered = await client.steerSession(activeRootTaskId, text);
+      if (currentRoot?.status === 'running' && client.steerSession && !isSwarmCommand(text) && !text.startsWith('/plan ')) {
+        const steered = await client.steerSession(activeRootTaskId, text, {
+          ...(Object.keys(files).length ? { files } : {}),
+        });
         if (steered.steered) {
-          pushToast('已实时注入纠偏指令，Agent 将在下一步生效', 'success');
+          pushToast('已实时注入插话引导，Agent 将在下一步生效', 'success');
           return true;
         }
       }
@@ -1144,6 +1311,26 @@ export const App: React.FC = () => {
       return true;
     } catch (e) {
       pushToast(`发送追问失败：${e instanceof Error ? e.message : '未知错误'}`, 'danger');
+      return false;
+    }
+  };
+
+  const handleSteerSession = async (text: string, files: Record<string, string>): Promise<boolean> => {
+    if (!activeRootTaskId) return false;
+    if (!client.steerSession) {
+      return handleSubmitFollowup(text, files);
+    }
+    try {
+      const steered = await client.steerSession(activeRootTaskId, text, {
+        ...(Object.keys(files).length ? { files } : {}),
+      });
+      if (steered.steered) {
+        pushToast('已实时注入插话引导，Agent 将在下一步生效', 'success');
+        return true;
+      }
+      return handleSubmitFollowup(text, files);
+    } catch (e) {
+      pushToast(`插话引导失败：${e instanceof Error ? e.message : '未知错误'}`, 'danger');
       return false;
     }
   };
@@ -1211,29 +1398,109 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleRedoRewind = useCallback(
+    async (sessionId: string, redoId?: string) => {
+      if (!client.redoSessionRewind) {
+        pushToast('当前数据源暂不支持重做撤销', 'warning');
+        return;
+      }
+      try {
+        const res = await client.redoSessionRewind(sessionId, redoId ? { redoId } : undefined);
+        if (currentRefreshScope.current !== refreshScope) return;
+        setRewindNotice(null);
+        await refreshWorkspace(false);
+        await refreshActiveBundles([sessionId]);
+        void handleRefreshGitStatus();
+        const total = res.restoredFiles.length + (res.deletedFiles?.length ?? 0);
+        pushToast(total > 0 ? `已重做恢复 ${total} 个文件的变更` : '已重做恢复回退前的状态', 'success');
+      } catch (e) {
+        pushToast(`重做撤销失败：${e instanceof Error ? e.message : '未知错误'}`, 'warning');
+      }
+    },
+    [client, pushToast, refreshScope, refreshWorkspace, refreshActiveBundles, handleRefreshGitStatus],
+  );
+
   const handleRewindSession = useCallback(
-    async (sessionId: string, scope: 'code' | 'conversation' | 'both' = 'code', turnId?: string) => {
+    async (sessionId: string, scope: RewindScope = 'files', turnId?: string) => {
       if (!client.rewindSession) {
         pushToast('当前数据源暂不支持会话快照回退', 'warning');
         return;
       }
       try {
         const res = await client.rewindSession(sessionId, { scope, turnId });
+        if (currentRefreshScope.current !== refreshScope) return;
         await refreshWorkspace(false);
         await refreshActiveBundles([sessionId]);
-        pushToast(
-          res.restoredFiles.length
-            ? `已回退 ${res.restoredFiles.length} 个文件${res.removedMessages ? `并撤销 ${res.removedMessages} 条消息` : ''}`
+        void handleRefreshGitStatus();
+        const nextNotice: RewindNoticeState = {
+          sessionId,
+          scope,
+          restoredCount: res.restoredFiles.length,
+          deletedCount: res.deletedFiles?.length ?? 0,
+          removedMessages: res.removedMessages,
+          redoId: res.redoId ?? null,
+        };
+        setRewindNotice(res.redoId ? nextNotice : null);
+        const deletedCount = res.deletedFiles?.length ?? 0;
+        const msgSuffix = res.removedMessages ? `并回退 ${res.removedMessages} 条消息` : '';
+        const summary = res.restoredFiles.length
+          ? `已还原 ${res.restoredFiles.length} 个文件${msgSuffix}`
+          : deletedCount
+            ? `已清理 ${deletedCount} 个新增文件${msgSuffix}`
             : res.removedMessages
               ? `已回退会话（撤销 ${res.removedMessages} 条消息）`
-              : '未发现需要回退的文件变更',
+              : '未发现需要还原的文件变更';
+        pushToast(
+          summary,
           'success',
+          res.redoId && client.redoSessionRewind
+            ? {
+                label: '重做撤销 (Redo)',
+                onClick: () => void handleRedoRewind(sessionId, res.redoId ?? undefined),
+              }
+            : undefined,
         );
       } catch (e) {
         pushToast(`回退失败：${e instanceof Error ? e.message : '暂无可用快照'}`, 'warning');
       }
     },
-    [client, pushToast, refreshWorkspace, refreshActiveBundles],
+    [client, pushToast, refreshScope, refreshWorkspace, refreshActiveBundles, handleRefreshGitStatus, handleRedoRewind],
+  );
+
+  const handleRewindFile = useCallback(
+    async (path: string, turnId?: string) => {
+      const targetSessionId = inspectorTaskId ?? activeRootTaskId;
+      if (!targetSessionId || !client.rewindSessionFile) {
+        pushToast('当前数据源暂不支持单文件还原', 'warning');
+        return;
+      }
+      const res = await client.rewindSessionFile(targetSessionId, { path, turnId });
+      if (currentRefreshScope.current !== refreshScope) return;
+      await refreshWorkspace(false);
+      await refreshActiveBundles([targetSessionId]);
+      void handleRefreshGitStatus();
+      if (res.redoId) {
+        setRewindNotice({
+          sessionId: targetSessionId,
+          scope: 'files',
+          restoredCount: res.action === 'deleted' ? 0 : 1,
+          deletedCount: res.action === 'deleted' ? 1 : 0,
+          removedMessages: 0,
+          redoId: res.redoId,
+        });
+      }
+      pushToast(
+        res.action === 'deleted' ? `已清理新增文件 ${res.path}` : `已还原文件 ${res.path}`,
+        'success',
+        res.redoId && client.redoSessionRewind
+          ? {
+              label: '重做撤销 (Redo)',
+              onClick: () => void handleRedoRewind(targetSessionId, res.redoId ?? undefined),
+            }
+          : undefined,
+      );
+    },
+    [inspectorTaskId, activeRootTaskId, client, pushToast, refreshScope, refreshWorkspace, refreshActiveBundles, handleRefreshGitStatus, handleRedoRewind],
   );
 
   const handleCompactSession = useCallback(
@@ -1515,9 +1782,10 @@ export const App: React.FC = () => {
         if (activeRootTaskId) void handleCompactSession(activeRootTaskId);
         break;
       case '/rewind':
-        if (activeRootTaskId && window.confirm('回退上一轮的对话和工作区文件变更？')) {
-          void handleRewindSession(activeRootTaskId, 'both');
-        }
+        if (activeRootTaskId) setRewindConfirmSessionId(activeRootTaskId);
+        break;
+      case '/import':
+        void openExternalImportWizard(true);
         break;
       case '/pin':
         if (activeRootTaskId) handleTogglePin(activeRootTaskId);
@@ -1663,10 +1931,24 @@ export const App: React.FC = () => {
     [plugins, installedPluginIds, resolvedTheme],
   );
 
-  const mentionSkills = useMemo(
-    () => skills.filter((s) => s.installed).map(({ id, name, description }) => ({ id, name, description })),
-    [skills],
-  );
+  const mentionSkills = useMemo(() => {
+    const base = skills
+      .filter((s) => s.installed)
+      .map(({ id, name, description }) => ({ id, name, description }));
+    const seen = new Set(base.map((item) => item.name.toLowerCase()));
+    for (const entry of workspaceCustomizations?.skills ?? []) {
+      if (entry.disabled || entry.enabled === false) continue;
+      const key = entry.name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      base.push({
+        id: entry.id || `custom:${entry.name}`,
+        name: entry.name,
+        description: entry.description || entry.summary || entry.displayPath || '已导入技能',
+      });
+    }
+    return base;
+  }, [skills, workspaceCustomizations]);
 
   const selectedProject = workedOutsideProject
     ? null
@@ -1860,6 +2142,7 @@ export const App: React.FC = () => {
                 onStartReview={client.startGitReview ? handleStartReview : undefined}
                 onSlashCommand={handleSlashCommand}
                 commandAvailability={commandAvailability}
+                customizations={workspaceCustomizations}
                 searchMentionFiles={searchMentionFiles}
                 onSubmitGoal={handleSubmitGoal}
                 onSubmitTask={handleSubmitNewTask}
@@ -1918,6 +2201,9 @@ export const App: React.FC = () => {
                 liveToolOutputs={liveToolOutputs}
                 recentRuntimeEvents={recentEvents}
                 onRewindSession={handleRewindSession}
+                onRedoRewind={handleRedoRewind}
+                rewindNotice={rewindNotice}
+                onDismissRewindNotice={() => setRewindNotice(null)}
                 onCompactSession={handleCompactSession}
                 codexMode={codexMode}
                 projects={projects}
@@ -1949,8 +2235,10 @@ export const App: React.FC = () => {
                 onStartReview={client.startGitReview ? handleStartReview : undefined}
                 onSlashCommand={handleSlashCommand}
                 commandAvailability={commandAvailability}
+                customizations={workspaceCustomizations}
                 searchMentionFiles={searchMentionFiles}
                 onSubmitGoal={handleSubmitGoal}
+                onSteerSession={handleSteerSession}
                 onSubmitFollowup={handleSubmitFollowup}
                 onControlTask={handleControlTask}
                 archiving={activeRootTaskId !== null && archiveBusy.has(activeRootTaskId)}
@@ -2372,6 +2660,8 @@ export const App: React.FC = () => {
                 onOpenTask={(taskId) => navigate({ kind: 'thread', taskId })}
                 onSearchMemory={handleSearchMemory}
                 onDeleteMemory={handleDeleteMemory}
+                customizations={workspaceCustomizations}
+                onOpenExternalImport={() => void openExternalImportWizard(true)}
               />
             )}
           </div>
@@ -2399,6 +2689,8 @@ export const App: React.FC = () => {
             onSelectFile={setInspectorFile}
             onSelectSubagent={setInspectorSubagentId}
             onFetchVersion={handleFetchVersion}
+            onRewindFile={client.rewindSessionFile ? handleRewindFile : undefined}
+            onRefreshGitStatus={handleRefreshGitStatus}
             onClose={() => setInspectorOpen(false)}
             onToast={(msg) => pushToast(msg)}
           />
@@ -2475,6 +2767,48 @@ export const App: React.FC = () => {
             onClick={exportFeedback}>导出反馈</button>
         </div>
       </ComposerDialog>
+      <ExternalImportModal
+        open={importWizardOpen}
+        loading={importWizardLoading}
+        busy={importWizardBusy}
+        result={externalDetect}
+        error={importWizardError}
+        onClose={() => { if (!importWizardBusy) setImportWizardOpen(false); }}
+        onRefresh={() => void openExternalImportWizard(true)}
+        onImport={handleImportExternal}
+        onSkip={handleSkipExternal}
+      />
+
+      <ComposerDialog
+        open={rewindConfirmSessionId !== null}
+        title="回退上一轮变更"
+        onClose={() => setRewindConfirmSessionId(null)}
+      >
+        <p className="composer-dialog-note">选择要还原的范围。还原后可随时点击“重做撤销 (Redo)”恢复。</p>
+        <button
+          type="button"
+          className="composer-dialog-option"
+          onClick={() => {
+            const target = rewindConfirmSessionId;
+            setRewindConfirmSessionId(null);
+            if (target) void handleRewindSession(target, 'files');
+          }}
+        >
+          仅还原文件（保留对话消息）
+        </button>
+        <button
+          type="button"
+          className="composer-dialog-option"
+          onClick={() => {
+            const target = rewindConfirmSessionId;
+            setRewindConfirmSessionId(null);
+            if (target) void handleRewindSession(target, 'both');
+          }}
+        >
+          文件 + 对话回退（同时撤销上一轮消息）
+        </button>
+      </ComposerDialog>
+
       <ToastHost toasts={toasts} />
     </div>
     </PromptCacheProvider>

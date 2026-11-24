@@ -10,10 +10,18 @@ import type {
   ModelSpec,
   PermissionMode,
   SessionPermissionMode,
+  WorkspaceCustomizations,
   WorkspaceEntryKind,
   Project,
 } from '../types/backend';
-import { commandGroups, findSlashCommand, matchesSlashCommand, type CommandAvailability, type MentionExtension, type SlashCommand } from './slashCommands';
+import {
+  findSlashCommand,
+  matchesSlashCommand,
+  mergeSlashCommandGroups,
+  type CommandAvailability,
+  type MentionExtension,
+  type SlashCommand,
+} from './slashCommands';
 import { usePresence, usePresenceSnapshot } from '../hooks/usePresence';
 import { ComposerDialog, SketchDialog } from './ComposerDialog';
 import { PresenceDiv } from './PresenceDiv';
@@ -77,8 +85,10 @@ interface ComposerProps {
   onStartReview?: (baseBranch?: string) => Promise<void>;
   onSlashCommand?: (command: SlashCommand) => void;
   commandAvailability?: CommandAvailability;
+  customizations?: WorkspaceCustomizations | null;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal?: (goal: string, files: Record<string, string>) => Promise<boolean>;
+  onSteer?: (text: string, files: Record<string, string>) => Promise<boolean | void> | void;
   onSubmit: (text: string, files: Record<string, string>) => Promise<boolean | void> | void;
   onStop?: () => void;
 }
@@ -171,8 +181,10 @@ export const Composer: React.FC<ComposerProps> = ({
   onStartReview,
   onSlashCommand,
   commandAvailability,
+  customizations = null,
   searchMentionFiles,
   onSubmitGoal,
+  onSteer,
   onSubmit,
   onStop,
 }) => {
@@ -258,15 +270,21 @@ ${draftInjection.text}`
     };
   }, []);
 
-  const slashQuery = !menuDismissed && !addContextOpen && onSlashCommand && /^\/[\p{L}\p{N}_?-]*$/u.test(text.trimStart())
+  const allCommandGroups = useMemo(() => mergeSlashCommandGroups(customizations), [customizations]);
+  const dynamicCommands = useMemo(
+    () => allCommandGroups.find((g) => g.label === '项目命令与技能')?.commands ?? [],
+    [allCommandGroups],
+  );
+  const slashQuery = !menuDismissed && !addContextOpen && onSlashCommand && /^\/[\p{L}\p{N}_?:-]*$/u.test(text.trimStart())
     ? text.trimStart().toLowerCase() : null;
-  const slashGroups = useMemo(() => slashQuery === null ? [] : commandGroups.map(({ label, commands }) => ({
+  const slashGroups = useMemo(() => slashQuery === null ? [] : allCommandGroups.map(({ label, commands }) => ({
     label, commands: commands.filter((command) => matchesSlashCommand(command, slashQuery)),
-  })).filter(({ commands }) => commands.length), [slashQuery]);
+  })).filter(({ commands }) => commands.length), [slashQuery, allCommandGroups]);
   const slashMatches = slashGroups.flatMap(({ commands }) => commands);
-  const exactSlash = slashQuery ? findSlashCommand(slashQuery) : undefined;
+  const exactSlash = slashQuery ? findSlashCommand(slashQuery, dynamicCommands) : undefined;
   const firstMatch = exactSlash ? slashMatches.indexOf(exactSlash) : 0;
-  const commandBlock = ({ cmd, threadOnly }: SlashCommand) => {
+  const commandBlock = ({ cmd, threadOnly, customCommand }: SlashCommand) => {
+    if (customCommand) return undefined;
     if (threadOnly && variant !== 'thread') return '请先打开一个会话';
     if (permissionMode === 'read-only' && ['/swarm', '/goal', '/plan'].includes(cmd)) return '请在普通会话中启动执行任务';
     if (cmd === '/goal' && !onSubmitGoal) return '当前连接未提供自主任务';
@@ -488,7 +506,35 @@ ${draftInjection.text}`
     placeCaret(caret);
   };
 
-  const executeSlash = (command: SlashCommand) => {
+  const clearDraft = () => {
+    if (!draftStore.clearIfUnchanged(snapshot)) return;
+    setCaret(0);
+    setMenuDismissed(true);
+  };
+
+  const submitPromptText = async (body: string, attached: Record<string, string>) => {
+    if (submitting || permissionPending || draftStore.isSending()) return false;
+    if (draftStore.hasPendingFileReads()) {
+      setCommandError('请等待附件读取完成。');
+      return false;
+    }
+    setCommandError('');
+    draftStore.setSending(true);
+    try {
+      const ok = isRunning && onSteer && !isSwarmCommand(body) && activeMode !== 'plan'
+        ? await onSteer(body, attached)
+        : await onSubmit(body, attached);
+      if (ok !== false) {
+        clearDraft();
+        return true;
+      }
+      return false;
+    } finally {
+      draftStore.setSending(false);
+    }
+  };
+
+  const executeSlash = (command: SlashCommand, opts?: { fillOnly?: boolean }) => {
     const blocked = commandBlock(command);
     if (blocked) {
       setCommandError(blocked);
@@ -497,6 +543,18 @@ ${draftInjection.text}`
     setCommandError('');
     setAddContextOpen(false);
     const { cmd } = command;
+    if (command.customCommand) {
+      const prompt = command.submitText ?? cmd;
+      if (opts?.fillOnly) {
+        setMenuDismissed(true);
+        setText(`${prompt} `);
+        placeCaret(prompt.length + 1);
+      } else {
+        setMenuDismissed(true);
+        void submitPromptText(prompt, { ...files });
+      }
+      return;
+    }
     if (cmd === '/swarm' || cmd === '/goal' || cmd === '/plan') {
       setMode(cmd.slice(1) as ComposerMode);
       return;
@@ -593,12 +651,6 @@ ${draftInjection.text}`
     }
   };
 
-  const clearDraft = () => {
-    if (!draftStore.clearIfUnchanged(snapshot)) return;
-    setCaret(0);
-    setMenuDismissed(true);
-  };
-
   const handleSend = async () => {
     if (submitting || permissionPending || draftStore.isSending()) return;
     const draft = resolveComposerDraft(text, activeMode);
@@ -612,8 +664,8 @@ ${draftInjection.text}`
       return;
     }
     const [word] = text.trim().split(/\s/, 1);
-    const command = onSlashCommand ? findSlashCommand(word) : undefined;
-    if (command && !['/plan', '/swarm', '/goal'].includes(command.cmd)) {
+    const command = onSlashCommand ? findSlashCommand(word, dynamicCommands) : undefined;
+    if (command && !command.customCommand && !['/plan', '/swarm', '/goal'].includes(command.cmd)) {
       if (text.trim().length === word.length) executeSlash(command);
       else setCommandError(`${command.cmd} 无需参数，请仅输入命令。`);
       return;
@@ -628,16 +680,16 @@ ${draftInjection.text}`
     }
     setCommandError('');
     const attached = { ...files };
-    draftStore.setSending(true);
-    try {
-      if (draft.kind === 'goal') {
+    if (draft.kind === 'goal') {
+      draftStore.setSending(true);
+      try {
         if (await onSubmitGoal?.(draft.body, attached)) clearDraft();
-      } else if (await onSubmit(draft.body, attached) !== false) {
-        clearDraft();
+      } finally {
+        draftStore.setSending(false);
       }
-    } finally {
-      draftStore.setSending(false);
+      return;
     }
+    await submitPromptText(draft.body, attached);
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -658,7 +710,7 @@ ${draftInjection.text}`
     if (menuCount && !event.shiftKey && (event.key === 'Enter' || event.key === 'Tab')) {
       event.preventDefault();
       if (slashMatches.length) {
-        executeSlash(slashMatches[selectedIndex]);
+        executeSlash(slashMatches[selectedIndex], { fillOnly: event.key === 'Tab' });
       } else insertMention(mentionItems[selectedIndex]);
       return;
     }
@@ -954,21 +1006,38 @@ ${draftInjection.text}`
                 </div>
               </form>
             ) : (
-              <button
-                type="button"
-                className="codex-popover-item"
-                disabled={branchBusy}
-                onClick={() => {
-                  setCreatingBranch(true);
-                  setBranchError('');
-                  setNewBranchName(branchSearch.trim());
-                }}
-              >
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                  <IconPlus size={14} />
-                  <span>创建并检出新分支...</span>
-                </span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="codex-popover-item"
+                  disabled={branchBusy}
+                  onClick={() => {
+                    setCreatingBranch(true);
+                    setBranchError('');
+                    setNewBranchName(branchSearch.trim());
+                  }}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    <IconPlus size={14} />
+                    <span>创建并检出新分支...</span>
+                  </span>
+                </button>
+                {onSlashCommand && findSlashCommand('/commit') && (
+                  <button
+                    type="button"
+                    className="codex-popover-item"
+                    onClick={() => {
+                      setPopover(null);
+                      onSlashCommand(findSlashCommand('/commit')!);
+                    }}
+                  >
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                      <IconBranch size={14} />
+                      <span>Git 暂存与提交...</span>
+                    </span>
+                  </button>
+                )}
+              </>
             )}
           </div>
         </PresenceDiv>
@@ -1248,7 +1317,14 @@ ${draftInjection.text}`
             className="codex-composer-textarea"
             rows={1}
             aria-label="消息内容"
-            placeholder={modeControl?.placeholder ?? (variant === 'home' ? '随心输入' : '输入消息')}
+            placeholder={
+              modeControl?.placeholder ??
+              (isRunning && variant === 'thread'
+                ? '运行中：输入插话可实时引导，Enter 发送…'
+                : variant === 'home'
+                  ? '随心输入'
+                  : '输入消息')
+            }
             value={text}
             aria-controls={menuIsOpen ? menuId : undefined}
             aria-activedescendant={menuIsOpen && menuCount ? `${menuId}-${selectedIndex}` : undefined}
@@ -1566,12 +1642,40 @@ ${draftInjection.text}`
               </PresenceDiv>
             </div>
 
-            {isRunning && onStop && !text.trim() && !activeMode ? (
+            {isRunning && variant === 'thread' ? (
+              <div className="codex-composer-running-actions">
+                <button
+                  type="button"
+                  className="codex-toolbar-btn codex-steer-btn"
+                  data-variant="primary"
+                  aria-label={activeMode ? sendLabel : '插话引导'}
+                  title={activeMode ? sendLabel : '实时注入插话引导 (Enter)'}
+                  disabled={!text.trim() || submitting || permissionPending}
+                  onClick={() => void handleSend()}
+                >
+                  <IconArrowUp size={13} aria-hidden="true" />
+                  <span>{activeMode ? '发送' : '插话引导'}</span>
+                </button>
+                {onStop && (
+                  <button
+                    type="button"
+                    className="codex-toolbar-btn codex-stop-btn"
+                    data-variant="outline"
+                    aria-label="停止"
+                    title="停止当前任务"
+                    onClick={onStop}
+                  >
+                    <IconStopSquare size={11} aria-hidden="true" />
+                    <span>停止</span>
+                  </button>
+                )}
+              </div>
+            ) : isRunning && onStop && !text.trim() && !activeMode ? (
               <button
                 type="button"
                 className="codex-send-btn"
-                aria-label="暂停任务"
-                title="暂停当前任务"
+                aria-label="停止"
+                title="停止当前任务"
                 onClick={onStop}
               >
                 <IconStopSquare size={12} />

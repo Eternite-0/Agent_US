@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { AciBudgetWatermarks, Approval, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
+import type { AciBudgetWatermarks, Approval, GitChangesResponse, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
 import {
   aggregateFileChanges,
   buildDiffPresentation,
@@ -43,11 +43,13 @@ import {
   IconPlus,
   IconRightPanelToggle,
   IconSearch,
+  IconUndo,
 } from './Icons';
 import { ImageLightbox, isImagePath, toImageDataUrl, type PreviewImageItem } from './ImageLightbox';
 import { Markdown } from './Markdown';
 import type { AgentBackendClient } from '../api/client';
 import { AutonomousRunPanel } from './AutonomousRunPanel';
+import { GitWorkbench } from './GitWorkbench';
 import type { SwarmSection } from './slashCommands';
 import { DiffLineSign, DiffLineText } from './FileChangeCard';
 import { CopyFeedbackIcon } from './CopyFeedbackIcon';
@@ -82,6 +84,9 @@ interface InspectorDrawerProps {
   onSelectFile: (path: string) => void;
   onSelectSubagent: (workerId: string | null) => void;
   onFetchVersion?: (taskId: string, version: number) => Promise<Task | null>;
+  onRewindFile?: (path: string, turnId?: string) => Promise<void>;
+  onRefreshGitStatus?: () => Promise<void>;
+  initialGitChanges?: GitChangesResponse | null;
   onClose: () => void;
   onToast: (msg: string) => void;
 }
@@ -90,6 +95,7 @@ type OpenPaneTab =
   | { id: 'subagents'; kind: 'subagents'; label: string }
   | { id: 'events'; kind: 'events'; label: string }
   | { id: 'autonomous'; kind: 'autonomous'; label: string }
+  | { id: 'git'; kind: 'git'; label: string }
   | { id: `file:${string}`; kind: 'file'; path: string; label: string };
 
 interface TreeDirNode {
@@ -196,15 +202,20 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   onSelectFile,
   onSelectSubagent,
   onFetchVersion,
+  onRewindFile,
+  onRefreshGitStatus,
+  initialGitChanges = null,
   onClose,
   onToast,
 }) => {
   const [resizing, setResizing] = useState(false);
+  const [revertingFile, setRevertingFile] = useState(false);
   const resizeDrag = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const initialTargetTab = (): OpenPaneTab | null => {
     if (!open || tab === 'subagents') return null;
     if (tab === 'autonomous') return { id: 'autonomous', kind: 'autonomous', label: '自主任务' };
     if (tab === 'events') return { id: 'events', kind: 'events', label: '事件与版本' };
+    if (tab === 'git') return { id: 'git', kind: 'git', label: 'Git 提交' };
     const p = selectedFile || '__all__';
     const label = p === '__all__' ? '变更' : p.replace(/\\/g, '/').split('/').pop() || p;
     return { id: `file:${p}`, kind: 'file', path: p, label };
@@ -336,6 +347,8 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
       ensureTab({ id: 'autonomous', kind: 'autonomous', label: '自主任务' });
     } else if (tab === 'events') {
       ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
+    } else if (tab === 'git') {
+      ensureTab({ id: 'git', kind: 'git', label: 'Git 提交' });
     } else if (tab === 'diff' || tab === 'artifacts') {
       const requested = selectedFile
         ? resolveMatchingFilePath(selectedFile, diffs.map((d) => d.path)) ??
@@ -619,6 +632,33 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     onResize(clampInspectorWidth(next));
   };
 
+  const latestTurnId = useMemo(() => {
+    if (bundle?.task?.code) return bundle.task.code;
+    const ev = bundle?.events?.findLast((e) => typeof e.payload?.turnId === 'string');
+    return typeof ev?.payload?.turnId === 'string' ? ev.payload.turnId : undefined;
+  }, [bundle?.task?.code, bundle?.events]);
+
+  const handleRevertActiveFile = async () => {
+    if (!activeFileDiff || !sessionId || revertingFile) return;
+    setRevertingFile(true);
+    try {
+      if (onRewindFile) {
+        await onRewindFile(activeFileDiff.path, latestTurnId);
+      } else if (client.rewindSessionFile) {
+        const res = await client.rewindSessionFile(sessionId, {
+          path: activeFileDiff.path,
+          turnId: latestTurnId,
+        });
+        await onRefreshGitStatus?.();
+        onToast(`已还原文件 ${res.path || activeFileDiff.path}`);
+      }
+    } catch (err) {
+      onToast(`还原失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setRevertingFile(false);
+    }
+  };
+
   const selectTab = (next: OpenPaneTab) => {
     setActiveTabId(next.id);
     if (next.kind === 'file') {
@@ -862,6 +902,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                       }}>
                       {t.kind === 'subagents' ? <IconAgentTeam size={13} />
                         : t.kind === 'autonomous' ? <IconDagNodes size={13} />
+                        : t.kind === 'git' ? <IconBranch size={13} />
                         : t.kind === 'events' ? <IconHistory size={13} /> : <IconFileDoc size={13} />}
                       <span className="codex-split-tab-label">{t.label}</span>
                     </button>
@@ -927,6 +968,17 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   className="codex-popover-item"
                   onClick={() => {
                     closePlusMenu();
+                    onChangeTab('git');
+                    ensureTab({ id: 'git', kind: 'git', label: 'Git 提交' });
+                  }}
+                >
+                  <span><IconBranch size={14} /> Git 暂存与提交</span>
+                </button>
+                <button
+                  type="button"
+                  className="codex-popover-item"
+                  onClick={() => {
+                    closePlusMenu();
                     onChangeTab('events');
                     ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
                   }}
@@ -963,6 +1015,16 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
         {/* Empty state if no active task */}
         {activePaneTab?.kind === 'autonomous' ? (
           open && <AutonomousRunPanel key={sessionId ?? 'no-session'} client={client} sessionId={sessionId} preferredRunId={preferredRunId} receipt={swarmReceipt} eventSeq={swarmEventSeq} approvals={swarmApprovals} sectionRequest={swarmSectionRequest} />
+        ) : activePaneTab?.kind === 'git' ? (
+          <GitWorkbench
+            client={client}
+            sessionId={sessionId}
+            open={open}
+            initialChanges={initialGitChanges}
+            onInspectFile={(path) => openFileInPane(path)}
+            onRefreshGitStatus={onRefreshGitStatus}
+            onToast={(msg) => onToast(msg)}
+          />
         ) : !bundle ? (
           <div
             style={{
@@ -1171,7 +1233,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   ))}
               </div>
 
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flex: 'none' }}>
+              <div className="codex-ide-actions">
                 {activeFileDiff && (
                   <>
                     {showChanges && (
@@ -1240,6 +1302,37 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                           <IconChevronDown size={12} />
                         </button>
                       </span>
+                    )}
+                    {(activeFileDiff.added > 0 || activeFileDiff.deleted > 0 || activeFileDiff.isNew || activeFileDiff.isDeleted || activeFileDiff.action) &&
+                      (onRewindFile || (sessionId && client.rewindSessionFile)) && (
+                      <button
+                        type="button"
+                        className="codex-toolbar-btn"
+                        data-variant="outline"
+                        style={{ height: 26, fontSize: 12 }}
+                        disabled={revertingFile || !sessionId}
+                        title="仅将此文件还原到改动前快照"
+                        onClick={() => void handleRevertActiveFile()}
+                      >
+                        <IconUndo size={12} aria-hidden="true" />
+                        <span>{revertingFile ? '还原中…' : '还原此文件'}</span>
+                      </button>
+                    )}
+                    {client.getGitChanges && (
+                      <button
+                        type="button"
+                        className="codex-toolbar-btn"
+                        data-variant="outline"
+                        style={{ height: 26, fontSize: 12 }}
+                        title="打开 Git 暂存与提交工作台"
+                        onClick={() => {
+                          onChangeTab('git');
+                          ensureTab({ id: 'git', kind: 'git', label: 'Git 提交' });
+                        }}
+                      >
+                        <IconBranch size={12} aria-hidden="true" />
+                        <span>Git 提交</span>
+                      </button>
                     )}
                     <button
                       type="button"

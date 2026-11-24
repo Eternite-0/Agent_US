@@ -6140,3 +6140,281 @@ button:focus-visible {
 }
 [data-reduced-motion='true'] .codex-icon-btn:active:not(:disabled) { scale: none; }
 [data-reduced-motion='true'] .codex-send-btn:active:not(:disabled) { transform: none; }
+
+/* Agent_US 3.0: Instant Rewind Choice & Redo Bar */
+.codex-rewind-choice-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface-secondary);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.codex-rewind-choice-label {
+  color: var(--text-secondary);
+  margin-right: 2px;
+}
+
+.codex-rewind-bar {
+  width: 100%;
+  max-width: var(--thread-content-max-width);
+  margin: 0 auto 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface-secondary);
+  color: var(--text-default);
+  font-size: 12.5px;
+  box-shadow: none;
+}
+
+.codex-rewind-bar-info {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text-secondary);
+}
+
+.codex-rewind-bar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+/* Live Mid-Turn Steering Actions next to Stop */
+.codex-composer-running-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.codex-steer-btn,
+.codex-stop-btn {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+/* Explicit External Config Onboarding Import Dialog */
+.codex-external-import-dialog {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.codex-external-import-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.codex-external-import-lead {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.codex-external-import-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.codex-external-import-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  box-shadow: none;
+}
+
+.codex-external-import-alert {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--color-danger) 30%, transparent);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  font-size: 12.5px;
+  box-shadow: none;
+}
+
+.codex-external-import-empty {
+  padding: 18px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-secondary);
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+  text-align: center;
+  box-shadow: none;
+}
+
+.codex-external-import-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.codex-external-import-scope {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.codex-external-import-scope select {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-default);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.codex-external-import-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 290px;
+  overflow-y: auto;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  box-shadow: none;
+}
+
+.codex-external-import-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.codex-external-import-item:last-child {
+  border-bottom: none;
+}
+
+.codex-external-import-item:hover {
+  background: var(--bg-ghost-hover-soft);
+}
+
+.codex-external-import-item input[type='checkbox'] {
+  margin-top: 3px;
+  flex: none;
+}
+
+.codex-external-import-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.codex-external-import-item-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.codex-external-import-badge,
+.codex-external-import-provider {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  box-shadow: none;
+}
+
+.codex-external-import-badge[data-kind='mcp'] {
+  color: var(--color-warning);
+  background: var(--color-warning-soft);
+}
+
+.codex-external-import-name {
+  font-size: 13px;
+  font-weight: var(--font-weight-strong);
+  color: var(--text-default);
+}
+
+.codex-external-import-size {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.codex-external-import-path {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-external-import-item-summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.codex-external-import-mcp-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: none;
+}
+
+.codex-external-import-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.codex-external-import-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
