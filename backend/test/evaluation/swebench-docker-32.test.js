@@ -12,6 +12,7 @@ import {
   ensureDockerImage,
   extractTestbedFromImage,
   isAuthorizedSweBenchCommand,
+  removeDockerImage,
   resolveSweBenchDockerImage,
   scrubAntiCheatGitRefs,
 } from '../../src/evaluation/swebench-docker.js';
@@ -111,6 +112,20 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
       }),
       'local/django__django/django__django-11099:dev',
     );
+    assert.equal(
+      resolveSweBenchDockerImage({
+        dockerPreset: 'official',
+        instance: { instance_id: 'PyData__Xarray-4094', repo: 'pydata/xarray' },
+      }),
+      'swebench/sweb.eval.x86_64.pydata__xarray-4094:latest',
+    );
+    assert.equal(
+      resolveSweBenchDockerImage({
+        dockerPreset: 'epoch',
+        instance: { instance_id: 'Scikit-Learn__Scikit-Learn-13142', repo: 'scikit-learn/scikit-learn' },
+      }),
+      'ghcr.io/epoch-research/swe-bench.eval.x86_64.scikit-learn__scikit-learn-13142:latest',
+    );
     assert.equal(resolveSweBenchDockerImage({ instance }), null);
 
     assert.throws(
@@ -159,17 +174,20 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
       ['docker', 'pull', 'repo/img:2'],
     ]);
 
-    // pull='always' skips inspect and always pulls
+    // pull='always' skips inspect and always pulls with >= 900_000ms timeout
     const callsAlways = [];
+    const pullTimeouts = [];
     const resAlways = await ensureDockerImage('repo/img:3', {
       pull: 'always',
-      execFileImpl: async (bin, args) => {
+      execFileImpl: async (bin, args, opts) => {
         callsAlways.push([bin, ...args]);
+        pullTimeouts.push(opts?.timeout);
         return { stdout: 'Pulled', stderr: '' };
       },
     });
     assert.equal(resAlways.pulled, true);
     assert.deepEqual(callsAlways, [['docker', 'pull', 'repo/img:3']]);
+    assert.ok(pullTimeouts[0] >= 900_000, `Expected pull timeout >= 900_000ms, got ${pullTimeouts[0]}`);
 
     // pull='never' fails clearly when absent and does NOT call docker pull
     const callsNever = [];
@@ -498,8 +516,6 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
       image: 'ghcr.io/epoch-research/swe-bench.eval.x86_64.django__django-11099:latest',
       workspaceRoot: ws,
       pull: 'missing',
-      memory: '4g',
-      cpus: '2',
       timeoutMs: 5000,
       execFileImpl: async (bin, args) => {
         execFileCalls.push([bin, ...args]);
@@ -566,7 +582,8 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
     assert.ok(runArgs.includes('-d'));
     assert.ok(runArgs.includes('--rm'));
     assert.ok(runArgs.includes('--network=none'));
-    assert.ok(runArgs.includes('--memory=4g'));
+    assert.ok(runArgs.includes('--memory=2g'));
+    assert.ok(runArgs.includes('--memory-swap=2.5g'));
     assert.ok(runArgs.includes('--cpus=2'));
     assert.ok(runArgs.includes(`${realpathSync(ws)}:/testbed:rw`) || runArgs.includes(`${ws}:/testbed:rw`));
     assert.ok(runArgs.includes(`PATH=${DEFAULT_TESTBED_PATH}`));
@@ -631,5 +648,41 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
     assert.equal(rmCalls.length, 1);
     assert.deepEqual(rmCalls[0], ['docker', 'rm', '-f', 'cid-live-007']);
     assert.equal(adapter.containerId, null);
+  });
+
+  test('removeDockerImage removes ancestor containers then deletes image and tolerates missing image', async () => {
+    const callsWithLeftover = [];
+    const resRemoved = await removeDockerImage('ghcr.io/epoch-research/swe-bench.eval.x86_64.django__django-11099:latest', {
+      execFileImpl: async (bin, args) => {
+        callsWithLeftover.push([bin, ...args]);
+        if (args[0] === 'ps') {
+          return { stdout: 'cid-stale-1\ncid-stale-2\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    });
+    assert.deepEqual(resRemoved, {
+      image: 'ghcr.io/epoch-research/swe-bench.eval.x86_64.django__django-11099:latest',
+      removed: true,
+    });
+    assert.deepEqual(callsWithLeftover, [
+      ['docker', 'ps', '-aq', '--filter', 'ancestor=ghcr.io/epoch-research/swe-bench.eval.x86_64.django__django-11099:latest'],
+      ['docker', 'rm', '-f', 'cid-stale-1', 'cid-stale-2'],
+      ['docker', 'rmi', '-f', 'ghcr.io/epoch-research/swe-bench.eval.x86_64.django__django-11099:latest'],
+    ]);
+
+    // Tolerate already-missing image cleanly
+    const resMissing = await removeDockerImage('swe/missing:latest', {
+      execFileImpl: async (_bin, args) => {
+        if (args[0] === 'ps') return { stdout: '', stderr: '' };
+        if (args[0] === 'rmi') {
+          const err = new Error('Command failed');
+          err.stderr = 'Error response from daemon: No such image: swe/missing:latest';
+          throw err;
+        }
+        return { stdout: '', stderr: '' };
+      },
+    });
+    assert.deepEqual(resMissing, { image: 'swe/missing:latest', removed: false });
   });
 });

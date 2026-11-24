@@ -433,7 +433,8 @@ export function resolveSweBenchDockerImage({ dockerImage = null, dockerPreset = 
   const pattern = explicit || presetPattern;
   if (!pattern) return null;
 
-  const instanceId = String(instance?.instance_id ?? instance?.id ?? '').trim();
+  const rawInstanceId = String(instance?.instance_id ?? instance?.id ?? '').trim();
+  const instanceId = rawInstanceId.toLowerCase();
   const repo = String(instance?.repo ?? '').trim();
   const repoSlug = repo.replace(/\//g, '__');
 
@@ -461,12 +462,13 @@ export async function ensureDockerImage(
   }
 
   const env = buildDockerClientEnv();
+  const effectivePullTimeoutMs = Math.max(900_000, Number(pullTimeoutMs ?? 900_000) || 900_000);
   if (pull === 'always') {
     try {
       await invokeExecFile(execFileImpl, dockerBin, ['pull', img], {
         env,
         windowsHide: true,
-        timeout: pullTimeoutMs,
+        timeout: effectivePullTimeoutMs,
         maxBuffer: 20 * 1024 * 1024,
       });
       return { image: img, pulled: true, present: true };
@@ -498,7 +500,7 @@ export async function ensureDockerImage(
       await invokeExecFile(execFileImpl, dockerBin, ['pull', img], {
         env,
         windowsHide: true,
-        timeout: pullTimeoutMs,
+        timeout: effectivePullTimeoutMs,
         maxBuffer: 20 * 1024 * 1024,
       });
       return { image: img, pulled: true, present: true };
@@ -507,6 +509,75 @@ export async function ensureDockerImage(
         `Docker image "${img}" was not found locally and docker pull failed: ${pullErr?.stderr?.trim() || pullErr?.message || pullErr}`,
       );
     }
+  }
+}
+
+/**
+ * Force-removes any leftover containers spawned from `image` and deletes the
+ * image itself via `docker rmi -f`, tolerating already-missing images cleanly.
+ */
+export async function removeDockerImage(
+  image,
+  { dockerBin = 'docker', execFileImpl = null } = {},
+) {
+  const img = validateNonEmptyFlagArg(image, 'Docker image');
+  const env = buildDockerClientEnv();
+
+  let cids = [];
+  try {
+    const psRes = await invokeExecFile(
+      execFileImpl,
+      dockerBin,
+      ['ps', '-aq', '--filter', `ancestor=${img}`],
+      {
+        env,
+        windowsHide: true,
+        timeout: 30_000,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    );
+    cids = String(psRes.stdout ?? '')
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch {
+    cids = [];
+  }
+
+  if (cids.length > 0) {
+    try {
+      await invokeExecFile(execFileImpl, dockerBin, ['rm', '-f', ...cids], {
+        env,
+        windowsHide: true,
+        timeout: 30_000,
+      });
+    } catch {
+      for (const cid of cids) {
+        await invokeExecFile(execFileImpl, dockerBin, ['rm', '-f', cid], {
+          env,
+          windowsHide: true,
+          timeout: 15_000,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  try {
+    await invokeExecFile(execFileImpl, dockerBin, ['rmi', '-f', img], {
+      env,
+      windowsHide: true,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return { image: img, removed: true };
+  } catch (err) {
+    const msg = `${err?.stderr ?? ''} ${err?.message ?? ''}`;
+    if (/no such image|not found|does not exist|no such object/i.test(msg)) {
+      return { image: img, removed: false };
+    }
+    throw new Error(
+      `Failed to remove Docker image "${img}": ${err?.stderr?.trim() || err?.message || err}`,
+    );
   }
 }
 
@@ -1308,7 +1379,8 @@ export class SweBenchDockerAdapter {
     workspaceRoot,
     pull = 'missing',
     network = 'none',
-    memory = '4g',
+    memory = '2g',
+    memorySwap = undefined,
     cpus = '2',
     timeoutMs = 120_000,
     dockerBin = 'docker',
@@ -1328,6 +1400,13 @@ export class SweBenchDockerAdapter {
     this.pull = pull;
     this.network = validateNonEmptyFlagArg(network, 'Docker network');
     this.memory = validateNonEmptyFlagArg(memory, 'Docker memory');
+    const resolvedMemorySwap =
+      memorySwap === undefined
+        ? (this.memory.toLowerCase() === '2g' ? '2.5g' : null)
+        : memorySwap === null || String(memorySwap).trim() === ''
+          ? null
+          : validateNonEmptyFlagArg(memorySwap, 'Docker memorySwap');
+    this.memorySwap = resolvedMemorySwap;
     this.cpus = validateNonEmptyFlagArg(cpus, 'Docker cpus');
     this.timeoutMs = Math.max(50, Number(timeoutMs ?? 120_000) || 120_000);
     this.dockerBin = String(dockerBin || 'docker').trim();
@@ -1418,6 +1497,7 @@ export class SweBenchDockerAdapter {
           '--rm',
           `--network=${this.network}`,
           `--memory=${this.memory}`,
+          ...(this.memorySwap ? [`--memory-swap=${this.memorySwap}`] : []),
           `--cpus=${this.cpus}`,
           '-v',
           `${hostMount}:/testbed:rw`,
