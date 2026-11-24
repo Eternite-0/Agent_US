@@ -110,7 +110,7 @@ export class InferenceError extends RuntimeError {
 }
 
 const TRANSIENT_MSG_RE =
-  /\b(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|rate[_ ]?limit|too many requests|429|502|503|504|overloaded|temporarily unavailable|socket hang up|fetch failed)\b/i;
+  /\b(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|EPIPE|ERR_STREAM_PREMATURE_CLOSE|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT|rate[_ ]?limit|too many requests|429|500|502|503|504|internal server error|bad gateway|service unavailable|gateway timeout|overloaded|temporarily unavailable|socket hang up|premature close|connection error|fetch failed)\b/i;
 
 export function classifyError(err) {
   if (!err) {
@@ -151,21 +151,29 @@ export function classifyError(err) {
     }
     return new RuntimeError(code, {
       status: err.status ?? 500,
-      retryable: err.status === 429 || err.status >= 502,
+      retryable:
+        err.status === 429 ||
+        (err.status >= 502 && err.status < 600) ||
+        (err.status === 500 && code !== 'ARTIFACT_HASH_MISMATCH'),
       message: err.detail?.message ?? err.message ?? code,
       detail: err.detail,
       cause: err,
     });
   }
 
-  const msg = String(err?.message ?? err);
-  const errCodeStr = String(err?.code ?? '');
-  const status = Number(err?.status ?? err?.statusCode ?? 0) || 500;
+  const msg = [String(err?.message ?? err), String(err?.cause?.message ?? '')]
+    .filter(Boolean)
+    .join(' | ');
+  const errCodeStr = String(err?.code ?? err?.cause?.code ?? '');
+  const explicitStatus = Number(
+    err?.status ?? err?.statusCode ?? err?.cause?.status ?? err?.cause?.statusCode ?? 0,
+  );
+  const status = explicitStatus || 500;
   const retryable =
-    status === 429 ||
-    status === 502 ||
-    status === 503 ||
-    status === 504 ||
+    explicitStatus === 429 ||
+    (explicitStatus >= 500 && explicitStatus < 600) ||
+    err?.name === 'APIConnectionError' ||
+    err?.name === 'APIConnectionTimeoutError' ||
     TRANSIENT_MSG_RE.test(msg) ||
     TRANSIENT_MSG_RE.test(errCodeStr);
   if (retryable) {

@@ -92,6 +92,173 @@ export class BackgroundProcessManager {
   }
 }
 
+const INTERACTIVE_PROMPT_LINE_RE =
+  /(?:\[y\/n\]|\(y\/n\)|password\s*:|passphrase|continue\?|overwrite)/i;
+const INTERACTIVE_PROMPT_TAIL_RE = /\?\s+(?:\r?\n)?$/;
+
+export function hasInteractivePromptTail(text) {
+  const raw = String(text ?? '');
+  if (!raw) return false;
+  const windowTail = raw.slice(-512);
+  const lines = windowTail.split(/\r?\n/);
+  let lastNonEmpty = '';
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim().length > 0) {
+      lastNonEmpty = lines[i];
+      break;
+    }
+  }
+  if (lastNonEmpty && INTERACTIVE_PROMPT_LINE_RE.test(lastNonEmpty)) {
+    return true;
+  }
+  return INTERACTIVE_PROMPT_TAIL_RE.test(windowTail);
+}
+
+export function resolveInteractiveTimeoutMs(args = {}) {
+  const raw =
+    args?.interactiveTimeoutMs ??
+    process.env.AGENT_US_SHELL_INTERACTIVE_TIMEOUT_MS ??
+    2500;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 2500;
+  return Math.min(120000, Math.max(50, Math.trunc(n)));
+}
+
+function createInteractiveHangError(tail, { stdout = '', stderr = '', interactiveTimeoutMs = 2500 } = {}) {
+  const snippet = String(tail ?? '').trim().slice(-200);
+  const err = new Error(
+    `INTERACTIVE_INPUT_REQUIRED: 检测到命令在提示「${snippet || 'interactive prompt'}」处静默等待输入超过 ${interactiveTimeoutMs}ms（非交互终端已禁闭 stdin，请改用 -y / --yes / --non-interactive 等非交互参数）`,
+  );
+  err.code = 'INTERACTIVE_INPUT_REQUIRED';
+  err.stdout = stdout;
+  err.stderr = stderr;
+  return err;
+}
+
+function runHostWithInteractiveGuard(
+  command,
+  cwd,
+  {
+    timeoutMs = 30000,
+    interactiveTimeoutMs = 2500,
+    signal = undefined,
+    allowEnvKeys = [],
+    maxCaptureBytes = 256 * 1024,
+    onOutput = null,
+  } = {},
+) {
+  return new Promise((resolveRun, rejectRun) => {
+    const isWin = process.platform === 'win32';
+    const bin = isWin ? 'powershell.exe' : 'sh';
+    const args = isWin
+      ? ['-NoProfile', '-NonInteractive', '-Command', command]
+      : ['-c', command];
+
+    const child = spawn(bin, args, {
+      cwd,
+      windowsHide: true,
+      detached: !isWin,
+      env: sanitizeChildEnv(process.env, { allowKeys: allowEnvKeys }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let recentTail = '';
+    let settled = false;
+    let interactiveTimer = null;
+
+    const clearInteractiveTimer = () => {
+      if (interactiveTimer) {
+        clearTimeout(interactiveTimer);
+        interactiveTimer = null;
+      }
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearInteractiveTimer();
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      killProcessTree(child);
+      resolveRun({
+        exitCode: 124,
+        stdout,
+        stderr: `${stderr}\n[timeout after ${timeoutMs}ms]`.trim(),
+        timedOut: true,
+      });
+    }, Math.min(Math.max(500, timeoutMs), 120000));
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      killProcessTree(child);
+      rejectRun(new Error('命令执行已取消'));
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    const scheduleInteractiveCheck = () => {
+      clearInteractiveTimer();
+      if (settled || !hasInteractivePromptTail(recentTail)) return;
+      interactiveTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        killProcessTree(child);
+        rejectRun(
+          createInteractiveHangError(recentTail, {
+            stdout,
+            stderr,
+            interactiveTimeoutMs,
+          }),
+        );
+      }, interactiveTimeoutMs);
+    };
+
+    const handleChunk = (stream, chunk) => {
+      const str = chunk.toString('utf8');
+      if (stream === 'stdout') {
+        if (stdout.length < maxCaptureBytes) stdout += str;
+      } else if (stderr.length < maxCaptureBytes) {
+        stderr += str;
+      }
+      recentTail = (recentTail + str).slice(-512);
+      onOutput?.({ stream, chunk: str });
+      scheduleInteractiveCheck();
+    };
+
+    child.stdout.on('data', (chunk) => handleChunk('stdout', chunk));
+    child.stderr.on('data', (chunk) => handleChunk('stderr', chunk));
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectRun(err);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveRun({
+        exitCode: code ?? 1,
+        stdout,
+        stderr,
+        timedOut: false,
+      });
+    });
+  });
+}
+
 export function createShellTools({
   workspaceRoot,
   bgProcs,
@@ -115,6 +282,7 @@ export function createShellTools({
         command: z.string().min(1).describe('要执行的 Shell 命令'),
         cwd: z.string().optional().describe('可选的相对子目录'),
         timeoutMs: z.number().int().min(500).max(120000).optional().describe('超时毫秒数（默认 30000，上限 120000）'),
+        interactiveTimeoutMs: z.number().int().min(50).max(120000).optional(),
       }),
       async execute(args, ctx) {
         const command = String(args.command ?? '').trim();
@@ -127,16 +295,93 @@ export function createShellTools({
           ? resolveConfinedPath(workspaceRoot, args.cwd).full
           : resolve(workspaceRoot);
         await guardFallback('bash', { command, cwd }, ctx);
-        const res = await sandbox.run(command, cwd, {
-          timeoutMs: Number(args.timeoutMs ?? 30000),
-          signal: ctx?.signal ?? signal,
-          onOutput: (chunk) =>
-            onToolOutput({
-              callId: ctx?.callId,
-              name: 'bash',
-              ...chunk,
-            }),
-        });
+
+        const timeoutMs = Number(args.timeoutMs ?? 30000);
+        const interactiveTimeoutMs = resolveInteractiveTimeoutMs(args);
+        const activeSignal = ctx?.signal ?? signal;
+        const emitChunk = (chunk) => {
+          const payload = {
+            callId: ctx?.callId,
+            name: 'bash',
+            ...chunk,
+          };
+          ctx?.onOutput?.(payload);
+          onToolOutput?.(payload);
+        };
+
+        const isDefaultHostSandbox =
+          sandbox instanceof HostSandboxAdapter &&
+          sandbox.run === HostSandboxAdapter.prototype.run;
+
+        let res;
+        if (isDefaultHostSandbox) {
+          try {
+            res = await runHostWithInteractiveGuard(command, cwd, {
+              timeoutMs,
+              interactiveTimeoutMs,
+              signal: activeSignal,
+              allowEnvKeys: sandbox.allowEnvKeys ?? [],
+              maxCaptureBytes: sandbox.maxCaptureBytes ?? 256 * 1024,
+              onOutput: emitChunk,
+            });
+          } catch (err) {
+            if (err?.code === 'INTERACTIVE_INPUT_REQUIRED') {
+              ctx?.reportOutcome?.({
+                exitCode: 124,
+                errorCode: 'INTERACTIVE_INPUT_REQUIRED',
+              });
+            }
+            throw err;
+          }
+        } else {
+          const promptAbortCtrl = new AbortController();
+          const combinedSignal = activeSignal
+            ? AbortSignal.any([activeSignal, promptAbortCtrl.signal])
+            : promptAbortCtrl.signal;
+          let recentTail = '';
+          let interactiveTimer = null;
+          let interactiveHangErr = null;
+          const clearPromptTimer = () => {
+            if (interactiveTimer) {
+              clearTimeout(interactiveTimer);
+              interactiveTimer = null;
+            }
+          };
+          try {
+            res = await sandbox.run(command, cwd, {
+              timeoutMs,
+              signal: combinedSignal,
+              onOutput: (chunk) => {
+                const str = String(chunk?.chunk ?? '');
+                recentTail = (recentTail + str).slice(-512);
+                emitChunk(chunk);
+                clearPromptTimer();
+                if (hasInteractivePromptTail(recentTail)) {
+                  interactiveTimer = setTimeout(() => {
+                    if (promptAbortCtrl.signal.aborted) return;
+                    interactiveHangErr = createInteractiveHangError(recentTail, {
+                      interactiveTimeoutMs,
+                    });
+                    promptAbortCtrl.abort(interactiveHangErr);
+                  }, interactiveTimeoutMs);
+                }
+              },
+            });
+            if (interactiveHangErr) throw interactiveHangErr;
+          } catch (err) {
+            if (interactiveHangErr || err?.code === 'INTERACTIVE_INPUT_REQUIRED') {
+              ctx?.reportOutcome?.({
+                exitCode: 124,
+                errorCode: 'INTERACTIVE_INPUT_REQUIRED',
+              });
+              throw interactiveHangErr ?? err;
+            }
+            throw err;
+          } finally {
+            clearPromptTimer();
+          }
+        }
+
         const exitCode = Number.isInteger(res.exitCode) ? res.exitCode : 1;
         ctx?.reportOutcome?.({
           exitCode,

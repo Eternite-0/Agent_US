@@ -1,5 +1,5 @@
 import { existsSync, readdirSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { extname, join, relative, resolve } from 'node:path';
 import { sha256Hex } from '../integrity.js';
 import { computeArgsDigest } from '../tools/dispatcher.js';
 import { compactTwoStage, estimateTokens, excerpt } from '../context.js';
@@ -46,6 +46,14 @@ const NON_ESSENTIAL_POST_TEST_TOOLS = new Set([
   'start_process',
   'run_diagnostics',
 ]);
+
+const STEER_IMAGE_MIME = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+};
 
 function safeParseToolArgsSimple(rawArgs) {
   if (!rawArgs) return {};
@@ -419,6 +427,7 @@ export class AgentLoop {
     node = null,
     execution = null,
     aci = null,
+    pool = null,
   }) {
     const sm = new TurnStateMachine({
       store: this.store,
@@ -1014,13 +1023,62 @@ export class AgentLoop {
         }
 
         // Drain mid-turn steering input and inter-agent mailbox messages at step boundary
-        const steers = drainSteering() ?? [];
-        for (const steerText of steers) {
-          messages.push({
-            role: 'user',
-            content: [{ type: 'text', text: `[用户实时纠偏指令]\n${steerText}` }],
-          });
-        }
+        const injectSteeringMessages = (steers) => {
+          const rawItems = Array.isArray(steers) ? steers.filter(Boolean) : [];
+          if (!rawItems.length) return 0;
+          const injectedTexts = [];
+          for (const item of rawItems) {
+            const isObj = item && typeof item === 'object' && !Array.isArray(item);
+            const baseText = isObj ? String(item.text ?? '').trim() : String(item ?? '').trim();
+            const files =
+              isObj && item.files && typeof item.files === 'object' && !Array.isArray(item.files)
+                ? item.files
+                : null;
+            if (!baseText && !files) continue;
+            const imageBlocks = [];
+            const textNotes = [];
+            if (files) {
+              for (const [fPath, b64] of Object.entries(files).slice(0, 10)) {
+                const mime = STEER_IMAGE_MIME[extname(fPath).toLowerCase()];
+                if (mime && typeof b64 === 'string') {
+                  imageBlocks.push({ type: 'image', mimeType: mime, data: b64 });
+                  textNotes.push(`[附带图像: ${fPath}]`);
+                } else {
+                  try {
+                    const decoded = Buffer.from(String(b64), 'base64').toString('utf8');
+                    textNotes.push(`[附带文件: ${fPath}]\n${decoded.slice(0, 8000)}`);
+                  } catch {
+                    textNotes.push(`[附带文件: ${fPath}]`);
+                  }
+                }
+              }
+            }
+            const bodyText = [baseText, ...textNotes].filter(Boolean).join('\n');
+            messages.push({
+              role: 'user',
+              content: [{ type: 'text', text: `[用户实时纠偏指令]\n${bodyText}` }, ...imageBlocks],
+            });
+            injectedTexts.push(baseText || textNotes.join('\n'));
+          }
+          if (injectedTexts.length > 0) {
+            this.eventRouter.emitPersisted({
+              sessionId,
+              turnId,
+              type: RUNTIME_EVENTS.TURN_STEER_INJECTED,
+              data: {
+                sessionId,
+                turnId,
+                step: steps,
+                count: injectedTexts.length,
+                texts: injectedTexts,
+              },
+              audit: false,
+            });
+          }
+          return injectedTexts.length;
+        };
+
+        injectSteeringMessages(drainSteering?.() ?? []);
         if (typeof drainMailbox === 'function') {
           const mailItems = (await drainMailbox()) ?? [];
           for (const mail of mailItems) {
@@ -1466,6 +1524,24 @@ export class AgentLoop {
         try {
           stepResult = await this.inferenceEngine.streamStep({
             ...requestOptions,
+            pool,
+            onRouteFailover: ({ attempt, statusCode, fromAccountId, toAccountId, reason }) => {
+              this.eventRouter.emitPersisted({
+                sessionId,
+                turnId,
+                type: RUNTIME_EVENTS.TURN_ROUTE_FAILOVER,
+                data: {
+                  sessionId,
+                  turnId,
+                  attempt,
+                  statusCode: statusCode ?? null,
+                  fromAccountId: fromAccountId ?? null,
+                  toAccountId: toAccountId ?? null,
+                  reason: String(reason || 'upstream_failover'),
+                },
+                audit: false,
+              });
+            },
             onRetryBudget:
               budgetLedger && budgetContext?.treeId
                 ? ({ attempt: retryAttempt, usage: partialUsage, error: retryErr }) => {
@@ -1618,17 +1694,8 @@ export class AgentLoop {
 
         // Idle completion / verification check when model emitted no tool calls
         if (!stepResult.toolCalls.length) {
-          if (drainSteering) {
-            const lateSteers = drainSteering();
-            if (lateSteers?.length) {
-              for (const s of lateSteers) {
-                messages.push({
-                  role: 'user',
-                  content: [{ type: 'text', text: `[用户实时纠偏指令]\n${s}` }],
-                });
-              }
-              continue;
-            }
+          if (drainSteering && injectSteeringMessages(drainSteering()) > 0) {
+            continue;
           }
 
           const monologueTrigger = reasoningTracker.recordAssistantTurn({
@@ -1780,6 +1847,9 @@ export class AgentLoop {
               });
               continue;
             }
+          }
+          if (drainSteering && injectSteeringMessages(drainSteering()) > 0) {
+            continue;
           }
           if (decision.verdict) {
             finalVerdict = decision.verdict;
@@ -2146,6 +2216,11 @@ export class AgentLoop {
             role: 'user',
             content: [{ type: 'text', text: guidanceText }],
           });
+        }
+
+        // Drain steering queued during inference/tool-batch execution before starting next step
+        if (drainSteering) {
+          injectSteeringMessages(drainSteering());
         }
       }
 

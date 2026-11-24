@@ -6,6 +6,8 @@ export const RUNTIME_EVENTS = Object.freeze({
   TURN_STARTED: 'turn/started',
   TURN_PHASE_CHANGED: 'turn/phase_changed',
   TURN_STEERED: 'turn/steered',
+  TURN_STEER_INJECTED: 'turn/steer_injected',
+  TURN_ROUTE_FAILOVER: 'turn/route_failover',
   TURN_COMPLETED: 'turn/completed',
   TURN_FAILED: 'turn/failed',
   TURN_CANCELLED: 'turn/cancelled',
@@ -39,6 +41,7 @@ export const RUNTIME_EVENTS = Object.freeze({
   SWARM_REPLANNED: 'swarm/replanned',
   SWARM_MESSAGE: 'swarm/message',
   SWARM_RUN_COMPLETED: 'swarm/run_completed',
+  ONBOARDING_IMPORTED: 'onboarding/imported',
 });
 
 function parseJsonSafe(str, fallback) {
