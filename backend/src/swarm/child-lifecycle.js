@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Fault, id as uuid } from '../store.js';
 import { excerpt } from '../context.js';
 import { HookRunner } from '../agent-context.js';
@@ -12,7 +14,8 @@ import { withTraceContext } from '../observability/trace.js';
 import { filterToolsByPolicy, intersectAllowlists, intersectPolicies } from '../tools/policy.js';
 import { ISOLATION_MODES } from '../tools/sandbox.js';
 import { WORKSPACE_TOOL_META } from '../workspace-tools.js';
-import { createSwarmArtifactTools } from './artifacts.js';
+import { createSwarmArtifactTools, hasUnresolvedConflictMarkers } from './artifacts.js';
+import { inspectWorkspaceGitDiff } from './reviewer.js';
 import {
   BUDGET_SCOPES,
   TaskTreeBudgetLedger,
@@ -634,6 +637,7 @@ export class ChildAgentManager {
           }
 
           // Overlay verified predecessor artifacts onto isolated worktree BEFORE child execution
+          const stageMergeConflicts = Boolean(budget?.conflictResolutionStep);
           if (
             isIsolated &&
             wt &&
@@ -647,6 +651,7 @@ export class ChildAgentManager {
               {
                 dependenciesByNodeKey,
                 saveOverlayState: true,
+                stageMergeConflicts,
               },
             );
             if (!overlayRes?.ok || (overlayRes.conflicts?.length ?? 0) > 0) {
@@ -654,6 +659,7 @@ export class ChildAgentManager {
               throw new Fault('WORKTREE_ARTIFACT_CONFLICT', 409, {
                 message: `Predecessor artifact collision while preparing worktree for node ${nodeKey || subId}: ${(overlayRes?.conflicts || []).map((c) => `${c.path} (${c.reason})`).join('; ')}`,
                 conflicts: overlayRes?.conflicts || [],
+                mergeConflicts: overlayRes?.mergeConflicts || [],
               });
             }
             overlaidState = overlayRes.overlayState || overlayRes;
@@ -1041,6 +1047,26 @@ export class ChildAgentManager {
 
           // Fix C1/C5/C10: Persist & register isolated worktree artifacts BEFORE marking completed!
           const diffSummary = wt ? await wt.diffSummary() : '';
+          const gitDiff = isIsolated && wt && !state.paused ? inspectWorkspaceGitDiff(wt.path) : null;
+          let remainingConflictMarkers = [];
+          if (isIsolated && wt && !state.paused && stageMergeConflicts) {
+            const checkSet = new Set([
+              ...(overlaidState?.resolvedConflictPaths ?? []),
+              ...(gitDiff?.files ?? []),
+            ]);
+            for (const rel of checkSet) {
+              const full = join(wt.path, rel);
+              if (existsSync(full)) {
+                try {
+                  if (hasUnresolvedConflictMarkers(readFileSync(full))) {
+                    remainingConflictMarkers.push(rel);
+                  }
+                } catch {
+                  // ignore unreadable file
+                }
+              }
+            }
+          }
           if (!state.paused) assertActive();
           assertLeaseInTx(turnLeaseGuard);
           if (isIsolated && wt && !state.paused && this.artifactManager && runId && nodeKey) {
@@ -1168,6 +1194,8 @@ export class ChildAgentManager {
             verdict: result.verdict ?? null,
             verifiedPass: result.verifiedPass ?? null,
             diffSummary,
+            ...(gitDiff ? { gitDiff } : {}),
+            ...(stageMergeConflicts ? { remainingConflictMarkers } : {}),
             artifact: archivedArtifact,
             binding: payload.binding,
             ...(childAciMetrics ? { aciMetrics: childAciMetrics } : {}),

@@ -25,8 +25,8 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 8,
     readOnly: true,
     weights: { coding: 0.4, reasoning: 0.6, research: 1.0, planning: 0.3, speed: 0.7, contextCapacity: 0.8, multimodal: 0.1, toolCompatibility: 0.8 },
-    toolAllow: ['read_file', 'glob', 'grep', 'read_blob', 'web_fetch', 'search_history', 'inspect_repository'],
-    toolCeiling: ['read_file', 'glob', 'grep', 'read_blob', 'web_fetch', 'search_history', 'inspect_repository', 'read_swarm_artifact'],
+    toolAllow: ['read_file', 'glob', 'grep', 'read_blob', 'web_fetch', 'search_history', 'inspect_repository', 'query_symbol_graph'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'read_blob', 'web_fetch', 'search_history', 'inspect_repository', 'query_symbol_graph', 'read_swarm_artifact'],
     instruction: '专注于只读代码检索、调用链梳理与事实提取，引用精确文件路径与符号名。',
   },
   implementation: {
@@ -35,10 +35,10 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 20,
     readOnly: false,
     weights: { coding: 1.0, reasoning: 0.7, research: 0.4, planning: 0.4, speed: 0.5, contextCapacity: 0.6, multimodal: 0.1, toolCompatibility: 1.0 },
-    toolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository'],
-    worktreeToolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'bash'],
-    toolCeiling: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'read_swarm_artifact'],
-    worktreeToolCeiling: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'bash', 'read_process_output', 'read_swarm_artifact'],
+    toolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'query_symbol_graph'],
+    worktreeToolAllow: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'query_symbol_graph', 'bash'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'query_symbol_graph', 'read_swarm_artifact'],
+    worktreeToolCeiling: ['read_file', 'glob', 'grep', 'edit_file', 'write_file', 'apply_patch', 'read_blob', 'inspect_repository', 'query_symbol_graph', 'bash', 'read_process_output', 'read_swarm_artifact'],
     instruction: '编写模块化、高内聚的生产级代码修改，保持既有接口与风格一致；在隔离 worktree 中可运行局部测试或构建命令自检。',
   },
   verification: {
@@ -47,8 +47,8 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 10,
     readOnly: false,
     weights: { coding: 0.8, reasoning: 0.8, research: 0.5, planning: 0.3, speed: 0.6, contextCapacity: 0.5, multimodal: 0.1, toolCompatibility: 1.0 },
-    toolAllow: ['read_file', 'glob', 'grep', 'bash', 'read_process_output', 'read_blob', 'inspect_repository'],
-    toolCeiling: ['read_file', 'glob', 'grep', 'bash', 'read_process_output', 'read_blob', 'inspect_repository', 'read_swarm_artifact'],
+    toolAllow: ['read_file', 'glob', 'grep', 'bash', 'read_process_output', 'read_blob', 'inspect_repository', 'query_symbol_graph'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'bash', 'read_process_output', 'read_blob', 'inspect_repository', 'query_symbol_graph', 'read_swarm_artifact'],
     instruction: '运行真实测试/编译检查并以可观测退出码与输出作为客观验证证据。',
   },
   planning: {
@@ -57,8 +57,8 @@ const BASE_CAPABILITIES = Object.freeze({
     defaultMaxSteps: 6,
     readOnly: true,
     weights: { coding: 0.25, reasoning: 1.4, research: 0.4, planning: 1.4, speed: 0.15, contextCapacity: 0.35, multimodal: 0.05, toolCompatibility: 0.4 },
-    toolAllow: ['read_file', 'glob', 'grep', 'update_plan', 'search_history', 'inspect_repository'],
-    toolCeiling: ['read_file', 'glob', 'grep', 'update_plan', 'search_history', 'inspect_repository', 'read_swarm_artifact'],
+    toolAllow: ['read_file', 'glob', 'grep', 'update_plan', 'search_history', 'inspect_repository', 'query_symbol_graph'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'update_plan', 'search_history', 'inspect_repository', 'query_symbol_graph', 'read_swarm_artifact'],
     instruction: '分析系统边界、状态流与模块依赖，产出无环可执行步骤与清晰验收标准。',
   },
   review: {
@@ -68,7 +68,7 @@ const BASE_CAPABILITIES = Object.freeze({
     readOnly: true,
     weights: { coding: 0.8, reasoning: 0.9, research: 0.7, planning: 0.4, speed: 0.5, contextCapacity: 0.8, multimodal: 0.1, toolCompatibility: 0.7 },
     toolAllow: ['read_file', 'glob', 'grep', 'read_blob'],
-    toolCeiling: ['read_file', 'glob', 'grep', 'read_blob', 'inspect_repository', 'read_swarm_artifact'],
+    toolCeiling: ['read_file', 'glob', 'grep', 'read_blob', 'inspect_repository', 'query_symbol_graph', 'read_swarm_artifact'],
     instruction: '独立核对实现边界、回归风险、错误处理与权限安全，禁止直接篡改产物。',
   },
 });
@@ -297,6 +297,8 @@ export class AgentCapabilityRegistry {
     let baseKey = 'research';
     if (this.archetypes.has(taskType)) {
       baseKey = taskType;
+    } else if (taskType === 'conflict_resolution') {
+      baseKey = 'implementation';
     } else if (/test|verify|check|build|benchmark|测试|验证|编译|运行/i.test(hint)) {
       baseKey = 'verification';
     } else if (/review|audit|inspect|security|审计|审查|复核/i.test(hint)) {

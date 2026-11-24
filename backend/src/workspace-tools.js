@@ -13,6 +13,7 @@ import {
   findCrossFileReferences,
   findRelatedTests,
   formatRepositorySummary,
+  querySymbolGraph,
 } from './repo-intelligence.js';
 import { EFFECT_CLASSES, RISK_LEVELS, ToolRegistry, defineTool } from './tools/registry.js';
 import { ToolPermissionPolicy } from './tools/policy.js';
@@ -39,6 +40,7 @@ export const WORKSPACE_TOOL_META = Object.freeze({
   expand_context: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   compute_file_digest: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   inspect_repository: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
+  query_symbol_graph: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   run_diagnostics: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   web_fetch: { readOnly: true, risk: 'low', effectClass: 'external_network', replayable: true, outward: false },
   search_history: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
@@ -272,6 +274,81 @@ function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback 
   });
 }
 
+function createQuerySymbolGraphTool({ workspaceRoot, wrapResult, guardFallback }) {
+  return defineTool({
+    name: 'query_symbol_graph',
+    serializeZodSchema: false,
+    description:
+      '只读符号关系图谱工具：单次调用返回符号精确定义（path/line/endLine/kind/signature）、跨文件调用方与导入方（callers/importers）及关联测试文件（relatedTests）。改代码或查引用时优先使用。',
+    effectClass: EFFECT_CLASSES.READ_ONLY,
+    riskLevel: RISK_LEVELS.LOW,
+    readOnly: true,
+    replayable: true,
+    outward: false,
+    zodSchema: z.object({
+      symbol: z.string().max(240).optional().describe('要查询的符号名称（如函数名、类名或 Class.method）'),
+      path: z.string().max(500).optional().describe('可选：限定符号或依赖分析的工作区内文件或子目录路径'),
+      includeCallers: z.boolean().optional().describe('是否返回跨文件调用方与导入方（默认 true）'),
+      includeTests: z.boolean().optional().describe('是否返回关联测试文件列表（默认 true）'),
+      maxResults: z.number().int().min(1).max(100).optional().describe('每类结果最大返回条数（默认 25）'),
+    }),
+    async execute(args = {}, ctx) {
+      await guardFallback('query_symbol_graph', args, ctx);
+      const symbol = typeof args.symbol === 'string' ? args.symbol.trim() : '';
+      const rawPath = typeof args.path === 'string' ? args.path.trim() : '';
+      if (!symbol && !rawPath) {
+        throw new Error('query_symbol_graph 需要至少提供 symbol 或 path 参数');
+      }
+
+      const root = resolve(workspaceRoot);
+      let confinedRel = null;
+      if (rawPath) {
+        const confined = resolveConfinedPath(root, rawPath);
+        if (isBlockedRepoFocusRel(confined.rel)) {
+          throw new Error(`受保护目录或密钥文件不允许访问: ${rawPath}`);
+        }
+        if (existsSync(confined.full)) {
+          const realRoot = realpathSync(root);
+          const realTarget = realpathSync(confined.full);
+          const realRel = relative(realRoot, realTarget).replace(/\\/g, '/');
+          if (isBlockedRepoFocusRel(realRel)) {
+            throw new Error(`受保护目录或密钥文件不允许访问: ${rawPath}`);
+          }
+        }
+        confinedRel = confined.rel;
+      }
+
+      const graph = await querySymbolGraph(root, {
+        symbol,
+        path: confinedRel,
+        includeCallers: args.includeCallers !== false,
+        includeTests: args.includeTests !== false,
+        maxResults: args.maxResults ?? 25,
+      });
+
+      const headerLines = [
+        `[query_symbol_graph${symbol ? ` symbol="${symbol}"` : ''}${confinedRel ? ` path="${confinedRel}"` : ''} defs=${graph.definitions.length} callers=${graph.callers.length} importers=${graph.importers.length} tests=${graph.relatedTests.length}]`,
+      ];
+      for (const d of graph.definitions.slice(0, 6)) {
+        headerLines.push(
+          `- def ${d.path}:${d.line}-${d.endLine} [${d.kind}] ${d.signature || d.name}`,
+        );
+      }
+      for (const c of graph.callers.slice(0, 6)) {
+        headerLines.push(`- caller ${c.path}:${c.line} (${c.fromName})`);
+      }
+      if (graph.importers.length > 0) {
+        headerLines.push(`- importers: ${graph.importers.slice(0, 8).map((im) => im.from).join(', ')}`);
+      }
+      if (graph.relatedTests.length > 0) {
+        headerLines.push(`- tests: ${graph.relatedTests.slice(0, 8).join(', ')}`);
+      }
+
+      return wrapResult('query_symbol_graph', `${headerLines.join('\n')}\n\n${JSON.stringify(graph)}`);
+    },
+  });
+}
+
 export function createWorkspaceTools({
   workspaceRoot,
   dataRoot = null,
@@ -456,6 +533,11 @@ export function createWorkspaceTools({
       signal,
     }),
     createInspectRepositoryTool({
+      workspaceRoot,
+      wrapResult,
+      guardFallback,
+    }),
+    createQuerySymbolGraphTool({
       workspaceRoot,
       wrapResult,
       guardFallback,

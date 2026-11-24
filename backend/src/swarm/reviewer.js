@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { hasUnresolvedConflictMarkers } from './artifacts.js';
 
 export const REVIEWER_SCHEMA_VERSION = '1.0.0';
 export const MAX_REVIEWER_FORMAT_RETRIES = 2;
@@ -662,6 +663,104 @@ export function evaluateReviewerHardGate({
     reasons,
     downgraded,
     originalVerdict: rawVerdict,
+  };
+}
+
+/**
+ * Verifies a bounded `conflict_resolution` repair step before acceptance:
+ * 1. Zero remaining `<<<<<<<` / `=======` / `>>>>>>>` conflict markers in resolved/artifact files
+ * 2. Every conflicted file is addressed in the resolution artifact / diff
+ * 3. `evaluateReviewerHardGate` passes with real git diff (>0 files + digest) and test exitCode === 0.
+ */
+export function evaluateConflictResolutionGate({
+  conflictFiles = [],
+  artifact = null,
+  artifactManager = null,
+  reviewerEvidence = null,
+  workspaceRoot = null,
+  gitDiff = null,
+  precomputedRemainingMarkers = null,
+} = {}) {
+  const normalizedConflictFiles = [
+    ...new Set((Array.isArray(conflictFiles) ? conflictFiles : []).map((f) => String(f || '').trim()).filter(Boolean)),
+  ];
+  const remainingMarkerSet = new Set(
+    Array.isArray(precomputedRemainingMarkers) ? precomputedRemainingMarkers : [],
+  );
+  const artifactFiles = new Set((artifact?.files ?? []).map((f) => f.path).filter(Boolean));
+  const diffFiles = new Set((gitDiff?.files ?? []).map(String).filter(Boolean));
+  const checkPaths = [...new Set([...normalizedConflictFiles, ...artifactFiles])];
+
+  for (const rel of checkPaths) {
+    let content = null;
+    if (artifact && artifactManager?.readArtifactFile && artifactFiles.has(rel)) {
+      const entry = (artifact.files ?? []).find((f) => f.path === rel);
+      if (entry && entry.changeType !== 'deleted' && !entry.binary && entry.mode !== '120000') {
+        try {
+          content = artifactManager.readArtifactFile(artifact.id, rel).buffer;
+        } catch {
+          content = null;
+        }
+      }
+    }
+    if (content === null && workspaceRoot) {
+      const full = join(resolve(workspaceRoot), rel);
+      if (existsSync(full)) {
+        try {
+          content = readFileSync(full);
+        } catch {
+          content = null;
+        }
+      }
+    }
+    if (content !== null && hasUnresolvedConflictMarkers(content)) {
+      remainingMarkerSet.add(rel);
+    }
+  }
+
+  const untouchedConflictFiles = normalizedConflictFiles.filter(
+    (f) => !artifactFiles.has(f) && !diffFiles.has(f),
+  );
+
+  const gate = evaluateReviewerHardGate({
+    parsedVerdict: {
+      verdict: 'pass',
+      summary: 'Conflict resolution verified with resolved hunks and passing tests.',
+      ...(artifact?.uri ? { checkedArtifacts: [artifact.uri] } : {}),
+    },
+    reviewerEvidence,
+    workspaceRoot,
+    artifactManager,
+    gitDiff,
+    requireGitDiff: true,
+    requireTestExecution: true,
+    hardGate: true,
+  });
+
+  const remainingMarkers = [...remainingMarkerSet];
+  const reasons = [...(gate.reasons ?? [])];
+  if (remainingMarkers.length > 0) {
+    reasons.push(`REMAINING_CONFLICT_MARKERS:${remainingMarkers.join(',')}`);
+  }
+  if (untouchedConflictFiles.length > 0) {
+    reasons.push(`CONFLICT_FILES_UNTOUCHED:${untouchedConflictFiles.join(',')}`);
+  }
+
+  const hardGatePassed =
+    Boolean(gate.hardGatePassed) &&
+    remainingMarkers.length === 0 &&
+    untouchedConflictFiles.length === 0;
+
+  return {
+    resolved: hardGatePassed,
+    hardGatePassed,
+    testExitCode: gate.verifiedTestExitCode ?? null,
+    verifiedGitDiff: Boolean(gate.verifiedGitDiff),
+    diffFileCount: Number(gate.diffFileCount ?? 0),
+    diffDigest: gate.diffDigest ?? null,
+    remainingMarkers,
+    untouchedConflictFiles,
+    reasons,
   };
 }
 

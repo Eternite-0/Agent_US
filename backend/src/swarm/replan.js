@@ -418,6 +418,7 @@ const DEFAULT_REPAIR_TOOLS = [
   'grep',
   'read_blob',
   'inspect_repository',
+  'query_symbol_graph',
   'bash',
   'read_swarm_artifact',
 ];
@@ -431,6 +432,7 @@ const DEFAULT_REVERIFY_TOOLS = [
   'start_process',
   'stop_process',
   'inspect_repository',
+  'query_symbol_graph',
   'read_swarm_artifact',
 ];
 
@@ -1460,7 +1462,7 @@ export class DynamicReplanner {
 
       const implToolAllow =
         Array.isArray(activeImplNode?.toolAllow) && activeImplNode.toolAllow.length > 0
-          ? [...new Set([...activeImplNode.toolAllow, 'bash', 'inspect_repository', 'read_swarm_artifact'])]
+          ? [...new Set([...activeImplNode.toolAllow, 'bash', 'inspect_repository', 'query_symbol_graph', 'read_swarm_artifact'])]
           : [...DEFAULT_REPAIR_TOOLS];
 
       const perNodeMaxSteps = (defaultSteps) => {

@@ -38,19 +38,29 @@ export const SWARM_ARTIFACT_URI_PREFIX = 'swarm-artifact://';
 
 const MUTATING_WRITE_TOOLS = new Set(['write_file', 'edit_file', 'apply_patch', 'bash']);
 
+function toDependenciesMap(dependenciesByNodeKey) {
+  if (!dependenciesByNodeKey) return null;
+  if (dependenciesByNodeKey instanceof Map) return dependenciesByNodeKey;
+  if (typeof dependenciesByNodeKey === 'object') {
+    return new Map(Object.entries(dependenciesByNodeKey));
+  }
+  return null;
+}
+
 function isCausalAncestorNode(candidateAncestorKey, candidateDescendantKey, dependenciesByNodeKey) {
   if (!candidateAncestorKey || !candidateDescendantKey || candidateAncestorKey === candidateDescendantKey) {
     return false;
   }
-  if (!dependenciesByNodeKey || !(dependenciesByNodeKey instanceof Map)) return false;
+  const depMap = toDependenciesMap(dependenciesByNodeKey);
+  if (!depMap) return false;
   const visited = new Set();
-  const queue = [...(dependenciesByNodeKey.get(candidateDescendantKey) ?? [])];
+  const queue = [...(depMap.get(candidateDescendantKey) ?? [])];
   while (queue.length > 0) {
     const cur = queue.shift();
     if (!cur || visited.has(cur)) continue;
     if (cur === candidateAncestorKey) return true;
     visited.add(cur);
-    const parents = dependenciesByNodeKey.get(cur);
+    const parents = depMap.get(cur);
     if (Array.isArray(parents)) {
       for (const p of parents) queue.push(p);
     }
@@ -82,7 +92,8 @@ function sortArtifactsTopologically(artifacts, dependenciesByNodeKey = null) {
       Number(a.createdAt ?? 0) - Number(b.createdAt ?? 0) ||
       Number(a.attempt ?? 1) - Number(b.attempt ?? 1),
   );
-  if (!dependenciesByNodeKey || !(dependenciesByNodeKey instanceof Map) || ordered.length <= 1) {
+  const depMap = toDependenciesMap(dependenciesByNodeKey);
+  if (!depMap || ordered.length <= 1) {
     return ordered;
   }
   const result = [];
@@ -92,7 +103,7 @@ function sortArtifactsTopologically(artifacts, dependenciesByNodeKey = null) {
       remaining.every(
         (other) =>
           other === candidate ||
-          !isCausalAncestorNode(other.nodeKey, candidate.nodeKey, dependenciesByNodeKey),
+          !isCausalAncestorNode(other.nodeKey, candidate.nodeKey, depMap),
       ),
     );
     if (pickedIdx < 0) pickedIdx = 0;
@@ -145,8 +156,69 @@ function mergeFileModesThreeWay({ currentMode, baseMode = null, incomingMode }) 
   return { ok: false, reason: 'mode_conflict', mode: cur };
 }
 
+const CONFLICT_MARKER_LINE_RE = /^(?:<{7}(?:\s|$)|\|{7}(?:\s|$)|={7}$|>{7}(?:\s|$))/m;
+
+export function hasUnresolvedConflictMarkers(content) {
+  if (content === null || content === undefined) return false;
+  const text = Buffer.isBuffer(content) ? content.toString('utf8') : String(content);
+  return CONFLICT_MARKER_LINE_RE.test(text);
+}
+
 /**
- * True Git 3-way merge (`git merge-file -p`) using base snapshot, current working copy,
+ * Extracts structured conflict hunks (`{ startLine, endLine, ours, base, theirs, rawConflictSlice }`)
+ * from Git `merge-file --diff3` (or 2-way) conflict output without modifying any files.
+ */
+export function extractConflictBlocks(conflictText) {
+  const text = Buffer.isBuffer(conflictText)
+    ? conflictText.toString('utf8')
+    : String(conflictText ?? '');
+  if (!text) return [];
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (/^<{7}(?:\s|$)/.test(lines[i])) {
+      const startIdx = i;
+      let baseMarkerIdx = -1;
+      let sepIdx = -1;
+      let endIdx = -1;
+      let j = i + 1;
+      while (j < lines.length) {
+        if (/^\|{7}(?:\s|$)/.test(lines[j]) && sepIdx === -1 && baseMarkerIdx === -1) {
+          baseMarkerIdx = j;
+        } else if (/^={7}$/.test(lines[j]) && sepIdx === -1) {
+          sepIdx = j;
+        } else if (/^>{7}(?:\s|$)/.test(lines[j])) {
+          endIdx = j;
+          break;
+        }
+        j++;
+      }
+      if (sepIdx !== -1 && endIdx !== -1) {
+        const oursEnd = baseMarkerIdx !== -1 ? baseMarkerIdx : sepIdx;
+        const ours = lines.slice(startIdx + 1, oursEnd).join('\n');
+        const base = baseMarkerIdx !== -1 ? lines.slice(baseMarkerIdx + 1, sepIdx).join('\n') : '';
+        const theirs = lines.slice(sepIdx + 1, endIdx).join('\n');
+        const rawConflictSlice = lines.slice(startIdx, endIdx + 1).join('\n');
+        blocks.push({
+          startLine: startIdx + 1,
+          endLine: endIdx + 1,
+          ours,
+          base,
+          theirs,
+          rawConflictSlice,
+        });
+        i = endIdx + 1;
+        continue;
+      }
+    }
+    i++;
+  }
+  return blocks;
+}
+
+/**
+ * True Git 3-way merge (`git merge-file -p --diff3`) using base snapshot, current working copy,
  * and incoming artifact blob. Never mutates target workspace on conflict.
  */
 export function mergeFileThreeWay({
@@ -162,16 +234,24 @@ export function mergeFileThreeWay({
   const inc = Buffer.isBuffer(incomingBuf) ? incomingBuf : Buffer.from(String(incomingBuf ?? ''), 'utf8');
 
   if (cur.equals(inc)) {
-    return { ok: true, mergedBuffer: cur, conflictCount: 0, conflictPreview: null };
+    return { ok: true, mergedBuffer: cur, conflictCount: 0, conflictPreview: null, conflictBlocks: [] };
   }
   if (cur.equals(base)) {
-    return { ok: true, mergedBuffer: inc, conflictCount: 0, conflictPreview: null };
+    return { ok: true, mergedBuffer: inc, conflictCount: 0, conflictPreview: null, conflictBlocks: [] };
   }
   if (inc.equals(base)) {
-    return { ok: true, mergedBuffer: cur, conflictCount: 0, conflictPreview: null };
+    return { ok: true, mergedBuffer: cur, conflictCount: 0, conflictPreview: null, conflictBlocks: [] };
   }
   if (isBinaryBuffer(cur) || isBinaryBuffer(base) || isBinaryBuffer(inc)) {
-    return { ok: false, binaryConflict: true, conflictCount: 1, mergedBuffer: null, conflictPreview: null };
+    return {
+      ok: false,
+      binaryConflict: true,
+      conflictCount: 1,
+      mergedBuffer: null,
+      conflictedBuffer: null,
+      conflictPreview: null,
+      conflictBlocks: [],
+    };
   }
 
   const runMerge = (cBuf, bBuf, iBuf) => {
@@ -188,6 +268,7 @@ export function mergeFileThreeWay({
         [
           'merge-file',
           '-p',
+          '--diff3',
           '-L',
           String(labelCurrent || 'current'),
           '-L',
@@ -205,18 +286,22 @@ export function mergeFileThreeWay({
           maxBuffer: 32 * 1024 * 1024,
         },
       );
-      return { ok: true, mergedBuffer: merged, conflictCount: 0, conflictPreview: null };
+      return { ok: true, mergedBuffer: merged, conflictCount: 0, conflictPreview: null, conflictBlocks: [] };
     } catch (err) {
       const status = Number(err?.status ?? -1);
       if (status > 0 && status <= 127) {
-        const preview = Buffer.isBuffer(err?.stdout)
-          ? err.stdout.toString('utf8').slice(0, 2000)
-          : String(err?.stdout ?? '').slice(0, 2000);
+        const rawBuf = Buffer.isBuffer(err?.stdout)
+          ? err.stdout
+          : Buffer.from(String(err?.stdout ?? ''), 'utf8');
+        const fullText = rawBuf.toString('utf8');
+        const conflictBlocks = extractConflictBlocks(fullText);
         return {
           ok: false,
           conflictCount: status,
           mergedBuffer: null,
-          conflictPreview: preview || null,
+          conflictedBuffer: rawBuf,
+          conflictPreview: fullText.slice(0, 2000) || null,
+          conflictBlocks,
         };
       }
       throw err;
@@ -239,6 +324,9 @@ export function mergeFileThreeWay({
   if (curLf !== cur || baseLf !== base || incLf !== inc) {
     const lfAttempt = runMerge(curLf, baseLf, incLf);
     if (lfAttempt.ok) return lfAttempt;
+    if (lfAttempt.conflictBlocks.length > direct.conflictBlocks.length) {
+      return lfAttempt;
+    }
   }
   return direct;
 }
@@ -917,6 +1005,10 @@ export class SwarmArtifactManager {
             ...(Array.isArray(effectiveOverlayState?.artifacts) && effectiveOverlayState.artifacts.length
               ? { overlaidArtifacts: effectiveOverlayState.artifacts }
               : {}),
+            ...(Array.isArray(effectiveOverlayState?.resolvedConflictPaths) &&
+            effectiveOverlayState.resolvedConflictPaths.length
+              ? { resolvedConflictPaths: effectiveOverlayState.resolvedConflictPaths }
+              : {}),
             createdAt: now,
             entries,
           };
@@ -1549,6 +1641,7 @@ export class SwarmArtifactManager {
             reason: 'target_exists_diverged',
             mergeConflict: true,
             conflictMarkers: mergePreview.conflictPreview ?? null,
+            conflictBlocks: mergePreview.conflictBlocks ?? [],
             baseSha256: null,
             parentSha256: parentSha,
             artifactSha256: entry.sha256,
@@ -1646,6 +1739,7 @@ export class SwarmArtifactManager {
               reason: 'parent_modified_concurrently',
               mergeConflict: true,
               conflictMarkers: mergeRes.conflictPreview ?? null,
+              conflictBlocks: mergeRes.conflictBlocks ?? [],
               baseSha256: entry.baseSha256,
               parentSha256: parentSha,
               artifactSha256: entry.sha256,
@@ -1919,6 +2013,39 @@ export class SwarmArtifactManager {
     return applied;
   }
 
+  #findResolvingDescendantArtifact(
+    orderedArtifacts,
+    afterIndex,
+    relPath,
+    prevMeta,
+    curArt,
+    dependenciesByNodeKey,
+  ) {
+    const curMeta = {
+      artifactId: curArt.id,
+      uri: curArt.uri,
+      nodeKey: curArt.nodeKey,
+    };
+    for (let idx = afterIndex + 1; idx < orderedArtifacts.length; idx++) {
+      const cand = orderedArtifacts[idx];
+      const candEntry = (cand.files ?? []).find((f) => f.path === relPath);
+      if (!candEntry) continue;
+      const overridesPrev = isCausalArtifactOverride(prevMeta, cand, dependenciesByNodeKey);
+      const overridesCur = isCausalArtifactOverride(curMeta, cand, dependenciesByNodeKey);
+      if (!overridesPrev || !overridesCur) continue;
+      if (candEntry.changeType !== 'deleted' && !candEntry.binary && candEntry.mode !== '120000') {
+        try {
+          const readRes = this.readArtifactFile(cand.id, relPath);
+          if (hasUnresolvedConflictMarkers(readRes.buffer)) continue;
+        } catch {
+          continue;
+        }
+      }
+      return cand;
+    }
+    return null;
+  }
+
   /**
    * Overlays multiple verified upstream artifacts onto an isolated worktree directory
    * BEFORE a downstream child turn executes. Verifies SHA-256 of every bundle/file,
@@ -1928,7 +2055,7 @@ export class SwarmArtifactManager {
   applyArtifactsToWorktree(
     artifacts,
     worktreePath,
-    { dependenciesByNodeKey = null, saveOverlayState = true } = {},
+    { dependenciesByNodeKey = null, saveOverlayState = true, stageMergeConflicts = false } = {},
   ) {
     if (!worktreePath || !existsSync(worktreePath)) {
       throw new Fault('WORKTREE_MISSING', 404, {
@@ -1936,7 +2063,7 @@ export class SwarmArtifactManager {
       });
     }
     if (!Array.isArray(artifacts) || artifacts.length === 0) {
-      return { ok: true, applied: [], conflicts: [], mergeConflicts: [], skipped: [] };
+      return { ok: true, applied: [], conflicts: [], mergeConflicts: [], stagedConflicts: [], skipped: [] };
     }
 
     const targetRoot = resolve(worktreePath);
@@ -1957,15 +2084,19 @@ export class SwarmArtifactManager {
       verifiedList.push(verification.artifact);
     }
 
-    const ordered = sortArtifactsTopologically(verifiedList, dependenciesByNodeKey);
+    const depMap = toDependenciesMap(dependenciesByNodeKey);
+    const ordered = sortArtifactsTopologically(verifiedList, depMap);
     const touched = new Map();
     const overlayEntries = {};
     const applied = [];
     const skipped = [];
     const conflicts = [];
     const mergeConflicts = [];
+    const stagedConflicts = [];
+    const resolvedConflictPaths = new Set();
 
-    for (const art of ordered) {
+    for (let artIdx = 0; artIdx < ordered.length; artIdx++) {
+      const art = ordered[artIdx];
       for (const entry of art.files) {
         const readRes =
           entry.changeType !== 'deleted' ? this.readArtifactFile(art.id, entry.path) : null;
@@ -1993,7 +2124,7 @@ export class SwarmArtifactManager {
             });
             continue;
           }
-          if (isCausalArtifactOverride(existingTouch, art, dependenciesByNodeKey)) {
+          if (isCausalArtifactOverride(existingTouch, art, depMap)) {
             causalOverride = true;
           } else {
             // Attempt true Git 3-way merge across non-causal sibling artifacts before rejecting
@@ -2077,11 +2208,40 @@ export class SwarmArtifactManager {
                   };
                   continue;
                 }
+                if (
+                  this.#findResolvingDescendantArtifact(
+                    ordered,
+                    artIdx,
+                    entry.path,
+                    existingTouch,
+                    art,
+                    depMap,
+                  )
+                ) {
+                  continue;
+                }
+                if (stageMergeConflicts && mergeRes.conflictedBuffer) {
+                  mkdirSync(dirname(target.full), { recursive: true });
+                  writeFileSync(target.full, mergeRes.conflictedBuffer);
+                  delete overlayEntries[entry.path];
+                  resolvedConflictPaths.add(entry.path);
+                  stagedConflicts.push({
+                    path: entry.path,
+                    reason: 'cross_branch_collision',
+                    mergeConflict: true,
+                    conflictMarkers: mergeRes.conflictPreview ?? null,
+                    conflictBlocks: mergeRes.conflictBlocks ?? [],
+                    nodeKeys: [existingTouch.nodeKey, art.nodeKey],
+                    artifactIds: [existingTouch.artifactId, art.id],
+                  });
+                  continue;
+                }
                 const conflictObj = {
                   path: entry.path,
                   reason: 'cross_branch_collision',
                   mergeConflict: true,
                   conflictMarkers: mergeRes.conflictPreview ?? null,
+                  conflictBlocks: mergeRes.conflictBlocks ?? [],
                   nodeKeys: [existingTouch.nodeKey, art.nodeKey],
                   artifactIds: [existingTouch.artifactId, art.id],
                   existingChangeType: existingTouch.changeType,
@@ -2094,10 +2254,23 @@ export class SwarmArtifactManager {
                 continue;
               }
             }
+            if (
+              this.#findResolvingDescendantArtifact(
+                ordered,
+                artIdx,
+                entry.path,
+                existingTouch,
+                art,
+                depMap,
+              )
+            ) {
+              continue;
+            }
             const conflictObj = {
               path: entry.path,
               reason: 'cross_branch_collision',
               mergeConflict: true,
+              conflictBlocks: [],
               nodeKeys: [existingTouch.nodeKey, art.nodeKey],
               artifactIds: [existingTouch.artifactId, art.id],
               existingChangeType: existingTouch.changeType,
@@ -2264,6 +2437,9 @@ export class SwarmArtifactManager {
         bundleSha256: a.bundleSha256,
       })),
       entries: overlayEntries,
+      ...(resolvedConflictPaths.size > 0
+        ? { resolvedConflictPaths: [...resolvedConflictPaths] }
+        : {}),
     };
 
     if (saveOverlayState && conflicts.length === 0) {
@@ -2275,6 +2451,7 @@ export class SwarmArtifactManager {
       applied,
       conflicts,
       mergeConflicts,
+      stagedConflicts,
       skipped,
       overlayState,
     };
@@ -2287,12 +2464,13 @@ export class SwarmArtifactManager {
    */
   analyzeRunArtifacts(
     artifacts,
-    { dependenciesByNodeKey = null, workspaceRoot = null, maxDiffBytes = 64000 } = {},
+    { dependenciesByNodeKey = null, workspaceRoot = null, maxDiffBytes = 64000, nodeGoalsByKey = null } = {},
   ) {
     const active = (Array.isArray(artifacts) ? artifacts : []).filter(
       (a) => a && a.status !== 'superseded',
     );
-    const ordered = sortArtifactsTopologically(active, dependenciesByNodeKey);
+    const depMap = toDependenciesMap(dependenciesByNodeKey);
+    const ordered = sortArtifactsTopologically(active, depMap);
     const verificationErrors = [];
     const verifiedArtifacts = [];
     for (const raw of ordered) {
@@ -2324,18 +2502,29 @@ export class SwarmArtifactManager {
       const k = `${c.path}:${c.reason}:${[...(c.nodeKeys ?? [])].sort().join(',')}`;
       if (!conflictKeySet.has(k)) {
         conflictKeySet.add(k);
+        if (nodeGoalsByKey && Array.isArray(c.nodeKeys) && !c.siblingNodes) {
+          const goalsObj =
+            nodeGoalsByKey instanceof Map ? Object.fromEntries(nodeGoalsByKey) : nodeGoalsByKey;
+          c.siblingNodes = c.nodeKeys.map((nk) => ({
+            nodeKey: nk,
+            ...(typeof goalsObj[nk] === 'string'
+              ? { goal: goalsObj[nk], summary: '' }
+              : goalsObj[nk] ?? {}),
+          }));
+        }
         conflicts.push(c);
       }
     };
 
-    for (const art of verifiedArtifacts) {
+    for (let artIdx = 0; artIdx < verifiedArtifacts.length; artIdx++) {
+      const art = verifiedArtifacts[artIdx];
       for (const entry of art.files) {
         const prevWin = winningByPath.get(entry.path);
         if (prevWin) {
           if (isIdenticalOverlayEntry(prevWin.entry, entry)) {
             continue;
           }
-          if (isCausalArtifactOverride(prevWin, art, dependenciesByNodeKey)) {
+          if (isCausalArtifactOverride(prevWin, art, depMap)) {
             if (entry.overlaidDeleted && prevWin.entry.changeType === 'added') {
               winningByPath.delete(entry.path);
               continue;
@@ -2404,6 +2593,18 @@ export class SwarmArtifactManager {
                 });
                 continue;
               }
+              if (
+                this.#findResolvingDescendantArtifact(
+                  verifiedArtifacts,
+                  artIdx,
+                  entry.path,
+                  prevWin,
+                  art,
+                  depMap,
+                )
+              ) {
+                continue;
+              }
               pushConflict({
                 path: entry.path,
                 nodeKeys: [prevWin.nodeKey, art.nodeKey],
@@ -2411,11 +2612,24 @@ export class SwarmArtifactManager {
                 reason: 'cross_branch_collision',
                 mergeConflict: true,
                 conflictMarkers: mergeRes.conflictPreview ?? null,
+                conflictBlocks: mergeRes.conflictBlocks ?? [],
                 parentPreserved: true,
                 artifactPreserved: true,
               });
               continue;
             }
+          }
+          if (
+            this.#findResolvingDescendantArtifact(
+              verifiedArtifacts,
+              artIdx,
+              entry.path,
+              prevWin,
+              art,
+              depMap,
+            )
+          ) {
+            continue;
           }
           pushConflict({
             path: entry.path,
@@ -2423,6 +2637,7 @@ export class SwarmArtifactManager {
             artifactIds: [prevWin.artifactId, art.id],
             reason: 'cross_branch_collision',
             mergeConflict: true,
+            conflictBlocks: [],
             parentPreserved: true,
             artifactPreserved: true,
           });
@@ -2564,6 +2779,7 @@ export class SwarmArtifactManager {
               reason: 'parent_modified_concurrently',
               mergeConflict: true,
               conflictMarkers: finalMerge.conflictPreview ?? null,
+              conflictBlocks: finalMerge.conflictBlocks ?? [],
               parentPreserved: true,
               artifactPreserved: true,
             });
