@@ -3,6 +3,7 @@ import { estimateTokens } from '../context.js';
 import { redactSecrets, sanitize } from '../envelope.js';
 import { extractRepositorySymbols } from '../repo-symbols.js';
 import {
+  ReversibleContextStore,
   formatAciRefStub,
   normalizeContextPath,
 } from './aci-store.js';
@@ -16,10 +17,20 @@ export const ADMISSION_DECISIONS = Object.freeze({
 });
 
 export const DEFAULT_ADMISSION_MIN_CHARS = 1400;
+export const DEFAULT_WORKING_SET_READ_MAX_CHARS = 16000;
+export const DEFAULT_PROBE_ADMISSION_MIN_CHARS = 2400;
 export const DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS = 6;
 
 const VALID_DECISIONS = new Set(Object.values(ADMISSION_DECISIONS));
 const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delete_file']);
+const NOISY_PROBE_TOOLS = new Set([
+  'grep',
+  'glob',
+  'bash',
+  'start_process',
+  'inspect_repository',
+  'run_diagnostics',
+]);
 const ALWAYS_DIRECT_TOOLS = new Set([
   'compute_file_digest',
   'expand_context',
@@ -32,11 +43,13 @@ const ALWAYS_DIRECT_TOOLS = new Set([
 const ERROR_OUTPUT_RE =
   /(?:^exitCode:\s*[1-9]\d*\b|exit\s+code[:=\s]+[1-9]\d*\b|AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|ECONNREFUSED|Traceback \(most recent call last\)|\b(?:FAIL|FAILED|FATAL|PANIC)\b|✖\s|×\s|^not ok \d+|^\s*(?:Expected|Actual|Received)\b|^\s+at\s+\S+:\d+:\d+|^\s+File\s+".+",\s+line\s+\d+|\bTS\d{4,5}:|\berror\[E\d+\]|\bError:\s|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/m;
 
-const DECOY_CUE_RE =
-  /legacy|deprecated|v0|v1-compat|archive|fixture|sample|mock-data|changelog|generated|storybook/i;
+const DECOY_PATH_SEGMENT_RE =
+  /(?:^|\/)(?:legacy|archive|v0|v1[-_]compat|backup|old[-_]version|mock[-_]data|storybook)(?:\/|$)/i;
 
-const DECOY_CONTENT_LINE_RE =
-  /^\s*(?:\/\/|\/\*|\*|#|<!--)?\s*(?:@deprecated|.*\b(?:legacy|deprecated|v0|v1-compat|archive|fixture|sample|mock-data|changelog|generated|storybook)\b)/i;
+const DECOY_FILENAME_RE = /(?:^|\/)[^/]*[_-]decoy\.[^/]+$/i;
+
+const DECOY_BANNER_LINE_RE =
+  /^\s*(?:\/\/|\/\*+|\*|#|<!--|"""|''')?\s*DO NOT EDIT\s*[-—:]\s*ARCHIVED DECOY\b/i;
 
 const DOMAIN_RULES = Object.freeze({
   auth: {
@@ -334,33 +347,53 @@ function buildLineRangeLabel(args, parsedRead, innerText) {
   return `L1-${lines}`;
 }
 
+function isDecoyPath(rawPath) {
+  const norm = String(rawPath || '').replace(/\\/g, '/').trim();
+  if (!norm) return false;
+  return DECOY_PATH_SEGMENT_RE.test(norm) || DECOY_FILENAME_RE.test(norm);
+}
+
+function extractFirstNonEmptyLine(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  for (const line of lines) {
+    if (line.trim().length > 0) return line;
+  }
+  return '';
+}
+
 /**
- * Detects explicit legacy/archive/changelog/fixture/sample/mock-data decoy cues.
+ * Detects explicit legacy/archive/decoy path segments, `[_-]decoy.` filenames,
+ * or explicit `DO NOT EDIT - ARCHIVED DECOY` first-line banners.
  */
 export function isDecoyCue(path = '', content = '') {
   const normPath = String(path || '').replace(/\\/g, '/');
-  const headLines = String(content ?? '').split(/\r?\n/).slice(0, 16);
   if (normPath.startsWith('grep:') || normPath.startsWith('glob:')) {
+    const headLines = String(content ?? '').split(/\r?\n/).slice(0, 16);
     const nonEmpty = headLines.map((l) => l.trim()).filter(Boolean);
-    return (
-      nonEmpty.length > 0 &&
-      nonEmpty.every((line) => DECOY_CUE_RE.test(line) || DECOY_CONTENT_LINE_RE.test(line))
-    );
+    if (nonEmpty.length === 0) return false;
+    return nonEmpty.every((line) => {
+      if (normPath.startsWith('grep:')) {
+        const m = line.match(/^(.+?):\d+:(.*)$/);
+        if (m) {
+          return isDecoyPath(m[1]) || DECOY_BANNER_LINE_RE.test(m[2]);
+        }
+      }
+      return isDecoyPath(line) || DECOY_BANNER_LINE_RE.test(line);
+    });
   }
-  if (normPath && DECOY_CUE_RE.test(normPath)) {
+  if (isDecoyPath(normPath)) {
     return true;
   }
-  for (const line of headLines) {
-    if (DECOY_CONTENT_LINE_RE.test(line)) {
-      return true;
-    }
+  const firstNonEmpty = extractFirstNonEmptyLine(content);
+  if (firstNonEmpty && DECOY_BANNER_LINE_RE.test(firstNonEmpty)) {
+    return true;
   }
   return false;
 }
 
 /**
  * Classifies candidates into the 5 protected domains while distinguishing genuine
- * active source/contract paths from unreferenced legacy/archive/sample decoys.
+ * active source/contract paths from unreferenced legacy/archive decoys.
  */
 export function classifyCriticalDomains({
   path = '',
@@ -391,7 +424,7 @@ export function classifyCriticalDomains({
   return {
     domains,
     rawDomains,
-    isDecoy: decoy,
+    isDecoy: suppressedAsDecoy,
     suppressedAsDecoy,
     isCritical,
     matchedPrompt,
@@ -451,7 +484,7 @@ function buildFocusedHunks({
     const chunk = [];
     for (let i = w.from; i <= w.to; i += 1) {
       const ln = startLineOffset + i;
-      const lineStr = `L${ln}: ${lines[i] ?? ''}`;
+      const lineStr = `${ln}: ${lines[i] ?? ''}`;
       if (used + lineStr.length + 1 > maxChars) break;
       chunk.push(lineStr);
       used += lineStr.length + 1;
@@ -520,11 +553,11 @@ function renderProgressivePayload({
   if (decision === ADMISSION_DECISIONS.DEFER) {
     const header = formatAciRefStub(ref, { decision: ADMISSION_DECISIONS.DEFER });
     const importSection = structure.imports.length
-      ? `Imports:\n${structure.imports.slice(0, 10).map((im) => `L${im.line}: ${im.text}`).join('\n')}`
+      ? `Imports:\n${structure.imports.slice(0, 10).map((im) => `${im.line}: ${im.text}`).join('\n')}`
       : '';
     const symbolMap = structure.definitions.length
-      ? `Symbols:\n${structure.definitions.slice(0, 24).map((d) => `L${d.line}: [${d.kind}] ${d.name}`).join('\n')}`
-      : `Preview:\n${lines.slice(0, 8).map((l, idx) => `L${startLineOffset + idx}: ${l}`).join('\n')}`;
+      ? `Symbols:\n${structure.definitions.slice(0, 24).map((d) => `${d.line}: [${d.kind}] ${d.name}`).join('\n')}`
+      : `Preview:\n${lines.slice(0, 8).map((l, idx) => `${startLineOffset + idx}: ${l}`).join('\n')}`;
     const restoreHint = `Restore slice: expand_context({ ref: "${ref.uri}", startLine, endLine })`;
     const body = [importSection, symbolMap, restoreHint].filter(Boolean).join('\n\n');
     const candidate = wrapIfNeeded(header, body);
@@ -551,7 +584,7 @@ function renderProgressivePayload({
   const restoreFooter = `Expand omitted lines: expand_context({ ref: "${ref.uri}", startLine, endLine })`;
   const outlineLines = structure.definitions
     .slice(0, 20)
-    .map((d) => `L${d.line}: [${d.kind}] ${d.name}`);
+    .map((d) => `${d.line}: [${d.kind}] ${d.name}`);
   const outlineBlock = outlineLines.length ? `Outline:\n${outlineLines.join('\n')}` : '';
   const hunkBudget = Math.max(
     160,
@@ -616,12 +649,29 @@ export class PreInjectionAdmissionController {
   constructor({
     aciStore,
     ledger = null,
-    admissionMinChars = DEFAULT_ADMISSION_MIN_CHARS,
+    admissionMinChars = undefined,
+    workingSetReadMaxChars = undefined,
     maxSupervisorAdmissionCalls = DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
   } = {}) {
-    this.aciStore = aciStore;
+    this.aciStore = aciStore ?? new ReversibleContextStore();
     this.ledger = ledger;
-    this.admissionMinChars = Math.max(200, Number(admissionMinChars ?? DEFAULT_ADMISSION_MIN_CHARS));
+    const hasExplicitMinChars =
+      admissionMinChars !== undefined &&
+      admissionMinChars !== null &&
+      admissionMinChars !== '' &&
+      Number.isFinite(Number(admissionMinChars));
+    this._explicitAdmissionMinChars = hasExplicitMinChars
+      ? Math.max(200, Number(admissionMinChars))
+      : undefined;
+    this.admissionMinChars = this._explicitAdmissionMinChars ?? DEFAULT_ADMISSION_MIN_CHARS;
+    const hasExplicitWorkingSet =
+      workingSetReadMaxChars !== undefined &&
+      workingSetReadMaxChars !== null &&
+      workingSetReadMaxChars !== '' &&
+      Number.isFinite(Number(workingSetReadMaxChars));
+    this.workingSetReadMaxChars = hasExplicitWorkingSet
+      ? Math.max(0, Number(workingSetReadMaxChars))
+      : undefined;
     this.maxSupervisorAdmissionCalls = Math.max(
       0,
       Number(maxSupervisorAdmissionCalls ?? DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS),
@@ -655,7 +705,8 @@ export class PreInjectionAdmissionController {
     const norm = normalizeContextPath(rawPath);
     if (!norm) return;
     for (const key of this.activeHashesByPath.keys()) {
-      if (pathsMatch(key, norm)) {
+      const baseKey = key.split('#')[0];
+      if (pathsMatch(baseKey, norm)) {
         this.activeHashesByPath.delete(key);
       }
     }
@@ -697,15 +748,36 @@ export class PreInjectionAdmissionController {
       supervisorEnabled = true,
       supervisorConfigOverride = null,
       signal = null,
-      admissionMinChars = null,
+      admissionMinChars = undefined,
+      workingSetReadMaxChars = undefined,
       maxSupervisorAdmissionCalls = null,
     } = {},
   ) {
     const items = Array.isArray(executedBatch) ? executedBatch : [];
-    const minChars =
-      admissionMinChars != null && Number.isFinite(Number(admissionMinChars))
-        ? Math.max(200, Number(admissionMinChars))
-        : this.admissionMinChars;
+    const hasOptAdmissionMinChars =
+      admissionMinChars !== undefined &&
+      admissionMinChars !== null &&
+      admissionMinChars !== '' &&
+      Number.isFinite(Number(admissionMinChars));
+    const hasExplicitAdmissionMinChars =
+      hasOptAdmissionMinChars || this._explicitAdmissionMinChars !== undefined;
+    const minChars = hasOptAdmissionMinChars
+      ? Math.max(200, Number(admissionMinChars))
+      : this.admissionMinChars;
+    const optWorkingSetMax =
+      workingSetReadMaxChars !== undefined &&
+      workingSetReadMaxChars !== null &&
+      workingSetReadMaxChars !== '' &&
+      Number.isFinite(Number(workingSetReadMaxChars))
+        ? Math.max(0, Number(workingSetReadMaxChars))
+        : undefined;
+    const effectiveWorkingSetMax =
+      optWorkingSetMax ??
+      this.workingSetReadMaxChars ??
+      (hasExplicitAdmissionMinChars ? 0 : DEFAULT_WORKING_SET_READ_MAX_CHARS);
+    const probeMinChars = hasExplicitAdmissionMinChars
+      ? minChars
+      : DEFAULT_PROBE_ADMISSION_MIN_CHARS;
     const maxSupCalls =
       maxSupervisorAdmissionCalls != null && Number.isFinite(Number(maxSupervisorAdmissionCalls))
         ? Math.max(0, Number(maxSupervisorAdmissionCalls))
@@ -906,6 +978,9 @@ export class PreInjectionAdmissionController {
         priorStep: null,
       };
 
+      const isNoisyProbeTool = NOISY_PROBE_TOOLS.has(lowerTool);
+      const smallFastPathMaxChars = isNoisyProbeTool ? probeMinChars : minChars;
+
       // Deterministic Pre-Screen & Fast-Paths
       if (isErr) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
@@ -919,12 +994,21 @@ export class PreInjectionAdmissionController {
       } else if (isNarrowSlice) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'narrow_line_slice';
-      } else if (innerText.length <= minChars) {
+      } else if (innerText.length <= smallFastPathMaxChars) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'small_payload_fast_path';
       } else {
-        // Check DUPLICATE against activeHashesByPath or aciStore
-        const activeMem = normPath ? this.activeHashesByPath.get(normPath) : null;
+        // Check DUPLICATE against activeHashesByPath or aciStore BEFORE explicit_read_working_set
+        const isSliceRead =
+          args?.startLine != null ||
+          args?.endLine != null ||
+          args?.start_line != null ||
+          args?.end_line != null;
+        const sliceKey = normPath && isSliceRead ? `${normPath}#${lineRange}` : null;
+        const activeMem = normPath
+          ? ((sliceKey && this.activeHashesByPath.get(sliceKey)) ||
+              this.activeHashesByPath.get(normPath))
+          : null;
         const storeMatch =
           !activeMem && normPath
             ? this.aciStore?.findByPathAndHash?.(targetPath, contentSha256)
@@ -940,6 +1024,15 @@ export class PreInjectionAdmissionController {
           ctxRecord.decision = ADMISSION_DECISIONS.DUPLICATE;
           ctxRecord.priorStep = dupMatch.step ?? 0;
           ctxRecord.reason = `duplicate_unchanged_step_${ctxRecord.priorStep}`;
+        } else if (
+          lowerTool === 'read_file' &&
+          !isErr &&
+          !domainInfo.isDecoy &&
+          !domainInfo.suppressedAsDecoy &&
+          innerText.length <= effectiveWorkingSetMax
+        ) {
+          ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
+          ctxRecord.reason = 'explicit_read_working_set';
         } else if (
           (promptTarget && !domainInfo.isDecoy && innerText.length <= 2600) ||
           ((errorTarget || mutatedTarget) && innerText.length <= 6000) ||
@@ -1120,15 +1213,25 @@ export class PreInjectionAdmissionController {
                 step,
               })
             : null;
-        if (c.normPath && directMeta && !c.args?.startLine && !c.args?.endLine) {
-          this.activeHashesByPath.set(c.normPath, {
+        const isSliceRead =
+          c.args?.startLine != null ||
+          c.args?.endLine != null ||
+          c.args?.start_line != null ||
+          c.args?.end_line != null;
+        if (c.normPath && !c.isMutation && !c.lowerTool.startsWith('bash')) {
+          const directEntry = {
             sha256: c.contentSha256,
             step,
-            uri: directMeta.uri,
+            uri: directMeta?.uri ?? `artifact://${c.contentSha256}`,
             refId: null,
             lineRange: c.lineRange,
-          });
-          this.activeUriByPathStep.set(`${c.normPath}@${step}`, directMeta.uri);
+          };
+          if (!isSliceRead) {
+            this.activeHashesByPath.set(c.normPath, directEntry);
+          } else if (c.reason === 'explicit_read_working_set') {
+            this.activeHashesByPath.set(`${c.normPath}#${c.lineRange}`, directEntry);
+          }
+          this.activeUriByPathStep.set(`${c.normPath}@${step}`, directEntry.uri);
         }
         this.#recordSymbolsFromStructure(c.targetPath, c.structure);
       } else {
@@ -1257,6 +1360,7 @@ export async function admitToolBatch(executedBatch, opts = {}) {
       aciStore: opts.aciStore,
       ledger: opts.ledger ?? null,
       admissionMinChars: opts.admissionMinChars,
+      workingSetReadMaxChars: opts.workingSetReadMaxChars,
       maxSupervisorAdmissionCalls: opts.maxSupervisorAdmissionCalls,
     });
   return controller.admitBatch(executedBatch, opts);
