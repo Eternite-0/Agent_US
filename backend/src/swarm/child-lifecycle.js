@@ -1156,6 +1156,7 @@ export class ChildAgentManager {
             }
           }
 
+          const childAciMetrics = result?.aciMetrics ?? result?.reasoningMetrics?.aciMetrics ?? null;
           return {
             childSessionId,
             childTurnId: turnId,
@@ -1169,6 +1170,8 @@ export class ChildAgentManager {
             diffSummary,
             artifact: archivedArtifact,
             binding: payload.binding,
+            ...(childAciMetrics ? { aciMetrics: childAciMetrics } : {}),
+            ...(result?.reasoningMetrics ? { reasoningMetrics: result.reasoningMetrics } : {}),
           };
         } catch (err) {
           // Graceful runtime shutdown is an interruption, NOT user cancellation or failure — preserve state & dirty worktree!
