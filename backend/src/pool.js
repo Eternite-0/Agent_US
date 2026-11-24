@@ -837,14 +837,24 @@ function toAnthropicPayload(o, wireModel) {
 }
 
 function classifyError(err) {
-  const status = Number(err?.status ?? err?.statusCode ?? 0);
-  const message = String(err?.message ?? err ?? 'Unknown upstream error');
+  const explicitStatus = Number(
+    err?.status ?? err?.statusCode ?? err?.cause?.status ?? err?.cause?.statusCode ?? 0,
+  );
+  const causeMsg = String(err?.cause?.message ?? '');
+  const message = [String(err?.message ?? err ?? 'Unknown upstream error'), causeMsg]
+    .filter(Boolean)
+    .join(' | ');
+  const errCode = String(err?.code ?? err?.cause?.code ?? '');
+  const errName = String(err?.name ?? '');
+  const status =
+    explicitStatus ||
+    (/\b(429|500|502|503|504)\b/.exec(message) ? Number(RegExp.$1) : 0);
   const retryAfterRaw =
     err?.headers?.get?.('retry-after') ?? err?.headers?.['retry-after'];
   const retryAfterSec = retryAfterRaw ? Number(retryAfterRaw) : 0;
   const isRateLimit =
     status === 429 ||
-    /rate.?limit|too many requests|quota|insufficient_quota|429/i.test(message);
+    /rate.?limit|too many requests|quota|insufficient_quota|\b429\b/i.test(message);
   const isAuth =
     status === 401 ||
     status === 403 ||
@@ -852,7 +862,12 @@ function classifyError(err) {
   const isTransient =
     status >= 500 ||
     status === 408 ||
-    /timeout|econnrefused|fetch failed|network|overloaded|502|503|504/i.test(
+    errName === 'APIConnectionError' ||
+    errName === 'APIConnectionTimeoutError' ||
+    /^(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|EPIPE|ERR_STREAM_PREMATURE_CLOSE|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT)$/i.test(
+      errCode,
+    ) ||
+    /timeout|econnreset|econnrefused|epipe|eai_again|socket hang up|premature close|connection error|fetch failed|network|overloaded|internal server error|bad gateway|service unavailable|gateway timeout|\b500\b|\b502\b|\b503\b|\b504\b/i.test(
       message,
     );
   return { status, message, retryAfterSec, isRateLimit, isAuth, isTransient };
@@ -2373,10 +2388,18 @@ export class AccountPool {
 
   // ---- Routing, Stickiness, Failover & Cooldown ----
 
-  resolveRoutes(requestedModel, { provider = null, sessionKey = null } = {}) {
+  resolveRoutes(
+    requestedModel,
+    { provider = null, sessionKey = null, excludeAccountIds = null } = {},
+  ) {
     const now = Date.now();
     const reqModel = String(requestedModel || this.getDefaultModel() || '').trim();
     const ranks = this.#getProviderRanks();
+    const excludedSet = new Set(
+      excludeAccountIds
+        ? [...excludeAccountIds].filter(Boolean).map(String)
+        : [],
+    );
 
     // 1. Determine candidate (preset, targetAccountId, wireModel) pairs from mappings + pool_models
     const pairs = [];
@@ -2446,6 +2469,7 @@ export class AccountPool {
 
     for (const p of pairs) {
       for (const acc of allEnabled) {
+        if (excludedSet.has(acc.id)) continue;
         if (p.targetAccountId && acc.id !== p.targetAccountId) continue;
         if (p.targetPreset && acc.preset !== p.targetPreset) continue;
         const routeKey = `${acc.id}::${p.wireModel}`;
@@ -2483,8 +2507,14 @@ export class AccountPool {
     const cooling = candidates.filter((c) => c.cooldownUntil > now);
 
     const sortHealthy = (a, b) => {
-      const stickyRank = (route) => route.status === 'healthy' &&
-        route.accountId === stickyRoute?.accountId && route.wireModel === stickyRoute?.wireModel ? 0 : 1;
+      const stickyRank = (route) =>
+        route.status === 'healthy' &&
+        route.cooldownUntil <= now &&
+        !excludedSet.has(route.accountId) &&
+        route.accountId === stickyRoute?.accountId &&
+        route.wireModel === stickyRoute?.wireModel
+          ? 0
+          : 1;
       const aSticky = stickyRank(a);
       const bSticky = stickyRank(b);
       if (aSticky !== bSticky) return aSticky - bSticky;
@@ -2504,9 +2534,11 @@ export class AccountPool {
     if (this.legacyProviders?.routes) {
       for (const [pid, route] of this.legacyProviders.routes.entries()) {
         if (provider && pid !== provider) continue;
+        const legacyId = `legacy:${pid}`;
+        if (excludedSet.has(legacyId)) continue;
         ordered.push({
           source: 'legacy',
-          accountId: `legacy:${pid}`,
+          accountId: legacyId,
           preset: pid,
           label: pid,
           protocol: 'openai',
@@ -2557,6 +2589,11 @@ export class AccountPool {
         )
         .run(now, now, route.accountId);
     });
+  }
+
+  recordAccountFailure(accountId, err) {
+    if (!accountId || String(accountId).startsWith('legacy:')) return null;
+    return this.markRouteFailure({ source: 'pool', accountId: String(accountId) }, err);
   }
 
   markRouteFailure(route, err) {
@@ -3080,6 +3117,7 @@ export class PoolLlmAdapter extends LlmAdapter {
     const routes = this.pool.resolveRoutes(o.model, {
       provider: o.provider && o.provider !== 'pool' ? o.provider : null,
       sessionKey: o.sessionKey ?? null,
+      excludeAccountIds: o.excludeAccountIds ?? null,
     });
     if (!routes.length) {
       this.pool.metrics?.record('model_route', {
@@ -3093,8 +3131,10 @@ export class PoolLlmAdapter extends LlmAdapter {
       });
       throw new Fault('PROVIDER_UNAVAILABLE', 503, {
         message: `没有为模型「${o.model}」配置可用的启用账号，请前往「设置 → 账号号池」添加账号并获取模型。`,
+        exhausted: true,
       });
     }
+    const maxFailovers = Math.max(0, Number(o.maxFailoverAttempts ?? 3));
     let yielded = false;
     let lastErr = null;
     let lastRoute = null;
@@ -3102,12 +3142,30 @@ export class PoolLlmAdapter extends LlmAdapter {
     let failovers = 0;
     let cooldownHits = 0;
     let lastWasRateLimit = false;
+    let lastStatusCode = null;
+    let pendingFailover = null;
+    const triedAccountIds = [];
     for (const r of routes) {
+      if (attempts >= 1 && failovers >= maxFailovers) break;
       attempts++;
       if (attempts > 1) failovers++;
       if (Number(r.cooldownUntil || 0) > Date.now()) {
         cooldownHits++;
       }
+      if (pendingFailover) {
+        yield {
+          type: 'route-failover',
+          failover: {
+            attempt: pendingFailover.attempt,
+            statusCode: pendingFailover.statusCode,
+            fromAccountId: pendingFailover.fromAccountId,
+            toAccountId: r.accountId,
+            reason: pendingFailover.reason,
+          },
+        };
+        pendingFailover = null;
+      }
+      triedAccountIds.push(r.accountId);
       lastRoute = r;
       let routeEmitted = false;
       this.pool.markRouteStart(r);
@@ -3126,7 +3184,14 @@ export class PoolLlmAdapter extends LlmAdapter {
               },
             };
           }
-          if (chunk.type !== 'usage') yielded = true;
+          if (
+            chunk.type === 'text-delta' ||
+            chunk.type === 'reasoning-delta' ||
+            chunk.type === 'tool-call-delta' ||
+            (chunk.type === 'block-end' && chunk.block?.type === 'tool-call')
+          ) {
+            yielded = true;
+          }
           yield chunk;
         }
         if (!routeEmitted) {
@@ -3164,6 +3229,7 @@ export class PoolLlmAdapter extends LlmAdapter {
         if (o.signal?.aborted) throw err;
         const errInfo = classifyError(err);
         lastWasRateLimit = errInfo.isRateLimit;
+        lastStatusCode = errInfo.status || null;
         if (errInfo.isRateLimit) {
           cooldownHits++;
         }
@@ -3188,6 +3254,12 @@ export class PoolLlmAdapter extends LlmAdapter {
             message: String(err?.message ?? err),
           });
         }
+        pendingFailover = {
+          attempt: failovers + 1,
+          statusCode: errInfo.status || null,
+          fromAccountId: r.accountId,
+          reason: errInfo.message,
+        };
       } finally {
         this.pool.markRouteEnd(r);
       }
@@ -3208,9 +3280,15 @@ export class PoolLlmAdapter extends LlmAdapter {
         cooldownSkipped: lastWasRateLimit ? Math.max(0, cooldownHits - 1) : cooldownHits,
       },
     });
-    throw new Fault('PROVIDER_UNAVAILABLE', 503, {
+    const exhaustedErr = new Fault('PROVIDER_UNAVAILABLE', 503, {
       message: String(lastErr?.message ?? '号池内所有候选账号请求失败'),
+      exhausted: true,
+      statusCode: lastStatusCode ?? 503,
+      accountId: lastRoute?.accountId ?? null,
+      triedAccountIds,
     });
+    exhaustedErr.cause = lastErr;
+    throw exhaustedErr;
   }
 
   async *streamRoute(rawRoute, o) {

@@ -1436,14 +1436,14 @@ const DIAG_SKIP_DIRS = new Set([
   'var',
 ]);
 
-function normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir = null) {
+export function normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir = null) {
   let s = String(rawFile ?? '')
     .trim()
-    .replace(/^file:\/\/\/?/i, '');
+    .replace(/^file:\/\//i, '');
   if (!/^\\\\[^\\]/.test(s)) {
     s = s.replace(/\\\\/g, '\\');
   }
-  if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(s)) {
+  if (/^\/[A-Za-z]:/.test(s)) {
     s = s.slice(1);
   }
   if (workspaceRoot && s) {
@@ -1489,8 +1489,8 @@ function isBlockedDiagnosticsRel(relPath) {
 function extractStackLocation(line) {
   const s = String(line ?? '');
   const patterns = [
-    /\(((?:file:\/\/\/)?[^()\r\n]+?\.[cm]?[jt]sx?):(\d+)(?::(\d+))?\)/i,
-    /((?:file:\/\/\/|[A-Za-z]:[\\/]|[\w./\\-]+)[^():\s\r\n]*?\.[cm]?[jt]sx?):(\d+)(?::(\d+))?/i,
+    /\(((?:file:\/\/\/?)?[^()\r\n]+?\.[cm]?[jt]sx?):(\d+)(?::(\d+))?\)/i,
+    /((?:file:\/\/\/?|[A-Za-z]:[\\/]|[\w./\\-]+)[^():\s\r\n]*?\.[cm]?[jt]sx?):(\d+)(?::(\d+))?/i,
   ];
   for (const rx of patterns) {
     const m = rx.exec(s);
