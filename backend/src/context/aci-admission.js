@@ -280,15 +280,21 @@ function extractStructure(filePath, codeText, startLineOffset = 1) {
 function extractMutationPaths(toolName, args) {
   const lower = String(toolName || '').toLowerCase();
   const out = [];
+  const pushUnique = (raw) => {
+    const p = String(raw || '').trim();
+    if (p && !out.includes(p)) out.push(p);
+  };
   if (lower === 'apply_patch') {
     const patchText = String(args?.patch ?? args?.patchText ?? args?.input ?? '');
     for (const m of patchText.matchAll(/^\*\*\*\s+(?:Add|Update|Delete|Move to:)\s*(?:File:\s*)?(.+)$/gm)) {
-      const p = String(m[1] || '').trim();
-      if (p) out.push(p);
+      pushUnique(m[1]);
+    }
+    for (const m of patchText.matchAll(/^(?:\+\+\+|---)\s+(?:a\/|b\/)?([^\t\r\n]+)(?:\t.*)?$/gm)) {
+      const candidate = String(m[1] ?? '').trim();
+      if (candidate && candidate !== '/dev/null' && candidate !== 'dev/null') pushUnique(candidate);
     }
   } else {
-    const p = String(args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '').trim();
-    if (p) out.push(p);
+    pushUnique(args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '');
   }
   return out;
 }

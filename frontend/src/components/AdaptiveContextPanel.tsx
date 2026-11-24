@@ -147,6 +147,8 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
   );
   const circuitTimeoutSec =
     Math.round((((config?.circuitTimeoutMs ?? config?.timeoutMs ?? 8000) || 8000) / 1000) * 10) / 10;
+  const formatDtocWatermarkValue = (val: number): string =>
+    val >= 0 && val <= 2 ? `${Math.round(val * 100)}%` : `${val.toLocaleString()} tok`;
   const usedTok = watermarks?.usedTokens;
   const maxTok = watermarks?.maxTokens;
   const dtocWatermarkTok = watermarks?.dtocWatermark;
@@ -385,14 +387,14 @@ export const AdaptiveContextPanel: React.FC<AdaptiveContextPanelProps> = ({ clie
                 {usedTok !== undefined && maxTok !== undefined
                   ? `活跃预算占用 ${usedTok.toLocaleString()} / ${maxTok.toLocaleString()} tokens`
                   : '单步 DTOC 水位门限与验证后收尾保留金（防止长任务写完未交卷时提前耗尽上下文）'}
-                {dtocWatermarkTok !== undefined ? ` · 单步 DTOC 水位 ${dtocWatermarkTok.toLocaleString()} tokens` : ''}
+                {dtocWatermarkTok !== undefined ? ` · 单步 DTOC 水位 ${formatDtocWatermarkValue(dtocWatermarkTok)}` : ''}
               </span>
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end' }}>
               <span className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
                 {usedTok !== undefined && maxTok !== undefined
                   ? `${usedTok.toLocaleString()} / ${maxTok.toLocaleString()}`
-                  : `单步水位 ${(dtocWatermarkTok ?? currentDtocMinTokens).toLocaleString()} tok`}
+                  : `单步水位 ${formatDtocWatermarkValue(dtocWatermarkTok ?? currentDtocMinTokens)}`}
               </span>
               <span className="codex-status-chip" data-tone={postTestReserveActive ? 'warning' : undefined}>
                 {postTestReserveActive ? '完工保留金已激活' : '完工保留就绪'}

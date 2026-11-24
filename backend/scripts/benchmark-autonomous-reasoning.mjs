@@ -27,7 +27,7 @@ import {
   resolveTaskCriticalContextFiles,
 } from '../src/evaluation/autonomous-reasoning-benchmark.js';
 import { removeFixtureWorkspace } from '../src/evaluation/fixtures.js';
-import { parseCodexPatch } from '../src/patch-and-diagnostics.js';
+import { parseCodexPatch, parsePatch } from '../src/patch-and-diagnostics.js';
 import { BenchmarkSandbox, SANDBOX_MODES, runHardenedGitSync } from '../src/tools/benchmark-sandbox.js';
 import { scanCommandSyntax } from '../src/tools/command-analyzer.js';
 
@@ -1050,7 +1050,7 @@ function buildSafeArgsSummary(toolName, args) {
   } else if (toolName === 'apply_patch') {
     const patchText = String(args.patch ?? args.patchText ?? args.input ?? '');
     try {
-      const hunks = parseCodexPatch(patchText);
+      const { hunks } = parsePatch(patchText, { format: 'auto' });
       raw = `patch: ${hunks.map((h) => h.path).filter(Boolean).join(', ')}`;
     } catch {
       raw = 'patch: invalid';
@@ -1139,7 +1139,7 @@ export function authorizeRealBenchmarkApproval({
     if (!patchText) return false;
     let hunks;
     try {
-      hunks = parseCodexPatch(patchText);
+      hunks = parsePatch(patchText, { format: 'auto' }).hunks;
     } catch {
       return false;
     }

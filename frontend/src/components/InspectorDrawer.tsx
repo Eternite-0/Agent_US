@@ -1268,7 +1268,10 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
                     {latestAciWatermarks.dtocWatermark !== undefined && (
                       <span className="codex-status-chip tabular-nums" style={{ fontFamily: 'var(--font-mono)' }}>
-                        单步 DTOC 水位 {fmtTokens(latestAciWatermarks.dtocWatermark)}
+                        单步 DTOC 水位{' '}
+                        {latestAciWatermarks.dtocWatermark <= 2
+                          ? `${Math.round(latestAciWatermarks.dtocWatermark * 100)}%`
+                          : `${fmtTokens(latestAciWatermarks.dtocWatermark)} tok`}
                       </span>
                     )}
                     {latestAciWatermarks.postTestReserveActive !== undefined && (

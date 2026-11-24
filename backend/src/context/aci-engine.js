@@ -276,16 +276,21 @@ function parseToolArgs(rawArgs) {
 
 function extractPathsFromMutationToolCall(name, args) {
   const paths = [];
+  const addPath = (raw) => {
+    const norm = normalizeContextPath(raw);
+    if (norm && !paths.includes(norm)) paths.push(norm);
+  };
   if (name === 'apply_patch') {
-    const patchText = String(args?.patch ?? args?.input ?? '');
-    for (const match of patchText.matchAll(/^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+)$/gm)) {
-      const norm = normalizeContextPath(match[1]);
-      if (norm) paths.push(norm);
+    const patchText = String(args?.patch ?? args?.patchText ?? args?.input ?? '');
+    for (const match of patchText.matchAll(/^\*\*\*\s+(?:Add|Update|Delete|Move to:)\s*(?:File:\s*)?(.+)$/gm)) {
+      addPath(match[1]);
+    }
+    for (const match of patchText.matchAll(/^(?:\+\+\+|---)\s+(?:a\/|b\/)?([^\t\r\n]+)(?:\t.*)?$/gm)) {
+      const candidate = String(match[1] ?? '').trim();
+      if (candidate && candidate !== '/dev/null' && candidate !== 'dev/null') addPath(candidate);
     }
   } else {
-    const rawPath = args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '';
-    const norm = normalizeContextPath(rawPath);
-    if (norm) paths.push(norm);
+    addPath(args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '');
   }
   return paths;
 }
@@ -731,6 +736,7 @@ function isErrorToolMessage(msg, text) {
   const raw = String(text ?? '');
   const m = raw.match(/^<untrusted\s+id="([^"]+)"\s+bytes="\d+">([\s\S]*)<\/untrusted\s+id="\1">$/);
   const inner = m ? m[2] : raw;
+  if (/\[run_diagnostics\s+[^\]]*\bok=false\b/i.test(inner)) return true;
   if (ERROR_OUTPUT_RE.test(inner) || ERROR_OUTPUT_RE.test(raw)) return true;
   return false;
 }
