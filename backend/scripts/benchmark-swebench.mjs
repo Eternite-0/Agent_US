@@ -1623,6 +1623,39 @@ async function resolveDatasetInputPath(opts, runtimeDeps = {}) {
 }
 
 /**
+ * Commits any pre-existing uncommitted Docker image setup changes (e.g. Epoch
+ * `setup.py` / `tox.ini` dependency pins) before the agent runs so `git diff`
+ * captures only the agent's patch and applies cleanly during `--evaluate`.
+ */
+async function commitContainerBaselineChanges(workspaceRoot, fallbackCommit) {
+  cleanPythonTestCaches(workspaceRoot);
+  const statusOut = await runGitAsyncChecked(['status', '--porcelain'], workspaceRoot);
+  if (!statusOut.trim()) {
+    return fallbackCommit;
+  }
+  await runGitAsyncChecked(['add', '-A'], workspaceRoot);
+  const afterAddStatus = await runGitAsyncChecked(['status', '--porcelain'], workspaceRoot);
+  if (!afterAddStatus.trim()) {
+    return fallbackCommit;
+  }
+  await runGitAsyncChecked(
+    [
+      '-c',
+      'user.name=Agent_US',
+      '-c',
+      'user.email=swebench@agent-us.invalid',
+      'commit',
+      '--no-verify',
+      '-q',
+      '-m',
+      'swebench-container-env-baseline',
+    ],
+    workspaceRoot,
+  );
+  return (await runGitAsyncChecked(['rev-parse', 'HEAD'], workspaceRoot)).trim();
+}
+
+/**
  * Executes a single `(instance, arm)` evaluation turn via `DirectAgentRuntime`.
  */
 async function runSweBenchInstanceArm({
@@ -1741,10 +1774,17 @@ async function runSweBenchInstanceArm({
 
   let unsub = null;
   let sessionSandbox = null;
+  let effectiveBaseCommit = instance.base_commit;
   try {
     if (!opts.dryRun) {
       const scrubFn = runtimeDeps.scrubAntiCheatGitRefs ?? scrubAntiCheatGitRefs;
       await scrubFn(workspaceRoot, instance.base_commit);
+      if (extractedFromImage) {
+        effectiveBaseCommit = await commitContainerBaselineChanges(
+          workspaceRoot,
+          instance.base_commit,
+        );
+      }
     }
 
     if (containerMode) {
@@ -1841,7 +1881,7 @@ async function runSweBenchInstanceArm({
     }
 
     const wallClockMs = Math.max(1, Math.round(performance.now() - started));
-    const { patch } = await extractInstanceGitDiff(workspaceRoot, instance.base_commit);
+    const { patch } = await extractInstanceGitDiff(workspaceRoot, effectiveBaseCommit);
 
     const prediction = formatPredictionRecord({
       instanceId: instance.instance_id,
@@ -2206,6 +2246,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
           model:
             opts.model ||
             providerConfig?.model ||
+            telemetryByArm[opts.arms[0]]?.find((r) => r?.status !== 'env_error' && r?.model)?.model ||
             telemetryByArm[opts.arms[0]]?.[0]?.model ||
             (opts.dryRun ? 'swebench-dry-run-sim' : 'default'),
           maxSteps: opts.maxSteps,

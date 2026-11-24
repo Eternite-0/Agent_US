@@ -2,7 +2,7 @@ import test, { after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -310,6 +310,55 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
         }),
       /does not match expected baseCommit/,
     );
+
+    // 4. Windows symlink privilege fallback sets core.symlinks=false and restores tracked 120000 entries
+    const symSeed = makeTmp('extract-sym-seed-');
+    writeFileSync(join(symSeed, 'real.txt'), 'target content\n', 'utf8');
+    runGit(symSeed, ['init', '-q']);
+    runGit(symSeed, ['config', 'user.email', 'test@agent-us.invalid']);
+    runGit(symSeed, ['config', 'user.name', 'Test']);
+    runGit(symSeed, ['add', 'real.txt']);
+    // Register a tracked mode-120000 symlink entry directly in git index without OS symlink privileges
+    const linkTargetHash = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+      cwd: symSeed,
+      input: 'real.txt',
+      encoding: 'utf8',
+    }).trim();
+    runGit(symSeed, ['update-index', '--add', '--cacheinfo', `120000,${linkTargetHash},link.txt`]);
+    runGit(symSeed, ['commit', '-qm', 'seed with tracked symlink']);
+    const symBaseCommit = runGit(symSeed, ['rev-parse', 'HEAD']).trim();
+
+    const symTarget = join(makeTmp('extract-sym-out-'), 'repo');
+    const symCalls = [];
+    const symExtracted = await extractTestbedFromImage({
+      image: 'swe/img:sym',
+      targetDir: symTarget,
+      baseCommit: symBaseCommit,
+      pull: 'never',
+      execFileImpl: async (_bin, args) => {
+        symCalls.push(args);
+        if (args[0] === 'image') return { stdout: '[{}]', stderr: '' };
+        if (args[0] === 'create') return { stdout: 'cid-sym-1\n', stderr: '' };
+        if (args[0] === 'cp') {
+          throw Object.assign(new Error('symlink real.txt link.txt: A required privilege is not held by the client.'), {
+            stderr: 'symlink real.txt link.txt: A required privilege is not held by the client.',
+          });
+        }
+        if (args[0] === 'run') {
+          const { cpSync } = await import('node:fs');
+          cpSync(symSeed, symTarget, { recursive: true });
+          return { stdout: '', stderr: '' };
+        }
+        if (args[0] === 'rm') return { stdout: 'cid-sym-1', stderr: '' };
+        return { stdout: '', stderr: '' };
+      },
+    });
+    assert.equal(symExtracted.headCommit, symBaseCommit);
+    assert.equal(runGit(symTarget, ['config', '--local', '--get', 'core.symlinks']).trim(), 'false');
+    assert.equal(readFileSync(join(symTarget, 'link.txt'), 'utf8'), 'real.txt');
+    assert.equal(runGit(symTarget, ['status', '--porcelain']).trim(), '');
+    assert.ok(symCalls.some((a) => a[0] === 'run' && a.includes('swe/img:sym')));
+    assert.ok(symCalls.some((a) => a[0] === 'rm' && a[1] === '-f' && a[2] === 'cid-sym-1'));
   });
 
   test('scrubAntiCheatGitRefs destroys remotes, tags, future/diverged branches, reflogs, and unreachable objects while preserving baseCommit', async () => {

@@ -1050,11 +1050,30 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     assert.ok(firstRmiIdx > firstAciIdx && firstRmiIdx < secondRawIdx, 'Must rmi instance 1 before starting instance 2');
 
     // Verify --keep-images (cleanupImages: false) skips removeDockerImage
+    // Also verify dirty Epoch container baseline files (e.g. setup.py/tox.ini) are excluded from model_patch!
+    const dirtySeedRepo = makeTmp('swe-wp5-dirtyseed-');
+    cpSync(seedRepo, dirtySeedRepo, { recursive: true });
+    writeFileSync(join(dirtySeedRepo, 'docs', 'legacy_pricing_changelog.md'), '<!-- DO NOT EDIT - ARCHIVED DECOY -->\n' + readFileSync(join(dirtySeedRepo, 'docs', 'legacy_pricing_changelog.md'), 'utf8'), 'utf8');
+    writeFileSync(join(dirtySeedRepo, 'env_pin_setup.py'), '# container env setup pin\n', 'utf8');
+    runGit(dirtySeedRepo, ['add', 'env_pin_setup.py']);
+    runGit(dirtySeedRepo, ['commit', '-qm', 'add env_pin_setup.py']);
+    const dirtyBaseCommit = runGit(dirtySeedRepo, ['rev-parse', 'HEAD']);
+    const dirtyDsPath = join(makeTmp('swe-wp5-dirtyds-'), 'ds.jsonl');
+    writeFileSync(
+      dirtyDsPath,
+      JSON.stringify({
+        instance_id: 'acme__dirty-container-1',
+        repo: 'acme/discounts',
+        base_commit: dirtyBaseCommit,
+        problem_statement: 'Fix cap.',
+      }) + '\n',
+      'utf8',
+    );
     const keepOut = makeTmp('swe-wp5-keep-');
     const keepRmiCalls = [];
-    await runSweBenchBenchmark(
+    const keepRes = await runSweBenchBenchmark(
       {
-        dataset: cachePath,
+        dataset: dirtyDsPath,
         limit: 1,
         arms: ['raw_full'],
         dockerPreset: 'epoch',
@@ -1063,8 +1082,10 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
       },
       {
         extractTestbedFromImage: async ({ targetDir }) => {
-          cpSync(seedRepo, targetDir, { recursive: true });
-          return { targetDir, headCommit: baseCommit };
+          cpSync(dirtySeedRepo, targetDir, { recursive: true });
+          // Simulate pre-existing container setup modification on top of base_commit
+          writeFileSync(join(targetDir, 'env_pin_setup.py'), '# container env setup pin == 1.0\n', 'utf8');
+          return { targetDir, headCommit: dirtyBaseCommit };
         },
         createDockerAdapter: makeStubDockerAdapter,
         createAdapter: () => new PrefixBlockCacheSimulatorAdapter(),
@@ -1075,6 +1096,9 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
       },
     );
     assert.equal(keepRmiCalls.length, 0, '--keep-images must NOT invoke removeDockerImage');
+    const keepPatch = keepRes.predictionsByArm.raw_full[0]?.model_patch ?? '';
+    assert.match(keepPatch, /src\/discounts\/calculator\.py/);
+    assert.equal(keepPatch.includes('env_pin_setup.py'), false, 'Pre-existing container env baseline edits must not leak into model_patch');
 
     // Verify env_error fault tolerance + --resume retry + latest-wins deduplication
     const errOut = makeTmp('swe-wp5-enverr-');

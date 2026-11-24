@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, isAbsolute, posix as posixPath, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, posix as posixPath, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { analyzeCommand, scanCommandSyntax } from '../tools/command-analyzer.js';
 import { buildStrictSandboxEnv, runHardenedGit } from '../tools/benchmark-sandbox.js';
@@ -625,13 +625,67 @@ export async function extractTestbedFromImage({
     throw new Error(`docker create did not return a valid container ID for image "${img}"`);
   }
 
+  let usedSymlinkFallback = false;
   try {
-    await invokeExecFile(execFileImpl, dockerBin, ['cp', `${cid}:/testbed/.`, resolvedTargetDir], {
-      env,
-      windowsHide: true,
-      timeout: 300_000,
-      maxBuffer: 20 * 1024 * 1024,
-    });
+    try {
+      await invokeExecFile(execFileImpl, dockerBin, ['cp', `${cid}:/testbed/.`, resolvedTargetDir], {
+        env,
+        windowsHide: true,
+        timeout: 300_000,
+        maxBuffer: 20 * 1024 * 1024,
+      });
+    } catch (cpErr) {
+      const cpErrMsg = `${cpErr?.stderr ?? ''} ${cpErr?.message ?? ''}`;
+      if (!/privilege is not held|symbolic link|symlink/i.test(cpErrMsg)) {
+        throw cpErr;
+      }
+      // Windows non-Developer-Mode environments cannot materialize Linux symlinks via `docker cp`.
+      // Copy all non-symlink files (including .git and uncommitted env pins), then restore tracked symlinks via `core.symlinks=false`.
+      usedSymlinkFallback = true;
+      rmSync(resolvedTargetDir, { recursive: true, force: true });
+      mkdirSync(resolvedTargetDir, { recursive: true });
+      const hostMount = realpathIfExists(resolvedTargetDir);
+      try {
+        await invokeExecFile(
+          execFileImpl,
+          dockerBin,
+          [
+            'run',
+            '--rm',
+            '--network=none',
+            '--entrypoint',
+            'sh',
+            '-v',
+            `${hostMount}:/out:rw`,
+            img,
+            '-c',
+            'cd /testbed && find . -mindepth 1 ! -type l -print0 | tar --no-recursion --null -T - -cf - | tar -C /out -xm --no-same-owner --no-same-permissions -f -',
+          ],
+          {
+            env,
+            windowsHide: true,
+            timeout: 300_000,
+            maxBuffer: 20 * 1024 * 1024,
+          },
+        );
+      } catch {
+        rmSync(resolvedTargetDir, { recursive: true, force: true });
+        mkdirSync(resolvedTargetDir, { recursive: true });
+        await invokeExecFile(
+          execFileImpl,
+          dockerBin,
+          ['cp', `${cid}:/testbed/.git`, join(resolvedTargetDir, '.git')],
+          {
+            env,
+            windowsHide: true,
+            timeout: 300_000,
+            maxBuffer: 20 * 1024 * 1024,
+          },
+        );
+        await execGit(gitRunner, ['config', 'core.symlinks', 'false'], resolvedTargetDir);
+        await execGit(gitRunner, ['checkout', '--force', '--detach', 'HEAD'], resolvedTargetDir);
+      }
+    }
   } finally {
     await invokeExecFile(execFileImpl, dockerBin, ['rm', '-f', cid], {
       env,
@@ -642,6 +696,35 @@ export async function extractTestbedFromImage({
 
   await execGit(gitRunner, ['config', 'core.autocrlf', 'false'], resolvedTargetDir);
   await execGit(gitRunner, ['config', 'core.filemode', 'false'], resolvedTargetDir);
+  if (usedSymlinkFallback) {
+    await execGit(gitRunner, ['config', 'core.symlinks', 'false'], resolvedTargetDir);
+    const lsRes = await execGit(gitRunner, ['ls-files', '-s'], resolvedTargetDir, {
+      allowNonZero: true,
+    });
+    const symlinkPaths = [];
+    for (const line of String(lsRes.stdout ?? '').split(/\r?\n/)) {
+      const m = line.match(/^120000\s+[0-9a-f]+\s+\d+\t(.+)$/);
+      if (m?.[1]) {
+        let p = m[1].trim();
+        if (p.startsWith('"') && p.endsWith('"')) {
+          try {
+            p = JSON.parse(p);
+          } catch {
+            p = p.slice(1, -1);
+          }
+        }
+        if (p) symlinkPaths.push(p);
+      }
+    }
+    for (let i = 0; i < symlinkPaths.length; i += 50) {
+      await execGit(
+        gitRunner,
+        ['checkout', '--force', '--', ...symlinkPaths.slice(i, i + 50)],
+        resolvedTargetDir,
+        { allowNonZero: true },
+      );
+    }
+  }
 
   const userNameRes = await execGit(gitRunner, ['config', '--local', '--get', 'user.name'], resolvedTargetDir, {
     allowNonZero: true,
