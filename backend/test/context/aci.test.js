@@ -934,8 +934,9 @@ test('Stage 4: classifyCriticalDomains detects 5 protected domains, suppresses d
     assert.ok(hiddenRes.domains.includes('hidden_acceptance'));
 
     assert.equal(isDecoyCue('src/legacy/auth-v0.js', ''), true);
-    assert.equal(isDecoyCue('docs/CHANGELOG.md', '# Changelog'), true);
-    assert.equal(isDecoyCue('src/notes.js', '// @deprecated v1-compat shim'), true);
+    assert.equal(isDecoyCue('docs/CHANGELOG.md', '# Changelog'), false);
+    assert.equal(isDecoyCue('src/notes.js', '// @deprecated v1-compat shim'), false);
+    assert.equal(isDecoyCue('src/archived-banner.js', '// DO NOT EDIT - ARCHIVED DECOY\nexport const x = 1;'), true);
     const decoyAuth = classifyCriticalDomains({
       path: 'src/legacy/auth-v0.js',
       content: 'export function verifyToken() { return false; }',
@@ -979,7 +980,7 @@ test('Stage 4: classifyCriticalDomains detects 5 protected domains, suppresses d
     const supervisor = new ContextSupervisor({ store, pool, adapter });
     const aciStore = new ReversibleContextStore(store);
     const ledger = new ContextEvidenceLedger();
-    const controller = new PreInjectionAdmissionController({ aciStore, ledger });
+    const controller = new PreInjectionAdmissionController({ aciStore, ledger, workingSetReadMaxChars: 2600 });
 
     const authGuardCode =
       Array.from({ length: 55 }, (_, i) => `export function helperAuth${i}(x) { return x + ${i}; }`).join('\n') +
@@ -1334,7 +1335,7 @@ test('Stage 4 calibration: ACI-SKIP stubs, json_key outline + >2600 CONTRACT.jso
       },
     };
     const supervisor = new ContextSupervisor({ store, pool, adapter: calibAdapter });
-    const controller = new PreInjectionAdmissionController({ aciStore, ledger });
+    const controller = new PreInjectionAdmissionController({ aciStore, ledger, workingSetReadMaxChars: 2600 });
 
     const contractObj = {
       contractVersion: '2.4.0',
