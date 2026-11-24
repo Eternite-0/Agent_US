@@ -1,9 +1,18 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { EvaluationRunner } from './runner.js';
 import { EvaluationRecorder } from './recorder.js';
 import { EvaluationRegistry } from './registry.js';
 import { createBenchmarkDataset, createRealEngineeringDataset } from './dataset.js';
+import {
+  ACI_ARM_PROFILES,
+  computeWilson95CI,
+  exportPaperTablesLatex,
+  exportPaperTablesMarkdown,
+} from './aci-governance-benchmark.js';
 import {
   OSS_BENCHMARK_ID,
   OSS_BENCHMARK_VERSION,
@@ -28,6 +37,189 @@ export const REAL_ENGINEERING_DATASET_VERSION = '1.0.0';
 export { OSS_BENCHMARK_ID, OSS_BENCHMARK_VERSION, OSS_DATASET_VERSION };
 const TERMINAL_TURN_STATES = new Set(['completed', 'failed', 'cancelled']);
 const TERMINAL_EVALUATION_STATUSES = new Set(['passed', 'failed', 'cancelled', 'timeout']);
+export const DEFAULT_ACI_EVIDENCE_DIR = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  'docs',
+  'evidence',
+);
+
+function normalizeAblationArmSummary(arm, rawArm = {}, armProfiles = {}) {
+  const passedTrials = Math.max(0, Math.trunc(Number(rawArm?.passedTrials ?? 0) || 0));
+  const totalTrials = Math.max(0, Math.trunc(Number(rawArm?.totalTrials ?? 0) || 0));
+  const failedTrials = Math.max(
+    0,
+    Math.trunc(Number(rawArm?.failedTrials ?? Math.max(0, totalTrials - passedTrials)) || 0),
+  );
+  const rawCi = rawArm?.passRateCI;
+  const passRateCI =
+    rawCi && typeof rawCi === 'object' && Number.isFinite(Number(rawCi.rate))
+      ? {
+          rate: Number(rawCi.rate),
+          lower: Number(rawCi.lower ?? 0),
+          upper: Number(rawCi.upper ?? 0),
+          ci95HalfWidth: Number(
+            rawCi.ci95HalfWidth ?? Number(((Number(rawCi.upper ?? 0) - Number(rawCi.lower ?? 0)) / 2).toFixed(4)),
+          ),
+        }
+      : computeWilson95CI(passedTrials, totalTrials);
+  const supRaw = rawArm?.supervisorCost && typeof rawArm.supervisorCost === 'object' ? rawArm.supervisorCost : {};
+  const tokRaw = rawArm?.tokenBreakdown && typeof rawArm.tokenBreakdown === 'object' ? rawArm.tokenBreakdown : {};
+  const decRaw = rawArm?.decisions && typeof rawArm.decisions === 'object' ? rawArm.decisions : {};
+  return {
+    arm,
+    aciProfile:
+      armProfiles?.[arm]?.aciProfile ??
+      rawArm?.aciProfile ??
+      ACI_ARM_PROFILES[arm]?.aciProfile ??
+      null,
+    passedTrials,
+    totalTrials,
+    failedTrials,
+    passRateCI,
+    pairedPassTokenReduction:
+      rawArm?.pairedPassTokenReduction == null ? null : Number(rawArm.pairedPassTokenReduction),
+    pairedPassCount: Math.max(0, Math.trunc(Number(rawArm?.pairedPassCount ?? 0) || 0)),
+    tokensPerCompletedPass:
+      rawArm?.tokensPerCompletedPass == null ? null : Number(rawArm.tokensPerCompletedPass),
+    meanTokensOnPassedTrials:
+      rawArm?.meanTokensOnPassedTrials == null ? null : Number(rawArm.meanTokensOnPassedTrials),
+    tokenReduction: Number(rawArm?.tokenReduction ?? 0) || 0,
+    criticalContextRecall: Number(rawArm?.criticalContextRecall ?? 0) || 0,
+    contextPrecision: Number(rawArm?.contextPrecision ?? 0) || 0,
+    falseNegativeRate: Number(rawArm?.falseNegativeRate ?? 0) || 0,
+    usefulTokenRatio: Number(rawArm?.usefulTokenRatio ?? 0) || 0,
+    cacheHitRate: Number(rawArm?.cacheHitRate ?? 0) || 0,
+    recoverySuccessRate: Number(rawArm?.recoverySuccessRate ?? 0) || 0,
+    finalTaskSuccessRate:
+      rawArm?.finalTaskSuccessRate != null
+        ? Number(rawArm.finalTaskSuccessRate)
+        : totalTrials > 0
+          ? Number((passedTrials / totalTrials).toFixed(4))
+          : 0,
+    supervisorCost: {
+      calls: Math.max(0, Math.trunc(Number(supRaw.calls ?? 0) || 0)),
+      inputTokens: Math.max(0, Math.trunc(Number(supRaw.inputTokens ?? 0) || 0)),
+      outputTokens: Math.max(0, Math.trunc(Number(supRaw.outputTokens ?? 0) || 0)),
+      totalTokens: Math.max(0, Math.trunc(Number(supRaw.totalTokens ?? 0) || 0)),
+      durationMs: Math.max(0, Math.trunc(Number(supRaw.durationMs ?? 0) || 0)),
+      tokenShareOfTotal: Number(supRaw.tokenShareOfTotal ?? 0) || 0,
+    },
+    tokenBreakdown: {
+      totalTokens: Math.max(0, Math.trunc(Number(tokRaw.totalTokens ?? 0) || 0)),
+      meanTokens: Math.max(0, Math.trunc(Number(tokRaw.meanTokens ?? 0) || 0)),
+      inputTokens: Math.max(0, Math.trunc(Number(tokRaw.inputTokens ?? 0) || 0)),
+      outputTokens: Math.max(0, Math.trunc(Number(tokRaw.outputTokens ?? 0) || 0)),
+      cacheReadTokens: Math.max(0, Math.trunc(Number(tokRaw.cacheReadTokens ?? 0) || 0)),
+      cacheWriteTokens: Math.max(0, Math.trunc(Number(tokRaw.cacheWriteTokens ?? 0) || 0)),
+      eligibleInputTokens: Math.max(0, Math.trunc(Number(tokRaw.eligibleInputTokens ?? 0) || 0)),
+    },
+    supersededEvictions: Math.max(0, Math.trunc(Number(rawArm?.supersededEvictions ?? 0) || 0)),
+    supersededTokensSaved: Math.max(0, Math.trunc(Number(rawArm?.supersededTokensSaved ?? 0) || 0)),
+    partialRecoveries: Math.max(0, Math.trunc(Number(rawArm?.partialRecoveries ?? 0) || 0)),
+    recoveryTokensSaved: Math.max(0, Math.trunc(Number(rawArm?.recoveryTokensSaved ?? 0) || 0)),
+    antiThrashingTriggered: Math.max(0, Math.trunc(Number(rawArm?.antiThrashingTriggered ?? 0) || 0)),
+    decisions: {
+      DIRECT: Math.max(0, Math.trunc(Number(decRaw.DIRECT ?? 0) || 0)),
+      SUPPORTING: Math.max(0, Math.trunc(Number(decRaw.SUPPORTING ?? 0) || 0)),
+      DEFER: Math.max(0, Math.trunc(Number(decRaw.DEFER ?? 0) || 0)),
+      DUPLICATE: Math.max(0, Math.trunc(Number(decRaw.DUPLICATE ?? 0) || 0)),
+      IRRELEVANT: Math.max(0, Math.trunc(Number(decRaw.IRRELEVANT ?? 0) || 0)),
+    },
+  };
+}
+
+/**
+ * Reads the latest archived ACI ablation summary (`*-summary.json`) and its
+ * companion Markdown/LaTeX tables from `evidenceDir` (default `backend/docs/evidence`).
+ */
+export function loadLatestAciAblationSummary({ evidenceDir = DEFAULT_ACI_EVIDENCE_DIR } = {}) {
+  const dir = resolve(String(evidenceDir || DEFAULT_ACI_EVIDENCE_DIR));
+  if (!existsSync(dir)) return { available: false };
+
+  let entries = [];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return { available: false };
+  }
+
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !/^.+?-summary\.json$/i.test(entry.name)) continue;
+    const summaryPath = join(dir, entry.name);
+    try {
+      const stat = statSync(summaryPath);
+      const parsed = JSON.parse(readFileSync(summaryPath, 'utf8'));
+      const byArm = parsed?.metrics?.byArm;
+      if (!parsed || typeof parsed !== 'object' || !byArm || typeof byArm !== 'object') continue;
+      const parsedTs = parsed.createdAt ? Date.parse(String(parsed.createdAt)) : NaN;
+      const sortMs = Number.isFinite(parsedTs) ? parsedTs : stat.mtimeMs;
+      candidates.push({
+        name: entry.name,
+        prefix: entry.name.replace(/-summary\.json$/i, ''),
+        sortMs,
+        mtimeMs: stat.mtimeMs,
+        parsed,
+      });
+    } catch {
+      // Skip malformed or unrelated summary files cleanly
+    }
+  }
+
+  if (candidates.length === 0) return { available: false };
+
+  candidates.sort((a, b) => b.sortMs - a.sortMs || b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
+  const latest = candidates[0];
+  const { parsed, prefix, mtimeMs } = latest;
+  const byArmRaw = parsed.metrics?.byArm ?? {};
+  const rawArms =
+    Array.isArray(parsed.arms) && parsed.arms.length > 0
+      ? parsed.arms
+      : Array.isArray(parsed.metrics?.arms) && parsed.metrics.arms.length > 0
+        ? parsed.metrics.arms
+        : Object.keys(byArmRaw);
+  const armOrder = rawArms.filter((arm) => Object.hasOwn(byArmRaw, arm));
+  const summaryByArm = {};
+  for (const arm of armOrder) {
+    summaryByArm[arm] = normalizeAblationArmSummary(arm, byArmRaw[arm], parsed.armProfiles);
+  }
+
+  const texPath = join(dir, `${prefix}-paper-tables.tex`);
+  const mdPath = join(dir, `${prefix}-paper-tables.md`);
+  let latexTable = '';
+  let markdownTable = '';
+  try {
+    latexTable = existsSync(texPath) ? readFileSync(texPath, 'utf8') : exportPaperTablesLatex(parsed);
+  } catch {
+    latexTable = exportPaperTablesLatex(parsed);
+  }
+  try {
+    markdownTable = existsSync(mdPath) ? readFileSync(mdPath, 'utf8') : exportPaperTablesMarkdown(parsed);
+  } catch {
+    markdownTable = exportPaperTablesMarkdown(parsed);
+  }
+
+  return {
+    available: true,
+    suite: String(parsed.suite ?? 'aci'),
+    model:
+      parsed.model != null
+        ? String(parsed.model)
+        : parsed.mode === 'deterministic'
+          ? 'deterministic-probe'
+          : null,
+    mode: parsed.mode != null ? String(parsed.mode) : null,
+    benchmarkId: parsed.benchmarkId != null ? String(parsed.benchmarkId) : null,
+    createdAt: parsed.createdAt ? String(parsed.createdAt) : new Date(mtimeMs).toISOString(),
+    archivePrefix: prefix,
+    armOrder,
+    summaryByArm,
+    latexTable: redactSecrets(latexTable),
+    markdownTable: redactSecrets(markdownTable),
+  };
+}
 
 function hydrateEvaluationRun(run) {
   if (!run || typeof run !== 'object') return run ?? null;
@@ -693,7 +885,7 @@ export class EvaluationService {
   #controllers = new Map();
   #activeExecutions = new Map();
 
-  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, judge = null, maxConcurrency = 2, timeoutMs = 120_000, memory = null, capabilityRegistry = null, ossCacheDir = null, ossRepoOverrides = null, sandbox = null, sandboxOptions = null } = {}) {
+  constructor({ store, directAgent, runtimeFactory = null, jobQueue = null, judge = null, maxConcurrency = 2, timeoutMs = 120_000, memory = null, capabilityRegistry = null, ossCacheDir = null, ossRepoOverrides = null, sandbox = null, sandboxOptions = null, aciEvidenceDir = null } = {}) {
     if (!store || typeof store.add !== 'function' || typeof store.list !== 'function') {
       throw new TypeError('EvaluationService requires Store');
     }
@@ -701,6 +893,7 @@ export class EvaluationService {
     this.directAgent = directAgent ?? null;
     this.ossCacheDir = ossCacheDir ? String(ossCacheDir) : null;
     this.ossRepoOverrides = ossRepoOverrides && typeof ossRepoOverrides === 'object' ? ossRepoOverrides : null;
+    this.aciEvidenceDir = aciEvidenceDir ? resolve(String(aciEvidenceDir)) : DEFAULT_ACI_EVIDENCE_DIR;
     this.sandbox = sandbox ?? null;
     this.sandboxOptions = sandboxOptions && typeof sandboxOptions === 'object' ? sandboxOptions : null;
     const datasetSandboxOpts = {
@@ -882,6 +1075,10 @@ export class EvaluationService {
 
   getRun(id) {
     return hydrateEvaluationRun(this.store.get('evaluation_runs', String(id)));
+  }
+
+  getAciAblationSummary({ evidenceDir = this.aciEvidenceDir } = {}) {
+    return loadLatestAciAblationSummary({ evidenceDir });
   }
 
   start({ benchmarkId = BENCHMARK_ID, taskIds = null, model = null, projectId = null, concurrency = this.maxConcurrency, timeoutMs = this.timeoutMs, maxAttempts = 1 } = {}) {

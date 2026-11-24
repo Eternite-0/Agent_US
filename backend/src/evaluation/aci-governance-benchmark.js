@@ -53,16 +53,30 @@ export const ACI_GOVERNANCE_25_TASK_IDS = Object.freeze([
   ...ACI_25_EXTRA_TASK_IDS,
 ]);
 
+export const ACI_26_EXTRA_TASK_IDS = Object.freeze([
+  'aci-07-cross-module-evolution',
+]);
+
+export const ACI_GOVERNANCE_26_TASK_IDS = Object.freeze([
+  ...ACI_GOVERNANCE_25_TASK_IDS,
+  ...ACI_26_EXTRA_TASK_IDS,
+]);
+
+export const TRAJECTORY_EVICTION_V26_DTOC_POLICY = 'trajectory_eviction_v26';
+
 export const ACI_25_PROFILE_ALIASES = Object.freeze(new Set(['full_aci', 'aci_25']));
+export const ACI_26_PROFILE_ALIASES = Object.freeze(new Set(['full_aci', 'aci_25', 'aci_26']));
 
 export function normalizeAciProfileName(profile) {
   const clean = String(profile ?? '').trim();
   if (!clean) return 'full_aci';
-  return clean === 'aci_25' ? 'aci_25' : clean;
+  if (clean === 'aci_25') return 'aci_25';
+  if (clean === 'aci_26') return 'aci_26';
+  return clean;
 }
 
 export function isFullAciProfile(profile) {
-  return ACI_25_PROFILE_ALIASES.has(String(profile ?? '').trim());
+  return ACI_26_PROFILE_ALIASES.has(String(profile ?? '').trim());
 }
 
 export const ACI_ARM_PROFILES = Object.freeze({
@@ -1161,6 +1175,150 @@ const ACI_06_SPEC = [
   '- `transitionTerminalState(currentState, nextState)` enforces CAS: once `currentState` is `"completed" | "failed" | "cancelled"`, refuse transition (`{ ok: false, state: currentState, overwritten: false }`).',
   '- `runContractIntegration({ contract, baseFiles = {}, workerOutputs = [], claimedVerdict = "pass", testExitCode = 0 } = {})` validates all worker outputs, runs `mergeParallelArtifacts`, calls `evaluateReviewerHardGate`, and computes deterministic `integrationDigest`.',
 ].join('\n') + '\n';
+
+const ACI_07_CONTRACT_JSON = JSON.stringify(
+  {
+    schemaVersion: 2,
+    contractId: 'aci-07-cross-module-evolution',
+    allowedStates: ['pending', 'running', 'completed', 'failed', 'cancelled'],
+    terminalStates: ['completed', 'failed', 'cancelled'],
+    transitions: {
+      pending: ['running', 'cancelled'],
+      running: ['completed', 'failed', 'cancelled'],
+      completed: [],
+      failed: [],
+      cancelled: [],
+    },
+    partitionKeyPattern: '^[a-z0-9][a-z0-9._-]{1,63}$',
+    requiredEnvelopeFields: [
+      'schemaVersion',
+      'eventId',
+      'correlationId',
+      'partitionKey',
+      'state',
+      'payload',
+    ],
+    allowV1MigrationDefault: true,
+    evolutionInvariants: Array.from({ length: 22 }, (_, i) => ({
+      id: `EVOL_INV_${String(i + 1).padStart(2, '0')}`,
+      enforced: true,
+      description: `Cross-module evolution invariant ${i + 1}: enforce terminal state immutability, strict v2 schemaVersion, explicit correlationId and partitionKey validation without default fallback, canonical SHA-256 envelope digest, and contract-required pipeline-runner caller propagation.`,
+    })),
+  },
+  null,
+  2,
+) + '\n';
+
+const ACI_07_SPEC = [
+  '# Cross-Module Contract, Adapter, Event Pipeline & State Validator Evolution Specification',
+  '',
+  '## 1. State Validator (`src/validators/state-validator.js`)',
+  '- `validateStateTransition(currentState, nextState, contract)`:',
+  '  - Terminal states (`completed`, `failed`, `cancelled`, or `contract.terminalStates`) are immutable: attempting to transition out of any terminal state MUST return `{ ok: false, code: "TERMINAL_STATE_IMMUTABLE", state: currentState, overwritten: false }`.',
+  '  - Non-terminal transitions must appear in `contract.transitions[currentState]` (default `pending -> [running, cancelled]`, `running -> [completed, failed, cancelled]`); otherwise return `{ ok: false, code: "INVALID_STATE_TRANSITION", state: currentState, overwritten: false }`.',
+  '  - Allowed transitions return `{ ok: true, code: "OK", state: nextState, overwritten: false }`.',
+  '- `validateEvolutionEnvelope(envelope, contract)`:',
+  '  - Require object with `Number(envelope.schemaVersion) === 2` (`INVALID_SCHEMA_VERSION`), non-empty `eventId` (`INVALID_SCHEMA_VERSION`), non-empty trimmed `correlationId` (`MISSING_CORRELATION_ID`), `partitionKey` matching `contract.partitionKeyPattern` (`INVALID_PARTITION_KEY`), valid `state` in `contract.allowedStates`, and non-array object `payload`.',
+  '',
+  '## 2. V2 Envelope Adapter (`src/adapters/v2-envelope-adapter.js`)',
+  '- `computeEnvelopeDigest(envelope)` computes `sha256Hex(canonicalJson({ schemaVersion: Number(envelope.schemaVersion), eventId, correlationId, partitionKey, state, payload }))` using `src/core/evolution-codes.js`.',
+  '- `verifyEnvelopeChecksum(envelope)` returns `true` iff `typeof envelope?.checksum === "string"` and `envelope.checksum === computeEnvelopeDigest(envelope)`.',
+  '- `adaptV1ToV2Envelope(rawEvent, { allowV1Migration = true } = {})`:',
+  '  - For `schemaVersion === 2`: normalize string fields, preserve explicit `checksum` if supplied (or compute if omitted), and return `{ ok: true, migrationApplied: false, envelope }`.',
+  '  - For v1 (`schemaVersion === 1` or omitted): if `!allowV1Migration` return `{ ok: false, code: "INVALID_SCHEMA_VERSION" }`. Derive `correlationId` from `correlationId || traceId || requestId` (`MISSING_CORRELATION_ID` if empty) and `partitionKey` from `partitionKey || tenantId` lowercased (`INVALID_PARTITION_KEY` if missing or invalid — NEVER fall back to `"default"`!). Return `{ ok: true, migrationApplied: true, envelope }` with `schemaVersion: 2` and `checksum`.',
+  '',
+  '## 3. Event Transformer (`src/pipeline/event-transformer.js`)',
+  '- `transformPipelineBatch(events = [], options = {})` MUST require `options.contract` (if missing/non-object return `{ ok: false, code: "MISSING_CONTRACT", accepted: [], rejected: [], batchDigest: null }`).',
+  '- For each event: adapt via `adaptV1ToV2Envelope`, validate via `validateEvolutionEnvelope`, verify `checksum` via `verifyEnvelopeChecksum` (`CHECKSUM_MISMATCH` on mismatch), and collect `accepted` (each with `digest` and `migrationApplied`) vs `rejected` (`{ eventId, code }`).',
+  '- Return `{ ok: rejected.length === 0, code: rejected.length === 0 ? "OK" : "BATCH_REJECTED", accepted, rejected, batchDigest }`.',
+  '',
+  '## 4. Pipeline Runner Caller (`src/cli/pipeline-runner.js`)',
+  '- `runEvolutionPipeline({ contract, currentState = "pending", nextState = "running", events = [], allowV1Migration = true } = {})` MUST pass `{ contract, allowV1Migration }` to `transformPipelineBatch`, fail closed before batch processing when `!contract` (`MISSING_CONTRACT`) or `!transition.ok`, and return `{ ok, code, state, accepted, rejected, batchDigest, pipelineDigest, summary }`.',
+].join('\n') + '\n';
+
+const ACI_07_EVOLUTION_CODES = (() => {
+  const lines = [
+    "import { createHash } from 'node:crypto';",
+    'export const EVOLUTION_CODES = Object.freeze({',
+    '  OK: "OK",',
+    '  MISSING_CONTRACT: "MISSING_CONTRACT",',
+    '  INVALID_STATE_TRANSITION: "INVALID_STATE_TRANSITION",',
+    '  TERMINAL_STATE_IMMUTABLE: "TERMINAL_STATE_IMMUTABLE",',
+    '  INVALID_SCHEMA_VERSION: "INVALID_SCHEMA_VERSION",',
+    '  MISSING_CORRELATION_ID: "MISSING_CORRELATION_ID",',
+    '  INVALID_PARTITION_KEY: "INVALID_PARTITION_KEY",',
+    '  CHECKSUM_MISMATCH: "CHECKSUM_MISMATCH",',
+    '  BATCH_REJECTED: "BATCH_REJECTED",',
+    '});',
+    'export function canonicalJson(value) {',
+    '  if (value === null || typeof value !== "object") return JSON.stringify(value);',
+    '  if (Array.isArray(value)) return "[" + value.map((v) => (v === undefined ? "null" : canonicalJson(v))).join(",") + "]";',
+    '  return "{" + Object.keys(value).filter((k) => value[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(value[k])).join(",") + "}";',
+    '}',
+    'export function sha256Hex(value) {',
+    '  return createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");',
+    '}',
+    'export const EVOLUTION_INVARIANTS = Object.freeze({',
+  ];
+  for (let i = 1; i <= 40; i++) {
+    lines.push(
+      `  EVOL_${String(i).padStart(2, '0')}: Object.freeze({ id: "EV-${300 + i}", stage: "${i % 4 === 0 ? 'runner' : i % 3 === 0 ? 'pipeline' : i % 2 === 0 ? 'adapter' : 'validator'}", strict: true, note: "Cross-module v2 evolution rule #${i} preserving fail-closed validation and canonical digests" }),`,
+    );
+  }
+  lines.push('});');
+  return lines.join('\n') + '\n';
+})();
+
+const ACI_07_STATE_VALIDATOR_HEADER = (() => {
+  const lines = [
+    "import { EVOLUTION_CODES } from '../core/evolution-codes.js';",
+    '',
+    '// Historical V1 -> V2 state normalization metadata (lines 1-64); validator logic follows below.',
+    'export const LEGACY_V1_STATE_ALIAS_TABLE = Object.freeze({',
+  ];
+  for (let i = 1; i <= 44; i++) {
+    const srcState = ['queued', 'active', 'done', 'errored', 'aborted'][i % 5];
+    const dstState = ['pending', 'running', 'completed', 'failed', 'cancelled'][i % 5];
+    lines.push(
+      `  LEGACY_STATE_${String(i).padStart(2, '0')}: Object.freeze({ legacy: "${srcState}_v${(i % 3) + 1}", canonical: "${dstState}", terminal: ${dstState === 'completed' || dstState === 'failed' || dstState === 'cancelled'}, deprecatedSince: "2.0.0" }),`,
+    );
+  }
+  lines.push('});', '');
+  return lines.join('\n');
+})();
+
+const ACI_07_ADAPTER_HEADER = (() => {
+  const lines = [
+    "import { EVOLUTION_CODES, canonicalJson, sha256Hex } from '../core/evolution-codes.js';",
+    '',
+    '// Historical V1 -> V2 envelope field migration table (lines 1-68); active adapter functions below.',
+    'export const V1_TO_V2_FIELD_MIGRATION_MAP = Object.freeze({',
+  ];
+  for (let i = 1; i <= 48; i++) {
+    const srcField = ['traceId', 'requestId', 'tenantId', 'id', 'jobState'][i % 5];
+    const dstField = ['correlationId', 'correlationId', 'partitionKey', 'eventId', 'state'][i % 5];
+    lines.push(
+      `  FIELD_RULE_${String(i).padStart(2, '0')}: Object.freeze({ from: "${srcField}_${i}", to: "${dstField}", requiredInV2: true, allowDefaultFallback: false, note: "Strict v2 migration rule #${i}" }),`,
+    );
+  }
+  lines.push('});', '');
+  return lines.join('\n');
+})();
+
+const ACI_07_BASELINE_EVENTS = JSON.stringify(
+  [
+    {
+      schemaVersion: 2,
+      eventId: 'evt-base-01',
+      correlationId: 'corr-base-01',
+      partitionKey: 'tenant-alpha',
+      state: 'pending',
+      payload: { op: 'sync', batch: 1 },
+    },
+  ],
+  null,
+  2,
+) + '\n';
 
 // ---------------------------------------------------------------------------
 // 4 Multi-File ACI Governance Tasks (`aci-01`..`aci-04`)
@@ -2526,13 +2684,16 @@ test('hidden acceptance: AUDIT_REPORT.json and audit-export CLI produce matching
   },
 ];
 
-function finalizeRawAciTask(raw, { is25 = false } = {}) {
+function finalizeRawAciTask(raw, { is25 = false, is26 = false } = {}) {
   const baselineFileHashes = computeFileHashes(raw.fixture.files, [
     ...(raw.fixture.baselineTestFiles ?? []),
     ...Object.keys(raw.fixture.files).filter((p) =>
       ['SPEC.md', 'CONSTRAINTS.md', 'CONTRACT.json', 'fixtures/baseline-events.json'].includes(p) ||
       p === 'src/core/runtime-options.js' ||
       p === 'src/core/diagnostic-codes.js' ||
+      p === 'src/core/evolution-codes.js' ||
+      p === 'src/reporting/audit-summary.js' ||
+      p === 'src/index.js' ||
       p === 'src/auth/token-verifier.js' ||
       p === 'src/api/auth-routes.js' ||
       p === 'src/persistence/crc32.js' ||
@@ -2554,16 +2715,18 @@ function finalizeRawAciTask(raw, { is25 = false } = {}) {
     recoveryRequirements: true,
   });
   const minBudgetTokens =
-    raw.id === 'aci-04-long-horizon-security-audit'
-      ? 220_000
-      : raw.id === 'aci-06-swarm-contract-integration'
-        ? 200_000
+    raw.id === 'aci-06-swarm-contract-integration'
+      ? 240_000
+      : raw.id === 'aci-04-long-horizon-security-audit' || raw.id === 'aci-07-cross-module-evolution'
+        ? 220_000
         : raw.id === 'aci-05-multi-module-patch-refactor'
           ? 180_000
           : 160_000;
+  const maxBudgetTokens = Math.max(minBudgetTokens, budgetPlan.estimatedTokens);
   const resourceBudget = {
     maxSteps: Math.max(22, budgetPlan.maxSteps),
-    maxTokens: Math.max(minBudgetTokens, budgetPlan.estimatedTokens),
+    maxTokens: maxBudgetTokens,
+    maxTotalTokens: maxBudgetTokens,
     finalVerificationReserve: budgetPlan.finalVerificationReserve,
     maxDurationMs: Math.max(90_000, budgetPlan.maxSteps * 5_000),
     breakdown: {
@@ -2579,11 +2742,13 @@ function finalizeRawAciTask(raw, { is25 = false } = {}) {
   };
   return {
     ...raw,
-    category: is25 ? 'aci-governance-2.5' : 'aci-governance-2.4-s4',
+    category: is26 ? 'aci-governance-2.6' : is25 ? 'aci-governance-2.5' : 'aci-governance-2.4-s4',
     difficulty: 'hard',
-    tags: is25
-      ? ['benchmark', 'aci-governance', '2.5', raw.area]
-      : ['benchmark', 'aci-governance', '2.4', 'stage-4', raw.area],
+    tags: is26
+      ? ['benchmark', 'aci-governance', '2.6', raw.area]
+      : is25
+        ? ['benchmark', 'aci-governance', '2.5', raw.area]
+        : ['benchmark', 'aci-governance', '2.4', 'stage-4', raw.area],
     fixture: {
       ...raw.fixture,
       baselineFileHashes,
@@ -3263,8 +3428,439 @@ test('hidden acceptance: reviewer hard gate blocks synthetic pass and transition
 
 const RAW_ACI_25_TASKS = [...RAW_ACI_TASKS, ...RAW_ACI_25_ONLY_TASKS];
 
+const RAW_ACI_26_ONLY_TASKS = [
+  // 7) aci-07-cross-module-evolution
+  {
+    id: 'aci-07-cross-module-evolution',
+    area: 'cross_module_evolution',
+    title: 'Cross-Module Contract, Adapter, Event Pipeline & State Validator Evolution',
+    objective: 'Evolve v1 ingestion to strict v2 schema validation, canonical SHA-256 envelope adaptation, terminal state immutability, and contract-required pipeline-runner caller fixes across 4 modules.',
+    prompt: [
+      'Inspect `CONTRACT.json`, `SPEC.md`, `src/index.js`, and `src/core/evolution-codes.js`.',
+      'Evolve the cross-module event pipeline ONLY in:',
+      '1. `src/validators/state-validator.js`: enforce terminal-state immutability (`TERMINAL_STATE_IMMUTABLE`), contract transition rules (`INVALID_STATE_TRANSITION`), and strict v2 envelope validation (`validateEvolutionEnvelope`).',
+      '2. `src/adapters/v2-envelope-adapter.js`: compute canonical SHA-256 `computeEnvelopeDigest`, enforce strict `verifyEnvelopeChecksum`, and evolve `adaptV1ToV2Envelope` to migrate v1 (`traceId`/`requestId`, `tenantId`) without falling back to `"default"` (`MISSING_CORRELATION_ID` / `INVALID_PARTITION_KEY`).',
+      '3. `src/pipeline/event-transformer.js`: update `transformPipelineBatch(events, options)` to require `options.contract` (`MISSING_CONTRACT`), adapt/validate/checksum-verify every event, and compute canonical `batchDigest`.',
+      '4. `src/cli/pipeline-runner.js`: update caller `runEvolutionPipeline` to fail closed on missing contract or invalid state transitions and pass `{ contract, allowV1Migration }` to `transformPipelineBatch` with canonical `pipelineDigest`.',
+      'Do NOT modify `CONTRACT.json`, `SPEC.md`, or `test/evolution-baseline.test.js`. Keep `evolution-codes.js`, `audit-summary.js`, and `index.js` unchanged and read-only.',
+      'Run `node --test test/evolution-baseline.test.js` after editing to verify callers and baseline compatibility.',
+    ].join('\n'),
+    fixture: {
+      files: {
+        'package.json': JSON.stringify({ name: 'aci-07-cross-module-evolution', version: '2.0.0', type: 'module' }, null, 2) + '\n',
+        'README.md': '# Cross-Module Event Evolution Pipeline\nEntrypoint: `src/index.js`. Governed by `CONTRACT.json` and `SPEC.md`.\n',
+        'CONTRACT.json': ACI_07_CONTRACT_JSON,
+        'SPEC.md': ACI_07_SPEC,
+        'src/index.js': [
+          "export { EVOLUTION_CODES, EVOLUTION_INVARIANTS, canonicalJson, sha256Hex } from './core/evolution-codes.js';",
+          "export { validateStateTransition, validateEvolutionEnvelope } from './validators/state-validator.js';",
+          "export { adaptV1ToV2Envelope, computeEnvelopeDigest, verifyEnvelopeChecksum } from './adapters/v2-envelope-adapter.js';",
+          "export { transformPipelineBatch } from './pipeline/event-transformer.js';",
+          "export { runEvolutionPipeline } from './cli/pipeline-runner.js';",
+          "export { summarizeEvolutionRun } from './reporting/audit-summary.js';",
+        ].join('\n') + '\n',
+        'src/core/evolution-codes.js': ACI_07_EVOLUTION_CODES,
+        'src/reporting/audit-summary.js': [
+          'export function summarizeEvolutionRun({ accepted = [], rejected = [], state = "pending", pipelineDigest = null } = {}) {',
+          '  return {',
+          '    acceptedCount: Array.isArray(accepted) ? accepted.length : 0,',
+          '    rejectedCount: Array.isArray(rejected) ? rejected.length : 0,',
+          '    state: String(state || "pending"),',
+          '    pipelineDigest: pipelineDigest ?? null,',
+          '  };',
+          '}',
+        ].join('\n') + '\n',
+        'src/validators/state-validator.js':
+          ACI_07_STATE_VALIDATOR_HEADER +
+          [
+            'export function validateStateTransition(currentState, nextState, contract = {}) {',
+            '  return { ok: true, code: EVOLUTION_CODES.OK, state: nextState, overwritten: false };',
+            '}',
+            'export function validateEvolutionEnvelope(envelope, contract = {}) {',
+            '  if (!envelope || !envelope.eventId) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_SCHEMA_VERSION };',
+            '  }',
+            '  return { ok: true, code: EVOLUTION_CODES.OK };',
+            '}',
+          ].join('\n') + '\n',
+        'src/adapters/v2-envelope-adapter.js':
+          ACI_07_ADAPTER_HEADER +
+          [
+            'export function computeEnvelopeDigest(envelope = {}) {',
+            '  return sha256Hex(JSON.stringify(envelope ?? {}));',
+            '}',
+            'export function verifyEnvelopeChecksum(envelope) {',
+            '  return Boolean(envelope && typeof envelope.checksum === "string");',
+            '}',
+            'export function adaptV1ToV2Envelope(rawEvent, { allowV1Migration = true } = {}) {',
+            '  const ev = rawEvent && typeof rawEvent === "object" ? rawEvent : {};',
+            '  return {',
+            '    ok: true,',
+            '    migrationApplied: false,',
+            '    envelope: {',
+            '      schemaVersion: 2,',
+            '      eventId: String(ev.eventId || ev.id || ""),',
+            '      correlationId: String(ev.correlationId || ""),',
+            '      partitionKey: String(ev.partitionKey || "default"),',
+            '      state: String(ev.state || "pending"),',
+            '      payload: ev.payload ?? {},',
+            '      checksum: ev.checksum ?? computeEnvelopeDigest(ev),',
+            '    },',
+            '  };',
+            '}',
+          ].join('\n') + '\n',
+        'src/pipeline/event-transformer.js': [
+          "import { EVOLUTION_CODES, canonicalJson, sha256Hex } from '../core/evolution-codes.js';",
+          "import { adaptV1ToV2Envelope, computeEnvelopeDigest } from '../adapters/v2-envelope-adapter.js';",
+          "import { validateEvolutionEnvelope } from '../validators/state-validator.js';",
+          'export function transformPipelineBatch(events = [], options = {}) {',
+          '  const accepted = [];',
+          '  const rejected = [];',
+          '  for (const ev of Array.isArray(events) ? events : []) {',
+          '    const adapted = adaptV1ToV2Envelope(ev);',
+          '    const check = validateEvolutionEnvelope(adapted.envelope, options?.contract);',
+          '    if (!check.ok) { rejected.push({ eventId: ev?.eventId ?? null, code: check.code }); continue; }',
+          '    accepted.push({ ...adapted.envelope, digest: computeEnvelopeDigest(adapted.envelope), migrationApplied: adapted.migrationApplied });',
+          '  }',
+          '  return { ok: rejected.length === 0, code: EVOLUTION_CODES.OK, accepted, rejected, batchDigest: sha256Hex(canonicalJson({ accepted, rejected })) };',
+          '}',
+        ].join('\n') + '\n',
+        'src/cli/pipeline-runner.js': [
+          "import { EVOLUTION_CODES, canonicalJson, sha256Hex } from '../core/evolution-codes.js';",
+          "import { validateStateTransition } from '../validators/state-validator.js';",
+          "import { transformPipelineBatch } from '../pipeline/event-transformer.js';",
+          "import { summarizeEvolutionRun } from '../reporting/audit-summary.js';",
+          'export function runEvolutionPipeline({ contract, currentState = "pending", nextState = "running", events = [] } = {}) {',
+          '  const transition = validateStateTransition(currentState, nextState, contract);',
+          '  const transformed = transformPipelineBatch(events);',
+          '  return {',
+          '    ok: Boolean(transition.ok && transformed.ok),',
+          '    code: EVOLUTION_CODES.OK,',
+          '    state: transition.state ?? nextState,',
+          '    accepted: transformed.accepted ?? [],',
+          '    rejected: transformed.rejected ?? [],',
+          '    batchDigest: transformed.batchDigest ?? null,',
+          '    pipelineDigest: sha256Hex(canonicalJson({ state: nextState, accepted: transformed.accepted ?? [] })),',
+          '    summary: summarizeEvolutionRun({ accepted: transformed.accepted, rejected: transformed.rejected, state: nextState }),',
+          '  };',
+          '}',
+        ].join('\n') + '\n',
+        'fixtures/baseline-events.json': ACI_07_BASELINE_EVENTS,
+        'test/evolution-baseline.test.js': [
+          "import test from 'node:test';",
+          "import assert from 'node:assert/strict';",
+          "import { readFileSync } from 'node:fs';",
+          "import { join } from 'node:path';",
+          "import { runEvolutionPipeline } from '../src/index.js';",
+          "test('baseline evolution pipeline processes valid v2 event across pending -> running transition', () => {",
+          '  const contract = JSON.parse(readFileSync(join(import.meta.dirname, "..", "CONTRACT.json"), "utf8"));',
+          '  const events = JSON.parse(readFileSync(join(import.meta.dirname, "..", "fixtures", "baseline-events.json"), "utf8"));',
+          '  const res = runEvolutionPipeline({ contract, currentState: "pending", nextState: "running", events });',
+          '  assert.equal(res.ok, true);',
+          '  assert.equal(res.state, "running");',
+          '  assert.equal(res.accepted.length, 1);',
+          '  assert.equal(res.rejected.length, 0);',
+          '});',
+        ].join('\n') + '\n',
+        'src/legacy/v1-state-machine.js': buildLegacyJsDecoy({
+          moduleLabel: 'v1-state-machine',
+          domainKeywords: ['validateStateTransition', 'terminalStates', 'pending', 'running', 'completed'],
+          exportsList: ['transitionV1State', 'resetLegacyState'],
+        }),
+        'src/legacy/v1-event-normalizer.js': buildLegacyJsDecoy({
+          moduleLabel: 'v1-event-normalizer',
+          domainKeywords: ['adaptV1ToV2Envelope', 'partitionKey', 'correlationId', 'schemaVersion'],
+          exportsList: ['normalizeLegacyV1Event', 'coerceV1TenantFallback'],
+        }),
+        'src/compat/v1-adapter-shim.js': buildLegacyJsDecoy({
+          moduleLabel: 'v1-adapter-shim',
+          domainKeywords: ['computeEnvelopeDigest', 'verifyEnvelopeChecksum', 'traceId', 'requestId'],
+          exportsList: ['shimLegacyEnvelope', 'bypassV1Checksum'],
+        }),
+        'src/telemetry/evolution-metrics-exporter.js': buildLegacyJsDecoy({
+          moduleLabel: 'evolution-metrics-exporter',
+          domainKeywords: ['runEvolutionPipeline', 'transformPipelineBatch', 'batchDigest', 'pipelineDigest'],
+          exportsList: ['exportEvolutionTelemetry', 'flushLegacyPipelineCounters'],
+        }),
+        'docs/CHANGELOG.md': buildChangelogDecoy({
+          title: 'Event Evolution Pipeline',
+          keywords: ['state-validator', 'v2-envelope-adapter', 'event-transformer', 'pipeline-runner'],
+        }),
+        'docs/HISTORICAL-MIGRATIONS.md': buildMarkdownArchiveDecoy({
+          title: 'Historical V1 Schema Migration Archive',
+          keywords: ['TERMINAL_STATE_IMMUTABLE', 'MISSING_CONTRACT', 'INVALID_PARTITION_KEY', 'CHECKSUM_MISMATCH'],
+          sections: 20,
+        }),
+        'fixtures/legacy-evolution-traces.json': buildJsonFixtureDecoy({
+          title: 'Legacy V1 Pipeline Evolution Traces',
+          keywords: ['schemaVersion', 'correlationId', 'partitionKey', 'pipelineDigest'],
+        }),
+        'templates/migration-report.html': buildHtmlTemplateDecoy({
+          title: 'V1 to V2 Pipeline Migration Report',
+          keywords: ['evolution', 'envelope', 'validator', 'checksum'],
+        }),
+      },
+      baselineTestFiles: ['test/evolution-baseline.test.js'],
+      baselineTestCommand: ['node', '--test', 'test/evolution-baseline.test.js'],
+    },
+    judge: makeAciGovernanceJudge({
+      requiredSourceFiles: [
+        'src/validators/state-validator.js',
+        'src/adapters/v2-envelope-adapter.js',
+        'src/pipeline/event-transformer.js',
+        'src/cli/pipeline-runner.js',
+      ],
+      protectedReadOnlyFiles: [
+        'CONTRACT.json',
+        'SPEC.md',
+        'src/core/evolution-codes.js',
+        'src/reporting/audit-summary.js',
+        'src/index.js',
+        'fixtures/baseline-events.json',
+        'test/evolution-baseline.test.js',
+      ],
+      rootCauseFiles: [
+        'src/validators/state-validator.js',
+        'src/adapters/v2-envelope-adapter.js',
+        'src/pipeline/event-transformer.js',
+        'src/cli/pipeline-runner.js',
+      ],
+      extraCheck: ({ workspaceRoot }) => {
+        const pkg = readWorkspaceJson(workspaceRoot, 'package.json');
+        const valSrc = readWorkspaceText(workspaceRoot, 'src/validators/state-validator.js') ?? '';
+        const adpSrc = readWorkspaceText(workspaceRoot, 'src/adapters/v2-envelope-adapter.js') ?? '';
+        const trSrc = readWorkspaceText(workspaceRoot, 'src/pipeline/event-transformer.js') ?? '';
+        const runSrc = readWorkspaceText(workspaceRoot, 'src/cli/pipeline-runner.js') ?? '';
+        const c1 = !pkg?.dependencies || Object.keys(pkg.dependencies).length === 0;
+        const c2 =
+          /export\s+function\s+validateStateTransition/.test(valSrc) &&
+          /export\s+function\s+validateEvolutionEnvelope/.test(valSrc) &&
+          /export\s+function\s+adaptV1ToV2Envelope/.test(adpSrc) &&
+          /export\s+function\s+computeEnvelopeDigest/.test(adpSrc) &&
+          /export\s+function\s+verifyEnvelopeChecksum/.test(adpSrc) &&
+          /export\s+function\s+transformPipelineBatch/.test(trSrc) &&
+          /export\s+function\s+runEvolutionPipeline/.test(runSrc);
+        return { constraintsPreserved: c1 && c2 };
+      },
+      hiddenAcceptanceScript: `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
+
+test('hidden acceptance: state validator enforces terminal immutability and strict v2 envelope rules', async () => {
+  const { validateStateTransition, validateEvolutionEnvelope, EVOLUTION_CODES } = await import(
+    pathToFileURL(join(ws, 'src/index.js')).href
+  );
+  const contract = JSON.parse(readFileSync(join(ws, 'CONTRACT.json'), 'utf8'));
+
+  const okTrans = validateStateTransition('pending', 'running', contract);
+  assert.equal(okTrans.ok, true);
+  assert.equal(okTrans.state, 'running');
+
+  const termBlocked = validateStateTransition('completed', 'running', contract);
+  assert.equal(termBlocked.ok, false);
+  assert.equal(termBlocked.code, EVOLUTION_CODES.TERMINAL_STATE_IMMUTABLE);
+  assert.equal(termBlocked.state, 'completed');
+
+  const badSkip = validateStateTransition('pending', 'completed', contract);
+  assert.equal(badSkip.ok, false);
+  assert.equal(badSkip.code, EVOLUTION_CODES.INVALID_STATE_TRANSITION);
+
+  const missingCorr = validateEvolutionEnvelope({
+    schemaVersion: 2,
+    eventId: 'e1',
+    correlationId: '   ',
+    partitionKey: 'tenant-1',
+    state: 'pending',
+    payload: {},
+  }, contract);
+  assert.equal(missingCorr.ok, false);
+  assert.equal(missingCorr.code, EVOLUTION_CODES.MISSING_CORRELATION_ID);
+
+  const badPk = validateEvolutionEnvelope({
+    schemaVersion: 2,
+    eventId: 'e2',
+    correlationId: 'c2',
+    partitionKey: '../bad',
+    state: 'pending',
+    payload: {},
+  }, contract);
+  assert.equal(badPk.ok, false);
+  assert.equal(badPk.code, EVOLUTION_CODES.INVALID_PARTITION_KEY);
+});
+
+test('hidden acceptance: v2 adapter migrates v1 safely without default fallback and verifies canonical digests', async () => {
+  const { adaptV1ToV2Envelope, computeEnvelopeDigest, verifyEnvelopeChecksum, EVOLUTION_CODES } = await import(
+    pathToFileURL(join(ws, 'src/index.js')).href
+  );
+
+  const migrated = adaptV1ToV2Envelope({
+    schemaVersion: 1,
+    id: 'evt-v1-1',
+    traceId: 'trace-99',
+    tenantId: 'TENANT-BETA',
+    state: 'pending',
+    payload: { b: 2, a: 1 },
+  });
+  assert.equal(migrated.ok, true);
+  assert.equal(migrated.migrationApplied, true);
+  assert.equal(migrated.envelope.schemaVersion, 2);
+  assert.equal(migrated.envelope.correlationId, 'trace-99');
+  assert.equal(migrated.envelope.partitionKey, 'tenant-beta');
+  assert.equal(verifyEnvelopeChecksum(migrated.envelope), true);
+
+  const reorderedDigest = computeEnvelopeDigest({
+    ...migrated.envelope,
+    payload: { a: 1, b: 2 },
+  });
+  assert.equal(reorderedDigest, migrated.envelope.checksum);
+
+  const tampered = { ...migrated.envelope, payload: { a: 1, b: 999 } };
+  assert.equal(verifyEnvelopeChecksum(tampered), false);
+
+  const noTenant = adaptV1ToV2Envelope({
+    schemaVersion: 1,
+    eventId: 'evt-v1-2',
+    traceId: 'trace-2',
+    payload: {},
+  });
+  assert.equal(noTenant.ok, false);
+  assert.equal(noTenant.code, EVOLUTION_CODES.INVALID_PARTITION_KEY);
+});
+
+test('hidden acceptance: event-transformer requires contract and pipeline-runner caller integrates end-to-end', async () => {
+  const { transformPipelineBatch, runEvolutionPipeline, computeEnvelopeDigest, EVOLUTION_CODES } = await import(
+    pathToFileURL(join(ws, 'src/index.js')).href
+  );
+  const contract = JSON.parse(readFileSync(join(ws, 'CONTRACT.json'), 'utf8'));
+
+  const noContract = transformPipelineBatch([]);
+  assert.equal(noContract.ok, false);
+  assert.equal(noContract.code, EVOLUTION_CODES.MISSING_CONTRACT);
+
+  const badChecksumEvt = {
+    schemaVersion: 2,
+    eventId: 'evt-bad-chk',
+    correlationId: 'corr-bad',
+    partitionKey: 'tenant-1',
+    state: 'pending',
+    payload: { ok: false },
+    checksum: '0'.repeat(64),
+  };
+  const goodV1Evt = {
+    schemaVersion: 1,
+    eventId: 'evt-good-1',
+    requestId: 'req-1',
+    tenantId: 'tenant-gamma',
+    state: 'running',
+    payload: { x: 1 },
+  };
+  const goodV2Evt = {
+    schemaVersion: 2,
+    eventId: 'evt-good-2',
+    correlationId: 'corr-2',
+    partitionKey: 'tenant-delta',
+    state: 'running',
+    payload: { y: 2 },
+  };
+  goodV2Evt.checksum = computeEnvelopeDigest(goodV2Evt);
+
+  const mixed = runEvolutionPipeline({
+    contract,
+    currentState: 'pending',
+    nextState: 'running',
+    events: [goodV1Evt, badChecksumEvt],
+  });
+  assert.equal(mixed.ok, false);
+  assert.equal(mixed.code, EVOLUTION_CODES.BATCH_REJECTED);
+  assert.equal(mixed.accepted.length, 1);
+  assert.equal(mixed.rejected.length, 1);
+  assert.equal(mixed.rejected[0].code, EVOLUTION_CODES.CHECKSUM_MISMATCH);
+
+  const blockedTerm = runEvolutionPipeline({
+    contract,
+    currentState: 'completed',
+    nextState: 'running',
+    events: [goodV2Evt],
+  });
+  assert.equal(blockedTerm.ok, false);
+  assert.equal(blockedTerm.code, EVOLUTION_CODES.TERMINAL_STATE_IMMUTABLE);
+  assert.equal(blockedTerm.accepted.length, 0);
+
+  const okRun = runEvolutionPipeline({
+    contract,
+    currentState: 'pending',
+    nextState: 'running',
+    events: [goodV1Evt, goodV2Evt],
+  });
+  assert.equal(okRun.ok, true);
+  assert.equal(okRun.code, EVOLUTION_CODES.OK);
+  assert.equal(okRun.accepted.length, 2);
+  assert.match(okRun.pipelineDigest, /^[0-9a-f]{64}$/);
+});
+`,
+    }),
+    metadata: buildTaskMetadata({
+      id: 'aci-07-cross-module-evolution',
+      area: 'cross_module_evolution',
+      requiredChangedFiles: [
+        'src/validators/state-validator.js',
+        'src/adapters/v2-envelope-adapter.js',
+        'src/pipeline/event-transformer.js',
+        'src/cli/pipeline-runner.js',
+      ],
+      testFiles: ['test/evolution-baseline.test.js'],
+      testCommand: ['node', '--test', 'test/evolution-baseline.test.js'],
+      repoFileCount: 21,
+      groundTruth: {
+        criticalFiles: [
+          'CONTRACT.json',
+          'SPEC.md',
+          'src/core/evolution-codes.js',
+          'src/validators/state-validator.js',
+          'src/adapters/v2-envelope-adapter.js',
+          'src/pipeline/event-transformer.js',
+          'src/cli/pipeline-runner.js',
+        ],
+        relevantFiles: [
+          'package.json',
+          'README.md',
+          'CONTRACT.json',
+          'SPEC.md',
+          'src/index.js',
+          'src/core/evolution-codes.js',
+          'src/reporting/audit-summary.js',
+          'src/validators/state-validator.js',
+          'src/adapters/v2-envelope-adapter.js',
+          'src/pipeline/event-transformer.js',
+          'src/cli/pipeline-runner.js',
+          'fixtures/baseline-events.json',
+          'test/evolution-baseline.test.js',
+        ],
+        noiseFiles: [
+          'src/legacy/v1-state-machine.js',
+          'src/legacy/v1-event-normalizer.js',
+          'src/compat/v1-adapter-shim.js',
+          'src/telemetry/evolution-metrics-exporter.js',
+          'docs/CHANGELOG.md',
+          'docs/HISTORICAL-MIGRATIONS.md',
+          'fixtures/legacy-evolution-traces.json',
+          'templates/migration-report.html',
+        ],
+      },
+    }),
+  },
+].map((raw) => finalizeRawAciTask(raw, { is26: true }));
+
+const RAW_ACI_26_TASKS = [...RAW_ACI_25_TASKS, ...RAW_ACI_26_ONLY_TASKS];
+
 export const ACI_GOVERNANCE_DATASET = Object.freeze(RAW_ACI_TASKS);
 export const ACI_GOVERNANCE_25_DATASET = Object.freeze(RAW_ACI_25_TASKS);
+export const ACI_GOVERNANCE_26_DATASET = Object.freeze(RAW_ACI_26_TASKS);
 
 export function createAciGovernanceDataset({
   sandbox = null,
@@ -3272,11 +3868,16 @@ export function createAciGovernanceDataset({
   repoOverrides = null,
   suite = 'aci',
   include25 = false,
+  include26 = false,
 } = {}) {
   const datasetSandbox =
     sandbox ?? (sandboxOptions ? new BenchmarkSandbox(sandboxOptions) : getDefaultBenchmarkSandbox());
   const sourceTasks =
-    include25 || suite === 'aci25' || suite === 'all' ? RAW_ACI_25_TASKS : RAW_ACI_TASKS;
+    include26 || suite === 'aci26' || suite === 'all'
+      ? RAW_ACI_26_TASKS
+      : include25 || suite === 'aci25'
+        ? RAW_ACI_25_TASKS
+        : RAW_ACI_TASKS;
   return sourceTasks.map((task) => {
     const override =
       repoOverrides && typeof repoOverrides === 'object' ? repoOverrides[task.id] ?? null : null;
@@ -3304,7 +3905,12 @@ export function createAciGovernanceDataset({
 
 export async function materializeAciGovernanceRepos(rootDir, { tasks = null, suite = 'aci' } = {}) {
   const targetTasks =
-    tasks ?? (suite === 'aci25' || suite === 'all' ? RAW_ACI_25_TASKS : RAW_ACI_TASKS);
+    tasks ??
+    (suite === 'aci26' || suite === 'all'
+      ? RAW_ACI_26_TASKS
+      : suite === 'aci25'
+        ? RAW_ACI_25_TASKS
+        : RAW_ACI_TASKS);
   const baseRoot = resolve(String(rootDir));
   mkdirSync(baseRoot, { recursive: true });
   const repoOverrides = {};
@@ -4120,6 +4726,201 @@ export function getAciGovernanceReferenceFix(taskId, workspaceRoot = null) {
         ].join('\n') + '\n',
       };
 
+    case 'aci-07-cross-module-evolution':
+      return {
+        'src/validators/state-validator.js':
+          ACI_07_STATE_VALIDATOR_HEADER +
+          [
+            'const DEFAULT_TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);',
+            'const DEFAULT_TRANSITIONS = {',
+            '  pending: ["running", "cancelled"],',
+            '  running: ["completed", "failed", "cancelled"],',
+            '  completed: [],',
+            '  failed: [],',
+            '  cancelled: [],',
+            '};',
+            'export function validateStateTransition(currentState, nextState, contract = {}) {',
+            '  const terminals = Array.isArray(contract?.terminalStates) ? new Set(contract.terminalStates) : DEFAULT_TERMINAL_STATES;',
+            '  if (terminals.has(currentState)) {',
+            '    return { ok: false, code: EVOLUTION_CODES.TERMINAL_STATE_IMMUTABLE, state: currentState, overwritten: false };',
+            '  }',
+            '  const transitions = contract?.transitions && typeof contract.transitions === "object" ? contract.transitions : DEFAULT_TRANSITIONS;',
+            '  const allowed = Array.isArray(transitions[currentState]) ? transitions[currentState] : [];',
+            '  if (!allowed.includes(nextState)) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_STATE_TRANSITION, state: currentState, overwritten: false };',
+            '  }',
+            '  return { ok: true, code: EVOLUTION_CODES.OK, state: nextState, overwritten: false };',
+            '}',
+            'export function validateEvolutionEnvelope(envelope, contract = {}) {',
+            '  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_SCHEMA_VERSION };',
+            '  }',
+            '  if (Number(envelope.schemaVersion) !== 2) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_SCHEMA_VERSION };',
+            '  }',
+            '  if (typeof envelope.eventId !== "string" || !envelope.eventId.trim()) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_SCHEMA_VERSION };',
+            '  }',
+            '  if (typeof envelope.correlationId !== "string" || !envelope.correlationId.trim()) {',
+            '    return { ok: false, code: EVOLUTION_CODES.MISSING_CORRELATION_ID };',
+            '  }',
+            '  const pkRe = new RegExp(contract?.partitionKeyPattern || "^[a-z0-9][a-z0-9._-]{1,63}$");',
+            '  if (typeof envelope.partitionKey !== "string" || !pkRe.test(envelope.partitionKey.trim())) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_PARTITION_KEY };',
+            '  }',
+            '  const allowedStates = Array.isArray(contract?.allowedStates) ? contract.allowedStates : ["pending", "running", "completed", "failed", "cancelled"];',
+            '  if (!allowedStates.includes(envelope.state)) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_STATE_TRANSITION };',
+            '  }',
+            '  if (!envelope.payload || typeof envelope.payload !== "object" || Array.isArray(envelope.payload)) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_SCHEMA_VERSION };',
+            '  }',
+            '  return { ok: true, code: EVOLUTION_CODES.OK };',
+            '}',
+          ].join('\n') + '\n',
+        'src/adapters/v2-envelope-adapter.js':
+          ACI_07_ADAPTER_HEADER +
+          [
+            'const PARTITION_KEY_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/;',
+            'export function computeEnvelopeDigest(envelope = {}) {',
+            '  const env = envelope && typeof envelope === "object" ? envelope : {};',
+            '  return sha256Hex(canonicalJson({',
+            '    schemaVersion: Number(env.schemaVersion),',
+            '    eventId: String(env.eventId || "").trim(),',
+            '    correlationId: String(env.correlationId || "").trim(),',
+            '    partitionKey: String(env.partitionKey || "").trim(),',
+            '    state: String(env.state || "").trim(),',
+            '    payload: env.payload ?? {},',
+            '  }));',
+            '}',
+            'export function verifyEnvelopeChecksum(envelope) {',
+            '  if (!envelope || typeof envelope !== "object" || typeof envelope.checksum !== "string") return false;',
+            '  return envelope.checksum === computeEnvelopeDigest(envelope);',
+            '}',
+            'export function adaptV1ToV2Envelope(rawEvent, { allowV1Migration = true } = {}) {',
+            '  if (!rawEvent || typeof rawEvent !== "object" || Array.isArray(rawEvent)) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_SCHEMA_VERSION };',
+            '  }',
+            '  const rawVersion = rawEvent.schemaVersion ?? 1;',
+            '  if (Number(rawVersion) === 2) {',
+            '    const base = {',
+            '      schemaVersion: 2,',
+            '      eventId: String(rawEvent.eventId || "").trim(),',
+            '      correlationId: String(rawEvent.correlationId || "").trim(),',
+            '      partitionKey: String(rawEvent.partitionKey || "").trim(),',
+            '      state: String(rawEvent.state || "pending").trim(),',
+            '      payload: rawEvent.payload && typeof rawEvent.payload === "object" && !Array.isArray(rawEvent.payload) ? rawEvent.payload : null,',
+            '    };',
+            '    const checksum = rawEvent.checksum !== undefined ? rawEvent.checksum : computeEnvelopeDigest(base);',
+            '    return { ok: true, migrationApplied: false, envelope: { ...base, checksum } };',
+            '  }',
+            '  if (Number(rawVersion) !== 1 || !allowV1Migration) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_SCHEMA_VERSION };',
+            '  }',
+            '  const correlationId = String(rawEvent.correlationId ?? rawEvent.traceId ?? rawEvent.requestId ?? "").trim();',
+            '  if (!correlationId) {',
+            '    return { ok: false, code: EVOLUTION_CODES.MISSING_CORRELATION_ID };',
+            '  }',
+            '  const partitionKey = String(rawEvent.partitionKey ?? rawEvent.tenantId ?? "").trim().toLowerCase();',
+            '  if (!PARTITION_KEY_RE.test(partitionKey)) {',
+            '    return { ok: false, code: EVOLUTION_CODES.INVALID_PARTITION_KEY };',
+            '  }',
+            '  const base = {',
+            '    schemaVersion: 2,',
+            '    eventId: String(rawEvent.eventId || rawEvent.id || "").trim(),',
+            '    correlationId,',
+            '    partitionKey,',
+            '    state: String(rawEvent.state || "pending").trim(),',
+            '    payload: rawEvent.payload && typeof rawEvent.payload === "object" && !Array.isArray(rawEvent.payload) ? rawEvent.payload : {},',
+            '  };',
+            '  const checksum = rawEvent.checksum !== undefined ? rawEvent.checksum : computeEnvelopeDigest(base);',
+            '  return { ok: true, migrationApplied: true, envelope: { ...base, checksum } };',
+            '}',
+          ].join('\n') + '\n',
+        'src/pipeline/event-transformer.js': [
+          "import { EVOLUTION_CODES, canonicalJson, sha256Hex } from '../core/evolution-codes.js';",
+          "import { adaptV1ToV2Envelope, computeEnvelopeDigest, verifyEnvelopeChecksum } from '../adapters/v2-envelope-adapter.js';",
+          "import { validateEvolutionEnvelope } from '../validators/state-validator.js';",
+          'export function transformPipelineBatch(events = [], options = {}) {',
+          '  if (!options || !options.contract || typeof options.contract !== "object") {',
+          '    return { ok: false, code: EVOLUTION_CODES.MISSING_CONTRACT, accepted: [], rejected: [], batchDigest: null };',
+          '  }',
+          '  const accepted = [];',
+          '  const rejected = [];',
+          '  for (const ev of Array.isArray(events) ? events : []) {',
+          '    const adapted = adaptV1ToV2Envelope(ev, { allowV1Migration: options.allowV1Migration !== false });',
+          '    if (!adapted.ok) {',
+          '      rejected.push({ eventId: ev?.eventId ?? ev?.id ?? null, code: adapted.code });',
+          '      continue;',
+          '    }',
+          '    const valid = validateEvolutionEnvelope(adapted.envelope, options.contract);',
+          '    if (!valid.ok) {',
+          '      rejected.push({ eventId: adapted.envelope?.eventId ?? null, code: valid.code });',
+          '      continue;',
+          '    }',
+          '    if (adapted.envelope.checksum !== undefined && !verifyEnvelopeChecksum(adapted.envelope)) {',
+          '      rejected.push({ eventId: adapted.envelope.eventId, code: EVOLUTION_CODES.CHECKSUM_MISMATCH });',
+          '      continue;',
+          '    }',
+          '    accepted.push({',
+          '      ...adapted.envelope,',
+          '      digest: computeEnvelopeDigest(adapted.envelope),',
+          '      migrationApplied: adapted.migrationApplied,',
+          '    });',
+          '  }',
+          '  const ok = rejected.length === 0;',
+          '  const code = ok ? EVOLUTION_CODES.OK : EVOLUTION_CODES.BATCH_REJECTED;',
+          '  const batchDigest = sha256Hex(canonicalJson({ accepted, rejected }));',
+          '  return { ok, code, accepted, rejected, batchDigest };',
+          '}',
+        ].join('\n') + '\n',
+        'src/cli/pipeline-runner.js': [
+          "import { EVOLUTION_CODES, canonicalJson, sha256Hex } from '../core/evolution-codes.js';",
+          "import { validateStateTransition } from '../validators/state-validator.js';",
+          "import { transformPipelineBatch } from '../pipeline/event-transformer.js';",
+          "import { summarizeEvolutionRun } from '../reporting/audit-summary.js';",
+          'export function runEvolutionPipeline({ contract, currentState = "pending", nextState = "running", events = [], allowV1Migration = true } = {}) {',
+          '  if (!contract || typeof contract !== "object") {',
+          '    return {',
+          '      ok: false,',
+          '      code: EVOLUTION_CODES.MISSING_CONTRACT,',
+          '      state: currentState,',
+          '      accepted: [],',
+          '      rejected: [],',
+          '      batchDigest: null,',
+          '      pipelineDigest: null,',
+          '      summary: summarizeEvolutionRun({ state: currentState }),',
+          '    };',
+          '  }',
+          '  const transition = validateStateTransition(currentState, nextState, contract);',
+          '  if (!transition.ok) {',
+          '    return {',
+          '      ok: false,',
+          '      code: transition.code,',
+          '      state: transition.state,',
+          '      accepted: [],',
+          '      rejected: [],',
+          '      batchDigest: null,',
+          '      pipelineDigest: null,',
+          '      summary: summarizeEvolutionRun({ state: transition.state }),',
+          '    };',
+          '  }',
+          '  const transformed = transformPipelineBatch(events, { contract, allowV1Migration });',
+          '  const pipelineDigest = sha256Hex(canonicalJson({ state: transition.state, accepted: transformed.accepted, rejected: transformed.rejected, batchDigest: transformed.batchDigest }));',
+          '  return {',
+          '    ok: Boolean(transformed.ok),',
+          '    code: transformed.ok ? EVOLUTION_CODES.OK : transformed.code,',
+          '    state: transition.state,',
+          '    accepted: transformed.accepted,',
+          '    rejected: transformed.rejected,',
+          '    batchDigest: transformed.batchDigest,',
+          '    pipelineDigest,',
+          '    summary: summarizeEvolutionRun({ accepted: transformed.accepted, rejected: transformed.rejected, state: transition.state, pipelineDigest }),',
+          '  };',
+          '}',
+        ].join('\n') + '\n',
+      };
+
     default:
       throw new Error(`Unknown ACI governance taskId: ${taskId}`);
   }
@@ -4149,7 +4950,7 @@ export function buildAciGovernanceEvidenceOutput(task, changedFiles = null, over
 // 9 Governance Metrics Engine (Post-Hoc Ground Truth Scoring Only)
 // ---------------------------------------------------------------------------
 
-const TASK_BY_ID = new Map(RAW_ACI_25_TASKS.map((t) => [t.id, t]));
+const TASK_BY_ID = new Map(RAW_ACI_26_TASKS.map((t) => [t.id, t]));
 
 export function resolveAciTaskGroundTruth(taskOrId) {
   const id = typeof taskOrId === 'string' ? taskOrId : taskOrId?.id ?? taskOrId?.taskId;
@@ -4233,11 +5034,26 @@ const CONTEXT_INSPECTION_TOOLS = new Set([
   'grep',
 ]);
 
+const NON_FILE_ADMISSION_TOOLS = new Set([
+  'expand_context',
+  'compute_file_digest',
+  'query_symbol_graph',
+  'run_diagnostics',
+]);
+
 function isContextAdmissionRecord(adm) {
   const p = String(adm?.path || '').trim();
-  if (!p || /^(?:bash|glob|grep|expand_context):/i.test(p)) return false;
-  if (p === 'expand_context' || p === 'compute_file_digest') return false;
+  if (
+    !p ||
+    /^(?:bash|glob|grep|expand_context|query_symbol_graph|run_diagnostics|compute_file_digest):/i.test(
+      p,
+    )
+  ) {
+    return false;
+  }
+  if (NON_FILE_ADMISSION_TOOLS.has(p) || p === 'inspect_repository') return false;
   const tn = String(adm?.toolName || '').trim().toLowerCase();
+  if (NON_FILE_ADMISSION_TOOLS.has(tn)) return false;
   if (!tn) return true;
   return CONTEXT_INSPECTION_TOOLS.has(tn);
 }
@@ -4549,6 +5365,110 @@ function normalizeGovernanceTrial(raw) {
         evidence: ev,
       });
 
+  const ledgerPartialCount = recoveries.filter(
+    (r) =>
+      r?.partial === true ||
+      ['symbol', 'lines', 'outline', 'hunk'].includes(String(r?.mode || '').toLowerCase()),
+  ).length;
+  const ledgerRecoverySaved = recoveries.reduce(
+    (s, r) => s + Math.max(0, Number(r?.tokensSaved ?? 0) || 0),
+    0,
+  );
+  const ledgerCompressed = Array.isArray(ledger?.compressed) ? ledger.compressed : [];
+  const ledgerSupersededItems = ledgerCompressed.filter(
+    (c) => c?.superseded === true || /superseded/i.test(String(c?.reason || '')),
+  );
+  const ledgerSupersededSaved = ledgerSupersededItems.reduce(
+    (s, c) => s + Math.max(0, Number(c?.tokensSaved ?? 0) || 0),
+    0,
+  );
+
+  const supersededEvictions = Math.max(
+    0,
+    Math.trunc(
+      Number(
+        aciMetrics?.supersededEvictions ??
+          trial?.supersededEvictions ??
+          ledger?.supersededEvictions ??
+          0,
+      ) || 0,
+    ),
+    ledgerSupersededItems.length,
+  );
+  const supersededTokensSaved = Math.max(
+    0,
+    Math.trunc(
+      Number(
+        aciMetrics?.supersededTokensSaved ??
+          trial?.supersededTokensSaved ??
+          ledger?.supersededTokensSaved ??
+          0,
+      ) || 0,
+    ),
+    ledgerSupersededSaved,
+  );
+  const partialRecoveries = Math.max(
+    0,
+    Math.trunc(
+      Number(
+        aciMetrics?.partialRecoveries ??
+          recStatsSource?.partialRecoveries ??
+          trial?.partialRecoveries ??
+          ledger?.partialRecoveries ??
+          0,
+      ) || 0,
+    ),
+    ledgerPartialCount,
+  );
+  const recoveryTokensSaved = Math.max(
+    0,
+    Math.trunc(
+      Number(
+        aciMetrics?.recoveryTokensSaved ??
+          recStatsSource?.recoveryTokensSaved ??
+          trial?.recoveryTokensSaved ??
+          ledger?.recoveryTokensSaved ??
+          0,
+      ) || 0,
+    ),
+    ledgerRecoverySaved,
+  );
+  const rawAntiThrashing =
+    rm?.antiThrashingTriggered ??
+    aciMetrics?.antiThrashingTriggered ??
+    trial?.antiThrashingTriggered ??
+    0;
+  const antiThrashingTriggered =
+    typeof rawAntiThrashing === 'boolean'
+      ? rawAntiThrashing
+        ? 1
+        : 0
+      : Math.max(0, Math.trunc(Number(rawAntiThrashing) || 0));
+
+  const rawDecSource =
+    aciMetrics?.admissionDecisions ??
+    aciMetrics?.decisions ??
+    trial?.decisions ??
+    ledger?.decisionCounts ??
+    null;
+  const decisions = { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 };
+  const hasExplicitDecisions =
+    rawDecSource &&
+    typeof rawDecSource === 'object' &&
+    ['DIRECT', 'SUPPORTING', 'DEFER', 'DUPLICATE', 'IRRELEVANT'].some(
+      (k) => Number(rawDecSource[k] || 0) > 0,
+    );
+  if (hasExplicitDecisions) {
+    for (const k of Object.keys(decisions)) {
+      decisions[k] = Math.max(0, Math.trunc(Number(rawDecSource[k] ?? 0) || 0));
+    }
+  } else {
+    for (const adm of admissions) {
+      const k = String(adm?.decision || '').toUpperCase();
+      if (Object.hasOwn(decisions, k)) decisions[k] += 1;
+    }
+  }
+
   return {
     taskId,
     arm,
@@ -4579,6 +5499,12 @@ function normalizeGovernanceTrial(raw) {
     epochTransitions: Math.max(0, Number(aciMetrics?.epochTransitions ?? trial?.epochTransitions ?? 0) || 0),
     offloadedCount: Math.max(0, Number(aciMetrics?.offloadedCount ?? trial?.offloadedCount ?? 0) || 0),
     savedTokens: Math.max(0, Number(aciMetrics?.savedTokens ?? trial?.savedTokens ?? 0) || 0),
+    supersededEvictions,
+    supersededTokensSaved,
+    partialRecoveries,
+    recoveryTokensSaved,
+    antiThrashingTriggered,
+    decisions,
     failureCategory,
     attribution,
   };
@@ -4735,6 +5661,18 @@ function aggregateArmMetrics(
   const recoveryAssistedPassRate = trialsWithRecovery > 0 ? round4(passedWithRecovery / trialsWithRecovery) : 0;
 
   const totalDurationMs = armTrials.reduce((s, t) => s + t.durationMs, 0);
+  const supersededEvictions = armTrials.reduce((s, t) => s + (t.supersededEvictions || 0), 0);
+  const supersededTokensSaved = armTrials.reduce((s, t) => s + (t.supersededTokensSaved || 0), 0);
+  const partialRecoveries = armTrials.reduce((s, t) => s + (t.partialRecoveries || 0), 0);
+  const recoveryTokensSaved = armTrials.reduce((s, t) => s + (t.recoveryTokensSaved || 0), 0);
+  const antiThrashingTriggered = armTrials.reduce((s, t) => s + (t.antiThrashingTriggered || 0), 0);
+  const decisions = { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 };
+  for (const t of armTrials) {
+    if (!t.decisions || typeof t.decisions !== 'object') continue;
+    for (const k of Object.keys(decisions)) {
+      decisions[k] += Math.max(0, Math.trunc(Number(t.decisions[k] ?? 0) || 0));
+    }
+  }
   const attributionCounts = {
     [FAILURE_ATTRIBUTIONS.TOOL_MECHANISM]: 0,
     [FAILURE_ATTRIBUTIONS.MODEL_CAPABILITY]: 0,
@@ -4765,6 +5703,13 @@ function aggregateArmMetrics(
     supervisorCost,
     recoverySuccessRate,
     finalTaskSuccessRate: totalTrials ? round4(passedTrials / totalTrials) : 0,
+    // 2.6 Trajectory Eviction, Partial Recovery, Anti-Thrashing & 5-Level Decisions:
+    supersededEvictions,
+    supersededTokensSaved,
+    partialRecoveries,
+    recoveryTokensSaved,
+    antiThrashingTriggered,
+    decisions,
     // Detailed Governance Breakdowns:
     criticalContextRecallDetail: {
       activeRecall: meanActiveRecall,
@@ -4791,6 +5736,8 @@ function aggregateArmMetrics(
       expandAttempts,
       hashVerified,
       totalRestores,
+      partialRecoveries,
+      recoveryTokensSaved,
       trialsWithRecovery,
       recoveryAssistedPassRate,
     },
@@ -4807,6 +5754,8 @@ function aggregateArmMetrics(
       epochTransitions: armTrials.reduce((s, t) => s + t.epochTransitions, 0),
       offloadedCount: armTrials.reduce((s, t) => s + t.offloadedCount, 0),
       savedTokens: armTrials.reduce((s, t) => s + t.savedTokens, 0),
+      supersededEvictions,
+      supersededTokensSaved,
     },
     meanDurationMs: totalTrials ? Math.round(totalDurationMs / totalTrials) : 0,
     attributionCounts,
@@ -5020,6 +5969,25 @@ export function exportPaperTablesMarkdown(summary) {
           `| \`${taskId}\` | ${arm} | ${ta.passedTrials}/${ta.totalTrials} | ${fmtInt(ta.tokenBreakdown?.meanTokens)} | ${pairedStr} | ${fmtPct(ta.criticalContextRecall)} | ${fmtPct(ta.contextPrecision)} | ${fmtPct(ta.cacheHitRate)} |`,
         );
       }
+    }
+  }
+
+  if (arms.length > 0) {
+    lines.push(
+      '',
+      '### Table 3: ACI 2.6 Trajectory Eviction, Partial Recovery & Admission Decisions',
+      '',
+      '| Arm | Superseded Evictions | Superseded Saved Tok | Partial Recoveries | Recovery Saved Tok | Anti-Thrashing | Decisions (D/S/Def/Dup/Irr) |',
+      '| --- | --- | --- | --- | --- | --- | --- |',
+    );
+    for (const arm of arms) {
+      const a = byArm[arm];
+      if (!a) continue;
+      const dec = a.decisions ?? {};
+      const decStr = `${dec.DIRECT ?? 0}/${dec.SUPPORTING ?? 0}/${dec.DEFER ?? 0}/${dec.DUPLICATE ?? 0}/${dec.IRRELEVANT ?? 0}`;
+      lines.push(
+        `| ${arm} | ${fmtInt(a.supersededEvictions ?? 0)} | ${fmtInt(a.supersededTokensSaved ?? 0)} | ${fmtInt(a.partialRecoveries ?? 0)} | ${fmtInt(a.recoveryTokensSaved ?? 0)} | ${fmtInt(a.antiThrashingTriggered ?? 0)} | ${decStr} |`,
+      );
     }
   }
 
