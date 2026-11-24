@@ -445,7 +445,7 @@ export function buildSweBenchPrompt(instance, { containerMode = false } = {}) {
   parts.push(
     '',
     containerMode
-      ? 'Locate the root cause using grep and read_file, apply a minimal targeted fix with edit_file or apply_patch, run the relevant Python/repository test suite inside /testbed using bash (e.g., pytest, ./tests/runtests.py, or bin/test — do NOT rely on host diagnostics), and verify the resulting git diff.'
+      ? 'Locate the root cause using grep and read_file, apply a minimal targeted fix with edit_file or apply_patch, run the relevant Python/repository test suite inside /testbed using bash (e.g., pytest, Django runtests, or SymPy bin/test — do NOT rely on host diagnostics), and verify the resulting git diff.'
       : 'Locate the root cause using grep and read_file, apply a minimal targeted fix, run the relevant test suite to confirm all tests pass, and verify the resulting git diff.',
   );
   return parts.join('\n');

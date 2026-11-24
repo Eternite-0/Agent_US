@@ -91,7 +91,7 @@ function createMockDockerSpawn() {
     const stdout =
       args[0] === 'image' && args[1] === 'inspect'
         ? '[{"Id":"sha256:abc"}]'
-        : args[0] === 'rm'
+        : args[0] === 'run' || args[0] === 'rm'
           ? 'cid-live-harness-123\n'
           : '';
     if (typeof callback === 'function') {
@@ -212,10 +212,18 @@ function seedBuggyPythonRepo(repoDir) {
     ].join('\n'),
     'utf8',
   );
+  const decoySections = Array.from({ length: 40 }, (_, idx) => {
+    const rev = idx + 1;
+    const regions = ['EMEA', 'APAC', 'AMER', 'LATAM', 'NORDIC'];
+    const tiers = ['gold', 'silver', 'bronze', 'enterprise', 'partner'];
+    return [
+      `### Archived Tariff Batch v0.${rev} (${regions[idx % regions.length]})`,
+      `Historical ${tiers[idx % tiers.length]} rebate schedule entry for quarterly ledger reconciliation.`,
+    ].join('\n');
+  }).join('\n\n');
   writeFileSync(
     join(repoDir, 'docs', 'legacy', 'changelog_decoy.md'),
-    '<!-- DO NOT EDIT - ARCHIVED DECOY -->\n' +
-      'Legacy discount tariff history row\n'.repeat(120),
+    `<!-- DO NOT EDIT - ARCHIVED DECOY -->\n# Archived Discount Schedule\n\n${decoySections}\n`,
     'utf8',
   );
   const legacySections = Array.from({ length: 35 }, (_, idx) => {
@@ -381,7 +389,9 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     assert.ok(scrubRes.removedRemotes.includes('origin'));
     assert.equal(runGit(repoDir, ['remote']), '');
     assert.equal(runGit(repoDir, ['tag']), '');
-    assert.match(runGit(repoDir, ['branch']), /^\* \(HEAD detached at [0-9a-f]+\)$/i);
+    assert.match(runGit(repoDir, ['branch']), /^\* \((?:HEAD detached at [0-9a-f]+|no branch)\)/i);
+    assert.throws(() => runGit(repoDir, ['symbolic-ref', '-q', 'HEAD']));
+    assert.equal(runGit(repoDir, ['reflog']), '');
     assert.equal(runGit(repoDir, ['rev-parse', 'HEAD']), baseCommit);
     assert.equal(existsSync(join(repoDir, 'FUTURE.txt')), false);
 
@@ -660,6 +670,18 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
                 target: '    effective_pct = combined_pct',
                 replacement: '    effective_pct = min(combined_pct, max_discount_pct)',
               }),
+            },
+          ],
+        };
+      }
+      if (stage === 2 && msgs.some((m) => m.role === 'tool' && m.tool_call_id === 'call-edit')) {
+        stage = 3;
+        return {
+          toolCalls: [
+            {
+              id: 'call-test',
+              name: 'bash',
+              arguments: JSON.stringify({ command: 'pytest -q' }),
             },
           ],
         };
