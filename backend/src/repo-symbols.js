@@ -256,3 +256,286 @@ export function traceRepositoryCalls(
   }
   return { roots, edges };
 }
+
+function stemWithoutTestMarker(relPath) {
+  const base = String(relPath ?? '').replace(/\\/g, '/').split('/').pop().toLowerCase();
+  return base
+    .replace(/\.(?:test|spec)\.[cm]?[jt]sx?$/, '')
+    .replace(/^test_/, '')
+    .replace(/_test\.(?:py|go|rs)$/, '')
+    .replace(/\.[a-z0-9]+$/, '');
+}
+
+function isTestCandidatePath(relPath) {
+  const norm = String(relPath ?? '').replace(/\\/g, '/');
+  if (/(?:^|\/)(?:tests?|__tests__|specs?)\//i.test(norm)) return true;
+  const base = norm.split('/').pop() ?? '';
+  if (/\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(base)) return true;
+  if (/^(?:test_.*\.py|.*_test\.py)$/i.test(base)) return true;
+  if (/_test\.(?:go|rs)$/i.test(base)) return true;
+  return false;
+}
+
+export function findCrossFileReferencesFromAnalysis(analysis, symbolName, { path = null } = {}) {
+  const needle = String(symbolName ?? '').trim();
+  if (!needle || !analysis?.callGraph) {
+    return { symbol: needle, definitions: [], callers: [], importers: [], files: [] };
+  }
+  const allSymbols = analysis.callGraph.symbols ?? [];
+  const byId = new Map(allSymbols.map((s) => [s.id, s]));
+
+  const definitions = allSymbols
+    .filter((s) => {
+      if (path && s.path !== path) return false;
+      const qualified = s.owner ? `${s.owner}.${s.name}` : s.name;
+      return s.name === needle || qualified === needle || s.id === needle;
+    })
+    .map((s) => ({
+      id: s.id,
+      name: s.name,
+      kind: s.kind,
+      path: s.path,
+      line: s.line,
+      column: s.column,
+      ...(s.owner ? { owner: s.owner } : {}),
+    }));
+
+  const defIds = new Set(definitions.map((d) => d.id));
+  const defPaths = new Set(definitions.map((d) => d.path));
+  const shortNames = new Set(definitions.map((d) => d.name));
+  if (!shortNames.size) shortNames.add(needle.includes('.') ? needle.split('.').pop() : needle);
+
+  const callers = [];
+  const callerSeen = new Set();
+  const callerFiles = new Set();
+  for (const call of analysis.callGraph.calls ?? []) {
+    if (!defIds.has(call.to)) continue;
+    const fromSym = byId.get(call.from);
+    const toSym = byId.get(call.to);
+    const fromPath = fromSym?.path ?? call.from.slice(0, call.from.lastIndexOf('#'));
+    const toPath = toSym?.path ?? call.to.slice(0, call.to.lastIndexOf('#'));
+    const key = `${call.from}->${call.to}@${call.line}`;
+    if (callerSeen.has(key)) continue;
+    callerSeen.add(key);
+    callerFiles.add(fromPath);
+    callers.push({
+      from: call.from,
+      fromName: fromSym?.name ?? call.from,
+      path: fromPath,
+      line: call.line,
+      to: call.to,
+      toPath,
+      crossFile: fromPath !== toPath,
+    });
+  }
+
+  const edges = analysis.callGraph.edges ?? [];
+  const modulesByPath = new Map((analysis.callGraph.modules ?? []).map((m) => [m.path, m]));
+  const reachableTargets = new Set(defPaths);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const e of edges) {
+      if (
+        e.kind === 'esm-reexport' &&
+        reachableTargets.has(e.to) &&
+        !reachableTargets.has(e.from) &&
+        (e.symbols?.some((s) => shortNames.has(s) || s === '*' || s.startsWith('* as ')) ?? false)
+      ) {
+        const mod = modulesByPath.get(e.from);
+        if (!mod || mod.exports?.some((ex) => shortNames.has(ex)) || e.symbols?.includes('*')) {
+          reachableTargets.add(e.from);
+          grew = true;
+        }
+      }
+    }
+  }
+
+  const importers = [];
+  const importerSeen = new Set();
+  for (const e of edges) {
+    if (!reachableTargets.has(e.to)) continue;
+    const syms = e.symbols ?? [];
+    const origSyms = e.originalSymbols ?? [];
+    const explicitMatch =
+      syms.some((s) => shortNames.has(s) || s === '*' || s.startsWith('* as ')) ||
+      origSyms.some((s) => shortNames.has(s) || s === '*' || s.startsWith('* as '));
+    const implicitMatch =
+      syms.length === 0 ||
+      callerFiles.has(e.from) ||
+      (syms.includes('default') && definitions.some((d) => d.path === e.to));
+    if (!explicitMatch && !implicitMatch) continue;
+    const key = `${e.from}->${e.to}`;
+    if (importerSeen.has(key)) continue;
+    importerSeen.add(key);
+    importers.push({
+      from: e.from,
+      to: e.to,
+      specifier: e.specifier,
+      kind: e.kind,
+      symbols: [...syms],
+    });
+  }
+
+  const files = [
+    ...new Set([
+      ...definitions.map((d) => d.path),
+      ...callers.map((c) => c.path),
+      ...importers.map((im) => im.from),
+    ]),
+  ].sort((a, b) => a.localeCompare(b));
+
+  return { symbol: needle, definitions, callers, importers, files };
+}
+
+export function findRelatedTestsFromAnalysis(analysis, filePaths, { maxDepth = 5 } = {}) {
+  const rawList = (Array.isArray(filePaths) ? filePaths : [filePaths])
+    .map((p) => String(p ?? '').replace(/\\/g, '/').replace(/^\.\//, '').trim())
+    .filter(Boolean);
+
+  if (!rawList.length || !analysis?.callGraph) {
+    return { targetFiles: [], tests: [], details: [] };
+  }
+
+  const modules = analysis.callGraph.modules ?? [];
+  const edges = analysis.callGraph.edges ?? [];
+  const allPaths = [
+    ...new Set([
+      ...modules.map((m) => m.path),
+      ...(analysis.structure?.sourceFiles ?? []),
+      ...(analysis.structure?.testFiles ?? []),
+    ]),
+  ];
+  const testSet = new Set([
+    ...modules.filter((m) => m.isTest).map((m) => m.path),
+    ...(analysis.structure?.testFiles ?? []),
+  ]);
+  for (const p of allPaths) {
+    if (isTestCandidatePath(p)) testSet.add(p);
+  }
+
+  const resolveInputPath = (input) => {
+    if (allPaths.includes(input)) return input;
+    const lower = input.toLowerCase();
+    const exactCi = allPaths.find((p) => p.toLowerCase() === lower);
+    if (exactCi) return exactCi;
+    const suffixMatches = allPaths.filter((p) => p.toLowerCase().endsWith(`/${lower}`));
+    if (suffixMatches.length) return suffixMatches.sort((a, b) => a.localeCompare(b))[0];
+    return input;
+  };
+
+  const targetFiles = [...new Set(rawList.map(resolveInputPath))];
+  const reverseImports = new Map();
+  for (const e of edges) {
+    if (!reverseImports.has(e.to)) reverseImports.set(e.to, new Set());
+    reverseImports.get(e.to).add(e.from);
+  }
+
+  const testsByStem = new Map();
+  for (const t of testSet) {
+    const stem = stemWithoutTestMarker(t);
+    if (!stem) continue;
+    if (!testsByStem.has(stem)) testsByStem.set(stem, []);
+    testsByStem.get(stem).push(t);
+  }
+
+  const hits = new Map(); // testPath -> { path, reasons: Set, distance, matchedTargets: Set }
+  const recordHit = (testPath, reason, distance, target) => {
+    if (!hits.has(testPath)) {
+      hits.set(testPath, {
+        path: testPath,
+        reasons: new Set(),
+        distance,
+        matchedTargets: new Set(),
+      });
+    }
+    const entry = hits.get(testPath);
+    entry.reasons.add(reason);
+    entry.distance = Math.min(entry.distance, distance);
+    entry.matchedTargets.add(target);
+  };
+
+  for (const target of targetFiles) {
+    if (testSet.has(target)) {
+      recordHit(target, 'direct-test', 0, target);
+    }
+
+    // 1. Reverse import graph BFS
+    const visited = new Set([target]);
+    const queue = [{ path: target, depth: 0 }];
+    for (let i = 0; i < queue.length; i++) {
+      const { path: cur, depth } = queue[i];
+      if (depth >= maxDepth) continue;
+      for (const importer of reverseImports.get(cur) ?? []) {
+        if (testSet.has(importer)) {
+          recordHit(
+            importer,
+            depth === 0 ? 'direct-import' : 'transitive-import',
+            depth + 1,
+            target,
+          );
+        }
+        if (!visited.has(importer)) {
+          visited.add(importer);
+          queue.push({ path: importer, depth: depth + 1 });
+        }
+      }
+    }
+
+    // 2. Naming convention match (foo.js -> test/**/foo.test.*, etc.)
+    if (!testSet.has(target)) {
+      const stems = new Set();
+      const ownStem = stemWithoutTestMarker(target);
+      if (ownStem && ownStem !== 'index') stems.add(ownStem);
+      if (ownStem === 'index') {
+        const parts = target.split('/');
+        if (parts.length >= 2) {
+          stems.add(parts[parts.length - 2].toLowerCase());
+        }
+      }
+      for (const s of stems) {
+        for (const cand of testsByStem.get(s) ?? []) {
+          recordHit(cand, 'naming-convention', 1, target);
+        }
+      }
+    }
+  }
+
+  const details = [...hits.values()]
+    .map((h) => ({
+      path: h.path,
+      reasons: [...h.reasons].sort((a, b) => a.localeCompare(b)),
+      distance: h.distance,
+      matchedTargets: [...h.matchedTargets].sort((a, b) => a.localeCompare(b)),
+    }))
+    .sort(
+      (a, b) =>
+        a.distance - b.distance ||
+        b.reasons.length - a.reasons.length ||
+        a.path.localeCompare(b.path),
+    );
+
+  return {
+    targetFiles,
+    tests: details.map((d) => d.path),
+    details,
+  };
+}
+
+export function findCrossFileReferences(indexOrRoot, symbolName, options = {}) {
+  if (typeof indexOrRoot === 'string') {
+    return import('./repo-intelligence.js').then((m) =>
+      m.findCrossFileReferences(indexOrRoot, symbolName, options),
+    );
+  }
+  return findCrossFileReferencesFromAnalysis(indexOrRoot, symbolName, options);
+}
+
+export function findRelatedTests(indexOrRoot, filePaths, options = {}) {
+  if (typeof indexOrRoot === 'string') {
+    return import('./repo-intelligence.js').then((m) =>
+      m.findRelatedTests(indexOrRoot, filePaths, options),
+    );
+  }
+  return findRelatedTestsFromAnalysis(indexOrRoot, filePaths, options);
+}
