@@ -23,6 +23,7 @@ const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delet
 const ALWAYS_DIRECT_TOOLS = new Set([
   'compute_file_digest',
   'expand_context',
+  'query_symbol_graph',
   'read_blob',
   'update_plan',
   'search_history',
@@ -305,6 +306,9 @@ function extractTargetPath(toolName, args, parsedRead) {
     args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? parsedRead?.headerPath ?? '',
   ).trim();
   if (explicit) return explicit.replace(/\\/g, '/');
+  if (lower === 'query_symbol_graph' && args?.symbol) {
+    return `query_symbol_graph:${String(args.symbol).slice(0, 60)}`;
+  }
   if (lower === 'grep' && args?.pattern) return `grep:${String(args.pattern).slice(0, 60)}`;
   if (lower === 'grep' && args?.query) return `grep:${String(args.query).slice(0, 60)}`;
   if (lower === 'glob' && args?.pattern) return `glob:${String(args.pattern).slice(0, 60)}`;

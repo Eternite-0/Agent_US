@@ -64,6 +64,7 @@ import { ReversibleContextStore, ContextEvidenceLedger } from './context/aci-sto
 import {
   ACIEngine,
   PHASE_WATERMARK_V25_DTOC_POLICY,
+  TRAJECTORY_EVICTION_V26_DTOC_POLICY,
   resolveWatermarksForPolicy,
 } from './context/aci-engine.js';
 import {
@@ -795,6 +796,7 @@ export class DirectAgentRuntime {
       'retrieval_supervisor',
       'full_aci',
       'aci_25',
+      'aci_26',
     ]);
     const sessionCfg = this.sessionAciConfigs.get(sessionId) ?? {};
     const rawProfile = turnAciProfile ?? sessionCfg.aciProfile ?? 'full_aci';
@@ -864,14 +866,16 @@ export class DirectAgentRuntime {
     if (
       mergedOptions.dtocPolicy === 'cumulative' ||
       mergedOptions.dtocPolicy === 'adaptive_single_step' ||
-      mergedOptions.dtocPolicy === 'phase_watermark_v25'
+      mergedOptions.dtocPolicy === 'phase_watermark_v25' ||
+      mergedOptions.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
     ) {
       dtocPolicy = mergedOptions.dtocPolicy;
+    } else if (aciProfile === 'aci_25') {
+      dtocPolicy = PHASE_WATERMARK_V25_DTOC_POLICY;
+    } else if (aciProfile === 'full_aci' || aciProfile === 'aci_26') {
+      dtocPolicy = TRAJECTORY_EVICTION_V26_DTOC_POLICY;
     } else {
-      dtocPolicy =
-        aciProfile === 'full_aci' || aciProfile === 'aci_25'
-          ? PHASE_WATERMARK_V25_DTOC_POLICY
-          : 'adaptive_single_step';
+      dtocPolicy = 'adaptive_single_step';
     }
     const dtocMinPromptTokens =
       mergedOptions.dtocMinPromptTokens != null &&
@@ -897,7 +901,8 @@ export class DirectAgentRuntime {
         ? this.store.getSetting(ACI_CONFIG_KEY, null)
         : null;
     const hasCustomWatermarks =
-      dtocPolicy !== PHASE_WATERMARK_V25_DTOC_POLICY ||
+      (dtocPolicy !== PHASE_WATERMARK_V25_DTOC_POLICY &&
+        dtocPolicy !== TRAJECTORY_EVICTION_V26_DTOC_POLICY) ||
       (Array.isArray(mergedOptions.watermarks) && mergedOptions.watermarks.length > 0) ||
       (Array.isArray(mergedOptions.epochWatermarks) && mergedOptions.epochWatermarks.length > 0) ||
       (Array.isArray(mergedOptions.supervisorConfigOverride?.epochWatermarks) &&
@@ -2018,15 +2023,29 @@ export class DirectAgentRuntime {
             uri: restored.uri,
             refId: restored.refId,
             path: restored.path,
-            recordRecovery: ({ level = 'verbatim', tokensRestored = 0, path = '' } = {}) => {
+            recordRecovery: ({
+              level = 'verbatim',
+              mode = undefined,
+              isPartial = undefined,
+              fullTokens = undefined,
+              tokensRestored = 0,
+              tokensSaved = undefined,
+              sliceSha256 = undefined,
+              path = '',
+            } = {}) => {
               aciLedger.recordRecovery({
                 refId: restored.refId,
                 uri: restored.uri,
                 sha256: restored.sha256,
+                sliceSha256: sliceSha256 ?? null,
                 path: path || restored.path,
                 level,
+                mode,
+                isPartial,
+                fullTokens,
                 verified: restored.verified,
                 tokensRestored,
+                tokensSaved,
                 triggeredBy: 'expand_context',
                 step: 0,
               });
@@ -2340,6 +2359,8 @@ export class DirectAgentRuntime {
       const finalVerdict = loopResult.verdict ?? null;
       const reasoningMetrics = loopResult.reasoningMetrics ?? null;
       const budgetWatermarks = loopResult.budgetWatermarks ?? reasoningMetrics?.budgetWatermarks ?? null;
+      const aciTelemetry =
+        loopResult.aciTelemetry ?? reasoningMetrics?.aciMetrics?.aciTelemetry ?? null;
       if (turnAciLedger) {
         turnAciLedger.mergeFrom(aciLedger);
       }
@@ -2522,6 +2543,7 @@ export class DirectAgentRuntime {
               durationMs,
               ...(reasoningMetrics ? { reasoningMetrics } : {}),
               ...(budgetWatermarks ? { budgetWatermarks } : {}),
+              ...(aciTelemetry ? { aciTelemetry } : {}),
               ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
             },
             audit: false,
@@ -2544,6 +2566,7 @@ export class DirectAgentRuntime {
               durationMs,
               ...(reasoningMetrics ? { reasoningMetrics } : {}),
               ...(budgetWatermarks ? { budgetWatermarks } : {}),
+              ...(aciTelemetry ? { aciTelemetry } : {}),
             }),
           );
           safeIsolateSideEffect(() =>
@@ -2706,6 +2729,7 @@ export class DirectAgentRuntime {
             text: excerpt(finalAssistantText, 4000),
             ...(reasoningMetrics ? { reasoningMetrics } : {}),
             ...(budgetWatermarks ? { budgetWatermarks } : {}),
+            ...(aciTelemetry ? { aciTelemetry } : {}),
             ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
           },
           audit: false,
@@ -2734,6 +2758,7 @@ export class DirectAgentRuntime {
             evidenceCount: Number(evidenceCount || 0),
             ...(reasoningMetrics ? { reasoningMetrics } : {}),
             ...(budgetWatermarks ? { budgetWatermarks } : {}),
+            ...(aciTelemetry ? { aciTelemetry } : {}),
             ...(experienceMemoryTelemetry ? { experienceMemory: experienceMemoryTelemetry } : {}),
           }),
         );
@@ -2839,6 +2864,11 @@ export class DirectAgentRuntime {
         err?.budgetWatermarks ??
         classified?.budgetWatermarks ??
         catchReasoningMetrics?.budgetWatermarks ??
+        null;
+      const catchAciTelemetry =
+        err?.aciTelemetry ??
+        classified?.aciTelemetry ??
+        catchReasoningMetrics?.aciMetrics?.aciTelemetry ??
         null;
       if (turnAciLedger) {
         turnAciLedger.mergeFrom(aciLedger);
@@ -2996,6 +3026,7 @@ export class DirectAgentRuntime {
                   durationMs,
                   ...(catchReasoningMetrics ? { reasoningMetrics: catchReasoningMetrics } : {}),
                   ...(catchBudgetWatermarks ? { budgetWatermarks: catchBudgetWatermarks } : {}),
+                  ...(catchAciTelemetry ? { aciTelemetry: catchAciTelemetry } : {}),
                 }
               : {
                   turnId,
@@ -3012,6 +3043,7 @@ export class DirectAgentRuntime {
                   durationMs,
                   ...(catchReasoningMetrics ? { reasoningMetrics: catchReasoningMetrics } : {}),
                   ...(catchBudgetWatermarks ? { budgetWatermarks: catchBudgetWatermarks } : {}),
+                  ...(catchAciTelemetry ? { aciTelemetry: catchAciTelemetry } : {}),
                 },
             audit: false,
             at: finishedAt,
@@ -3136,6 +3168,12 @@ export class DirectAgentRuntime {
         const evData = JSON.parse(evRow.data || '{}');
         if (!evData.reasoningMetrics) {
           evData.reasoningMetrics = reasoningMetrics;
+          if (!evData.budgetWatermarks && reasoningMetrics.budgetWatermarks) {
+            evData.budgetWatermarks = reasoningMetrics.budgetWatermarks;
+          }
+          if (!evData.aciTelemetry && reasoningMetrics.aciMetrics?.aciTelemetry) {
+            evData.aciTelemetry = reasoningMetrics.aciMetrics.aciTelemetry;
+          }
           this.store.db
             .prepare('UPDATE direct_events SET data=? WHERE seq=?')
             .run(JSON.stringify(evData), evRow.seq);

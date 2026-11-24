@@ -652,7 +652,7 @@ test('ContextEvidenceLedger.mergeFrom is idempotent, toSharedDigest & buildShare
     const session = runtime.createSession({ model: 'main-test-model', workspaceRoot: workDir });
     const { turn } = runtime.startTurn(session.id, {
       input: 'Read src/small.js and summarize without losing context across retry.',
-      aciProfile: 'full_aci',
+      aciProfile: 'aci_25',
       aciOptions: { admissionMinChars: 1200 },
     });
 
@@ -675,7 +675,7 @@ test('ContextEvidenceLedger.mergeFrom is idempotent, toSharedDigest & buildShare
       rm.aciMetrics.ledger.admissions.length >= 1,
       'ACI admissions from attempt 1 must survive mid-turn retry',
     );
-    assert.equal(rm.aciMetrics.aciProfile, 'full_aci');
+    assert.equal(rm.aciMetrics.aciProfile, 'aci_25');
     assert.equal(rm.aciMetrics.dtocPolicy, 'phase_watermark_v25');
     assert.ok(data.budgetWatermarks, 'TURN_COMPLETED must carry budgetWatermarks');
   } finally {

@@ -4,7 +4,7 @@ import { relative, resolve } from 'node:path';
 import { z } from 'zod';
 import { canonicalJson, sha256Hex } from '../../integrity.js';
 import { estimateTokens } from '../../context.js';
-import { extractSymbolsFromText } from '../../context/aci-engine.js';
+import { extractBoundedSymbolSpans, extractSymbolsFromText } from '../../context/aci-engine.js';
 import { Fault } from '../../store.js';
 import { PolicyError } from '../../kernel/errors.js';
 import { normalizeProtectedSegment, resolveConfinedPath } from '../sandbox.js';
@@ -366,21 +366,22 @@ export function createMetaTools({
     defineTool({
       name: 'expand_context',
       readOnly: true,
-      description: '无损恢复 artifact://<sha256> 或 ACI refId 原文（支持行号/字符/大纲/符号片段）。',
+      description: '无损恢复 artifact/refId 原文（支持符号/行号/大纲）。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
       riskLevel: RISK_LEVELS.LOW,
       replayable: true,
       outward: false,
       zodSchema: z.object({
-        ref: z.string().min(1).optional().describe('artifact:// URI 或 refId'),
-        uri: z.string().min(1).optional().describe('URI 别名'),
-        refId: z.string().min(1).optional().describe('refId 别名'),
+        ref: z.string().min(1).optional().describe('artifact:// URI或refId'),
+        uri: z.string().min(1).optional(),
+        refId: z.string().min(1).optional(),
         level: z.enum(['verbatim', 'hunk', 'outline']).optional(),
+        symbol: z.string().optional(),
         symbols: z.array(z.string().min(1)).max(20).optional(),
-        startLine: z.number().int().min(1).optional().describe('起始行'),
-        endLine: z.number().int().min(1).optional().describe('结束行'),
-        offset: z.number().int().min(0).optional().describe('字符偏移'),
-        limit: z.number().int().min(1).max(32768).optional().describe('字符上限'),
+        startLine: z.number().int().min(1).optional(),
+        endLine: z.number().int().min(1).optional(),
+        offset: z.number().int().min(0).optional(),
+        limit: z.number().int().min(1).max(32768).optional(),
       }),
       async execute(args, ctx) {
         await guardFallback('expand_context', args, ctx);
@@ -390,13 +391,20 @@ export function createMetaTools({
         }
         const level =
           args.level === 'hunk' || args.level === 'outline' ? args.level : 'verbatim';
+        const requestedSymbols = [
+          ...(args.symbol ? [args.symbol] : []),
+          ...(Array.isArray(args.symbols) ? args.symbols : []),
+        ]
+          .map((s) => String(s ?? '').trim())
+          .filter(Boolean);
 
         let blob = null;
         let resolvedMeta = null;
         if (typeof resolveContextRef === 'function') {
           const resolved = await resolveContextRef(rawRef, {
             level,
-            symbols: args.symbols,
+            symbol: args.symbol,
+            symbols: requestedSymbols,
             startLine: args.startLine,
             endLine: args.endLine,
             offset: args.offset,
@@ -465,8 +473,10 @@ export function createMetaTools({
         const maxChars = Math.min(32768, Math.max(1, Number(args.limit ?? 16384)));
         let slice = fullText;
         let rangeDesc = '';
+        let mode = 'full';
 
         if (level === 'outline') {
+          mode = 'outline';
           const pathForParse = blob.path || 'file.js';
           const extracted = extractSymbolsFromText(pathForParse, fullText);
           const imports = lines
@@ -486,6 +496,7 @@ export function createMetaTools({
           slice = sections.join('\n\n').slice(0, maxChars);
           rangeDesc = `outline (${lines.length} lines)`;
         } else if (level === 'hunk') {
+          mode = 'hunk';
           if (args.startLine !== undefined || args.endLine !== undefined) {
             const sLine = Math.max(1, Number(args.startLine ?? 1));
             const eLine = Math.min(lines.length, Math.max(sLine, Number(args.endLine ?? lines.length)));
@@ -495,44 +506,56 @@ export function createMetaTools({
               .join('\n')
               .slice(0, maxChars);
             rangeDesc = `hunk lines ${sLine}-${eLine}/${lines.length}`;
+          } else if (requestedSymbols.length > 0) {
+            const spanRes = extractBoundedSymbolSpans(
+              blob.path || 'file.js',
+              fullText,
+              requestedSymbols,
+              { fallbackRadius: 12, maxChars },
+            );
+            if (spanRes.text) {
+              slice = spanRes.text;
+              rangeDesc = `hunk ${spanRes.rangeDesc}`;
+            } else {
+              const previewEnd = Math.min(lines.length, 30);
+              slice = lines
+                .slice(0, previewEnd)
+                .map((l, idx) => `L${idx + 1}: ${l}`)
+                .join('\n')
+                .slice(0, maxChars);
+              rangeDesc = `hunk (symbol not found; L1-${previewEnd}/${lines.length})`;
+            }
           } else {
-            const needles = (args.symbols ?? [])
-              .map((s) => String(s || '').trim())
-              .filter(Boolean);
-            const matchLines = [];
-            if (needles.length > 0) {
-              for (let i = 0; i < lines.length; i += 1) {
-                const lower = lines[i].toLowerCase();
-                if (needles.some((n) => lower.includes(n.toLowerCase()))) {
-                  matchLines.push(i + 1);
-                  if (matchLines.length >= 16) break;
-                }
-              }
-            }
-            const windows = [];
-            for (const ln of matchLines) {
-              const from = Math.max(1, ln - 8);
-              const to = Math.min(lines.length, ln + 8);
-              if (windows.length && from <= windows.at(-1).to + 2) {
-                windows.at(-1).to = Math.max(windows.at(-1).to, to);
-              } else {
-                windows.push({ from, to });
-              }
-            }
-            if (windows.length === 0) {
-              windows.push({ from: 1, to: Math.min(lines.length, 30) });
-            }
-            const hunkBlocks = windows.map((w) => {
-              const chunk = [];
-              for (let ln = w.from; ln <= w.to; ln += 1) {
-                chunk.push(`L${ln}: ${lines[ln - 1] ?? ''}`);
-              }
-              return `@@ L${w.from}-${w.to} @@\n${chunk.join('\n')}`;
-            });
-            slice = hunkBlocks.join('\n...\n').slice(0, maxChars);
-            rangeDesc = `hunk (${windows.map((w) => `L${w.from}-${w.to}`).join(',')}/${lines.length})`;
+            const previewEnd = Math.min(lines.length, 30);
+            slice = lines
+              .slice(0, previewEnd)
+              .map((l, idx) => `L${idx + 1}: ${l}`)
+              .join('\n')
+              .slice(0, maxChars);
+            rangeDesc = `hunk (L1-${previewEnd}/${lines.length})`;
+          }
+        } else if (requestedSymbols.length > 0) {
+          mode = 'symbol';
+          const spanRes = extractBoundedSymbolSpans(
+            blob.path || 'file.js',
+            fullText,
+            requestedSymbols,
+            { fallbackRadius: 12, maxChars },
+          );
+          if (spanRes.text) {
+            slice = spanRes.text;
+            rangeDesc = spanRes.rangeDesc;
+          } else {
+            const fallbackEnd = Math.min(lines.length, 25);
+            slice = lines
+              .slice(0, fallbackEnd)
+              .map((l, idx) => `L${idx + 1}: ${l}`)
+              .join('\n')
+              .slice(0, maxChars);
+            rangeDesc = `symbols(not-found) L1-${fallbackEnd}/${lines.length}`;
           }
         } else if (args.startLine !== undefined || args.endLine !== undefined) {
+          mode = 'lines';
           const sLine = Math.max(1, Number(args.startLine ?? 1));
           const eLine = Math.min(lines.length, Math.max(sLine, Number(args.endLine ?? lines.length)));
           const selected = lines.slice(sLine - 1, eLine).join('\n');
@@ -542,18 +565,31 @@ export function createMetaTools({
         } else {
           const offset = Math.max(0, Number(args.offset ?? 0));
           slice = fullText.slice(offset, offset + maxChars);
+          mode = offset > 0 || slice.length < fullText.length ? 'lines' : 'full';
           rangeDesc = `chars ${offset}-${offset + slice.length}/${fullText.length}`;
         }
 
+        const fullTokens = estimateTokens(fullText);
+        const tokensRestored = estimateTokens(slice);
+        const sliceSha256 = sha256Hex(slice);
+        const isPartial = mode !== 'full' || slice.length < fullText.length;
+        const effectiveMode = isPartial && mode === 'full' ? 'lines' : mode;
+        const tokensSaved = isPartial ? Math.max(0, fullTokens - tokensRestored) : 0;
+
         resolvedMeta?.recordRecovery?.({
           level,
-          tokensRestored: estimateTokens(slice),
+          mode: effectiveMode,
+          isPartial,
+          fullTokens,
+          tokensRestored,
+          tokensSaved,
+          sliceSha256,
           path: blob.path || '',
         });
 
         return wrapResult(
           'expand_context',
-          `[expand_context sha256:${actualSha256.slice(0, 12)} verified=true ${rangeDesc}]\n${slice}`,
+          `[expand_context sha256:${actualSha256.slice(0, 12)} verified=true ${rangeDesc}] [sliceSha256:${sliceSha256.slice(0, 12)} verified=true mode=${effectiveMode}]\n${slice}`,
         );
       },
     }),
