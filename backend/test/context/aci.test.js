@@ -1265,7 +1265,7 @@ test('Stage 4: adaptive_single_step DTOC preserves short-task KV cache at tokens
 });
 
 test('Stage 4 calibration: ACI-SKIP stubs, json_key outline + >2600 CONTRACT.json SUPPORTING, mixed grep decoy, one-shot emergencyUsed, and supervisor stream usage dedupe', async (t) => {
-  assert.equal(DEFAULT_ACI_SUPERVISOR_CONFIG.timeoutMs, 25000);
+  assert.equal(DEFAULT_ACI_SUPERVISOR_CONFIG.timeoutMs, 8000);
 
   await makeTempPool(t, async ({ store, pool }) => {
     pool.createAccount({

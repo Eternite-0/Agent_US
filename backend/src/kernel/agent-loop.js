@@ -2,7 +2,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { sha256Hex } from '../integrity.js';
 import { computeArgsDigest } from '../tools/dispatcher.js';
-import { compactTwoStage, excerpt } from '../context.js';
+import { compactTwoStage, estimateTokens, excerpt } from '../context.js';
 import { verifyTurn, buildRepairNote } from '../verifier.js';
 import { BudgetError, RecoveryError, classifyError } from './errors.js';
 import { RUNTIME_EVENTS } from './events.js';
@@ -20,10 +20,42 @@ import { resolveTurnOutcome } from './verdict.js';
 import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
 import { selectOffloadableAciCandidates } from '../context/aci-engine.js';
 import {
+  computeCompletionReserveTokens,
+  evaluatePostTestCompletionReserve,
+} from '../planning/budget-estimator.js';
+import {
   BUDGET_SCOPES,
   estimateRequestInputTokens,
   normalizeBudgetLimit,
 } from '../swarm/budget-ledger.js';
+
+const NON_ESSENTIAL_POST_TEST_TOOLS = new Set([
+  'read_file',
+  'read_blob',
+  'grep',
+  'glob',
+  'inspect_repository',
+  'search_history',
+  'expand_context',
+  'update_plan',
+  'web_search',
+  'web_fetch',
+  'compute_file_digest',
+  'bash',
+  'start_process',
+  'run_diagnostics',
+]);
+
+function safeParseToolArgsSimple(rawArgs) {
+  if (!rawArgs) return {};
+  if (typeof rawArgs === 'object' && !Array.isArray(rawArgs)) return rawArgs;
+  try {
+    const parsed = JSON.parse(String(rawArgs));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
 function normalizeAciPath(p) {
   return String(p ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
@@ -442,6 +474,9 @@ export class AgentLoop {
       workspaceRoot,
       baselineTestFiles: execution?.baselineTestFiles ?? node?.baselineTestFiles ?? null,
     });
+    if (Array.isArray(aci?.priorReadFiles) && aci.priorReadFiles.length > 0) {
+      reasoningTracker.seedReadFiles(aci.priorReadFiles);
+    }
     const aciProfile = aci?.aciProfile ?? 'full_aci';
     const aciAdmissionEnabled =
       Boolean(aci?.engine) &&
@@ -601,6 +636,57 @@ export class AgentLoop {
     let verificationReserveAdvised = false;
     let budgetReserveAdvised = false;
     let budgetFinalCallAdvised = false;
+    let postTestReserveActive = false;
+    let postTestReserveAdvised = false;
+    let lastEstimatedInputTokens = 0;
+    let lastSingleStepRatio = 0;
+    const effectiveWatermarkMaxTokens =
+      maxTotalTokens !== null
+        ? maxTotalTokens
+        : aci?.engine?.maxTotalTokens != null && Number.isFinite(Number(aci.engine.maxTotalTokens))
+          ? Math.max(0, Math.trunc(Number(aci.engine.maxTotalTokens)))
+          : null;
+    let lastCompletionReserveTokens = computeCompletionReserveTokens({
+      currentStepEstimatedIn: 0,
+      maxTotalTokens: effectiveWatermarkMaxTokens,
+    });
+    const buildBudgetWatermarks = () => {
+      const usedTokens = Math.max(0, Math.trunc(tm.totalIn + tm.totalOut));
+      const maxTokens = effectiveWatermarkMaxTokens;
+      const ratio =
+        maxTokens !== null && maxTokens > 0
+          ? Number((usedTokens / maxTokens).toFixed(4))
+          : 0;
+      const evalReserve = evaluatePostTestCompletionReserve({
+        lastRunTestsPassed: reasoningTracker.lastRunTestsPassed,
+        verificationCount: reasoningTracker.verificationCount,
+        unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
+        usedTokens,
+        maxTotalTokens: maxTokens,
+        currentStepEstimatedIn: lastEstimatedInputTokens,
+      });
+      lastCompletionReserveTokens = evalReserve.completionReserveTokens;
+      postTestReserveActive = Boolean(evalReserve.postTestReserveActive);
+      const engineLastWm = Number(aci?.engine?.epochState?.lastWatermark ?? -1);
+      const dtocWatermark =
+        engineLastWm >= 0
+          ? Number(Math.max(engineLastWm, lastSingleStepRatio).toFixed(4))
+          : Number(lastSingleStepRatio.toFixed(4));
+      const supervisorCircuitOpen = Boolean(
+        aci?.supervisor?.isCircuitOpen?.() || aci?.supervisor?.getStatus?.()?.circuitOpen,
+      );
+      const snapshot = {
+        usedTokens,
+        maxTokens,
+        ratio,
+        reserveTokens: evalReserve.completionReserveTokens,
+        postTestReserveActive,
+        dtocWatermark,
+        supervisorCircuitOpen,
+      };
+      reasoningTracker.updateBudgetWatermarks(snapshot);
+      return snapshot;
+    };
     let finalStepAdvised = false;
     let repairedOnce = false;
     let repairRound = 0;
@@ -608,6 +694,8 @@ export class AgentLoop {
     let policyBlockWarned = false;
     const nonFatalPatternsWarned = new Set();
     let contractCompletionChecked = false;
+    let postPassGraceUsed = false;
+    let postPassGraceStepActive = false;
     let finalAssistantText = '';
     let finalVerdict = null;
     let stopReason = 'completed';
@@ -650,8 +738,31 @@ export class AgentLoop {
         if (deadlineAt !== null && Date.now() > deadlineAt) {
           throw new BudgetError('TASK_DEADLINE', { message: '任务执行超出时间预算' });
         }
+        postPassGraceStepActive = false;
         if (maxTotalTokens !== null && tm.totalIn + tm.totalOut >= maxTotalTokens) {
-          throw new BudgetError('TOKEN_BUDGET', { message: '任务执行超出 Token 预算' });
+          const canGrantPostPassGrace =
+            reasoningTracker.lastRunTestsPassed &&
+            !reasoningTracker.hasUnverifiedMutationsAfterLastPass &&
+            !postPassGraceUsed;
+          if (canGrantPostPassGrace) {
+            postPassGraceUsed = true;
+            postPassGraceStepActive = true;
+            postTestReserveActive = true;
+            postTestReserveAdvised = true;
+            budgetReserveAdvised = true;
+            budgetFinalCallAdvised = true;
+            reasoningTracker.markBudgetReserveAdvised();
+            reasoningTracker.markBudgetFinalCallAdvised();
+            const graceText = execution?.evidenceContract
+              ? `[最终交付宽限步 — 禁止工具调用] 核心测试已通过且无未验证源码变更。累计预算已触及上限，系统授予唯一 1 次纯文本交付宽限步（tools=[]）。请停止所有工具调用，立即直接输出简洁结论与完整的 Evidence Manifest v1.0.0 JSON。`
+              : `[最终交付宽限步 — 禁止工具调用] 核心测试已通过且无未验证源码变更。累计预算已触及上限，系统授予唯一 1 次纯文本交付宽限步（tools=[]）。请停止所有工具调用，立即直接输出最终交付总结。`;
+            messages.push({
+              role: 'user',
+              content: [{ type: 'text', text: graceText }],
+            });
+          } else {
+            throw new BudgetError('TOKEN_BUDGET', { message: '任务执行超出 Token 预算' });
+          }
         }
 
         steps++;
@@ -684,7 +795,7 @@ export class AgentLoop {
           maxTotalTokens !== null ? maxTotalTokens - (tm.totalIn + tm.totalOut) : null;
         const remainingDurationMs = deadlineAt !== null ? deadlineAt - Date.now() : null;
         const currentStepEstimatedIn =
-          maxTotalTokens !== null
+          effectiveWatermarkMaxTokens !== null
             ? estimateRequestInputTokens({
                 provider,
                 model,
@@ -694,6 +805,18 @@ export class AgentLoop {
                 tools: getModelTools ? getModelTools() : tools,
               })
             : 0;
+        lastEstimatedInputTokens = currentStepEstimatedIn;
+        const postTestReserveEval = evaluatePostTestCompletionReserve({
+          lastRunTestsPassed: reasoningTracker.lastRunTestsPassed,
+          verificationCount: reasoningTracker.verificationCount,
+          unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
+          usedTokens: tm.totalIn + tm.totalOut,
+          maxTotalTokens: effectiveWatermarkMaxTokens,
+          currentStepEstimatedIn,
+        });
+        lastCompletionReserveTokens = postTestReserveEval.completionReserveTokens;
+        postTestReserveActive = postTestReserveEval.postTestReserveActive;
+        buildBudgetWatermarks();
         const finalManifestReserve = currentStepEstimatedIn + 1800;
         const estTurnCost = Math.max(4000, currentStepEstimatedIn + 1500);
         const approxTurnsLeft =
@@ -703,6 +826,25 @@ export class AgentLoop {
           Math.floor(currentStepEstimatedIn * 2.15) + 1500,
           currentStepEstimatedIn + finalManifestReserve,
         );
+
+        if (postTestReserveActive && !postTestReserveAdvised) {
+          postTestReserveAdvised = true;
+          budgetReserveAdvised = true;
+          advisedReserveThisStep = true;
+          reasoningTracker.markBudgetReserveAdvised();
+          const postTestWrapUpText = execution?.evidenceContract
+            ? `[测试通过收尾预留已激活] 核心测试已通过且无未验证源码变更，剩余预算约 ${postTestReserveEval.remainingTokens ?? remainingTokens ?? '未知'} tokens（已进入完成预留区间 ${postTestReserveEval.completionReserveTokens} tokens）。请立即停止所有非必需读取、探测或重复验证工具调用，直接基于已有真实回执输出最终结论与完整的 Evidence Manifest v1.0.0 JSON。`
+            : `[测试通过收尾预留已激活] 核心测试已通过且无未验证源码变更，剩余预算约 ${postTestReserveEval.remainingTokens ?? remainingTokens ?? '未知'} tokens（已进入完成预留区间 ${postTestReserveEval.completionReserveTokens} tokens）。请立即停止所有非必需读取、探测或重复验证工具调用，直接输出简洁的最终交付总结。`;
+          messages.push({
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: postTestWrapUpText,
+              },
+            ],
+          });
+        }
 
         if (
           !budgetFinalCallAdvised &&
@@ -809,7 +951,7 @@ export class AgentLoop {
           sessionKey: sessionId,
           effort,
           messages,
-          tools: getModelTools ? getModelTools() : tools,
+          tools: postPassGraceStepActive ? [] : getModelTools ? getModelTools() : tools,
           maxTokens: baseMaxOutputTokens,
           signal,
         };
@@ -817,12 +959,19 @@ export class AgentLoop {
           if (aciDtocEnabled) {
             const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
             const epochContextWindow = aci.engine.contextWindow ?? 128000;
+            const contractFiles = [
+              ...(execution?.evidenceContract?.requiredChangedFiles ?? []),
+              ...(taskContract?.requiredFiles ?? []),
+            ];
             const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
               currentStep: steps,
               tools: requestOptions.tools,
               cumulativeUsedTokens,
               contextWindow: epochContextWindow,
+              verificationCount: reasoningTracker.verificationCount,
+              unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
             });
+            lastSingleStepRatio = Number((epochProbe?.singleStepRatio ?? 0).toFixed(4));
             if (epochProbe?.triggered) {
               const activeMutationTargets = [...reasoningTracker.filesMutated];
               const eligibleCandidates = selectOffloadableAciCandidates(requestOptions.messages, {
@@ -830,6 +979,8 @@ export class AgentLoop {
                 singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
                 singleStepBudget: aci.engine.singleStepBudget,
                 activeMutationTargets,
+                dtocPolicy: aci.engine.dtocPolicy,
+                contractFiles,
               });
               if (eligibleCandidates.length > 0) {
                 let keepRefs = [];
@@ -897,6 +1048,9 @@ export class AgentLoop {
                   keepRefs,
                   compressRefs,
                   activeMutationTargets,
+                  contractFiles,
+                  verificationCount: reasoningTracker.verificationCount,
+                  unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
                 });
                 if (
                   compResult?.triggered &&
@@ -917,11 +1071,13 @@ export class AgentLoop {
                       watermark: compResult.watermark,
                       step: steps,
                       compressedCount: compResult.compressedCount,
+                      netSavingsTokens: compResult.netSavingsTokens ?? 0,
                       tokens: {
                         before: compResult.tokensBefore,
                         after: compResult.tokensAfter,
                       },
                       pairClosedValid: compResult.pairClosedValid,
+                      budgetWatermarks: buildBudgetWatermarks(),
                     },
                     audit: false,
                   });
@@ -959,13 +1115,52 @@ export class AgentLoop {
 
         // Pre-inference budget admission, atomic reservation & controllable maxOutputTokens clamping
         let estimatedInputTokens = estimateRequestInputTokens(requestOptions);
+        lastEstimatedInputTokens = estimatedInputTokens;
+        if (aci?.engine?.singleStepBudget > 0 && lastSingleStepRatio === 0) {
+          lastSingleStepRatio = Number(
+            (estimatedInputTokens / aci.engine.singleStepBudget).toFixed(4),
+          );
+        }
         const nodeBudgetCaps = {
           maxSteps: explicitMaxSteps,
           maxTokens: maxTotalTokens,
           maxOutputTokens: explicitMaxOutput,
         };
-        const tryEmergencyBudgetPrune = async (budgetRemaining) => {
-          if (!(budgetRemaining > 2000 && estimatedInputTokens >= budgetRemaining)) {
+        const pruneStaleToolOutputsStage1 = (msgs, keepTailMsgs = 3, minChars = 320) => {
+          if (!Array.isArray(msgs) || msgs.length <= keepTailMsgs + 1) {
+            return { messages: msgs, prunedCount: 0 };
+          }
+          const cutoff = Math.max(1, msgs.length - keepTailMsgs);
+          let prunedCount = 0;
+          const nextMsgs = msgs.map((msg, idx) => {
+            if (idx === 0 || idx >= cutoff || msg?.role !== 'tool') return msg;
+            const rawText = Array.isArray(msg.content)
+              ? msg.content.map((p) => (p?.type === 'text' ? String(p.text ?? '') : '')).join('\n')
+              : String(msg.content ?? '');
+            if (
+              rawText.length < minChars ||
+              rawText.startsWith('[EMERGENCY STAGE-1 PRUNED') ||
+              rawText.startsWith('[POST_TEST_RESERVE_GATED]')
+            ) {
+              return msg;
+            }
+            if (/\b(?:error|failed|exception|traceback|assertionerror|syntaxerror)\b/i.test(rawText)) {
+              return msg;
+            }
+            prunedCount += 1;
+            const headLine = rawText.split(/\r?\n/)[0]?.slice(0, 120) ?? '';
+            const prunedText = `[EMERGENCY STAGE-1 PRUNED STALE TOOL OUTPUT: original=${rawText.length} chars; head=${headLine}]`;
+            return {
+              ...msg,
+              content: Array.isArray(msg.content)
+                ? [{ type: 'text', text: prunedText }]
+                : prunedText,
+            };
+          });
+          return { messages: nextMsgs, prunedCount };
+        };
+        const tryEmergencyBudgetPrune = async (budgetRemaining, { minHeadroomTokens = 0 } = {}) => {
+          if (!(budgetRemaining > 1200 && estimatedInputTokens + minHeadroomTokens >= budgetRemaining)) {
             return false;
           }
           let emergency = null;
@@ -977,17 +1172,15 @@ export class AgentLoop {
               summarize: null,
             });
           } catch {
-            return false;
+            emergency = null;
           }
-          if (!emergency?.stage || emergency.stage === 'none') {
-            return false;
-          }
-          let nextOpts = emergency.options;
+          let nextOpts =
+            emergency?.stage && emergency.stage !== 'none' ? emergency.options : requestOptions;
           let nextEstimated = estimateRequestInputTokens(nextOpts);
-          if (nextEstimated >= budgetRemaining && budgetRemaining > 2000) {
+          if (nextEstimated + minHeadroomTokens >= budgetRemaining && budgetRemaining > 1800) {
             try {
-              const tight = await compactTwoStage(requestOptions, {
-                contextWindow: Math.max(1024, budgetRemaining - 1800),
+              const tight = await compactTwoStage(nextOpts, {
+                contextWindow: Math.max(1024, budgetRemaining - Math.max(1200, minHeadroomTokens)),
                 reserveTokens: 256,
                 keepRecentTokens: 512,
                 summarize: null,
@@ -1004,6 +1197,26 @@ export class AgentLoop {
               // ignore fallback prune failure
             }
           }
+          let usedStage1StalePrune = false;
+          if (
+            (postTestReserveActive || nextEstimated >= budgetRemaining) &&
+            nextEstimated + minHeadroomTokens >= budgetRemaining
+          ) {
+            const stalePrune = pruneStaleToolOutputsStage1(
+              nextOpts.messages,
+              postTestReserveActive ? 2 : 3,
+              240,
+            );
+            if (stalePrune.prunedCount > 0) {
+              const candidateOpts = { ...nextOpts, messages: stalePrune.messages };
+              const candidateEst = estimateRequestInputTokens(candidateOpts);
+              if (candidateEst < nextEstimated) {
+                nextOpts = candidateOpts;
+                nextEstimated = candidateEst;
+                usedStage1StalePrune = true;
+              }
+            }
+          }
           if (nextEstimated >= estimatedInputTokens) {
             return false;
           }
@@ -1013,15 +1226,19 @@ export class AgentLoop {
             requestOptions = { ...requestOptions, messages };
           }
           estimatedInputTokens = nextEstimated;
+          lastEstimatedInputTokens = nextEstimated;
           reasoningTracker.recordBudgetPrune();
           this.eventRouter.emitPersisted({
             sessionId,
             turnId,
             type: RUNTIME_EVENTS.CONTEXT_COMPACTED,
             data: {
-              stage: 'budget_prune',
+              stage: usedStage1StalePrune && (!emergency?.stage || emergency.stage === 'none')
+                ? 'emergency_stage1_stale_prune'
+                : 'budget_prune',
               step: steps,
-              tokens: emergency.tokens ?? estimatedInputTokens,
+              tokens: emergency?.tokens ?? estimatedInputTokens,
+              budgetWatermarks: buildBudgetWatermarks(),
             },
             audit: false,
           });
@@ -1030,6 +1247,13 @@ export class AgentLoop {
 
         let activeReservation = null;
         if (budgetLedger && budgetContext?.treeId) {
+          if (postTestReserveActive) {
+            const localAvail =
+              maxTotalTokens !== null
+                ? Math.max(0, maxTotalTokens - (tm.totalIn + tm.totalOut))
+                : lastCompletionReserveTokens;
+            await tryEmergencyBudgetPrune(localAvail, { minHeadroomTokens: 1600 });
+          }
           const makeReservation = () =>
             budgetLedger.reserveInference({
               treeId: budgetContext.treeId,
@@ -1056,9 +1280,13 @@ export class AgentLoop {
                 reserveErr?.detail?.nodeAvailable,
               ].filter((v) => v != null && Number.isFinite(Number(v)));
               const avail = availList.length > 0 ? Math.min(...availList.map(Number)) : 0;
-              const pruned = await tryEmergencyBudgetPrune(avail);
+              const pruned = await tryEmergencyBudgetPrune(avail, {
+                minHeadroomTokens: postTestReserveActive ? 512 : 0,
+              });
               if (pruned && estimatedInputTokens < avail) {
                 activeReservation = makeReservation();
+              } else if (postPassGraceStepActive) {
+                activeReservation = null;
               } else {
                 throw reserveErr;
               }
@@ -1068,26 +1296,43 @@ export class AgentLoop {
           }
           requestOptions = {
             ...requestOptions,
-            maxTokens: activeReservation.constrainedMaxOutputTokens,
+            maxTokens:
+              activeReservation?.constrainedMaxOutputTokens ??
+              Math.min(requestOptions.maxTokens ?? baseMaxOutputTokens, 2048),
+            ...(postPassGraceStepActive ? { tools: [] } : {}),
           };
         } else if (maxTotalTokens !== null) {
           const localRemaining = Math.max(0, maxTotalTokens - (tm.totalIn + tm.totalOut));
-          if (localRemaining > 2000 && estimatedInputTokens >= localRemaining) {
-            await tryEmergencyBudgetPrune(localRemaining);
-          }
-          if (localRemaining <= 0 || estimatedInputTokens >= localRemaining) {
-            throw new BudgetError('TOKEN_BUDGET', {
-              message: `预估输入 Token (${estimatedInputTokens}) 超出剩余 Token 预算 (${localRemaining})`,
-              detail: { estimatedInputTokens, remainingTokens: localRemaining, maxTotalTokens },
+          const minHeadroomTokens = postTestReserveActive ? 1600 : 0;
+          if (localRemaining > 1200 && estimatedInputTokens + minHeadroomTokens >= localRemaining) {
+            await tryEmergencyBudgetPrune(localRemaining, { minHeadroomTokens });
+          } else if (postPassGraceStepActive && estimatedInputTokens > 1600) {
+            await tryEmergencyBudgetPrune(Math.max(1600, Math.floor(estimatedInputTokens * 0.65)), {
+              minHeadroomTokens: 0,
             });
           }
-          requestOptions = {
-            ...requestOptions,
-            maxTokens: Math.min(
-              requestOptions.maxTokens ?? baseMaxOutputTokens,
-              Math.max(1, localRemaining - estimatedInputTokens),
-            ),
-          };
+          if (localRemaining <= 0 || estimatedInputTokens >= localRemaining) {
+            if (!postPassGraceStepActive) {
+              throw new BudgetError('TOKEN_BUDGET', {
+                message: `预估输入 Token (${estimatedInputTokens}) 超出剩余 Token 预算 (${localRemaining})`,
+                detail: { estimatedInputTokens, remainingTokens: localRemaining, maxTotalTokens },
+              });
+            }
+            requestOptions = {
+              ...requestOptions,
+              tools: [],
+              maxTokens: Math.min(requestOptions.maxTokens ?? baseMaxOutputTokens, 2048),
+            };
+          } else {
+            requestOptions = {
+              ...requestOptions,
+              maxTokens: Math.min(
+                requestOptions.maxTokens ?? baseMaxOutputTokens,
+                Math.max(1, localRemaining - estimatedInputTokens),
+              ),
+              ...(postPassGraceStepActive ? { tools: [] } : {}),
+            };
+          }
         }
 
         // Model inference phase
@@ -1427,25 +1672,68 @@ export class AgentLoop {
           step: steps,
         });
         sm.transition(TURN_PHASES.TOOLS, { step: steps, persist: profile?.persistTurn !== false });
-        const executedBatch = await toolDispatcher.dispatchBatch({
-          sessionId,
-          turnId,
-          toolCalls: stepResult.toolCalls,
-          tools,
-          hooks,
-          argStrikes,
-          signal,
-          leaseGuard,
-          parentGuard,
-          verifierEvents,
-          permissionMode,
-          allowTools,
-          denyTools,
-          getLivePolicy,
-          getApprovedPrefixes,
-          requestApproval,
-          approvalManager,
-          tainted: Boolean(execution?.tainted),
+        const postTestToolsEval = evaluatePostTestCompletionReserve({
+          lastRunTestsPassed: reasoningTracker.lastRunTestsPassed,
+          verificationCount: reasoningTracker.verificationCount,
+          unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
+          usedTokens: tm.totalIn + tm.totalOut,
+          maxTotalTokens: effectiveWatermarkMaxTokens,
+          currentStepEstimatedIn: lastEstimatedInputTokens,
+        });
+        lastCompletionReserveTokens = postTestToolsEval.completionReserveTokens;
+        postTestReserveActive = postTestToolsEval.postTestReserveActive;
+        buildBudgetWatermarks();
+
+        const allowedCalls = [];
+        const gatedIndices = new Set();
+        for (let tcIdx = 0; tcIdx < stepResult.toolCalls.length; tcIdx += 1) {
+          const tc = stepResult.toolCalls[tcIdx];
+          if (postTestReserveActive && NON_ESSENTIAL_POST_TEST_TOOLS.has(tc.name)) {
+            gatedIndices.add(tcIdx);
+          } else {
+            allowedCalls.push(tc);
+          }
+        }
+        const dispatchedBatch =
+          allowedCalls.length > 0
+            ? await toolDispatcher.dispatchBatch({
+                sessionId,
+                turnId,
+                toolCalls: allowedCalls,
+                tools,
+                hooks,
+                argStrikes,
+                signal,
+                leaseGuard,
+                parentGuard,
+                verifierEvents,
+                permissionMode,
+                allowTools,
+                denyTools,
+                getLivePolicy,
+                getApprovedPrefixes,
+                requestApproval,
+                approvalManager,
+                tainted: Boolean(execution?.tainted),
+              })
+            : [];
+        let dispatchedCursor = 0;
+        const executedBatch = stepResult.toolCalls.map((tc, tcIdx) => {
+          if (gatedIndices.has(tcIdx)) {
+            return {
+              tc,
+              parsedArgs: safeParseToolArgsSimple(tc.arguments),
+              output: `[POST_TEST_RESERVE_GATED] Tool "${tc.name}" gated: tests already passed with 0 unverified src mutations and remaining budget (${postTestToolsEval.remainingTokens ?? 'low'} tokens) is within completion reserve (${postTestToolsEval.completionReserveTokens} tokens). Stop calling optional tools and output the final answer / Evidence Manifest immediately.`,
+              isError: false,
+              durationMs: 0,
+              receipt: null,
+              pending: false,
+              gated: true,
+            };
+          }
+          const executedItem = dispatchedBatch[dispatchedCursor];
+          dispatchedCursor += 1;
+          return executedItem;
         });
 
         signal?.throwIfAborted?.();
@@ -1453,7 +1741,7 @@ export class AgentLoop {
         leaseGuard?.();
 
         const preparedBatch = executedBatch.map((item) => {
-          const hint = selectionRecoveryHint?.(item, getModelTools);
+          const hint = item.gated ? null : selectionRecoveryHint?.(item, getModelTools);
           const output = hint ? `${item.output}\n${hint}` : item.output;
           return { ...item, output };
         });
@@ -1505,23 +1793,26 @@ export class AgentLoop {
             durationMs,
             receipt,
             step: steps,
+            gated: Boolean(item.gated),
           });
           messages.push({
             role: 'tool',
             toolCallId: tc.id,
             content: [{ type: 'text', text: promptOutput }],
           });
-          verifierEvents.push({
-            type: 'tool/result',
-            data: {
-              callId: tc.id,
-              name: tc.name,
-              isError,
-              content: output,
-              effectiveArgs: item.parsedArgs,
-              receipt,
-            },
-          });
+          if (!item.gated) {
+            verifierEvents.push({
+              type: 'tool/result',
+              data: {
+                callId: tc.id,
+                name: tc.name,
+                isError,
+                content: output,
+                effectiveArgs: item.parsedArgs,
+                receipt,
+              },
+            });
+          }
           if (profile?.emitToolEvents !== false) {
             this.eventRouter.emitPersisted({
               sessionId,
@@ -1536,28 +1827,31 @@ export class AgentLoop {
                 durationMs,
                 output: excerpt(output, 4000),
                 ...(receipt?.id ? { receiptId: receipt.id } : {}),
+                ...(item.gated ? { gated: true } : {}),
               },
               audit: false,
             });
           }
-          if (tm.thrashWarned && MUTATING_FILE_TOOLS.has(tc.name) && !isError) {
-            tm.recentCallSigs = [];
-          }
-          const tmRepeat = tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending);
-          const reasoningEvent = reasoningTracker.recordToolResult({
-            tc,
-            args: item.parsedArgs,
-            output,
-            isError,
-            pending: item.pending,
-            receipt,
-            step: steps,
-          });
-          if (reasoningEvent?.trigger) {
-            detectedThrashing = true;
-            batchTrigger = reasoningEvent.trigger;
-          } else if (tmRepeat) {
-            detectedThrashing = true;
+          if (!item.gated) {
+            if (tm.thrashWarned && MUTATING_FILE_TOOLS.has(tc.name) && !isError) {
+              tm.recentCallSigs = [];
+            }
+            const tmRepeat = tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending);
+            const reasoningEvent = reasoningTracker.recordToolResult({
+              tc,
+              args: item.parsedArgs,
+              output,
+              isError,
+              pending: item.pending,
+              receipt,
+              step: steps,
+            });
+            if (reasoningEvent?.trigger) {
+              detectedThrashing = true;
+              batchTrigger = reasoningEvent.trigger;
+            } else if (tmRepeat) {
+              detectedThrashing = true;
+            }
           }
         }
 
@@ -1573,6 +1867,8 @@ export class AgentLoop {
             totalCacheWrite: tm.totalCacheWrite,
             totalCacheEligible: tm.totalCacheEligible,
             lastToolCallIds: executedBatch.map((b) => b.tc.id),
+            filesRead: [...reasoningTracker.filesRead],
+            aciLedger: aci?.ledger?.toJSON?.() ?? null,
           },
         });
 
@@ -1708,6 +2004,7 @@ export class AgentLoop {
         steps,
       });
       syncAciMetrics();
+      const budgetWatermarks = buildBudgetWatermarks();
       const reasoningMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: outcome.status === 'completed' && outcome.verdict?.accepted !== false,
         stopReason,
@@ -1732,6 +2029,7 @@ export class AgentLoop {
         verifiedPass: outcome.verifiedPass,
         failureKind: outcome.failureKind,
         reasoningMetrics,
+        budgetWatermarks,
         verifierEvents,
         phaseHistory: sm.history,
         deferredPhaseTransition: sm.deferredTerminalTransition ?? null,
@@ -1752,17 +2050,20 @@ export class AgentLoop {
         steps,
       });
       syncAciMetrics();
+      const catchWatermarks = buildBudgetWatermarks();
       const catchMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: false,
         stopReason: classified.code || err?.code || 'aborted',
       });
       if (err && typeof err === 'object') {
         err.reasoningMetrics = catchMetrics;
+        err.budgetWatermarks = catchWatermarks;
       }
       classified.usage = catchUsage;
       classified.steps = steps;
       classified.route = lastRoute;
       classified.reasoningMetrics = catchMetrics;
+      classified.budgetWatermarks = catchWatermarks;
       // Fix D6: On LEASE_LOST (or if lease was already lost before error), exit cleanly without corrupting turn phase
       if (isLeaseLostError(classified) || !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
         const leaseErr = isLeaseLostError(classified)
@@ -1772,6 +2073,7 @@ export class AgentLoop {
               cause: err,
             });
         leaseErr.reasoningMetrics = catchMetrics;
+        leaseErr.budgetWatermarks = catchWatermarks;
         throw leaseErr;
       }
       if (isShutdownAbort(signal, err) || isShutdownAbort(signal, classified)) {

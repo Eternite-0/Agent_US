@@ -5,6 +5,10 @@ import { getLearnedGuidelines, sanitizeGuidelineText } from './aci-engine.js';
 
 export const ACI_CONFIG_KEY = 'aci.config';
 
+export const DEFAULT_SUPERVISOR_TIMEOUT_MS = 8000;
+export const DEFAULT_SUPERVISOR_BREAKER_THRESHOLD = 2;
+export const DEFAULT_SUPERVISOR_BREAKER_COOLDOWN_MS = 60_000;
+
 export const DEFAULT_ACI_SUPERVISOR_CONFIG = Object.freeze({
   enabled: true,
   mode: 'auto',
@@ -12,7 +16,7 @@ export const DEFAULT_ACI_SUPERVISOR_CONFIG = Object.freeze({
   maxBudgetRatio: 0.72,
   epochWatermarks: [0.6, 0.82],
   maxOutputTokens: 1200,
-  timeoutMs: 25000,
+  timeoutMs: DEFAULT_SUPERVISOR_TIMEOUT_MS,
   admissionEnabled: true,
   dtocMinPromptTokens: 24000,
 });
@@ -224,10 +228,46 @@ export function normalizeSupervisorConfig(raw = {}) {
 }
 
 export class ContextSupervisor {
-  constructor({ store = null, pool = null, adapter = null } = {}) {
+  constructor({
+    store = null,
+    pool = null,
+    adapter = null,
+    breakerThreshold = DEFAULT_SUPERVISOR_BREAKER_THRESHOLD,
+    breakerCooldownMs = DEFAULT_SUPERVISOR_BREAKER_COOLDOWN_MS,
+    nowFn = Date.now,
+  } = {}) {
     this.store = store;
     this.pool = pool;
     this.adapter = adapter ?? pool?.adapter ?? null;
+    this._breakerThreshold = Math.max(1, Math.trunc(Number(breakerThreshold ?? DEFAULT_SUPERVISOR_BREAKER_THRESHOLD)));
+    this._breakerCooldownMs = Math.max(100, Math.trunc(Number(breakerCooldownMs ?? DEFAULT_SUPERVISOR_BREAKER_COOLDOWN_MS)));
+    this._now = typeof nowFn === 'function' ? nowFn : Date.now;
+    this._timeoutStreak = 0;
+    this._circuitOpenedUntil = 0;
+  }
+
+  isCircuitOpen(now = this._now()) {
+    if (this._circuitOpenedUntil <= 0) return false;
+    if (now >= this._circuitOpenedUntil) {
+      this._circuitOpenedUntil = 0;
+      this._timeoutStreak = 0;
+      return false;
+    }
+    return true;
+  }
+
+  #recordSupervisorCallOutcome({ ok = false, timedOut = false } = {}) {
+    if (timedOut) {
+      this._timeoutStreak += 1;
+      if (this._timeoutStreak >= this._breakerThreshold) {
+        this._circuitOpenedUntil = this._now() + this._breakerCooldownMs;
+      }
+      return;
+    }
+    if (ok) {
+      this._timeoutStreak = 0;
+      this._circuitOpenedUntil = 0;
+    }
   }
 
   getConfig() {
@@ -400,6 +440,7 @@ export class ContextSupervisor {
   getStatus() {
     const resolved = this.resolveModel();
     const guidelines = getLearnedGuidelines(this.store);
+    const circuitOpen = this.isCircuitOpen();
     return {
       config: resolved.config,
       effectiveModel: resolved.effectiveModel,
@@ -412,6 +453,9 @@ export class ContextSupervisor {
       reversibleStore: true,
       candidates: resolved.candidates,
       guidelinesCount: guidelines.length,
+      circuitOpen,
+      timeoutStreak: this._timeoutStreak,
+      circuitOpenedUntil: circuitOpen ? this._circuitOpenedUntil : null,
     };
   }
 
@@ -427,9 +471,19 @@ export class ContextSupervisor {
     const startedAt = Date.now();
     const userText = JSON.stringify(userPayload);
     const timeoutController = new AbortController();
+    let timedOut = false;
+    let rejectTimeout = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      rejectTimeout = reject;
+    });
     const timer = setTimeout(() => {
-      timeoutController.abort(new Error('ACI supervisor timeout'));
+      timedOut = true;
+      const err = new Error(`ACI supervisor timeout (${timeoutMs}ms)`);
+      err.code = 'ETIMEDOUT';
+      timeoutController.abort(err);
+      rejectTimeout?.(err);
     }, timeoutMs);
+    timer.unref?.();
     const onExternalAbort = () => timeoutController.abort(signal?.reason ?? new Error('Aborted'));
     if (signal) {
       if (signal.aborted) onExternalAbort();
@@ -459,8 +513,9 @@ export class ContextSupervisor {
       };
     };
 
+    let iterator = null;
     try {
-      for await (const chunk of effectiveAdapter.stream({
+      const streamIterable = effectiveAdapter.stream({
         provider: 'pool',
         model,
         system,
@@ -473,9 +528,19 @@ export class ContextSupervisor {
         tools: [], // STRICT READ-ONLY BOUNDARY: zero tool privileges
         maxTokens,
         signal: timeoutController.signal,
-      })) {
+      });
+      iterator = streamIterable?.[Symbol.asyncIterator]?.();
+      if (!iterator) {
+        throw new Error('Supervisor adapter stream is not async iterable');
+      }
+
+      for (;;) {
+        const nextPromise = iterator.next();
+        const step = await Promise.race([nextPromise, timeoutPromise]);
+        if (step.done) break;
+        const chunk = step.value;
         if (timeoutController.signal.aborted) {
-          throw new Error('ACI supervisor aborted/timed out');
+          throw new Error(timedOut ? `ACI supervisor timeout (${timeoutMs}ms)` : 'ACI supervisor aborted');
         }
         if (chunk?.type === 'tool-call' || chunk?.block?.type === 'tool-call') {
           throw new Error('Read-only supervisor attempted tool invocation');
@@ -496,16 +561,27 @@ export class ContextSupervisor {
 
       return {
         ok: true,
+        timedOut: false,
         rawOutput,
         parsed: parseJsonObjectFromText(rawOutput),
         ...finalizeUsage(),
       };
     } catch (error) {
+      const msg = String(error?.message || error || 'supervisor_failed');
+      const isTimeoutErr =
+        timedOut ||
+        (!signal?.aborted &&
+          (error?.code === 'ETIMEDOUT' ||
+            /(?:supervisor\s+timeout|timed?\s*out)/i.test(msg)));
+      if (iterator?.return) {
+        Promise.resolve(iterator.return()).catch(() => {});
+      }
       return {
         ok: false,
+        timedOut: isTimeoutErr,
         rawOutput,
         parsed: null,
-        error: String(error?.message || error || 'supervisor_failed'),
+        error: msg,
         ...finalizeUsage(),
       };
     } finally {
@@ -561,8 +637,31 @@ export class ContextSupervisor {
         bypassed: false,
         usedLlm: false,
         fallback: 'deterministic',
+        circuitOpen: this.isCircuitOpen(),
         model: resolved.effectiveModel ?? null,
         rationale: !resolved.effectiveModel ? resolved.rationale : 'adapter_unavailable_deterministic_fallback',
+        keepRefs: [],
+        compressRefs: [],
+        expandSuggestions: [],
+        contractHints: [],
+        summary: '',
+        rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    if (this.isCircuitOpen()) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        circuitOpen: true,
+        model: resolved.effectiveModel,
+        rationale: 'supervisor_circuit_open_deterministic_fallback',
         keepRefs: [],
         compressRefs: [],
         expandSuggestions: [],
@@ -619,6 +718,7 @@ export class ContextSupervisor {
       timeoutMs: config.timeoutMs,
       signal,
     });
+    this.#recordSupervisorCallOutcome({ ok: callRes.ok, timedOut: callRes.timedOut });
 
     if (!callRes.ok) {
       return {
@@ -626,8 +726,12 @@ export class ContextSupervisor {
         bypassed: false,
         usedLlm: false,
         fallback: 'deterministic',
+        circuitOpen: this.isCircuitOpen(),
+        timedOut: Boolean(callRes.timedOut),
         model: resolved.effectiveModel,
-        rationale: 'supervisor_error_deterministic_fallback',
+        rationale: callRes.timedOut
+          ? 'supervisor_timeout_deterministic_fallback'
+          : 'supervisor_error_deterministic_fallback',
         keepRefs: [],
         compressRefs: [],
         expandSuggestions: [],
@@ -707,6 +811,7 @@ export class ContextSupervisor {
       bypassed: false,
       usedLlm: true,
       fallback: null,
+      circuitOpen: false,
       model: resolved.effectiveModel,
       rationale: resolved.rationale,
       keepRefs,
@@ -770,8 +875,28 @@ export class ContextSupervisor {
         bypassed: false,
         usedLlm: false,
         fallback: 'deterministic',
+        circuitOpen: this.isCircuitOpen(),
         model: resolved.effectiveModel ?? null,
         rationale: !resolved.effectiveModel ? resolved.rationale : 'adapter_unavailable_deterministic_fallback',
+        decisions: [],
+        contractHints: [],
+        rejectedIds: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    if (this.isCircuitOpen()) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        circuitOpen: true,
+        model: resolved.effectiveModel,
+        rationale: 'supervisor_circuit_open_deterministic_fallback',
         decisions: [],
         contractHints: [],
         rejectedIds: [],
@@ -836,6 +961,7 @@ export class ContextSupervisor {
       timeoutMs: config.timeoutMs,
       signal,
     });
+    this.#recordSupervisorCallOutcome({ ok: callRes.ok, timedOut: callRes.timedOut });
 
     if (!callRes.ok) {
       return {
@@ -843,8 +969,12 @@ export class ContextSupervisor {
         bypassed: false,
         usedLlm: false,
         fallback: 'deterministic',
+        circuitOpen: this.isCircuitOpen(),
+        timedOut: Boolean(callRes.timedOut),
         model: resolved.effectiveModel,
-        rationale: 'supervisor_error_deterministic_fallback',
+        rationale: callRes.timedOut
+          ? 'supervisor_timeout_deterministic_fallback'
+          : 'supervisor_error_deterministic_fallback',
         decisions: [],
         contractHints: [],
         rejectedIds: [],
@@ -924,6 +1054,7 @@ export class ContextSupervisor {
       bypassed: false,
       usedLlm: true,
       fallback: null,
+      circuitOpen: false,
       model: resolved.effectiveModel,
       rationale: resolved.rationale,
       decisions,

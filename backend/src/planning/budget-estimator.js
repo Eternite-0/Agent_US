@@ -104,6 +104,68 @@ function posIntOrNull(val) {
   return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null;
 }
 
+export const DEFAULT_COMPLETION_RESERVE_FLOOR_TOKENS = 3200;
+export const DEFAULT_COMPLETION_RESERVE_RATIO = 0.12;
+
+/**
+ * Computes the post-test completion reserve token floor so verified runs keep
+ * enough headroom for the final answer / Evidence Manifest without hitting `TOKEN_BUDGET`.
+ */
+export function computeCompletionReserveTokens({
+  currentStepEstimatedIn = 0,
+  maxTotalTokens = null,
+  reserveFloorTokens = DEFAULT_COMPLETION_RESERVE_FLOOR_TOKENS,
+  reserveRatio = DEFAULT_COMPLETION_RESERVE_RATIO,
+} = {}) {
+  const estIn = Math.max(0, Math.trunc(Number(currentStepEstimatedIn || 0)));
+  const floor = Math.max(0, Math.trunc(Number(reserveFloorTokens ?? DEFAULT_COMPLETION_RESERVE_FLOOR_TOKENS)));
+  const ratio = Number.isFinite(Number(reserveRatio))
+    ? Math.max(0, Math.min(0.95, Number(reserveRatio)))
+    : DEFAULT_COMPLETION_RESERVE_RATIO;
+  const maxTok = posIntOrNull(maxTotalTokens);
+  const pctReserve = maxTok !== null ? Math.floor(maxTok * ratio) : 0;
+  return Math.max(estIn + floor, pctReserve);
+}
+
+/**
+ * Evaluates whether post-test completion reserve gating should activate for the current turn.
+ */
+export function evaluatePostTestCompletionReserve({
+  usedTokens = 0,
+  maxTotalTokens = null,
+  currentStepEstimatedIn = 0,
+  lastRunTestsPassed = false,
+  verificationCount = 0,
+  unverifiedSrcMutations = 0,
+  reserveFloorTokens = DEFAULT_COMPLETION_RESERVE_FLOOR_TOKENS,
+  reserveRatio = DEFAULT_COMPLETION_RESERVE_RATIO,
+} = {}) {
+  const maxTok = posIntOrNull(maxTotalTokens);
+  const used = Math.max(0, Math.trunc(Number(usedTokens || 0)));
+  const reserveTokens = computeCompletionReserveTokens({
+    currentStepEstimatedIn,
+    maxTotalTokens: maxTok,
+    reserveFloorTokens,
+    reserveRatio,
+  });
+  const remainingTokens = maxTok !== null ? Math.max(0, maxTok - used) : null;
+  const verifCount = Math.max(0, Math.trunc(Number(verificationCount || 0)));
+  const unverifiedSrc = Math.max(0, Math.trunc(Number(unverifiedSrcMutations || 0)));
+  const testsVerified = Boolean(lastRunTestsPassed) && verifCount >= 1 && unverifiedSrc === 0;
+  const postTestReserveActive =
+    maxTok !== null &&
+    remainingTokens !== null &&
+    testsVerified &&
+    remainingTokens <= reserveTokens;
+
+  return {
+    completionReserveTokens: reserveTokens,
+    remainingTokens,
+    testsVerified,
+    postTestReserveActive,
+  };
+}
+
 export function queryHistoricalTaskMetrics(store, { taskType = null, model = null, limit = 50 } = {}) {
   if (!store?.db?.isOpen) {
     return { sampleCount: 0, avgTokens: null, avgSteps: null, failureRate: 0, budgetExhaustedRate: 0, adjustmentFactor: 1 };
@@ -254,6 +316,10 @@ export function estimateTaskBudget({
     minFeasibleSteps,
     estimatedTokens,
     maxTokens,
+    completionReserveTokens: computeCompletionReserveTokens({
+      currentStepEstimatedIn: baselineTokensPerStep,
+      maxTotalTokens: maxTokens,
+    }),
     ...buckets,
     feasible,
     insufficientReason,

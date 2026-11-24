@@ -1811,12 +1811,12 @@ test('Stage 4: DirectAgent supports all 4 aciProfiles, short-task DTOC KV preser
   assert.ok(retRes.aciMetrics.admissionSavedTokens > 0);
   assert.ok(retRes.aciMetrics.hashVerifiedRestores >= 1);
 
-  // 4. full_aci: admission=true, dtoc=true (adaptive_single_step), short task cumulative ~104k SKIPS DTOC (epochTransitions === 0)!
+  // 4. full_aci: admission=true, dtoc=true (phase_watermark_v25), short task cumulative ~104k SKIPS DTOC (epochTransitions === 0)!
   const fullRes = await runProfile('full_aci');
   assert.equal(fullRes.aciMetrics.aciProfile, 'full_aci');
   assert.equal(fullRes.aciMetrics.admissionEnabled, true);
   assert.equal(fullRes.aciMetrics.dtocEnabled, true);
-  assert.equal(fullRes.aciMetrics.dtocPolicy, 'adaptive_single_step');
+  assert.equal(fullRes.aciMetrics.dtocPolicy, 'phase_watermark_v25');
   assert.equal(fullRes.aciMetrics.epochTransitions, 0, 'Short task (~5k prompt tokens) must skip DTOC even at 104k cumulative');
   assert.ok(fullRes.aciMetrics.admissionSavedTokens > 0);
   assert.ok(fullRes.aciMetrics.totalAciSavedTokens >= fullRes.aciMetrics.admissionSavedTokens);
