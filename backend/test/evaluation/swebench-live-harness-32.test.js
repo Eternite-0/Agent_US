@@ -1100,6 +1100,102 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     assert.match(keepPatch, /src\/discounts\/calculator\.py/);
     assert.equal(keepPatch.includes('env_pin_setup.py'), false, 'Pre-existing container env baseline edits must not leak into model_patch');
 
+    // Verify reconciling turn (e.g. from timed-out container bash call) settles cleanly without unsettled-await hang
+    let reconStage = 0;
+    const reconOut = makeTmp('swe-wp5-recon-');
+    const reconRes = await runSweBenchBenchmark(
+      {
+        dataset: dirtyDsPath,
+        limit: 1,
+        arms: ['raw_full'],
+        dockerPreset: 'epoch',
+        cleanupImages: false,
+        outputDir: reconOut,
+      },
+      {
+        extractTestbedFromImage: async ({ targetDir }) => {
+          cpSync(dirtySeedRepo, targetDir, { recursive: true });
+          return { targetDir, headCommit: dirtyBaseCommit };
+        },
+        createDockerAdapter: ({ workspaceRoot }) => {
+          const adapterObj = {
+            isSweBenchContainer: true,
+            workspaceRoot,
+            start: async () => 'stub-cid',
+            run: async (cmd) => {
+              if (cmd.includes('git diff')) {
+                return { exitCode: 124, stdout: '', stderr: '[timeout after 500ms]', timedOut: true };
+              }
+              return { exitCode: 0, stdout: '1 passed\n', stderr: '', timedOut: false };
+            },
+            exec: async () => ({ exitCode: 0, stdout: 'ok\n', stderr: '', timedOut: false }),
+            destroy: async () => {},
+            close: async () => {},
+          };
+          adapterObj.resolveBackend = () => ({ mode: 'docker', tier: 'strong-os-isolation', backend: adapterObj });
+          return adapterObj;
+        },
+        createAdapter: () =>
+          new (class ReconAdapter extends LlmAdapter {
+            async *stream() {
+              if (reconStage === 0) {
+                reconStage = 1;
+                yield {
+                  type: 'block-end',
+                  index: 0,
+                  block: {
+                    type: 'tool-call',
+                    id: 'rc-edit',
+                    name: 'edit_file',
+                    arguments: JSON.stringify({
+                      path: 'src/discounts/calculator.py',
+                      target: '    effective_pct = combined_pct',
+                      replacement: '    effective_pct = min(combined_pct, max_discount_pct)',
+                    }),
+                  },
+                };
+                yield { type: 'finish', reason: { kind: 'tool-calls' } };
+                return;
+              }
+              if (reconStage === 1) {
+                reconStage = 2;
+                yield {
+                  type: 'block-end',
+                  index: 0,
+                  block: {
+                    type: 'tool-call',
+                    id: 'rc-timeout-diff',
+                    name: 'bash',
+                    arguments: JSON.stringify({ command: 'git diff', timeoutMs: 500 }),
+                  },
+                };
+                yield { type: 'finish', reason: { kind: 'tool-calls' } };
+                return;
+              }
+              if (reconStage === 2) {
+                reconStage = 3;
+                yield {
+                  type: 'block-end',
+                  index: 0,
+                  block: {
+                    type: 'tool-call',
+                    id: 'rc-pytest',
+                    name: 'bash',
+                    arguments: JSON.stringify({ command: 'pytest -q' }),
+                  },
+                };
+                yield { type: 'finish', reason: { kind: 'tool-calls' } };
+                return;
+              }
+              yield { type: 'text-delta', index: 0, text: 'Patched and tested.' };
+              yield { type: 'finish', reason: { kind: 'stop' } };
+            }
+          })(),
+      },
+    );
+    assert.equal(reconRes.telemetryByArm.raw_full[0].status, 'reconciling');
+    assert.match(reconRes.predictionsByArm.raw_full[0].model_patch, /src\/discounts\/calculator\.py/);
+
     // Verify env_error fault tolerance + --resume retry + latest-wins deduplication
     const errOut = makeTmp('swe-wp5-enverr-');
     const errRmiCalls = [];

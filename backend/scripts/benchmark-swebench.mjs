@@ -1369,7 +1369,7 @@ function extractTurnTelemetryRow({
 }) {
   const evRow = store.db
     .prepare(
-      "SELECT type, data FROM direct_events WHERE sessionId=? AND turnId=? AND type IN ('turn/completed','turn/failed','turn/cancelled') ORDER BY seq DESC LIMIT 1",
+      "SELECT type, data FROM direct_events WHERE sessionId=? AND turnId=? AND type IN ('turn/completed','turn/failed','turn/cancelled','turn/parked') ORDER BY seq DESC LIMIT 1",
     )
     .get(sessionId, turnId);
   let evData = {};
@@ -1816,6 +1816,15 @@ async function runSweBenchInstanceArm({
               ...(containerMemorySwap ? { memorySwap: containerMemorySwap } : {}),
               timeoutMs: 120_000,
             });
+      if (typeof sessionSandbox?.exec === 'function') {
+        // Warm Linux 9P/drvfs stat cache for `.git/index` before agent runs so `git diff` / `git status` won't timeout on large repos like Django.
+        await sessionSandbox
+          .exec('git -c core.preloadIndex=true update-index -q --refresh || true', {
+            skipAntiCheatGuard: true,
+            timeoutMs: 90_000,
+          })
+          .catch(() => {});
+      }
     }
 
     const session = direct.createSession({
@@ -1876,7 +1885,7 @@ async function runSweBenchInstanceArm({
       direct.cancelTurn(turn.id);
       await direct.waitForTurnTerminal(turn.id, { timeoutMs: 5_000 }).catch(() => {});
       turnRow = direct.listTurns(session.id, { limit: 20 }).find((t) => t.id === turn.id) ?? turnRow;
-    } else {
+    } else if (turnRow?.state !== 'reconciling') {
       await direct.waitForTurnTerminal(turn.id, { timeoutMs: 5_000 }).catch(() => {});
     }
 
