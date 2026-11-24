@@ -57,8 +57,12 @@ async function setupEnv(t, { adapter = null, initGit = false } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'agent-us-30-snapgit-')));
   const dataDir = join(root, 'data');
   const workDir = join(root, 'workspace');
+  const emptyHome = join(root, 'home');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(workDir, { recursive: true });
+  mkdirSync(emptyHome, { recursive: true });
+  const prevTestHome = process.env.AGENT_US_TEST_HOMEDIR;
+  process.env.AGENT_US_TEST_HOMEDIR = emptyHome;
 
   if (initGit) {
     await runGit(workDir, ['init', '-b', 'main']);
@@ -95,6 +99,8 @@ async function setupEnv(t, { adapter = null, initGit = false } = {}) {
     });
 
   t.after(async () => {
+    if (prevTestHome === undefined) delete process.env.AGENT_US_TEST_HOMEDIR;
+    else process.env.AGENT_US_TEST_HOMEDIR = prevTestHome;
     await directAgent.close();
     await app.close();
     store.close();
@@ -563,6 +569,9 @@ test('Cross-module route hooks: onboarding detect/import, workspace customizatio
   const { workDir, directAgent, req } = await setupEnv(t, { initGit: false });
 
   // 1. Default fallbacks when runtime hooks are absent
+  directAgent.detectExternalConfigs = undefined;
+  directAgent.importExternalConfigs = undefined;
+  directAgent.getWorkspaceCustomizations = undefined;
   const d0 = await req('GET', '/v1/onboarding/detect-external');
   assert.equal(d0.statusCode, 200);
   assert.equal(d0.json().promptNeeded, false);

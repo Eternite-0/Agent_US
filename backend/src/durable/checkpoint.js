@@ -394,6 +394,47 @@ export class WorkspaceRewindManager {
     }
   }
 
+  async #readGitHeadShaFast(realRoot) {
+    try {
+      const dotGit = join(realRoot, '.git');
+      if (existsSync(dotGit)) {
+        const st = lstatSync(dotGit);
+        let gitDir = null;
+        if (st.isDirectory()) {
+          gitDir = dotGit;
+        } else if (st.isFile()) {
+          const ptr = readFileSync(dotGit, 'utf8').trim();
+          const m = /^gitdir:\s*(.+)$/i.exec(ptr);
+          if (m) gitDir = resolve(realRoot, m[1].trim());
+        }
+        if (gitDir && existsSync(join(gitDir, 'HEAD'))) {
+          const headRaw = readFileSync(join(gitDir, 'HEAD'), 'utf8').trim();
+          if (/^[0-9a-f]{40}$/i.test(headRaw)) return headRaw.toLowerCase();
+          if (headRaw.startsWith('ref:')) {
+            const refRel = headRaw.slice(4).trim();
+            const directRef = join(gitDir, refRel);
+            if (existsSync(directRef)) {
+              const sha = readFileSync(directRef, 'utf8').trim();
+              if (/^[0-9a-f]{40}$/i.test(sha)) return sha.toLowerCase();
+            }
+            const commonFile = join(gitDir, 'commondir');
+            if (existsSync(commonFile)) {
+              const commonDir = resolve(gitDir, readFileSync(commonFile, 'utf8').trim());
+              const commonRef = join(commonDir, refRel);
+              if (existsSync(commonRef)) {
+                const sha = readFileSync(commonRef, 'utf8').trim();
+                if (/^[0-9a-f]{40}$/i.test(sha)) return sha.toLowerCase();
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // fall back to git CLI
+    }
+    return this.#getGitHeadSha(realRoot);
+  }
+
   async #getGitHeadSha(realRoot) {
     try {
       const res = await execGit(realRoot, ['rev-parse', '--verify', 'HEAD']);
@@ -436,8 +477,8 @@ export class WorkspaceRewindManager {
 
     const gitRoot = await this.#detectGitRepoRoot(realRoot);
     if (gitRoot) {
-      const { dirs } = walkWorkspaceEntries(realRoot, { includeFiles: false });
-      const headSha = await this.#getGitHeadSha(realRoot);
+      const { dirs, files: walkedFiles } = walkWorkspaceEntries(realRoot, { includeFiles: true });
+      const headSha = await this.#readGitHeadShaFast(realRoot);
       const statusRes = await execGit(realRoot, [
         'status',
         '--porcelain=v1',
@@ -458,12 +499,34 @@ export class WorkspaceRewindManager {
         const snap = this.#snapshotDiskFile(confined.full, normalizeRelPosix(confined.rel));
         if (snap) dirtyFiles[pathLookupKey(snap.path)] = snap;
       }
+      const fileStats = {};
+      const hashSmall = walkedFiles.length <= 200;
+      for (const f of walkedFiles) {
+        try {
+          const lst = lstatSync(f.full);
+          if (!lst.isFile() || lst.isSymbolicLink()) continue;
+          const entry = {
+            path: f.rel,
+            size: lst.size,
+            mtimeMs: lst.mtimeMs,
+            ctimeMs: lst.ctimeMs,
+          };
+          if (hashSmall && lst.size <= 256 * 1024) {
+            entry.sha256 = sha256BufferHex(readFileSync(f.full));
+          }
+          fileStats[pathLookupKey(f.rel)] = entry;
+        } catch {
+          // skip unreadable file
+        }
+      }
       return {
         version: 1,
         workspaceRoot: realRoot,
         isGit: true,
         headSha,
         dirtyFiles,
+        fileStats,
+        fileStatsTruncated: walkedFiles.length >= MAX_BASELINE_FILES,
         dirs,
         capturedAt: Date.now(),
       };
@@ -666,8 +729,9 @@ export class WorkspaceRewindManager {
     return intents;
   }
 
-  async #augmentIntentsWithBaseline(realRoot, baseline, intents, onlyKey = null) {
+  async #augmentIntentsWithBaseline(realRoot, baseline, intents, onlyRel = null) {
     if (!baseline) return;
+    const onlyKey = onlyRel ? pathLookupKey(onlyRel) : null;
 
     const consider = async (rel, baselineEntry) => {
       const key = pathLookupKey(rel);
@@ -762,6 +826,64 @@ export class WorkspaceRewindManager {
 
     if (baseline.isGit) {
       const dirtyMap = baseline.dirtyFiles ?? {};
+      if (onlyKey) {
+        const dirtyTarget = dirtyMap[onlyKey] ?? null;
+        const targetRel = dirtyTarget?.path || baseline.fileStats?.[onlyKey]?.path || onlyRel;
+        if (targetRel) {
+          await consider(targetRel, dirtyTarget);
+        }
+        return;
+      }
+
+      const curHead = baseline.headSha ? await this.#readGitHeadShaFast(realRoot) : null;
+      const headUnchanged = !baseline.headSha || curHead === baseline.headSha;
+      if (headUnchanged && baseline.fileStats && !baseline.fileStatsTruncated) {
+        const { files: currentWalked } = walkWorkspaceEntries(realRoot, { includeFiles: true });
+        const seenKeys = new Set();
+        const candidates = [];
+        const hashSmall = currentWalked.length <= 200;
+
+        for (const f of currentWalked) {
+          const k = pathLookupKey(f.rel);
+          seenKeys.add(k);
+          if (intents.has(k)) continue;
+          const prev = baseline.fileStats[k];
+          if (!prev) {
+            candidates.push(f.rel);
+            continue;
+          }
+          try {
+            const lst = lstatSync(f.full);
+            if (prev.sha256 && hashSmall && lst.size <= 256 * 1024) {
+              const curSha = sha256BufferHex(readFileSync(f.full));
+              if (curSha !== prev.sha256) candidates.push(f.rel);
+            } else if (
+              lst.size !== prev.size ||
+              lst.mtimeMs !== prev.mtimeMs ||
+              lst.ctimeMs !== prev.ctimeMs
+            ) {
+              candidates.push(f.rel);
+            }
+          } catch {
+            candidates.push(f.rel);
+          }
+        }
+        for (const [k, prev] of Object.entries(baseline.fileStats)) {
+          if (!seenKeys.has(k) && !intents.has(k) && prev?.path) {
+            candidates.push(prev.path);
+          }
+        }
+        for (const [k, entry] of Object.entries(dirtyMap)) {
+          if (!seenKeys.has(k) && !intents.has(k) && entry?.path) {
+            candidates.push(entry.path);
+          }
+        }
+        for (const rel of candidates) {
+          await consider(rel, dirtyMap[pathLookupKey(rel)] ?? null);
+        }
+        return;
+      }
+
       const candidates = new Set();
       for (const entry of Object.values(dirtyMap)) {
         if (entry?.path) candidates.add(entry.path);
@@ -776,17 +898,14 @@ export class WorkspaceRewindManager {
       for (const ent of parseGitPorcelainZ(statusRes.stdout)) {
         candidates.add(ent.path);
       }
-      if (baseline.headSha) {
-        const curHead = await this.#getGitHeadSha(realRoot);
-        if (curHead && curHead !== baseline.headSha) {
-          try {
-            const diffRes = await execGit(realRoot, ['diff', '--name-only', '-z', baseline.headSha, curHead]);
-            for (const p of String(diffRes.stdout || '').split('\0').filter(Boolean)) {
-              candidates.add(normalizeRelPosix(p));
-            }
-          } catch {
-            // ignore diff if baseline head unreachable
+      if (baseline.headSha && curHead && curHead !== baseline.headSha) {
+        try {
+          const diffRes = await execGit(realRoot, ['diff', '--name-only', '-z', baseline.headSha, curHead]);
+          for (const p of String(diffRes.stdout || '').split('\0').filter(Boolean)) {
+            candidates.add(normalizeRelPosix(p));
           }
+        } catch {
+          // ignore diff if baseline head unreachable
         }
       }
       for (const rel of candidates) {
@@ -1142,7 +1261,7 @@ export class WorkspaceRewindManager {
     }
 
     const baseline = this.store.getSetting(this.#baselineKey(sessionId, targetTurn.id), null);
-    await this.#augmentIntentsWithBaseline(realRoot, baseline, intents, targetKey);
+    await this.#augmentIntentsWithBaseline(realRoot, baseline, intents, rel);
 
     const intent = intents.get(targetKey);
     if (!intent) {
