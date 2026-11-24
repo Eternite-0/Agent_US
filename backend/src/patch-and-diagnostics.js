@@ -2804,6 +2804,55 @@ function findNearestTsconfigProjects(workspaceRoot, targetFiles, normPaths = [])
   return projects;
 }
 
+function findPytestStyleTestFunction(files) {
+  const topDefRe = /^(?:async\s+)?def\s+(test_[A-Za-z0-9_]*)\s*\(/;
+  const indentedDefRe = /^([ \t]+)(?:async\s+)?def\s+(test_[A-Za-z0-9_]*)\s*\((.*)$/;
+  const classOrDefRe = /^([ \t]*)(?:class\s+|(?:async\s+)?def\s+)/;
+
+  for (const f of files) {
+    let text;
+    try {
+      text = readFileSync(f.full, 'utf8');
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    let blockIndent = null;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+
+      const indentLen = line.length - line.trimStart().length;
+      if (blockIndent !== null && indentLen <= blockIndent) {
+        blockIndent = null;
+      }
+
+      if (topDefRe.test(line)) {
+        return { file: f.rel, line: i + 1 };
+      }
+
+      if (blockIndent === null) {
+        const m = indentedDefRe.exec(line);
+        if (m) {
+          let paramsHead = m[3];
+          if (!paramsHead.trim()) {
+            paramsHead = lines.slice(i + 1, i + 5).find((l) => l.trim() && !l.trim().startsWith('#')) || '';
+          }
+          if (!/^\s*(?:self|cls)\b/.test(paramsHead)) {
+            return { file: f.rel, line: i + 1 };
+          }
+        }
+        const blk = classOrDefRe.exec(line);
+        if (blk) {
+          blockIndent = blk[1].length;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 export function runDiagnostics(
   workspaceRoot,
   { kind = 'auto', paths = [], testPattern = '', maxDiagnostics = 25 } = {},
@@ -3172,7 +3221,30 @@ export function runDiagnostics(
       totalRawLines += parsed.compression.rawLines;
       for (const d of parsed.diagnostics) pushDiag(d);
       for (const t of parsed.failingTests) pushTest(t);
-      if (res.status !== 0 || res.error) {
+      let pytestUnavailable = false;
+      if (usedRunner === 'unittest' && /\bRan 0 tests\b/i.test(combined)) {
+        const explicitPyFileSet = new Set(pyCliTargets.filter((t) => !t.isDir).map((t) => stateKeyFor(t.rel)));
+        const candidateTestFiles = pyCollected.files.filter(
+          (f) => explicitPyFileSet.has(stateKeyFor(f.rel)) || isPyTestRel(f.rel),
+        );
+        const match = findPytestStyleTestFunction(candidateTestFiles);
+        if (match) {
+          pytestUnavailable = true;
+          hadFailureExit = true;
+          totalRawLines = Math.max(totalRawLines, 1);
+          pushDiag({
+            file: match.file,
+            line: match.line,
+            column: 1,
+            severity: 'error',
+            code: 'PYTEST_UNAVAILABLE',
+            message: 'PYTEST_UNAVAILABLE: unittest discovered 0 tests for pytest-style functions',
+            source: 'unittest',
+            testName: match.file,
+          });
+        }
+      }
+      if (!pytestUnavailable && (res.status !== 0 || res.error)) {
         hadFailureExit = true;
         if (parsed.failingTests.length === 0 && parsed.diagnostics.length === 0) {
           const fallbackFile = pyRelArgs[0] || pyCollected.files[0]?.rel || '';
@@ -3201,7 +3273,9 @@ export function runDiagnostics(
         }
       }
       const pyCount = pyRelArgs.length || pyCollected.files.length;
-      notes.push(`py-test(${usedRunner}):${pyCount} targets (${res.status === 0 && !res.error ? 'pass' : 'fail'})`);
+      notes.push(
+        `py-test(${usedRunner}):${pyCount} targets (${res.status === 0 && !res.error && !pytestUnavailable ? 'pass' : 'fail'})`,
+      );
     }
   };
 

@@ -10,6 +10,7 @@ import {
   realpathSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -21,7 +22,7 @@ import { AccountPool } from '../src/pool.js';
 import { Store } from '../src/store.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { WorkspaceRewindManager } from '../src/durable/checkpoint.js';
-import { runGit } from '../src/routes/workspace-git.js';
+import { runGit, stageGitPaths } from '../src/routes/workspace-git.js';
 import { rmDirSafe, withTimeout } from './fixtures.js';
 
 class ScriptedTurnAdapter extends LlmAdapter {
@@ -406,13 +407,18 @@ test('Native Git Delivery Loop: changes, path confinement, sensitive/secret guar
   }
   const outsideTarget = join(root, 'outside.txt');
   writeFileSync(outsideTarget, 'outside', 'utf8');
+  let hasEscapeSymlink = false;
   try {
     symlinkSync(outsideTarget, join(workDir, 'escape-link.txt'));
+    hasEscapeSymlink = true;
+  } catch (err) {
+    // Symlink creation may require Developer Mode on some Windows hosts
+    if (!['EPERM', 'EACCES'].includes(err?.code)) throw err;
+  }
+  if (hasEscapeSymlink) {
     const symRes = await req('POST', '/v1/git/stage', { sessionId: sess.id, paths: ['escape-link.txt'] });
     assert.equal(symRes.statusCode, 400);
     assert.equal(symRes.json().error.code, 'GIT_INVALID_PATH');
-  } catch {
-    // Symlink creation may require Developer Mode on some Windows hosts
   }
 
   // Sensitive file block on explicit stage
@@ -422,7 +428,7 @@ test('Native Git Delivery Loop: changes, path confinement, sensitive/secret guar
     assert.equal(blk.json().error.code, 'GIT_SENSITIVE_FILE_BLOCKED');
   }
 
-  // Stage all safe files (excludes sensitive files, includes app.js & .env.example!)
+  // Stage all safe files (excludes sensitive files and escaping symlinks, includes app.js & .env.example!)
   const stAll = await req('POST', '/v1/git/stage', { sessionId: sess.id, all: true });
   assert.equal(stAll.statusCode, 200);
   const stagedPaths = stAll.json().staged.map((s) => s.path);
@@ -430,6 +436,9 @@ test('Native Git Delivery Loop: changes, path confinement, sensitive/secret guar
   assert.ok(stagedPaths.includes('.env.example'));
   assert.ok(!stagedPaths.includes('.env'));
   assert.ok(!stagedPaths.includes('.pool-key'));
+  if (hasEscapeSymlink) {
+    assert.ok(!stagedPaths.includes('escape-link.txt'), 'stage all must exclude escaping symlink');
+  }
 
   // Unstage on unborn HEAD (`git rm --cached --`)
   const unstageRes = await req('POST', '/v1/git/unstage', { sessionId: sess.id, paths: ['.env.example'] });
@@ -651,4 +660,82 @@ test('Cross-module route hooks: onboarding detect/import, workspace customizatio
     input: 'check attachment',
     opts: { files: { 'note.txt': Buffer.from('hello').toString('base64') } },
   });
+});
+
+test('WP6.1: stageGitPaths filters escaping symlinks on all=true while keeping explicit paths strict', async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'agent-us-32-stage-symlink-')));
+  const outsideDir = join(root, 'outside');
+  const repoDir = join(root, 'repo');
+  const escapeDirLink = join(repoDir, 'escape-dir-link');
+  const escapeFileLink = join(repoDir, 'escape-file-link.txt');
+  t.after(() => {
+    for (const p of [escapeDirLink, escapeFileLink]) {
+      try {
+        unlinkSync(p);
+      } catch {
+        // Ignore if not created
+      }
+    }
+    rmDirSafe(root);
+  });
+
+  mkdirSync(outsideDir, { recursive: true });
+  mkdirSync(repoDir, { recursive: true });
+  writeFileSync(join(outsideDir, 'outside.txt'), 'outside-secret\n', 'utf8');
+  writeFileSync(join(repoDir, 'app.js'), 'export const safe = 1;\n', 'utf8');
+  writeFileSync(join(repoDir, '.env'), 'SECRET=1\n', 'utf8');
+
+  await runGit(repoDir, ['init', '-b', 'main']);
+
+  symlinkSync(outsideDir, escapeDirLink, process.platform === 'win32' ? 'junction' : 'dir');
+  let hasFileSymlink = false;
+  try {
+    symlinkSync(join(outsideDir, 'outside.txt'), escapeFileLink);
+    hasFileSymlink = true;
+  } catch (err) {
+    if (!['EPERM', 'EACCES'].includes(err?.code)) throw err;
+  }
+
+  // Explicit request for an escaping symlink/junction path must reject with GIT_INVALID_PATH
+  await assert.rejects(
+    () => stageGitPaths(repoDir, { paths: ['escape-dir-link'] }),
+    (err) => err?.code === 'GIT_INVALID_PATH',
+  );
+  if (process.platform === 'win32') {
+    await assert.rejects(
+      () => stageGitPaths(repoDir, { paths: ['escape-dir-link/outside.txt'] }),
+      (err) => err?.code === 'GIT_INVALID_PATH',
+    );
+  }
+  if (hasFileSymlink) {
+    await assert.rejects(
+      () => stageGitPaths(repoDir, { paths: ['escape-file-link.txt'] }),
+      (err) => err?.code === 'GIT_INVALID_PATH',
+    );
+  }
+
+  // all=true must stage safe files while cleanly skipping escaping links and sensitive files
+  const stagedRes = await stageGitPaths(repoDir, { all: true });
+  assert.equal(stagedRes.ok, true);
+  assert.deepEqual(
+    stagedRes.staged.map((s) => s.path),
+    ['app.js'],
+  );
+
+  // Only sensitive + escaping link remaining -> GIT_SENSITIVE_FILE_BLOCKED (without leaking escape links)
+  await runGit(repoDir, ['rm', '-f', '--', 'app.js']);
+  await assert.rejects(
+    () => stageGitPaths(repoDir, { all: true }),
+    (err) =>
+      err?.code === 'GIT_SENSITIVE_FILE_BLOCKED' &&
+      Array.isArray(err.detail?.blockedSensitive) &&
+      err.detail.blockedSensitive.includes('.env') &&
+      !err.detail.blockedSensitive.some((p) => p.includes('escape')),
+  );
+
+  // Only escaping link remaining -> cleanly skipped with 0 staged files
+  unlinkSync(join(repoDir, '.env'));
+  const onlyEscapeRes = await stageGitPaths(repoDir, { all: true });
+  assert.equal(onlyEscapeRes.ok, true);
+  assert.deepEqual(onlyEscapeRes.staged, []);
 });
