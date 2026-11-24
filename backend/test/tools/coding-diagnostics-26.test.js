@@ -440,7 +440,9 @@ test('query_symbol_graph returns definitions with endLine/signature, cross-file 
   const catalog = modelToolCatalog(tools, policy, { permissionMode: 'auto-safe' });
   const names = catalog.map((c) => c.name);
   assert.ok(names.includes('query_symbol_graph'));
-  assert.ok(names.indexOf('query_symbol_graph') < names.indexOf('edit_file'));
+  assert.ok(names.indexOf('edit_file') < names.indexOf('apply_patch'));
+  assert.ok(names.indexOf('apply_patch') < names.indexOf('run_diagnostics'));
+  assert.ok(names.indexOf('run_diagnostics') < names.indexOf('query_symbol_graph'));
   assert.ok(names.indexOf('query_symbol_graph') < names.indexOf('write_file'));
   assert.ok(names.indexOf('query_symbol_graph') < names.indexOf('bash'));
   assert.match(catalog.find((c) => c.name === 'bash').description, /query_symbol_graph/);
