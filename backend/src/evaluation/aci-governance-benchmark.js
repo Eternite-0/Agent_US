@@ -43,6 +43,28 @@ export const ACI_GOVERNANCE_TASK_IDS = Object.freeze([
   'aci-04-long-horizon-security-audit',
 ]);
 
+export const ACI_25_EXTRA_TASK_IDS = Object.freeze([
+  'aci-05-multi-module-patch-refactor',
+  'aci-06-swarm-contract-integration',
+]);
+
+export const ACI_GOVERNANCE_25_TASK_IDS = Object.freeze([
+  ...ACI_GOVERNANCE_TASK_IDS,
+  ...ACI_25_EXTRA_TASK_IDS,
+]);
+
+export const ACI_25_PROFILE_ALIASES = Object.freeze(new Set(['full_aci', 'aci_25']));
+
+export function normalizeAciProfileName(profile) {
+  const clean = String(profile ?? '').trim();
+  if (!clean) return 'full_aci';
+  return clean === 'aci_25' ? 'aci_25' : clean;
+}
+
+export function isFullAciProfile(profile) {
+  return ACI_25_PROFILE_ALIASES.has(String(profile ?? '').trim());
+}
+
 export const ACI_ARM_PROFILES = Object.freeze({
   A: Object.freeze({
     arm: 'A',
@@ -1020,6 +1042,126 @@ function buildAci04FixedAuditReport(filesMap) {
   );
 }
 
+const ACI_05_SPEC = [
+  '# Multi-Module Patch Validation & Diagnostic Compression Specification',
+  '',
+  '## 1. Diagnostic Parser (`src/diagnostics/parser.js`)',
+  '- `parseDiagnosticLines(rawText)` strips ANSI escape sequences (`\\x1b\\[[0-9;]*m`), skips blank lines, normalizes Windows `\\\\` paths to POSIX `/`, and parses:',
+  '  - TypeScript / compiler style: `src/foo.ts(12,4): error TS2345: Argument type mismatch`',
+  '  - Colon-delimited style: `src/foo.js:12:4: warning W101: Unused import` or `src/foo.js:12: SyntaxError: Unexpected token`',
+  '  - Fallback unparsed non-empty lines with `{ file: null, line: null, column: null, severity: "info", code: null, message: trimmedLine }`',
+  '- Normalize `severity` to one of `"error" | "warning" | "info"` (treat `"fatal"`/`"syntaxerror"`/`"err"` as `"error"`, `"warn"` as `"warning"`).',
+  '',
+  '## 2. Diagnostic Deduplicator (`src/diagnostics/deduplicator.js`)',
+  '- `deduplicateDiagnostics(entries, { maxItems = 50 } = {})` deduplicates by canonical `(normFile, line, code, message)`, keeping `occurrenceCount` and `firstSeenLine` (minimum line).',
+  '- Sort deduplicated items by severity priority (`error` < `warning` < `info`), then `file`, then `line`, then `message`.',
+  '- Slice to `maxItems` and return `{ items, compression: { totalRaw, uniqueCount, keptCount, truncatedCount } }` (`truncatedCount = Math.max(0, uniqueCount - items.length)`).',
+  '',
+  '## 3. Atomic Patch Conflict Guard (`src/patch/conflict-guard.js`)',
+  '- `validatePatchBatch(hunks, fileContents = {})` verifies ALL hunks BEFORE returning `appliedFiles` (all-or-nothing atomicity!):',
+  '  - Reject empty/invalid relative paths, leading `/`, `..` segments, drive letters (`C:`), or `.git` segments (`code: "PATH_CONFINEMENT_ERROR"`).',
+  '  - When `hunk.expectedSha256` is supplied, compare against SHA-256 of `fileContents[normPath]` (missing file = `null`); on any mismatch return `{ ok: false, code: "OPTIMISTIC_LOCK_CONFLICT", conflicts: [...], appliedFiles: {} }`.',
+  '  - Compute `{ path, additions, deletions, sha256After }` for each valid hunk and return `{ ok: true, code: "OK", conflicts: [], appliedFiles, fileSummaries }`.',
+  '',
+  '## 4. Pipeline Report Builder (`src/pipeline/report-builder.js`)',
+  '- `buildPatchDiagnosticsReport({ hunks = [], fileContents = {}, rawDiagnostics = "", maxItems = 50 } = {})`:',
+  '  - Calls `validatePatchBatch(hunks, fileContents)`, `parseDiagnosticLines(rawDiagnostics)`, and `deduplicateDiagnostics(..., { maxItems })`.',
+  '  - Computes `ok = patchResult.ok && diagnosticsResult.items.every((d) => d.severity !== "error")`.',
+  '  - Emits deterministic `reportDigest = sha256(canonicalJson({ ok, patchCode: patchResult.code, appliedPaths, items: diagnosticsResult.items, compression: diagnosticsResult.compression }))`.',
+].join('\n') + '\n';
+
+const ACI_05_CONSTRAINTS = [
+  '# Multi-Module Patch & Diagnostics Constraints',
+  '- **C1**: Zero external npm dependencies in `package.json`.',
+  '- **C2**: Preserve public exports (`parseDiagnosticLines` in `src/diagnostics/parser.js`, `deduplicateDiagnostics` in `src/diagnostics/deduplicator.js`, `validatePatchBatch` in `src/patch/conflict-guard.js`, `buildPatchDiagnosticsReport` in `src/pipeline/report-builder.js`).',
+  '- **C3**: `validatePatchBatch` MUST fail atomically with `OPTIMISTIC_LOCK_CONFLICT` and `appliedFiles: {}` whenever any hunk in the batch has a stale `expectedSha256`.',
+  '- **C4**: Do NOT modify `SPEC.md`, `CONSTRAINTS.md`, `src/core/diagnostic-codes.js`, or `test/patch-diagnostics-baseline.test.js`.',
+].join('\n') + '\n';
+
+const ACI_05_CODES_MODULE = (() => {
+  const lines = [
+    "import { createHash } from 'node:crypto';",
+    'export const PATCH_DIAGNOSTIC_CODES = Object.freeze({',
+    '  OK: "OK",',
+    '  OPTIMISTIC_LOCK_CONFLICT: "OPTIMISTIC_LOCK_CONFLICT",',
+    '  PATH_CONFINEMENT_ERROR: "PATH_CONFINEMENT_ERROR",',
+    '  INVALID_HUNK: "INVALID_HUNK",',
+    '  DIAGNOSTIC_ERRORS_PRESENT: "DIAGNOSTIC_ERRORS_PRESENT",',
+    '});',
+    'export const SEVERITY_ORDER = Object.freeze({ error: 0, warning: 1, info: 2 });',
+    'export function sha256Hex(value) {',
+    '  return createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");',
+    '}',
+    'export function canonicalStringify(value) {',
+    '  if (value === null || typeof value !== "object") return JSON.stringify(value);',
+    '  if (Array.isArray(value)) return "[" + value.map((v) => (v === undefined ? "null" : canonicalStringify(v))).join(",") + "]";',
+    '  return "{" + Object.keys(value).filter((k) => value[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonicalStringify(value[k])).join(",") + "}";',
+    '}',
+    'export const DIAGNOSTIC_RULE_CATALOG = Object.freeze({',
+  ];
+  for (let i = 1; i <= 36; i++) {
+    lines.push(
+      `  RULE_${String(i).padStart(2, '0')}: Object.freeze({ id: "DX-${200 + i}", category: "${i % 2 === 0 ? 'patch' : 'syntax'}", severity: "${i % 3 === 0 ? 'error' : 'warning'}", description: "Invariant check ${i} for atomic patch and diagnostic compression pipeline" }),`,
+    );
+  }
+  lines.push('});');
+  return lines.join('\n') + '\n';
+})();
+
+const ACI_06_CONTRACT_JSON = JSON.stringify(
+  {
+    schemaVersion: '1.0.0',
+    contractId: 'aci-06-swarm-contract-integration',
+    terminalStates: ['completed', 'failed', 'cancelled'],
+    allowedModes: ['0o644', '0o755'],
+    requiredWorkerFields: ['nodeKey', 'writeScope', 'changedFiles', 'outputDigest'],
+    reviewerHardGate: {
+      requireVerifiedGitDiff: true,
+      requireZeroTestExitCode: true,
+      rejectOnMergeConflicts: true,
+      downgradeVerdictTo: 'fail',
+    },
+    conflictPolicy: 'three_way_merge_markers',
+    invariants: Array.from({ length: 18 }, (_, i) => ({
+      id: `SWARM_INV_${String(i + 1).padStart(2, '0')}`,
+      enforced: true,
+      description: `Swarm contract invariant ${i + 1}: enforce writeScope containment, conflict-aware 3-way merge, executable mode preservation, CAS terminal immutability, and hard reviewer git-diff + test exit gate.`,
+    })),
+  },
+  null,
+  2,
+) + '\n';
+
+const ACI_06_SPEC = [
+  '# Parallel Swarm Contract Integration & Reviewer Hard-Gate Specification',
+  '',
+  '## 1. Schema & Scope Registry (`src/contracts/schema-registry.js`)',
+  '- `validateWorkerContractOutput(contract, payload)` verifies:',
+  '  - `payload.nodeKey` is non-empty string, `payload.writeScope` is non-empty array of confined relative paths.',
+  '  - Every file path in `payload.changedFiles` (array of `{ path, content, mode? }`) stays inside `contract` bounds (no `..`, no leading `/`, no `.git`), AND falls under at least one `payload.writeScope` prefix (`path === scope || path.startsWith(scope + "/")`).',
+  '  - Computes canonical `expectedDigest = sha256(canonicalJson({ nodeKey, changedFiles: sortedPathAndContent }))` and rejects if `payload.outputDigest !== expectedDigest` (`code: "CONTRACT_DIGEST_MISMATCH"`).',
+  '',
+  '## 2. Executable-Preserving 3-Way Merger (`src/merge/three-way-merger.js`)',
+  '- `mergeParallelArtifacts(baseFiles = {}, workerOutputs = [])`:',
+  '  - Normalizes file entries `{ content, mode }` (default mode `"0o644"`, preserving `"0o755"` if ANY contributing worker or base requires executable mode without deletion).',
+  '  - When 1 worker edits a path, apply its content + mode directly.',
+  '  - When 2+ workers edit the same path differently relative to `baseFiles[path]`, perform line-level 3-way merge:',
+  '    - If workers modified disjoint line ranges (non-overlapping changed regions relative to base), merge BOTH edits cleanly with zero conflict!',
+  '    - If workers modified overlapping line ranges with different replacement lines, emit conflict markers (`<<<<<<< <nodeA>`, `=======`, `>>>>>>> <nodeB>`), record `{ path, nodeKeys, reason: "overlapping_hunk_conflict" }` in `conflicts`, and NEVER silently overwrite!',
+  '',
+  '## 3. Reviewer Hard Gate (`src/gates/reviewer-gate.js`)',
+  '- `evaluateReviewerHardGate({ claimedVerdict, gitDiffFiles = [], testExitCode = null, mergeConflicts = [] } = {})`:',
+  '  - Even when `claimedVerdict === "pass"`, set `hardGatePassed = false` and downgrade `verdict = "fail"` if:',
+  '    - `!Array.isArray(gitDiffFiles) || gitDiffFiles.length === 0` (`NO_VERIFIED_GIT_DIFF`)',
+  '    - `testExitCode !== 0` (`TEST_EXECUTION_FAILED`)',
+  '    - `Array.isArray(mergeConflicts) && mergeConflicts.length > 0` (`UNRESOLVED_MERGE_CONFLICTS`)',
+  '  - Returns `{ verifiedGitDiff, diffFileCount, verifiedTestExitCode, hardGatePassed, verdict, reasons }`.',
+  '',
+  '## 4. Integration Runner & Terminal CAS (`src/coordinator/integration-runner.js`)',
+  '- `transitionTerminalState(currentState, nextState)` enforces CAS: once `currentState` is `"completed" | "failed" | "cancelled"`, refuse transition (`{ ok: false, state: currentState, overwritten: false }`).',
+  '- `runContractIntegration({ contract, baseFiles = {}, workerOutputs = [], claimedVerdict = "pass", testExitCode = 0 } = {})` validates all worker outputs, runs `mergeParallelArtifacts`, calls `evaluateReviewerHardGate`, and computes deterministic `integrationDigest`.',
+].join('\n') + '\n';
+
 // ---------------------------------------------------------------------------
 // 4 Multi-File ACI Governance Tasks (`aci-01`..`aci-04`)
 // ---------------------------------------------------------------------------
@@ -1080,7 +1222,7 @@ function buildTaskMetadata({
   };
 }
 
-const RAW_ACI_TASKS = [
+const RAW_ACI_BASE_TASKS = [
   // 1) aci-01-auth-tenant-boundary
   {
     id: 'aci-01-auth-tenant-boundary',
@@ -2382,12 +2524,15 @@ test('hidden acceptance: AUDIT_REPORT.json and audit-export CLI produce matching
       },
     }),
   },
-].map((raw) => {
+];
+
+function finalizeRawAciTask(raw, { is25 = false } = {}) {
   const baselineFileHashes = computeFileHashes(raw.fixture.files, [
     ...(raw.fixture.baselineTestFiles ?? []),
     ...Object.keys(raw.fixture.files).filter((p) =>
       ['SPEC.md', 'CONSTRAINTS.md', 'CONTRACT.json', 'fixtures/baseline-events.json'].includes(p) ||
       p === 'src/core/runtime-options.js' ||
+      p === 'src/core/diagnostic-codes.js' ||
       p === 'src/auth/token-verifier.js' ||
       p === 'src/api/auth-routes.js' ||
       p === 'src/persistence/crc32.js' ||
@@ -2408,12 +2553,17 @@ test('hidden acceptance: AUDIT_REPORT.json and audit-export CLI produce matching
     verificationComplexity: 'high',
     recoveryRequirements: true,
   });
+  const minBudgetTokens =
+    raw.id === 'aci-04-long-horizon-security-audit'
+      ? 220_000
+      : raw.id === 'aci-06-swarm-contract-integration'
+        ? 200_000
+        : raw.id === 'aci-05-multi-module-patch-refactor'
+          ? 180_000
+          : 160_000;
   const resourceBudget = {
     maxSteps: Math.max(22, budgetPlan.maxSteps),
-    maxTokens: Math.max(
-      raw.id === 'aci-04-long-horizon-security-audit' ? 220_000 : 160_000,
-      budgetPlan.estimatedTokens,
-    ),
+    maxTokens: Math.max(minBudgetTokens, budgetPlan.estimatedTokens),
     finalVerificationReserve: budgetPlan.finalVerificationReserve,
     maxDurationMs: Math.max(90_000, budgetPlan.maxSteps * 5_000),
     breakdown: {
@@ -2429,9 +2579,11 @@ test('hidden acceptance: AUDIT_REPORT.json and audit-export CLI produce matching
   };
   return {
     ...raw,
-    category: 'aci-governance-2.4-s4',
+    category: is25 ? 'aci-governance-2.5' : 'aci-governance-2.4-s4',
     difficulty: 'hard',
-    tags: ['benchmark', 'aci-governance', '2.4', 'stage-4', raw.area],
+    tags: is25
+      ? ['benchmark', 'aci-governance', '2.5', raw.area]
+      : ['benchmark', 'aci-governance', '2.4', 'stage-4', raw.area],
     fixture: {
       ...raw.fixture,
       baselineFileHashes,
@@ -2459,18 +2611,673 @@ test('hidden acceptance: AUDIT_REPORT.json and audit-export CLI produce matching
       },
     },
   };
+}
+
+const RAW_ACI_TASKS = RAW_ACI_BASE_TASKS.map((raw) => finalizeRawAciTask(raw, { is25: false }));
+
+const RAW_ACI_25_ONLY_TASKS = [
+  // 5) aci-05-multi-module-patch-refactor
+  {
+    id: 'aci-05-multi-module-patch-refactor',
+    area: 'multi_module_patch_refactor',
+    title: 'Multi-Module Patch Conflict Guard & Structured Diagnostic Pipeline Refactor',
+    objective: 'Fix ANSI/compiler diagnostic parsing, severity-ranked deduplication, atomic optimistic-lock patch validation, and deterministic report digests across 4 pipeline modules.',
+    prompt: [
+      'Inspect `SPEC.md`, `CONSTRAINTS.md`, `src/core/diagnostic-codes.js`, and `src/index.js`.',
+      'Repair the multi-module patch validation & diagnostic compression pipeline ONLY in:',
+      '1. `src/diagnostics/parser.js`: strip ANSI color escapes, normalize `\\\\` to `/`, parse both `file(line,col): severity code: msg` and `file:line(:col)?: severity (code:)?: msg`, normalize severity (`error|warning|info`), and emit fallback info entries for unparsed non-empty lines.',
+      '2. `src/diagnostics/deduplicator.js`: deduplicate by `(normFile, line, code, message)` tracking `occurrenceCount` and `firstSeenLine`, sort by `SEVERITY_ORDER` then file/line/message, slice to `maxItems`, and return `{ items, compression: { totalRaw, uniqueCount, keptCount, truncatedCount } }`.',
+      '3. `src/patch/conflict-guard.js`: confine relative paths (reject empty, `/`, `..`, `C:`, `.git`), enforce all-or-nothing preflight `OPTIMISTIC_LOCK_CONFLICT` when any hunk `expectedSha256` mismatches `fileContents`, and compute `{ path, additions, deletions, sha256After }` summaries.',
+      '4. `src/pipeline/report-builder.js`: wire `validatePatchBatch`, `parseDiagnosticLines`, and `deduplicateDiagnostics` to emit `{ ok, patch, diagnostics, reportDigest }` with canonical SHA-256 `reportDigest`.',
+      'Leave `src/core/diagnostic-codes.js`, `SPEC.md`, `CONSTRAINTS.md`, and `test/patch-diagnostics-baseline.test.js` unmodified.',
+      'Run `node --test test/patch-diagnostics-baseline.test.js` after editing.',
+    ].join('\n'),
+    fixture: {
+      files: {
+        'package.json': JSON.stringify({ name: 'aci-05-patch-diagnostics', version: '1.0.0', type: 'module' }, null, 2) + '\n',
+        'README.md': '# Patch & Diagnostics Pipeline\nEntrypoint: `src/index.js`. Governed by `SPEC.md` and `CONSTRAINTS.md`.\n',
+        'SPEC.md': ACI_05_SPEC,
+        'CONSTRAINTS.md': ACI_05_CONSTRAINTS,
+        'src/index.js': [
+          "export { PATCH_DIAGNOSTIC_CODES, SEVERITY_ORDER, sha256Hex, canonicalStringify } from './core/diagnostic-codes.js';",
+          "export { parseDiagnosticLines } from './diagnostics/parser.js';",
+          "export { deduplicateDiagnostics } from './diagnostics/deduplicator.js';",
+          "export { validatePatchBatch } from './patch/conflict-guard.js';",
+          "export { buildPatchDiagnosticsReport } from './pipeline/report-builder.js';",
+        ].join('\n') + '\n',
+        'src/core/diagnostic-codes.js': ACI_05_CODES_MODULE,
+        'src/diagnostics/parser.js': [
+          'export function parseDiagnosticLines(rawText = "") {',
+          '  const lines = String(rawText || "").split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);',
+          '  const out = [];',
+          '  for (const line of lines) {',
+          '    const m = /^([^:]+):(\\d+):\\s*(.+)$/.exec(line);',
+          '    if (m) {',
+          '      out.push({ file: m[1], line: Number(m[2]), column: null, severity: "error", code: null, message: m[3] });',
+          '    }',
+          '  }',
+          '  return out;',
+          '}',
+        ].join('\n') + '\n',
+        'src/diagnostics/deduplicator.js': [
+          'export function deduplicateDiagnostics(entries = [], { maxItems = 50 } = {}) {',
+          '  const list = Array.isArray(entries) ? entries : [];',
+          '  const unique = [];',
+          '  const seen = new Set();',
+          '  for (const e of list) {',
+          '    const key = JSON.stringify(e);',
+          '    if (seen.has(key)) continue;',
+          '    seen.add(key);',
+          '    unique.push({ ...e, occurrenceCount: 1, firstSeenLine: e.line ?? null });',
+          '  }',
+          '  const items = unique.slice(0, maxItems);',
+          '  return { items, compression: { totalRaw: list.length, uniqueCount: unique.length, keptCount: items.length, truncatedCount: 0 } };',
+          '}',
+        ].join('\n') + '\n',
+        'src/patch/conflict-guard.js': [
+          "import { PATCH_DIAGNOSTIC_CODES, sha256Hex } from '../core/diagnostic-codes.js';",
+          'export function validatePatchBatch(hunks = [], fileContents = {}) {',
+          '  const appliedFiles = { ...fileContents };',
+          '  const fileSummaries = [];',
+          '  for (const h of Array.isArray(hunks) ? hunks : []) {',
+          '    appliedFiles[h.path] = h.after ?? "";',
+          '    fileSummaries.push({ path: h.path, additions: 1, deletions: 0, sha256After: sha256Hex(h.after ?? "") });',
+          '  }',
+          '  return { ok: true, code: PATCH_DIAGNOSTIC_CODES.OK, conflicts: [], appliedFiles, fileSummaries };',
+          '}',
+        ].join('\n') + '\n',
+        'src/pipeline/report-builder.js': [
+          "import { sha256Hex } from '../core/diagnostic-codes.js';",
+          "import { parseDiagnosticLines } from '../diagnostics/parser.js';",
+          "import { deduplicateDiagnostics } from '../diagnostics/deduplicator.js';",
+          "import { validatePatchBatch } from '../patch/conflict-guard.js';",
+          'export function buildPatchDiagnosticsReport({ hunks = [], fileContents = {}, rawDiagnostics = "", maxItems = 50 } = {}) {',
+          '  const patch = validatePatchBatch(hunks, fileContents);',
+          '  const parsed = parseDiagnosticLines(rawDiagnostics);',
+          '  const diagnostics = deduplicateDiagnostics(parsed, { maxItems });',
+          '  return { ok: true, patch, diagnostics, reportDigest: sha256Hex(JSON.stringify({ patch, diagnostics })) };',
+          '}',
+        ].join('\n') + '\n',
+        'test/patch-diagnostics-baseline.test.js': [
+          "import test from 'node:test';",
+          "import assert from 'node:assert/strict';",
+          "import { buildPatchDiagnosticsReport } from '../src/index.js';",
+          "test('baseline patch diagnostics pipeline handles basic single-file colon diagnostic', () => {",
+          '  const res = buildPatchDiagnosticsReport({',
+          '    hunks: [{ path: "src/app.js", after: "export const x = 1;\\n" }],',
+          '    fileContents: { "src/app.js": "export const x = 0;\\n" },',
+          '    rawDiagnostics: "src/app.js:1: sample diagnostic",',
+          '  });',
+          '  assert.equal(res.patch.ok, true);',
+          '  assert.equal(res.diagnostics.items.length, 1);',
+          '});',
+        ].join('\n') + '\n',
+        'src/legacy/v1-regex-linter.js': buildLegacyJsDecoy({
+          moduleLabel: 'v1-regex-linter',
+          domainKeywords: ['parseDiagnosticLines', 'deduplicateDiagnostics', 'severity', 'ANSI'],
+          exportsList: ['runLegacyRegexLinter', 'formatV1LintOutput'],
+        }),
+        'src/legacy/v1-patch-shim.js': buildLegacyJsDecoy({
+          moduleLabel: 'v1-patch-shim',
+          domainKeywords: ['validatePatchBatch', 'expectedSha256', 'OPTIMISTIC_LOCK_CONFLICT', 'hunks'],
+          exportsList: ['applyV1PatchShim', 'verifyLegacyPatchLock'],
+        }),
+        'src/telemetry/diagnostic-sampler.js': buildLegacyJsDecoy({
+          moduleLabel: 'diagnostic-sampler',
+          domainKeywords: ['reportDigest', 'truncatedCount', 'diagnostics', 'sampler'],
+          exportsList: ['sampleDiagnosticTelemetry', 'emitDiagnosticMetric'],
+        }),
+        'docs/CHANGELOG.md': buildChangelogDecoy({
+          title: 'Multi-Module Patch & Diagnostics',
+          keywords: ['parser', 'deduplicator', 'conflict-guard', 'report-builder'],
+        }),
+        'docs/HISTORICAL-DIAGNOSTICS.md': buildMarkdownArchiveDecoy({
+          title: 'Historical Diagnostic Formats',
+          keywords: ['TS2345', 'OPTIMISTIC_LOCK_CONFLICT', 'deduplicator', 'patch'],
+          sections: 20,
+        }),
+        'fixtures/sample-tsc-output.json': buildJsonFixtureDecoy({
+          title: 'Sample Compiler Diagnostic Records',
+          keywords: ['diagnostics', 'severity', 'hunk', 'sha256After'],
+        }),
+        'fixtures/historical-lint-traces.csv': buildCsvDecoy({
+          headerCols: ['seq', 'ts', 'stage', 'kind', 'tenant', 'digest', 'status', 'note'],
+          keywords: ['parser', 'dedup', 'patch', 'report'],
+          rows: 92,
+        }),
+        'templates/patch-report.html': buildHtmlTemplateDecoy({
+          title: 'Patch Diagnostics Archive Template',
+          keywords: ['patch', 'diagnostic', 'reportDigest', 'conflict'],
+        }),
+      },
+      baselineTestFiles: ['test/patch-diagnostics-baseline.test.js'],
+      baselineTestCommand: ['node', '--test', 'test/patch-diagnostics-baseline.test.js'],
+    },
+    judge: makeAciGovernanceJudge({
+      requiredSourceFiles: [
+        'src/diagnostics/parser.js',
+        'src/diagnostics/deduplicator.js',
+        'src/patch/conflict-guard.js',
+        'src/pipeline/report-builder.js',
+      ],
+      protectedReadOnlyFiles: [
+        'SPEC.md',
+        'CONSTRAINTS.md',
+        'src/core/diagnostic-codes.js',
+        'test/patch-diagnostics-baseline.test.js',
+      ],
+      rootCauseFiles: [
+        'src/diagnostics/parser.js',
+        'src/diagnostics/deduplicator.js',
+        'src/patch/conflict-guard.js',
+        'src/pipeline/report-builder.js',
+      ],
+      extraCheck: ({ workspaceRoot }) => {
+        const pkg = readWorkspaceJson(workspaceRoot, 'package.json');
+        const parserSrc = readWorkspaceText(workspaceRoot, 'src/diagnostics/parser.js') ?? '';
+        const dedupSrc = readWorkspaceText(workspaceRoot, 'src/diagnostics/deduplicator.js') ?? '';
+        const guardSrc = readWorkspaceText(workspaceRoot, 'src/patch/conflict-guard.js') ?? '';
+        const builderSrc = readWorkspaceText(workspaceRoot, 'src/pipeline/report-builder.js') ?? '';
+        const c1 = !pkg?.dependencies || Object.keys(pkg.dependencies).length === 0;
+        const c2 =
+          /export\s+function\s+parseDiagnosticLines/.test(parserSrc) &&
+          /export\s+function\s+deduplicateDiagnostics/.test(dedupSrc) &&
+          /export\s+function\s+validatePatchBatch/.test(guardSrc) &&
+          /export\s+function\s+buildPatchDiagnosticsReport/.test(builderSrc);
+        return { constraintsPreserved: c1 && c2 };
+      },
+      hiddenAcceptanceScript: `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
+
+test('hidden acceptance: ANSI/Windows/TSC parser and severity-ranked deduplication with truncation stats', async () => {
+  const { parseDiagnosticLines, deduplicateDiagnostics } = await import(pathToFileURL(join(ws, 'src/index.js')).href);
+  const raw = [
+    '',
+    '\\x1b[31msrc\\\\b.js(14,3): error TS2345: Type mismatch\\x1b[0m',
+    'src/b.js:14:3: error TS2345: Type mismatch',
+    'src\\\\a.js:4:2: warn W100: Unused variable',
+    'src/a.js:4:2: warn W100: Unused variable',
+    'src/z.js:9: info: Check complete',
+    'unstructured diagnostic note',
+  ].join('\\n');
+
+  const parsed = parseDiagnosticLines(raw);
+  assert.equal(parsed.length, 6);
+  assert.equal(parsed[0].file, 'src/b.js');
+  assert.equal(parsed[0].line, 14);
+  assert.equal(parsed[0].column, 3);
+  assert.equal(parsed[0].severity, 'error');
+  assert.equal(parsed[0].code, 'TS2345');
+  assert.equal(parsed[2].severity, 'warning');
+  assert.equal(parsed[5].file, null);
+  assert.equal(parsed[5].severity, 'info');
+
+  const dedup = deduplicateDiagnostics(parsed, { maxItems: 3 });
+  assert.equal(dedup.compression.totalRaw, 6);
+  assert.equal(dedup.compression.uniqueCount, 4);
+  assert.equal(dedup.compression.keptCount, 3);
+  assert.equal(dedup.compression.truncatedCount, 1);
+  assert.equal(dedup.items[0].severity, 'error');
+  assert.equal(dedup.items[0].occurrenceCount, 2);
+  assert.equal(dedup.items[1].severity, 'warning');
+  assert.equal(dedup.items[1].occurrenceCount, 2);
 });
 
+test('hidden acceptance: validatePatchBatch enforces path confinement and atomic OPTIMISTIC_LOCK_CONFLICT', async () => {
+  const { validatePatchBatch, PATCH_DIAGNOSTIC_CODES } = await import(pathToFileURL(join(ws, 'src/index.js')).href);
+  const baseA = 'line1\\nline2\\n';
+  const baseB = 'alpha\\nbeta\\n';
+  const shaA = createHash('sha256').update(baseA).digest('hex');
+
+  const conflictRes = validatePatchBatch(
+    [
+      { path: 'src/a.js', after: 'line1\\nchanged\\n', expectedSha256: shaA },
+      { path: 'src/b.js', after: 'gamma\\n', expectedSha256: 'deadbeef' },
+    ],
+    { 'src/a.js': baseA, 'src/b.js': baseB },
+  );
+  assert.equal(conflictRes.ok, false);
+  assert.equal(conflictRes.code, PATCH_DIAGNOSTIC_CODES.OPTIMISTIC_LOCK_CONFLICT);
+  assert.deepEqual(conflictRes.appliedFiles, {});
+  assert.equal(conflictRes.conflicts.length, 1);
+  assert.equal(conflictRes.conflicts[0].path, 'src/b.js');
+
+  const escapeRes = validatePatchBatch(
+    [{ path: '../escape.js', after: 'bad' }],
+    {},
+  );
+  assert.equal(escapeRes.ok, false);
+  assert.equal(escapeRes.code, PATCH_DIAGNOSTIC_CODES.PATH_CONFINEMENT_ERROR);
+});
+
+test('hidden acceptance: buildPatchDiagnosticsReport computes deterministic canonical digest and status', async () => {
+  const { buildPatchDiagnosticsReport } = await import(pathToFileURL(join(ws, 'src/index.js')).href);
+  const base = 'const a = 1;\\nconst b = 2;\\n';
+  const sha = createHash('sha256').update(base).digest('hex');
+  const clean = buildPatchDiagnosticsReport({
+    hunks: [{ path: 'src/mod.js', after: 'const a = 1;\\nconst b = 3;\\nconst c = 4;\\n', expectedSha256: sha }],
+    fileContents: { 'src/mod.js': base },
+    rawDiagnostics: 'src/mod.js:2: warning W001: check value',
+    maxItems: 10,
+  });
+  assert.equal(clean.ok, true);
+  assert.equal(clean.patch.fileSummaries[0].additions >= 2, true);
+  assert.equal(clean.patch.fileSummaries[0].deletions >= 1, true);
+  assert.match(clean.reportDigest, /^[0-9a-f]{64}$/);
+
+  const withErr = buildPatchDiagnosticsReport({
+    hunks: [{ path: 'src/mod.js', after: 'const a = 1;\\n', expectedSha256: sha }],
+    fileContents: { 'src/mod.js': base },
+    rawDiagnostics: 'src/mod.js(1,1): error TS1005: syntax',
+  });
+  assert.equal(withErr.ok, false);
+});
+`,
+    }),
+    metadata: buildTaskMetadata({
+      id: 'aci-05-multi-module-patch-refactor',
+      area: 'multi_module_patch_refactor',
+      requiredChangedFiles: [
+        'src/diagnostics/parser.js',
+        'src/diagnostics/deduplicator.js',
+        'src/patch/conflict-guard.js',
+        'src/pipeline/report-builder.js',
+      ],
+      testFiles: ['test/patch-diagnostics-baseline.test.js'],
+      testCommand: ['node', '--test', 'test/patch-diagnostics-baseline.test.js'],
+      repoFileCount: 19,
+      groundTruth: {
+        criticalFiles: [
+          'SPEC.md',
+          'CONSTRAINTS.md',
+          'src/core/diagnostic-codes.js',
+          'src/diagnostics/parser.js',
+          'src/diagnostics/deduplicator.js',
+          'src/patch/conflict-guard.js',
+          'src/pipeline/report-builder.js',
+        ],
+        relevantFiles: [
+          'package.json',
+          'README.md',
+          'SPEC.md',
+          'CONSTRAINTS.md',
+          'src/index.js',
+          'src/core/diagnostic-codes.js',
+          'src/diagnostics/parser.js',
+          'src/diagnostics/deduplicator.js',
+          'src/patch/conflict-guard.js',
+          'src/pipeline/report-builder.js',
+          'test/patch-diagnostics-baseline.test.js',
+        ],
+        noiseFiles: [
+          'src/legacy/v1-regex-linter.js',
+          'src/legacy/v1-patch-shim.js',
+          'src/telemetry/diagnostic-sampler.js',
+          'docs/CHANGELOG.md',
+          'docs/HISTORICAL-DIAGNOSTICS.md',
+          'fixtures/sample-tsc-output.json',
+          'fixtures/historical-lint-traces.csv',
+          'templates/patch-report.html',
+        ],
+      },
+    }),
+  },
+
+  // 6) aci-06-swarm-contract-integration
+  {
+    id: 'aci-06-swarm-contract-integration',
+    area: 'swarm_contract_integration',
+    title: 'Parallel Swarm Contract Validation, 3-Way Merge & Reviewer Hard-Gate Integration',
+    objective: 'Integrate writeScope contract enforcement, executable-preserving 3-way line merge, terminal CAS transitions, and hard reviewer git-diff/test-exit verification.',
+    prompt: [
+      'Inspect `CONTRACT.json`, `SPEC.md`, and `src/index.js`.',
+      'Fix the Swarm contract integration pipeline ONLY in:',
+      '1. `src/contracts/schema-registry.js`: implement `validateWorkerContractOutput(contract, payload)` verifying confined paths, `writeScope` ownership, required fields, and canonical `outputDigest` (`CONTRACT_DIGEST_MISMATCH`).',
+      '2. `src/merge/three-way-merger.js`: replace naive last-writer-wins with line-level 3-way merge (`mergeParallelArtifacts(baseFiles, workerOutputs)`) that auto-merges disjoint hunks, emits `<<<<<<<`/`=======`/`>>>>>>>` conflict markers + `conflicts` entries on overlapping incompatible edits, and preserves `mode: "0o755"` executable permissions.',
+      '3. `src/gates/reviewer-gate.js`: implement `evaluateReviewerHardGate({ claimedVerdict, gitDiffFiles, testExitCode, mergeConflicts })` refusing `"pass"` whenever `gitDiffFiles` is empty (`NO_VERIFIED_GIT_DIFF`), `testExitCode !== 0` (`TEST_EXECUTION_FAILED`), or `mergeConflicts` is non-empty (`UNRESOLVED_MERGE_CONFLICTS`).',
+      '4. `src/coordinator/integration-runner.js`: implement CAS `transitionTerminalState(currentState, nextState)` (`completed|failed|cancelled` immutable once reached) and `runContractIntegration` chaining validation -> merge -> hard gate -> canonical `integrationDigest`.',
+      'Do NOT modify `CONTRACT.json`, `SPEC.md`, or `test/swarm-contract-baseline.test.js`.',
+      'Run `node --test test/swarm-contract-baseline.test.js` after editing.',
+    ].join('\n'),
+    fixture: {
+      files: {
+        'package.json': JSON.stringify({ name: 'aci-06-swarm-integration', version: '1.0.0', type: 'module' }, null, 2) + '\n',
+        'README.md': '# Swarm Contract Integration\nEntrypoint: `src/index.js`. Governed by `CONTRACT.json` and `SPEC.md`.\n',
+        'CONTRACT.json': ACI_06_CONTRACT_JSON,
+        'SPEC.md': ACI_06_SPEC,
+        'src/index.js': [
+          "export { validateWorkerContractOutput, computeWorkerOutputDigest } from './contracts/schema-registry.js';",
+          "export { mergeParallelArtifacts } from './merge/three-way-merger.js';",
+          "export { evaluateReviewerHardGate } from './gates/reviewer-gate.js';",
+          "export { transitionTerminalState, runContractIntegration } from './coordinator/integration-runner.js';",
+        ].join('\n') + '\n',
+        'src/contracts/schema-registry.js': [
+          "import { createHash } from 'node:crypto';",
+          'export function computeWorkerOutputDigest(nodeKey, changedFiles = []) {',
+          '  return createHash("sha256").update(JSON.stringify({ nodeKey, changedFiles })).digest("hex");',
+          '}',
+          'export function validateWorkerContractOutput(contract, payload) {',
+          '  if (!payload || !payload.nodeKey) return { ok: false, code: "INVALID_PAYLOAD" };',
+          '  return { ok: true, code: "OK" };',
+          '}',
+        ].join('\n') + '\n',
+        'src/merge/three-way-merger.js': [
+          'export function mergeParallelArtifacts(baseFiles = {}, workerOutputs = []) {',
+          '  const merged = {};',
+          '  for (const [p, v] of Object.entries(baseFiles || {})) {',
+          '    merged[p] = typeof v === "string" ? { content: v, mode: "0o644" } : { content: v.content ?? "", mode: v.mode ?? "0o644" };',
+          '  }',
+          '  for (const w of Array.isArray(workerOutputs) ? workerOutputs : []) {',
+          '    for (const f of w?.changedFiles ?? []) {',
+          '      merged[f.path] = { content: String(f.content ?? ""), mode: "0o644" };',
+          '    }',
+          '  }',
+          '  return { files: merged, conflicts: [] };',
+          '}',
+        ].join('\n') + '\n',
+        'src/gates/reviewer-gate.js': [
+          'export function evaluateReviewerHardGate({ claimedVerdict = "pass", gitDiffFiles = [], testExitCode = null, mergeConflicts = [] } = {}) {',
+          '  const count = Array.isArray(gitDiffFiles) ? gitDiffFiles.length : 0;',
+          '  return {',
+          '    verifiedGitDiff: count > 0,',
+          '    diffFileCount: count,',
+          '    verifiedTestExitCode: testExitCode,',
+          '    hardGatePassed: claimedVerdict === "pass",',
+          '    verdict: claimedVerdict,',
+          '    reasons: [],',
+          '  };',
+          '}',
+        ].join('\n') + '\n',
+        'src/coordinator/integration-runner.js': [
+          "import { createHash } from 'node:crypto';",
+          "import { validateWorkerContractOutput } from '../contracts/schema-registry.js';",
+          "import { mergeParallelArtifacts } from '../merge/three-way-merger.js';",
+          "import { evaluateReviewerHardGate } from '../gates/reviewer-gate.js';",
+          'export function transitionTerminalState(currentState, nextState) {',
+          '  return { ok: true, state: nextState, overwritten: true };',
+          '}',
+          'export function runContractIntegration({ contract, baseFiles = {}, workerOutputs = [], claimedVerdict = "pass", testExitCode = 0 } = {}) {',
+          '  for (const w of workerOutputs) validateWorkerContractOutput(contract, w);',
+          '  const merged = mergeParallelArtifacts(baseFiles, workerOutputs);',
+          '  const reviewerVerification = evaluateReviewerHardGate({ claimedVerdict, gitDiffFiles: Object.keys(merged.files), testExitCode, mergeConflicts: merged.conflicts });',
+          '  return { ok: true, merged, reviewerVerification, integrationDigest: createHash("sha256").update(JSON.stringify(merged)).digest("hex") };',
+          '}',
+        ].join('\n') + '\n',
+        'test/swarm-contract-baseline.test.js': [
+          "import test from 'node:test';",
+          "import assert from 'node:assert/strict';",
+          "import { computeWorkerOutputDigest, runContractIntegration } from '../src/index.js';",
+          "test('baseline swarm contract runner merges single-worker output', () => {",
+          '  const changedFiles = [{ path: "src/a.js", content: "export const a = 1;\\n" }];',
+          '  const worker = { nodeKey: "worker-1", writeScope: ["src/a.js"], changedFiles, outputDigest: computeWorkerOutputDigest("worker-1", changedFiles) };',
+          '  const res = runContractIntegration({',
+          '    contract: { terminalStates: ["completed", "failed", "cancelled"] },',
+          '    baseFiles: {},',
+          '    workerOutputs: [worker],',
+          '    claimedVerdict: "pass",',
+          '    testExitCode: 0,',
+          '  });',
+          '  assert.equal(res.reviewerVerification.hardGatePassed, true);',
+          '  assert.equal(res.merged.files["src/a.js"].content, "export const a = 1;\\n");',
+          '});',
+        ].join('\n') + '\n',
+        'src/legacy/v1-naive-overlay.js': buildLegacyJsDecoy({
+          moduleLabel: 'v1-naive-overlay',
+          domainKeywords: ['mergeParallelArtifacts', 'three-way', 'writeScope', 'overlay'],
+          exportsList: ['overlayArtifactsNaive', 'restoreV1Snapshot'],
+        }),
+        'src/legacy/v1-dag-scheduler.js': buildLegacyJsDecoy({
+          moduleLabel: 'v1-dag-scheduler',
+          domainKeywords: ['transitionTerminalState', 'nodeKey', 'reviewerVerification', 'swarm'],
+          exportsList: ['scheduleV1Dag', 'dispatchLegacyWorker'],
+        }),
+        'src/compat/legacy-event-bus.js': buildLegacyJsDecoy({
+          moduleLabel: 'legacy-event-bus',
+          domainKeywords: ['evaluateReviewerHardGate', 'CONTRACT', 'swarm', 'mailbox'],
+          exportsList: ['publishLegacySwarmEvent', 'subscribeLegacyBus'],
+        }),
+        'docs/CHANGELOG.md': buildChangelogDecoy({
+          title: 'Swarm Contract Integration',
+          keywords: ['schema-registry', 'three-way-merger', 'reviewer-gate', 'integration-runner'],
+        }),
+        'docs/LEGACY-SWARM-NOTES.md': buildMarkdownArchiveDecoy({
+          title: 'Legacy Swarm Coordination Notes',
+          keywords: ['three-way', 'CAS', 'hardGatePassed', 'writeScope'],
+          sections: 20,
+        }),
+        'fixtures/legacy-worker-traces.json': buildJsonFixtureDecoy({
+          title: 'Legacy Worker Coordination Traces',
+          keywords: ['workerOutputs', 'gitDiffFiles', 'testExitCode', 'outputDigest'],
+        }),
+        'fixtures/legacy-merge-metrics.sql': buildSqlDecoy({
+          tableName: 'legacy_swarm_merge_metrics',
+          keywords: ['merge', 'conflict', 'reviewer', 'cas'],
+          rows: 85,
+        }),
+        'plugins/sample-swarm-openapi.json': buildOpenApiDecoy({
+          serviceName: 'Legacy Swarm V1',
+          keywords: ['swarm', 'merge', 'reviewer', 'artifact'],
+        }),
+      },
+      baselineTestFiles: ['test/swarm-contract-baseline.test.js'],
+      baselineTestCommand: ['node', '--test', 'test/swarm-contract-baseline.test.js'],
+    },
+    judge: makeAciGovernanceJudge({
+      requiredSourceFiles: [
+        'src/contracts/schema-registry.js',
+        'src/merge/three-way-merger.js',
+        'src/gates/reviewer-gate.js',
+        'src/coordinator/integration-runner.js',
+      ],
+      protectedReadOnlyFiles: [
+        'CONTRACT.json',
+        'SPEC.md',
+        'test/swarm-contract-baseline.test.js',
+      ],
+      rootCauseFiles: [
+        'src/contracts/schema-registry.js',
+        'src/merge/three-way-merger.js',
+        'src/gates/reviewer-gate.js',
+        'src/coordinator/integration-runner.js',
+      ],
+      extraCheck: ({ workspaceRoot }) => {
+        const pkg = readWorkspaceJson(workspaceRoot, 'package.json');
+        const regSrc = readWorkspaceText(workspaceRoot, 'src/contracts/schema-registry.js') ?? '';
+        const mergeSrc = readWorkspaceText(workspaceRoot, 'src/merge/three-way-merger.js') ?? '';
+        const gateSrc = readWorkspaceText(workspaceRoot, 'src/gates/reviewer-gate.js') ?? '';
+        const runnerSrc = readWorkspaceText(workspaceRoot, 'src/coordinator/integration-runner.js') ?? '';
+        const c1 = !pkg?.dependencies || Object.keys(pkg.dependencies).length === 0;
+        const c2 =
+          /export\s+function\s+validateWorkerContractOutput/.test(regSrc) &&
+          /export\s+function\s+mergeParallelArtifacts/.test(mergeSrc) &&
+          /export\s+function\s+evaluateReviewerHardGate/.test(gateSrc) &&
+          /export\s+function\s+transitionTerminalState/.test(runnerSrc) &&
+          /export\s+function\s+runContractIntegration/.test(runnerSrc);
+        return { constraintsPreserved: c1 && c2 };
+      },
+      hiddenAcceptanceScript: `
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const ws = process.env.WORKSPACE_ROOT || process.env.AGENT_US_EVAL_WORKSPACE;
+
+test('hidden acceptance: schema registry rejects writeScope escape and outputDigest mismatch', async () => {
+  const { validateWorkerContractOutput, computeWorkerOutputDigest } = await import(
+    pathToFileURL(join(ws, 'src/index.js')).href
+  );
+  const contract = JSON.parse(readFileSync(join(ws, 'CONTRACT.json'), 'utf8'));
+  const files = [{ path: 'src/allowed/mod.js', content: 'export const x = 1;\\n' }];
+  const goodDigest = computeWorkerOutputDigest('w-a', files);
+
+  const okRes = validateWorkerContractOutput(contract, {
+    nodeKey: 'w-a',
+    writeScope: ['src/allowed'],
+    changedFiles: files,
+    outputDigest: goodDigest,
+  });
+  assert.equal(okRes.ok, true);
+
+  const scopeEscape = validateWorkerContractOutput(contract, {
+    nodeKey: 'w-a',
+    writeScope: ['src/allowed'],
+    changedFiles: [{ path: 'src/other/mod.js', content: 'x' }],
+    outputDigest: computeWorkerOutputDigest('w-a', [{ path: 'src/other/mod.js', content: 'x' }]),
+  });
+  assert.equal(scopeEscape.ok, false);
+
+  const badDigest = validateWorkerContractOutput(contract, {
+    nodeKey: 'w-a',
+    writeScope: ['src/allowed'],
+    changedFiles: files,
+    outputDigest: '0'.repeat(64),
+  });
+  assert.equal(badDigest.ok, false);
+  assert.match(badDigest.code, /DIGEST/i);
+});
+
+test('hidden acceptance: 3-way merger merges disjoint parallel edits, detects conflicts, and preserves 0o755 mode', async () => {
+  const { mergeParallelArtifacts } = await import(pathToFileURL(join(ws, 'src/index.js')).href);
+  const base = {
+    'bin/run.sh': { content: '#!/bin/sh\\n# header\\necho start\\necho mid\\necho end\\n', mode: '0o755' },
+  };
+  const workerA = {
+    nodeKey: 'worker-a',
+    changedFiles: [{ path: 'bin/run.sh', content: '#!/bin/sh\\n# header-A\\necho start\\necho mid\\necho end\\n', mode: '0o755' }],
+  };
+  const workerB = {
+    nodeKey: 'worker-b',
+    changedFiles: [{ path: 'bin/run.sh', content: '#!/bin/sh\\n# header\\necho start\\necho mid\\necho end-B\\n', mode: '0o644' }],
+  };
+  const cleanMerge = mergeParallelArtifacts(base, [workerA, workerB]);
+  assert.equal(cleanMerge.conflicts.length, 0);
+  assert.equal(cleanMerge.files['bin/run.sh'].mode, '0o755');
+  assert.equal(cleanMerge.files['bin/run.sh'].content.includes('# header-A'), true);
+  assert.equal(cleanMerge.files['bin/run.sh'].content.includes('echo end-B'), true);
+
+  const workerC = {
+    nodeKey: 'worker-c',
+    changedFiles: [{ path: 'bin/run.sh', content: '#!/bin/sh\\n# header-C\\necho start\\necho mid\\necho end\\n', mode: '0o755' }],
+  };
+  const conflicted = mergeParallelArtifacts(base, [workerA, workerC]);
+  assert.equal(conflicted.conflicts.length, 1);
+  assert.equal(conflicted.conflicts[0].path, 'bin/run.sh');
+  assert.equal(conflicted.files['bin/run.sh'].content.includes('<<<<<<<'), true);
+  assert.equal(conflicted.files['bin/run.sh'].content.includes('>>>>>>>'), true);
+});
+
+test('hidden acceptance: reviewer hard gate blocks synthetic pass and transitionTerminalState enforces CAS', async () => {
+  const { evaluateReviewerHardGate, transitionTerminalState, runContractIntegration, computeWorkerOutputDigest } = await import(
+    pathToFileURL(join(ws, 'src/index.js')).href
+  );
+  const contract = JSON.parse(readFileSync(join(ws, 'CONTRACT.json'), 'utf8'));
+
+  const noDiff = evaluateReviewerHardGate({ claimedVerdict: 'pass', gitDiffFiles: [], testExitCode: 0, mergeConflicts: [] });
+  assert.equal(noDiff.hardGatePassed, false);
+  assert.equal(noDiff.verdict, 'fail');
+  assert.equal(noDiff.reasons.includes('NO_VERIFIED_GIT_DIFF'), true);
+
+  const badTest = evaluateReviewerHardGate({ claimedVerdict: 'pass', gitDiffFiles: ['src/a.js'], testExitCode: 1, mergeConflicts: [] });
+  assert.equal(badTest.hardGatePassed, false);
+  assert.equal(badTest.verdict, 'fail');
+  assert.equal(badTest.reasons.includes('TEST_EXECUTION_FAILED'), true);
+
+  const casBlocked = transitionTerminalState('completed', 'failed');
+  assert.equal(casBlocked.ok, false);
+  assert.equal(casBlocked.state, 'completed');
+  assert.equal(casBlocked.overwritten, false);
+
+  const casOk = transitionTerminalState('running', 'completed');
+  assert.equal(casOk.ok, true);
+  assert.equal(casOk.state, 'completed');
+
+  const files = [{ path: 'src/x.js', content: 'export const x = 42;\\n', mode: '0o755' }];
+  const integ = runContractIntegration({
+    contract,
+    baseFiles: {},
+    workerOutputs: [{ nodeKey: 'w1', writeScope: ['src'], changedFiles: files, outputDigest: computeWorkerOutputDigest('w1', files) }],
+    claimedVerdict: 'pass',
+    testExitCode: 0,
+  });
+  assert.equal(integ.ok, true);
+  assert.equal(integ.reviewerVerification.hardGatePassed, true);
+  assert.match(integ.integrationDigest, /^[0-9a-f]{64}$/);
+});
+`,
+    }),
+    metadata: buildTaskMetadata({
+      id: 'aci-06-swarm-contract-integration',
+      area: 'swarm_contract_integration',
+      requiredChangedFiles: [
+        'src/contracts/schema-registry.js',
+        'src/merge/three-way-merger.js',
+        'src/gates/reviewer-gate.js',
+        'src/coordinator/integration-runner.js',
+      ],
+      testFiles: ['test/swarm-contract-baseline.test.js'],
+      testCommand: ['node', '--test', 'test/swarm-contract-baseline.test.js'],
+      repoFileCount: 18,
+      groundTruth: {
+        criticalFiles: [
+          'CONTRACT.json',
+          'SPEC.md',
+          'src/contracts/schema-registry.js',
+          'src/merge/three-way-merger.js',
+          'src/gates/reviewer-gate.js',
+          'src/coordinator/integration-runner.js',
+        ],
+        relevantFiles: [
+          'package.json',
+          'README.md',
+          'CONTRACT.json',
+          'SPEC.md',
+          'src/index.js',
+          'src/contracts/schema-registry.js',
+          'src/merge/three-way-merger.js',
+          'src/gates/reviewer-gate.js',
+          'src/coordinator/integration-runner.js',
+          'test/swarm-contract-baseline.test.js',
+        ],
+        noiseFiles: [
+          'src/legacy/v1-naive-overlay.js',
+          'src/legacy/v1-dag-scheduler.js',
+          'src/compat/legacy-event-bus.js',
+          'docs/CHANGELOG.md',
+          'docs/LEGACY-SWARM-NOTES.md',
+          'fixtures/legacy-worker-traces.json',
+          'fixtures/legacy-merge-metrics.sql',
+          'plugins/sample-swarm-openapi.json',
+        ],
+      },
+    }),
+  },
+].map((raw) => finalizeRawAciTask(raw, { is25: true }));
+
+const RAW_ACI_25_TASKS = [...RAW_ACI_TASKS, ...RAW_ACI_25_ONLY_TASKS];
+
 export const ACI_GOVERNANCE_DATASET = Object.freeze(RAW_ACI_TASKS);
+export const ACI_GOVERNANCE_25_DATASET = Object.freeze(RAW_ACI_25_TASKS);
 
 export function createAciGovernanceDataset({
   sandbox = null,
   sandboxOptions = null,
   repoOverrides = null,
+  suite = 'aci',
+  include25 = false,
 } = {}) {
   const datasetSandbox =
     sandbox ?? (sandboxOptions ? new BenchmarkSandbox(sandboxOptions) : getDefaultBenchmarkSandbox());
-  return RAW_ACI_TASKS.map((task) => {
+  const sourceTasks =
+    include25 || suite === 'aci25' || suite === 'all' ? RAW_ACI_25_TASKS : RAW_ACI_TASKS;
+  return sourceTasks.map((task) => {
     const override =
       repoOverrides && typeof repoOverrides === 'object' ? repoOverrides[task.id] ?? null : null;
     const baseFixture = structuredClone(task.fixture);
@@ -2495,12 +3302,14 @@ export function createAciGovernanceDataset({
   });
 }
 
-export async function materializeAciGovernanceRepos(rootDir, { tasks = RAW_ACI_TASKS } = {}) {
+export async function materializeAciGovernanceRepos(rootDir, { tasks = null, suite = 'aci' } = {}) {
+  const targetTasks =
+    tasks ?? (suite === 'aci25' || suite === 'all' ? RAW_ACI_25_TASKS : RAW_ACI_TASKS);
   const baseRoot = resolve(String(rootDir));
   mkdirSync(baseRoot, { recursive: true });
   const repoOverrides = {};
   const entries = await Promise.all(
-    tasks.map(async (task) => {
+    targetTasks.map(async (task) => {
       const work = join(baseRoot, `${task.id}-src`);
       const bare = join(baseRoot, `${task.id}.git`);
       rmSync(work, { recursive: true, force: true });
@@ -2960,6 +3769,357 @@ export function getAciGovernanceReferenceFix(taskId, workspaceRoot = null) {
       return fixedFiles;
     }
 
+    case 'aci-05-multi-module-patch-refactor':
+      return {
+        'src/diagnostics/parser.js': [
+          'const ANSI_RE = /\\x1b\\[[0-9;]*m/g;',
+          'function normalizeSeverity(raw = "") {',
+          '  const s = String(raw || "").trim().toLowerCase();',
+          '  if (s === "fatal" || s === "err" || s === "error" || s === "syntaxerror") return "error";',
+          '  if (s === "warn" || s === "warning") return "warning";',
+          '  return "info";',
+          '}',
+          'function normalizeFile(raw = "") {',
+          '  return String(raw || "").trim().replaceAll("\\\\", "/").replace(/^\\.\\//, "");',
+          '}',
+          'export function parseDiagnosticLines(rawText = "") {',
+          '  const cleaned = String(rawText ?? "").replace(ANSI_RE, "");',
+          '  const lines = cleaned.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);',
+          '  const out = [];',
+          '  for (const line of lines) {',
+          '    const tsc = /^(.+?)\\((\\d+),(\\d+)\\):\\s*(error|warning|warn|info|fatal)\\s+([A-Za-z0-9_-]+):\\s*(.+)$/i.exec(line);',
+          '    if (tsc) {',
+          '      out.push({ file: normalizeFile(tsc[1]), line: Number(tsc[2]), column: Number(tsc[3]), severity: normalizeSeverity(tsc[4]), code: tsc[5], message: tsc[6].trim() });',
+          '      continue;',
+          '    }',
+          '    const colon = /^([A-Za-z0-9_./\\\\-]+):(\\d+)(?::(\\d+))?:\\s*(?:(error|warning|warn|info|fatal|syntaxerror)\\s*(?:([A-Za-z0-9_-]+):\\s*)?|:?\\s*(.+))$/i.exec(line);',
+          '    if (colon) {',
+          '      const restIdx = line.indexOf(":", colon[1].length + 1 + colon[2].length + (colon[3] ? 1 + colon[3].length : 0));',
+          '      const tail = restIdx >= 0 ? line.slice(restIdx + 1).trim() : "";',
+          '      const sevMatch = /^(error|warning|warn|info|fatal|syntaxerror)(?:\\s+([A-Za-z0-9_-]+))?:\\s*(.+)$/i.exec(tail);',
+          '      if (sevMatch) {',
+          '        out.push({ file: normalizeFile(colon[1]), line: Number(colon[2]), column: colon[3] ? Number(colon[3]) : null, severity: normalizeSeverity(sevMatch[1]), code: sevMatch[2] || null, message: sevMatch[3].trim() });',
+          '        continue;',
+          '      }',
+          '      const sevNoCode = /^(error|warning|warn|info|fatal|syntaxerror)\\s+([A-Za-z0-9_-]+):\\s*(.+)$/i.exec(tail);',
+          '      if (sevNoCode) {',
+          '        out.push({ file: normalizeFile(colon[1]), line: Number(colon[2]), column: colon[3] ? Number(colon[3]) : null, severity: normalizeSeverity(sevNoCode[1]), code: sevNoCode[2], message: sevNoCode[3].trim() });',
+          '        continue;',
+          '      }',
+          '      out.push({ file: normalizeFile(colon[1]), line: Number(colon[2]), column: colon[3] ? Number(colon[3]) : null, severity: /error|fail/i.test(tail) ? "error" : /warn/i.test(tail) ? "warning" : "info", code: null, message: tail });',
+          '      continue;',
+          '    }',
+          '    out.push({ file: null, line: null, column: null, severity: "info", code: null, message: line });',
+          '  }',
+          '  return out;',
+          '}',
+        ].join('\n') + '\n',
+        'src/diagnostics/deduplicator.js': [
+          "import { SEVERITY_ORDER } from '../core/diagnostic-codes.js';",
+          'export function deduplicateDiagnostics(entries = [], { maxItems = 50 } = {}) {',
+          '  const list = Array.isArray(entries) ? entries : [];',
+          '  const map = new Map();',
+          '  for (const raw of list) {',
+          '    if (!raw || typeof raw !== "object") continue;',
+          '    const file = raw.file ? String(raw.file).replaceAll("\\\\", "/").replace(/^\\.\\//, "") : null;',
+          '    const line = Number.isInteger(raw.line) ? raw.line : null;',
+          '    const column = Number.isInteger(raw.column) ? raw.column : null;',
+          '    const severity = raw.severity === "error" || raw.severity === "warning" ? raw.severity : "info";',
+          '    const code = raw.code ? String(raw.code) : null;',
+          '    const message = String(raw.message ?? "").trim();',
+          '    const key = `${file ?? ""}|${line ?? ""}|${code ?? ""}|${message}`;',
+          '    const prev = map.get(key);',
+          '    if (prev) {',
+          '      prev.occurrenceCount += 1;',
+          '      if (line !== null && (prev.firstSeenLine === null || line < prev.firstSeenLine)) {',
+          '        prev.firstSeenLine = line;',
+          '      }',
+          '    } else {',
+          '      map.set(key, { file, line, column, severity, code, message, occurrenceCount: 1, firstSeenLine: line });',
+          '    }',
+          '  }',
+          '  const unique = [...map.values()].sort((a, b) => {',
+          '    const sa = SEVERITY_ORDER[a.severity] ?? 9;',
+          '    const sb = SEVERITY_ORDER[b.severity] ?? 9;',
+          '    if (sa !== sb) return sa - sb;',
+          '    const fa = a.file ?? "\\uffff";',
+          '    const fb = b.file ?? "\\uffff";',
+          '    if (fa !== fb) return fa.localeCompare(fb);',
+          '    const la = a.line ?? Number.MAX_SAFE_INTEGER;',
+          '    const lb = b.line ?? Number.MAX_SAFE_INTEGER;',
+          '    if (la !== lb) return la - lb;',
+          '    return a.message.localeCompare(b.message);',
+          '  });',
+          '  const cap = Number.isInteger(maxItems) && maxItems >= 0 ? maxItems : 50;',
+          '  const items = unique.slice(0, cap);',
+          '  const truncatedCount = Math.max(0, unique.length - items.length);',
+          '  return {',
+          '    items,',
+          '    compression: { totalRaw: list.length, uniqueCount: unique.length, keptCount: items.length, truncatedCount },',
+          '  };',
+          '}',
+        ].join('\n') + '\n',
+        'src/patch/conflict-guard.js': [
+          "import { PATCH_DIAGNOSTIC_CODES, sha256Hex } from '../core/diagnostic-codes.js';",
+          'function normalizeConfinedRelPath(raw) {',
+          '  if (typeof raw !== "string" || !raw.trim()) return null;',
+          '  const p = raw.trim().replaceAll("\\\\", "/");',
+          '  if (p.startsWith("/") || /^[a-zA-Z]:/.test(p)) return null;',
+          '  const segs = p.split("/").filter(Boolean);',
+          '  if (!segs.length || segs.some((s) => s === ".." || s === "." || s === ".git")) return null;',
+          '  return segs.join("/");',
+          '}',
+          'function countLineDiff(before, after) {',
+          '  const a = before === null ? [] : String(before).replace(/\\r\\n/g, "\\n").split("\\n");',
+          '  const b = after === null ? [] : String(after).replace(/\\r\\n/g, "\\n").split("\\n");',
+          '  let prefix = 0;',
+          '  while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;',
+          '  let suffix = 0;',
+          '  while (suffix < a.length - prefix && suffix < b.length - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++;',
+          '  return { deletions: Math.max(0, a.length - prefix - suffix), additions: Math.max(0, b.length - prefix - suffix) };',
+          '}',
+          'export function validatePatchBatch(hunks = [], fileContents = {}) {',
+          '  const list = Array.isArray(hunks) ? hunks : [];',
+          '  const conflicts = [];',
+          '  const staged = [];',
+          '  for (const h of list) {',
+          '    const norm = normalizeConfinedRelPath(h?.path);',
+          '    if (!norm) {',
+          '      return { ok: false, code: PATCH_DIAGNOSTIC_CODES.PATH_CONFINEMENT_ERROR, conflicts: [{ path: String(h?.path ?? ""), reason: "path_confinement_violation" }], appliedFiles: {}, fileSummaries: [] };',
+          '    }',
+          '    const hasBefore = Object.hasOwn(fileContents || {}, norm);',
+          '    const beforeText = hasBefore ? String(fileContents[norm]) : null;',
+          '    const actualSha = beforeText !== null ? sha256Hex(beforeText) : null;',
+          '    if (h.expectedSha256 !== undefined && h.expectedSha256 !== actualSha) {',
+          '      conflicts.push({ path: norm, expectedSha256: h.expectedSha256, actualSha256: actualSha });',
+          '      continue;',
+          '    }',
+          '    const afterText = h.after === null ? null : String(h.after ?? "");',
+          '    const { additions, deletions } = countLineDiff(beforeText, afterText);',
+          '    staged.push({ path: norm, afterText, additions, deletions, sha256After: afterText === null ? null : sha256Hex(afterText) });',
+          '  }',
+          '  if (conflicts.length > 0) {',
+          '    return { ok: false, code: PATCH_DIAGNOSTIC_CODES.OPTIMISTIC_LOCK_CONFLICT, conflicts, appliedFiles: {}, fileSummaries: [] };',
+          '  }',
+          '  const appliedFiles = { ...(fileContents || {}) };',
+          '  const fileSummaries = [];',
+          '  for (const s of staged) {',
+          '    if (s.afterText === null) delete appliedFiles[s.path];',
+          '    else appliedFiles[s.path] = s.afterText;',
+          '    fileSummaries.push({ path: s.path, additions: s.additions, deletions: s.deletions, sha256After: s.sha256After });',
+          '  }',
+          '  return { ok: true, code: PATCH_DIAGNOSTIC_CODES.OK, conflicts: [], appliedFiles, fileSummaries };',
+          '}',
+        ].join('\n') + '\n',
+        'src/pipeline/report-builder.js': [
+          "import { canonicalStringify, sha256Hex } from '../core/diagnostic-codes.js';",
+          "import { parseDiagnosticLines } from '../diagnostics/parser.js';",
+          "import { deduplicateDiagnostics } from '../diagnostics/deduplicator.js';",
+          "import { validatePatchBatch } from '../patch/conflict-guard.js';",
+          'export function buildPatchDiagnosticsReport({ hunks = [], fileContents = {}, rawDiagnostics = "", maxItems = 50 } = {}) {',
+          '  const patch = validatePatchBatch(hunks, fileContents);',
+          '  const parsed = parseDiagnosticLines(rawDiagnostics);',
+          '  const diagnostics = deduplicateDiagnostics(parsed, { maxItems });',
+          '  const ok = Boolean(patch.ok && diagnostics.items.every((d) => d.severity !== "error"));',
+          '  const appliedPaths = patch.fileSummaries.map((f) => f.path).sort();',
+          '  const reportDigest = sha256Hex(canonicalStringify({ ok, patchCode: patch.code, appliedPaths, items: diagnostics.items, compression: diagnostics.compression }));',
+          '  return { ok, patch, diagnostics, reportDigest };',
+          '}',
+        ].join('\n') + '\n',
+      };
+
+    case 'aci-06-swarm-contract-integration':
+      return {
+        'src/contracts/schema-registry.js': [
+          "import { createHash } from 'node:crypto';",
+          'function canonical(v) {',
+          '  if (v === null || typeof v !== "object") return JSON.stringify(v);',
+          '  if (Array.isArray(v)) return "[" + v.map(canonical).join(",") + "]";',
+          '  return "{" + Object.keys(v).filter((k) => v[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}";',
+          '}',
+          'function isConfinedPath(raw) {',
+          '  if (typeof raw !== "string" || !raw.trim()) return false;',
+          '  const p = raw.trim().replaceAll("\\\\", "/");',
+          '  if (p.startsWith("/") || /^[a-zA-Z]:/.test(p)) return false;',
+          '  const segs = p.split("/").filter(Boolean);',
+          '  return segs.length > 0 && !segs.some((s) => s === ".." || s === "." || s === ".git");',
+          '}',
+          'function normRel(raw) {',
+          '  return String(raw || "").trim().replaceAll("\\\\", "/").replace(/^\\.\\//, "").replace(/\\/+$/, "");',
+          '}',
+          'export function computeWorkerOutputDigest(nodeKey, changedFiles = []) {',
+          '  const normFiles = (Array.isArray(changedFiles) ? changedFiles : [])',
+          '    .map((f) => ({ path: normRel(f?.path), content: String(f?.content ?? "") }))',
+          '    .sort((a, b) => a.path.localeCompare(b.path));',
+          '  return createHash("sha256").update(canonical({ nodeKey: String(nodeKey || ""), changedFiles: normFiles }), "utf8").digest("hex");',
+          '}',
+          'export function validateWorkerContractOutput(contract, payload) {',
+          '  if (!payload || typeof payload !== "object") return { ok: false, code: "INVALID_PAYLOAD" };',
+          '  const nodeKey = typeof payload.nodeKey === "string" ? payload.nodeKey.trim() : "";',
+          '  if (!nodeKey) return { ok: false, code: "MISSING_NODE_KEY" };',
+          '  const scopes = Array.isArray(payload.writeScope) ? payload.writeScope.map(normRel).filter(Boolean) : [];',
+          '  if (!scopes.length || !payload.writeScope.every(isConfinedPath)) return { ok: false, code: "INVALID_WRITE_SCOPE" };',
+          '  if (!Array.isArray(payload.changedFiles)) return { ok: false, code: "INVALID_CHANGED_FILES" };',
+          '  for (const f of payload.changedFiles) {',
+          '    if (!isConfinedPath(f?.path)) return { ok: false, code: "PATH_CONFINEMENT_ERROR" };',
+          '    const rel = normRel(f.path);',
+          '    if (!scopes.some((s) => rel === s || rel.startsWith(`${s}/`))) {',
+          '      return { ok: false, code: "WRITE_SCOPE_VIOLATION", path: rel };',
+          '    }',
+          '    if (f.mode && Array.isArray(contract?.allowedModes) && !contract.allowedModes.includes(f.mode)) {',
+          '      return { ok: false, code: "INVALID_FILE_MODE", path: rel };',
+          '    }',
+          '  }',
+          '  const expectedDigest = computeWorkerOutputDigest(nodeKey, payload.changedFiles);',
+          '  if (payload.outputDigest !== expectedDigest) {',
+          '    return { ok: false, code: "CONTRACT_DIGEST_MISMATCH", expectedDigest };',
+          '  }',
+          '  return { ok: true, code: "OK" };',
+          '}',
+        ].join('\n') + '\n',
+        'src/merge/three-way-merger.js': [
+          'function computeEditChunk(baseLines, targetLines) {',
+          '  let start = 0;',
+          '  while (start < baseLines.length && start < targetLines.length && baseLines[start] === targetLines[start]) start++;',
+          '  let endB = baseLines.length;',
+          '  let endT = targetLines.length;',
+          '  while (endB > start && endT > start && baseLines[endB - 1] === targetLines[endT - 1]) {',
+          '    endB--;',
+          '    endT--;',
+          '  }',
+          '  if (start === endB && start === endT) return null;',
+          '  return { start, end: endB, replacement: targetLines.slice(start, endT) };',
+          '}',
+          'export function mergeParallelArtifacts(baseFiles = {}, workerOutputs = []) {',
+          '  const baseMap = new Map();',
+          '  for (const [p, v] of Object.entries(baseFiles || {})) {',
+          '    const content = typeof v === "string" ? v : String(v?.content ?? "");',
+          '    const mode = typeof v === "object" && v?.mode === "0o755" ? "0o755" : "0o644";',
+          '    baseMap.set(p, { content, mode });',
+          '  }',
+          '  const editsByPath = new Map();',
+          '  for (const w of Array.isArray(workerOutputs) ? workerOutputs : []) {',
+          '    const nodeKey = String(w?.nodeKey || "worker");',
+          '    for (const f of w?.changedFiles ?? []) {',
+          '      if (!f?.path) continue;',
+          '      const list = editsByPath.get(f.path) ?? [];',
+          '      list.push({ nodeKey, content: String(f.content ?? ""), mode: f.mode === "0o755" ? "0o755" : "0o644" });',
+          '      editsByPath.set(f.path, list);',
+          '    }',
+          '  }',
+          '  const files = {};',
+          '  for (const [p, entry] of baseMap.entries()) files[p] = { ...entry };',
+          '  const conflicts = [];',
+          '  for (const [path, edits] of editsByPath.entries()) {',
+          '    const base = baseMap.get(path) ?? { content: "", mode: "0o644" };',
+          '    const hasExec = base.mode === "0o755" || edits.some((e) => e.mode === "0o755");',
+          '    const mode = hasExec ? "0o755" : "0o644";',
+          '    if (edits.length === 1) {',
+          '      files[path] = { content: edits[0].content, mode };',
+          '      continue;',
+          '    }',
+          '    const baseLines = base.content === "" ? [] : base.content.replace(/\\r\\n/g, "\\n").split("\\n");',
+          '    const chunks = [];',
+          '    for (const ed of edits) {',
+          '      const targetLines = ed.content === "" ? [] : ed.content.replace(/\\r\\n/g, "\\n").split("\\n");',
+          '      const chunk = computeEditChunk(baseLines, targetLines);',
+          '      if (chunk) chunks.push({ ...chunk, nodeKey: ed.nodeKey, lines: targetLines });',
+          '    }',
+          '    if (chunks.length === 0) {',
+          '      files[path] = { content: base.content, mode };',
+          '      continue;',
+          '    }',
+          '    chunks.sort((a, b) => a.start - b.start || a.end - b.end);',
+          '    const outLines = [];',
+          '    let cursor = 0;',
+          '    let hadConflict = false;',
+          '    for (let i = 0; i < chunks.length; i++) {',
+          '      const cur = chunks[i];',
+          '      const nxt = chunks[i + 1];',
+          '      const overlaps = nxt && (nxt.start < cur.end || (nxt.start === cur.start && nxt.end === cur.end));',
+          '      if (overlaps) {',
+          '        const same = JSON.stringify(cur.replacement) === JSON.stringify(nxt.replacement);',
+          '        while (cursor < cur.start) outLines.push(baseLines[cursor++]);',
+          '        if (same) {',
+          '          outLines.push(...cur.replacement);',
+          '          cursor = Math.max(cur.end, nxt.end);',
+          '        } else {',
+          '          hadConflict = true;',
+          '          conflicts.push({ path, nodeKeys: [cur.nodeKey, nxt.nodeKey], reason: "overlapping_hunk_conflict" });',
+          '          outLines.push(`<<<<<<< ${cur.nodeKey}`, ...cur.replacement, "=======", ...nxt.replacement, `>>>>>>> ${nxt.nodeKey}`);',
+          '          cursor = Math.max(cur.end, nxt.end);',
+          '        }',
+          '        i++;',
+          '        continue;',
+          '      }',
+          '      while (cursor < cur.start) outLines.push(baseLines[cursor++]);',
+          '      outLines.push(...cur.replacement);',
+          '      cursor = cur.end;',
+          '    }',
+          '    while (cursor < baseLines.length) outLines.push(baseLines[cursor++]);',
+          '    const mergedText = outLines.join("\\n");',
+          '    files[path] = { content: base.content.endsWith("\\n") && !mergedText.endsWith("\\n") && !hadConflict ? `${mergedText}\\n` : mergedText, mode };',
+          '  }',
+          '  return { files, conflicts };',
+          '}',
+        ].join('\n') + '\n',
+        'src/gates/reviewer-gate.js': [
+          'export function evaluateReviewerHardGate({ claimedVerdict = "fail", gitDiffFiles = [], testExitCode = null, mergeConflicts = [] } = {}) {',
+          '  const diffs = Array.isArray(gitDiffFiles) ? gitDiffFiles.filter(Boolean) : [];',
+          '  const conflicts = Array.isArray(mergeConflicts) ? mergeConflicts : [];',
+          '  const reasons = [];',
+          '  if (diffs.length === 0) reasons.push("NO_VERIFIED_GIT_DIFF");',
+          '  if (testExitCode !== 0) reasons.push("TEST_EXECUTION_FAILED");',
+          '  if (conflicts.length > 0) reasons.push("UNRESOLVED_MERGE_CONFLICTS");',
+          '  const hardGatePassed = reasons.length === 0 && claimedVerdict === "pass";',
+          '  return {',
+          '    verifiedGitDiff: diffs.length > 0,',
+          '    diffFileCount: diffs.length,',
+          '    verifiedTestExitCode: testExitCode,',
+          '    hardGatePassed,',
+          '    verdict: hardGatePassed ? "pass" : "fail",',
+          '    reasons,',
+          '  };',
+          '}',
+        ].join('\n') + '\n',
+        'src/coordinator/integration-runner.js': [
+          "import { createHash } from 'node:crypto';",
+          "import { validateWorkerContractOutput } from '../contracts/schema-registry.js';",
+          "import { mergeParallelArtifacts } from '../merge/three-way-merger.js';",
+          "import { evaluateReviewerHardGate } from '../gates/reviewer-gate.js';",
+          'const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);',
+          'function canonical(v) {',
+          '  if (v === null || typeof v !== "object") return JSON.stringify(v);',
+          '  if (Array.isArray(v)) return "[" + v.map(canonical).join(",") + "]";',
+          '  return "{" + Object.keys(v).filter((k) => v[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}";',
+          '}',
+          'export function transitionTerminalState(currentState, nextState) {',
+          '  if (TERMINAL_STATES.has(currentState)) {',
+          '    return { ok: false, state: currentState, overwritten: false };',
+          '  }',
+          '  return { ok: true, state: nextState, overwritten: false };',
+          '}',
+          'export function runContractIntegration({ contract, baseFiles = {}, workerOutputs = [], claimedVerdict = "pass", testExitCode = 0 } = {}) {',
+          '  const validationErrors = [];',
+          '  for (const w of Array.isArray(workerOutputs) ? workerOutputs : []) {',
+          '    const check = validateWorkerContractOutput(contract, w);',
+          '    if (!check.ok) validationErrors.push(check);',
+          '  }',
+          '  const merged = mergeParallelArtifacts(baseFiles, workerOutputs);',
+          '  const changedPaths = [];',
+          '  for (const [p, entry] of Object.entries(merged.files)) {',
+          '    const baseEntry = baseFiles[p];',
+          '    const baseText = typeof baseEntry === "string" ? baseEntry : baseEntry?.content;',
+          '    if (baseText !== entry.content) changedPaths.push(p);',
+          '  }',
+          '  const reviewerVerification = evaluateReviewerHardGate({ claimedVerdict, gitDiffFiles: changedPaths, testExitCode, mergeConflicts: merged.conflicts });',
+          '  const ok = validationErrors.length === 0 && reviewerVerification.hardGatePassed;',
+          '  const integrationDigest = createHash("sha256").update(canonical({ ok, validationErrors, files: merged.files, conflicts: merged.conflicts, reviewerVerification }), "utf8").digest("hex");',
+          '  return { ok, validationErrors, merged, reviewerVerification, integrationDigest };',
+          '}',
+        ].join('\n') + '\n',
+      };
+
     default:
       throw new Error(`Unknown ACI governance taskId: ${taskId}`);
   }
@@ -2989,7 +4149,7 @@ export function buildAciGovernanceEvidenceOutput(task, changedFiles = null, over
 // 9 Governance Metrics Engine (Post-Hoc Ground Truth Scoring Only)
 // ---------------------------------------------------------------------------
 
-const TASK_BY_ID = new Map(RAW_ACI_TASKS.map((t) => [t.id, t]));
+const TASK_BY_ID = new Map(RAW_ACI_25_TASKS.map((t) => [t.id, t]));
 
 export function resolveAciTaskGroundTruth(taskOrId) {
   const id = typeof taskOrId === 'string' ? taskOrId : taskOrId?.id ?? taskOrId?.taskId;
@@ -3157,6 +4317,41 @@ function synthesizeAdmissionsFromTrial(trial, ledger, taskId) {
   return out;
 }
 
+function inferArmFromProfile(rawProfile) {
+  const p = String(rawProfile ?? '').trim();
+  if (!p) return null;
+  if (p === 'aci_25' || p === 'full_aci') return 'D';
+  if (p === 'retrieval_supervisor') return 'C';
+  if (p === 'deterministic_progressive') return 'B';
+  if (p === 'raw_full') return 'A';
+  return null;
+}
+
+/**
+ * Computes the Wilson score 95% (or custom z) binomial confidence interval.
+ */
+export function computeWilson95CI(successes, total, z = 1.96) {
+  const n = Number(total);
+  if (!Number.isFinite(n) || n <= 0) {
+    return { rate: 0, lower: 0, upper: 0, ci95HalfWidth: 0 };
+  }
+  const s = Math.max(0, Math.min(n, Number(successes) || 0));
+  const zVal = Number.isFinite(Number(z)) && Number(z) > 0 ? Number(z) : 1.96;
+  const p = s / n;
+  const z2 = zVal * zVal;
+  const denom = 1 + z2 / n;
+  const center = (p + z2 / (2 * n)) / denom;
+  const margin = (zVal * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n))) / denom;
+  const lower = round4(Math.max(0, center - margin));
+  const upper = round4(Math.min(1, center + margin));
+  return {
+    rate: round4(p),
+    lower,
+    upper,
+    ci95HalfWidth: round4((upper - lower) / 2),
+  };
+}
+
 function normalizeGovernanceTrial(raw) {
   const trial = raw && typeof raw === 'object' ? raw : {};
   const ev = trial?.judge?.evidence ?? trial?.evidence ?? {};
@@ -3164,7 +4359,15 @@ function normalizeGovernanceTrial(raw) {
   const aciMetrics = trial?.aciMetrics ?? rm?.aciMetrics ?? {};
   const ledger = trial?.ledger ?? aciMetrics?.ledger ?? null;
   const taskId = String(trial.taskId ?? ev?.taskId ?? 'unknown');
-  const arm = String(trial.arm ?? 'A').trim().toUpperCase() || 'A';
+  const rawProfile = trial.aciProfile ?? aciMetrics?.aciProfile ?? null;
+  const arm =
+    String(trial.arm ?? inferArmFromProfile(rawProfile) ?? 'A')
+      .trim()
+      .toUpperCase() || 'A';
+  const explicitRep =
+    trial.rep !== undefined && trial.rep !== null && Number.isInteger(Number(trial.rep))
+      ? Number(trial.rep)
+      : null;
 
   const passed = Boolean(
     trial.passed === true &&
@@ -3349,7 +4552,8 @@ function normalizeGovernanceTrial(raw) {
   return {
     taskId,
     arm,
-    aciProfile: trial.aciProfile ?? aciMetrics?.aciProfile ?? ACI_ARM_PROFILES[arm]?.aciProfile ?? null,
+    rep: explicitRep,
+    aciProfile: rawProfile ? normalizeAciProfileName(rawProfile) : ACI_ARM_PROFILES[arm]?.aciProfile ?? null,
     status,
     passed,
     criticalContextRecall: activeRecall,
@@ -3380,10 +4584,64 @@ function normalizeGovernanceTrial(raw) {
   };
 }
 
-function aggregateArmMetrics(armTrials, baselineMeanTokens = null) {
+function assignPairingKeys(normalizedTrials) {
+  const seqCounters = new Map();
+  return normalizedTrials.map((t) => {
+    let pairRep = t.rep;
+    if (pairRep === null || pairRep === undefined) {
+      const k = `${t.arm}::${t.taskId}`;
+      pairRep = seqCounters.get(k) ?? 0;
+      seqCounters.set(k, pairRep + 1);
+    }
+    return {
+      ...t,
+      rep: pairRep,
+      _pairKey: `${t.taskId}::${pairRep}`,
+    };
+  });
+}
+
+function computePairedPassTokenStats(armTrials, baselinePassedByPairKey, isBaselineArm) {
+  if (isBaselineArm) {
+    const passedCount = armTrials.filter((t) => t.passed).length;
+    return {
+      pairedPassCount: passedCount,
+      pairedPassTokenReduction: passedCount > 0 ? 0 : null,
+    };
+  }
+  if (!baselinePassedByPairKey || baselinePassedByPairKey.size === 0) {
+    return { pairedPassCount: 0, pairedPassTokenReduction: null };
+  }
+  let baseSum = 0;
+  let armSum = 0;
+  let pairedPassCount = 0;
+  for (const t of armTrials) {
+    if (!t.passed) continue;
+    const baseTokens = baselinePassedByPairKey.get(t._pairKey);
+    if (baseTokens === undefined) continue;
+    baseSum += baseTokens;
+    armSum += t.tokenCost;
+    pairedPassCount += 1;
+  }
+  if (pairedPassCount === 0 || baseSum <= 0) {
+    return { pairedPassCount: 0, pairedPassTokenReduction: null };
+  }
+  return {
+    pairedPassCount,
+    pairedPassTokenReduction: round4((baseSum - armSum) / baseSum),
+  };
+}
+
+function aggregateArmMetrics(
+  armTrials,
+  baselineMeanTokens = null,
+  { baselinePassedByPairKey = null, isBaselineArm = false } = {},
+) {
   const totalTrials = armTrials.length;
-  const passedTrials = armTrials.filter((t) => t.passed).length;
+  const passedList = armTrials.filter((t) => t.passed);
+  const passedTrials = passedList.length;
   const failedTrials = totalTrials - passedTrials;
+  const passRateCI = computeWilson95CI(passedTrials, totalTrials);
 
   const meanActiveRecall = totalTrials
     ? round4(armTrials.reduce((s, t) => s + t.criticalContextRecall, 0) / totalTrials)
@@ -3420,11 +4678,21 @@ function aggregateArmMetrics(armTrials, baselineMeanTokens = null) {
   const totalCacheWriteTokens = armTrials.reduce((s, t) => s + t.tokens.cacheWriteTokens, 0);
   const totalEligibleInputTokens = armTrials.reduce((s, t) => s + t.eligibleInputTokens, 0);
   const meanTokens = totalTrials ? Math.round(totalTokens / totalTrials) : 0;
+  const tokensPerCompletedPass = passedTrials > 0 ? Math.round(totalTokens / passedTrials) : null;
+  const meanTokensOnPassedTrials =
+    passedTrials > 0
+      ? Math.round(passedList.reduce((s, t) => s + t.tokenCost, 0) / passedTrials)
+      : null;
 
   const tokenReduction =
     baselineMeanTokens && baselineMeanTokens > 0
       ? round4((baselineMeanTokens - meanTokens) / baselineMeanTokens)
       : 0;
+  const { pairedPassCount, pairedPassTokenReduction } = computePairedPassTokenStats(
+    armTrials,
+    baselinePassedByPairKey,
+    isBaselineArm,
+  );
 
   const overallCacheHitRate =
     totalEligibleInputTokens > 0 && totalCacheReadTokens > 0
@@ -3482,12 +4750,17 @@ function aggregateArmMetrics(armTrials, baselineMeanTokens = null) {
     totalTrials,
     passedTrials,
     failedTrials,
+    passRateCI,
     // Exact 9 Governance Metrics:
     criticalContextRecall: meanActiveRecall,
     contextPrecision: meanContextPrecision,
     falseNegativeRate: round4(1 - meanActiveRecall),
     usefulTokenRatio,
     tokenReduction,
+    tokensPerCompletedPass,
+    meanTokensOnPassedTrials,
+    pairedPassTokenReduction,
+    pairedPassCount,
     cacheHitRate: overallCacheHitRate,
     supervisorCost,
     recoverySuccessRate,
@@ -3541,16 +4814,17 @@ function aggregateArmMetrics(armTrials, baselineMeanTokens = null) {
 }
 
 /**
- * Computes all 9 ACI Governance Metrics per arm and per task while retaining
- * 100% of failed, timed-out, and cancelled trials.
+ * Computes all 9 ACI Governance Metrics (plus Wilson 95% CI & success-normalized
+ * token efficiency metrics) per arm and per task while retaining 100% of
+ * failed, timed-out, and cancelled trials.
  */
 export function computeAciGovernanceMetrics(trials = [], { baselineArm = 'A' } = {}) {
   const rawList = Array.isArray(trials) ? trials : [];
-  const normalized = rawList.map(normalizeGovernanceTrial);
+  const normalizedWithPairs = assignPairingKeys(rawList.map(normalizeGovernanceTrial));
   const normBaseArm = String(baselineArm || 'A').trim().toUpperCase() || 'A';
 
   const armOrder = ['A', 'B', 'C', 'D'];
-  const presentArms = [...new Set(normalized.map((t) => t.arm))];
+  const presentArms = [...new Set(normalizedWithPairs.map((t) => t.arm))];
   presentArms.sort((a, b) => {
     const ia = armOrder.indexOf(a);
     const ib = armOrder.indexOf(b);
@@ -3560,40 +4834,56 @@ export function computeAciGovernanceMetrics(trials = [], { baselineArm = 'A' } =
     return a.localeCompare(b);
   });
 
-  const baseTrials = normalized.filter((t) => t.arm === normBaseArm);
+  const baseTrials = normalizedWithPairs.filter((t) => t.arm === normBaseArm);
   const baseMeanTokens = baseTrials.length
     ? Math.round(baseTrials.reduce((s, t) => s + t.tokenCost, 0) / baseTrials.length)
     : null;
+  const baselinePassedByPairKey = new Map();
+  for (const bt of baseTrials) {
+    if (bt.passed) baselinePassedByPairKey.set(bt._pairKey, bt.tokenCost);
+  }
 
   const byArm = {};
   for (const arm of presentArms) {
-    const armTrials = normalized.filter((t) => t.arm === arm);
+    const armTrials = normalizedWithPairs.filter((t) => t.arm === arm);
+    const isBase = arm === normBaseArm;
     byArm[arm] = {
       arm,
-      ...aggregateArmMetrics(armTrials, arm === normBaseArm ? null : baseMeanTokens),
+      ...aggregateArmMetrics(armTrials, isBase ? null : baseMeanTokens, {
+        baselinePassedByPairKey,
+        isBaselineArm: isBase,
+      }),
     };
-    if (arm === normBaseArm) {
+    if (isBase) {
       byArm[arm].tokenReduction = 0;
     }
   }
 
-  const taskIds = [...new Set(normalized.map((t) => t.taskId))];
+  const taskIds = [...new Set(normalizedWithPairs.map((t) => t.taskId))];
   const byTask = {};
   for (const taskId of taskIds) {
-    const taskTrials = normalized.filter((t) => t.taskId === taskId);
+    const taskTrials = normalizedWithPairs.filter((t) => t.taskId === taskId);
     const taskBaseTrials = taskTrials.filter((t) => t.arm === normBaseArm);
     const taskBaseMean = taskBaseTrials.length
       ? Math.round(taskBaseTrials.reduce((s, t) => s + t.tokenCost, 0) / taskBaseTrials.length)
       : null;
+    const taskBasePassedByPairKey = new Map();
+    for (const bt of taskBaseTrials) {
+      if (bt.passed) taskBasePassedByPairKey.set(bt._pairKey, bt.tokenCost);
+    }
     const taskByArm = {};
     for (const arm of presentArms) {
       const sub = taskTrials.filter((t) => t.arm === arm);
       if (!sub.length) continue;
+      const isBase = arm === normBaseArm;
       taskByArm[arm] = {
         arm,
-        ...aggregateArmMetrics(sub, arm === normBaseArm ? null : taskBaseMean),
+        ...aggregateArmMetrics(sub, isBase ? null : taskBaseMean, {
+          baselinePassedByPairKey: taskBasePassedByPairKey,
+          isBaselineArm: isBase,
+        }),
       };
-      if (arm === normBaseArm) taskByArm[arm].tokenReduction = 0;
+      if (isBase) taskByArm[arm].tokenReduction = 0;
     }
     byTask[taskId] = {
       taskId,
@@ -3603,8 +4893,9 @@ export function computeAciGovernanceMetrics(trials = [], { baselineArm = 'A' } =
     };
   }
 
-  const totalTrials = normalized.length;
-  const passedTrials = normalized.filter((t) => t.passed).length;
+  const totalTrials = normalizedWithPairs.length;
+  const passedTrials = normalizedWithPairs.filter((t) => t.passed).length;
+  const cleanTrials = normalizedWithPairs.map(({ _pairKey, ...rest }) => rest);
 
   return {
     benchmarkId: ACI_GOVERNANCE_BENCHMARK_ID,
@@ -3616,6 +4907,166 @@ export function computeAciGovernanceMetrics(trials = [], { baselineArm = 'A' } =
     arms: presentArms,
     byArm,
     byTask,
-    trials: normalized,
+    trials: cleanTrials,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Paper Table Exporters (Markdown & LaTeX)
+// ---------------------------------------------------------------------------
+
+function resolveMetricsRoot(summaryOrMetrics) {
+  if (!summaryOrMetrics || typeof summaryOrMetrics !== 'object') {
+    return { metrics: { arms: [], byArm: {}, byTask: {}, baselineArm: 'A' }, armProfiles: {} };
+  }
+  const metrics = summaryOrMetrics.metrics ?? summaryOrMetrics;
+  const armProfiles = summaryOrMetrics.armProfiles ?? {};
+  return {
+    benchmarkId: summaryOrMetrics.benchmarkId ?? metrics.benchmarkId ?? ACI_GOVERNANCE_BENCHMARK_ID,
+    mode: summaryOrMetrics.mode ?? 'unknown',
+    suite: summaryOrMetrics.suite ?? 'aci',
+    sandboxBackend: summaryOrMetrics.sandboxBackend ?? 'unknown',
+    metrics,
+    armProfiles,
+  };
+}
+
+function fmtPct(ratio, digits = 1) {
+  if (ratio === null || ratio === undefined || !Number.isFinite(Number(ratio))) return 'N/A';
+  return `${(Number(ratio) * 100).toFixed(digits)}%`;
+}
+
+function fmtInt(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'N/A';
+  return Math.round(Number(value)).toLocaleString('en-US');
+}
+
+function fmtCI(ci) {
+  if (!ci || !Number.isFinite(Number(ci.rate))) return 'N/A';
+  return `${fmtPct(ci.rate)} [${fmtPct(ci.lower)}, ${fmtPct(ci.upper)}]`;
+}
+
+function resolveArmDisplayProfile(arm, armMetrics, armProfiles) {
+  const fromProfiles = armProfiles?.[arm]?.aciProfile;
+  if (fromProfiles) return fromProfiles;
+  if (armMetrics?.aciProfile) return armMetrics.aciProfile;
+  return ACI_ARM_PROFILES[arm]?.aciProfile ?? arm;
+}
+
+function escapeLatex(text) {
+  return String(text ?? '')
+    .replaceAll('\\', '\\textbackslash{}')
+    .replaceAll('&', '\\&')
+    .replaceAll('%', '\\%')
+    .replaceAll('$', '\\$')
+    .replaceAll('#', '\\#')
+    .replaceAll('_', '\\_')
+    .replaceAll('{', '\\{')
+    .replaceAll('}', '\\}');
+}
+
+/**
+ * Formats benchmark summary/metrics into Markdown tables ready for paper/report inclusion.
+ */
+export function exportPaperTablesMarkdown(summary) {
+  const ctx = resolveMetricsRoot(summary);
+  const m = ctx.metrics ?? {};
+  const arms = Array.isArray(m.arms) ? m.arms : Object.keys(m.byArm ?? {});
+  const byArm = m.byArm ?? {};
+  const byTask = m.byTask ?? {};
+
+  const lines = [
+    `## ACI Governance Benchmark Summary (${ctx.benchmarkId}, suite=${ctx.suite}, mode=${ctx.mode}, sandbox=${ctx.sandboxBackend})`,
+    '',
+    '### Table 1: Overall Arm Comparison & Success-Normalized Efficiency',
+    '',
+    '| Arm | Profile | Pass (n/N) | Pass Rate (Wilson 95% CI) | Recall | Precision | Useful Tok | Mean Tok | Tok/Pass | Mean Passed Tok | Paired-Pass Tok Red | Cache Hit | Sup Tok | Recovery |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  ];
+
+  for (const arm of arms) {
+    const a = byArm[arm];
+    if (!a) continue;
+    const prof = resolveArmDisplayProfile(arm, a, ctx.armProfiles);
+    const ci = a.passRateCI ?? computeWilson95CI(a.passedTrials, a.totalTrials);
+    const pairedStr =
+      a.pairedPassTokenReduction === null || a.pairedPassTokenReduction === undefined
+        ? 'N/A'
+        : `${fmtPct(a.pairedPassTokenReduction)} (n=${a.pairedPassCount ?? 0})`;
+    lines.push(
+      `| ${arm} | \`${prof}\` | ${a.passedTrials}/${a.totalTrials} | ${fmtCI(ci)} | ${fmtPct(a.criticalContextRecall)} | ${fmtPct(a.contextPrecision)} | ${fmtPct(a.usefulTokenRatio)} | ${fmtInt(a.tokenBreakdown?.meanTokens)} | ${fmtInt(a.tokensPerCompletedPass)} | ${fmtInt(a.meanTokensOnPassedTrials)} | ${pairedStr} | ${fmtPct(a.cacheHitRate)} | ${fmtInt(a.supervisorCost?.totalTokens)} | ${fmtPct(a.recoverySuccessRate)} |`,
+    );
+  }
+
+  const taskIds = Object.keys(byTask);
+  if (taskIds.length > 0) {
+    lines.push(
+      '',
+      '### Table 2: Per-Task Breakdown',
+      '',
+      '| Task | Arm | Pass (n/N) | Mean Tok | Paired-Pass Tok Red | Recall | Precision | Cache Hit |',
+      '| --- | --- | --- | --- | --- | --- | --- | --- |',
+    );
+    for (const taskId of taskIds) {
+      const tEntry = byTask[taskId];
+      for (const arm of arms) {
+        const ta = tEntry?.byArm?.[arm];
+        if (!ta) continue;
+        const pairedStr =
+          ta.pairedPassTokenReduction === null || ta.pairedPassTokenReduction === undefined
+            ? 'N/A'
+            : `${fmtPct(ta.pairedPassTokenReduction)} (n=${ta.pairedPassCount ?? 0})`;
+        lines.push(
+          `| \`${taskId}\` | ${arm} | ${ta.passedTrials}/${ta.totalTrials} | ${fmtInt(ta.tokenBreakdown?.meanTokens)} | ${pairedStr} | ${fmtPct(ta.criticalContextRecall)} | ${fmtPct(ta.contextPrecision)} | ${fmtPct(ta.cacheHitRate)} |`,
+        );
+      }
+    }
+  }
+
+  return lines.join('\n') + '\n';
+}
+
+/**
+ * Formats benchmark summary/metrics into LaTeX booktabs tables ready for paper inclusion.
+ */
+export function exportPaperTablesLatex(summary) {
+  const ctx = resolveMetricsRoot(summary);
+  const m = ctx.metrics ?? {};
+  const arms = Array.isArray(m.arms) ? m.arms : Object.keys(m.byArm ?? {});
+  const byArm = m.byArm ?? {};
+
+  const lines = [
+    '% Auto-generated by Agent_US ACI Governance Evaluator',
+    '\\begin{table}[htbp]',
+    '\\centering',
+    `\\caption{ACI Governance Comparison (${escapeLatex(ctx.benchmarkId)}, suite=${escapeLatex(ctx.suite)})}`,
+    '\\label{tab:aci-governance-comparison}',
+    '\\begin{tabular}{llrrrrrrr}',
+    '\\toprule',
+    'Arm & Profile & Pass & Pass Rate (Wilson 95\\% CI) & Recall & Precision & Mean Tok & Tok/Pass & Paired-Pass Red \\\\',
+    '\\midrule',
+  ];
+
+  for (const arm of arms) {
+    const a = byArm[arm];
+    if (!a) continue;
+    const prof = resolveArmDisplayProfile(arm, a, ctx.armProfiles);
+    const ci = a.passRateCI ?? computeWilson95CI(a.passedTrials, a.totalTrials);
+    const ciStr = `${fmtPct(ci.rate)} [${fmtPct(ci.lower)}, ${fmtPct(ci.upper)}]`;
+    const pairedStr =
+      a.pairedPassTokenReduction === null || a.pairedPassTokenReduction === undefined
+        ? '--'
+        : `${fmtPct(a.pairedPassTokenReduction)} (n=${a.pairedPassCount ?? 0})`;
+    lines.push(
+      `${escapeLatex(arm)} & \\texttt{${escapeLatex(prof)}} & ${a.passedTrials}/${a.totalTrials} & ${escapeLatex(ciStr)} & ${escapeLatex(fmtPct(a.criticalContextRecall))} & ${escapeLatex(fmtPct(a.contextPrecision))} & ${escapeLatex(fmtInt(a.tokenBreakdown?.meanTokens))} & ${escapeLatex(fmtInt(a.tokensPerCompletedPass))} & ${escapeLatex(pairedStr)} \\\\`,
+    );
+  }
+
+  lines.push(
+    '\\bottomrule',
+    '\\end{tabular}',
+    '\\end{table}',
+  );
+
+  return lines.join('\n') + '\n';
 }

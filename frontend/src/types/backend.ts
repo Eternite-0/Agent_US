@@ -194,6 +194,24 @@ export interface FileChangeDelta {
   path: string;
   before: string | null; // base64 or null
   after: string | null; // base64 or null
+  action?: 'create' | 'update' | 'delete' | string;
+  unifiedDiff?: string;
+  additions?: number;
+  deletions?: number;
+  sha256After?: string | null;
+}
+
+export interface AciBudgetWatermarks {
+  usedTokens?: number;
+  maxTokens?: number;
+  utilizationRatio?: number;
+  reserveTokens?: number;
+  postTestReserveActive?: boolean;
+  dtocWatermark?: number;
+  dtocMinPromptTokens?: number;
+  dtocPolicy?: string | null;
+  supervisorCircuitOpen?: boolean;
+  circuitOpenUntil?: number | null;
 }
 
 export interface Evidence extends Entity {
@@ -805,6 +823,16 @@ export interface SwarmReviewerFinding {
   evidenceRef?: string;
 }
 
+export interface SwarmReviewerVerification {
+  verifiedGitDiff: boolean;
+  diffFileCount: number;
+  diffDigest?: string | null;
+  verifiedTestExitCode: number | null;
+  hardGatePassed: boolean;
+  verdict?: string;
+  reasons?: string[];
+}
+
 export interface SwarmReviewerVerdict {
   nodeKey: string;
   nodeStatus?: string;
@@ -814,6 +842,7 @@ export interface SwarmReviewerVerdict {
   checkedArtifacts?: string[];
   evidenceRefs?: string[];
   findings?: SwarmReviewerFinding[];
+  reviewerVerification?: SwarmReviewerVerification | null;
   validatedAt?: number;
 }
 
@@ -835,6 +864,7 @@ export interface SwarmRunVerdict {
   verificationMode?: string;
   evidenceCount?: number;
   reviewerVerdicts?: SwarmReviewerVerdict[];
+  reviewerVerification?: SwarmReviewerVerification | null;
   independentReviewerVerdict?: {
     status: string;
     source?: string;
@@ -890,6 +920,7 @@ export interface SwarmDeliveryRecord {
   unifiedDiffPreview?: string;
   testResults?: SwarmDeliveryTestResult[];
   reviewerVerdicts?: SwarmReviewerVerdict[];
+  reviewerVerification?: SwarmReviewerVerification | null;
   verdict?: SwarmRunVerdict | null;
   usage?: SwarmUsageSummary & Record<string, unknown>;
   artifacts?: SwarmArtifactRecord[];
@@ -919,6 +950,7 @@ export interface SwarmRunRecord {
   repoContext?: SwarmRepoContext | null;
   strategy?: Record<string, unknown>;
   usage: SwarmUsageSummary & Record<string, unknown>;
+  reviewerVerification?: SwarmReviewerVerification | null;
   verdict?: SwarmRunVerdict | null;
   nodes: SwarmNodeRecord[];
   createdAt: number;

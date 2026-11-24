@@ -3,6 +3,7 @@ import { swarmAttachmentError } from '../utils/swarmCommand.ts';
 import { swarmWorkerStatus } from '../utils/subagentProgress.ts';
 import type {
   AccountBalance,
+  AciBudgetWatermarks,
   Approval,
   Artifact,
   Assignment,
@@ -54,6 +55,7 @@ import type {
   SwarmReplanRecord,
   SwarmRepoContext,
   SwarmReviewerVerdict,
+  SwarmReviewerVerification,
   McpServerStatus,
   WorkspaceEntryKind,
   SwarmRunRecord,
@@ -108,6 +110,7 @@ export interface ContextSupervisorConfig {
   timeoutMs: number;
   admissionEnabled?: boolean;
   dtocMinPromptTokens?: number;
+  circuitTimeoutMs?: number;
 }
 
 export interface ContextSupervisorCandidate {
@@ -140,6 +143,10 @@ export interface ContextSupervisorStatus {
   reversibleStore: boolean;
   candidates: ContextSupervisorCandidate[];
   guidelinesCount: number;
+  supervisorCircuitOpen?: boolean;
+  circuitOpen?: boolean;
+  timeoutStreak?: number;
+  budgetWatermarks?: AciBudgetWatermarks | null;
 }
 
 export type ContextSupervisorUpdate = Partial<
@@ -1820,10 +1827,16 @@ export class LiveBackendClient implements AgentBackendClient {
           path: p.path,
           before: typeof p.before === 'string' ? p.before : null,
           after: typeof p.after === 'string' ? p.after : null,
+          ...(typeof p.action === 'string' ? { action: p.action } : {}),
+          ...(typeof p.unifiedDiff === 'string' ? { unifiedDiff: p.unifiedDiff } : {}),
+          ...(typeof p.additions === 'number' ? { additions: p.additions } : {}),
+          ...(typeof p.deletions === 'number' ? { deletions: p.deletions } : {}),
+          ...(typeof p.sha256After === 'string' ? { sha256After: p.sha256After } : {}),
         });
       } else if (ev.type === 'tool/result') {
         const toolName = String(p.name ?? 'tool');
-        const isEdit = toolName === 'edit_file' || toolName === 'write_file';
+        const isEdit =
+          toolName === 'edit_file' || toolName === 'write_file' || toolName === 'apply_patch';
         const changes = isEdit && pendingChanges.length ? pendingChanges.splice(0) : undefined;
         evidence.push({
           id: String(p.callId || `ev-${ev.seq}`),
@@ -2161,11 +2174,47 @@ export function normalizeSwarmRepoContext(raw: unknown): SwarmRepoContext | null
   };
 }
 
+export function normalizeSwarmReviewerVerification(raw: unknown): SwarmReviewerVerification | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const hasAny =
+    typeof r.verifiedGitDiff === 'boolean' ||
+    typeof r.diffFileCount === 'number' ||
+    'verifiedTestExitCode' in r ||
+    typeof r.hardGatePassed === 'boolean';
+  if (!hasAny) return null;
+  const exitCode =
+    r.verifiedTestExitCode === null || r.verifiedTestExitCode === undefined
+      ? null
+      : finiteNumber(r.verifiedTestExitCode) ?? null;
+  return {
+    verifiedGitDiff: Boolean(r.verifiedGitDiff),
+    diffFileCount: finiteNumber(r.diffFileCount) ?? 0,
+    diffDigest: typeof r.diffDigest === 'string' ? r.diffDigest : null,
+    verifiedTestExitCode: exitCode,
+    hardGatePassed: Boolean(r.hardGatePassed),
+    verdict: typeof r.verdict === 'string' ? r.verdict : undefined,
+    reasons: Array.isArray(r.reasons) ? stringList(r.reasons) : undefined,
+  };
+}
+
 export function normalizeSwarmDelivery(
   raw: Partial<SwarmDeliveryRecord> | null | undefined,
   fallbackRunId = '',
 ): SwarmDeliveryRecord {
   const record = raw && typeof raw === 'object' ? raw : {};
+  const verdict = record.verdict
+    ? {
+        ...record.verdict,
+        ...(normalizeSwarmReviewerVerification(record.verdict.reviewerVerification)
+          ? { reviewerVerification: normalizeSwarmReviewerVerification(record.verdict.reviewerVerification) }
+          : {}),
+      }
+    : null;
+  const reviewerVerification =
+    normalizeSwarmReviewerVerification(record.reviewerVerification) ??
+    verdict?.reviewerVerification ??
+    null;
   return {
     runId: String(record.runId ?? fallbackRunId),
     teamRationale: typeof record.teamRationale === 'string' ? record.teamRationale.trim() : undefined,
@@ -2179,7 +2228,8 @@ export function normalizeSwarmDelivery(
     unifiedDiffPreview: typeof record.unifiedDiffPreview === 'string' ? record.unifiedDiffPreview : '',
     testResults: Array.isArray(record.testResults) ? record.testResults : [],
     reviewerVerdicts: Array.isArray(record.reviewerVerdicts) ? record.reviewerVerdicts : [],
-    verdict: record.verdict ?? null,
+    ...(reviewerVerification ? { reviewerVerification } : {}),
+    verdict,
     usage: record.usage && typeof record.usage === 'object' ? record.usage : {},
     artifacts: Array.isArray(record.artifacts) ? record.artifacts : [],
   };
@@ -2333,6 +2383,25 @@ export function collectSwarmReviewerVerdicts(
   const fromDelivery = delivery?.reviewerVerdicts ?? delivery?.verdict?.reviewerVerdicts;
   const list = Array.isArray(fromRun) && fromRun.length > 0 ? fromRun : Array.isArray(fromDelivery) ? fromDelivery : [];
   return list.filter((item): item is SwarmReviewerVerdict => Boolean(item && typeof item === 'object'));
+}
+
+export function collectSwarmReviewerVerification(
+  run: Partial<SwarmRunRecord> | null | undefined,
+  delivery?: Partial<SwarmDeliveryRecord> | null,
+): SwarmReviewerVerification | null {
+  const fromDelivery =
+    normalizeSwarmReviewerVerification(delivery?.reviewerVerification) ??
+    normalizeSwarmReviewerVerification(delivery?.verdict?.reviewerVerification);
+  if (fromDelivery) return fromDelivery;
+  const fromRun =
+    normalizeSwarmReviewerVerification(run?.reviewerVerification) ??
+    normalizeSwarmReviewerVerification(run?.verdict?.reviewerVerification);
+  if (fromRun) return fromRun;
+  for (const rv of collectSwarmReviewerVerdicts(run, delivery)) {
+    const normalized = normalizeSwarmReviewerVerification(rv.reviewerVerification);
+    if (normalized) return normalized;
+  }
+  return null;
 }
 
 export function isUnsupportedSwarmEndpointError(error: unknown): boolean {
