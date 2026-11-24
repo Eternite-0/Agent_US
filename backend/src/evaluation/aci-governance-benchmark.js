@@ -3062,44 +3062,70 @@ function normalizeSupervisorCost(trial, aciMetrics, ledger) {
   return { calls, inputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 0 };
 }
 
+const CONTEXT_INSPECTION_TOOLS = new Set([
+  'read_file',
+  'read_blob',
+  'inspect_repository',
+  'glob',
+  'grep',
+]);
+
+function isContextAdmissionRecord(adm) {
+  const p = String(adm?.path || '').trim();
+  if (!p || /^(?:bash|glob|grep|expand_context):/i.test(p)) return false;
+  if (p === 'expand_context' || p === 'compute_file_digest') return false;
+  const tn = String(adm?.toolName || '').trim().toLowerCase();
+  if (!tn) return true;
+  return CONTEXT_INSPECTION_TOOLS.has(tn);
+}
+
 function synthesizeAdmissionsFromTrial(trial, ledger, taskId) {
   if (Array.isArray(ledger?.admissions) && ledger.admissions.length > 0) {
-    return ledger.admissions.map((a) => ({
-      path: normalizeEvidencePath(a.path || ''),
-      decision: String(a.decision || 'DIRECT').toUpperCase(),
-      originalTokens: Math.max(0, Number(a.originalTokens ?? a.injectedTokens ?? 0) || 0),
-      injectedTokens: Math.max(0, Number(a.injectedTokens ?? a.originalTokens ?? 0) || 0),
-    }));
+    return ledger.admissions
+      .filter(isContextAdmissionRecord)
+      .map((a) => ({
+        path: normalizeEvidencePath(a.path || ''),
+        toolName: a.toolName ? String(a.toolName) : 'read_file',
+        decision: String(a.decision || 'DIRECT').toUpperCase(),
+        originalTokens: Math.max(0, Number(a.originalTokens ?? a.injectedTokens ?? 0) || 0),
+        injectedTokens: Math.max(0, Number(a.injectedTokens ?? a.originalTokens ?? 0) || 0),
+      }));
   }
   if (Array.isArray(trial?.admissions) && trial.admissions.length > 0) {
-    return trial.admissions.map((a) => ({
-      path: normalizeEvidencePath(a.path || ''),
-      decision: String(a.decision || 'DIRECT').toUpperCase(),
-      originalTokens: Math.max(0, Number(a.originalTokens ?? a.injectedTokens ?? 0) || 0),
-      injectedTokens: Math.max(0, Number(a.injectedTokens ?? a.originalTokens ?? 0) || 0),
-    }));
+    return trial.admissions
+      .filter(isContextAdmissionRecord)
+      .map((a) => ({
+        path: normalizeEvidencePath(a.path || ''),
+        toolName: a.toolName ? String(a.toolName) : 'read_file',
+        decision: String(a.decision || 'DIRECT').toUpperCase(),
+        originalTokens: Math.max(0, Number(a.originalTokens ?? a.injectedTokens ?? 0) || 0),
+        injectedTokens: Math.max(0, Number(a.injectedTokens ?? a.originalTokens ?? 0) || 0),
+      }));
   }
   const taskObj = TASK_BY_ID.get(taskId);
   const fixtureFiles = taskObj?.fixture?.files ?? {};
   const estimateForPath = (rel) => {
     const norm = normalizeEvidencePath(rel);
     if (norm && Object.hasOwn(fixtureFiles, norm)) return estimateTokens(fixtureFiles[norm]);
+    if (trial?.fileTokensMap && Object.hasOwn(trial.fileTokensMap, norm)) {
+      return Math.max(1, Number(trial.fileTokensMap[norm]) || 100);
+    }
     return 100;
   };
   const out = [];
   if (ledger && (ledger.kept?.length || ledger.compressed?.length || ledger.expanded?.length)) {
     for (const item of ledger.kept ?? []) {
       const tok = Math.max(0, Number(item.tokens ?? item.originalTokens ?? estimateForPath(item.path)) || 0);
-      out.push({ path: normalizeEvidencePath(item.path || ''), decision: 'DIRECT', originalTokens: tok, injectedTokens: tok });
+      out.push({ path: normalizeEvidencePath(item.path || ''), toolName: 'read_file', decision: 'DIRECT', originalTokens: tok, injectedTokens: tok });
     }
     for (const item of ledger.compressed ?? []) {
       const orig = Math.max(0, Number(item.originalTokens ?? estimateForPath(item.path)) || 0);
       const stub = Math.max(0, Number(item.stubTokens ?? 25) || 25);
-      out.push({ path: normalizeEvidencePath(item.path || ''), decision: 'DEFER', originalTokens: orig, injectedTokens: stub });
+      out.push({ path: normalizeEvidencePath(item.path || ''), toolName: 'read_file', decision: 'DEFER', originalTokens: orig, injectedTokens: stub });
     }
     for (const item of ledger.expanded ?? []) {
       const tok = Math.max(0, Number(item.tokens ?? estimateForPath(item.path)) || 0);
-      out.push({ path: normalizeEvidencePath(item.path || ''), decision: 'SUPPORTING', originalTokens: tok, injectedTokens: tok });
+      out.push({ path: normalizeEvidencePath(item.path || ''), toolName: 'read_file', decision: 'SUPPORTING', originalTokens: tok, injectedTokens: tok });
     }
     return out.filter((x) => x.path);
   }
@@ -3109,15 +3135,20 @@ function synthesizeAdmissionsFromTrial(trial, ledger, taskId) {
       const rel = normalizeEvidencePath(String(call.argsSummary).replace(/^read_file:\s*/i, '').trim());
       if (!rel) continue;
       const tok = estimateForPath(rel);
-      out.push({ path: rel, decision: 'DIRECT', originalTokens: tok, injectedTokens: tok });
+      out.push({ path: rel, toolName: 'read_file', decision: 'DIRECT', originalTokens: tok, injectedTokens: tok });
     }
   }
-  if (!out.length && Array.isArray(trial?.readFiles)) {
-    for (const rel of trial.readFiles) {
+  const filesReadList = Array.isArray(trial?.readFiles)
+    ? trial.readFiles
+    : Array.isArray(trial?.reasoningMetrics?.filesRead)
+      ? trial.reasoningMetrics.filesRead
+      : [];
+  if (!out.length && filesReadList.length > 0) {
+    for (const rel of filesReadList) {
       const norm = normalizeEvidencePath(rel);
       if (!norm) continue;
       const tok = estimateForPath(norm);
-      out.push({ path: norm, decision: 'DIRECT', originalTokens: tok, injectedTokens: tok });
+      out.push({ path: norm, toolName: 'read_file', decision: 'DIRECT', originalTokens: tok, injectedTokens: tok });
     }
   }
   return out;

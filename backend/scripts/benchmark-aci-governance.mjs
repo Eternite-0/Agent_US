@@ -5,11 +5,12 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -424,19 +425,25 @@ class DeterministicAciProbeAdapter extends LlmAdapter {
       return;
     }
 
-    // Step 2 for Arm D: recover deferred/large contract via expand_context lossless SHA-256 restore
+    // Step 2 for Arm D: recover deferred/supporting active context via expand_context lossless SHA-256 restore (never restore IRRELEVANT decoys)
     if (this.readPlan.armName === 'D' && !hasCall('probe-expand-0')) {
       let artifactRef = null;
+      let secondaryRef = null;
       for (const m of msgs) {
         if (m.role !== 'tool') continue;
         const txt = String(m.content?.[0]?.text ?? '');
+        if (/\bIRRELEVANT\b/i.test(txt)) continue;
         const match = txt.match(/artifact:\/\/[0-9a-f]{64}/i);
-        if (match) {
+        if (!match) continue;
+        if (this.readPlan.criticalTarget && txt.includes(this.readPlan.criticalTarget)) {
           artifactRef = match[0];
           break;
         }
+        if (!secondaryRef && /\b(?:DEFER|SUPPORTING)\b/i.test(txt)) {
+          secondaryRef = match[0];
+        }
       }
-      artifactRef = artifactRef ?? this.fallbackArtifactUri;
+      artifactRef = artifactRef ?? this.fallbackArtifactUri ?? secondaryRef;
       if (artifactRef) {
         yield {
           type: 'block-end',
@@ -559,13 +566,148 @@ class DeterministicMockSupervisorAdapter extends LlmAdapter {
   }
 }
 
+function normalizeTrialRelPath(workspaceRoot, rawPath) {
+  const raw = String(rawPath ?? '').trim();
+  if (!raw) return '';
+  if (workspaceRoot && (/^[A-Za-z]:/.test(raw) || raw.startsWith('/') || raw.startsWith('\\'))) {
+    try {
+      const rel = relative(resolve(workspaceRoot), resolve(raw)).replace(/\\/g, '/');
+      if (rel && !rel.startsWith('..') && !/^[A-Za-z]:/.test(rel)) return rel;
+    } catch {
+      // fall through
+    }
+  }
+  return raw.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function extractReadAdmissionsFromTurnData({
+  workspaceRoot,
+  verifierEvents = null,
+  eventRows = null,
+  assistantMessageRows = null,
+  filesRead = null,
+}) {
+  const admissions = [];
+  const fileTokensMap = {};
+  const seenKey = new Set();
+
+  if (Array.isArray(verifierEvents) && verifierEvents.length > 0) {
+    for (const ev of verifierEvents) {
+      if (ev?.type !== 'tool/result') continue;
+      const d = ev.data ?? {};
+      if (d.name !== 'read_file' || d.isError) continue;
+      const rawPath = d.effectiveArgs?.path ?? d.effectiveArgs?.filePath ?? '';
+      const rel = normalizeTrialRelPath(workspaceRoot, rawPath);
+      if (!rel) continue;
+      const tok = Math.max(1, estimateTokens(String(d.content ?? '')));
+      fileTokensMap[rel] = Math.max(fileTokensMap[rel] ?? 0, tok);
+      admissions.push({
+        path: rel,
+        toolName: 'read_file',
+        decision: 'DIRECT',
+        originalTokens: tok,
+        injectedTokens: tok,
+        tokensSaved: 0,
+        step: 1,
+      });
+      seenKey.add(`${d.callId ?? rel}`);
+    }
+  }
+
+  if (admissions.length === 0 && (Array.isArray(assistantMessageRows) || Array.isArray(eventRows))) {
+    const callPathById = new Map();
+    for (const row of Array.isArray(assistantMessageRows) ? assistantMessageRows : []) {
+      let calls = row?.toolCalls ?? row;
+      if (typeof calls === 'string') {
+        try { calls = JSON.parse(calls); } catch { calls = null; }
+      }
+      if (!Array.isArray(calls)) continue;
+      for (const tc of calls) {
+        if (!tc?.id || tc.name !== 'read_file') continue;
+        let args = tc.arguments;
+        if (typeof args === 'string') {
+          try { args = JSON.parse(args); } catch { args = {}; }
+        }
+        const rel = normalizeTrialRelPath(workspaceRoot, args?.path ?? args?.filePath ?? '');
+        if (rel) callPathById.set(String(tc.id), rel);
+      }
+    }
+
+    const resultByCallId = new Map();
+    for (const ev of Array.isArray(eventRows) ? eventRows : []) {
+      if (ev?.type !== 'tool/result') continue;
+      let d = ev.data;
+      if (typeof d === 'string') {
+        try { d = JSON.parse(d); } catch { d = null; }
+      }
+      if (!d || d.isError) continue;
+      if (d.callId) resultByCallId.set(String(d.callId), d);
+    }
+
+    for (const [callId, rel] of callPathById.entries()) {
+      const evData = resultByCallId.get(callId);
+      let tok = evData?.output ? Math.max(1, estimateTokens(String(evData.output))) : 0;
+      if (workspaceRoot) {
+        try {
+          const abs = join(workspaceRoot, rel);
+          if (existsSync(abs)) {
+            const diskTok = Math.max(1, estimateTokens(readFileSync(abs, 'utf8')));
+            tok = Math.max(tok, diskTok);
+          }
+        } catch {
+          // ignore read error
+        }
+      }
+      tok = Math.max(1, tok || 100);
+      fileTokensMap[rel] = Math.max(fileTokensMap[rel] ?? 0, tok);
+      admissions.push({
+        path: rel,
+        toolName: 'read_file',
+        decision: 'DIRECT',
+        originalTokens: tok,
+        injectedTokens: tok,
+        tokensSaved: 0,
+        step: 1,
+      });
+      seenKey.add(rel);
+    }
+
+    for (const rawFile of Array.isArray(filesRead) ? filesRead : []) {
+      const rel = normalizeTrialRelPath(workspaceRoot, rawFile);
+      if (!rel || seenKey.has(rel)) continue;
+      let tok = 100;
+      if (workspaceRoot) {
+        try {
+          const abs = join(workspaceRoot, rel);
+          if (existsSync(abs)) tok = Math.max(1, estimateTokens(readFileSync(abs, 'utf8')));
+        } catch {
+          // ignore
+        }
+      }
+      fileTokensMap[rel] = Math.max(fileTokensMap[rel] ?? 0, tok);
+      admissions.push({
+        path: rel,
+        toolName: 'read_file',
+        decision: 'DIRECT',
+        originalTokens: tok,
+        injectedTokens: tok,
+        tokensSaved: 0,
+        step: 1,
+      });
+    }
+  }
+
+  return { admissions, fileTokensMap };
+}
+
 function buildArmAdmissionTelemetry({
   task,
   armName,
   readPlan,
+  workspaceRoot,
+  verifierEvents,
   aciStore,
   ledger,
-  supervisorAdapter,
   capabilities,
 }) {
   // If Stream A's ContextEvidenceLedger already populated admissions, honor them directly
@@ -574,6 +716,16 @@ function buildArmAdmissionTelemetry({
       admissions: ledger.admissions,
       supervisorCalls: ledger.supervisorCalls ?? [],
       recoveries: ledger.recoveries ?? [],
+    };
+  }
+
+  // For Arm A (raw_full), extract apples-to-apples wrapped read_file tokens directly from AgentLoop verifierEvents
+  const extracted = extractReadAdmissionsFromTurnData({ workspaceRoot, verifierEvents });
+  if (extracted.admissions.length > 0) {
+    return {
+      admissions: extracted.admissions,
+      supervisorCalls: ledger?.supervisorCalls ?? [],
+      recoveries: ledger?.recoveries ?? [],
     };
   }
 
@@ -689,6 +841,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
   });
   const {
     Store,
+    AccountPool,
     AgentLoop,
     DecisionEngine,
     EventRouter,
@@ -706,6 +859,16 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
 
   const store = new Store(join(stateDir, 'eval.sqlite'));
   try {
+    const pool = new AccountPool(store, { root: stateDir });
+    pool.createAccount({
+      preset: 'custom-openai',
+      label: 'deterministic-aci-supervisor',
+      credential: 'det-sup-key',
+      endpoint: 'https://det-supervisor.invalid/v1',
+      models: ['mock-supervisor-flash'],
+    });
+    pool.setDefaultModel('mock-supervisor-flash');
+
     const sessionId = `sess-${task.id}-${armName}-${rep}`;
     const turnId = `turn-${task.id}-${armName}-${rep}`;
     const now = Date.now();
@@ -719,13 +882,14 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
     const aciStore = new ReversibleContextStore(store);
     const aciLedger = new ContextEvidenceLedger();
     const mockSupAdapter = new DeterministicMockSupervisorAdapter();
-    const supervisor = new ContextSupervisor({ store, adapter: mockSupAdapter });
+    const supervisor = new ContextSupervisor({ store, pool, adapter: mockSupAdapter });
     if (armName === 'A' || armName === 'B') {
-      store.setSetting?.('aci.config', { enabled: false, mode: 'off' });
+      store.setSetting?.('aci.config', { enabled: false, mode: 'off', admissionEnabled: armName === 'B' });
     } else {
       store.setSetting?.('aci.config', {
         enabled: true,
         mode: 'auto',
+        admissionEnabled: true,
         dtocMinPromptTokens: opts.dtocMinPromptTokens,
       });
     }
@@ -734,8 +898,11 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       store,
       aciStore,
       ledger: aciLedger,
+      supervisor,
       contextWindow: 128_000,
       maxTotalTokens: opts.maxTokens ?? 160_000,
+      dtocPolicy: 'adaptive_single_step',
+      dtocMinPromptTokens: opts.dtocMinPromptTokens,
     });
 
     const readPlan = buildProbeReadPlan(task, armName);
@@ -842,21 +1009,6 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       },
     });
 
-    if (armName === 'C' || armName === 'D') {
-      // Ensure read-only Supervisor interface works cleanly against mock adapter
-      await supervisor.supervise({
-        query: task.objective || task.title,
-        candidates: readPlan.semanticDecoys.map((p, idx) => ({
-          id: `cand-${idx}`,
-          path: p,
-          score: 0.45,
-          excerpt: String(task.fixture?.files?.[p] ?? '').slice(0, 200),
-        })),
-        errorSummary: '',
-        contractHints: [],
-      }).catch(() => {});
-    }
-
     const receipts = store.db
       .prepare('SELECT id, callId, toolName, status, exitCode FROM tool_receipts WHERE turnId=? ORDER BY rowid')
       .all(turnId);
@@ -894,21 +1046,33 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       task,
       armName,
       readPlan,
+      workspaceRoot,
+      verifierEvents: loopResult.verifierEvents,
       aciStore,
       ledger: aciLedger,
-      supervisorAdapter: mockSupAdapter,
       capabilities: armRuntime.capabilities,
     });
-    const supTokensIn = telemetry.supervisorCalls.reduce((s, c) => s + Number(c.inputTokens || 0), 0);
-    const supTokensOut = telemetry.supervisorCalls.reduce((s, c) => s + Number(c.outputTokens || 0), 0);
+    const existingRm = loopResult.reasoningMetrics ?? {};
+    const existingAci = existingRm.aciMetrics ?? {};
+    const supCallsArr = telemetry.supervisorCalls;
+    const supTokensIn = supCallsArr.reduce((s, c) => s + Number(c.inputTokens || 0), 0);
+    const supTokensOut = supCallsArr.reduce((s, c) => s + Number(c.outputTokens || 0), 0);
+    const supDurMs = supCallsArr.reduce((s, c) => s + Number(c.durationMs || 0), 0);
+    const supervisorCost = existingAci.supervisorCost && Number(existingAci.supervisorCost.calls ?? 0) >= supCallsArr.length
+      ? existingAci.supervisorCost
+      : {
+          calls: supCallsArr.length,
+          inputTokens: supTokensIn,
+          outputTokens: supTokensOut,
+          totalTokens: supTokensIn + supTokensOut,
+          durationMs: supDurMs,
+        };
 
-    const rm = loopResult.reasoningMetrics ?? {};
-    const existingAci = rm.aciMetrics ?? {};
     const baseIn = Number(loopResult.usage?.inputTokens ?? 0);
     const baseOut = Number(loopResult.usage?.outputTokens ?? 0);
     const baseCacheRead = Number(loopResult.usage?.cacheReadTokens ?? 0);
-    const totalIn = baseIn + supTokensIn;
-    const totalOut = baseOut + supTokensOut;
+    const totalIn = baseIn + Number(supervisorCost.inputTokens || 0);
+    const totalOut = baseOut + Number(supervisorCost.outputTokens || 0);
     const durationMs = Math.round(performance.now() - started);
 
     return {
@@ -932,13 +1096,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       tokenCost: totalIn + totalOut,
       sseCacheReported: baseCacheRead > 0,
       durationMs,
-      supervisorCost: {
-        calls: telemetry.supervisorCalls.length,
-        inputTokens: supTokensIn,
-        outputTokens: supTokensOut,
-        totalTokens: supTokensIn + supTokensOut,
-        durationMs: telemetry.supervisorCalls.reduce((s, c) => s + Number(c.durationMs || 0), 0),
-      },
+      supervisorCost,
       aciMetrics: {
         ...existingAci,
         aciProfile: armCfg.aciProfile,
@@ -946,15 +1104,20 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
         epochTransitions:
           task._suite === 'ar'
             ? 0
-            : Number(existingAci.epochTransitions ?? (armName === 'D' ? 1 : 0)),
+            : Number(existingAci.epochTransitions ?? 0),
         restoredCount: Math.max(
           Number(existingAci.restoredCount ?? 0),
           telemetry.recoveries.length,
         ),
-        hashVerifiedRestores: telemetry.recoveries.filter((r) => r.verified).length,
+        hashVerifiedRestores: Math.max(
+          Number(existingAci.hashVerifiedRestores ?? 0),
+          telemetry.recoveries.filter((r) => r.verified !== false).length,
+        ),
+        supervisorCost,
         ledger: {
+          ...(existingAci.ledger ?? {}),
           admissions: telemetry.admissions,
-          supervisorCalls: telemetry.supervisorCalls,
+          supervisorCalls: supCallsArr,
           recoveries: telemetry.recoveries,
         },
       },
@@ -1221,13 +1384,25 @@ async function runRealAciTrial({
     const durationMs = Math.round(performance.now() - started);
     const rm = diagnostics.reasoningMetrics ?? {};
     const aciMetrics = rm.aciMetrics ?? {};
-    const supervisorCost = aciMetrics.supervisorCost ?? {
-      calls: wireSup.length || Number(aciMetrics.supervisorCalls ?? 0),
-      inputTokens: supInput,
-      outputTokens: supOutput,
-      totalTokens: supInput + supOutput,
-      durationMs: supMs,
+    const rawSupCost = aciMetrics.supervisorCost ?? {};
+    const supervisorCost = {
+      calls: Math.max(wireSup.length, Number(rawSupCost.calls ?? aciMetrics.supervisorCalls ?? 0)),
+      inputTokens: supInput > 0 ? supInput : Number(rawSupCost.inputTokens ?? 0),
+      outputTokens: supOutput > 0 ? supOutput : Number(rawSupCost.outputTokens ?? 0),
+      totalTokens:
+        supInput + supOutput > 0
+          ? supInput + supOutput
+          : Number(rawSupCost.totalTokens ?? 0),
+      durationMs: supMs > 0 ? supMs : Number(rawSupCost.durationMs ?? 0),
+      fallbackCount: Number(rawSupCost.fallbackCount ?? 0),
     };
+    const hasLedgerAdmissions = Array.isArray(aciMetrics?.ledger?.admissions) && aciMetrics.ledger.admissions.length > 0;
+    const readFallback = extractReadAdmissionsFromTurnData({
+      workspaceRoot,
+      eventRows,
+      assistantMessageRows,
+      filesRead: rm.filesRead ?? [],
+    });
 
     return {
       taskId: task.id,
@@ -1254,9 +1429,16 @@ async function runRealAciTrial({
       sseCacheReported,
       durationMs,
       supervisorCost,
+      recoveryStats: aciMetrics.recoveryStats ?? null,
+      readFiles: Array.isArray(rm.filesRead) ? rm.filesRead : [],
+      fileTokensMap: readFallback.fileTokensMap,
+      ...(hasLedgerAdmissions ? {} : { admissions: readFallback.admissions }),
       toolCallTrace: diagnostics.toolCallTrace,
       reasoningMetrics: rm,
-      aciMetrics,
+      aciMetrics: {
+        ...aciMetrics,
+        supervisorCost,
+      },
       assistantExcerpt: safeRedactValue(String(assistantMsgs?.content ?? '').slice(0, 600), benchKey),
       failureCategory: timedOut ? 'timeout' : judgment.evidence.failureCategory,
       failureAttribution: judgment.evidence.failureAttribution,

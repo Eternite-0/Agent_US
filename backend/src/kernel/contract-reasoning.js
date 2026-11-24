@@ -103,18 +103,27 @@ function extractExportNamesFromJs(path, text) {
 }
 
 function collectPromptPaths(text) {
-  const found = [];
+  const candidates = [];
   const seen = new Set();
   for (const m of String(text || '').matchAll(FILE_PATH_TOKEN_RE)) {
     const raw = m[1]?.trim();
     if (!raw || !isSafeWorkspaceRelativePath(raw)) continue;
+    const isBareDotSlash = /^\.\//.test(raw) && !raw.slice(2).includes('/');
     const norm = raw.replace(/\\/g, '/').replace(/^\.\//, '');
     if (!seen.has(norm)) {
       seen.add(norm);
-      found.push(norm);
+      candidates.push({ norm, isBareDotSlash });
     }
   }
-  return found;
+  const allNorms = candidates.map((c) => c.norm);
+  // Ignore sibling ESM relative specifiers (e.g. `./normalizer.js`) when a fuller subpath exists.
+  return candidates
+    .filter(
+      (c) =>
+        !c.isBareDotSlash ||
+        !allNorms.some((other) => other !== c.norm && other.endsWith(`/${c.norm}`)),
+    )
+    .map((c) => c.norm);
 }
 
 function collectForbiddenMutations(prompt) {
