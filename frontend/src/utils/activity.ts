@@ -8,7 +8,7 @@ import type {
   TaskPlan,
   Worker,
 } from '../types/backend';
-import { computeDiff, decodeBase64Utf8, type DiffLine } from './diff';
+import { computeDiff, decodeBase64Utf8, parseUnifiedDiff, type DiffLine } from './diff';
 import { fmtActionCommand } from './format';
 import {
   getWorkerActivityLabel,
@@ -1221,14 +1221,18 @@ export function buildUnifiedActivityTimeline(input: UnifiedTimelineInput): Unifi
         ? ev.changes.map((c) => {
             const beforeText = decodeBase64Utf8(c.before);
             const afterText = decodeBase64Utf8(c.after);
-            const { lines, added, deleted } = computeDiff(beforeText, afterText);
+            const parsedPatch = c.unifiedDiff ? parseUnifiedDiff(c.unifiedDiff) : null;
+            const computed =
+              parsedPatch && parsedPatch.lines.length > 0 && (!c.before || !c.after)
+                ? { lines: parsedPatch.lines, added: parsedPatch.added, deleted: parsedPatch.deleted }
+                : computeDiff(beforeText, afterText);
             return {
               path: normalizeFilePath(c.path),
-              added,
-              deleted,
-              isCreated: !beforeText.trim(),
+              added: typeof c.additions === 'number' ? c.additions : computed.added,
+              deleted: typeof c.deletions === 'number' ? c.deletions : computed.deleted,
+              isCreated: c.action === 'create' || (!beforeText.trim() && c.action !== 'delete'),
               afterText,
-              lines,
+              lines: computed.lines,
             };
           })
         : targetPath

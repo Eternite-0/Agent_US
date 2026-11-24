@@ -23,15 +23,20 @@ function presentTool(row: DirectToolActivity) {
     return typeof value === 'string' && value.trim() ? value : undefined;
   };
   const paths = new Set<string>();
-  if (kind === 'read' || kind === 'edit') {
+  if (kind === 'read' || kind === 'edit' || row.name === 'run_diagnostics') {
     const path = field('path') ?? field('filePath');
     if (path) paths.add(path);
     if (Array.isArray(fields.paths)) {
       for (const entry of fields.paths) if (typeof entry === 'string' && entry.trim()) paths.add(entry);
     }
     if (row.name === 'apply_patch') {
-      for (const match of (field('patch') ?? '').matchAll(/^\*\*\* (?:Update File|Add File|Delete File|Move to): (.+)$/gm)) {
+      const patchText = field('patch') ?? '';
+      for (const match of patchText.matchAll(/^\*\*\* (?:Update File|Add File|Delete File|Move to): (.+)$/gm)) {
         if (match[1].trim()) paths.add(match[1].trim());
+      }
+      for (const match of patchText.matchAll(/^(?:\+\+\+|---)\s+(?:a\/|b\/)?(.+?)(?:\t.*)?$/gm)) {
+        const p = match[1].trim();
+        if (p && p !== '/dev/null') paths.add(p);
       }
     }
   }

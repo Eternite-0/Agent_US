@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   appendFileSync,
   existsSync,
@@ -25,8 +26,11 @@ import {
   buildAciGovernanceEvidenceOutput,
   computeAciGovernanceMetrics,
   createAciGovernanceDataset,
+  exportPaperTablesLatex,
+  exportPaperTablesMarkdown,
   getAciGovernanceReferenceFix,
   instantiateAciGovernanceWorkspace,
+  normalizeAciProfileName,
   resolveAciTaskGroundTruth,
 } from '../src/evaluation/aci-governance-benchmark.js';
 import {
@@ -43,6 +47,10 @@ import { BenchmarkSandbox, SANDBOX_MODES, runHardenedGitSync } from '../src/tool
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(SCRIPT_DIR, '..', '..');
 const VALID_ARMS = new Set(['A', 'B', 'C', 'D']);
+const TRIAL_HEADER_NAME = 'x-agent-us-bench-trial';
+const TRIAL_FETCH_ALS = new AsyncLocalStorage();
+const ACTIVE_FETCH_CAPTURES = new Map();
+let baseOriginalFetch = null;
 
 function printUsage() {
   console.log([
@@ -51,12 +59,18 @@ function printUsage() {
     'Options:',
     '  --mode <deterministic|real>         Evaluation mode (default: deterministic)',
     '  --arms <A,B,C,D>                    Comma-separated arms (default: A,B,C,D)',
-    '  --suite <aci|ar|all>                Dataset suite (default: aci)',
+    '  --suite <aci|aci25|ar|all>          Dataset suite (default: aci)',
     '  --tasks <all|id1,id2,...>           Task filter (default: all)',
     '  --repeats <n>                       Repeats per task (1..20, default: 1)',
+    '  --concurrency <n>                   Concurrent isolated trials 1..16 (default: 1)',
+    '  --resume                            Resume existing --output JSONL skipping completed cells',
     '  --lane <idx>                        Worker shard index (default: 0)',
     '  --lanes <count>                     Worker shard count (default: 1)',
     '  --output <path>                     JSONL output path (also writes -summary.json)',
+    '  --export-paper <path>               Write Markdown paper tables (or LaTeX if .tex)',
+    '  --export-latex <path>               Write LaTeX paper tables',
+    '  --aci-profile <full_aci|aci_25>     Override Arm D ACI profile label',
+    '  --dtoc-policy <policy>              Optional DTOC policy override',
     '  --max-steps <n>                     Override max steps per turn',
     '  --max-tokens <n>                    Override max total tokens per turn',
     '  --dtoc-min-prompt-tokens <n>        Adaptive single-step DTOC min prompt tokens (default: 24000)',
@@ -74,17 +88,61 @@ export function buildSummaryOutputPath(outputPath) {
   return `${resolved}-summary.json`;
 }
 
-export function resolveArmProfileConfig(arm, { dtocMinPromptTokens = 24000 } = {}) {
+export function buildTrialCellKey(taskId, arm, rep = 0) {
+  return `${String(taskId ?? '').trim()}::${String(arm ?? 'A').trim().toUpperCase()}::${Number(rep ?? 0)}`;
+}
+
+export function loadResumeStateFromJsonl(outputPath) {
+  const existingRows = [];
+  const completedKeys = new Set();
+  let hadCorruptLines = false;
+  if (!outputPath || !existsSync(outputPath)) {
+    return { existingRows, completedKeys, hadCorruptLines };
+  }
+  const rawText = readFileSync(outputPath, 'utf8');
+  const lines = rawText.split(/\r?\n/);
+  const byKey = new Map();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== 'object' || !parsed.taskId || !parsed.arm) {
+        hadCorruptLines = true;
+        continue;
+      }
+      const key = buildTrialCellKey(parsed.taskId, parsed.arm, parsed.rep ?? 0);
+      byKey.set(key, parsed);
+      completedKeys.add(key);
+    } catch {
+      hadCorruptLines = true;
+    }
+  }
+  for (const row of byKey.values()) {
+    existingRows.push(row);
+  }
+  return { existingRows, completedKeys, hadCorruptLines };
+}
+
+export function resolveArmProfileConfig(
+  arm,
+  { dtocMinPromptTokens = 24000, aciProfile = null, dtocPolicy = null } = {},
+) {
   const key = String(arm || 'A').trim().toUpperCase();
   const profile = ACI_ARM_PROFILES[key];
   if (!profile) {
     throw new Error(`Unsupported arm "${arm}"; expected A, B, C, or D`);
   }
+  const resolvedProfile =
+    key === 'D' && aciProfile && ['full_aci', 'aci_25'].includes(String(aciProfile).trim())
+      ? normalizeAciProfileName(aciProfile)
+      : profile.aciProfile;
   return {
     arm: profile.arm,
-    aciProfile: profile.aciProfile,
+    aciProfile: resolvedProfile,
     aciOptions: {
       dtocMinPromptTokens: Number(dtocMinPromptTokens) || 24000,
+      ...(dtocPolicy ? { dtocPolicy: String(dtocPolicy).trim() } : {}),
     },
   };
 }
@@ -123,9 +181,15 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
     suite: 'aci',
     tasks: null,
     repeats: 1,
+    concurrency: 1,
+    resume: false,
     lane: 0,
     lanes: 1,
     output: null,
+    exportPaper: null,
+    exportLatex: null,
+    aciProfile: null,
+    dtocPolicy: null,
     maxSteps: null,
     maxTokens: null,
     dtocMinPromptTokens: 24000,
@@ -142,6 +206,7 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
     };
     if (arg === '--help' || arg === '-h') opts.help = true;
     else if (arg === '--json') opts.json = true;
+    else if (arg === '--resume') opts.resume = true;
     else if (arg === '--mode') opts.mode = String(nextVal());
     else if (arg.startsWith('--mode=')) opts.mode = arg.slice('--mode='.length);
     else if (arg === '--arms') opts.arms = String(nextVal()).split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
@@ -157,12 +222,22 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
     }
     else if (arg === '--repeats') opts.repeats = Number(nextVal());
     else if (arg.startsWith('--repeats=')) opts.repeats = Number(arg.slice('--repeats='.length));
+    else if (arg === '--concurrency') opts.concurrency = Number(nextVal());
+    else if (arg.startsWith('--concurrency=')) opts.concurrency = Number(arg.slice('--concurrency='.length));
     else if (arg === '--lane') opts.lane = Number(nextVal());
     else if (arg.startsWith('--lane=')) opts.lane = Number(arg.slice('--lane='.length));
     else if (arg === '--lanes') opts.lanes = Number(nextVal());
     else if (arg.startsWith('--lanes=')) opts.lanes = Number(arg.slice('--lanes='.length));
     else if (arg === '--output') opts.output = String(nextVal());
     else if (arg.startsWith('--output=')) opts.output = arg.slice('--output='.length);
+    else if (arg === '--export-paper') opts.exportPaper = String(nextVal());
+    else if (arg.startsWith('--export-paper=')) opts.exportPaper = arg.slice('--export-paper='.length);
+    else if (arg === '--export-latex') opts.exportLatex = String(nextVal());
+    else if (arg.startsWith('--export-latex=')) opts.exportLatex = arg.slice('--export-latex='.length);
+    else if (arg === '--aci-profile') opts.aciProfile = String(nextVal());
+    else if (arg.startsWith('--aci-profile=')) opts.aciProfile = arg.slice('--aci-profile='.length);
+    else if (arg === '--dtoc-policy') opts.dtocPolicy = String(nextVal());
+    else if (arg.startsWith('--dtoc-policy=')) opts.dtocPolicy = arg.slice('--dtoc-policy='.length);
     else if (arg === '--max-steps') opts.maxSteps = Number(nextVal());
     else if (arg.startsWith('--max-steps=')) opts.maxSteps = Number(arg.slice('--max-steps='.length));
     else if (arg === '--max-tokens') opts.maxTokens = Number(nextVal());
@@ -177,8 +252,8 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
   if (!['deterministic', 'real'].includes(opts.mode)) {
     throw new Error(`Unsupported --mode "${opts.mode}"; expected deterministic or real`);
   }
-  if (!['aci', 'ar', 'all'].includes(opts.suite)) {
-    throw new Error(`Unsupported --suite "${opts.suite}"; expected aci, ar, or all`);
+  if (!['aci', 'aci25', 'ar', 'all'].includes(opts.suite)) {
+    throw new Error(`Unsupported --suite "${opts.suite}"; expected aci, aci25, ar, or all`);
   }
   if (!opts.arms.length || opts.arms.some((a) => !VALID_ARMS.has(a))) {
     throw new Error(`Invalid --arms "${opts.arms.join(',')}"; expected subset of A,B,C,D`);
@@ -186,6 +261,9 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
   opts.arms = [...new Set(opts.arms)];
   if (!Number.isInteger(opts.repeats) || opts.repeats < 1 || opts.repeats > 20) {
     throw new Error('--repeats must be an integer between 1 and 20');
+  }
+  if (!Number.isInteger(opts.concurrency) || opts.concurrency < 1 || opts.concurrency > 16) {
+    throw new Error('--concurrency must be an integer between 1 and 16');
   }
   if (!Number.isInteger(opts.lane) || !Number.isInteger(opts.lanes) || opts.lanes < 1 || opts.lane < 0 || opts.lane >= opts.lanes) {
     throw new Error('Invalid --lane / --lanes values');
@@ -198,6 +276,9 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
   }
   if (opts.maxTokens !== null && (!Number.isInteger(opts.maxTokens) || opts.maxTokens < 1024)) {
     throw new Error('--max-tokens must be an integer >= 1024');
+  }
+  if (opts.aciProfile !== null && !['full_aci', 'aci_25'].includes(opts.aciProfile.trim())) {
+    throw new Error('--aci-profile must be full_aci or aci_25');
   }
   return opts;
 }
@@ -294,6 +375,13 @@ export async function probeAciRuntimeCapabilities(repoRoot = DEFAULT_REPO_ROOT) 
     ledgerGovernance: typeof aciStoreMod.ContextEvidenceLedger?.prototype?.recordAdmission === 'function',
     supervisorAdmission: typeof supervisorMod.ContextSupervisor?.prototype?.admitCandidates === 'function',
     engineAdmitBatch: typeof aciEngineMod.ACIEngine?.prototype?.admitToolBatch === 'function',
+    phaseWatermarkV25: Boolean(
+      aciEngineMod?.PHASE_WATERMARK_V25_DTOC_POLICY ||
+        aciEngineMod?.DTOC_POLICIES?.phase_watermark_v25 ||
+        aciEngineMod?.DTOC_POLICIES?.PHASE_WATERMARK_V25 ||
+        aciEngineMod?.PHASE_WATERMARK_V25 ||
+        aciEngineMod?.ACI_25_VERSION,
+    ),
   };
 
   return {
@@ -324,10 +412,19 @@ export async function probeAciRuntimeCapabilities(repoRoot = DEFAULT_REPO_ROOT) 
 }
 
 function getTaskDataset(opts) {
-  const aciTasks = opts.suite === 'ar' ? [] : createAciGovernanceDataset({ sandboxOptions: buildSandboxOptions(opts.sandbox) });
-  const arTasks = opts.suite === 'aci' ? [] : createAutonomousReasoningDataset({ sandboxOptions: buildSandboxOptions(opts.sandbox) });
+  const aciTasks =
+    opts.suite === 'ar'
+      ? []
+      : createAciGovernanceDataset({
+          sandboxOptions: buildSandboxOptions(opts.sandbox),
+          suite: opts.suite,
+        });
+  const arTasks =
+    opts.suite === 'aci' || opts.suite === 'aci25'
+      ? []
+      : createAutonomousReasoningDataset({ sandboxOptions: buildSandboxOptions(opts.sandbox) });
   const combined = [
-    ...aciTasks.map((t) => ({ ...t, _suite: 'aci' })),
+    ...aciTasks.map((t) => ({ ...t, _suite: t.suite || (opts.suite === 'aci25' ? 'aci25' : 'aci') })),
     ...arTasks.map((t) => ({ ...t, _suite: 'ar' })),
   ];
   if (!opts.tasks) return combined;
@@ -861,10 +958,15 @@ function buildArmAdmissionTelemetry({
 
 async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, judgeSandbox }) {
   const started = performance.now();
-  const armCfg = resolveArmProfileConfig(armName, { dtocMinPromptTokens: opts.dtocMinPromptTokens });
-  const stateDir = mkdtempSync(join(tmpdir(), `agent-us-aci-det-${armName}-`));
+  const armCfg = resolveArmProfileConfig(armName, {
+    dtocMinPromptTokens: opts.dtocMinPromptTokens,
+    aciProfile: opts.aciProfile,
+    dtocPolicy: opts.dtocPolicy,
+  });
+  const trialNonce = randomUUID().slice(0, 8);
+  const stateDir = mkdtempSync(join(tmpdir(), `agent-us-aci-det-${armName}-${trialNonce}-`));
   const workspaceRoot = await instantiateWorkspaceForTask(task, {
-    prefix: `agent-us-aci-ws-${armName}-`,
+    prefix: `agent-us-aci-ws-${armName}-${trialNonce}-`,
   });
   const {
     Store,
@@ -896,8 +998,8 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
     });
     pool.setDefaultModel('mock-supervisor-flash');
 
-    const sessionId = `sess-${task.id}-${armName}-${rep}`;
-    const turnId = `turn-${task.id}-${armName}-${rep}`;
+    const sessionId = `sess-${task.id}-${armName}-${rep}-${trialNonce}`;
+    const turnId = `turn-${task.id}-${armName}-${rep}-${trialNonce}`;
     const now = Date.now();
     store.db
       .prepare('INSERT INTO direct_sessions(id,title,workspaceRoot,model,permissionMode,state,createdAt,updatedAt) VALUES(?,?,?,?,?,?,?,?)')
@@ -928,7 +1030,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       supervisor,
       contextWindow: 128_000,
       maxTotalTokens: resolveBenchmarkTaskMaxTokens(task, opts),
-      dtocPolicy: 'adaptive_single_step',
+      dtocPolicy: opts.dtocPolicy || 'adaptive_single_step',
       dtocMinPromptTokens: opts.dtocMinPromptTokens,
     });
 
@@ -1159,6 +1261,205 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
   }
 }
 
+function readHeaderValue(headers, targetName) {
+  if (!headers) return null;
+  const lower = targetName.toLowerCase();
+  if (typeof headers.get === 'function') {
+    return headers.get(targetName) || headers.get(lower) || null;
+  }
+  if (Array.isArray(headers)) {
+    for (const entry of headers) {
+      if (Array.isArray(entry) && String(entry[0] || '').toLowerCase() === lower) {
+        return String(entry[1] ?? '');
+      }
+    }
+    return null;
+  }
+  if (typeof headers === 'object') {
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === lower) return String(v ?? '');
+    }
+  }
+  return null;
+}
+
+function stripTrialHeaderFromFetch(input, init) {
+  let nextInput = input;
+  let nextInit = init;
+  if (init?.headers && readHeaderValue(init.headers, TRIAL_HEADER_NAME) != null) {
+    const cleaned = new Headers(init.headers);
+    cleaned.delete(TRIAL_HEADER_NAME);
+    nextInit = { ...init, headers: cleaned };
+  }
+  if (typeof Request !== 'undefined' && input instanceof Request && input.headers?.has(TRIAL_HEADER_NAME)) {
+    const cleaned = new Headers(input.headers);
+    cleaned.delete(TRIAL_HEADER_NAME);
+    nextInput = new Request(input, { headers: cleaned });
+  }
+  return [nextInput, nextInit];
+}
+
+function resolveFetchTrialCapture(input, init) {
+  const headerTrialId =
+    readHeaderValue(init?.headers, TRIAL_HEADER_NAME) ||
+    (typeof input === 'object' ? readHeaderValue(input?.headers, TRIAL_HEADER_NAME) : null);
+  const alsTrialId = TRIAL_FETCH_ALS.getStore() || null;
+  const resolvedId = headerTrialId || alsTrialId;
+  if (resolvedId && ACTIVE_FETCH_CAPTURES.has(resolvedId)) {
+    return ACTIVE_FETCH_CAPTURES.get(resolvedId);
+  }
+  if (!resolvedId && ACTIVE_FETCH_CAPTURES.size === 1) {
+    return ACTIVE_FETCH_CAPTURES.values().next().value;
+  }
+  return null;
+}
+
+function acquireFetchWireCapture(trialId, endpoint, wireRecords, pendingWirePromises) {
+  if (ACTIVE_FETCH_CAPTURES.size === 0) {
+    baseOriginalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const ctx = resolveFetchTrialCapture(input, init);
+      const [cleanInput, cleanInit] = stripTrialHeaderFromFetch(input, init);
+      const url = new URL(
+        typeof cleanInput === 'string' || cleanInput instanceof URL ? cleanInput : cleanInput.url,
+      );
+      const isTrackedPath =
+        url.pathname.endsWith('/chat/completions') || url.pathname.endsWith('/messages');
+      if (!ctx || url.origin !== ctx.endpoint.origin || !isTrackedPath) {
+        return baseOriginalFetch(cleanInput, cleanInit);
+      }
+
+      let isSupervisorCall = false;
+      if (typeof cleanInit?.body === 'string') {
+        try {
+          const parsedReq = JSON.parse(cleanInit.body);
+          isSupervisorCall = !Array.isArray(parsedReq?.tools) || parsedReq.tools.length === 0;
+        } catch {
+          isSupervisorCall = false;
+        }
+      }
+      const rec = {
+        http: null,
+        ms: null,
+        isSupervisorCall,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheReported: false,
+      };
+      const t0 = performance.now();
+      ctx.wireRecords.push(rec);
+      const res = await baseOriginalFetch(cleanInput, cleanInit);
+      rec.http = res.status;
+      const wirePromise = res
+        .clone()
+        .text()
+        .then((body) => {
+          for (const line of body.split(/\r?\n/)) {
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (payload === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(payload);
+              const u = parsed.usage || parsed.message?.usage || null;
+              if (u) {
+                rec.inputTokens = Number(u.prompt_tokens ?? u.input_tokens ?? rec.inputTokens ?? 0);
+                rec.outputTokens = Number(u.completion_tokens ?? u.output_tokens ?? rec.outputTokens ?? 0);
+                const cr =
+                  u.prompt_tokens_details?.cached_tokens ??
+                  u.cache_read_input_tokens ??
+                  u.prompt_cache_hit_tokens;
+                const cw =
+                  u.cache_creation_input_tokens ?? u.prompt_tokens_details?.cache_creation_tokens;
+                if (cr != null && Number.isFinite(Number(cr))) {
+                  rec.cacheReadTokens = Number(cr);
+                  rec.cacheReported = true;
+                }
+                if (cw != null && Number.isFinite(Number(cw))) {
+                  rec.cacheWriteTokens = Number(cw);
+                }
+              }
+            } catch {
+              // ignore non-JSON SSE chunks
+            }
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          rec.ms = Math.round(performance.now() - t0);
+        });
+      ctx.pendingWirePromises.push(wirePromise);
+      return res;
+    };
+  }
+
+  ACTIVE_FETCH_CAPTURES.set(trialId, { endpoint, wireRecords, pendingWirePromises });
+  return () => {
+    ACTIVE_FETCH_CAPTURES.delete(trialId);
+    if (ACTIVE_FETCH_CAPTURES.size === 0 && baseOriginalFetch) {
+      globalThis.fetch = baseOriginalFetch;
+      baseOriginalFetch = null;
+    }
+  };
+}
+
+function authorizeAciBenchmarkApproval({
+  toolName,
+  args,
+  allowedTestCommands,
+  protectedSet,
+  allowWorkspaceNodeCli,
+}) {
+  if (toolName === 'run_diagnostics') return true;
+  if (
+    authorizeRealBenchmarkApproval({
+      toolName,
+      args,
+      allowedTestCommands,
+      protectedSet,
+      allowWorkspaceNodeCli,
+    })
+  ) {
+    return true;
+  }
+  if (toolName === 'apply_patch') {
+    const patch = String(args?.patch ?? '');
+    if (!patch.trim()) return false;
+    const unifiedPaths = [];
+    for (const line of patch.split(/\r?\n/)) {
+      const m = /^(?:\+\+\+|---)\s+(?:a\/|b\/)?(.+?)(?:\t.*)?$/.exec(line);
+      if (m) {
+        const rawPath = m[1].trim();
+        if (rawPath && rawPath !== '/dev/null') unifiedPaths.push(rawPath);
+      }
+    }
+    if (unifiedPaths.length > 0) {
+      return unifiedPaths.every((p) => {
+        const norm = p.replace(/\\/g, '/').replace(/^\.\//, '');
+        if (norm.startsWith('/') || norm.includes('..')) return false;
+        return !protectedSet.has(norm);
+      });
+    }
+  }
+  return false;
+}
+
+async function runTasksWithConcurrency(items, concurrency, workerFn) {
+  const results = new Array(items.length);
+  const limit = Math.max(1, Math.min(Number(concurrency) || 1, items.length || 1));
+  let cursor = 0;
+  const workers = Array.from({ length: limit }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) break;
+      results[idx] = await workerFn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function runRealAciTrial({
   task,
   armName,
@@ -1171,10 +1472,15 @@ async function runRealAciTrial({
   judgeSandbox,
 }) {
   const started = performance.now();
-  const armCfg = resolveArmProfileConfig(armName, { dtocMinPromptTokens: opts.dtocMinPromptTokens });
-  const stateDir = mkdtempSync(join(tmpdir(), `agent-us-aci-real-${armName}-`));
+  const armCfg = resolveArmProfileConfig(armName, {
+    dtocMinPromptTokens: opts.dtocMinPromptTokens,
+    aciProfile: opts.aciProfile,
+    dtocPolicy: opts.dtocPolicy,
+  });
+  const trialId = `${task.id}--${armName}--${rep}--${randomUUID().slice(0, 8)}`;
+  const stateDir = mkdtempSync(join(tmpdir(), `agent-us-aci-real-${armName}-${trialId.slice(-8)}-`));
   const workspaceRoot = await instantiateWorkspaceForTask(task, {
-    prefix: `agent-us-aci-realws-${armName}-`,
+    prefix: `agent-us-aci-realws-${armName}-${trialId.slice(-8)}-`,
   });
   const { Store, AccountPool, DirectAgentRuntime, BenchmarkSandbox: ArmSandbox } = armRuntime.modules;
   const store = new Store(join(stateDir, 'eval.sqlite'));
@@ -1186,6 +1492,7 @@ async function runRealAciTrial({
     protocol: 'openai',
     endpoint: endpoint.href,
     models: [requestedModel],
+    headers: { [TRIAL_HEADER_NAME]: trialId },
   });
   pool.setDefaultModel(requestedModel);
 
@@ -1217,253 +1524,196 @@ async function runRealAciTrial({
   const wireRecords = [];
   const pendingWirePromises = [];
   let unsub = null;
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
-    if (url.origin !== endpoint.origin || !url.pathname.endsWith('/chat/completions')) {
-      return originalFetch(input, init);
-    }
-    let isSupervisorCall = false;
-    if (typeof init?.body === 'string') {
-      try {
-        const parsedReq = JSON.parse(init.body);
-        isSupervisorCall = !Array.isArray(parsedReq?.tools) || parsedReq.tools.length === 0;
-      } catch {
-        isSupervisorCall = false;
-      }
-    }
-    const rec = {
-      http: null,
-      ms: null,
-      isSupervisorCall,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheWriteTokens: 0,
-      cacheReported: false,
-    };
-    const t0 = performance.now();
-    wireRecords.push(rec);
-    const res = await originalFetch(input, init);
-    rec.http = res.status;
-    const wirePromise = res.clone().text().then((body) => {
-      for (const line of body.split(/\r?\n/)) {
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(payload);
-          if (parsed.usage) {
-            const u = parsed.usage;
-            rec.inputTokens = Number(u.prompt_tokens ?? u.input_tokens ?? rec.inputTokens ?? 0);
-            rec.outputTokens = Number(u.completion_tokens ?? u.output_tokens ?? rec.outputTokens ?? 0);
-            const cr = u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens ?? u.prompt_cache_hit_tokens;
-            const cw = u.cache_creation_input_tokens ?? u.prompt_tokens_details?.cache_creation_tokens;
-            if (cr != null && Number.isFinite(Number(cr))) {
-              rec.cacheReadTokens = Number(cr);
-              rec.cacheReported = true;
-            }
-            if (cw != null && Number.isFinite(Number(cw))) {
-              rec.cacheWriteTokens = Number(cw);
-            }
-          }
-        } catch {
-          // ignore non-JSON SSE chunks
-        }
-      }
-    }).catch(() => {}).finally(() => {
-      rec.ms = Math.round(performance.now() - t0);
-    });
-    pendingWirePromises.push(wirePromise);
-    return res;
-  };
+  const releaseWireCapture = acquireFetchWireCapture(trialId, endpoint, wireRecords, pendingWirePromises);
 
   try {
-    const maxSteps = opts.maxSteps ?? task.resourceBudget?.maxSteps ?? 22;
-    const maxTokens = resolveBenchmarkTaskMaxTokens(task, opts);
-    const session = direct.createSession({
-      workspaceRoot,
-      projectId: task.id,
-      model: requestedModel,
-      permissionMode: 'auto-safe',
-      budget: { maxSteps, maxOutputTokens: 8192, maxTotalTokens: maxTokens },
-      sandbox: sessionSandbox,
-      disableWorkspaceHooks: true,
-      disableWorkspaceMcp: true,
-      trafficSource: 'benchmark',
-      isSynthetic: true,
-      aciProfile: armCfg.aciProfile,
-      aciOptions: armCfg.aciOptions,
-    });
-
-    const allowedTestCommands = new Set([
-      task.fixture.baselineTestCommand.join(' '),
-      task.metadata.acceptanceCriteria.testCommand.join(' '),
-    ]);
-    const protectedSet = new Set([
-      ...(task.fixture.baselineTestFiles ?? []),
-      ...Object.keys(task.fixture.baselineFileHashes ?? {}),
-    ]);
-    unsub = direct.subscribe(session.id, (evt) => {
-      if (evt.type === 'approval/requested') {
-        const a = evt.data;
-        const allow = authorizeRealBenchmarkApproval({
-          toolName: a.tool,
-          args: a.arguments,
-          allowedTestCommands,
-          protectedSet,
-          allowWorkspaceNodeCli,
-        });
-        queueMicrotask(() =>
-          direct.decideApproval(a.approvalId, {
-            decision: allow ? 'allow' : 'deny',
-            scope: 'once',
-            reason: 'Frozen ACI governance benchmark policy',
-          }),
-        );
-      }
-    });
-
-    const deadlineMs = 300_000;
-    const { turn } = direct.startTurn(session.id, {
-      input: task.prompt,
-      model: requestedModel,
-      maxSteps,
-      aciProfile: armCfg.aciProfile,
-      aciOptions: armCfg.aciOptions,
-      evidenceContract: {
-        taskId: task.id,
-        attemptId: 'attempt-1',
-        planVersion: 1,
-        expectedTestCommand: task.metadata.acceptanceCriteria.testCommand,
-        requiredChangedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
+    return await TRIAL_FETCH_ALS.run(trialId, async () => {
+      const maxSteps = opts.maxSteps ?? task.resourceBudget?.maxSteps ?? 22;
+      const maxTokens = resolveBenchmarkTaskMaxTokens(task, opts);
+      const session = direct.createSession({
         workspaceRoot,
-      },
-    });
+        projectId: task.id,
+        model: requestedModel,
+        permissionMode: 'auto-safe',
+        budget: { maxSteps, maxOutputTokens: 8192, maxTotalTokens: maxTokens },
+        sandbox: sessionSandbox,
+        disableWorkspaceHooks: true,
+        disableWorkspaceMcp: true,
+        trafficSource: 'benchmark',
+        isSynthetic: true,
+        aciProfile: armCfg.aciProfile,
+        aciOptions: armCfg.aciOptions,
+      });
 
-    let row;
-    const tTurn = performance.now();
-    while (performance.now() - tTurn < deadlineMs) {
-      row = direct.listTurns(session.id).find((r) => r.id === turn.id);
-      if (['completed', 'failed', 'cancelled', 'reconciling'].includes(row?.state)) break;
-      await delay(50);
-    }
-    const timedOut = !['completed', 'failed', 'cancelled', 'reconciling'].includes(row?.state);
-    if (timedOut) {
-      direct.cancelTurn(turn.id);
-      await direct.waitForTurnTerminal(turn.id, { timeoutMs: 5000 }).catch(() => {});
-      row = direct.listTurns(session.id).find((r) => r.id === turn.id) ?? row;
-    }
+      const allowedTestCommands = new Set([
+        task.fixture.baselineTestCommand.join(' '),
+        task.metadata.acceptanceCriteria.testCommand.join(' '),
+      ]);
+      const protectedSet = new Set([
+        ...(task.fixture.baselineTestFiles ?? []),
+        ...Object.keys(task.fixture.baselineFileHashes ?? {}),
+      ]);
+      unsub = direct.subscribe(session.id, (evt) => {
+        if (evt.type === 'approval/requested') {
+          const a = evt.data;
+          const allow = authorizeAciBenchmarkApproval({
+            toolName: a.tool,
+            args: a.arguments,
+            allowedTestCommands,
+            protectedSet,
+            allowWorkspaceNodeCli,
+          });
+          queueMicrotask(() =>
+            direct.decideApproval(a.approvalId, {
+              decision: allow ? 'allow' : 'deny',
+              scope: 'once',
+              reason: 'Frozen ACI governance benchmark policy',
+            }),
+          );
+        }
+      });
 
-    await Promise.race([Promise.allSettled(pendingWirePromises), delay(2000)]);
-
-    const assistantMsgs = store.db
-      .prepare("SELECT content FROM direct_messages WHERE turnId=? AND role='assistant' ORDER BY seq DESC LIMIT 1")
-      .get(turn.id);
-    const assistantMessageRows = store.db
-      .prepare("SELECT toolCalls FROM direct_messages WHERE turnId=? AND role='assistant' AND toolCalls IS NOT NULL ORDER BY seq ASC")
-      .all(turn.id);
-    const receipts = store.db
-      .prepare('SELECT id, callId, toolName, status, exitCode, errorCode FROM tool_receipts WHERE turnId=? ORDER BY rowid')
-      .all(turn.id);
-    const enrichedReceipts = enrichReceiptsWithCommands(receipts, assistantMessageRows);
-    const eventRows = store.db
-      .prepare('SELECT type, data FROM direct_events WHERE turnId=? ORDER BY seq ASC')
-      .all(turn.id);
-    const diagnostics = extractTurnDiagnosticsFromEvents(eventRows, enrichedReceipts, assistantMessageRows, benchKey);
-    const turnErrorCode = diagnostics.turnErrorCode ?? row?.errorCode ?? (timedOut ? 'TURN_DEADLINE_EXCEEDED' : null);
-
-    const judgment = await task.judge({
-      task,
-      output: assistantMsgs?.content ?? '',
-      context: {
-        workspaceRoot,
-        sandbox: judgeSandbox,
-        attemptId: 'attempt-1',
-        planVersion: 1,
-        toolReceipts: enrichedReceipts,
-        trustedVerdict:
-          row?.state === 'completed'
-            ? { status: 'pass', source: 'trusted_server_verifier', evidenceRefs: enrichedReceipts.map((r) => r.id) }
-            : null,
-        trialMeta: {
-          status: timedOut ? 'timeout' : row?.state === 'completed' ? 'passed' : 'failed',
-          errorCode: turnErrorCode,
+      const deadlineMs = 300_000;
+      const { turn } = direct.startTurn(session.id, {
+        input: task.prompt,
+        model: requestedModel,
+        maxSteps,
+        aciProfile: armCfg.aciProfile,
+        aciOptions: armCfg.aciOptions,
+        evidenceContract: {
+          taskId: task.id,
+          attemptId: 'attempt-1',
+          planVersion: 1,
+          expectedTestCommand: task.metadata.acceptanceCriteria.testCommand,
+          requiredChangedFiles: task.metadata.acceptanceCriteria.requiredChangedFiles,
+          workspaceRoot,
         },
-      },
-    });
+      });
 
-    const wireSup = wireRecords.filter((r) => r.isSupervisorCall);
+      let row;
+      const tTurn = performance.now();
+      while (performance.now() - tTurn < deadlineMs) {
+        row = direct.listTurns(session.id).find((r) => r.id === turn.id);
+        if (['completed', 'failed', 'cancelled', 'reconciling'].includes(row?.state)) break;
+        await delay(50);
+      }
+      const timedOut = !['completed', 'failed', 'cancelled', 'reconciling'].includes(row?.state);
+      if (timedOut) {
+        direct.cancelTurn(turn.id);
+        await direct.waitForTurnTerminal(turn.id, { timeoutMs: 5000 }).catch(() => {});
+        row = direct.listTurns(session.id).find((r) => r.id === turn.id) ?? row;
+      }
 
-    let inputTokens = wireRecords.reduce((s, r) => s + r.inputTokens, 0);
-    let outputTokens = wireRecords.reduce((s, r) => s + r.outputTokens, 0);
-    const cacheReadTokens = wireRecords.reduce((s, r) => s + r.cacheReadTokens, 0);
-    const cacheWriteTokens = wireRecords.reduce((s, r) => s + r.cacheWriteTokens, 0);
-    const sseCacheReported = wireRecords.some((r) => r.cacheReported);
-    if (inputTokens === 0 && outputTokens === 0 && row) {
-      inputTokens = Number(row.inputTokens ?? 0);
-      outputTokens = Number(row.outputTokens ?? 0);
-    }
+      await Promise.race([Promise.allSettled(pendingWirePromises), delay(2000)]);
 
-    const durationMs = Math.round(performance.now() - started);
-    const rm = diagnostics.reasoningMetrics ?? {};
-    const aciMetrics = rm.aciMetrics ?? {};
-    const rawSupCost = aciMetrics.supervisorCost ?? {};
-    const supervisorCost = mergeSupervisorCostTelemetry(
-      rawSupCost,
-      wireSup,
-      aciMetrics.supervisorCalls,
-    );
-    const hasLedgerAdmissions = Array.isArray(aciMetrics?.ledger?.admissions) && aciMetrics.ledger.admissions.length > 0;
-    const readFallback = extractReadAdmissionsFromTurnData({
-      workspaceRoot,
-      eventRows,
-      assistantMessageRows,
-      filesRead: rm.filesRead ?? [],
-    });
+      const assistantMsgs = store.db
+        .prepare("SELECT content FROM direct_messages WHERE turnId=? AND role='assistant' ORDER BY seq DESC LIMIT 1")
+        .get(turn.id);
+      const assistantMessageRows = store.db
+        .prepare("SELECT toolCalls FROM direct_messages WHERE turnId=? AND role='assistant' AND toolCalls IS NOT NULL ORDER BY seq ASC")
+        .all(turn.id);
+      const receipts = store.db
+        .prepare('SELECT id, callId, toolName, status, exitCode, errorCode FROM tool_receipts WHERE turnId=? ORDER BY rowid')
+        .all(turn.id);
+      const enrichedReceipts = enrichReceiptsWithCommands(receipts, assistantMessageRows);
+      const eventRows = store.db
+        .prepare('SELECT type, data FROM direct_events WHERE turnId=? ORDER BY seq ASC')
+        .all(turn.id);
+      const diagnostics = extractTurnDiagnosticsFromEvents(eventRows, enrichedReceipts, assistantMessageRows, benchKey);
+      const turnErrorCode = diagnostics.turnErrorCode ?? row?.errorCode ?? (timedOut ? 'TURN_DEADLINE_EXCEEDED' : null);
 
-    return {
-      taskId: task.id,
-      suite: task._suite,
-      area: task.area,
-      arm: armName,
-      aciProfile: armCfg.aciProfile,
-      aciOptions: armCfg.aciOptions,
-      revision: armRuntime.revision,
-      rep,
-      passed: Boolean(judgment.passed && !timedOut),
-      status: timedOut ? 'timeout' : judgment.passed ? 'passed' : 'failed',
-      turnState: row?.state ?? null,
-      turnErrorCode,
-      groundTruth: getTaskGroundTruthForScoring(task),
-      tokenUsage: {
-        inputTokens,
-        outputTokens,
-        totalTokens: inputTokens + outputTokens,
-        cacheReadTokens,
-        cacheWriteTokens,
-      },
-      tokenCost: inputTokens + outputTokens,
-      sseCacheReported,
-      durationMs,
-      supervisorCost,
-      recoveryStats: aciMetrics.recoveryStats ?? null,
-      readFiles: Array.isArray(rm.filesRead) ? rm.filesRead : [],
-      fileTokensMap: readFallback.fileTokensMap,
-      ...(hasLedgerAdmissions ? {} : { admissions: readFallback.admissions }),
-      toolCallTrace: diagnostics.toolCallTrace,
-      reasoningMetrics: rm,
-      aciMetrics: {
-        ...aciMetrics,
+      const judgment = await task.judge({
+        task,
+        output: assistantMsgs?.content ?? '',
+        context: {
+          workspaceRoot,
+          sandbox: judgeSandbox,
+          attemptId: 'attempt-1',
+          planVersion: 1,
+          toolReceipts: enrichedReceipts,
+          trustedVerdict:
+            row?.state === 'completed'
+              ? { status: 'pass', source: 'trusted_server_verifier', evidenceRefs: enrichedReceipts.map((r) => r.id) }
+              : null,
+          trialMeta: {
+            status: timedOut ? 'timeout' : row?.state === 'completed' ? 'passed' : 'failed',
+            errorCode: turnErrorCode,
+          },
+        },
+      });
+
+      const wireSup = wireRecords.filter((r) => r.isSupervisorCall);
+
+      let inputTokens = wireRecords.reduce((s, r) => s + r.inputTokens, 0);
+      let outputTokens = wireRecords.reduce((s, r) => s + r.outputTokens, 0);
+      const cacheReadTokens = wireRecords.reduce((s, r) => s + r.cacheReadTokens, 0);
+      const cacheWriteTokens = wireRecords.reduce((s, r) => s + r.cacheWriteTokens, 0);
+      const sseCacheReported = wireRecords.some((r) => r.cacheReported);
+      if (inputTokens === 0 && outputTokens === 0 && row) {
+        inputTokens = Number(row.inputTokens ?? 0);
+        outputTokens = Number(row.outputTokens ?? 0);
+      }
+
+      const durationMs = Math.round(performance.now() - started);
+      const rm = diagnostics.reasoningMetrics ?? {};
+      const aciMetrics = rm.aciMetrics ?? {};
+      const rawSupCost = aciMetrics.supervisorCost ?? {};
+      const supervisorCost = mergeSupervisorCostTelemetry(
+        rawSupCost,
+        wireSup,
+        aciMetrics.supervisorCalls,
+      );
+      const hasLedgerAdmissions = Array.isArray(aciMetrics?.ledger?.admissions) && aciMetrics.ledger.admissions.length > 0;
+      const readFallback = extractReadAdmissionsFromTurnData({
+        workspaceRoot,
+        eventRows,
+        assistantMessageRows,
+        filesRead: rm.filesRead ?? [],
+      });
+
+      return {
+        taskId: task.id,
+        suite: task._suite,
+        area: task.area,
+        arm: armName,
+        aciProfile: armCfg.aciProfile,
+        aciOptions: armCfg.aciOptions,
+        revision: armRuntime.revision,
+        rep,
+        passed: Boolean(judgment.passed && !timedOut),
+        status: timedOut ? 'timeout' : judgment.passed ? 'passed' : 'failed',
+        turnState: row?.state ?? null,
+        turnErrorCode,
+        groundTruth: getTaskGroundTruthForScoring(task),
+        tokenUsage: {
+          inputTokens,
+          outputTokens,
+          totalTokens: inputTokens + outputTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+        },
+        tokenCost: inputTokens + outputTokens,
+        sseCacheReported,
+        durationMs,
         supervisorCost,
-      },
-      assistantExcerpt: safeRedactValue(String(assistantMsgs?.content ?? '').slice(0, 600), benchKey),
-      failureCategory: timedOut ? 'timeout' : judgment.evidence.failureCategory,
-      failureAttribution: judgment.evidence.failureAttribution,
-      judge: judgment,
-    };
+        recoveryStats: aciMetrics.recoveryStats ?? null,
+        readFiles: Array.isArray(rm.filesRead) ? rm.filesRead : [],
+        fileTokensMap: readFallback.fileTokensMap,
+        ...(hasLedgerAdmissions ? {} : { admissions: readFallback.admissions }),
+        toolCallTrace: diagnostics.toolCallTrace,
+        reasoningMetrics: rm,
+        aciMetrics: {
+          ...aciMetrics,
+          supervisorCost,
+        },
+        assistantExcerpt: safeRedactValue(String(assistantMsgs?.content ?? '').slice(0, 600), benchKey),
+        failureCategory: timedOut ? 'timeout' : judgment.evidence.failureCategory,
+        failureAttribution: judgment.evidence.failureAttribution,
+        judge: judgment,
+      };
+    });
   } finally {
-    globalThis.fetch = originalFetch;
+    releaseWireCapture();
     unsub?.();
     await direct.close();
     store.close();
@@ -1502,45 +1752,68 @@ export async function runAciGovernanceBenchmark(opts) {
   const dataset = getTaskDataset(opts);
   const armRuntime = await probeAciRuntimeCapabilities(DEFAULT_REPO_ROOT);
 
+  const resumeEnabled = Boolean(opts.resume && opts.output);
+  const resumeState = resumeEnabled
+    ? loadResumeStateFromJsonl(opts.output)
+    : { existingRows: [], completedKeys: new Set(), hadCorruptLines: false };
+
   if (opts.output) {
     mkdirSync(dirname(opts.output), { recursive: true });
-    writeFileSync(opts.output, '', { encoding: 'utf8', mode: 0o600 });
+    if (!resumeEnabled || !existsSync(opts.output)) {
+      writeFileSync(opts.output, '', { encoding: 'utf8', mode: 0o600 });
+    } else {
+      const existingRaw = readFileSync(opts.output, 'utf8');
+      if (existingRaw.length > 0 && !existingRaw.endsWith('\n')) {
+        appendFileSync(opts.output, '\n', { encoding: 'utf8', mode: 0o600 });
+      }
+    }
   }
 
-  const allTrials = [];
+  const plannedCells = [];
   for (let rep = 0; rep < opts.repeats; rep++) {
     for (const [idx, task] of dataset.entries()) {
       if (idx % opts.lanes !== opts.lane) continue;
       // Rotate arm execution order across tasks/repeats to eliminate cache/order bias
       const rotated = opts.arms.map((_, j) => opts.arms[(j + idx + rep) % opts.arms.length]);
       for (const armName of rotated) {
-        const trial =
-          opts.mode === 'real'
-            ? await runRealAciTrial({
-                task,
-                armName,
-                armRuntime,
-                rep,
-                opts,
-                benchKey,
-                endpoint,
-                requestedModel,
-                judgeSandbox,
-              })
-            : await runDeterministicAciTrial({
-                task,
-                armName,
-                armRuntime,
-                rep,
-                opts,
-                judgeSandbox,
-              });
-        allTrials.push(trial);
-        writeJsonlRow(opts.output, trial, benchKey);
+        const key = buildTrialCellKey(task.id, armName, rep);
+        if (resumeState.completedKeys.has(key)) continue;
+        plannedCells.push({ task, armName, rep });
       }
     }
   }
 
+  const newlyCompleted = await runTasksWithConcurrency(
+    plannedCells,
+    opts.concurrency ?? 1,
+    async ({ task, armName, rep }) => {
+      const trial =
+        opts.mode === 'real'
+          ? await runRealAciTrial({
+              task,
+              armName,
+              armRuntime,
+              rep,
+              opts,
+              benchKey,
+              endpoint,
+              requestedModel,
+              judgeSandbox,
+            })
+          : await runDeterministicAciTrial({
+              task,
+              armName,
+              armRuntime,
+              rep,
+              opts,
+              judgeSandbox,
+            });
+      writeJsonlRow(opts.output, trial, benchKey);
+      return trial;
+    },
+  );
+
+  const allTrials = [...resumeState.existingRows, ...newlyCompleted];
   const baselineArm = opts.arms.includes('A') ? 'A' : opts.arms[0];
   const metrics = computeAciGovernanceMetrics(allTrials, { baselineArm });
   const summary = safeRedactValue(
@@ -1550,9 +1823,20 @@ export async function runAciGovernanceBenchmark(opts) {
       mode: opts.mode,
       suite: opts.suite,
       sandboxBackend: judgeSandbox.resolveBackend().mode,
+      concurrency: opts.concurrency ?? 1,
+      resumed: resumeEnabled,
+      resumedExistingCount: resumeState.existingRows.length,
+      executedCount: newlyCompleted.length,
       arms: opts.arms,
       armProfiles: Object.fromEntries(
-        opts.arms.map((a) => [a, resolveArmProfileConfig(a, { dtocMinPromptTokens: opts.dtocMinPromptTokens })]),
+        opts.arms.map((a) => [
+          a,
+          resolveArmProfileConfig(a, {
+            dtocMinPromptTokens: opts.dtocMinPromptTokens,
+            aciProfile: opts.aciProfile,
+            dtocPolicy: opts.dtocPolicy,
+          }),
+        ]),
       ),
       revision: armRuntime.revision,
       capabilities: armRuntime.capabilities,
@@ -1568,6 +1852,20 @@ export async function runAciGovernanceBenchmark(opts) {
       encoding: 'utf8',
       mode: 0o600,
     });
+  }
+
+  if (opts.exportPaper) {
+    const outPath = resolve(String(opts.exportPaper));
+    mkdirSync(dirname(outPath), { recursive: true });
+    const content = /\.tex$/i.test(outPath)
+      ? exportPaperTablesLatex(summary)
+      : exportPaperTablesMarkdown(summary);
+    writeFileSync(outPath, content, { encoding: 'utf8', mode: 0o600 });
+  }
+  if (opts.exportLatex) {
+    const texPath = resolve(String(opts.exportLatex));
+    mkdirSync(dirname(texPath), { recursive: true });
+    writeFileSync(texPath, exportPaperTablesLatex(summary), { encoding: 'utf8', mode: 0o600 });
   }
 
   return summary;
@@ -1587,12 +1885,12 @@ if (isMain) {
     console.log(JSON.stringify(summary, null, 2));
   } else {
     console.log(
-      `[${summary.benchmarkId} v${summary.version}] mode=${summary.mode} suite=${summary.suite} sandbox=${summary.sandboxBackend}`,
+      `[${summary.benchmarkId} v${summary.version}] mode=${summary.mode} suite=${summary.suite} sandbox=${summary.sandboxBackend} concurrency=${summary.concurrency}${summary.resumed ? ` resumed=${summary.resumedExistingCount}` : ''}`,
     );
     for (const arm of summary.arms) {
       const m = summary.metrics.byArm[arm];
       console.log(
-        `Arm ${arm} (${summary.armProfiles[arm].aciProfile}): pass=${m.passedTrials}/${m.totalTrials} recall=${m.criticalContextRecall} precision=${m.contextPrecision} fnr=${m.falseNegativeRate} usefulTok=${m.usefulTokenRatio} tokRed=${m.tokenReduction} cache=${m.cacheHitRate} supTok=${m.supervisorCost.totalTokens} recov=${m.recoverySuccessRate}`,
+        `Arm ${arm} (${summary.armProfiles[arm].aciProfile}): pass=${m.passedTrials}/${m.totalTrials} ci95=[${m.passRateCI?.lower ?? 0},${m.passRateCI?.upper ?? 0}] recall=${m.criticalContextRecall} precision=${m.contextPrecision} fnr=${m.falseNegativeRate} usefulTok=${m.usefulTokenRatio} tokRed=${m.tokenReduction} pairedPassRed=${m.pairedPassTokenReduction ?? 'null'} tokPerPass=${m.tokensPerCompletedPass ?? 'null'} cache=${m.cacheHitRate} supTok=${m.supervisorCost.totalTokens} recov=${m.recoverySuccessRate}`,
       );
     }
   }

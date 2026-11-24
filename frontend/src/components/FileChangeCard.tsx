@@ -27,9 +27,14 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
 }) {
   const [open, setOpen] = useState(false);
   const previewId = useId();
-  const { path, added, deleted, lines, afterText } = file;
+  const { path, added, deleted, lines, afterText, hunks, sha256After } = file;
   const { dir, name } = splitPath(path);
-  const status = file.isNew ? { kind: 'add', label: '新增' } : file.isDeleted ? { kind: 'del', label: '删除' } : { kind: 'edit', label: '修改' };
+  const status =
+    file.isNew || file.action === 'create'
+      ? { kind: 'add', label: '新增' }
+      : file.isDeleted || file.action === 'delete'
+        ? { kind: 'del', label: '删除' }
+        : { kind: 'edit', label: '修改' };
   const visibleLines = useMemo(() => {
     const keep = new Set<number>();
     lines.forEach((line, index) => {
@@ -38,6 +43,19 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
     });
     return keep.size ? lines.filter((_, index) => keep.has(index)).slice(0, 120) : lines.slice(0, 60);
   }, [lines]);
+
+  const visibleHunks = useMemo(() => {
+    if (!hunks?.length) return null;
+    let remaining = 120;
+    const out: Array<{ header: string; lines: typeof lines }> = [];
+    for (const hunk of hunks) {
+      if (remaining <= 0) break;
+      const sliced = hunk.lines.slice(0, remaining);
+      remaining -= sliced.length;
+      out.push({ header: hunk.header, lines: sliced });
+    }
+    return out;
+  }, [hunks]);
 
   return (
     <div className="codex-file-row-wrap" hidden={hidden} data-scroll-anchor={`file:${listId}:${path}`}>
@@ -59,13 +77,48 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
         <div className="codex-file-inline-diff">
           <div className="codex-inline-diff-head">
             <button type="button" className="codex-inline-link-btn" onClick={() => onInspectFile(path)}><span>{path}</span></button>
-            <ActivityCopyButton text={afterText} label="复制文件内容" onCopy={onCopy} />
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              {sha256After && (
+                <span
+                  className="tabular-nums"
+                  title={`SHA-256: ${sha256After}`}
+                  style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)' }}
+                >
+                  #{sha256After.slice(0, 8)}
+                </span>
+              )}
+              <ActivityCopyButton text={afterText || file.unifiedDiff || ''} label="复制文件内容" onCopy={onCopy} />
+            </div>
           </div>
           <div className="codex-inline-diff-body">
-            {visibleLines.length === 0 ? (
+            {visibleHunks ? (
+              visibleHunks.map((hunk, hIdx) => (
+                <div key={`${hunk.header}-${hIdx}`} className="codex-inline-diff-hunk">
+                  <div
+                    className="codex-inline-diff-row"
+                    data-kind="hunk"
+                    style={{
+                      color: 'var(--text-tertiary)',
+                      background: 'var(--bg-surface-secondary)',
+                      borderTop: hIdx > 0 ? '1px solid var(--border-subtle)' : undefined,
+                      borderBottom: '1px solid var(--border-subtle)',
+                    }}
+                  >
+                    <span className="codex-inline-diff-ln">@@</span>
+                    <span>{hunk.header}</span>
+                  </div>
+                  {hunk.lines.map((line, lIdx) => (
+                    <div key={`${hIdx}:${lIdx}:${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
+                      <span className="codex-inline-diff-ln">{line.newLine ?? line.oldLine ?? ''}</span>
+                      <span>{line.text || ' '}</span>
+                    </div>
+                  ))}
+                </div>
+              ))
+            ) : visibleLines.length === 0 ? (
               <div style={{ padding: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>无文本行差异</div>
-            ) : visibleLines.map((line) => (
-              <div key={`${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
+            ) : visibleLines.map((line, lIdx) => (
+              <div key={`${lIdx}:${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
                 <span className="codex-inline-diff-ln">{line.newLine ?? line.oldLine ?? ''}</span>
                 <span>{line.text || ' '}</span>
               </div>
