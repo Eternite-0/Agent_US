@@ -37,6 +37,9 @@ summary:is(.codex-direct-activity-row, .codex-direct-tool-row):focus-visible { o
 .codex-file-row-trigger[aria-expanded='true'] .codex-direct-chevron { transform: rotate(90deg); }
 .codex-file-more-btn[aria-expanded='true'] .codex-direct-chevron { transform: rotate(180deg); }
 
+.codex-direct-activity-row:active, .codex-direct-tool-row:active,
+.codex-file-row-trigger:active:not(:disabled) { background: var(--control-pressed); }
+
 .codex-direct-tools { min-width: 0; margin-inline-start: 10px; padding-inline-start: 8px; border-inline-start: 1px solid var(--border-subtle); }
 .codex-direct-issue { flex: none; font-size: var(--text-caption); }
 .codex-direct-issue:not([data-status='interrupted']),

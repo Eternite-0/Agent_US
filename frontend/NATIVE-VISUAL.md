@@ -4,7 +4,7 @@ The transcript is the content surface. Assistant prose, the work log, and file c
 
 | Element | Treatment |
 | --- | --- |
-| Transcript | `--thread-content-max-width` (720 px); 14 px default assistant body with 1.65 line-height; adaptive gutters |
+| Transcript | `--thread-content-max-width` (720 px); 14.5 px default assistant body with 1.65 line-height; adaptive gutters |
 | Activity | 26 px minimum rows, 14 px icons, secondary text, monospace commands and paths; the disclosure marker stays beside its label; warning/error carry color |
 | Command / code | 5 px inset; no exterior border/shadow; output scrolls independently and chains vertical scrolling to the transcript at its bounds |
 | File changes | Flat list shown below the final response only after successful delivery; file names open Inspector; a separate disclosure opens the inline diff |
@@ -31,3 +31,17 @@ E2E_SCREENSHOT_DIR=/absolute/path/to/after npm run test:e2e:visual
 Run these commands from `frontend/`. The visual suite captures the running app against a deterministic test API in light/dark at 1440×960, 1280×800, and 780×650, with layout assertions for the native presentation. The runtime suite separately tests the real Direct backend, terminal execution, streamed updates, and Prompt Cache with a scripted upstream model response. Neither suite substitutes fixtures into the production app.
 
 For a before comparison, set `E2E_FRONTEND_DIR` to the absolute, symlink-resolved `frontend/` path of a separate worktree of `f79e164a24f1848e51ef7b4b03b69c4d68fcd0f9` with dependencies installed, and point `E2E_SCREENSHOT_DIR` at a different destination. Baseline mode tests the same input without imposing new visual requirements. `E2E_VISUAL_PORT` allows two runs without a port conflict.
+
+## iOS-inspired desktop interaction pass
+
+This is a desktop design reference, not a phone layout. Use Apple's [Motion](https://developer.apple.com/design/human-interface-guidelines/motion) and [Accessibility](https://developer.apple.com/design/human-interface-guidelines/accessibility) guidance for brief, optional feedback. The [ChatGPT App Store listing](https://apps.apple.com/us/app/chatgpt/id6448311069) is a public visual reference; it does not establish the app's private UI implementation or exact animation curves.
+
+| Interaction | Desktop treatment |
+| --- | --- |
+| Navigation / selected values | Low-intensity accent fill and readable text for workspace navigation, settings, Inspector, capability filters, and menu selection. |
+| Press / focus | 90 ms button feedback; 0.96 scale only for small command buttons, with color-only feedback under Reduce Motion. Keyboard focus gets a high-contrast outline. |
+| Popover / dialog | 150 ms anchored entry or 200 ms dialog entry; theme-aware opaque surfaces. No blur or heavy shadow. |
+| Content / live work | Markdown prose stays unboxed. Streamed transcript position, tool disclosure IDs, and scroll geometry are not animated. OS and in-app reduced-motion settings stop decoration and the expandable sidebar transition. |
+| Inspector | Arrow keys, Home/End, and Delete operate tabs; opening a tab from the plus menu no longer requires scrolling the tab strip. |
+
+Visual regression runs the same desktop routes in both themes, including the settings, search, scheduling dialog, capability and evaluation surfaces. Fixture screenshots establish layout, not completeness of real provider data. Browser tests also cover focus restoration from model selection and reduced-motion behavior independently of the operating system.

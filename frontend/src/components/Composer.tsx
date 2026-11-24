@@ -149,6 +149,8 @@ export const Composer: React.FC<ComposerProps> = ({
   const [menuDismissed, setMenuDismissed] = useState(false);
   const [searchResult, setSearchResult] = useState<{ query: string; kind: WorkspaceEntryKind; files: string[]; failed?: boolean } | null>(null);
   const menuId = useId();
+  const modelTrigger = useRef<HTMLButtonElement>(null);
+  const permissionTrigger = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const rootRef = useRef<HTMLDivElement>(null);
@@ -311,7 +313,13 @@ ${draftInjection.text}`
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPopover(null);
+      if (e.key !== 'Escape' || e.defaultPrevented || !popover) return;
+      // Preserve Escape dismissal even when a pointer-opened menu did not take focus.
+      if (rootRef.current?.contains(document.activeElement)) {
+        if (popover === 'effort' || popover === 'models') modelTrigger.current?.focus({ preventScroll: true });
+        if (popover === 'permission') permissionTrigger.current?.focus({ preventScroll: true });
+      }
+      setPopover(null);
     };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
@@ -1235,6 +1243,7 @@ ${draftInjection.text}`
                 className="codex-composer-pill"
                 data-warning={permissionMode === 'full-access' ? 'true' : undefined}
                 data-open={popover === 'permission' ? 'true' : undefined}
+                ref={permissionTrigger}
                 aria-expanded={popover === 'permission'}
                 aria-label={permissionLabel}
                 disabled={permissionPending || permissionMode === 'read-only'}
@@ -1351,6 +1360,9 @@ ${draftInjection.text}`
                 type="button"
                 className="codex-composer-pill"
                 data-open={popover === 'effort' || popover === 'models' ? 'true' : undefined}
+                ref={modelTrigger}
+                aria-label="模型与推理强度"
+                aria-expanded={popover === 'effort' || popover === 'models'}
                 onClick={() =>
                   setPopover((p) => (p === 'effort' || p === 'models' ? null : 'effort'))
                 }

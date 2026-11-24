@@ -238,3 +238,108 @@ test('approval and Swarm execution with Reviewer evidence', async ({ page }, inf
     await page.getByRole('button', { name: '关闭右侧面板', exact: true }).click();
   }
 });
+
+async function expectSingleFieldFocus(field) {
+  const input = field.locator('input');
+  await expect(input).toBeFocused();
+  if (process.env.E2E_FRONTEND_DIR) return;
+  await expect(field).toHaveCSS('outline-style', 'solid');
+  await expect(field).toHaveCSS('outline-width', '2px');
+  await expect(field).toHaveCSS('box-shadow', 'none');
+  await expect(input).toHaveCSS('outline-style', 'none');
+}
+
+test('desktop shell, search, settings, capability navigation and scheduling surfaces', async ({ page }, info) => {
+  await page.goto('/');
+  for (const theme of ['light', 'dark']) {
+    await toggleTheme(page, theme);
+    await page.keyboard.press('Control+K');
+    const search = page.getByRole('dialog', { name: '搜索与快捷操作' });
+    await expectSingleFieldFocus(search.locator('.codex-search-top'));
+    await capture(page, info, 'global-search');
+    await page.keyboard.press('Escape');
+    await expect(search).toHaveCount(0);
+
+    await navigate(page, '/settings/appearance');
+    await expect(page.getByRole('heading', { name: '外观', exact: true })).toBeVisible();
+    await capture(page, info, 'settings-appearance');
+    await navigate(page, '/capabilities');
+    await expect(page.locator('.codex-body[data-capabilities-view="true"] .codex-settings-body')).toBeVisible();
+    await capture(page, info, 'capabilities');
+    await navigate(page, '/evaluations');
+    await expect(page.getByRole('heading', { name: '能力评测', exact: true })).toBeVisible();
+    await capture(page, info, 'evaluations');
+    await navigate(page, '/tasks');
+    await page.getByRole('button', { name: '新建任务', exact: true }).first().click();
+    await expect(page.getByRole('heading', { name: '新建定时任务', exact: true })).toBeVisible();
+    await expectSingleFieldFocus(page.locator('.codex-modal-input-box'));
+    await capture(page, info, 'schedule-dialog');
+    await page.locator('.codex-modal-cancel-btn').click();
+    await navigate(page, '/');
+  }
+});
+
+test('desktop focus and reduced motion do not alter transcript or inspector state', async ({ page }, info) => {
+  test.skip(Boolean(process.env.E2E_FRONTEND_DIR), 'New keyboard and motion behavior');
+  test.skip(info.project.name !== '1440x960', 'Keyboard and motion are viewport-independent');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.goto('/');
+  const model = page.getByRole('button', { name: '模型与推理强度', exact: true });
+  await model.focus();
+  await page.keyboard.press('Enter');
+  const slider = page.getByRole('slider', { name: '推理强度' });
+  await slider.focus();
+  await page.keyboard.press('ArrowLeft');
+  await page.keyboard.press('Escape');
+  await expect(model).toBeFocused();
+  await expect(model).toHaveAttribute('aria-expanded', 'false');
+  await model.click();
+  await expect(model).toHaveAttribute('aria-expanded', 'true');
+  const searchTrigger = page.locator('.codex-sidebar [aria-label="搜索"]').first();
+  await searchTrigger.focus();
+  await page.keyboard.press('Escape');
+  await expect(model).toHaveAttribute('aria-expanded', 'false');
+  await expect(searchTrigger).toBeFocused();
+
+  await navigate(page, '/t/markdown-visual');
+  const files = transcript(page).locator('.codex-file-card');
+  await files.getByRole('button', { name: '在右侧分屏打开 src/config.ts', exact: true }).click();
+  const tabs = page.getByRole('tablist', { name: '工作区标签页' });
+  const file = tabs.getByRole('tab', { name: 'config.ts' });
+  const subagents = tabs.getByRole('tab', { name: '子智能体' });
+  await expect(file).toHaveAttribute('aria-selected', 'true');
+  await file.focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(subagents).toBeFocused();
+  await expect(subagents).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('End');
+  await expect(file).toBeFocused();
+  await expect(page.getByRole('tabpanel', { name: 'config.ts' })).toBeVisible();
+  await page.keyboard.press('Delete');
+  await expect(file).toHaveCount(0);
+  await expect(subagents).toBeFocused();
+  const addPane = page.getByRole('button', { name: '打开面板标签页', exact: true });
+  await addPane.click();
+  await page.getByRole('button', { name: 'SSE 事件与版本', exact: true }).click();
+  await expect(tabs.getByRole('tab', { name: '事件与版本' })).toHaveAttribute('aria-selected', 'true');
+  await addPane.click();
+  await page.keyboard.press('Escape');
+  await expect(addPane).toBeFocused();
+  await expect(addPane).toHaveAttribute('aria-expanded', 'false');
+  await page.getByRole('button', { name: '关闭右侧面板', exact: true }).click();
+
+  await navigate(page, '/settings/appearance');
+  await page.getByRole('switch', { name: '减弱动效' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-reduced-motion', 'true');
+  await navigate(page, '/t/approval-visual');
+  await expect(transcript(page).locator('.codex-approval-card')).toBeVisible();
+  await page.keyboard.press('Control+K');
+  await expect(page.getByRole('dialog', { name: '搜索与快捷操作' })).toHaveCSS('animation-name', 'none');
+  await page.keyboard.press('Escape');
+  await navigate(page, '/settings/appearance');
+  await page.getByRole('switch', { name: '减弱动效' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-reduced-motion', 'false');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.keyboard.press('Control+K');
+  await expect(page.getByRole('dialog', { name: '搜索与快捷操作' })).toHaveCSS('animation-name', 'none');
+});

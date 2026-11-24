@@ -28,7 +28,8 @@ export const Collapsible: React.FC<CollapsibleProps> = ({ open, id, className = 
       el.style.overflow = open ? 'visible' : 'hidden';
       if (!open) setRendered(false);
     };
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    if (document.documentElement.dataset.reducedMotion === 'true'
+        || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       settle();
       return;
     }

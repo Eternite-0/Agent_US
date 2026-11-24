@@ -70,7 +70,7 @@
   --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --text-chat: 14px;
   --text-chat-line: 22px;
-  --text-assistant: 14px;
+  --text-assistant: 14.5px;
   --text-assistant-line: 1.65;
   --text-meta: 12.5px;
   --text-meta-line: 17px;
@@ -103,13 +103,21 @@
   --radius-popover: 8px;
   --radius-dialog: 10px;
   --workspace-row-radius: 5px;
-  --workspace-selection: var(--bg-selected);
+  --workspace-selection: color-mix(in srgb, var(--color-accent) 10%, var(--bg-surface));
+  --workspace-selection-text: var(--color-text-accent);
+  --control-pressed: color-mix(in srgb, var(--text-default) 12%, transparent);
+  --control-focus: color-mix(in srgb, var(--color-accent) 76%, var(--bg-surface));
+  --overlay-stroke: var(--border-strong);
+  --overlay-scrim: rgb(15 20 28 / 27%);
   --thread-focus-ring: var(--color-accent);
   --row-height: 28px;
   --settings-nav-width: 252px;
   --settings-content-max: 760px;
 
   /* Motion */
+  --duration-feedback: 90ms;
+  --duration-popover: 150ms;
+  --duration-dialog: 200ms;
   --duration-basic: 150ms;
   --duration-moderate: 0.2s;
   --duration-relaxed: 0.3s;
@@ -127,6 +135,7 @@
 
 /* Dark workspace and overlay colors */
 [data-theme="dark"] {
+  --overlay-scrim: rgb(0 0 0 / 48%);
   --bg-chrome: #1f2022;
   --bg-surface: #191a1c;
   --bg-surface-secondary: rgba(252, 252, 252, 0.041);
@@ -424,8 +433,8 @@
 [data-font-size="compact"] {
   --text-chat: 13px;
   --text-chat-line: 19.5px;
-  --text-assistant: 14.5px;
-  --text-assistant-line: 1.66;
+  --text-assistant: 13px;
+  --text-assistant-line: 1.6;
 }
 
 [data-font-size="comfortable"] {

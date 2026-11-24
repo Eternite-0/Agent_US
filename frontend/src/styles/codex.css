@@ -39,12 +39,20 @@ button {
   outline: none;
 }
 
-button:focus-visible,
-input:focus-visible,
-textarea:focus-visible,
-select:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
-  outline-offset: -1px;
+/* Preserve a visible keyboard focus indicator on native and custom controls. */
+:is(button, input, textarea, select, a, summary, [role='button'], [role='tab'], [role='slider']):focus-visible {
+  outline: 2px solid var(--control-focus);
+  outline-offset: -2px;
+}
+
+/* Compound text fields show one ring around the full field, including its icon. */
+:is(.codex-settings-search, .codex-project-popover-search, .codex-modal-input-box, .chat-archive-filter, .codex-search-top):has(input:focus-visible) {
+  outline: 2px solid var(--control-focus);
+  outline-offset: -2px;
+}
+
+:is(.codex-settings-search, .codex-project-popover-search, .codex-modal-input-box, .chat-archive-filter, .codex-search-top) input:focus-visible {
+  outline: none;
 }
 
 button:disabled {
@@ -130,8 +138,9 @@ button:disabled {
   justify-content: center;
   color: var(--text-tertiary);
   transition:
-    color var(--duration-basic) var(--ease-out),
-    background-color var(--duration-basic) var(--ease-out);
+    color var(--duration-feedback) var(--ease-out),
+    background-color var(--duration-feedback) var(--ease-out),
+    scale var(--duration-feedback) var(--ease-out);
 }
 
 .codex-icon-btn:hover:not(:disabled),
@@ -141,8 +150,13 @@ button:disabled {
 }
 
 .codex-icon-btn[data-active="true"] {
-  background: var(--bg-selected);
-  color: var(--text-default);
+  background: var(--workspace-selection);
+  color: var(--workspace-selection-text);
+}
+
+.codex-icon-btn:active:not(:disabled) {
+  background: var(--control-pressed);
+  scale: .96;
 }
 
 .codex-menubar {
@@ -279,15 +293,11 @@ button:disabled {
 }
 
 .codex-rail-btn[data-active="true"] {
-  background: var(--bg-surface);
-  color: var(--text-default);
-  box-shadow: var(--shadow-sm);
+  background: var(--workspace-selection);
+  color: var(--workspace-selection-text);
 }
 
-[data-theme="dark"] .codex-rail-btn[data-active="true"] {
-  background: rgba(252, 252, 252, 0.11);
-  box-shadow: none;
-}
+.codex-rail-btn:active:not(:disabled) { background: var(--control-pressed); }
 
 .codex-rail-badge {
   position: absolute;
@@ -421,6 +431,7 @@ button:disabled {
 
 .codex-sidebar-row[data-selected="true"] {
   background: var(--workspace-selection);
+  color: var(--workspace-selection-text);
 }
 
 .codex-sidebar-row[data-selected="true"]::before {
@@ -510,7 +521,7 @@ button:disabled {
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-modal);
-  animation: codex-enter-popover 0.16s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 /* Right-click floating context menu */
@@ -520,10 +531,10 @@ button:disabled {
   min-width: 196px;
   padding: 5px;
   border-radius: var(--radius-popover);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--overlay-stroke);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-lg);
-  animation: codex-enter-popover 0.14s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 /* Composer drag-and-drop overlay */
@@ -558,7 +569,7 @@ button:disabled {
 
 .codex-effort-label-val {
   display: inline-block;
-  animation: codex-enter-popover-up 0.16s var(--ease-enter-snappy);
+  animation: codex-enter-popover-up var(--duration-popover) var(--ease-enter-snappy);
 }
 
 /* Slash command & @ mention popover above composer */
@@ -577,7 +588,7 @@ button:disabled {
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-popover);
-  animation: codex-enter-popover-up 0.14s var(--ease-enter-snappy);
+  animation: codex-enter-popover-up var(--duration-popover) var(--ease-enter-snappy);
 }
 
 /* Turn Minimap Hover Preview Tooltip */
@@ -603,7 +614,7 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  animation: codex-enter-popover 0.14s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 .codex-minimap-preview-item {
@@ -639,7 +650,7 @@ button:disabled {
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-lg);
-  animation: codex-enter-popover 0.14s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 .codex-find-bar input {
@@ -656,7 +667,7 @@ button:disabled {
   width: 100%;
   max-width: var(--thread-content-max-width);
   margin: 0 auto 10px;
-  animation: codex-enter-popover-up 0.18s var(--ease-enter-snappy);
+  animation: codex-enter-popover-up var(--duration-popover) var(--ease-enter-snappy);
 }
 
 .codex-approval-progress {
@@ -1135,6 +1146,10 @@ button:disabled {
   border-color: var(--composer-border-active);
 }
 
+.codex-composer-card:has(.codex-composer-textarea:focus-visible) {
+  border-color: var(--control-focus);
+}
+
 .codex-composer-attachments {
   display: flex;
   flex-wrap: wrap;
@@ -1238,6 +1253,8 @@ button:disabled {
   color: var(--color-warning);
 }
 
+.codex-composer-pill:active:not(:disabled) { background: var(--control-pressed); }
+
 .codex-composer-model-name {
   max-width: 140px;
   overflow: hidden;
@@ -1257,9 +1274,9 @@ button:disabled {
   color: var(--text-inverse);
   flex: none;
   transition:
-    transform var(--duration-basic) var(--ease-out),
-    opacity var(--duration-basic) var(--ease-out),
-    background-color var(--duration-basic) var(--ease-out);
+    transform var(--duration-feedback) var(--ease-out),
+    opacity var(--duration-feedback) var(--ease-out),
+    background-color var(--duration-feedback) var(--ease-out);
 }
 
 .codex-send-btn:hover:not(:disabled) {
@@ -1267,7 +1284,7 @@ button:disabled {
 }
 
 .codex-send-btn:active:not(:disabled) {
-  transform: scale(0.94);
+  transform: scale(.96);
 }
 
 .codex-send-btn:disabled {
@@ -1281,12 +1298,12 @@ button:disabled {
   position: absolute;
   z-index: 80;
   background: var(--bg-surface-elevated);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--overlay-stroke);
   border-radius: var(--radius-popover);
   box-shadow: var(--shadow-popover);
   padding: 5px;
   min-width: 200px;
-  animation: codex-enter-popover var(--duration-basic) var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 .codex-popover[data-side="top"] {
@@ -1313,13 +1330,12 @@ button:disabled {
   transition: background-color var(--duration-basic) var(--ease-out);
 }
 
-.codex-popover-item:hover {
-  background: var(--bg-ghost-hover);
+.codex-popover-item[data-selected="true"] {
+  background: var(--workspace-selection);
 }
 
-.codex-popover-item[data-selected="true"] {
-  background: var(--bg-selected);
-}
+.codex-popover-item:hover:not(:disabled) { background: var(--bg-ghost-hover); }
+.codex-popover-item:active:not(:disabled):not([aria-disabled='true']) { background: var(--control-pressed); }
 
 .codex-popover-divider {
   height: 1px;
@@ -1785,7 +1801,7 @@ button:disabled {
 }
 
 .codex-markdown p {
-  margin: 0 0 12px;
+  margin: 0 0 .88em;
 }
 
 .codex-markdown h1,
@@ -2047,6 +2063,8 @@ button:disabled {
 .codex-toolbar-btn:hover:not(:disabled) {
   background: var(--bg-ghost-hover);
 }
+
+.codex-toolbar-btn:active:not(:disabled) { opacity: .83; }
 
 .codex-toolbar-btn[data-variant="outline"] {
   border-color: var(--border-default);
@@ -2380,7 +2398,7 @@ button:disabled {
   width: 100%;
   height: 30px;
   padding: 5px 10px;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-control);
   display: flex;
   align-items: center;
   gap: 9px;
@@ -2397,7 +2415,9 @@ button:disabled {
 }
 
 .codex-settings-nav-item[data-active="true"] {
-  background: var(--bg-selected);
+  background: var(--workspace-selection);
+  color: var(--workspace-selection-text);
+  font-weight: var(--font-weight-strong);
 }
 
 .codex-settings-body {
@@ -2576,28 +2596,16 @@ button:disabled {
  * 12. Command Palette / Global Search (1:1 with live/search_dialog.png)
  * ========================================================================== */
 
-.codex-modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 120;
-  background: rgba(0, 0, 0, 0.28);
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding-top: 12vh;
-  animation: codex-fade-in 0.12s var(--ease-out);
-}
-
 .codex-search-modal {
   width: min(680px, 92vw);
   border-radius: var(--radius-dialog);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--overlay-stroke);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-modal);
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  animation: codex-dialog-enter 0.16s var(--ease-enter-snappy);
+  animation: codex-dialog-enter var(--duration-dialog) var(--ease-enter-snappy);
 }
 
 .codex-search-top {
@@ -2665,9 +2673,9 @@ button:disabled {
 }
 
 .codex-search-tab[data-active="true"] {
-  background: var(--bg-selected);
-  color: var(--text-default);
-  font-weight: 500;
+  background: var(--workspace-selection);
+  color: var(--workspace-selection-text);
+  font-weight: var(--font-weight-strong);
 }
 
 /* ============================================================================
@@ -2873,7 +2881,7 @@ button:disabled {
   border: 1px solid var(--border-default);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-lg);
-  animation: codex-enter-popover 0.12s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 .codex-selection-popover button {
@@ -3120,24 +3128,24 @@ button:disabled {
   position: fixed;
   inset: 0;
   z-index: 160;
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--overlay-scrim);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 20px;
-  animation: codex-fade-in 0.14s var(--ease-out);
+  animation: codex-fade-in var(--duration-popover) var(--ease-out);
 }
 
 .codex-modal-card {
   width: min(440px, 100%);
   border-radius: var(--radius-dialog);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--overlay-stroke);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-dialog);
   padding: 18px 20px 18px;
   display: flex;
   flex-direction: column;
-  animation: codex-enter-popover 0.16s var(--ease-enter-snappy);
+  animation: codex-dialog-enter var(--duration-dialog) var(--ease-enter-snappy);
 }
 
 .codex-modal-header {
@@ -3161,18 +3169,15 @@ button:disabled {
   gap: 9px;
   height: 40px;
   padding: 0 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-control);
   border: 1px solid var(--border-strong);
   background: var(--bg-surface);
   color: var(--text-secondary);
-  transition:
-    border-color var(--duration-basic) var(--ease-out),
-    box-shadow var(--duration-basic) var(--ease-out);
+  transition: border-color var(--duration-basic) var(--ease-out);
 }
 
 .codex-modal-input-box:focus-within {
-  border-color: var(--color-accent);
-  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--color-accent) 45%, transparent);
+  border-color: var(--control-focus);
 }
 
 .codex-modal-input-box input {
@@ -3350,7 +3355,7 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  animation: codex-enter-popover 0.16s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 /* Gracefully hide floating card only on genuinely narrow viewports */
@@ -3526,10 +3531,18 @@ button:disabled {
 }
 
 .codex-split-tab[data-active="true"] {
-  background: var(--bg-selected);
-  color: var(--text-default);
-  font-weight: 500;
+  background: var(--workspace-selection);
+  color: var(--workspace-selection-text);
+  font-weight: var(--font-weight-strong);
 }
+
+.codex-split-tablist { display: flex; flex: none; gap: 4px; }
+.codex-split-actions { display: inline-flex; align-items: center; gap: 2px; flex: none; }
+.codex-split-add { position: relative; flex: none; }
+.codex-split-add > .codex-popover { inset-inline-end: 0; }
+.codex-split-tab-trigger { display: inline-flex; align-items: center; gap: 6px; min-width: 0; height: 100%; border-radius: var(--radius-xs); }
+.codex-split-tab-trigger > svg { flex: none; }
+.codex-split-panel { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
 
 .codex-split-tab-label {
   overflow: hidden;
@@ -3780,9 +3793,9 @@ button:disabled {
 }
 
 .codex-tree-node[data-active="true"] {
-  background: var(--bg-selected);
-  color: var(--text-default);
-  font-weight: 500;
+  background: var(--workspace-selection);
+  color: var(--workspace-selection-text);
+  font-weight: var(--font-weight-strong);
 }
 
 .codex-tree-badge {
@@ -3998,7 +4011,7 @@ button:disabled {
   gap: 6px;
   text-align: left;
   cursor: pointer;
-  animation: codex-enter-popover 0.14s var(--ease-enter-snappy);
+  animation: codex-enter-popover var(--duration-popover) var(--ease-enter-snappy);
 }
 
 [data-theme="dark"] .codex-minimap-card {
@@ -4271,10 +4284,12 @@ button:disabled {
 }
 
 .codex-custom-pill[data-active="true"] {
-  background: var(--bg-selected);
+  background: var(--workspace-selection);
   border-color: var(--border-default);
-  color: var(--text-default);
+  color: var(--workspace-selection-text);
 }
+
+.codex-custom-pill:active:not(:disabled) { background: var(--control-pressed); }
 
 .codex-custom-install-btn {
   height: 26px;
@@ -4603,7 +4618,7 @@ button:disabled {
   border-radius: var(--radius-lg);
   background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-lg);
-  animation: codex-enter-popover-up .14s var(--ease-enter-snappy);
+  animation: codex-enter-popover-up var(--duration-popover) var(--ease-enter-snappy);
 }
 .codex-shortcuts-title { font-size: 12px; font-weight: 600; margin-bottom: 7px; }
 .codex-shortcuts-grid {
@@ -4630,7 +4645,7 @@ button:disabled {
   font-size: 12.5px;
   line-height: 18px;
 }
-.codex-provider-form { animation: codex-enter-popover-up .16s var(--ease-enter-snappy); }
+.codex-provider-form { animation: codex-enter-popover-up var(--duration-popover) var(--ease-enter-snappy); }
 @media (max-width: 720px) {
   .codex-composer-hint span:nth-child(2) { display: none; }
   .codex-composer-hint { gap: 8px; }
@@ -5014,10 +5029,6 @@ button:focus-visible {
   flex-direction: column;
 }
 
-.codex-project-popover-search input:focus-visible {
-  outline: none;
-}
-
 .codex-branch-section-label {
   padding: 8px 12px 4px;
   font-size: 12px;
@@ -5389,7 +5400,7 @@ button:focus-visible {
   justify-content: center;
   overflow-y: auto;
   padding: 24px;
-  background: rgba(10, 10, 10, 0.48);
+  background: var(--overlay-scrim);
 }
 
 .codex-body[data-capabilities-view="true"] .codex-modal {
@@ -5400,7 +5411,7 @@ button:focus-visible {
   max-height: calc(100vh - 48px);
   overflow: auto;
   overscroll-behavior: contain;
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--overlay-stroke);
   border-radius: var(--radius-dialog);
   background-color: var(--bg-surface-elevated);
   color: var(--text-default);
@@ -5408,6 +5419,7 @@ button:focus-visible {
   padding: 20px;
   opacity: 1;
   isolation: isolate;
+  animation: codex-dialog-enter var(--duration-dialog) var(--ease-enter-snappy);
 }
 
 @media (max-width: 560px) {
@@ -5471,7 +5483,6 @@ button:focus-visible {
   background: var(--bg-surface-elevated);
 }
 
-.chat-archive-filter:focus-within,
 .chat-archive-entry:focus-visible,
 .chat-archive-link:focus-visible,
 .chat-search-key:focus-visible,
@@ -5569,7 +5580,7 @@ button:focus-visible {
 .chat-archive-menu-label { display: inline-flex; align-items: center; gap: 7px; }
 
 .codex-search-modal .codex-search-top { padding: 15px 16px; color: var(--text-secondary); }
-.codex-search-modal .codex-search-input { min-width: 0; outline: none; }
+.codex-search-modal .codex-search-input { min-width: 0; }
 .codex-search-modal .codex-search-top:focus-within { border-bottom-color: var(--border-default); }
 .codex-search-modal .codex-search-tabs { border-top: 0; border-bottom: 1px solid var(--border-subtle); overflow-x: auto; }
 .codex-search-modal .codex-search-tab { flex: none; }
@@ -5580,6 +5591,7 @@ button:focus-visible {
   overscroll-behavior: contain;
 }
 .codex-search-modal .codex-search-row { min-height: 42px; }
+.codex-search-row:active:not(:disabled), .chat-archive-entry:active:not(:disabled) { background: var(--control-pressed); }
 .chat-search-icon { display: inline-flex; flex: none; color: var(--text-secondary); }
 .chat-search-meta { flex: none; display: flex; gap: 8px; align-items: center; font-size: 11px; color: var(--text-secondary); }
 .chat-search-archived { border-radius: 4px; padding: 2px 5px; background: var(--bg-selected); }
@@ -5649,7 +5661,8 @@ button:focus-visible {
   overflow-wrap: anywhere;
 }
 .evaluation-benchmarks button { flex: none; }
-.evaluation-run-row { width: 100%; text-align: left; transition: background-color 140ms ease; }
+.evaluation-run-row { width: 100%; text-align: left; transition: background-color var(--duration-feedback) var(--ease-out); }
+.evaluation-run-row:active:not(:disabled) { background: var(--control-pressed); }
 .evaluation-run-row:hover, .evaluation-run-row[aria-expanded="true"] { background: var(--bg-ghost-hover); }
 .evaluation-run-row small, .evaluation-results small, .evaluation-results li > span, .evaluation-detail-meta {
   color: var(--text-secondary);
@@ -5773,7 +5786,6 @@ button:focus-visible {
 .swarm-section-tab[aria-pressed='true'] svg { color: var(--color-text-accent); }
 .swarm-section-tab:focus-visible { outline-offset: -2px; }
 .codex-drawer .codex-split-tabbar { background: transparent; }
-.codex-split-tab[data-active='true'] { background: var(--workspace-selection); }
 .codex-subagent-list-row { border-radius: var(--workspace-row-radius); }
 .autonomous-panel details[open] > .swarm-row { background: var(--bg-ghost-hover-soft); }
 .autonomous-section { padding-top: 8px; }
@@ -5832,13 +5844,17 @@ button:focus-visible {
   width: min(440px, calc(100% - 28px));
   max-height: calc(100dvh - 24px);
   padding: 14px;
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--overlay-stroke);
   border-radius: var(--radius-dialog);
   background: var(--bg-surface-elevated);
   color: var(--text-default);
   box-shadow: var(--shadow-modal);
 }
-.composer-dialog::backdrop { background: rgba(5, 10, 17, 0.48); }
+.composer-dialog[open] { animation: codex-dialog-enter var(--duration-dialog) var(--ease-enter-snappy); }
+.composer-dialog::backdrop {
+  background: var(--overlay-scrim);
+  animation: codex-fade-in var(--duration-popover) var(--ease-out);
+}
 .composer-dialog-header, .composer-dialog-actions { display: flex; align-items: center; gap: 8px; }
 .composer-dialog-header { justify-content: space-between; margin-bottom: 10px; }
 .composer-dialog-header h2 { margin: 0; font-size: 15px; font-weight: 600; }
@@ -5983,3 +5999,11 @@ button:focus-visible {
 .swarm-run-diagnostics > summary { color: var(--text-secondary); cursor: pointer; font-size: 12px; }
 .swarm-run-diagnostics[open] > .swarm-dependencies { margin-top: 7px; }
 .swarm-run-diagnostics code { overflow-wrap: anywhere; }
+
+/* Reduced Motion keeps the pressed color without scaling the hit target. */
+@media (prefers-reduced-motion: reduce) {
+  .codex-icon-btn:active:not(:disabled) { scale: none; }
+  .codex-send-btn:active:not(:disabled) { transform: none; }
+}
+[data-reduced-motion='true'] .codex-icon-btn:active:not(:disabled) { scale: none; }
+[data-reduced-motion='true'] .codex-send-btn:active:not(:disabled) { transform: none; }

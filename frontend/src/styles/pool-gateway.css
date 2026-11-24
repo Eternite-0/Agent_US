@@ -390,7 +390,7 @@
   position: fixed;
   inset: 0;
   z-index: 1200;
-  background: rgba(0, 0, 0, 0.42);
+  background: var(--overlay-scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -399,13 +399,14 @@
 
 .a2a-modal-shell {
   width: min(880px, 95vw);
-  max-height: 86vh;
+  max-height: 86dvh;
   display: flex;
   flex-direction: column;
   border-radius: var(--radius-dialog);
-  border: 1px solid var(--border-strong);
-  background: var(--bg-surface);
+  border: 1px solid var(--overlay-stroke);
+  background: var(--bg-surface-elevated);
   box-shadow: var(--shadow-dialog);
+  animation: codex-dialog-enter var(--duration-dialog) var(--ease-enter-snappy);
   overflow: hidden;
 }
 

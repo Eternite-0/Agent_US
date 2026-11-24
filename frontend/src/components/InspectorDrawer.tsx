@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { Approval, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
 import { aggregateFileChanges, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
 import { fmtClock, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
@@ -198,6 +198,10 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   const [loadedVersion, setLoadedVersion] = useState<Task | null>(null);
   const [loadingVersion, setLoadingVersion] = useState(false);
 
+  const panelBodyId = useId();
+  const tabDomId = (id: string) => `${panelBodyId}-tab-${encodeURIComponent(id)}`;
+  const tabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const pendingTabFocus = useRef<string | null>(null);
   const plusMenuRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
@@ -385,26 +389,31 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     window.addEventListener('mouseup', onUp);
   };
 
-  const closeTab = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const selectTab = (next: OpenPaneTab) => {
+    setActiveTabId(next.id);
+    if (next.kind === 'file') {
+      onChangeTab('diff');
+      if (next.path !== '__all__') onSelectFile(next.path);
+    } else onChangeTab(next.kind);
+  };
+
+  const closeTab = (id: string) => {
     const remaining = openTabs.filter((t) => t.id !== id);
     if (remaining.length === 0) {
       onClose();
       return;
     }
+    const next = remaining[Math.min(openTabs.findIndex(tab => tab.id === id), remaining.length - 1)];
     setOpenTabs(remaining);
-    if (activeTabId === id) {
-      const next = remaining[remaining.length - 1];
-      setActiveTabId(next.id);
-      if (next.kind === 'subagents') onChangeTab('subagents');
-      else if (next.kind === 'events') onChangeTab('events');
-      else if (next.kind === 'autonomous') onChangeTab('autonomous');
-      else if (next.kind === 'file') {
-        onChangeTab('diff');
-        if (next.path !== '__all__') onSelectFile(next.path);
-      }
-    }
+    pendingTabFocus.current = next.id;
+    if (activePaneTab?.id === id) selectTab(next);
   };
+
+  useEffect(() => {
+    const next = pendingTabFocus.current;
+    if (next) tabRefs.current.get(next)?.focus();
+    pendingTabFocus.current = null;
+  }, [openTabs]);
 
   const openFileInPane = (path: string) => {
     const base = path.replace(/\\/g, '/').split('/').pop() || path;
@@ -540,8 +549,10 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
       onKeyDown={(event) => {
         if (event.key === 'Escape' && !event.defaultPrevented && !lightbox) {
           event.stopPropagation();
-          if (plusMenuOpen) setPlusMenuOpen(false);
-          else onClose();
+          if (plusMenuOpen) {
+            setPlusMenuOpen(false);
+            plusMenuRef.current?.querySelector('button')?.focus({ preventScroll: true });
+          } else onClose();
         }
       }}
       className="codex-drawer"
@@ -556,68 +567,55 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
       <div className="codex-drawer-inner" style={{ width }}>
         {/* Multi-Tab Bar (1:1 with User Screenshots 3, 4, 5!) */}
         <div className="codex-split-tabbar">
-          <div className="codex-split-tabs" role="tablist">
-            {openTabs.map((t) => {
-              const active = activePaneTab?.id === t.id;
-              return (
-                <div
-                  key={t.id}
-                  role="tab"
-                  aria-selected={active}
-                  tabIndex={0}
-                  className="codex-split-tab"
-                  data-active={active ? 'true' : undefined}
-                  onClick={() => {
-                    setActiveTabId(t.id);
-                    if (t.kind === 'subagents') onChangeTab('subagents');
-                    else if (t.kind === 'events') onChangeTab('events');
-                    else if (t.kind === 'autonomous') onChangeTab('autonomous');
-                    else if (t.kind === 'file') {
-                      onChangeTab('diff');
-                      if (t.path !== '__all__') onSelectFile(t.path);
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      setActiveTabId(t.id);
-                    }
-                  }}
-                >
-                  {t.kind === 'subagents' ? (
-                    <IconAgentTeam size={13} style={{ flex: 'none' }} />
-                  ) : t.kind === 'autonomous' ? (
-                    <IconDagNodes size={13} style={{ flex: 'none' }} />
-                  ) : t.kind === 'events' ? (
-                    <IconHistory size={13} style={{ flex: 'none' }} />
-                  ) : (
-                    <IconFileDoc size={13} style={{ flex: 'none' }} />
-                  )}
-                  <span className="codex-split-tab-label">{t.label}</span>
-                  <button
-                    type="button"
-                    className="codex-split-tab-close"
-                    aria-label={`关闭 ${t.label}`}
-                    onClick={(e) => closeTab(t.id, e)}
-                  >
-                    <IconClose size={11} />
-                  </button>
-                </div>
-              );
-            })}
+          <div className="codex-split-tabs">
+            <div className="codex-split-tablist" role="tablist" aria-label="工作区标签页">
+              {openTabs.map((t, index) => {
+                const active = activePaneTab?.id === t.id;
+                return (
+                  <div key={t.id} className="codex-split-tab" data-active={active ? 'true' : undefined}>
+                    <button type="button" role="tab" id={tabDomId(t.id)} aria-controls={panelBodyId}
+                      aria-selected={active} tabIndex={active ? 0 : -1} className="codex-split-tab-trigger"
+                      ref={node => { if (node) tabRefs.current.set(t.id, node); else tabRefs.current.delete(t.id); }}
+                      onClick={() => selectTab(t)}
+                      onKeyDown={event => {
+                        if (event.key === 'Delete') { event.preventDefault(); closeTab(t.id); return; }
+                        const n = openTabs.length;
+                        const nextIndex = event.key === 'ArrowRight' ? (index + 1) % n
+                          : event.key === 'ArrowLeft' ? (index + n - 1) % n
+                          : event.key === 'Home' ? 0 : event.key === 'End' ? n - 1 : -1;
+                        if (nextIndex < 0) return;
+                        event.preventDefault();
+                        selectTab(openTabs[nextIndex]);
+                        tabRefs.current.get(openTabs[nextIndex].id)?.focus();
+                      }}>
+                      {t.kind === 'subagents' ? <IconAgentTeam size={13} />
+                        : t.kind === 'autonomous' ? <IconDagNodes size={13} />
+                        : t.kind === 'events' ? <IconHistory size={13} /> : <IconFileDoc size={13} />}
+                      <span className="codex-split-tab-label">{t.label}</span>
+                    </button>
+                    <button type="button" className="codex-split-tab-close" tabIndex={-1}
+                      aria-label={`关闭 ${t.label}`} onClick={() => closeTab(t.id)}><IconClose size={11} /></button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
 
-            <div style={{ position: 'relative', flex: 'none' }} ref={plusMenuRef}>
+          <div className="codex-split-actions">
+            <div className="codex-split-add" ref={plusMenuRef}>
               <button
                 type="button"
                 className="codex-icon-btn"
                 style={{ width: 26, height: 26 }}
+                aria-label="打开面板标签页"
+                aria-expanded={plusMenuOpen}
                 title="打开面板标签页"
                 onClick={() => setPlusMenuOpen((v) => !v)}
               >
                 <IconPlus size={14} />
               </button>
               {plusMenuOpen && (
-                <div className="codex-popover" data-side="bottom" style={{ left: 0, width: 176 }}>
+                <div className="codex-popover" data-side="bottom">
                   <button
                     type="button"
                     className="codex-popover-item"
@@ -665,9 +663,6 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                 </div>
               )}
             </div>
-          </div>
-
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flex: 'none' }}>
             <button
               type="button"
               className="codex-icon-btn"
@@ -691,6 +686,8 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
           </div>
         </div>
 
+        <div className="codex-split-panel" id={panelBodyId} role="tabpanel"
+          aria-labelledby={activePaneTab ? tabDomId(activePaneTab.id) : undefined}>
         {/* Empty state if no active task */}
         {activePaneTab?.kind === 'autonomous' ? (
           open && <AutonomousRunPanel key={sessionId ?? 'no-session'} client={client} sessionId={sessionId} preferredRunId={preferredRunId} receipt={swarmReceipt} eventSeq={swarmEventSeq} approvals={swarmApprovals} sectionRequest={swarmSectionRequest} />
@@ -1283,6 +1280,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
             </div>
           </div>
         )}
+        </div>
       </div>
 
       <ImageLightbox

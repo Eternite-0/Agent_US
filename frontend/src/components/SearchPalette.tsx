@@ -73,7 +73,7 @@ export const SearchPalette: React.FC<SearchPaletteProps> = ({
     setTitleMatches(null);
     inputRef.current?.focus();
     return () => {
-      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus();
+      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus({ preventScroll: true });
     };
   }, [open]);
 
