@@ -11,7 +11,9 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
-export const SWEBENCH_HF_DATASET_ID = 'princeton-nlp/SWE-bench_Verified';
+export const SWEBENCH_HF_MINI_DATASET_ID = 'MariusHobbhahn/swe-bench-verified-mini';
+export const SWEBENCH_HF_FULL_DATASET_ID = 'princeton-nlp/SWE-bench_Verified';
+export const SWEBENCH_HF_DATASET_ID = SWEBENCH_HF_MINI_DATASET_ID;
 export const SMOKE5_PREFERRED_REPOS = Object.freeze([
   'psf/requests',
   'pytest-dev/pytest',
@@ -80,11 +82,14 @@ function writeTextAtomic(targetPath, content) {
 }
 
 /**
- * Returns the default local JSONL cache path for SWE-bench Verified.
+ * Returns the default local JSONL cache path for SWE-bench Verified (mini by default).
  */
-export function getDefaultSweBenchCachePath(repoRoot = DEFAULT_REPO_ROOT) {
+export function getDefaultSweBenchCachePath(
+  repoRoot = DEFAULT_REPO_ROOT,
+  fileName = 'swebench_verified_mini.jsonl',
+) {
   const root = repoRoot ? resolve(String(repoRoot)) : DEFAULT_REPO_ROOT;
-  return join(root, 'backend', 'data', 'benchmarks', 'swebench_verified.jsonl');
+  return join(root, 'backend', 'data', 'benchmarks', String(fileName || 'swebench_verified_mini.jsonl'));
 }
 
 function splitUnquotedList(rawText) {
@@ -209,11 +214,13 @@ export function normalizeSweBenchExtendedFields(raw = {}) {
 }
 
 /**
- * Paginates the HuggingFace Datasets Server HTTP API for `princeton-nlp/SWE-bench_Verified`
- * and atomically writes the normalized dataset as `.jsonl`.
+ * Paginates the HuggingFace Datasets Server HTTP API (defaulting to the 50-instance
+ * `MariusHobbhahn/swe-bench-verified-mini` dataset) and atomically writes the
+ * normalized dataset as `.jsonl`.
  */
 export async function fetchSweBenchVerifiedDataset({
-  outputPath = getDefaultSweBenchCachePath(),
+  outputPath = undefined,
+  datasetId = SWEBENCH_HF_MINI_DATASET_ID,
   fetchImpl = globalThis.fetch,
   pageSize = 100,
   split = 'test',
@@ -228,14 +235,21 @@ export async function fetchSweBenchVerifiedDataset({
     throw new Error('pageSize must be a positive integer');
   }
 
-  const absOut = resolve(String(outputPath || getDefaultSweBenchCachePath()));
+  const effectiveDatasetId = String(datasetId || SWEBENCH_HF_MINI_DATASET_ID).trim();
+  const defaultFileName =
+    effectiveDatasetId === SWEBENCH_HF_FULL_DATASET_ID
+      ? 'swebench_verified.jsonl'
+      : 'swebench_verified_mini.jsonl';
+  const absOut = resolve(
+    String(outputPath || getDefaultSweBenchCachePath(DEFAULT_REPO_ROOT, defaultFileName)),
+  );
   const instances = [];
   let offset = 0;
   let numRowsTotal = null;
 
   while (numRowsTotal === null || offset < numRowsTotal) {
     const url =
-      `${DEFAULT_HF_ROWS_URL}?dataset=${encodeURIComponent(SWEBENCH_HF_DATASET_ID)}` +
+      `${DEFAULT_HF_ROWS_URL}?dataset=${encodeURIComponent(effectiveDatasetId)}` +
       `&config=${encodeURIComponent(String(config))}` +
       `&split=${encodeURIComponent(String(split))}` +
       `&offset=${offset}&length=${effectivePageSize}`;
@@ -425,6 +439,13 @@ function allocateLargestRemainder(groups, totalQuota, rng = null) {
   return quotas;
 }
 
+function getInstanceTestCount(instance) {
+  return (
+    parseTestTargetList(instance?.FAIL_TO_PASS ?? instance?.fail_to_pass).length +
+    parseTestTargetList(instance?.PASS_TO_PASS ?? instance?.pass_to_pass).length
+  );
+}
+
 function selectSmoke5Subset(instances) {
   const targetCount = Math.min(5, instances.length);
   if (targetCount === 0) return [];
@@ -439,54 +460,34 @@ function selectSmoke5Subset(instances) {
   for (const list of byRepo.values()) {
     list.sort(
       (a, b) =>
-        computeSweBenchComplexityScore(a) - computeSweBenchComplexityScore(b) ||
+        getInstanceTestCount(a) - getInstanceTestCount(b) ||
+        String(a?.problem_statement ?? '').length - String(b?.problem_statement ?? '').length ||
         compareStringsAsc(a?.instance_id, b?.instance_id),
     );
   }
 
+  const orderedRepos = [
+    ...SMOKE5_PREFERRED_REPOS.filter((r) => byRepo.has(r)),
+    ...[...byRepo.keys()]
+      .filter((r) => !SMOKE5_PREFERRED_REPOS.includes(r))
+      .sort(compareStringsAsc),
+  ];
+
   const selected = [];
-  const selectedIds = new Set();
-  const usedRepos = new Set();
-
-  const pickMedianFromRepo = (repo) => {
-    const pool = (byRepo.get(repo) ?? []).filter((inst) => !selectedIds.has(inst.instance_id));
-    if (pool.length === 0) return null;
-    const medianIdx = Math.floor((pool.length - 1) / 2);
-    const chosen = pool[medianIdx];
-    selected.push(chosen);
-    selectedIds.add(chosen.instance_id);
-    usedRepos.add(repo);
-    return chosen;
-  };
-
-  for (const repo of SMOKE5_PREFERRED_REPOS) {
-    if (selected.length >= targetCount) break;
-    if (byRepo.has(repo)) {
-      pickMedianFromRepo(repo);
-    }
-  }
-
-  const remainingRepos = [...byRepo.keys()].filter((r) => !usedRepos.has(r)).sort(compareStringsAsc);
-  for (const repo of remainingRepos) {
-    if (selected.length >= targetCount) break;
-    pickMedianFromRepo(repo);
-  }
-
-  if (selected.length < targetCount) {
-    const orderedRepos = [
-      ...SMOKE5_PREFERRED_REPOS.filter((r) => byRepo.has(r)),
-      ...[...byRepo.keys()]
-        .filter((r) => !SMOKE5_PREFERRED_REPOS.includes(r))
-        .sort(compareStringsAsc),
-    ];
-    while (selected.length < targetCount) {
-      let progressed = false;
-      for (const repo of orderedRepos) {
-        if (selected.length >= targetCount) break;
-        if (pickMedianFromRepo(repo)) progressed = true;
+  const cursors = new Map(orderedRepos.map((repo) => [repo, 0]));
+  while (selected.length < targetCount) {
+    let progressed = false;
+    for (const repo of orderedRepos) {
+      if (selected.length >= targetCount) break;
+      const list = byRepo.get(repo);
+      const idx = cursors.get(repo) ?? 0;
+      if (idx < list.length) {
+        selected.push(list[idx]);
+        cursors.set(repo, idx + 1);
+        progressed = true;
       }
-      if (!progressed) break;
     }
+    if (!progressed) break;
   }
 
   return selected;
@@ -1249,13 +1250,21 @@ export async function evaluateSweBenchPredictions({
   imageResolver = null,
   createDockerSession,
   pull = 'missing',
+  memory = '2g',
+  memorySwap = undefined,
+  cpus = undefined,
   concurrency = 1,
   outputPath = null,
+  onInstanceDone = null,
   logger = console,
 } = {}) {
   if (!Array.isArray(instances)) {
     throw new Error('evaluateSweBenchPredictions requires an instances array');
   }
+
+  const resolvedMemory = memory === undefined ? '2g' : memory;
+  const resolvedMemorySwap =
+    memorySwap !== undefined ? memorySwap : resolvedMemory === '2g' ? '2.5g' : undefined;
 
   const loadedPredictions = loadPredictionsInput({ predictions, predictionsPath });
   const predById = new Map();
@@ -1279,13 +1288,6 @@ export async function evaluateSweBenchPredictions({
   const results = await runWithConcurrency(pairs, concurrency, async ({ instance, prediction }) => {
     const t0 = performance.now();
     const modelPatch = String(prediction?.model_patch ?? '');
-    if (!modelPatch.trim()) {
-      return buildUnresolvedEvalRecord(instance, prediction, {
-        reason: 'empty_patch',
-        durationMs: Math.max(1, Math.round(performance.now() - t0)),
-      });
-    }
-
     const image =
       typeof imageResolver === 'function'
         ? imageResolver(instance)
@@ -1294,18 +1296,37 @@ export async function evaluateSweBenchPredictions({
           : null;
 
     let session = null;
+    let result = null;
+    let usedDocker = false;
     try {
-      session = await createDockerSession({ instance, image, pull });
+      if (!modelPatch.trim()) {
+        result = buildUnresolvedEvalRecord(instance, prediction, {
+          reason: 'empty_patch',
+          durationMs: Math.max(1, Math.round(performance.now() - t0)),
+        });
+        return result;
+      }
+
+      usedDocker = true;
+      session = await createDockerSession({
+        instance,
+        image,
+        pull,
+        ...(resolvedMemory != null ? { memory: resolvedMemory } : {}),
+        ...(resolvedMemorySwap != null ? { memorySwap: resolvedMemorySwap } : {}),
+        ...(cpus != null ? { cpus } : {}),
+      });
 
       // 1. Apply model prediction patch cleanly inside /testbed
       const applyModelCmd = buildHeredocGitApplyCommand(modelPatch);
       const modelApplyRes = await session.exec(applyModelCmd, { skipAntiCheatGuard: true });
       if (!modelApplyRes || modelApplyRes.timedOut || modelApplyRes.exitCode !== 0) {
-        return buildUnresolvedEvalRecord(instance, prediction, {
+        result = buildUnresolvedEvalRecord(instance, prediction, {
           reason: 'patch_apply_failed',
           exitCode: modelApplyRes?.timedOut ? 124 : modelApplyRes?.exitCode ?? 1,
           durationMs: Math.max(1, Math.round(performance.now() - t0)),
         });
+        return result;
       }
 
       // 2. Reset any files touched by test_patch, then apply official test_patch
@@ -1324,11 +1345,12 @@ export async function evaluateSweBenchPredictions({
         const applyTestCmd = buildHeredocGitApplyCommand(testPatch);
         const testApplyRes = await session.exec(applyTestCmd, { skipAntiCheatGuard: true });
         if (!testApplyRes || testApplyRes.timedOut || testApplyRes.exitCode !== 0) {
-          return buildUnresolvedEvalRecord(instance, prediction, {
+          result = buildUnresolvedEvalRecord(instance, prediction, {
             reason: 'test_patch_apply_failed',
             exitCode: testApplyRes?.timedOut ? 124 : testApplyRes?.exitCode ?? 1,
             durationMs: Math.max(1, Math.round(performance.now() - t0)),
           });
+          return result;
         }
       }
 
@@ -1356,7 +1378,7 @@ export async function evaluateSweBenchPredictions({
         exitCode: combinedExitCode,
       });
 
-      return {
+      result = {
         instance_id: instance.instance_id,
         model_name_or_path: String(prediction?.model_name_or_path ?? ''),
         repo: String(instance.repo ?? ''),
@@ -1374,21 +1396,32 @@ export async function evaluateSweBenchPredictions({
         failedTests: [...parsed.failedNames],
         durationMs: Math.max(1, Math.round(performance.now() - t0)),
       };
+      return result;
     } catch (err) {
       logger?.warn?.(
         `[swebench-eval] Evaluation failed for ${instance.instance_id}: ${err?.message ?? err}`,
       );
-      return buildUnresolvedEvalRecord(instance, prediction, {
+      result = buildUnresolvedEvalRecord(instance, prediction, {
         reason: 'eval_error',
         error: err?.message ?? String(err),
         durationMs: Math.max(1, Math.round(performance.now() - t0)),
       });
+      return result;
     } finally {
       if (session && typeof session.destroy === 'function') {
         try {
           await session.destroy();
         } catch {
           // Ignore destroy failure
+        }
+      }
+      if (typeof onInstanceDone === 'function') {
+        try {
+          await onInstanceDone({ instance, image, result, usedDocker });
+        } catch (cleanupErr) {
+          logger?.warn?.(
+            `[swebench-eval] Cleanup callback failed for ${instance.instance_id}: ${cleanupErr?.message ?? cleanupErr}`,
+          );
         }
       }
     }

@@ -6,9 +6,10 @@ import { join, resolve } from 'node:path';
 import {
   SMOKE5_PREFERRED_REPOS,
   SWEBENCH_HF_DATASET_ID,
+  SWEBENCH_HF_FULL_DATASET_ID,
+  SWEBENCH_HF_MINI_DATASET_ID,
   buildSweBenchEvalCommands,
   computePairedResolutionMetrics,
-  computeSweBenchComplexityScore,
   djangoTestNodeToLabel,
   evaluateSweBenchPredictions,
   fetchSweBenchVerifiedDataset,
@@ -36,7 +37,9 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
   });
 
   test('constants, cache path, parseTestTargetList, and normalizeSweBenchExtendedFields handle all input variants', () => {
-    assert.equal(SWEBENCH_HF_DATASET_ID, 'princeton-nlp/SWE-bench_Verified');
+    assert.equal(SWEBENCH_HF_MINI_DATASET_ID, 'MariusHobbhahn/swe-bench-verified-mini');
+    assert.equal(SWEBENCH_HF_FULL_DATASET_ID, 'princeton-nlp/SWE-bench_Verified');
+    assert.equal(SWEBENCH_HF_DATASET_ID, SWEBENCH_HF_MINI_DATASET_ID);
     assert.deepEqual(SMOKE5_PREFERRED_REPOS, [
       'psf/requests',
       'pytest-dev/pytest',
@@ -47,12 +50,12 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
 
     const defaultCache = getDefaultSweBenchCachePath();
     assert.equal(
-      defaultCache.endsWith(join('backend', 'data', 'benchmarks', 'swebench_verified.jsonl')),
+      defaultCache.endsWith(join('backend', 'data', 'benchmarks', 'swebench_verified_mini.jsonl')),
       true,
     );
     assert.equal(
       getDefaultSweBenchCachePath('/tmp/custom-root'),
-      join(resolve('/tmp/custom-root'), 'backend', 'data', 'benchmarks', 'swebench_verified.jsonl'),
+      join(resolve('/tmp/custom-root'), 'backend', 'data', 'benchmarks', 'swebench_verified_mini.jsonl'),
     );
 
     // JSON array string with duplicates and whitespace
@@ -145,7 +148,7 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
       const parsed = new URL(url);
       assert.equal(parsed.origin, 'https://datasets-server.huggingface.co');
       assert.equal(parsed.pathname, '/rows');
-      assert.equal(parsed.searchParams.get('dataset'), 'princeton-nlp/SWE-bench_Verified');
+      assert.equal(parsed.searchParams.get('dataset'), 'MariusHobbhahn/swe-bench-verified-mini');
       assert.equal(parsed.searchParams.get('config'), 'default');
       assert.equal(parsed.searchParams.get('split'), 'test');
 
@@ -183,6 +186,22 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     assert.deepEqual(lines[0].FAIL_TO_PASS, ['tests/test_req.py::test_chunked']);
     assert.deepEqual(lines[1].FAIL_TO_PASS, ['test_alias (queries.tests.AnnotationTests)']);
     assert.equal(lines[2].version, '1.12');
+
+    // Explicit full dataset override fetches princeton-nlp/SWE-bench_Verified when requested
+    let fullFetchDatasetParam = null;
+    await fetchSweBenchVerifiedDataset({
+      outputPath: join(dir, 'full.jsonl'),
+      datasetId: SWEBENCH_HF_FULL_DATASET_ID,
+      fetchImpl: async (url) => {
+        fullFetchDatasetParam = new URL(url).searchParams.get('dataset');
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ rows: [{ row: mockRows[0] }], num_rows_total: 1 }),
+        };
+      },
+    });
+    assert.equal(fullFetchDatasetParam, 'princeton-nlp/SWE-bench_Verified');
 
     // Error handling: HTTP 500 & malformed shape
     await assert.rejects(
@@ -242,7 +261,7 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
 
     assert.throws(() => selectSweBenchSubset(instances, { preset: 'unknown' }), /Invalid SWE-bench subset preset/);
 
-    // smoke-5: picks 5 instances spanning the 5 preferred repos in order, median complexity per repo
+    // smoke-5: picks 5 smallest/lightest instances round-robin prioritizing distinct repos
     const smoke5 = selectSweBenchSubset(instances, { preset: 'smoke-5', outputDir: outDir });
     assert.equal(smoke5.instances.length, 5);
     assert.deepEqual(
@@ -255,17 +274,51 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     assert.equal(smokeManifest.count, 5);
     assert.deepEqual(smokeManifest.instanceIds, smoke5.instanceIds);
 
-    // Check median pick for django/django (36 items sorted by complexity -> index 17)
+    // Check lightest pick for django/django (sorted by testCount, problem_statement.length, instance_id)
     const djangoSorted = instances
       .filter((i) => i.repo === 'django/django')
-      .sort((a, b) => computeSweBenchComplexityScore(a) - computeSweBenchComplexityScore(b));
-    assert.equal(smoke5.instances[2].instance_id, djangoSorted[Math.floor((36 - 1) / 2)].instance_id);
+      .sort(
+        (a, b) =>
+          a.FAIL_TO_PASS.length +
+            a.PASS_TO_PASS.length -
+            (b.FAIL_TO_PASS.length + b.PASS_TO_PASS.length) ||
+          a.problem_statement.length - b.problem_statement.length ||
+          (a.instance_id < b.instance_id ? -1 : a.instance_id > b.instance_id ? 1 : 0),
+      );
+    assert.equal(smoke5.instances[2].instance_id, djangoSorted[0].instance_id);
 
-    // smoke-5 fallback when < 5 repos exist
-    const twoRepoInstances = instances.filter((i) => i.repo === 'psf/requests' || i.repo === 'pallets/flask');
-    const smokeTwoRepo = selectSweBenchSubset(twoRepoInstances, { preset: 'smoke-5' });
-    assert.equal(smokeTwoRepo.instances.length, 5);
-    assert.equal(new Set(smokeTwoRepo.instanceIds).size, 5);
+    // smoke-5 round-robin on mini-style 2-repo dataset (django/django + sphinx-doc/sphinx) -> 3 django + 2 sphinx lightest
+    const miniLikePool = [
+      ...Array.from({ length: 6 }, (_, i) => ({
+        instance_id: `django__django-${100 + i}`,
+        repo: 'django/django',
+        base_commit: `dj-${i}`,
+        problem_statement: 'x'.repeat(200 - i * 10),
+        FAIL_TO_PASS: ['t1'],
+        PASS_TO_PASS: Array.from({ length: 6 - i }, (_, k) => `p${k}`),
+      })),
+      ...Array.from({ length: 4 }, (_, i) => ({
+        instance_id: `sphinx-doc__sphinx-${200 + i}`,
+        repo: 'sphinx-doc/sphinx',
+        base_commit: `sp-${i}`,
+        problem_statement: 'y'.repeat(180 - i * 10),
+        FAIL_TO_PASS: ['t1'],
+        PASS_TO_PASS: Array.from({ length: 4 - i }, (_, k) => `p${k}`),
+      })),
+    ];
+    const smokeMini = selectSweBenchSubset(miniLikePool, { preset: 'smoke-5' });
+    assert.equal(smokeMini.instances.length, 5);
+    assert.deepEqual(smokeMini.repoDistribution, {
+      'django/django': 3,
+      'sphinx-doc/sphinx': 2,
+    });
+    assert.deepEqual(smokeMini.instanceIds, [
+      'django__django-105',
+      'sphinx-doc__sphinx-203',
+      'django__django-104',
+      'sphinx-doc__sphinx-202',
+      'django__django-103',
+    ]);
 
     // paper-50: deterministic under fixed seed even when input array order is reversed/shuffled
     const paperSeed42A = selectSweBenchSubset(instances, {
@@ -570,12 +623,15 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     );
 
     const sessionLog = [];
+    const sessionMemoryParams = [];
     const destroyedIds = [];
+    const doneEvents = [];
     const resolvedCommands = [];
 
-    const createDockerSession = async ({ instance }) => {
+    const createDockerSession = async ({ instance, memory, memorySwap }) => {
       const id = instance.instance_id;
       sessionLog.push(id);
+      sessionMemoryParams.push({ id, memory, memorySwap });
       let applyCount = 0;
       return {
         workspaceRoot: `/tmp/${id}`,
@@ -643,6 +699,15 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
       createDockerSession,
       concurrency: 2,
       outputPath: evalOutPath,
+      onInstanceDone: ({ instance, image, result, usedDocker }) => {
+        doneEvents.push({
+          id: instance.instance_id,
+          image,
+          reason: result?.reason,
+          usedDocker,
+          alreadyDestroyed: !usedDocker || destroyedIds.includes(instance.instance_id),
+        });
+      },
     });
 
     assert.equal(evalOut.totalInstances, 6);
@@ -650,6 +715,20 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     assert.equal(evalOut.resolvedCount, 1);
     assert.equal(evalOut.resolvedRate, Number((1 / 6).toFixed(4)));
     assert.equal(existsSync(evalOutPath), true);
+
+    // Default memory='2g' and memorySwap='2.5g' forwarded cleanly to createDockerSession
+    assert.ok(sessionMemoryParams.length > 0);
+    for (const mp of sessionMemoryParams) {
+      assert.equal(mp.memory, '2g');
+      assert.equal(mp.memorySwap, '2.5g');
+    }
+
+    // onInstanceDone fires after destroy() for every evaluated instance (supports --eval-only image cleanup)
+    assert.equal(doneEvents.length, 6);
+    for (const ev of doneEvents) {
+      assert.equal(ev.alreadyDestroyed, true, `destroy() must precede onInstanceDone for ${ev.id}`);
+      assert.match(ev.image, /^ghcr\.io\/epoch-research\/swe-bench\.eval\.x86_64\./);
+    }
 
     // Empty patch must skip Docker session creation; all opened sessions must be destroyed
     assert.equal(sessionLog.includes('inst-empty'), false);
@@ -681,20 +760,27 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
 
     // Ensure session.destroy() is always called even when exec throws mid-evaluation
     let thrownDestroyed = false;
+    let customMemSeen = null;
     const errEval = await evaluateSweBenchPredictions({
       instances: [instances[0]],
       predictions: [predictions[0]],
+      memory: '4g',
+      memorySwap: '4g',
       logger: { warn() {} },
-      createDockerSession: async () => ({
-        workspaceRoot: '/tmp/err',
-        async exec() {
-          throw new Error('simulated container crash');
-        },
-        async destroy() {
-          thrownDestroyed = true;
-        },
-      }),
+      createDockerSession: async ({ memory, memorySwap }) => {
+        customMemSeen = { memory, memorySwap };
+        return {
+          workspaceRoot: '/tmp/err',
+          async exec() {
+            throw new Error('simulated container crash');
+          },
+          async destroy() {
+            thrownDestroyed = true;
+          },
+        };
+      },
     });
+    assert.deepEqual(customMemSeen, { memory: '4g', memorySwap: '4g' });
     assert.equal(thrownDestroyed, true, 'destroy() must always run in finally');
     assert.equal(errEval.results[0].resolved, false);
     assert.equal(errEval.results[0].reason, 'eval_error');
