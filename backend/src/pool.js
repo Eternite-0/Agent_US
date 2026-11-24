@@ -679,7 +679,7 @@ function flattenBlocks(blocks) {
     .join('\n');
 }
 
-function toOpenAiMessages(o) {
+export function toOpenAiMessages(o) {
   return [
     ...(o.system ? [{ role: 'system', content: o.system }] : []),
     ...o.messages.map((m) => {
@@ -710,6 +710,9 @@ function toOpenAiMessages(o) {
       return {
         role: m.role,
         content,
+        ...(m.role === 'assistant' && typeof m.reasoning === 'string' && m.reasoning.length > 0
+          ? { reasoning_content: m.reasoning }
+          : {}),
         ...(m.role === 'tool' ? { tool_call_id: m.toolCallId } : {}),
         ...(calls.length ? { tool_calls: calls } : {}),
       };
@@ -736,7 +739,7 @@ function openAiReasoningEffort(effort, wireModel) {
   return undefined;
 }
 
-function toAnthropicPayload(o, wireModel) {
+export function toAnthropicPayload(o, wireModel) {
   let system = o.system ? String(o.system) : '';
   const messages = [];
   for (const m of o.messages) {
@@ -759,9 +762,25 @@ function toAnthropicPayload(o, wireModel) {
       }
       continue;
     }
+    // Never emit an unsigned Anthropic thinking block from m.reasoning / m.reasoning_content.
+    // Only forward explicit thinking blocks that carry both non-empty thinking and signature.
     const content = [];
     for (const b of Array.isArray(m.content) ? m.content : []) {
-      if (b.type === 'text' && b.text) {
+      if (!b || typeof b !== 'object') continue;
+      if (
+        m.role === 'assistant' &&
+        b.type === 'thinking' &&
+        typeof b.thinking === 'string' &&
+        b.thinking.length > 0 &&
+        typeof b.signature === 'string' &&
+        b.signature.trim().length > 0
+      ) {
+        content.push({
+          type: 'thinking',
+          thinking: b.thinking,
+          signature: b.signature,
+        });
+      } else if (b.type === 'text' && b.text) {
         content.push({ type: 'text', text: b.text });
       } else if (b.type === 'image' && b.data) {
         content.push({
@@ -799,7 +818,9 @@ function toAnthropicPayload(o, wireModel) {
 
   // The system checkpoint covers the tools too. Cache the current tail for
   // the next step and retain a nearby boundary when a message has many blocks.
-  const mark = (block) => { if (block) block.cache_control = { type: 'ephemeral' }; };
+  const mark = (block) => {
+    if (block && block.type !== 'thinking') block.cache_control = { type: 'ephemeral' };
+  };
   const tail = messages.at(-1)?.content;
   mark(tail?.at(-1));
   if ((tail?.length ?? 0) >= 18) mark(messages.at(-2)?.content?.at(-1));
