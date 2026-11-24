@@ -1,6 +1,6 @@
 import { SwarmThreadCard } from './SwarmThreadCard';
-import { groupDirectMessages, type DirectLiveStream, type DirectLiveToolOutput } from '../utils/directMessages';
-import { DirectActivityGroup, DirectTurnProcess } from './DirectActivity';
+import { groupDirectMessages, isDirectTurnEnd, type DirectLiveStream, type DirectLiveToolOutput, type DirectTimelineBlock } from '../utils/directMessages';
+import { ActivityDisclosureScope, DirectActivityGroup, DirectTurnProcess } from './DirectActivity';
 import type { CommandAvailability, MentionExtension, SlashCommand } from './slashCommands';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
@@ -37,7 +37,6 @@ import { ActivityBlock, ApprovalGateCard } from './ActivityBlock';
 import { AgentCompanionCard } from './AgentCompanionCard';
 import { SubagentProgress } from './SubagentProgress';
 import { Composer } from './Composer';
-import { EvidenceBadge } from './EvidenceBadge';
 import { FileChangeCard } from './FileChangeCard';
 import { ReconciliationCard } from './ReconciliationCard';
 import {
@@ -61,6 +60,7 @@ import {
   IconReset,
   IconRightPanelToggle,
   IconSearch,
+  IconShieldAlert,
 } from './Icons';
 import {
   ImageLightbox,
@@ -69,6 +69,7 @@ import {
   type PreviewImageItem,
 } from './ImageLightbox';
 import { Markdown } from './Markdown';
+import { useThreadScroll } from '../hooks/useThreadScroll';
 
 /**
  * Keeps the closing assistant reply crisp & concise (like Codex Desktop),
@@ -184,6 +185,22 @@ interface ThreadViewProps {
   onToast: (msg: string) => void;
 }
 
+const DirectProse = React.memo(function DirectProse({ text, live, taskId, imageFiles, onInspect, onOpenImage, onCopy }: {
+  text: string;
+  live: boolean;
+  taskId: string;
+  imageFiles: Record<string, string>;
+  onInspect: ThreadViewProps['onOpenInspector'];
+  onOpenImage: (images: PreviewImageItem[], index: number) => void;
+  onCopy: ThreadViewProps['onToast'];
+}) {
+  const openFile = useCallback((path: string) => onInspect('diff', path, taskId), [onInspect, taskId]);
+  return <div className="codex-assistant-turn codex-direct-prose">
+    <Markdown text={text} imageFiles={imageFiles} onOpenFile={openFile} onOpenImage={onOpenImage} onCopy={onCopy} />
+    {live && <span className="a2a-stream-cursor" aria-hidden="true" />}
+  </div>;
+});
+
 interface MinimapEntry {
   taskId: string;
   anchorKey: string;
@@ -248,20 +265,17 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   onSwitchToDemo,
   onToast,
 }) => {
-  const scrollRef = useRef<HTMLDivElement>(null);
   const titleMenuRef = useRef<HTMLDivElement>(null);
   const turnMenuRef = useRef<HTMLDivElement>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
-  const nearBottomRef = useRef(true);
 
   const [titleMenuOpen, setTitleMenuOpen] = useState(false);
   const [openTurnMenuId, setOpenTurnMenuId] = useState<string | null>(null);
-  const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [expandedUsers, setExpandedUsers] = useState<Record<string, boolean>>({});
   const [expandedReplies, setExpandedReplies] = useState<Record<string, boolean>>({});
   const [lightbox, setLightbox] = useState<{ images: PreviewImageItem[]; index: number } | null>(null);
+  const openThreadImage = useCallback((images: PreviewImageItem[], index: number) => setLightbox({ images, index }), []);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [activeTurnIdx, setActiveTurnIdx] = useState(0);
   const [hoveredTurnIdx, setHoveredTurnIdx] = useState<number | null>(null);
   const [bookmarkedTurns, setBookmarkedTurns] = useState<Record<string, boolean>>({});
   const [flashedKey, setFlashedKey] = useState<string | null>(null);
@@ -335,167 +349,202 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
     return () => document.removeEventListener('mousedown', clear);
   }, [selectionOverlay]);
 
-  // Precompute per-turn derived view models
-  const turnModels = useMemo(() => {
-    return bundles.map((b, turnIndex) => {
-      const { task, workers, sessions, histories, approvals, evidence, artifacts, usage, events } =
-        b;
-      const isLive =
-        task.status === 'planning' || task.status === 'running' || task.status === 'reviewing';
-      const visibleEvidence = focusWorkerId
-        ? evidence.filter((e) => e.workerId === focusWorkerId)
-        : evidence;
-      const visibleApprovals = focusWorkerId
-        ? approvals.filter((a) => a.workerId === focusWorkerId)
-        : approvals;
-      const visibleEvents = focusWorkerId
-        ? events.filter((ev) => eventMatchesWorker(ev, focusWorkerId, workers))
-        : events;
-      const publishedArtifacts = artifacts.filter(
-        (a) => a.published && (!focusWorkerId || !a.workerId || a.workerId === focusWorkerId),
+  // Cache historical view models by immutable bundle identity, not by the
+  // outer list (which changes on each batch for the active task).
+  const buildTurnModel = useCallback((b: TaskBundle, liveStream?: DirectLiveStream, liveOutput?: DirectLiveToolOutput[]) => {
+    const { task, workers, sessions, histories, approvals, evidence, artifacts, usage, events } =
+      b;
+    const isLive =
+      task.status === 'planning' || task.status === 'running' || task.status === 'reviewing';
+    const visibleEvidence = focusWorkerId
+      ? evidence.filter((e) => e.workerId === focusWorkerId)
+      : evidence;
+    const visibleApprovals = focusWorkerId
+      ? approvals.filter((a) => a.workerId === focusWorkerId)
+      : approvals;
+    const visibleEvents = focusWorkerId
+      ? events.filter((ev) => eventMatchesWorker(ev, focusWorkerId, workers))
+      : events;
+    const publishedArtifacts = artifacts.filter(
+      (a) => a.published && (!focusWorkerId || !a.workerId || a.workerId === focusWorkerId),
+    );
+
+    const isJsonBlob = (txt: string) => {
+      const s = txt.trim();
+      if (!(s.startsWith('{') && s.endsWith('}')) && !(s.startsWith('[') && s.endsWith(']'))) {
+        return false;
+      }
+      try {
+        return typeof JSON.parse(s) === 'object';
+      } catch {
+        return false;
+      }
+    };
+
+    const pendingApprovals = visibleApprovals.filter((a) => a.status === 'pending');
+    const isDirectSession = sessions[0]?.assignmentId === 'direct';
+    const directExchanges = isDirectSession ? groupDirectMessages(task.id, task.input, histories[task.id] ?? [], {
+      isLive,
+      events,
+      liveStream,
+      liveToolOutputs: liveOutput,
+      pendingCallIds: new Set(pendingApprovals.flatMap((approval) => approval.callId ? [approval.callId] : [])),
+      awaitingApproval: pendingApprovals.length > 0,
+    }) : [];
+
+    const assistantBlocks: Array<{ id: string; title?: string; text: string }> = [];
+    // Only show the final assistant prose once the turn completes (or when scoped to a worker),
+    // so intermediate subagent handoffs (like Researcher/Planner) stay inside Subagents instead of
+    // prematurely appearing as the final answer while the task is still executing!
+    if (!isLive || focusWorkerId) {
+      const nonJsonArtifacts = publishedArtifacts.filter(
+        (a) => a.text?.trim() && !isJsonBlob(a.text),
       );
-
-      const isJsonBlob = (txt: string) => {
-        const s = txt.trim();
-        if (!(s.startsWith('{') && s.endsWith('}')) && !(s.startsWith('[') && s.endsWith(']'))) {
-          return false;
-        }
-        try {
-          return typeof JSON.parse(s) === 'object';
-        } catch {
-          return false;
-        }
-      };
-
-      const pendingApprovals = visibleApprovals.filter((a) => a.status === 'pending');
-      const isDirectSession = sessions[0]?.assignmentId === 'direct';
-      const directExchanges = isDirectSession ? groupDirectMessages(task.id, task.input, histories[task.id] ?? [], {
-        isLive,
-        events,
-        liveStream: liveStreams[task.id],
-        liveToolOutputs: liveToolOutputs[task.id],
-        pendingCallIds: new Set(pendingApprovals.flatMap((approval) => approval.callId ? [approval.callId] : [])),
-        awaitingApproval: pendingApprovals.length > 0,
-      }) : [];
-
-      const assistantBlocks: Array<{ id: string; title?: string; text: string }> = [];
-      // Only show the final assistant prose once the turn completes (or when scoped to a worker),
-      // so intermediate subagent handoffs (like Researcher/Planner) stay inside Subagents instead of
-      // prematurely appearing as the final answer while the task is still executing!
-      if (!isLive || focusWorkerId) {
-        const nonJsonArtifacts = publishedArtifacts.filter(
-          (a) => a.text?.trim() && !isJsonBlob(a.text),
-        );
-        if (nonJsonArtifacts.length > 0) {
-          // Prefer the final synthesis artifact (last published non-JSON artifact)
-          const finalArt = nonJsonArtifacts[nonJsonArtifacts.length - 1];
-          assistantBlocks.push({ id: finalArt.id, title: finalArt.key, text: finalArt.text });
-        } else {
-          for (const sess of [...sessions].reverse()) {
-            if (focusWorkerId && sess.workerId !== focusWorkerId) continue;
-            if (!focusWorkerId && sess.assignmentId === null) continue;
-            const msgs = (histories[sess.id] ?? []).filter(
-              (h) => h.type === 'assistant/message' && h.text?.trim() && !isJsonBlob(h.text),
-            );
-            const last = msgs.at(-1);
-            if (last?.text) {
-              assistantBlocks.push({
-                id: `${sess.id}-${last.cursor}`,
-                title: sess.role,
-                text: last.text,
-              });
-              break;
-            }
+      if (nonJsonArtifacts.length > 0) {
+        // Prefer the final synthesis artifact (last published non-JSON artifact)
+        const finalArt = nonJsonArtifacts[nonJsonArtifacts.length - 1];
+        assistantBlocks.push({ id: finalArt.id, title: finalArt.key, text: finalArt.text });
+      } else {
+        for (const sess of [...sessions].reverse()) {
+          if (focusWorkerId && sess.workerId !== focusWorkerId) continue;
+          if (!focusWorkerId && sess.assignmentId === null) continue;
+          const msgs = (histories[sess.id] ?? []).filter(
+            (h) => h.type === 'assistant/message' && h.text?.trim() && !isJsonBlob(h.text),
+          );
+          const last = msgs.at(-1);
+          if (last?.text) {
+            assistantBlocks.push({
+              id: `${sess.id}-${last.cursor}`,
+              title: sess.role,
+              text: last.text,
+            });
+            break;
           }
         }
       }
+    }
 
-      const changes = visibleEvidence.flatMap((e) => e.changes ?? []);
-      const artFiles: Record<string, string> = {};
-      for (const a of publishedArtifacts) {
-        Object.assign(artFiles, a.files ?? {});
+    const changes = visibleEvidence.flatMap((e) => e.changes ?? []);
+    const artFiles: Record<string, string> = {};
+    for (const a of publishedArtifacts) {
+      Object.assign(artFiles, a.files ?? {});
+    }
+    const computedFiles = aggregateFileChanges(changes, artFiles, task.files);
+    // File writes arrive before tests, approvals, and the final reply. Keep
+    // them available in the work log and Inspector without showing delivery.
+    const latestTurnEvent = isDirectSession ? events.findLast((event) =>
+      typeof event.payload?.turnId === 'string' && (event.type === 'turn/started' || isDirectTurnEnd(event.type)),
+    ) : undefined;
+    const swarmStillWorking = b.swarmRuns?.some((run) =>
+      !['completed', 'failed', 'cancelled', 'parked', 'interrupted'].includes(run.status),
+    );
+    const showFileSummary = computedFiles.length > 0 && task.status === 'completed' && !swarmStillWorking
+      && !approvals.some((approval) => approval.status === 'pending')
+      && (!latestTurnEvent || (latestTurnEvent.type === 'turn/completed'
+        && (!task.code || latestTurnEvent.payload?.turnId === task.code)));
+
+    // Published image artifacts (outside internal inputs/ handoffs) for inline closing preview
+    const artifactImages: PreviewImageItem[] = [];
+    for (const [p, b64] of Object.entries(artFiles)) {
+      if (/^inputs\//i.test(p.replace(/\\/g, '/'))) continue;
+      if (!isImagePath(p)) continue;
+      const src = toImageDataUrl(p, b64);
+      if (src) {
+        artifactImages.push({
+          id: `${task.id}-artimg-${p}`,
+          src,
+          name: p.replace(/\\/g, '/').split('/').pop() || p,
+          caption: p,
+        });
       }
-      const computedFiles = aggregateFileChanges(changes, artFiles, task.files);
+    }
 
-      // Published image artifacts (outside internal inputs/ handoffs) for inline closing preview
-      const artifactImages: PreviewImageItem[] = [];
-      for (const [p, b64] of Object.entries(artFiles)) {
-        if (/^inputs\//i.test(p.replace(/\\/g, '/'))) continue;
-        if (!isImagePath(p)) continue;
-        const src = toImageDataUrl(p, b64);
-        if (src) {
-          artifactImages.push({
-            id: `${task.id}-artimg-${p}`,
-            src,
-            name: p.replace(/\\/g, '/').split('/').pop() || p,
-            caption: p,
-          });
-        }
-      }
+    const runningWorker = workers.find((w) => w.status === 'running');
+    const runningWorkerName = runningWorker ? getWorkerDisplayName(runningWorker) : '';
+    const runningActivity = runningWorker ? getWorkerActivityLabel(runningWorker) : '';
+    const latestEv = visibleEvidence.at(-1);
 
-      const runningWorker = workers.find((w) => w.status === 'running');
-      const runningWorkerName = runningWorker ? getWorkerDisplayName(runningWorker) : '';
-      const runningActivity = runningWorker ? getWorkerActivityLabel(runningWorker) : '';
-      const latestEv = visibleEvidence.at(-1);
+    const liveStatusText = pendingApprovals.length
+      ? `正在等待你的批准 · ${pendingApprovals[0].tool}`
+      : task.status === 'planning'
+        ? isLiveBackend && !routerReady
+          ? '任务已存入后端数据库，等待模型配置…'
+          : task.plan ? '正在思考并生成 DAG 计划…' : '正在思考并回复…'
+        : task.status === 'reviewing'
+          ? '正在进行独立验收与证据核验…'
+          : runningWorker
+            ? runningActivity
+              ? `${runningActivity}…`
+              : latestEv?.tool === 'write_file'
+                ? `正在编辑文件 (${runningWorkerName})…`
+                : latestEv?.tool === 'shell'
+                  ? `正在运行命令 (${runningWorkerName})…`
+                  : `正在运行 ${runningWorkerName}${runningWorker.model ? ` (${runningWorker.model})` : ''}…`
+            : isDirectSession ? '正在思考并执行…' : '正在调度工作节点…';
 
-      const liveStatusText = pendingApprovals.length
-        ? `正在等待你的批准 · ${pendingApprovals[0].tool}`
-        : task.status === 'planning'
-          ? isLiveBackend && !routerReady
-            ? '任务已存入后端数据库，等待模型配置…'
-            : task.plan ? '正在思考并生成 DAG 计划…' : '正在思考并回复…'
-          : task.status === 'reviewing'
-            ? '正在进行独立验收与证据核验…'
-            : runningWorker
-              ? runningActivity
-                ? `${runningActivity}…`
-                : latestEv?.tool === 'write_file'
-                  ? `正在编辑文件 (${runningWorkerName})…`
-                  : latestEv?.tool === 'shell'
-                    ? `正在运行命令 (${runningWorkerName})…`
-                    : `正在运行 ${runningWorkerName}${runningWorker.model ? ` (${runningWorker.model})` : ''}…`
-              : isDirectSession ? '正在思考并执行…' : '正在调度工作节点…';
+    const totalTokens = usage.reduce((s, u) => s + u.inputTokens + u.outputTokens, 0);
+    const totalUSD = usage.reduce((s, u) => s + u.estimatedUSD, 0);
 
-      const totalTokens = usage.reduce((s, u) => s + u.inputTokens + u.outputTokens, 0);
-      const totalUSD = usage.reduce((s, u) => s + u.estimatedUSD, 0);
+    const durationMs =
+      events.length >= 2
+        ? Math.max(1000, events.at(-1)!.timestamp - events[0].timestamp)
+        : !isLive && task.createdAt
+          ? 1000 * 60 * 2 + 18000
+          : undefined;
 
-      const durationMs =
-        events.length >= 2
-          ? Math.max(1000, events.at(-1)!.timestamp - events[0].timestamp)
-          : !isLive && task.createdAt
-            ? 1000 * 60 * 2 + 18000
-            : undefined;
+    const hasRuntimeActivity = visibleEvents.some((ev) =>
+      /^(tool|command|file|plan|node|worker|approval|turn\.failed|message\.failed)/.test(ev.type)
+      || ev.type.includes('compact'),
+    );
+    const hasProcess = Boolean(
+      visibleEvidence.length || task.plan || isLive || workers.length > 0 || hasRuntimeActivity,
+    );
 
-      const hasRuntimeActivity = visibleEvents.some((ev) =>
-        /^(tool|command|file|plan|node|worker|approval|turn\.failed|message\.failed)/.test(ev.type)
-        || ev.type.includes('compact'),
-      );
-      const hasProcess = Boolean(
-        visibleEvidence.length || task.plan || isLive || workers.length > 0 || hasRuntimeActivity,
-      );
+    return {
+      bundle: b,
+      imageFiles: { ...task.files, ...artFiles },
+      isLive,
+      visibleEvidence,
+      visibleApprovals,
+      visibleEvents,
+      pendingApprovals,
+      assistantBlocks,
+      artFiles,
+      artifactImages,
+      computedFiles,
+      showFileSummary,
+      liveStatusText,
+      totalTokens,
+      totalUSD,
+      durationMs,
+      hasProcess,
+      isDirectSession,
+      directExchanges,
+    };
+  }, [focusWorkerId, isLiveBackend, routerReady]);
+  const turnModelCache = useMemo(() => new WeakMap<TaskBundle, {
+    stream?: DirectLiveStream;
+    output?: DirectLiveToolOutput[];
+    model: ReturnType<typeof buildTurnModel>;
+  }>(), [buildTurnModel]);
+  const turnModels = useMemo(() => bundles.map((bundle) => {
+    const stream = liveStreams[bundle.task.id];
+    const output = liveToolOutputs[bundle.task.id];
+    const cached = turnModelCache.get(bundle);
+    if (cached && cached.stream === stream && cached.output === output) return cached.model;
+    const model = buildTurnModel(bundle, stream, output);
+    if (cached && Object.keys(model.imageFiles).length === Object.keys(cached.model.imageFiles).length
+        && Object.entries(model.imageFiles).every(([path, content]) => cached.model.imageFiles[path] === content)) {
+      model.imageFiles = cached.model.imageFiles;
+    }
+    turnModelCache.set(bundle, { stream, output, model });
+    return model;
+  }), [bundles, liveStreams, liveToolOutputs, buildTurnModel, turnModelCache]);
 
-      return {
-        bundle: b,
-        turnIndex,
-        isLive,
-        visibleEvidence,
-        visibleApprovals,
-        visibleEvents,
-        pendingApprovals,
-        assistantBlocks,
-        artFiles,
-        artifactImages,
-        computedFiles,
-        liveStatusText,
-        totalTokens,
-        totalUSD,
-        durationMs,
-        hasProcess,
-        isDirectSession,
-        directExchanges,
-      };
-    });
-  }, [bundles, focusWorkerId, isLiveBackend, routerReady, liveStreams, liveToolOutputs]);
+  const {
+    viewportRef: scrollRef, contentRef, showLatest: showScrollBottom, activeTurnIdx,
+    jumpToLatest: scrollToBottom, jumpTo, holdDisclosure, onViewportKeyDown,
+  } = useThreadScroll(primaryBundle?.task.id, turnModels);
 
   // Exact Codex Turn Minimap: 1 tick per User Turn (prompt title + 3-line assistant snippet)
   const minimapEntries = useMemo<MinimapEntry[]>(() => {
@@ -543,7 +592,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       if (tm.assistantBlocks.some((blk) => blk.text.toLowerCase().includes(q))) {
         hits.push({ anchorKey: `${tid}:assistant`, snippet: '回复正文匹配' });
       }
-      if (tm.computedFiles.some((f) => f.path.toLowerCase().includes(q))) {
+      if (tm.showFileSummary && tm.computedFiles.some((f) => f.path.toLowerCase().includes(q))) {
         hits.push({ anchorKey: `${tid}:files`, snippet: '文件改动匹配' });
       }
     }
@@ -559,56 +608,16 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
     if (!el) return;
     const target = el.querySelector<HTMLElement>(`[data-anchor-key="${CSS.escape(anchorKey)}"]`);
     if (!target) return;
-    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    jumpTo(target);
     setFlashedKey(anchorKey);
     window.setTimeout(() => setFlashedKey((cur) => (cur === anchorKey ? null : cur)), 900);
-  }, []);
+  }, [jumpTo, scrollRef]);
 
   const stepFind = (delta: number) => {
     if (!findMatches.length) return;
     const next = (findIdx + delta + findMatches.length) % findMatches.length;
     setFindIdx(next);
     jumpToAnchorKey(findMatches[next].anchorKey);
-  };
-
-  // Preserve scroll position when user scrolled up; auto-follow only when near bottom
-  const prevTurnCountRef = useRef(bundles.length);
-  const prevEvidenceCountRef = useRef(0);
-  const totalEvidenceCount = bundles.reduce((s, b) => s + b.evidence.length + b.artifacts.length + b.events.length, 0);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const addedTurn = bundles.length > prevTurnCountRef.current;
-    const addedStream = totalEvidenceCount > prevEvidenceCountRef.current;
-    prevTurnCountRef.current = bundles.length;
-    prevEvidenceCountRef.current = totalEvidenceCount;
-    if (addedTurn || (addedStream && nearBottomRef.current)) {
-      el.scrollTo({ top: el.scrollHeight, behavior: addedTurn ? 'smooth' : 'auto' });
-    }
-  }, [bundles.length, totalEvidenceCount]);
-
-  const handleScroll = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    nearBottomRef.current = distFromBottom <= 110;
-    setShowScrollBottom(distFromBottom > 110);
-
-    const turns = el.querySelectorAll<HTMLElement>('[data-turn-anchor="true"]');
-    if (!turns.length) return;
-    let best = 0;
-    const topEdge = el.getBoundingClientRect().top + 110;
-    turns.forEach((sec, idx) => {
-      if (sec.getBoundingClientRect().top <= topEdge) best = idx;
-    });
-    setActiveTurnIdx(best);
-  };
-
-  const scrollToBottom = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   };
 
   const copyText = async (key: string, value: string, toastMsg: string) => {
@@ -1188,14 +1197,18 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
         </div>
       )}
 
-      {/* Centered 736px Scrollable Transcript */}
+      {/* Single scroll owner. The composer takes its own space below. */}
       <div
         ref={scrollRef}
-        className="codex-transcript vertical-scroll-fade-mask"
-        onScroll={handleScroll}
+        className="codex-transcript"
+        role="region"
+        aria-label="对话记录"
+        tabIndex={0}
+        onClickCapture={holdDisclosure}
+        onKeyDown={onViewportKeyDown}
         onMouseUp={handleTranscriptMouseUp}
       >
-        <div className="codex-transcript-inner">
+        <div ref={contentRef} className="codex-transcript-inner">
           {focusedWorker && (
             <div
               style={{
@@ -1226,8 +1239,9 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
             </div>
           )}
 
+          <ActivityDisclosureScope>
           {turnModels.map((tm) => {
-            const { bundle, isLive, visibleEvidence, visibleApprovals, visibleEvents, assistantBlocks, computedFiles, isDirectSession, directExchanges } =
+            const { bundle, isLive, visibleEvidence, visibleApprovals, visibleEvents, assistantBlocks, computedFiles, showFileSummary, isDirectSession, directExchanges } =
               tm;
             const { task, assignments, workers, sessions, histories, swarmRuns = [] } = bundle;
             const tid = task.id;
@@ -1250,10 +1264,16 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
               const runsById = new Map(swarmRuns.map((run) => [run.id, run]));
               const linkedRuns = new Set(directExchanges.map((exchange) => exchange.swarmRunId));
               const goalRun = swarmRuns.find((run) => !linkedRuns.has(run.id));
+              // Successful verification belongs in the receipts/Reviewer, not in the transcript footer.
+              const verificationNotice = task.verdict?.verdict === 'block_reconciliation'
+                ? '待人工核对'
+                : task.verdict?.accepted === false && !(task.status === 'failed' && task.verdict.reason)
+                  ? '验证未通过'
+                  : undefined;
               return (
                 <React.Fragment key={tid}>
                   {showDateSep && <div className="codex-date-sep">{dateLabel}</div>}
-                  <div className="codex-turn" data-turn-anchor="true" data-anchor-key={userKey}>
+                  <div className="codex-turn" data-scroll-turn data-anchor-key={userKey}>
                     {task.livePlan && task.livePlan.steps && task.livePlan.steps.length > 0 && (() => {
                       const doneCount = task.livePlan.steps.filter((s) => s.status === 'completed').length;
                       const pct = Math.round((doneCount / task.livePlan.steps.length) * 100);
@@ -1285,28 +1305,35 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                     })()}
                     {directExchanges.map((ex) => {
                       const showSwarm = ex.command && Boolean(ex.swarmRunId);
+                      const promptText = showSwarm ? ex.userText.replace(/^\/swarm\s*/i, '') : ex.userText;
+                      const longPrompt = promptText.length > 600 || promptText.split('\n', 9).length > 8;
+                      const promptExpanded = Boolean(expandedUsers[ex.key]);
+                      const copyKey = `${ex.key}:copy`;
                       const tail = ex.blocks.at(-1);
                       const final = !ex.active && tail?.kind === 'message' ? tail : undefined;
-                      const process = final ? ex.blocks.slice(0, -1) : ex.blocks;
-                      const renderMessage = (block: Extract<(typeof ex.blocks)[number], { kind: 'message' }>) => (
-                        <div key={block.id} className="codex-assistant-turn">
-                          <Markdown
-                            text={block.text}
-                            imageFiles={{ ...(task.files ?? {}), ...tm.artFiles }}
-                            onOpenFile={(path) => onOpenInspector('diff', path, tid)}
-                            onOpenImage={(imgs, idx) => setLightbox({ images: imgs, index: idx })}
-                            onCopy={onToast}
-                          />
-                          {block.live && <span className="a2a-stream-cursor" aria-hidden="true" />}
-                        </div>
-                      );
+                      const renderBlock = (block: DirectTimelineBlock) => block.kind === 'activity'
+                        ? <DirectActivityGroup block={block} onInspectFile={(path) => onOpenInspector('diff', path, tid)} onCopy={onToast} />
+                        : <DirectProse
+                          text={block.text} live={Boolean(block.live)} taskId={tid} imageFiles={tm.imageFiles}
+                          onInspect={onOpenInspector} onOpenImage={openThreadImage} onCopy={onToast}
+                        />;
                       return (
-                        <div key={ex.key} className="codex-direct-exchange">
+                        <div key={ex.key} className="codex-direct-exchange" data-scroll-anchor={ex.key}>
                           {ex.userText && (
                             <div className="codex-user-turn">
-                              <div className="codex-user-bubble">
-                                <div className="codex-user-bubble-text">{showSwarm && <span className="swarm-message-mark"><IconAgentTeam size={14} aria-hidden="true" />Swarm</span>}
-                                  {showSwarm ? ex.userText.replace(/^\/swarm\s*/i, '') : ex.userText}</div>
+                              <div className="codex-user-bubble codex-direct-prompt">
+                                <div className={`codex-user-bubble-text${longPrompt && !promptExpanded ? ' codex-user-bubble-clamped' : ''}`}>
+                                  {showSwarm && <span className="swarm-message-mark"><IconAgentTeam size={14} aria-hidden="true" />Swarm</span>}
+                                  {promptText}
+                                </div>
+                                {longPrompt && <button type="button" className="codex-show-more-btn" aria-expanded={promptExpanded}
+                                  onClick={() => setExpandedUsers((previous) => ({ ...previous, [ex.key]: !promptExpanded }))}>
+                                  {promptExpanded ? '收起' : '显示更多'} <IconChevronDown size={14} />
+                                </button>}
+                                <button type="button" className="codex-icon-btn codex-direct-prompt-copy" aria-label="复制消息" title="复制消息"
+                                  onClick={() => void copyText(copyKey, ex.userText, '已复制提示词')}>
+                                  {copiedKey === copyKey ? <IconCheck size={14} /> : <IconCopy size={14} />}
+                                </button>
                               </div>
                             </div>
                           )}
@@ -1315,14 +1342,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                             <SwarmThreadCard run={runsById.get(ex.swarmRunId!)}
                               onOpen={onOpenSwarmRun ? () => onOpenSwarmRun(tid, ex.swarmRunId!) : undefined} />
                           ) : (
-                            <>
-                              <DirectTurnProcess active={ex.active} timing={ex.timing}>
-                                {process.length > 0 ? process.map((block) => block.kind === 'activity'
-                                  ? <DirectActivityGroup key={block.id} block={block} />
-                                  : renderMessage(block)) : null}
-                              </DirectTurnProcess>
-                              {final && renderMessage(final)}
-                            </>
+                            <DirectTurnProcess activityId={ex.key} active={ex.active} timing={ex.timing}
+                              blocks={ex.blocks} finalBlockId={final?.id} renderBlock={renderBlock} />
                           )}
                         </div>
                       );
@@ -1374,7 +1395,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       </div>
                     )}
 
-                    {computedFiles.length > 0 && (
+                    {showFileSummary && (
                       <div data-anchor-key={filesKey}>
                         <FileChangeCard
                           files={computedFiles}
@@ -1395,7 +1416,11 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       </div>
                     )}
                     <div className="a2a-direct-actions">
-                      {!isLive && <EvidenceBadge verdict={task.verdict} evidenceCount={task.evidenceCount} />}
+                      {!isLive && verificationNotice && (
+                        <span className="codex-verification-notice" title={task.verdict?.reason}>
+                          <IconShieldAlert size={13} aria-hidden="true" />{verificationNotice}
+                        </span>
+                      )}
                       {progress}
                       {!isLive && (onRewindSession || onCompactSession) && (
                         <div className="codex-turn-menu-wrap" ref={openTurnMenuId === tid ? turnMenuRef : undefined}
@@ -1433,12 +1458,11 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
               <React.Fragment key={tid}>
                 {showDateSep && <div className="codex-date-sep">{dateLabel}</div>}
 
-                <div className="codex-turn">
+                <div className="codex-turn" data-scroll-turn>
                   {/* 1. User Prompt Bubble */}
                   <div
                     className={`codex-user-turn ${flashedKey === userKey ? 'codex-turn-flash' : ''}`}
                     data-anchor-key={userKey}
-                    data-turn-anchor="true"
                   >
                     <div className="codex-user-bubble">
                       {inputFiles.length > 0 && (() => {
@@ -1504,6 +1528,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                         <button
                           type="button"
                           className="codex-show-more-btn"
+                          aria-expanded={userExpanded}
                           onClick={() =>
                             setExpandedUsers((prev) => ({ ...prev, [tid]: !prev[tid] }))
                           }
@@ -1555,6 +1580,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       data-anchor-key={procKey}
                     >
                       <ActivityBlock
+                        activityId={tid}
+                        status={task.status}
                         plan={task.plan}
                         assignments={assignments}
                         workers={workers}
@@ -1572,7 +1599,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                         finalProseTexts={assistantBlocks.map((b) => b.text)}
                         onOpenSubagent={(wId) => onOpenSubagent(wId, tid)}
                         onInspectFile={(path) => onOpenInspector('diff', path, tid)}
-                        onOpenImage={(imgs, idx) => setLightbox({ images: imgs, index: idx })}
+                        onOpenImage={openThreadImage}
                         onCopy={onToast}
                       />
                     </div>
@@ -1674,15 +1701,16 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                           <div key={block.id}>
                             <Markdown
                               text={displayText}
-                              imageFiles={{ ...(task.files ?? {}), ...tm.artFiles }}
+                              imageFiles={tm.imageFiles}
                               onOpenFile={(path) => onOpenInspector('diff', path, tid)}
-                              onOpenImage={(imgs, idx) => setLightbox({ images: imgs, index: idx })}
+                              onOpenImage={openThreadImage}
                               onCopy={onToast}
                             />
                             {isTruncated && (
                               <button
                                 type="button"
                                 className="codex-reply-expand-btn"
+                                aria-expanded={isReplyExpanded}
                                 onClick={() =>
                                   setExpandedReplies((prev) => ({
                                     ...prev,
@@ -1788,8 +1816,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                     </div>
                   )}
 
-                  {/* 5. File Change / Diff Resource Card (1:1 with live/conversation.png) */}
-                  {computedFiles.length > 0 && (
+                  {/* 5. Delivered file changes */}
+                  {showFileSummary && (
                     <div
                       className={flashedKey === filesKey ? 'codex-turn-flash' : undefined}
                       data-anchor-key={filesKey}
@@ -1936,23 +1964,23 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
               </React.Fragment>
             );
           })}
+          </ActivityDisclosureScope>
         </div>
       </div>
 
-      {/* Floating Scroll-to-Bottom Pill (exact 32px circle) */}
-      <button
-        type="button"
-        className="codex-scroll-bottom-btn"
-        data-visible={showScrollBottom ? 'true' : undefined}
-        aria-label="滚动到底部"
-        title="最新一条回复"
-        onClick={scrollToBottom}
-      >
-        <IconArrowDown size={15} />
-      </button>
-
-      {/* Bottom Floating Composer */}
       <div className="codex-thread-composer-dock">
+        <button
+          type="button"
+          className="codex-scroll-bottom-btn"
+          data-visible={showScrollBottom ? 'true' : undefined}
+          tabIndex={showScrollBottom ? 0 : -1}
+          aria-hidden={!showScrollBottom}
+          aria-label="滚动到底部"
+          title="最新一条回复"
+          onClick={scrollToBottom}
+        >
+          <IconArrowDown size={15} />
+        </button>
         <Composer
           variant="thread"
           codexMode={codexMode}

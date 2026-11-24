@@ -1,6 +1,6 @@
-import { PromptCacheContext } from './components/PromptCacheStatus';
+import { PromptCacheProvider } from './components/PromptCacheStatus';
 import { cacheRefreshEvent } from './utils/promptCache';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, LiveBackendClient, type AgentBackendClient } from './api/client';
 import { SimulatorClient } from './api/simulator';
 import {
@@ -50,7 +50,6 @@ import type {
   ProviderPresetCatalog,
   ProvidersHealth,
   Task,
-  TaskBundle,
   SwarmCommandReceipt,
   ThemeMode,
   ToastItem,
@@ -59,6 +58,20 @@ import type {
 } from './types/backend';
 import { isDirectTurnEnd, type DirectLiveStream, type DirectLiveToolOutput } from './utils/directMessages';
 import { isSwarmCommand } from './utils/swarmCommand';
+import {
+  appendRecentEvent,
+  createBundleSelector,
+  createLatestRequests,
+  createSseRefreshScheduler,
+  EMPTY_BUNDLE_CACHE,
+  mergeRecentEvents,
+  mergeTask,
+  mergeTaskBundle,
+  mergeTaskList,
+  shareSnapshot,
+  threadRootFor,
+  type BundleCache,
+} from './utils/sseRefresh';
 import { randomIdempotencyKey } from './utils/format';
 import { BUILTIN_PROVIDER_PRESETS, mergeProviderPresetCatalog } from './data/providerPresets';
 
@@ -95,6 +108,9 @@ function viewToHash(v: AppView): string {
   }
 }
 
+const EMPTY_THREAD_CHAINS: Record<string, string[]> = {};
+let nextConnectionId = 0;
+
 export const App: React.FC = () => {
   // Singleton simulator instance so demo state persists across mode toggles
   const simulatorRef = useRef<SimulatorClient | null>(null);
@@ -107,12 +123,27 @@ export const App: React.FC = () => {
     token: '',
   });
   const [backendHealthy, setBackendHealthy] = useState<boolean | null>(null);
-  const [sseState, setSseState] = useState<'connected' | 'reconnecting' | 'error'>('connected');
+  const [sseState, setSseState] = useState<'connected' | 'reconnecting' | 'error'>('reconnecting');
 
   const client: AgentBackendClient = useMemo(() => {
     if (connection.mode === 'demo') return simulatorRef.current!;
     return new LiveBackendClient(connection);
   }, [connection]);
+
+  // A connection epoch is distinct even when returning to the singleton demo client.
+  const refreshScope = useMemo(() => ({
+    id: ++nextConnectionId,
+    workspaceRequests: createLatestRequests<void>(),
+    bundleRequests: createLatestRequests<string>(),
+    archiveRequests: new Set<string>(),
+    taskWrites: new Map<string, number>(),
+    taskClock: 0,
+  }), [client]);
+  const currentRefreshScope = useRef<typeof refreshScope | null>(null);
+  useLayoutEffect(() => {
+    currentRefreshScope.current = refreshScope;
+    return () => { currentRefreshScope.current = null; };
+  }, [refreshScope]);
 
   // Atomic navigation history stack (prevents index/stack desync on repeated clicks)
   const [nav, setNav] = useState<{ stack: AppView[]; index: number }>(() => ({
@@ -205,13 +236,14 @@ export const App: React.FC = () => {
   // Sidebar Pin / Archive, Scheduled Tasks, Plugins/Skills & Multi-Turn Thread Chains (in-memory)
   const [pinnedIds, setPinnedIds] = useState<string[]>([]);
   const [archiveBusy, setArchiveBusy] = useState<ReadonlySet<string>>(() => new Set());
-  const archiveRequests = useRef(new Set<string>());
-  const archiveGeneration = useRef(0);
-  const currentClient = useRef(client);
-  currentClient.current = client;
   const [archiveRevision, setArchiveRevision] = useState(0);
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskItem[]>([]);
-  const [threadChains, setThreadChains] = useState<Record<string, string[]>>({});
+  // The simulator keeps the same tasks across mode toggles; keep their relationships as well.
+  const threadChainOwner = connection.mode === 'demo' ? client : refreshScope;
+  const [threadChainState, setThreadChainState] = useState<{ owner: typeof threadChainOwner; chains: Record<string, string[]> }>(
+    () => ({ owner: threadChainOwner, chains: EMPTY_THREAD_CHAINS }),
+  );
+  const threadChains = threadChainState.owner === threadChainOwner ? threadChainState.chains : EMPTY_THREAD_CHAINS;
   const [plugins, setPlugins] = useState<MarketplacePlugin[]>(INITIAL_PLUGINS);
   const [remoteSearchPlugins, setRemoteSearchPlugins] = useState<MarketplacePlugin[] | null>(null);
   const [remoteSearching, setRemoteSearching] = useState(false);
@@ -253,9 +285,9 @@ export const App: React.FC = () => {
   const [memory, setMemory] = useState<MemoryItem[]>([]);
   const [usage, setUsage] = useState<UsageItem[]>([]);
   const [recentEvents, setRecentEvents] = useState<EventEnvelope[]>([]);
-  const [activeBundles, setActiveBundles] = useState<TaskBundle[]>([]);
-  const [bundleLoading, setBundleLoading] = useState(false);
-  const [loadedChainKey, setLoadedChainKey] = useState<string | null>(null);
+  const [bundleState, setBundleState] = useState<{ scope: typeof refreshScope; cache: BundleCache }>(
+    () => ({ scope: refreshScope, cache: EMPTY_BUNDLE_CACHE }),
+  );
   const [submitting, setSubmitting] = useState(false);
   const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(null);
 
@@ -287,6 +319,13 @@ export const App: React.FC = () => {
     },
     [],
   );
+
+  const handleOpenThreadInspector = useCallback((tab: InspectorTab, filePath?: string, targetTaskId?: string) => {
+    setInspectorTab(tab);
+    if (filePath) setInspectorFile(filePath);
+    if (targetTaskId) setInspectorTaskId(targetTaskId);
+    setInspectorOpen(true);
+  }, []);
 
   // Theme & appearance DOM sync
   useEffect(() => {
@@ -342,14 +381,59 @@ export const App: React.FC = () => {
     setThemeMode(resolvedTheme === 'dark' ? 'light' : 'dark');
   }, [resolvedTheme]);
 
-  // Refresh global workspace collections from live backend (or demo engine if explicitly toggled)
+  const previousRefreshScope = useRef(refreshScope);
+  useLayoutEffect(() => {
+    if (previousRefreshScope.current === refreshScope) return;
+    previousRefreshScope.current = refreshScope;
+    // Do not mix snapshots, event cursors, or ephemeral streams from different connections.
+    setBackendHealthy(null);
+    setSseState('reconnecting');
+    setWorkspaceRoot('');
+    setProjects([]);
+    setTasks([]);
+    setApprovals([]);
+    setModels([]);
+    setProvidersHealth(null);
+    setMemory([]);
+    setUsage([]);
+    setScheduledTasks([]);
+    setRecentEvents([]);
+    setLiveStreams({});
+    setLiveToolOutputs({});
+    setBundleState({ scope: refreshScope, cache: EMPTY_BUNDLE_CACHE });
+    setInspectorTaskId(null);
+    setArchiveBusy(new Set());
+  }, [refreshScope]);
+
+  // Mark local task writes independently so a racing list snapshot cannot undo them or
+  // suppress fresh data for other tasks. This includes archive removals and newly created tasks.
+  const writeTask = useCallback((task: Task, mode: 'upsert' | 'update' | 'archive' = 'upsert') => {
+    if (currentRefreshScope.current !== refreshScope) return;
+    refreshScope.taskWrites.set(task.id, ++refreshScope.taskClock);
+    setTasks((previous) => {
+      const current = previous.find((entry) => entry.id === task.id);
+      if (mode === 'archive') return current ? previous.filter((entry) => entry !== current) : previous;
+      if (!current) {
+        return mode === 'update' ? previous
+          : [task, ...previous].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+      }
+      const next = mergeTask(current, task);
+      return next === current ? previous : previous.map((entry) => entry === current ? next : entry);
+    });
+  }, [refreshScope]);
+
+  const workedOutsideProjectRef = useRef(workedOutsideProject);
+  useLayoutEffect(() => { workedOutsideProjectRef.current = workedOutsideProject; }, [workedOutsideProject]);
+
+  // Refresh global workspace collections from live backend (or demo engine if explicitly toggled).
   const refreshWorkspace = useCallback(
     async (notifyOnFailure = false) => {
+      if (currentRefreshScope.current !== refreshScope) return;
+      const request = refreshScope.workspaceRequests.start();
       try {
         const health = await client.health();
-        const archiveVersion = archiveGeneration.current;
-        setBackendHealthy(health.ok ?? health.status === "ok");
-        if (health.workspaceRoot) setWorkspaceRoot(health.workspaceRoot);
+        if (currentRefreshScope.current !== refreshScope || !request.isCurrent()) return;
+        const taskClock = refreshScope.taskClock;
         const [projList, taskList, apprList, modelList, pHealth, memList, usgList, evList, schedList] =
           await Promise.all([
             client.listProjects(),
@@ -362,33 +446,32 @@ export const App: React.FC = () => {
             client.listEvents({ after: 0 }).catch(() => [] as EventEnvelope[]),
             client.listSchedules?.().catch(() => null) ?? Promise.resolve(null),
           ]);
+        if (currentRefreshScope.current !== refreshScope || !request.claim()) return;
 
-        setProjects(projList);
-        if (currentClient.current === client && archiveVersion === archiveGeneration.current) {
-          setTasks([...taskList].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0)));
-        }
-        setApprovals(apprList);
-        setModels(modelList);
-        setProvidersHealth(pHealth);
-        setMemory(memList);
-        setUsage(usgList);
+        setBackendHealthy(health.ok ?? health.status === 'ok');
+        if (health.workspaceRoot) setWorkspaceRoot(health.workspaceRoot);
+        setProjects((prev) => shareSnapshot(prev, projList));
+        const protectedIds = new Set([...refreshScope.taskWrites]
+          .filter(([, clock]) => clock > taskClock).map(([id]) => id));
+        setTasks((prev) => mergeTaskList(prev, taskList, protectedIds));
+        setApprovals((prev) => shareSnapshot(prev, apprList));
+        setModels((prev) => shareSnapshot(prev, modelList));
+        setProvidersHealth((prev) => shareSnapshot(prev, pHealth));
+        setMemory((prev) => shareSnapshot(prev, memList));
+        setUsage((prev) => shareSnapshot(prev, usgList));
         if (schedList) {
-          setScheduledTasks(schedList.map(hydrateScheduleItem));
+          const next = schedList.map(hydrateScheduleItem);
+          setScheduledTasks((prev) => shareSnapshot(prev, next));
         }
-        if (evList.length) {
-          setRecentEvents((prev) => {
-            const bySeq = new Map<number, EventEnvelope>();
-            for (const e of prev) bySeq.set(e.seq, e);
-            for (const e of evList) bySeq.set(e.seq, e);
-            return [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-120);
-          });
-        }
+        if (evList.length) setRecentEvents((prev) => mergeRecentEvents(prev, evList));
 
+        const outsideProject = workedOutsideProjectRef.current;
         setSelectedProjectId((cur) => {
           if (cur && projList.some((p) => p.id === cur)) return cur;
-          return workedOutsideProject ? null : projList[0]?.id ?? null;
+          return outsideProject ? null : projList[0]?.id ?? null;
         });
       } catch (err) {
+        if (currentRefreshScope.current !== refreshScope || !request.claim()) return;
         setBackendHealthy(false);
         if (notifyOnFailure && connection.mode === 'live') {
           if (err instanceof ApiError && err.status === 401) {
@@ -405,7 +488,7 @@ export const App: React.FC = () => {
         }
       }
     },
-    [client, connection.mode, navigate, pushToast, workedOutsideProject],
+    [client, connection.mode, navigate, pushToast, refreshScope],
   );
 
   const handleRefreshGitStatus = useCallback(async () => {
@@ -581,12 +664,9 @@ export const App: React.FC = () => {
     pushToast(result.items.length ? `已导入 ${result.items.length} 个本地账号` : '未发现可导入的本地账号', result.items.length ? 'success' : 'default');
   }, [client, pushToast, refreshWorkspace]);
 
-  // Initial probe & bootstrap (stays in live mode when backend is reachable!)
-  const didBootRef = useRef(false);
+  // Probe and bootstrap each connection. Only the latest probe can report an error.
   useEffect(() => {
-    const first = !didBootRef.current;
-    didBootRef.current = true;
-    void refreshWorkspace(first);
+    void refreshWorkspace(true);
   }, [refreshWorkspace]);
 
   // Load standalone Agent_US extension catalog (built-in seed + public GitHub / MCP hub, ZERO ~/.codex dependency)
@@ -645,85 +725,77 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  // Active thread chain IDs
-  const activeRootTaskId = view.kind === 'thread' ? view.taskId : null;
+  // Resolve the true chain before rendering so navigating to a child keeps the same thread instance.
+  const activeRootTaskId = view.kind === 'thread' ? threadRootFor(view.taskId, threadChains) : null;
   const activeChainIds = useMemo(() => {
     if (!activeRootTaskId) return [];
-    const extras = threadChains[activeRootTaskId] ?? [];
-    return [activeRootTaskId, ...extras.filter((id) => id !== activeRootTaskId)];
+    const children = Object.hasOwn(threadChains, activeRootTaskId) ? threadChains[activeRootTaskId] : [];
+    return [...new Set([activeRootTaskId, ...children])];
   }, [activeRootTaskId, threadChains]);
+  const activeChainRef = useRef(activeChainIds);
+  useLayoutEffect(() => { activeChainRef.current = activeChainIds; }, [activeChainIds]);
 
-  const activeChainKey = activeChainIds.join(',');
+  const bundleCache = bundleState.scope === refreshScope ? bundleState.cache : EMPTY_BUNDLE_CACHE;
+  const selectActiveBundles = useMemo(() => createBundleSelector(), [refreshScope]);
+  const activeBundles = selectActiveBundles(bundleCache, activeChainIds);
+  const bundleLoading = activeChainIds.some((id) => !bundleCache.has(id));
 
   const refreshActiveBundles = useCallback(
-    async (taskIds: string[], silent = false) => {
-      const key = taskIds.join(',');
-      if (!taskIds.length) {
-        setActiveBundles([]);
-        setLoadedChainKey(null);
-        return;
-      }
-      if (!silent) setBundleLoading(true);
-      try {
-        const loaded = await Promise.all(
-          taskIds.map((id) => client.loadTaskBundle(id).catch(() => null)),
-        );
-        const valid = loaded.filter((b): b is TaskBundle => b !== null);
-        setActiveBundles(valid);
-        setLoadedChainKey(key);
-      } finally {
-        if (!silent) setBundleLoading(false);
-      }
+    async (taskIds: readonly string[]) => {
+      if (currentRefreshScope.current !== refreshScope) return;
+      await Promise.all([...new Set(taskIds)].map(async (id) => {
+        const request = refreshScope.bundleRequests.start(id);
+        const loaded = await client.loadTaskBundle(id).catch(() => null);
+        if (currentRefreshScope.current !== refreshScope || !request.claim()) return;
+        setBundleState((previous) => {
+          if (previous.scope !== refreshScope) return previous;
+          const cache = mergeTaskBundle(previous.cache, id, loaded);
+          return cache === previous.cache ? previous : { scope: refreshScope, cache };
+        });
+      }));
     },
-    [client],
+    [client, refreshScope],
   );
 
-  // When switching between Live <-> Demo mode, leave stale thread IDs from the previous engine cleanly
+  // Switching engines leaves task IDs from the previous engine behind. Reconfiguring a live
+  // endpoint keeps the URL but loads it against a clean connection-scoped cache.
   const prevConnModeRef = useRef(connection.mode);
+  const switchingEngine = prevConnModeRef.current !== connection.mode;
   useEffect(() => {
-    if (prevConnModeRef.current !== connection.mode) {
+    if (switchingEngine) {
       prevConnModeRef.current = connection.mode;
-      setActiveBundles([]);
-      setLoadedChainKey(null);
-      if (view.kind === 'thread') {
-        navigate({ kind: 'home' });
-      }
+      if (view.kind === 'thread') navigate({ kind: 'home' });
     }
-  }, [connection.mode, navigate, view.kind]);
+  }, [switchingEngine, connection.mode, navigate, view.kind]);
 
   useEffect(() => {
-    if (!activeChainIds.length) {
-      setActiveBundles([]);
+    if (switchingEngine || !activeChainIds.length) {
       setInspectorTaskId(null);
       return;
     }
-    void refreshActiveBundles(activeChainIds, false);
-  }, [activeChainIds, refreshActiveBundles]);
+    void refreshActiveBundles(activeChainIds);
+  }, [switchingEngine, activeChainIds, refreshActiveBundles]);
 
-  // Live SSE Event Stream Subscription
-  const activeChainRef = useRef<string[]>([]);
-  activeChainRef.current = activeChainIds;
-
+  // Only persisted/structural events invalidate REST data. Ephemeral deltas update their
+  // task-local stream immediately, without triggering a workspace or bundle fetch.
   useEffect(() => {
-    let throttleTimer: number | null = null;
-    const scheduleRefresh = () => {
-      if (throttleTimer !== null) return;
-      throttleTimer = window.setTimeout(() => {
-        throttleTimer = null;
-        void refreshWorkspace(false);
-        if (activeChainRef.current.length) {
-          void refreshActiveBundles(activeChainRef.current, true);
-        }
-      }, 120);
-    };
+    let disposed = false;
+    const isCurrent = () => !disposed && currentRefreshScope.current === refreshScope;
+    const scheduler = createSseRefreshScheduler(
+      () => isCurrent() ? activeChainRef.current : [],
+      () => refreshWorkspace(false),
+      (id) => refreshActiveBundles([id]),
+    );
 
     const unsubscribe = client.subscribeEvents(
       {},
       (ev) => {
+        if (!isCurrent()) return;
         const sid = ev.taskId || (typeof ev.payload?.sessionId === 'string' ? ev.payload.sessionId : '');
         const turnId = typeof ev.payload?.turnId === 'string' ? ev.payload.turnId : undefined;
         const callId = typeof ev.payload?.callId === 'string' ? ev.payload.callId : '';
-        if (sid && ev.type === 'tool/output') {
+        if (ev.type === 'tool/output') {
+          if (!sid) return;
           const chunk = String(ev.payload?.chunk ?? '');
           const name = String(ev.payload?.name ?? 'bash');
           if (callId && chunk) {
@@ -736,12 +808,15 @@ export const App: React.FC = () => {
           }
           return;
         }
-        if (sid && (ev.type === 'assistant/delta' || ev.type === 'reasoning/delta')) {
+        if (ev.type === 'assistant/delta' || ev.type === 'reasoning/delta') {
+          if (!sid) return;
           setLiveStreams((prev) => {
             const stream = prev[sid];
             const cur = stream && stream.turnId === turnId ? stream : { text: '', reasoning: '' };
             const key = ev.type === 'assistant/delta' ? 'text' : 'reasoning';
-            return { ...prev, [sid]: { ...cur, turnId, [key]: String(ev.payload?.text ?? (cur[key] + String(ev.payload?.delta ?? ''))) } };
+            const next = String(ev.payload?.text ?? (cur[key] + String(ev.payload?.delta ?? '')));
+            if (stream && stream.turnId === turnId && stream[key] === next) return prev;
+            return { ...prev, [sid]: { ...cur, turnId, [key]: next } };
           });
           return;
         }
@@ -775,26 +850,22 @@ export const App: React.FC = () => {
         } else if (ev.type === 'session/recovered') {
           pushToast('已从检查点恢复中断会话', 'success');
         }
-        // Track structural runtime/swarm/verifier events in recentEvents & refresh bundles cleanly
-        setRecentEvents((prev) => {
-          if (ev.seq > 0 && prev.some((x) => x.seq === ev.seq && x.type === ev.type)) return prev;
-          return [...prev.slice(-119), ev];
-        });
-        if (
-          ev.type !== 'turn/phase_changed' ||
-          activeChainRef.current.includes(sid)
-        ) {
-          scheduleRefresh();
-        }
+        setRecentEvents((prev) => appendRecentEvent(prev, ev));
+        scheduler.event(ev);
       },
-      (state) => setSseState(state),
+      (state) => {
+        if (!isCurrent()) return;
+        setSseState(state);
+        scheduler.status(state);
+      },
     );
 
     return () => {
-      if (throttleTimer !== null) window.clearTimeout(throttleTimer);
+      disposed = true;
+      scheduler.stop();
       unsubscribe();
     };
-  }, [client, refreshWorkspace, refreshActiveBundles, pushToast]);
+  }, [client, refreshScope, refreshWorkspace, refreshActiveBundles, pushToast]);
 
   // Domain Actions
   const handleSelectProject = useCallback((projectId: string | null) => {
@@ -865,12 +936,12 @@ export const App: React.FC = () => {
         ...(Object.keys(files).length ? { files } : {}),
       });
 
-      if (currentClient.current !== client) return false;
+      if (currentRefreshScope.current !== refreshScope) return false;
       if ('mode' in task) {
         showSwarmReceipt(task);
         void refreshWorkspace(false);
       } else {
-        setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
+        writeTask(task);
       }
       navigate({ kind: 'thread', taskId: task.id });
       return true;
@@ -905,10 +976,10 @@ export const App: React.FC = () => {
           effort,
           clientTurnId: randomIdempotencyKey(),
         });
-        if (currentClient.current !== client || activeChainRef.current[0] !== activeRootTaskId) return false;
+        if (currentRefreshScope.current !== refreshScope || activeChainRef.current[0] !== activeRootTaskId) return false;
         if ('mode' in updated) showSwarmReceipt(updated);
-        else setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
-        await refreshActiveBundles([activeRootTaskId], true);
+        else writeTask(updated, 'update');
+        await refreshActiveBundles([activeRootTaskId]);
         return true;
       }
       const rootTask = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
@@ -931,17 +1002,20 @@ export const App: React.FC = () => {
         ...(Object.keys(files).length ? { files } : {}),
       });
 
+      if (currentRefreshScope.current !== refreshScope) return false;
       if ('mode' in nextTask) {
         showSwarmReceipt(nextTask);
         navigate({ kind: 'thread', taskId: nextTask.id });
         void refreshWorkspace(false);
         return true;
       }
-      setTasks((prev) => [nextTask, ...prev.filter((t) => t.id !== nextTask.id)]);
-      setThreadChains((prev) => ({
-        ...prev,
-        [activeRootTaskId]: [...(prev[activeRootTaskId] ?? []), nextTask.id],
-      }));
+      writeTask(nextTask);
+      setThreadChainState((prev) => {
+        const chains = prev.owner === threadChainOwner ? prev.chains : EMPTY_THREAD_CHAINS;
+        const children = chains[activeRootTaskId] ?? [];
+        if (nextTask.id === activeRootTaskId || children.includes(nextTask.id)) return prev;
+        return { owner: threadChainOwner, chains: { ...chains, [activeRootTaskId]: [...children, nextTask.id] } };
+      });
       setInspectorTaskId(nextTask.id);
       return true;
     } catch (e) {
@@ -958,9 +1032,10 @@ export const App: React.FC = () => {
   ) => {
     try {
       const updated = await client.controlTask(task.id, action, task.version);
-      setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+      if (currentRefreshScope.current !== refreshScope) return;
+      writeTask(updated, 'update');
       if (activeChainRef.current.includes(updated.id)) {
-        void refreshActiveBundles(activeChainRef.current, true);
+        void refreshActiveBundles([updated.id]);
       }
       const label = {
         pause: '已暂停任务',
@@ -1005,7 +1080,7 @@ export const App: React.FC = () => {
       }
       await refreshWorkspace(false);
       if (activeChainRef.current.length) {
-        await refreshActiveBundles(activeChainRef.current, true);
+        await refreshActiveBundles(activeChainRef.current);
       }
     } catch (e) {
       pushToast(`审批裁决失败：${e instanceof Error ? e.message : '审批已失效'}`, 'danger');
@@ -1023,9 +1098,7 @@ export const App: React.FC = () => {
       try {
         const res = await client.rewindSession(sessionId, { scope, turnId });
         await refreshWorkspace(false);
-        if (activeChainRef.current.length) {
-          await refreshActiveBundles(activeChainRef.current, true);
-        }
+        await refreshActiveBundles([sessionId]);
         pushToast(
           res.restoredFiles.length
             ? `已回退 ${res.restoredFiles.length} 个文件${res.removedMessages ? `并撤销 ${res.removedMessages} 条消息` : ''}`
@@ -1049,9 +1122,7 @@ export const App: React.FC = () => {
       }
       try {
         const res = await client.compactSession(sessionId);
-        if (activeChainRef.current.length) {
-          await refreshActiveBundles(activeChainRef.current, true);
-        }
+        await refreshActiveBundles([sessionId]);
         pushToast(
           res.compacted
             ? `已完成语义上下文压缩（折叠 ${res.compressedCount ?? 0} 条历史消息）`
@@ -1074,32 +1145,35 @@ export const App: React.FC = () => {
   };
 
   const updateArchive = async (taskId: string, archived: boolean): Promise<boolean> => {
-    if (currentClient.current !== client || archiveRequests.current.has(taskId)) return false;
-    archiveRequests.current.add(taskId);
-    setArchiveBusy(new Set(archiveRequests.current.keys()));
+    if (currentRefreshScope.current !== refreshScope || refreshScope.archiveRequests.has(taskId)) return false;
+    refreshScope.archiveRequests.add(taskId);
+    setArchiveBusy(new Set(refreshScope.archiveRequests));
     try {
       const updated = await client.setTaskArchived(taskId, archived);
-      if (currentClient.current !== client) return false;
-      archiveGeneration.current += 1;
-      setTasks((prev) => {
-        if (archived) return prev.filter((task) => task.id !== taskId);
-        const current = prev.find((task) => task.id === taskId);
-        return [{ ...(current ?? updated), archivedAt: updated.archivedAt }, ...prev.filter((task) => task.id !== taskId)]
-          .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+      if (currentRefreshScope.current !== refreshScope) return false;
+      writeTask(updated, archived ? 'archive' : 'upsert');
+      // Invalidate only this task's older snapshot, not the rest of the active chain.
+      refreshScope.bundleRequests.invalidate(taskId);
+      setBundleState((prev) => {
+        if (prev.scope !== refreshScope) return prev;
+        const bundle = prev.cache.get(taskId);
+        if (!bundle) return prev;
+        const cache = mergeTaskBundle(prev.cache, taskId, {
+          ...bundle, task: { ...bundle.task, archivedAt: updated.archivedAt },
+        });
+        return cache === prev.cache ? prev : { scope: refreshScope, cache };
       });
-      setActiveBundles((prev) => prev.map((bundle) => bundle.task.id === taskId
-        ? { ...bundle, task: { ...bundle.task, archivedAt: updated.archivedAt } }
-        : bundle));
+      if (activeChainRef.current.includes(taskId)) void refreshActiveBundles([taskId]);
       setArchiveRevision((prev) => prev + 1);
       return true;
     } catch (error) {
-      if (currentClient.current === client) {
+      if (currentRefreshScope.current === refreshScope) {
         pushToast(`${archived ? '归档' : '恢复'}失败：${error instanceof Error ? error.message : '连接异常'}`, 'danger');
       }
       return false;
     } finally {
-      archiveRequests.current.delete(taskId);
-      setArchiveBusy(new Set(archiveRequests.current.keys()));
+      refreshScope.archiveRequests.delete(taskId);
+      if (currentRefreshScope.current === refreshScope) setArchiveBusy(new Set(refreshScope.archiveRequests));
     }
   };
 
@@ -1127,7 +1201,7 @@ export const App: React.FC = () => {
       const result = await client.submitAutonomousGoal({
         goal, permissionMode, ...(activeRootTaskId ? { sessionId: activeRootTaskId } : { workspaceRoot: workspaceRoot || undefined }),
       });
-      if (currentClient.current !== client) return true;
+      if (currentRefreshScope.current !== refreshScope) return true;
       navigate({ kind: 'thread', taskId: result.sessionId });
       setInspectorTaskId(result.sessionId);
       setPreferredSwarmRun({ ...result, client });
@@ -1135,12 +1209,12 @@ export const App: React.FC = () => {
       setInspectorRequest((value) => value + 1);
       setInspectorTab('autonomous');
       setInspectorOpen(true);
-      if (activeRootTaskId === result.sessionId) void refreshActiveBundles(activeChainRef.current, true);
+      if (activeRootTaskId === result.sessionId) void refreshActiveBundles(activeChainRef.current);
       void refreshWorkspace(false);
       pushToast('自主任务已启动', 'success');
       return true;
     } catch (error) {
-      if (currentClient.current === client) pushToast(`自主任务启动失败：${error instanceof Error ? error.message : '连接异常'}`, 'danger');
+      if (currentRefreshScope.current === refreshScope) pushToast(`自主任务启动失败：${error instanceof Error ? error.message : '连接异常'}`, 'danger');
       return false;
     } finally {
       setSubmitting(false);
@@ -1270,7 +1344,8 @@ export const App: React.FC = () => {
     setForkPending(true);
     try {
       const task = await client.forkTask(forkSource, workspaceMode);
-      setTasks((previous) => [task, ...previous.filter((entry) => entry.id !== task.id)]);
+      if (currentRefreshScope.current !== refreshScope) return;
+      writeTask(task);
       setPermissionMode('approval');
       setForkSource(null);
       navigate({ kind: 'thread', taskId: task.id });
@@ -1340,7 +1415,7 @@ export const App: React.FC = () => {
   );
 
   const archivedThread = view.kind === 'thread'
-    ? activeBundles.find((bundle) => bundle.task.id === view.taskId && bundle.task.archivedAt != null)
+    ? activeBundles.find((bundle) => bundle.task.id === activeRootTaskId && bundle.task.archivedAt != null)
     : undefined;
 
   // Known files across active bundles & tasks for Ctrl+K file search and @ mentions
@@ -1438,7 +1513,7 @@ export const App: React.FC = () => {
   const lastCacheEvent = recentEvents.findLast(event => cacheRefreshEvent(event.type));
   const cacheRevision = lastCacheEvent ? `${lastCacheEvent.seq}:${lastCacheEvent.type}` : '';
   return (
-    <PromptCacheContext.Provider value={{ client, revision: cacheRevision }}>
+    <PromptCacheProvider client={client} revision={cacheRevision}>
     <div className="codex-shell">
       <TopBar
         canBack={nav.index > 0}
@@ -1459,7 +1534,7 @@ export const App: React.FC = () => {
         onRefresh={() => {
           void refreshWorkspace(false);
           if (activeChainRef.current.length) {
-            void refreshActiveBundles(activeChainRef.current, true);
+            void refreshActiveBundles(activeChainRef.current);
           }
           pushToast('已刷新数据');
         }}
@@ -1573,7 +1648,7 @@ export const App: React.FC = () => {
             )}
             {view.kind === 'thread' && (
               <ThreadView
-                key={view.taskId}
+                key={`${refreshScope.id}:${activeRootTaskId}`}
                 onOpenSwarmRun={(sessionId, runId) => {
                   setPreferredSwarmRun({ client, sessionId, runId });
                   setInspectorTaskId(sessionId);
@@ -1582,11 +1657,8 @@ export const App: React.FC = () => {
                   setInspectorTab('autonomous');
                   setInspectorOpen(true);
                 }}
-                bundles={activeBundles.filter((b) => activeChainIds.includes(b.task.id))}
-                loading={
-                  bundleLoading ||
-                  (activeChainIds.length > 0 && loadedChainKey !== activeChainKey)
-                }
+                bundles={activeBundles}
+                loading={bundleLoading}
                 focusWorkerId={view.focusWorkerId}
                 liveStreams={liveStreams}
                 liveToolOutputs={liveToolOutputs}
@@ -1623,17 +1695,12 @@ export const App: React.FC = () => {
                 onSubmitGoal={handleSubmitGoal}
                 onSubmitFollowup={handleSubmitFollowup}
                 onControlTask={handleControlTask}
-                archiving={archiveBusy.has(view.taskId)}
+                archiving={activeRootTaskId !== null && archiveBusy.has(activeRootTaskId)}
                 onToggleArchive={(task) => void (task.archivedAt != null
                   ? handleRestoreArchived(task.id)
                   : handleArchiveTask(task.id))}
                 onDecideApproval={handleDecideApproval}
-                onOpenInspector={(tab, filePath, targetTaskId) => {
-                  setInspectorTab(tab);
-                  if (filePath) setInspectorFile(filePath);
-                  if (targetTaskId) setInspectorTaskId(targetTaskId);
-                  setInspectorOpen(true);
-                }}
+                onOpenInspector={handleOpenThreadInspector}
                 onOpenSubagent={(workerId, targetTaskId) => {
                   if (targetTaskId) setInspectorTaskId(targetTaskId);
                   setInspectorSubagentId(workerId);
@@ -1652,7 +1719,7 @@ export const App: React.FC = () => {
                   navigate({ kind: 'home' });
                   pushToast('已切换至本地演示引擎，可体验完整多步执行流与审批', 'default');
                 }}
-                onToast={(msg) => pushToast(msg)}
+                onToast={pushToast}
               />
             )}
 
@@ -1770,8 +1837,9 @@ export const App: React.FC = () => {
                     permissionMode,
                     ...(workspaceRoot ? { workspaceRoot } : {}),
                   });
+                  if (currentRefreshScope.current !== refreshScope) return;
                   if ('mode' in task) showSwarmReceipt(task);
-                  else setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
+                  else writeTask(task);
                   setScheduledTasks((prev) =>
                     prev.map((s) =>
                       s.id === item.id
@@ -2022,7 +2090,10 @@ export const App: React.FC = () => {
                 onChangeReducedMotion={setReducedMotion}
                 onChangePermissionMode={setPermissionMode}
                 onUpdateConnection={(next) => {
-                  setConnection(next);
+                  setConnection((previous) => (
+                    previous.mode === next.mode && previous.baseUrl === next.baseUrl && previous.token === next.token
+                      ? previous : next
+                  ));
                   pushToast(
                     next.mode === 'demo' ? '已切换至本地演示引擎' : '已保存实时后端连接配置',
                   );
@@ -2132,6 +2203,6 @@ export const App: React.FC = () => {
       </ComposerDialog>}
       <ToastHost toasts={toasts} />
     </div>
-    </PromptCacheContext.Provider>
+    </PromptCacheProvider>
   );
 };

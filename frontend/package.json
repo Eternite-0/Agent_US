@@ -7,7 +7,11 @@
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "tsc --noEmit && vite build",
     "preview": "node server.mjs",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test:e2e": "node test/e2e/run.mjs fixture",
+    "test:e2e:direct": "node test/e2e/run.mjs direct",
+    "test:e2e:runtime": "playwright test --config test/browser-runtime/playwright.config.mjs",
+    "test:e2e:visual": "playwright test --config test/thread-visual/playwright.config.mjs"
   },
   "dependencies": {
     "agent-us": "file:..",
@@ -15,6 +19,7 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",

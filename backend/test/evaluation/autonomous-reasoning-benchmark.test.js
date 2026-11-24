@@ -104,7 +104,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     assert.deepEqual(leftover, [], `Expected 0 leftover agent-us-bench-* containers, found: ${leftover.join(', ')}`);
   });
 
-  test('Docker strong OS isolation is active (or node-permission fallback when Docker unavailable) and BenchmarkSandbox fails closed', () => {
+  test('Docker strong OS isolation is active (or node-permission fallback when Docker unavailable)', () => {
     const dockerProbe = new DockerBenchmarkSandbox().probe();
     const resolved = activeSandbox.resolveBackend();
     if (DOCKER_AVAILABLE) {
@@ -118,7 +118,9 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       assert.equal(resolved.isolationTier, SANDBOX_TIERS.PROCESS_HARDENING_ONLY);
       assert.equal(resolved.strongOsIsolation, false);
     }
+  });
 
+  test('BenchmarkSandbox fails closed with no host or Node-permission fallback', () => {
     const unavailableSandbox = new BenchmarkSandbox({
       mode: SANDBOX_MODES.STRONG,
       probes: {
@@ -204,7 +206,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     }
   });
 
-  test('all 10 reference fixes pass inside real Docker BenchmarkSandbox isolation', { concurrency: 4 }, async (t) => {
+  test('all 10 reference fixes pass inside active BenchmarkSandbox isolation', { concurrency: 4 }, async (t) => {
     const dataset = createAutonomousReasoningDataset({ sandbox: activeSandbox });
     await Promise.all(
       dataset.map((task) =>
@@ -242,7 +244,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     );
   });
 
-  test('judges reject broken, surface-only, incomplete, and tampered fixes', { concurrency: 4 }, async (t) => {
+  test('judges reject broken, surface-only, incomplete, and tampered fixes in sandbox', { concurrency: 4 }, async (t) => {
     const dataset = createAutonomousReasoningDataset({ sandbox: activeSandbox });
     const byId = Object.fromEntries(dataset.map((item) => [item.id, item]));
 
@@ -441,28 +443,28 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       assert.equal(judgment.passed, false);
       assert.equal(judgment.evidence.checks.constraintsPreserved, false);
     }),
-
-    t.test('enforceDeterministicHardVeto prevents advisory/premature-exit override', () => {
-      const vetoed = enforceDeterministicHardVeto(
-        {
-          passed: true,
-          score: 1,
-          evidence: {
-            hiddenAcceptancePassed: false,
-            baselineTestsUntampered: false,
-            sandboxIsolated: false,
-          },
-        },
-        { passed: true, score: 1, note: 'LLM advisory tried to force pass' },
-      );
-      assert.equal(vetoed.passed, false);
-      assert.equal(vetoed.score, 0);
-      assert.equal(vetoed.hardVetoed, true);
-      assert.ok(vetoed.vetoReasons.includes('baseline_tests_tampered'));
-      assert.ok(vetoed.vetoReasons.includes('sandbox_not_isolated'));
-      assert.ok(vetoed.vetoReasons.includes('hidden_acceptance_failed'));
-    }),
     ]);
+  });
+
+  test('enforceDeterministicHardVeto prevents advisory/premature-exit override', () => {
+    const vetoed = enforceDeterministicHardVeto(
+      {
+        passed: true,
+        score: 1,
+        evidence: {
+          hiddenAcceptancePassed: false,
+          baselineTestsUntampered: false,
+          sandboxIsolated: false,
+        },
+      },
+      { passed: true, score: 1, note: 'LLM advisory tried to force pass' },
+    );
+    assert.equal(vetoed.passed, false);
+    assert.equal(vetoed.score, 0);
+    assert.equal(vetoed.hardVetoed, true);
+    assert.ok(vetoed.vetoReasons.includes('baseline_tests_tampered'));
+    assert.ok(vetoed.vetoReasons.includes('sandbox_not_isolated'));
+    assert.ok(vetoed.vetoReasons.includes('hidden_acceptance_failed'));
   });
 
   test('computeAutonomousReasoningMetrics computes all 9 metrics, 3-way attribution, and retains all failed trials', () => {
@@ -573,13 +575,13 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
     );
   });
 
-  test('CLI arg parsing, dynamic worktree probing, and deterministic Docker A/B smoke run cleanly', async () => {
+  const repoRoot = join(import.meta.dirname, '..', '..', '..');
+  test('CLI parsing, worktree probing, compaction and experience recording', async () => {
     const parsed = parseCliArgs(['--mode', 'deterministic', '--tasks', 'ar-01-unfamiliar-codebase', '--repeats', '1', '--json']);
     assert.equal(parsed.mode, 'deterministic');
     assert.deepEqual(parsed.tasks, ['ar-01-unfamiliar-codebase']);
     assert.equal(parsed.json, true);
 
-    const repoRoot = join(import.meta.dirname, '..', '..', '..');
     const probed = await loadAndProbeWorktreeArm(repoRoot);
     assert.equal(typeof probed.capabilities.executionReasoningTracker, 'boolean');
     assert.equal(typeof probed.capabilities.postEditStaleVerifier, 'boolean');
@@ -657,7 +659,9 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       memStore.close();
       rmSync(memDir, { recursive: true, force: true });
     }
+  });
 
+  test('deterministic A/B smoke executes in active sandbox', async () => {
     const outDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-cli-out-'));
     const outPath = join(outDir, 'results.jsonl');
     const prevHardeningEnv = process.env.AGENT_US_BENCHMARK_ALLOW_PROCESS_HARDENING_ONLY;

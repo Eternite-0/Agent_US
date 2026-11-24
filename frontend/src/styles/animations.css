@@ -1,24 +1,4 @@
-/* ============================================================================
- * Codex Desktop 26.1111.2228.0 — Exact Keyframes & Motion Rules
- * ========================================================================== */
-
-@keyframes codex-blossom-shimmer {
-  0% {
-    background-position: 140% 0;
-  }
-  100% {
-    background-position: -105% 0;
-  }
-}
-
-@keyframes codex-loading-shimmer {
-  0% {
-    background-position: 200% 0;
-  }
-  100% {
-    background-position: -200% 0;
-  }
-}
+/* Motion: feedback only; never animate transcript geometry. */
 
 @keyframes codex-enter-popover {
   0% {
@@ -102,24 +82,15 @@
   }
 }
 
-/* Shimmering live status text (exact Codex thinking / working sweep) */
-.codex-shimmer-text {
-  background: linear-gradient(
-    90deg,
-    var(--text-tertiary) 0%,
-    var(--text-tertiary) 35%,
-    var(--text-default) 50%,
-    var(--text-tertiary) 65%,
-    var(--text-tertiary) 100%
-  );
-  background-size: 220% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: codex-loading-shimmer 2.2s linear infinite;
+/* An active operation is indicated by opacity only, not a moving gradient. */
+.codex-shimmer-text { color: var(--text-secondary); animation: codex-activity-pulse 1.6s ease-in-out infinite; }
+
+@keyframes codex-detail-enter {
+  from { opacity: .8; }
+  to { opacity: 1; }
 }
 
-/* Vertical scroll edge fade mask (exact Codex signature detail) */
+/* Edge fade for secondary panels only; the transcript keeps text and focus rings legible. */
 .vertical-scroll-fade-mask {
   -webkit-mask-image: linear-gradient(
     to bottom,
@@ -154,4 +125,10 @@
   transition-duration: 0.01ms !important;
   animation-duration: 0.01ms !important;
   scroll-behavior: auto !important;
+}
+
+/* Moving an activity between "live" and "done" should not animate geometry. */
+@keyframes codex-activity-pulse {
+  0%, 100% { opacity: 0.66; }
+  50% { opacity: 1; }
 }

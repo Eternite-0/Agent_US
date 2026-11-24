@@ -122,7 +122,7 @@ const CodeBlock: React.FC<{ lang: string; code: string; onCopy?: (msg: string) =
           <span>{copied ? '已复制' : '复制'}</span>
         </button>
       </div>
-      <pre className="codex-code-pre">
+      <pre className="codex-code-pre" tabIndex={0} aria-label={`${lang || 'text'} 代码`}>
         <code>{code}</code>
       </pre>
     </div>
@@ -155,11 +155,17 @@ export const Markdown: React.FC<MarkdownProps> = ({
     return null;
   };
 
+  const imagePattern = /^!\[([^\]]*)\]\(([^)\s]+)\)$/;
+  const tableSeparator = /^\s*\|?[\s:-]+\|[\s|:-]*$/;
+  // A streaming delta can end anywhere (including halfway through a fence info
+  // string). Both a complete and an incomplete fence must advance the parser.
+  const fencePattern = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
   while (i < lines.length) {
     const line = lines[i];
 
     // Standalone Markdown image: ![alt](src) -> exact Codex rounded thumbnail + caption link!
-    const imgMatch = line.trim().match(/^!\[([^\]]*)\]\(([^)\s]+)\)$/);
+    const imgMatch = line.trim().match(imagePattern);
     if (imgMatch) {
       const [, alt, rawSrc] = imgMatch;
       const resolved = resolveImageSrc(rawSrc);
@@ -178,7 +184,7 @@ export const Markdown: React.FC<MarkdownProps> = ({
               title="点击放大查看图像"
               onClick={() => onOpenImage?.([imgItem], 0)}
             >
-              <img src={resolved} alt={alt || imgItem.name} className="codex-md-image-thumb" />
+              <img src={resolved} alt={alt || imgItem.name} decoding="async" loading="lazy" className="codex-md-image-thumb" />
             </button>
             <button
               type="button"
@@ -196,16 +202,18 @@ export const Markdown: React.FC<MarkdownProps> = ({
     }
 
     // Fenced code block
-    const fence = line.match(/^```([\w+-]*)\s*$/);
+    const fence = line.match(fencePattern);
     if (fence) {
-      const lang = fence[1] || '';
+      const [marker, info] = [fence[1], fence[2]];
+      const closingFence = new RegExp(`^ {0,3}${marker[0]}{${marker.length},}\\s*$`);
+      const lang = info.trim().split(/\s+/, 1)[0];
       const codeLines: string[] = [];
       i++;
-      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+      while (i < lines.length && !closingFence.test(lines[i])) {
         codeLines.push(lines[i]);
         i++;
       }
-      i++; // skip closing fence
+      if (i < lines.length) i++;
       elements.push(<CodeBlock key={key++} lang={lang} code={codeLines.join('\n')} onCopy={onCopy} />);
       continue;
     }
@@ -239,7 +247,7 @@ export const Markdown: React.FC<MarkdownProps> = ({
     if (
       line.includes('|') &&
       i + 1 < lines.length &&
-      /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])
+      tableSeparator.test(lines[i + 1])
     ) {
       const splitRow = (r: string) =>
         r
@@ -256,7 +264,7 @@ export const Markdown: React.FC<MarkdownProps> = ({
         i++;
       }
       elements.push(
-        <div key={key++} className="codex-table-wrap">
+        <div key={key++} className="codex-table-wrap" tabIndex={0} role="region" aria-label="表格">
           <table>
             <thead>
               <tr>
@@ -328,11 +336,15 @@ export const Markdown: React.FC<MarkdownProps> = ({
     }
 
     // Paragraph
-    const para: string[] = [];
+    const para: string[] = [line];
+    i++;
     while (
       i < lines.length &&
       lines[i].trim() &&
-      !/^```/.test(lines[i]) &&
+      !fencePattern.test(lines[i]) &&
+      !imagePattern.test(lines[i].trim()) &&
+      !/^(-{3,}|\*{3,})$/.test(lines[i].trim()) &&
+      !(lines[i].includes('|') && i + 1 < lines.length && tableSeparator.test(lines[i + 1])) &&
       !/^#{1,4}\s+/.test(lines[i]) &&
       !/^>\s?/.test(lines[i]) &&
       !/^\s*[-*+]\s+/.test(lines[i]) &&

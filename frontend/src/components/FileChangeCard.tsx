@@ -1,16 +1,9 @@
-import React, { useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import type { ComputedFileDiff } from '../utils/diff';
 import { splitPath } from '../utils/format';
+import { ActivityCopyButton } from './ActivityPresentation';
 import { Collapsible } from './Collapsible';
-import {
-  IconArrowUpRight,
-  IconCheck,
-  IconChevronDown,
-  IconChevronRight,
-  IconCopy,
-  IconDiffBox,
-  IconUndo,
-} from './Icons';
+import { IconArrowUpRight, IconChevronDown, IconChevronRight, IconFileDoc, IconDiffBox, IconUndo } from './Icons';
 
 interface FileChangeCardProps {
   files: ComputedFileDiff[];
@@ -21,243 +14,102 @@ interface FileChangeCardProps {
 
 const INITIAL_VISIBLE = 3;
 
-export const FileChangeCard: React.FC<FileChangeCardProps> = ({
-  files,
-  onInspectFile,
-  onUndo,
-  onCopy,
-}) => {
-  const [expandedList, setExpandedList] = useState(false);
-  const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({});
-  const [copiedPath, setCopiedPath] = useState<string | null>(null);
+function DiffCounts({ added, deleted }: { added: number; deleted: number }) {
+  return <span className="codex-diff-counts tabular-nums"><span className="codex-git-add">+{added}</span><span className="codex-git-del">-{deleted}</span></span>;
+}
 
-  if (!files.length) return null;
-
-  const totalAdd = files.reduce((s, f) => s + f.added, 0);
-  const totalDel = files.reduce((s, f) => s + f.deleted, 0);
-  const primary = files.slice(0, INITIAL_VISIBLE);
-  const rest = files.slice(INITIAL_VISIBLE);
-
-  const toggleFile = (path: string) => {
-    setExpandedFiles((prev) => ({ ...prev, [path]: !prev[path] }));
-  };
-
-  const handleCopyFile = async (f: ComputedFileDiff, e: React.MouseEvent) => {
-    e.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(f.afterText);
-      setCopiedPath(f.path);
-      onCopy?.(`已复制 ${f.path}`);
-      window.setTimeout(() => setCopiedPath((cur) => (cur === f.path ? null : cur)), 1200);
-    } catch {
-      // ignore
-    }
-  };
-
-  const renderRow = (f: ComputedFileDiff) => {
-    const { dir, name } = splitPath(f.path);
-    const isOpen = Boolean(expandedFiles[f.path]);
-    // Compute compact hunk preview (changed lines + 2 context lines around each change)
+function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
+  file: ComputedFileDiff;
+  hidden: boolean;
+  listId: string;
+  onInspectFile: FileChangeCardProps['onInspectFile'];
+  onCopy?: FileChangeCardProps['onCopy'];
+}) {
+  const [open, setOpen] = useState(false);
+  const previewId = useId();
+  const { path, added, deleted, lines, afterText } = file;
+  const { dir, name } = splitPath(path);
+  const status = file.isNew ? { kind: 'add', label: '新增' } : file.isDeleted ? { kind: 'del', label: '删除' } : { kind: 'edit', label: '修改' };
+  const visibleLines = useMemo(() => {
     const keep = new Set<number>();
-    f.lines.forEach((l, idx) => {
-      if (l.kind !== 'context') {
-        for (let k = Math.max(0, idx - 2); k <= Math.min(f.lines.length - 1, idx + 2); k++) {
-          keep.add(k);
-        }
-      }
+    lines.forEach((line, index) => {
+      if (line.kind === 'context') return;
+      for (let i = Math.max(0, index - 2); i <= Math.min(lines.length - 1, index + 2); i++) keep.add(i);
     });
-    const visibleLines = keep.size
-      ? f.lines.filter((_, idx) => keep.has(idx)).slice(0, 120)
-      : f.lines.slice(0, 60);
-
-    return (
-      <div key={f.path} className="codex-file-row-wrap">
-        <div
-          role="button"
-          tabIndex={0}
-          className="codex-file-row"
-          aria-expanded={isOpen}
-          title={isOpen ? '点击收起变更预览' : '点击展开内联变更预览'}
-          onClick={() => toggleFile(f.path)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              toggleFile(f.path);
-            }
-          }}
-        >
-          <span className="codex-file-path" style={{ gap: 6 }}>
-            <IconChevronRight
-              size={13}
-              style={{
-                flex: 'none',
-                color: 'var(--text-tertiary)',
-                transition: 'transform var(--duration-basic) var(--ease-out)',
-                transform: isOpen ? 'rotate(90deg)' : 'rotate(0deg)',
-              }}
-            />
-            {dir && <span className="codex-file-dir">{dir}</span>}
-            <span className="codex-file-name">{name}</span>
-          </span>
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flex: 'none' }}>
-            <span className="codex-diff-counts tabular-nums">
-              <span className="codex-git-add">+{f.added}</span>
-              <span className="codex-git-del">-{f.deleted}</span>
-            </span>
-            <button
-              type="button"
-              className="codex-icon-btn"
-              style={{ width: 22, height: 22 }}
-              title="在右侧分屏打开"
-              aria-label={`在右侧分屏打开 ${f.path}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onInspectFile(f.path);
-              }}
-            >
-              <IconArrowUpRight size={13} />
-            </button>
-          </span>
-        </div>
-
-        <Collapsible open={isOpen}>
-          <div className="codex-file-inline-diff">
-            <div className="codex-inline-diff-head">
-              <button
-                type="button"
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  color: 'var(--text-default)',
-                  fontWeight: 500,
-                  fontSize: 12,
-                }}
-                onClick={() => onInspectFile(f.path)}
-              >
-                <span>{f.path}</span>
-                <span className="codex-diff-counts tabular-nums" style={{ fontSize: 11.5 }}>
-                  <span className="codex-git-add">+{f.added}</span>
-                  <span className="codex-git-del">-{f.deleted}</span>
-                </span>
-              </button>
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <button
-                  type="button"
-                  className="codex-icon-btn"
-                  style={{ width: 22, height: 22 }}
-                  title="复制文件内容"
-                  onClick={(e) => void handleCopyFile(f, e)}
-                >
-                  {copiedPath === f.path ? <IconCheck size={13} /> : <IconCopy size={13} />}
-                </button>
-                <button
-                  type="button"
-                  className="codex-icon-btn"
-                  style={{ width: 22, height: 22 }}
-                  title="在右侧完整视图打开"
-                  onClick={() => onInspectFile(f.path)}
-                >
-                  <IconArrowUpRight size={13} />
-                </button>
-              </div>
-            </div>
-            <div className="codex-inline-diff-body">
-              {visibleLines.length === 0 ? (
-                <div style={{ padding: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>
-                  无文本行差异
-                </div>
-              ) : (
-                visibleLines.map((ln, i) => (
-                  <div key={i} className="codex-inline-diff-row" data-kind={ln.kind}>
-                    <span className="codex-inline-diff-ln">{ln.newLine ?? ln.oldLine ?? ''}</span>
-                    <span>{ln.text || ' '}</span>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        </Collapsible>
-      </div>
-    );
-  };
+    return keep.size ? lines.filter((_, index) => keep.has(index)).slice(0, 120) : lines.slice(0, 60);
+  }, [lines]);
 
   return (
-    <div className="codex-file-card">
-      <div
-        className="codex-file-card-head"
-        role="button"
-        tabIndex={0}
-        aria-label="查看已更改的文件"
-        onClick={() => onInspectFile(files[0]?.path)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            onInspectFile(files[0]?.path);
-          }
-        }}
-      >
-        <span className="codex-file-card-icon">
-          <IconDiffBox size={20} />
-        </span>
-        <div className="codex-file-card-meta">
-          <span className="codex-file-card-title">已编辑 {files.length} 个文件</span>
-          <span className="codex-file-card-sub">
-            <span className="codex-diff-default-sub codex-diff-counts tabular-nums">
-              <span className="codex-git-add">+{totalAdd}</span>
-              <span className="codex-git-del">-{totalDel}</span>
-            </span>
-            <span className="codex-diff-hover-sub">
-              <span>查看变更</span>
-              <IconArrowUpRight size={13} />
-            </span>
+    <div className="codex-file-row-wrap" hidden={hidden} data-scroll-anchor={`file:${listId}:${path}`}>
+      <div className="codex-file-row">
+        <button type="button" className="codex-file-path" title={path} aria-label={`在右侧分屏打开 ${path}`} onClick={() => onInspectFile(path)}>
+          <IconFileDoc size={14} aria-hidden="true" />
+          <span className="codex-file-path-text">
+            {dir && <span className="codex-file-dir">{dir}</span>}{name}
           </span>
+        </button>
+        <span className="codex-file-state" data-kind={status.kind}>{status.label}</span>
+        <DiffCounts added={added} deleted={deleted} />
+        <button type="button" className="codex-icon-btn codex-activity-copy codex-file-row-trigger codex-activity-disclosure"
+          aria-expanded={open} aria-controls={previewId} aria-label={`${open ? '收起' : '预览'}差异 ${path}`} data-scroll-disclosure onClick={() => setOpen(!open)}>
+          <IconChevronRight className="codex-direct-chevron" size={13} aria-hidden="true" />
+        </button>
+      </div>
+      <Collapsible id={previewId} open={open}>
+        <div className="codex-file-inline-diff">
+          <div className="codex-inline-diff-head">
+            <button type="button" className="codex-inline-link-btn" onClick={() => onInspectFile(path)}><span>{path}</span></button>
+            <ActivityCopyButton text={afterText} label="复制文件内容" onCopy={onCopy} />
+          </div>
+          <div className="codex-inline-diff-body">
+            {visibleLines.length === 0 ? (
+              <div style={{ padding: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>无文本行差异</div>
+            ) : visibleLines.map((line) => (
+              <div key={`${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
+                <span className="codex-inline-diff-ln">{line.newLine ?? line.oldLine ?? ''}</span>
+                <span>{line.text || ' '}</span>
+              </div>
+            ))}
+          </div>
         </div>
-        <div
-          className="codex-file-card-actions"
-          onClick={(e) => e.stopPropagation()}
-        >
-          {onUndo && (
-            <button type="button" className="codex-toolbar-btn" onClick={onUndo}>
-              <span>撤销</span>
-              <IconUndo size={13} />
-            </button>
-          )}
-          <button
-            type="button"
-            className="codex-toolbar-btn"
-            data-variant="outline"
-            onClick={() => onInspectFile(files[0]?.path)}
-          >
-            查看变更
-          </button>
+      </Collapsible>
+    </div>
+  );
+}
+
+export function FileChangeCard({ files, onInspectFile, onUndo, onCopy }: FileChangeCardProps) {
+  const [expandedList, setExpandedList] = useState(false);
+  const listId = useId();
+  const uniqueFiles = useMemo(() => [...new Map(files.map((file) => [file.path, file])).values()], [files]);
+  if (!uniqueFiles.length) return null;
+
+  const totalAdd = uniqueFiles.reduce((sum, file) => sum + file.added, 0);
+  const totalDel = uniqueFiles.reduce((sum, file) => sum + file.deleted, 0);
+  const moreCount = uniqueFiles.length - INITIAL_VISIBLE;
+  const inspectFirst = () => onInspectFile(uniqueFiles[0].path);
+  return (
+    <div className="codex-file-card" data-status="completed">
+      <div className="codex-file-card-head">
+        <button className="codex-file-card-trigger" type="button" onClick={inspectFirst} aria-label="查看已更改的文件">
+          <span className="codex-file-card-icon"><IconDiffBox size={14} aria-hidden="true" /></span>
+          <span>已编辑 {uniqueFiles.length} 个文件</span>
+          <DiffCounts added={totalAdd} deleted={totalDel} />
+        </button>
+        <div className="codex-file-card-actions">
+          {onUndo && <button type="button" className="codex-toolbar-btn" onClick={onUndo}><span>撤销</span><IconUndo size={13} aria-hidden="true" /></button>}
+          <button type="button" className="codex-toolbar-btn" onClick={inspectFirst}>查看变更<IconArrowUpRight size={12} aria-hidden="true" /></button>
         </div>
       </div>
 
-      <div>{primary.map(renderRow)}</div>
-
-      {rest.length > 0 && (
-        <>
-          <Collapsible open={expandedList}>
-            <div>{rest.map(renderRow)}</div>
-          </Collapsible>
-          <button
-            type="button"
-            className="codex-file-more-btn"
-            aria-expanded={expandedList}
-            onClick={() => setExpandedList((v) => !v)}
-          >
-            <span>{expandedList ? '收起文件列表' : `再显示 ${rest.length} 个文件`}</span>
-            <IconChevronDown
-              size={15}
-              style={{
-                transition: 'transform var(--duration-basic) var(--ease-out)',
-                transform: expandedList ? 'rotate(180deg)' : 'rotate(0deg)',
-              }}
-            />
-          </button>
-        </>
-      )}
+      <div id={listId}>
+        {uniqueFiles.map((file, index) => <FileChangeRow key={file.path} file={file} listId={listId}
+          hidden={!expandedList && index >= INITIAL_VISIBLE} onInspectFile={onInspectFile} onCopy={onCopy} />)}
+      </div>
+      {moreCount > 0 && <button type="button" className="codex-file-more-btn codex-activity-disclosure" aria-expanded={expandedList}
+        aria-controls={listId} data-scroll-disclosure onClick={() => setExpandedList(!expandedList)}>
+        <span>{expandedList ? '收起文件列表' : `再显示 ${moreCount} 个文件`}</span>
+        <IconChevronDown className="codex-direct-chevron" size={15} aria-hidden="true" />
+      </button>}
     </div>
   );
-};
+}
