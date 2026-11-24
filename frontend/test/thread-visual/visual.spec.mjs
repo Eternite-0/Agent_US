@@ -279,6 +279,77 @@ test('desktop shell, search, settings, capability navigation and scheduling surf
   }
 });
 
+test('settings handle an older Supervisor endpoint, support retry and stay readable at each width', async ({ page }, info) => {
+  test.skip(Boolean(process.env.E2E_FRONTEND_DIR), 'New settings behavior');
+  const alias = 'workspace:long-model-alias-for-context-supervision-and-model-selection';
+  let readStatus = 404;
+  let patchStatus = 200;
+  let saved = { enabled: true, admissionEnabled: true, mode: 'off', model: null, dtocMinPromptTokens: 24_000,
+    epochWatermarks: [.6, .82], maxBudgetRatio: .72, maxOutputTokens: 512, timeoutMs: 5_000 };
+  await page.route('**/v1/context/supervisor', async route => {
+    const patch = route.request().method() === 'PATCH';
+    const status = patch ? patchStatus : readStatus;
+    if (status !== 200) return route.fulfill({ status, json: { message: 'Route GET:/v1/context/supervisor not found' } });
+    if (patch) saved = { ...saved, ...route.request().postDataJSON() };
+    return route.fulfill({ json: {
+      config: saved, effectiveModel: null, recommendedModel: alias, readOnly: true, reversibleStore: false,
+      rationale: 'supervisor_mode_off', recommendedRationale: 'auto_catalog_best_healthy', guidelinesCount: 0,
+      candidates: [{ alias, provider: 'Fixture', healthy: true, recommended: true }],
+    } });
+  });
+
+  await page.goto('/#/settings/context');
+  const settings = page.locator('.codex-settings-page');
+  const nav = settings.getByRole('navigation', { name: '设置分类' });
+  const search = settings.getByRole('textbox', { name: '搜索设置' });
+  const content = settings.locator('.codex-settings-body');
+  const refresh = settings.getByRole('button', { name: '刷新目录', exact: true });
+  const alert = content.getByRole('alert');
+  const toggle = content.getByRole('switch', { name: '启用自适应上下文', exact: true });
+  await expect(alert).toContainText('当前后端未提供自适应上下文接口');
+  await expect(content).not.toContainText('Route GET');
+  await expect(toggle).toHaveCount(0);
+  await expect(refresh).toHaveCSS('white-space', 'nowrap');
+  await capture(page, info, 'settings-context-unsupported');
+
+  readStatus = 200;
+  await refresh.click();
+  await expect(toggle).toBeChecked();
+  await expect(content.getByRole('combobox', { name: 'Supervisor 候选模型' })).toHaveValue('');
+  await expect(content.getByText('未启用', { exact: true })).toBeVisible();
+  patchStatus = 503;
+  await toggle.click();
+  await expect(alert).toContainText('未能保存设置');
+  await expect(toggle).toBeChecked();
+  patchStatus = 200;
+  await toggle.click();
+  await expect(toggle).not.toBeChecked();
+
+  readStatus = 503;
+  await refresh.click();
+  await expect(alert).toContainText('下方为上次读取的状态');
+  await expect(toggle).toBeDisabled();
+  readStatus = 200;
+  await refresh.click();
+  await expect(toggle).toBeEnabled();
+  const limits = await content.evaluate(el => ({ width: el.clientWidth, scrollWidth: el.scrollWidth }));
+  expect(limits.scrollWidth).toBeLessThanOrEqual(limits.width + 1);
+  await expect(settings.locator('.codex-settings-inner')).toHaveCSS('animation-name', 'none');
+  await capture(page, info, 'settings-context');
+  await toggleTheme(page, 'dark');
+  await capture(page, info, 'settings-context');
+
+  await content.evaluate(el => { el.scrollTop = el.scrollHeight; });
+  expect(await content.evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+  await search.fill('没有这个分类');
+  await expect(nav.getByRole('status')).toHaveText('没有匹配的设置');
+  await settings.getByRole('button', { name: '清除设置搜索' }).click();
+  await expect(search).toBeFocused();
+  await nav.getByRole('button', { name: '外观', exact: true }).click();
+  await expect(content.getByRole('heading', { name: '外观', exact: true })).toBeVisible();
+  await expect.poll(() => content.evaluate(el => el.scrollTop)).toBe(0);
+});
+
 test('desktop focus and reduced motion do not alter transcript or inspector state', async ({ page }, info) => {
   test.skip(Boolean(process.env.E2E_FRONTEND_DIR), 'New keyboard and motion behavior');
   test.skip(info.project.name !== '1440x960', 'Keyboard and motion are viewport-independent');

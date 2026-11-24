@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { AgentBackendClient } from '../api/client';
 import type {
   AppearancePreset,
@@ -30,6 +30,7 @@ import {
   IconActivity,
   IconArchive,
   IconCheck,
+  IconClose,
   IconCpu,
   IconDatabase,
   IconGlobe,
@@ -220,6 +221,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 }) => {
   const [navSearch, setNavSearch] = useState('');
   const settingsNavRef = useRef<HTMLElement>(null);
+  const settingsSearchRef = useRef<HTMLInputElement>(null);
+  const settingsBodyRef = useRef<HTMLDivElement>(null);
   const [memoryQuery, setMemoryQuery] = useState('');
   const [memoryScope, setMemoryScope] = useState<'global' | 'workspace' | 'session'>('global');
   const [draftBaseUrl, setDraftBaseUrl] = useState(connection.baseUrl);
@@ -268,10 +271,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const validSections = new Set(NAV_GROUPS.flatMap((group) => group.items.map((item) => item.id)));
   const activeSection = validSections.has(section) ? section : 'general';
   const isWide = WIDE_SECTIONS.has(activeSection);
+  useLayoutEffect(() => {
+    if (settingsBodyRef.current) settingsBodyRef.current.scrollTop = 0;
+  }, [activeSection]);
   useEffect(() => {
     const nav = settingsNavRef.current;
-    if (!nav || nav.scrollWidth <= nav.clientWidth) return;
-    nav.querySelector('[aria-current="page"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    if (!nav || (nav.scrollWidth <= nav.clientWidth && nav.scrollHeight <= nav.clientHeight)) return;
+    const active = nav.querySelector('[aria-current="page"]');
+    if (!active) return;
+    const row = active.getBoundingClientRect();
+    const bounds = nav.getBoundingClientRect();
+    if (row.left < bounds.left) nav.scrollLeft += row.left - bounds.left - 4;
+    if (row.right > bounds.right) nav.scrollLeft += row.right - bounds.right + 4;
+    if (row.top < bounds.top) nav.scrollTop += row.top - bounds.top - 4;
+    if (row.bottom > bounds.bottom) nav.scrollTop += row.bottom - bounds.bottom + 4;
   }, [activeSection, filteredGroups]);
   const pendingApprovals = approvals.filter((a) => a.status === 'pending');
 
@@ -308,16 +321,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         <div className="codex-settings-search">
           <IconSearch size={14} />
           <input
-            placeholder="搜索"
+            ref={settingsSearchRef}
+            placeholder="搜索设置"
             aria-label="搜索设置"
             value={navSearch}
             onChange={(e) => setNavSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape' && navSearch) {
+                e.stopPropagation();
+                setNavSearch('');
+              }
+            }}
           />
+          {navSearch && (
+            <button type="button" className="codex-icon-btn" aria-label="清除设置搜索" onClick={() => {
+              setNavSearch('');
+              settingsSearchRef.current?.focus();
+            }}><IconClose size={13} /></button>
+          )}
         </div>
 
         <nav className="codex-settings-nav-list" ref={settingsNavRef} aria-label="设置分类">
+          {filteredGroups.length === 0 && <p className="codex-settings-nav-empty" role="status">没有匹配的设置</p>}
           {filteredGroups.map((g) => (
-            <div key={g.group} data-group={g.group} style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            <div key={g.group} className="codex-settings-nav-group">
               <div className="codex-settings-group-label">{g.group}</div>
               {g.items.map((item) => (
                 <button
@@ -328,7 +355,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   aria-current={activeSection === item.id ? 'page' : undefined}
                   onClick={() => onChangeSection(item.id)}
                 >
-                  <span style={{ display: 'inline-flex', color: 'var(--text-secondary)', flex: 'none' }}>
+                  <span className="codex-settings-nav-icon">
                     {item.icon}
                   </span>
                   <span>{item.label}</span>
@@ -359,8 +386,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       </div>
 
       {/* Right Settings Body (widens automatically for Account Pool / Models / Check-in) */}
-      <div className="codex-settings-body">
-        <div className="codex-settings-inner" data-wide={isWide ? 'true' : undefined}>
+      <div className="codex-settings-body" ref={settingsBodyRef}>
+        <div key={activeSection} className="codex-settings-inner" data-wide={isWide ? 'true' : undefined}>
           {activeSection === 'providers' && (
             <ProviderAccountsPanel
               client={client}
@@ -421,7 +448,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       已有会话继续使用创建时的目录。工具审批与操作系统的目录权限相互独立。
                     </span>
                   </div>
-                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <div className="codex-settings-actions">
                     <input
                       className="codex-input"
                       style={{ width: 280 }}
@@ -483,7 +510,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       实时对接 `backend/src/main.js`（Direct Agent + 号池路由 + SQLite WAL）
                     </span>
                   </div>
-                  <div style={{ display: 'flex', gap: 6 }}>
+                  <div className="codex-settings-actions">
                     <button
                       type="button"
                       className="codex-toolbar-btn"
@@ -656,6 +683,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     </span>
                   </div>
                   <input
+                    aria-label="后端地址"
                     className="codex-input"
                     style={{ width: 240 }}
                     placeholder="留空走同源代理"
@@ -729,7 +757,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           {fmtActionCommand(a.tool, a.action)}
                         </span>
                       </div>
-                      <div style={{ display: 'flex', gap: 6, flex: 'none' }}>
+                      <div className="codex-settings-actions">
                         {a.status === 'pending' ? (
                           <>
                             <button
@@ -774,8 +802,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <h1 className="codex-settings-h1">记忆中心</h1>
               <ExperienceMemoryPanel key={workspaceRoot} client={client} projectId={workspaceRoot} onToast={onToast} />
               <h2 className="memory-section-title">持久记忆</h2>
-              <div style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center' }}>
+              <div className="codex-settings-actions" style={{ marginBottom: 12 }}>
                 <select
+                  aria-label="记忆范围"
                   className="codex-select"
                   value={memoryScope}
                   onChange={(e) => setMemoryScope(e.target.value as typeof memoryScope)}
@@ -787,7 +816,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <input
                   className="codex-input"
                   aria-label="搜索记忆"
-                  style={{ width: '100%', flex: 1 }}
+                  style={{ flex: '1 1 150px' }}
                   placeholder="搜索持久化记忆…"
                   value={memoryQuery}
                   onChange={(e) => setMemoryQuery(e.target.value)}

@@ -513,7 +513,7 @@ export interface AgentBackendClient {
     signal?: AbortSignal;
   }) => Promise<EvaluationRegressionSummary>;
   getContextSupervisor?: (signal?: AbortSignal) => Promise<ContextSupervisorStatus>;
-  updateContextSupervisor?: (patch: ContextSupervisorUpdate) => Promise<ContextSupervisorStatus>;
+  updateContextSupervisor?: (patch: ContextSupervisorUpdate, signal?: AbortSignal) => Promise<ContextSupervisorStatus>;
   listMemory(params?: {
     projectId?: string;
     taskId?: string;
@@ -1685,8 +1685,8 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.req('GET', '/v1/context/supervisor', { signal });
   }
 
-  updateContextSupervisor(patch: ContextSupervisorUpdate): Promise<ContextSupervisorStatus> {
-    return this.req('PATCH', '/v1/context/supervisor', { body: patch });
+  updateContextSupervisor(patch: ContextSupervisorUpdate, signal?: AbortSignal): Promise<ContextSupervisorStatus> {
+    return this.req('PATCH', '/v1/context/supervisor', { body: patch, signal });
   }
 
   async listMemory(params?: {

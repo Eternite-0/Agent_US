@@ -27,12 +27,15 @@
   flex-wrap: wrap;
 }
 
+.a2a-page-header > :first-child { flex: 1 1 280px; min-width: 0; }
+
 .a2a-status-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  border-radius: var(--radius-full);
+  max-width: 100%;
+  border-radius: var(--radius-control);
   font-size: 12px;
   font-weight: 500;
   border: 1px solid var(--border-default);
@@ -67,10 +70,8 @@
   justify-content: space-between;
   gap: 10px;
   flex-wrap: wrap;
-  padding: 10px 12px;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border-default);
-  background: var(--bg-surface);
+  padding: 10px 0;
+  border-block: 1px solid var(--border-subtle);
 }
 
 .a2a-filter-left,
@@ -672,10 +673,9 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 12px 10px;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border-default);
-  background: var(--bg-surface);
+  min-width: 0;
+  padding: 8px 10px 8px 0;
+  border-inline-end: 1px solid var(--border-subtle);
 }
 
 .a2a-models-sidebar-title {
@@ -996,9 +996,9 @@
 
 .a2a-bridge-card {
   padding: 14px 16px;
-  border-radius: var(--radius-lg);
-  border: 1px solid color-mix(in srgb, var(--color-accent) 35%, transparent);
-  background: var(--bg-surface);
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-secondary);
 }
 
 .a2a-kpi-grid {
@@ -1015,8 +1015,7 @@
 
 .a2a-kpi-card {
   padding: 14px 16px;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border-default);
+  border-block-start: 1px solid var(--border-subtle);
   background: var(--bg-surface);
   display: flex;
   flex-direction: column;
@@ -1062,8 +1061,7 @@
 }
 
 .a2a-checkin-card {
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border-default);
+  border-block: 1px solid var(--border-subtle);
   background: var(--bg-surface);
   overflow: hidden;
 }
@@ -1442,10 +1440,9 @@
 }
 
 /* Compact model inventory behavior used by the settings workspace on narrow windows. */
-@media (max-width: 1100px) {
-  .a2a-models-layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
+@container settings-body (max-width: 840px) {
+  .a2a-models-layout { grid-template-columns: minmax(0, 1fr); }
+  .a2a-models-sidebar { border-inline-end: 0; border-block-end: 1px solid var(--border-subtle); }
 }
 
 /* Both headers and rows use the same tracks. Only the table scrolls if
