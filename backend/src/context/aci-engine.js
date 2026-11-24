@@ -1,9 +1,12 @@
+import { createHash } from 'node:crypto';
 import { extname } from 'node:path';
 import { estimateTokens, measureRequestComposition, pairClosed } from '../context.js';
 import { redactSecrets, sanitize } from '../envelope.js';
+import { classifyMutationPath, isVerificationCommand } from '../kernel/execution-reasoning.js';
 import { extractRepositorySymbols } from '../repo-symbols.js';
 import {
   ReversibleContextStore,
+  formatAciRefStub,
   normalizeContextPath,
 } from './aci-store.js';
 import {
@@ -21,19 +24,53 @@ export const DEFAULT_ACI_WEIGHTS = Object.freeze({
 });
 
 export const DEFAULT_EPOCH_WATERMARKS = Object.freeze([0.6, 0.82]);
+export const PHASE_WATERMARK_V25_EPOCH_WATERMARKS = Object.freeze([0.78, 0.9]);
 export const DEFAULT_SINGLE_STEP_BUDGET = 8000;
 export const DEFAULT_DTOC_MIN_CHARS = 700;
 export const DEFAULT_DTOC_SUPERSEDED_MIN_CHARS = 600;
 export const DEFAULT_DTOC_POLICY = 'adaptive_single_step';
+export const PHASE_WATERMARK_V25_DTOC_POLICY = 'phase_watermark_v25';
+export const VALID_DTOC_POLICIES = Object.freeze([
+  DEFAULT_DTOC_POLICY,
+  'cumulative',
+  PHASE_WATERMARK_V25_DTOC_POLICY,
+]);
 export const DEFAULT_DTOC_MIN_PROMPT_TOKENS = 24000;
+export const DEFAULT_DTOC_PRESSURE_MIN_TOKENS = 28000;
+export const DEFAULT_DTOC_PRESSURE_RATIO = 0.65;
+export const DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS = 1200;
+export const DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS = 4;
 export const ACON_SETTINGS_KEY = 'aci.learned_guidelines';
 export const ACON_MAX_GUIDELINES = 12;
 
+export function normalizeDtocPolicy(dtocPolicy) {
+  if (
+    dtocPolicy === 'cumulative' ||
+    dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||
+    dtocPolicy === DEFAULT_DTOC_POLICY
+  ) {
+    return dtocPolicy;
+  }
+  return DEFAULT_DTOC_POLICY;
+}
+
+export function resolveWatermarksForPolicy(dtocPolicy, explicitWatermarks = null) {
+  if (Array.isArray(explicitWatermarks) && explicitWatermarks.length > 0) {
+    const cleaned = explicitWatermarks
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0 && n < 1);
+    if (cleaned.length > 0) return cleaned;
+  }
+  return normalizeDtocPolicy(dtocPolicy) === PHASE_WATERMARK_V25_DTOC_POLICY
+    ? [...PHASE_WATERMARK_V25_EPOCH_WATERMARKS]
+    : [...DEFAULT_EPOCH_WATERMARKS];
+}
+
 const COMPRESSIBLE_TOOLS = new Set(['read_file', 'glob', 'grep', 'bash']);
-const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch']);
+const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delete_file']);
 
 const ERROR_OUTPUT_RE =
-  /(?:^exitCode:\s*[1-9]\d*\b|exit\s+code[:=\s]+[1-9]\d*\b|AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|ECONNREFUSED|Traceback \(most recent call last\)|\b(?:FAIL|FAILED|FATAL|PANIC)\b|✖\s|×\s|^not ok \d+|^\s*(?:Expected|Actual|Received)\b|^\s+at\s+\S+:\d+:\d+|^\s+File\s+".+",\s+line\s+\d+|\bTS\d{4,5}:|\berror\[E\d+\]|\bError:\s|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/m;
+  /(?:^exitCode:\s*[1-9]\d*\b|\bexitCode:\s*[1-9]\d*\b|exit\s+code[:=\s]+[1-9]\d*\b|\[(?:NON_ZERO_EXIT|TOOL_ERROR)\]|AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|ECONNREFUSED|Traceback \(most recent call last\)|\b(?:FAIL|FAILED|FATAL|PANIC)\b|✖\s|×\s|^not ok \d+|^\s*(?:Expected|Actual|Received)\b|^\s+at\s+\S+:\d+:\d+|^\s+File\s+".+",\s+line\s+\d+|\bTS\d{4,5}:|\berror\[E\d+\]|\bError:\s|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/m;
 
 const STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'from', 'that', 'this', 'into', 'when', 'where',
@@ -43,7 +80,10 @@ const STOPWORDS = new Set([
 ]);
 
 const CONTRACT_PATH_RE =
-  /(?:^|\/)(?:agents\.md|package\.json|tsconfig(?:\.[^/]+)?\.json|readme\.md|.*contract.*|.*schema.*|.*interface.*|.*types?\.[^/]+|.*\.d\.ts|store\.js|routes\/[^/]+|api\/[^/]+)$/i;
+  /(?:^|\/)(?:agents\.md|spec\.md|constraints\.md|contract\.json|package\.json|tsconfig(?:\.[^/]+)?\.json|readme\.md|.*contract.*|.*schema.*|.*interface.*|.*types?\.[^/]+|.*\.d\.ts|store\.js|routes\/[^/]+|api\/[^/]+)$/i;
+
+const STRICT_DTOC_CONTRACT_RE =
+  /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
 
 export function detectLanguageFromPath(filePath) {
   const ext = extname(String(filePath || '').trim().toLowerCase());
@@ -187,6 +227,18 @@ export function extractErrorFeedbackSignals(errorText) {
   };
 }
 
+function isStrictDtocContractPath(filePath, contractFiles = []) {
+  const norm = normalizeContextPath(filePath);
+  if (!norm) return false;
+  for (const cf of contractFiles ?? []) {
+    const ncf = normalizeContextPath(cf);
+    if (ncf && (norm === ncf || norm.endsWith(`/${ncf}`) || ncf.endsWith(`/${norm}`))) {
+      return true;
+    }
+  }
+  return STRICT_DTOC_CONTRACT_RE.test(norm);
+}
+
 function isContractPath(filePath, contractFiles = []) {
   const norm = normalizeContextPath(filePath);
   if (!norm) return false;
@@ -260,18 +312,23 @@ function assignMessageSteps(srcMessages = [], currentStep = undefined) {
 function indexToolCallsAndMutations(srcMessages = [], msgSteps = [], activeMutationTargets = []) {
   const toolCallsById = new Map();
   const activeMutations = new Set();
+  const explicitActiveMutations = new Set();
   const lastMutationStepByPath = new Map();
 
   for (let i = 0; i < srcMessages.length; i += 1) {
     const m = srcMessages[i];
     if (m?.role !== 'assistant') continue;
     const step = msgSteps[i] ?? 0;
-    for (const b of m.content ?? []) {
-      if (b?.type !== 'tool-call') continue;
+    const blocks = [
+      ...(Array.isArray(m.content) ? m.content.filter((b) => b?.type === 'tool-call') : []),
+      ...(Array.isArray(m.toolCalls) ? m.toolCalls : []),
+    ];
+    for (const b of blocks) {
+      if (!b || typeof b !== 'object') continue;
       const toolName = String(b.name || '').trim();
       const lower = toolName.toLowerCase();
       const args = parseToolArgs(b.arguments);
-      if (b.id) {
+      if (b.id && !toolCallsById.has(b.id)) {
         toolCallsById.set(b.id, { name: toolName, args, step });
       }
       if (MUTATION_TOOLS.has(lower)) {
@@ -286,10 +343,13 @@ function indexToolCallsAndMutations(srcMessages = [], msgSteps = [], activeMutat
 
   for (const p of activeMutationTargets ?? []) {
     const norm = normalizeContextPath(p);
-    if (norm) activeMutations.add(norm);
+    if (norm) {
+      activeMutations.add(norm);
+      explicitActiveMutations.add(norm);
+    }
   }
 
-  return { toolCallsById, activeMutations, lastMutationStepByPath };
+  return { toolCallsById, activeMutations, explicitActiveMutations, lastMutationStepByPath };
 }
 
 function findLastMutationStep(rawFilePath, lastMutationStepByPath) {
@@ -659,10 +719,83 @@ export function refineCandidates(
   };
 }
 
+function extractTextFromToolMessage(msg) {
+  return (msg?.content ?? [])
+    .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('\n');
+}
+
 function isErrorToolMessage(msg, text) {
   if (msg?.isError === true || msg?.meta?.isError === true) return true;
-  if (ERROR_OUTPUT_RE.test(text)) return true;
+  const raw = String(text ?? '');
+  const m = raw.match(/^<untrusted\s+id="([^"]+)"\s+bytes="\d+">([\s\S]*)<\/untrusted\s+id="\1">$/);
+  const inner = m ? m[2] : raw;
+  if (ERROR_OUTPUT_RE.test(inner) || ERROR_OUTPUT_RE.test(raw)) return true;
   return false;
+}
+
+function findLatestErrorToolMessageIndex(srcMessages = []) {
+  for (let i = srcMessages.length - 1; i >= 0; i -= 1) {
+    const m = srcMessages[i];
+    if (m?.role !== 'tool') continue;
+    if (isErrorToolMessage(m, extractTextFromToolMessage(m))) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function derivePhaseSignalsFromMessages(srcMessages = [], toolCallsById = new Map(), lastMutationStepByPath = new Map()) {
+  let verificationCount = 0;
+  let seq = 0;
+  let lastPassingVerifSeq = -1;
+  const srcMutSeqByPath = new Map();
+
+  for (let i = 0; i < srcMessages.length; i += 1) {
+    const m = srcMessages[i];
+    if (m?.role !== 'tool') continue;
+    seq += 1;
+    const tc = m.toolCallId ? toolCallsById.get(m.toolCallId) : null;
+    const toolName = String(tc?.name || m.toolName || m.name || '').trim();
+    const lowerTool = toolName.toLowerCase();
+    const args = tc?.args ?? {};
+    const rawText = extractTextFromToolMessage(m);
+    const isErr = isErrorToolMessage(m, rawText);
+
+    if (MUTATION_TOOLS.has(lowerTool) && !isErr) {
+      for (const p of extractPathsFromMutationToolCall(lowerTool, args)) {
+        if (classifyMutationPath(p) === 'src') {
+          srcMutSeqByPath.set(p, seq);
+        }
+      }
+    }
+
+    const cmd = typeof args?.command === 'string' ? args.command.trim() : '';
+    const isVerif =
+      ((lowerTool === 'bash' || lowerTool === 'start_process') && isVerificationCommand(cmd)) ||
+      (lowerTool === 'run_diagnostics' && (!args?.kind || args.kind === 'test' || args.kind === 'auto' || args.kind === 'typecheck'));
+    if (isVerif) {
+      verificationCount += 1;
+      if (!isErr) {
+        lastPassingVerifSeq = seq;
+      }
+    }
+  }
+
+  if (srcMutSeqByPath.size === 0 && lastMutationStepByPath.size > 0 && lastPassingVerifSeq === -1) {
+    for (const mutPath of lastMutationStepByPath.keys()) {
+      if (classifyMutationPath(mutPath) === 'src') {
+        srcMutSeqByPath.set(mutPath, 1);
+      }
+    }
+  }
+
+  let unverifiedSrcMutations = 0;
+  for (const mutSeq of srcMutSeqByPath.values()) {
+    if (mutSeq > lastPassingVerifSeq) unverifiedSrcMutations += 1;
+  }
+  return { verificationCount, unverifiedSrcMutations };
 }
 
 function extractToolTargetPath(toolName, args) {
@@ -705,29 +838,87 @@ function normalizeIdSet(values) {
   return set;
 }
 
+function sha256HexLocal(text) {
+  return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
+}
+
+function buildDtocCandidateContext(
+  srcMessages,
+  {
+    currentStep = undefined,
+    activeMutationTargets = [],
+    keepRefs = [],
+    compressRefs = [],
+  } = {},
+) {
+  const { msgSteps, effectiveCurrentStep } = assignMessageSteps(srcMessages, currentStep);
+  const {
+    toolCallsById,
+    activeMutations,
+    explicitActiveMutations,
+    lastMutationStepByPath,
+  } = indexToolCallsAndMutations(srcMessages, msgSteps, activeMutationTargets);
+  const latestErrorIndex = findLatestErrorToolMessageIndex(srcMessages);
+  const keepSet = normalizeIdSet(keepRefs);
+  const preferCompressSet = normalizeIdSet(compressRefs);
+  return {
+    msgSteps,
+    effectiveCurrentStep,
+    toolCallsById,
+    activeMutations,
+    explicitActiveMutations,
+    lastMutationStepByPath,
+    latestErrorIndex,
+    keepSet,
+    preferCompressSet,
+  };
+}
+
 function computeEpochTriggerState(
   messages,
   {
     maxTotalTokens = 128000,
     contextWindow = 128000,
     cumulativeUsedTokens = null,
-    watermarks = DEFAULT_EPOCH_WATERMARKS,
+    watermarks = undefined,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
     dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    minNetSavingsTokens = DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS,
+    recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     epochState = { lastWatermark: -1, epochCount: 0 },
     singleStepTokens = undefined,
+    currentStep = undefined,
+    verificationCount = undefined,
+    unverifiedSrcMutations = undefined,
+    minAgeSteps = 3,
+    minChars = DEFAULT_DTOC_MIN_CHARS,
+    supersededMinAgeSteps = 2,
+    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
+    compressibleTools = COMPRESSIBLE_TOOLS,
+    keepRefs = [],
+    compressRefs = [],
+    activeMutationTargets = [],
+    contractFiles = [],
     systemPrompt = '',
     tools = [],
   } = {},
 ) {
   const srcMessages = Array.isArray(messages) ? messages : [];
-  const policy = dtocPolicy === 'cumulative' ? 'cumulative' : DEFAULT_DTOC_POLICY;
+  const policy = normalizeDtocPolicy(dtocPolicy);
   const minPromptTokens = Math.max(
     1000,
     Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
   );
-  const sortedWatermarks = [...(watermarks ?? DEFAULT_EPOCH_WATERMARKS)]
+  const effectiveMinNetSavings = Math.max(
+    0,
+    Number(minNetSavingsTokens ?? DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS),
+  );
+  const effectiveShieldSteps = Math.max(
+    0,
+    Number(recentEditShieldSteps ?? DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS),
+  );
+  const sortedWatermarks = [...resolveWatermarksForPolicy(policy, watermarks)]
     .map(Number)
     .filter((n) => Number.isFinite(n) && n > 0 && n < 1)
     .sort((a, b) => a - b);
@@ -773,6 +964,147 @@ function computeEpochTriggerState(
     }
   }
 
+  const prevWatermark = Number(epochState?.lastWatermark ?? -1);
+  const prevEpochCount = Number(epochState?.epochCount ?? 0);
+
+  if (policy === PHASE_WATERMARK_V25_DTOC_POLICY) {
+    const candCtx = buildDtocCandidateContext(srcMessages, {
+      currentStep,
+      activeMutationTargets,
+      keepRefs,
+      compressRefs,
+    });
+    const derivedPhase = derivePhaseSignalsFromMessages(
+      srcMessages,
+      candCtx.toolCallsById,
+      candCtx.lastMutationStepByPath,
+    );
+    const effectiveVerificationCount =
+      verificationCount != null && verificationCount !== '' && Number.isFinite(Number(verificationCount))
+        ? Math.max(0, Math.trunc(Number(verificationCount)))
+        : derivedPhase.verificationCount;
+    const effectiveUnverifiedSrc =
+      unverifiedSrcMutations != null &&
+      unverifiedSrcMutations !== '' &&
+      Number.isFinite(Number(unverifiedSrcMutations))
+        ? Math.max(0, Math.trunc(Number(unverifiedSrcMutations)))
+        : derivedPhase.unverifiedSrcMutations;
+
+    // (a) Phase gate: past initial research / first verification
+    const phasePassed =
+      effectiveVerificationCount >= 1 ||
+      (candCtx.effectiveCurrentStep >= 6 && effectiveUnverifiedSrc === 0);
+
+    // (b) Genuine single-step prompt pressure
+    const pressureMinTokens = Math.max(minPromptTokens, DEFAULT_DTOC_PRESSURE_MIN_TOKENS);
+    const pressureTriggered =
+      tokensBefore >= pressureMinTokens || singleStepRatio >= DEFAULT_DTOC_PRESSURE_RATIO;
+
+    let highestCrossedWatermark = -1;
+    if (pressureTriggered) {
+      for (const wm of sortedWatermarks) {
+        if (singleStepRatio >= wm) highestCrossedWatermark = wm;
+      }
+      if (singleStepRatio >= DEFAULT_DTOC_PRESSURE_RATIO) {
+        highestCrossedWatermark = Math.max(highestCrossedWatermark, DEFAULT_DTOC_PRESSURE_RATIO);
+      } else if (highestCrossedWatermark < 0 && tokensBefore >= pressureMinTokens) {
+        highestCrossedWatermark = Number(singleStepRatio.toFixed(4));
+      }
+    }
+
+    // (c) Estimated net token savings >= minNetSavingsTokens
+    let estimatedNetSavingsTokens = 0;
+    let eligibleCount = 0;
+    if (phasePassed && pressureTriggered) {
+      const trialMessages = srcMessages.map((m, idx) => {
+        if (m?.role !== 'tool') return m;
+        const ev = evaluateToolMessageEligibility(m, {
+          index: idx,
+          toolCallsById: candCtx.toolCallsById,
+          activeMutations: candCtx.activeMutations,
+          explicitActiveMutations: candCtx.explicitActiveMutations,
+          lastMutationStepByPath: candCtx.lastMutationStepByPath,
+          effectiveCurrentStep: candCtx.effectiveCurrentStep,
+          fallbackStep: candCtx.msgSteps[idx],
+          compressibleTools,
+          minAgeSteps,
+          minChars,
+          supersededMinAgeSteps,
+          supersededMinChars,
+          singleStepTriggered: false,
+          singleStepBudget,
+          keepSet: candCtx.keepSet,
+          preferCompressSet: candCtx.preferCompressSet,
+          dtocPolicy: policy,
+          recentEditShieldSteps: effectiveShieldSteps,
+          contractFiles,
+          latestErrorIndex: candCtx.latestErrorIndex,
+        });
+        if (!ev.eligible) return m;
+        eligibleCount += 1;
+        const stubText = formatAciRefStub(
+          {
+            uri: `artifact://${sha256HexLocal(ev.rawText)}`,
+            path: ev.rawFilePath || ev.targetPath,
+            lineRange: extractLineRangeLabel(ev.args, ev.rawText),
+            symbolOutline: [],
+            originalTokens: ev.rawTokens,
+            decision: 'DEFER',
+          },
+          { decision: 'DEFER' },
+        );
+        const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
+        return { ...m, content: [...nonTextBlocks, { type: 'text', text: stubText }] };
+      });
+      if (eligibleCount > 0) {
+        const estAfter = measureRequestComposition({
+          system: systemPrompt,
+          tools,
+          messages: trialMessages,
+        }).totalTokens;
+        estimatedNetSavingsTokens = Math.max(0, tokensBefore - estAfter);
+      }
+    }
+
+    const netSavingsMet = eligibleCount > 0 && estimatedNetSavingsTokens >= effectiveMinNetSavings;
+    const triggered = phasePassed && pressureTriggered && netSavingsMet;
+    const reason = !phasePassed
+      ? 'phase_gate_active'
+      : !pressureTriggered
+        ? 'below_pressure_watermark'
+        : !netSavingsMet
+          ? 'insufficient_net_savings'
+          : PHASE_WATERMARK_V25_DTOC_POLICY;
+
+    return {
+      srcMessages,
+      dtocPolicy: policy,
+      dtocMinPromptTokens: minPromptTokens,
+      minNetSavingsTokens: effectiveMinNetSavings,
+      recentEditShieldSteps: effectiveShieldSteps,
+      tokensBefore,
+      singleStepRatio,
+      cumulativeRatio,
+      ratio: singleStepRatio,
+      highestCrossedWatermark,
+      measuredSingleStep,
+      prevWatermark,
+      prevEpochCount,
+      watermarkTriggered: triggered && highestCrossedWatermark > prevWatermark,
+      singleStepTriggered: false,
+      emergencyTriggered: false,
+      phasePassed,
+      pressureTriggered,
+      netSavingsMet,
+      estimatedNetSavingsTokens,
+      verificationCount: effectiveVerificationCount,
+      unverifiedSrcMutations: effectiveUnverifiedSrc,
+      currentStep: candCtx.effectiveCurrentStep,
+      reason,
+      triggered,
+    };
+  }
+
   let ratio = singleStepRatio;
   let highestCrossedWatermark = -1;
   let emergencyTriggered = false;
@@ -806,14 +1138,14 @@ function computeEpochTriggerState(
     }
   }
 
-  const prevWatermark = Number(epochState?.lastWatermark ?? -1);
-  const prevEpochCount = Number(epochState?.epochCount ?? 0);
   const watermarkTriggered = highestCrossedWatermark > prevWatermark;
   const singleStepTriggered = measuredSingleStep > singleStepBudget;
   return {
     srcMessages,
     dtocPolicy: policy,
     dtocMinPromptTokens: minPromptTokens,
+    minNetSavingsTokens: effectiveMinNetSavings,
+    recentEditShieldSteps: effectiveShieldSteps,
     tokensBefore,
     singleStepRatio,
     cumulativeRatio,
@@ -826,6 +1158,7 @@ function computeEpochTriggerState(
     singleStepTriggered,
     emergencyTriggered,
     triggered: watermarkTriggered || singleStepTriggered || emergencyTriggered,
+    reason: watermarkTriggered || singleStepTriggered || emergencyTriggered ? 'triggered' : 'between_epochs',
   };
 }
 
@@ -837,11 +1170,13 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
   const state = computeEpochTriggerState(messages, options);
   return {
     triggered: state.triggered,
+    reason: state.reason,
     watermarkTriggered: state.watermarkTriggered,
     singleStepTriggered: state.singleStepTriggered,
     emergencyTriggered: state.emergencyTriggered,
     dtocPolicy: state.dtocPolicy,
     dtocMinPromptTokens: state.dtocMinPromptTokens,
+    minNetSavingsTokens: state.minNetSavingsTokens,
     singleStepRatio: state.singleStepRatio,
     cumulativeRatio: state.cumulativeRatio,
     ratio: state.ratio,
@@ -850,6 +1185,17 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
     watermark: state.highestCrossedWatermark,
     lastWatermark: state.prevWatermark,
     epochCount: state.prevEpochCount,
+    ...(state.phasePassed !== undefined ? { phasePassed: state.phasePassed } : {}),
+    ...(state.pressureTriggered !== undefined ? { pressureTriggered: state.pressureTriggered } : {}),
+    ...(state.netSavingsMet !== undefined ? { netSavingsMet: state.netSavingsMet } : {}),
+    ...(state.estimatedNetSavingsTokens !== undefined
+      ? { estimatedNetSavingsTokens: state.estimatedNetSavingsTokens }
+      : {}),
+    ...(state.verificationCount !== undefined ? { verificationCount: state.verificationCount } : {}),
+    ...(state.unverifiedSrcMutations !== undefined
+      ? { unverifiedSrcMutations: state.unverifiedSrcMutations }
+      : {}),
+    ...(state.currentStep !== undefined ? { currentStep: state.currentStep } : {}),
   };
 }
 
@@ -863,6 +1209,7 @@ export function evaluateToolMessageEligibility(
     index = 0,
     toolCallsById,
     activeMutations,
+    explicitActiveMutations = null,
     lastMutationStepByPath,
     effectiveCurrentStep = 0,
     fallbackStep = 0,
@@ -875,6 +1222,10 @@ export function evaluateToolMessageEligibility(
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     keepSet = new Set(),
     preferCompressSet = new Set(),
+    dtocPolicy = DEFAULT_DTOC_POLICY,
+    recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
+    contractFiles = [],
+    latestErrorIndex = -1,
   } = {},
 ) {
   if (!msg || msg.role !== 'tool') {
@@ -904,7 +1255,8 @@ export function evaluateToolMessageEligibility(
   const normRawPath = normalizeContextPath(rawFilePath);
   const normTargetPath = normalizeContextPath(targetPath);
 
-  const isErr = isErrorToolMessage(msg, rawText);
+  const isPhaseV25 = normalizeDtocPolicy(dtocPolicy) === PHASE_WATERMARK_V25_DTOC_POLICY;
+  const isErr = isErrorToolMessage(msg, rawText) || (isPhaseV25 && latestErrorIndex >= 0 && index === latestErrorIndex);
   const isPinnedKeep =
     (msg.toolCallId && keepSet.has(msg.toolCallId)) ||
     keepSet.has(fallbackMsgId) ||
@@ -913,11 +1265,20 @@ export function evaluateToolMessageEligibility(
     keepSet.has(targetPath) ||
     (normTargetPath && keepSet.has(normTargetPath));
 
+  const isContractShielded =
+    isPhaseV25 &&
+    ((rawFilePath && isStrictDtocContractPath(rawFilePath, contractFiles)) ||
+      (targetPath && isStrictDtocContractPath(targetPath, contractFiles)));
+
   let isActiveMutation = false;
   let superseded = false;
   if (rawFilePath) {
     const mutStep = findLastMutationStep(rawFilePath, lastMutationStepByPath);
-    if (lowerTool === 'read_file' && mutStep >= 0) {
+    const inExplicitTargets = explicitActiveMutations && pathMatchesAny(rawFilePath, explicitActiveMutations);
+    const mutWithinShieldWindow = mutStep >= 0 && effectiveCurrentStep - mutStep <= recentEditShieldSteps;
+    if (isPhaseV25 && (inExplicitTargets || mutWithinShieldWindow)) {
+      isActiveMutation = true;
+    } else if (lowerTool === 'read_file' && mutStep >= 0) {
       if (msgStep < mutStep) {
         superseded = true;
       } else {
@@ -928,6 +1289,7 @@ export function evaluateToolMessageEligibility(
     }
   }
 
+  const isRecentShielded = isPhaseV25 && age <= recentEditShieldSteps;
   const isCompressibleTool = compressibleTools.has(lowerTool);
   const isSingleStepOverflow = singleStepTriggered && rawTokens > singleStepBudget;
   const isPreferred =
@@ -939,14 +1301,19 @@ export function evaluateToolMessageEligibility(
     (normTargetPath && preferCompressSet.has(normTargetPath));
 
   const thresholdChars = superseded ? supersededMinChars : minChars;
-  const thresholdAge = superseded ? supersededMinAgeSteps : minAgeSteps;
+  const baseAgeThreshold = superseded ? supersededMinAgeSteps : minAgeSteps;
+  const thresholdAge = isPhaseV25
+    ? Math.max(baseAgeThreshold, recentEditShieldSteps + 1)
+    : baseAgeThreshold;
   const meetsSizeAndAge = rawText.length >= thresholdChars && age >= thresholdAge;
-  const meetsPreferred = isPreferred && rawText.length >= thresholdChars && age >= 1;
+  const meetsPreferred = isPreferred && rawText.length >= thresholdChars && age >= (isPhaseV25 ? recentEditShieldSteps + 1 : 1);
 
   const eligible =
     isCompressibleTool &&
     !isErr &&
     !isActiveMutation &&
+    !isContractShielded &&
+    !isRecentShielded &&
     !isPinnedKeep &&
     (meetsSizeAndAge || isSingleStepOverflow || meetsPreferred);
 
@@ -954,7 +1321,9 @@ export function evaluateToolMessageEligibility(
     ? 'error_preserved'
     : isActiveMutation
       ? 'active_mutation'
-      : 'recent_or_pinned';
+      : isContractShielded
+        ? 'contract_preserved'
+        : 'recent_or_pinned';
 
   return {
     eligible,
@@ -990,17 +1359,18 @@ export function selectOffloadableAciCandidates(
     keepRefs = [],
     compressRefs = [],
     activeMutationTargets = [],
+    dtocPolicy = DEFAULT_DTOC_POLICY,
+    recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
+    contractFiles = [],
   } = {},
 ) {
   const srcMessages = Array.isArray(messages) ? messages : [];
-  const { msgSteps, effectiveCurrentStep } = assignMessageSteps(srcMessages, currentStep);
-  const { toolCallsById, activeMutations, lastMutationStepByPath } = indexToolCallsAndMutations(
-    srcMessages,
-    msgSteps,
+  const candCtx = buildDtocCandidateContext(srcMessages, {
+    currentStep,
     activeMutationTargets,
-  );
-  const keepSet = normalizeIdSet(keepRefs);
-  const preferCompressSet = normalizeIdSet(compressRefs);
+    keepRefs,
+    compressRefs,
+  });
   const candidates = [];
 
   for (let i = 0; i < srcMessages.length; i += 1) {
@@ -1008,11 +1378,12 @@ export function selectOffloadableAciCandidates(
     if (m?.role !== 'tool') continue;
     const ev = evaluateToolMessageEligibility(m, {
       index: i,
-      toolCallsById,
-      activeMutations,
-      lastMutationStepByPath,
-      effectiveCurrentStep,
-      fallbackStep: msgSteps[i],
+      toolCallsById: candCtx.toolCallsById,
+      activeMutations: candCtx.activeMutations,
+      explicitActiveMutations: candCtx.explicitActiveMutations,
+      lastMutationStepByPath: candCtx.lastMutationStepByPath,
+      effectiveCurrentStep: candCtx.effectiveCurrentStep,
+      fallbackStep: candCtx.msgSteps[i],
       compressibleTools,
       minAgeSteps,
       minChars,
@@ -1020,8 +1391,12 @@ export function selectOffloadableAciCandidates(
       supersededMinChars,
       singleStepTriggered,
       singleStepBudget,
-      keepSet,
-      preferCompressSet,
+      keepSet: candCtx.keepSet,
+      preferCompressSet: candCtx.preferCompressSet,
+      dtocPolicy,
+      recentEditShieldSteps,
+      contractFiles,
+      latestErrorIndex: candCtx.latestErrorIndex,
     });
     if (!ev.eligible) continue;
     candidates.push({
@@ -1042,8 +1417,9 @@ export function selectOffloadableAciCandidates(
 
 /**
  * Epoch-based DTOC Reversible Compression:
- * Triggers ONLY when crossing budget watermarks (60%, 82% of maxTotalTokens)
- * or when a single-step input exceeds `singleStepBudget` (default 8000 tokens).
+ * Triggers ONLY when crossing budget watermarks (60%, 82% of maxTotalTokens),
+ * when a single-step input exceeds `singleStepBudget`, or under `phase_watermark_v25`
+ * when phase, prompt pressure, and net savings (>= 1200 tokens) ALL hold.
  * Keeps prefix bytes 100% untouched between epochs so KV Prompt Cache stays warm.
  */
 export function compressMessagesEpoch(
@@ -1054,10 +1430,12 @@ export function compressMessagesEpoch(
     maxTotalTokens = 128000,
     contextWindow = 128000,
     cumulativeUsedTokens = null,
-    watermarks = DEFAULT_EPOCH_WATERMARKS,
+    watermarks = undefined,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
     dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    minNetSavingsTokens = DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS,
+    recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     epochState = { lastWatermark: -1, epochCount: 0 },
     minAgeSteps = 3,
     minChars = DEFAULT_DTOC_MIN_CHARS,
@@ -1066,9 +1444,12 @@ export function compressMessagesEpoch(
     compressibleTools = COMPRESSIBLE_TOOLS,
     currentStep = undefined,
     singleStepTokens = undefined,
+    verificationCount = undefined,
+    unverifiedSrcMutations = undefined,
     keepRefs = [],
     compressRefs = [],
     activeMutationTargets = [],
+    contractFiles = [],
     systemPrompt = '',
     tools = [],
   } = {},
@@ -1081,8 +1462,22 @@ export function compressMessagesEpoch(
     singleStepBudget,
     dtocPolicy,
     dtocMinPromptTokens,
+    minNetSavingsTokens,
+    recentEditShieldSteps,
     epochState,
     singleStepTokens,
+    currentStep,
+    verificationCount,
+    unverifiedSrcMutations,
+    minAgeSteps,
+    minChars,
+    supersededMinAgeSteps,
+    supersededMinChars,
+    compressibleTools,
+    keepRefs,
+    compressRefs,
+    activeMutationTargets,
+    contractFiles,
     systemPrompt,
     tools,
   });
@@ -1099,10 +1494,10 @@ export function compressMessagesEpoch(
     emergencyTriggered,
   } = trigger;
 
-  if (!watermarkTriggered && !singleStepTriggered && !emergencyTriggered) {
+  if (!trigger.triggered) {
     return {
       triggered: false,
-      reason: 'between_epochs',
+      reason: trigger.reason || 'between_epochs',
       dtocPolicy: trigger.dtocPolicy,
       epoch: prevEpochCount,
       lastWatermark: prevWatermark,
@@ -1110,6 +1505,8 @@ export function compressMessagesEpoch(
       singleStepTokens: measuredSingleStep,
       tokensBefore,
       tokensAfter: tokensBefore,
+      netSavingsTokens: 0,
+      minNetSavingsTokens: trigger.minNetSavingsTokens,
       compressedCount: 0,
       compressedRefs: [],
       messages: srcMessages,
@@ -1122,15 +1519,12 @@ export function compressMessagesEpoch(
     };
   }
 
-  const { msgSteps, effectiveCurrentStep } = assignMessageSteps(srcMessages, currentStep);
-  const { toolCallsById, activeMutations, lastMutationStepByPath } = indexToolCallsAndMutations(
-    srcMessages,
-    msgSteps,
+  const candCtx = buildDtocCandidateContext(srcMessages, {
+    currentStep,
     activeMutationTargets,
-  );
-
-  const keepSet = normalizeIdSet(keepRefs);
-  const preferCompressSet = normalizeIdSet(compressRefs);
+    keepRefs,
+    compressRefs,
+  });
   const nextEpoch = prevEpochCount + 1;
 
   const outMessages = srcMessages.map((m) => ({
@@ -1138,7 +1532,7 @@ export function compressMessagesEpoch(
     content: Array.isArray(m?.content) ? m.content.map((b) => ({ ...b })) : m?.content,
   }));
 
-  const compressedRefs = [];
+  const stagedCompressions = [];
   const keptItems = [];
 
   for (let i = 0; i < outMessages.length; i += 1) {
@@ -1147,11 +1541,12 @@ export function compressMessagesEpoch(
 
     const ev = evaluateToolMessageEligibility(m, {
       index: i,
-      toolCallsById,
-      activeMutations,
-      lastMutationStepByPath,
-      effectiveCurrentStep,
-      fallbackStep: msgSteps[i],
+      toolCallsById: candCtx.toolCallsById,
+      activeMutations: candCtx.activeMutations,
+      explicitActiveMutations: candCtx.explicitActiveMutations,
+      lastMutationStepByPath: candCtx.lastMutationStepByPath,
+      effectiveCurrentStep: candCtx.effectiveCurrentStep,
+      fallbackStep: candCtx.msgSteps[i],
       compressibleTools,
       minAgeSteps,
       minChars,
@@ -1159,8 +1554,12 @@ export function compressMessagesEpoch(
       supersededMinChars,
       singleStepTriggered,
       singleStepBudget,
-      keepSet,
-      preferCompressSet,
+      keepSet: candCtx.keepSet,
+      preferCompressSet: candCtx.preferCompressSet,
+      dtocPolicy: trigger.dtocPolicy,
+      recentEditShieldSteps: trigger.recentEditShieldSteps,
+      contractFiles,
+      latestErrorIndex: candCtx.latestErrorIndex,
     });
 
     if (ev.skipReason === 'empty_or_stub') continue;
@@ -1182,7 +1581,7 @@ export function compressMessagesEpoch(
     const outlineWithLines = extracted.definitions.length
       ? extracted.definitions.slice(0, 12).map((d) => (d.line ? `${d.name}@L${d.line}` : d.name))
       : extracted.names;
-    const ref = aciStore.put(ev.rawText, {
+    const putMeta = {
       toolName: ev.toolName,
       path: ev.rawFilePath || ev.targetPath,
       lineRange: extractLineRangeLabel(ev.args, ev.rawText),
@@ -1190,11 +1589,58 @@ export function compressMessagesEpoch(
       originalTokens: ev.rawTokens,
       step: ev.msgStep,
       decision: 'DEFER',
-    });
-
+    };
+    const previewStub = formatAciRefStub(
+      {
+        uri: `artifact://${sha256HexLocal(ev.rawText)}`,
+        ...putMeta,
+      },
+      putMeta,
+    );
     const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
-    m.content = [...nonTextBlocks, { type: 'text', text: ref.stubText }];
+    m.content = [...nonTextBlocks, { type: 'text', text: previewStub }];
+    stagedCompressions.push({ msg: m, ev, putMeta, nonTextBlocks });
+  }
 
+  const tokensAfterPreview = measureRequestComposition({
+    system: systemPrompt,
+    tools,
+    messages: outMessages,
+  }).totalTokens;
+  const netSavingsTokens = Math.max(0, tokensBefore - tokensAfterPreview);
+
+  if (
+    trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY &&
+    (stagedCompressions.length === 0 || netSavingsTokens < trigger.minNetSavingsTokens)
+  ) {
+    return {
+      triggered: false,
+      reason: 'insufficient_net_savings',
+      dtocPolicy: trigger.dtocPolicy,
+      epoch: prevEpochCount,
+      lastWatermark: prevWatermark,
+      ratio,
+      singleStepTokens: measuredSingleStep,
+      tokensBefore,
+      tokensAfter: tokensBefore,
+      netSavingsTokens,
+      minNetSavingsTokens: trigger.minNetSavingsTokens,
+      compressedCount: 0,
+      compressedRefs: [],
+      messages: srcMessages,
+      pairClosedValid: pairClosed(srcMessages, 0, Math.max(0, srcMessages.length - 1)),
+      epochState: {
+        lastWatermark: prevWatermark,
+        epochCount: prevEpochCount,
+        emergencyUsed: Boolean(epochState?.emergencyUsed),
+      },
+    };
+  }
+
+  const compressedRefs = [];
+  for (const item of stagedCompressions) {
+    const ref = aciStore.put(item.ev.rawText, item.putMeta);
+    item.msg.content = [...item.nonTextBlocks, { type: 'text', text: ref.stubText }];
     compressedRefs.push(ref);
     ledger?.recordCompressed({
       refId: ref.refId,
@@ -1202,7 +1648,7 @@ export function compressMessagesEpoch(
       path: ref.path,
       originalTokens: ref.originalTokens,
       stubTokens: ref.stubTokens,
-      step: ev.msgStep,
+      step: item.ev.msgStep,
       epoch: nextEpoch,
     });
   }
@@ -1226,11 +1672,14 @@ export function compressMessagesEpoch(
 
   return {
     triggered: true,
-    reason: watermarkTriggered
-      ? 'watermark_crossed'
-      : singleStepTriggered
-        ? 'single_step_budget'
-        : 'emergency_budget',
+    reason:
+      trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY
+        ? PHASE_WATERMARK_V25_DTOC_POLICY
+        : watermarkTriggered
+          ? 'watermark_crossed'
+          : singleStepTriggered
+            ? 'single_step_budget'
+            : 'emergency_budget',
     dtocPolicy: trigger.dtocPolicy,
     epoch: effectiveEpochCount,
     watermark: highestCrossedWatermark,
@@ -1239,6 +1688,8 @@ export function compressMessagesEpoch(
     singleStepTokens: measuredSingleStep,
     tokensBefore,
     tokensAfter,
+    netSavingsTokens: Math.max(0, tokensBefore - tokensAfter),
+    minNetSavingsTokens: trigger.minNetSavingsTokens,
     compressedCount: compressedRefs.length,
     compressedRefs,
     messages: outMessages,
@@ -1493,10 +1944,12 @@ export class ACIEngine {
     supervisor = null,
     maxTotalTokens = 128000,
     contextWindow = 128000,
-    watermarks = DEFAULT_EPOCH_WATERMARKS,
+    watermarks = undefined,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
     dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    minNetSavingsTokens = DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS,
+    recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     admissionMinChars = DEFAULT_ADMISSION_MIN_CHARS,
     maxSupervisorAdmissionCalls = DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
     weights = DEFAULT_ACI_WEIGHTS,
@@ -1507,12 +1960,19 @@ export class ACIEngine {
     this.supervisor = supervisor;
     this.maxTotalTokens = maxTotalTokens;
     this.contextWindow = contextWindow;
-    this.watermarks = [...watermarks];
-    this.singleStepBudget = singleStepBudget;
-    this.dtocPolicy = dtocPolicy === 'cumulative' ? 'cumulative' : DEFAULT_DTOC_POLICY;
+    this.dtocPolicy = normalizeDtocPolicy(dtocPolicy);
+    this.watermarks = resolveWatermarksForPolicy(this.dtocPolicy, watermarks);
     this.dtocMinPromptTokens = Math.max(
       1000,
       Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
+    );
+    this.minNetSavingsTokens = Math.max(
+      0,
+      Number(minNetSavingsTokens ?? DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS),
+    );
+    this.recentEditShieldSteps = Math.max(
+      0,
+      Number(recentEditShieldSteps ?? DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS),
     );
     this.admissionMinChars = Math.max(
       200,
@@ -1563,6 +2023,8 @@ export class ACIEngine {
       singleStepBudget: this.singleStepBudget,
       dtocPolicy: this.dtocPolicy,
       dtocMinPromptTokens: this.dtocMinPromptTokens,
+      minNetSavingsTokens: this.minNetSavingsTokens,
+      recentEditShieldSteps: this.recentEditShieldSteps,
       epochState: this.epochState,
       ...options,
     });
@@ -1578,6 +2040,8 @@ export class ACIEngine {
       singleStepBudget: this.singleStepBudget,
       dtocPolicy: this.dtocPolicy,
       dtocMinPromptTokens: this.dtocMinPromptTokens,
+      minNetSavingsTokens: this.minNetSavingsTokens,
+      recentEditShieldSteps: this.recentEditShieldSteps,
       epochState: this.epochState,
       ...options,
     });
