@@ -5881,6 +5881,66 @@ button:focus-visible {
 .evaluation-compare-controls label { display: grid; gap: 5px; min-width: min(100%, 200px); flex: 1; font-size: 12px; color: var(--text-secondary); }
 .evaluation-compare-controls select { width: 100%; min-width: 0; }
 .evaluation-comparison-result { display: grid; gap: 5px; margin-top: 12px; font-size: 13px; }
+.evaluation-ablation-meta { margin: 4px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.evaluation-ablation-table-wrap {
+  margin-top: 12px;
+  overflow-x: auto;
+  border-block: 1px solid var(--border-subtle);
+  box-shadow: none;
+}
+.evaluation-ablation-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  text-align: left;
+  box-shadow: none;
+}
+.evaluation-ablation-table th,
+.evaluation-ablation-table td {
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.evaluation-ablation-table tbody tr:last-child td { border-bottom: 0; }
+.evaluation-ablation-table thead th {
+  font-size: 12px;
+  font-weight: 560;
+  color: var(--text-secondary);
+}
+.evaluation-ablation-arm { display: flex; align-items: center; gap: 6px; }
+.evaluation-ablation-arm code {
+  padding: 1px 5px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+  font: 400 11px/16px var(--font-mono);
+}
+.evaluation-ablation-table td[data-tone='positive'] { color: var(--color-success); font-weight: 560; }
+.evaluation-ablation-table td[data-tone='negative'] { color: var(--color-danger); }
+.evaluation-ci-cell { display: grid; gap: 4px; min-width: 180px; }
+.evaluation-ci-track {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-surface-secondary);
+  overflow: hidden;
+  box-shadow: none;
+}
+.evaluation-ci-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+}
+.evaluation-ci-point {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-1px);
+  background: var(--color-accent);
+}
 .capability-profile-list details { width: 100%; min-width: 0; overflow-wrap: anywhere; }
 .capability-profile-list summary, .experience-memory summary { cursor: pointer; }
 .capability-profile-list table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }

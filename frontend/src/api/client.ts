@@ -1,8 +1,10 @@
 import type { PromptCacheStats } from '../utils/promptCache';
+import { normalizeAciAblationSummary } from '../utils/aciTelemetry.ts';
 import { swarmAttachmentError } from '../utils/swarmCommand.ts';
 import { swarmWorkerStatus } from '../utils/subagentProgress.ts';
 import type {
   AccountBalance,
+  AciAblationSummary,
   AciBudgetWatermarks,
   Approval,
   Artifact,
@@ -147,6 +149,19 @@ export interface ContextSupervisorStatus {
   circuitOpen?: boolean;
   timeoutStreak?: number;
   budgetWatermarks?: AciBudgetWatermarks | null;
+  aciTelemetry?: {
+    aciProfile?: string | null;
+    dtocPolicy?: string | null;
+    admissionDecisions?: Partial<Record<'DIRECT' | 'SUPPORTING' | 'DEFER' | 'DUPLICATE' | 'IRRELEVANT', number>>;
+    decisions?: Partial<Record<'DIRECT' | 'SUPPORTING' | 'DEFER' | 'DUPLICATE' | 'IRRELEVANT', number>>;
+    partialRecoveries?: number;
+    fullRecoveries?: number;
+    recoveryTokensSaved?: number;
+    supersededEvictions?: number;
+    supersededTokensSaved?: number;
+    trajectoryTriggeredEpochs?: number;
+    supervisorCircuitOpen?: boolean;
+  } | null;
 }
 
 export type ContextSupervisorUpdate = Partial<
@@ -522,6 +537,7 @@ export interface AgentBackendClient {
     candidateRunId?: string;
     signal?: AbortSignal;
   }) => Promise<EvaluationRegressionSummary>;
+  getAciAblationSummary?: (signal?: AbortSignal) => Promise<AciAblationSummary>;
   getContextSupervisor?: (signal?: AbortSignal) => Promise<ContextSupervisorStatus>;
   updateContextSupervisor?: (patch: ContextSupervisorUpdate, signal?: AbortSignal) => Promise<ContextSupervisorStatus>;
   listMemory(params?: {
@@ -1718,6 +1734,18 @@ export class LiveBackendClient implements AgentBackendClient {
   }): Promise<EvaluationRegressionSummary> {
     const { signal, ...query } = params;
     return this.req('GET', '/v1/evaluations/regression', { query, signal });
+  }
+
+  async getAciAblationSummary(signal?: AbortSignal): Promise<AciAblationSummary> {
+    try {
+      const raw = await this.req<unknown>('GET', '/v1/evaluations/aci-ablation', { signal });
+      return normalizeAciAblationSummary(raw);
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.status === 405 || error.status === 501)) {
+        return { available: false };
+      }
+      throw error;
+    }
   }
 
   getContextSupervisor(signal?: AbortSignal): Promise<ContextSupervisorStatus> {

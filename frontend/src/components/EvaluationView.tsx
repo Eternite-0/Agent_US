@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AgentBackendClient } from '../api/client';
-import type { EvaluationBenchmark, EvaluationRun, EvaluationTaskResult, ModelSpec } from '../types/backend';
-import { fmtDuration } from '../utils/format';
+import type {
+  AciAblationArmMetrics,
+  AciAblationSummary,
+  EvaluationBenchmark,
+  EvaluationRun,
+  EvaluationTaskResult,
+  ModelSpec,
+} from '../types/backend';
+import { formatAciAblationLatexFallback } from '../utils/aciTelemetry.ts';
+import { fmtDuration, fmtTokens } from '../utils/format';
+import { CopyFeedbackIcon } from './CopyFeedbackIcon';
 import { EvaluationComparison } from './EvaluationComparison';
 import { ModelCapabilityPanel } from './ModelCapabilityPanel';
 
@@ -36,7 +45,12 @@ export function EvaluationView({ client, models, onToast }: EvaluationViewProps)
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [detailError, setDetailError] = useState(false);
+  const [ablation, setAblation] = useState<AciAblationSummary | null>(null);
+  const [ablationLoading, setAblationLoading] = useState(false);
+  const [copiedLatex, setCopiedLatex] = useState(false);
   const [action, setAction] = useState<{ type: 'start' | 'cancel'; id: string } | null>(null);
+  const copyTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(copyTimer.current), []);
   const currentClient = useRef(client);
   currentClient.current = client;
   const supported = Boolean(client.listBenchmarks && client.listEvaluationRuns);
@@ -49,8 +63,27 @@ export function EvaluationView({ client, models, onToast }: EvaluationViewProps)
     setFilter('');
     setModel('');
     setTaskSelections({});
+    setAblation(null);
     setAction(null);
   }, [client]);
+
+  useEffect(() => {
+    if (!client.getAciAblationSummary) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    setAblationLoading(true);
+    void client.getAciAblationSummary(signal).then(
+      (summary) => {
+        if (!signal.aborted) setAblation(summary);
+      },
+      () => {
+        if (!signal.aborted) setAblation({ available: false });
+      },
+    ).finally(() => {
+      if (!signal.aborted) setAblationLoading(false);
+    });
+    return () => controller.abort();
+  }, [client, revision]);
 
   useEffect(() => {
     if (!client.listBenchmarks || !client.listEvaluationRuns) return;
@@ -156,6 +189,26 @@ export function EvaluationView({ client, models, onToast }: EvaluationViewProps)
   const selected = detail?.id === selectedId ? detail : selectedSummary;
   const benchmarkTitle = (id: string) => benchmarks.find((benchmark) => benchmark.id === id)?.title || id;
   const refetch = () => setRevision((value) => value + 1);
+  const ablationArms: AciAblationArmMetrics[] = ablation?.available && ablation.summaryByArm
+    ? (ablation.armOrder ?? Object.keys(ablation.summaryByArm))
+        .map((armKey) => ablation.summaryByArm?.[armKey])
+        .filter((item): item is AciAblationArmMetrics => Boolean(item))
+    : [];
+  const latexTableText = ablation?.available
+    ? ablation.latexTable?.trim() || formatAciAblationLatexFallback(ablation)
+    : '';
+  const handleCopyLatex = async () => {
+    if (!latexTableText) return;
+    try {
+      await navigator.clipboard.writeText(latexTableText);
+      setCopiedLatex(true);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopiedLatex(false), 1200);
+      onToast('已复制 LaTeX 论文表', 'success');
+    } catch {
+      onToast('复制 LaTeX 论文表失败', 'danger');
+    }
+  };
 
   return (
     <section className="codex-page-view evaluation-page" aria-labelledby="evaluation-title">
@@ -262,6 +315,116 @@ export function EvaluationView({ client, models, onToast }: EvaluationViewProps)
           ) : <p className="evaluation-state">{loading ? '正在加载运行记录…' : '暂无运行记录。'}</p>}
         </section>
         <EvaluationComparison client={client} runs={runs} title={benchmarkTitle} />
+        {client.getAciAblationSummary && (
+          <section className="evaluation-history evaluation-ablation" aria-labelledby="aci-ablation-title">
+            <div className="evaluation-section-heading">
+              <div>
+                <h2 id="aci-ablation-title">ACI A/C/D 消融对照</h2>
+                {ablation?.available && (
+                  <p className="evaluation-ablation-meta">
+                    {[ablation.suite, ablation.model, ablation.createdAt ? new Date(ablation.createdAt).toLocaleString() : undefined]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </p>
+                )}
+              </div>
+              {ablation?.available && (
+                <button
+                  type="button"
+                  className="codex-toolbar-btn"
+                  data-variant="outline"
+                  aria-label="复制 LaTeX 论文表"
+                  disabled={!latexTableText}
+                  onClick={() => void handleCopyLatex()}
+                >
+                  <CopyFeedbackIcon copied={copiedLatex} size={14} />
+                  <span>复制 LaTeX 论文表</span>
+                </button>
+              )}
+            </div>
+            {ablation?.available && ablationArms.length > 0 ? (
+              <div className="evaluation-ablation-table-wrap">
+                <table className="evaluation-ablation-table" aria-label="Arm A/C/D 消融结果表">
+                  <thead>
+                    <tr>
+                      <th>实验组 / 策略</th>
+                      <th>通过率 (Wilson 95% CI)</th>
+                      <th>同题双通配对省 Token 率</th>
+                      <th>Tok / Pass</th>
+                      <th>Cache Hit %</th>
+                      <th>Sup Tok</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ablationArms.map((m) => {
+                      const ratePct = m.passRateCI.rate * 100;
+                      const lowerPct = Math.max(0, Math.min(100, m.passRateCI.lower * 100));
+                      const upperPct = Math.max(lowerPct, Math.min(100, m.passRateCI.upper * 100));
+                      const pairedVal = m.pairedPassTokenReduction;
+                      const pairedLabel =
+                        m.arm === 'A' && (pairedVal === 0 || pairedVal === null)
+                          ? '基线'
+                          : pairedVal === null
+                            ? 'N/A'
+                            : `${(pairedVal * 100).toFixed(1)}%${m.pairedPassCount !== undefined ? ` (n=${m.pairedPassCount})` : ''}`;
+                      return (
+                        <tr key={m.arm} data-arm={m.arm}>
+                          <td>
+                            <div className="evaluation-ablation-arm">
+                              <strong>Arm {m.arm}</strong>
+                              {m.aciProfile && <code>{m.aciProfile}</code>}
+                            </div>
+                          </td>
+                          <td>
+                            <div className="evaluation-ci-cell">
+                              <span className="tabular-nums">
+                                {m.passedTrials}/{m.totalTrials} · {ratePct.toFixed(1)}% [{lowerPct.toFixed(1)}%, {upperPct.toFixed(1)}%]
+                              </span>
+                              <div
+                                className="evaluation-ci-track"
+                                role="img"
+                                aria-label={`Arm ${m.arm} 通过率 ${ratePct.toFixed(1)}%，Wilson 95% CI ${lowerPct.toFixed(1)}% 至 ${upperPct.toFixed(1)}%`}
+                              >
+                                <span
+                                  className="evaluation-ci-band"
+                                  style={{ left: `${lowerPct}%`, width: `${Math.max(2, upperPct - lowerPct)}%` }}
+                                />
+                                <span className="evaluation-ci-point" style={{ left: `${ratePct}%` }} />
+                              </div>
+                            </div>
+                          </td>
+                          <td
+                            className="tabular-nums"
+                            data-tone={
+                              pairedVal !== null && pairedVal > 0
+                                ? 'positive'
+                                : pairedVal !== null && pairedVal < 0
+                                  ? 'negative'
+                                  : undefined
+                            }
+                          >
+                            {pairedLabel}
+                          </td>
+                          <td className="tabular-nums">
+                            {m.tokensPerCompletedPass !== null
+                              ? fmtTokens(Math.round(m.tokensPerCompletedPass))
+                              : 'N/A'}
+                          </td>
+                          <td className="tabular-nums">{(m.cacheHitRate * 100).toFixed(1)}%</td>
+                          <td className="tabular-nums">{Math.round(m.supervisorCost?.totalTokens ?? 0).toLocaleString('en-US')}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="evaluation-state">
+                {ablationLoading ? '正在加载 A/C/D 消融实验数据…' : '暂无已归档的 ACI A/C/D 消融实验证据。'}
+              </p>
+            )}
+          </section>
+        )}
         <ModelCapabilityPanel client={client} revision={revision + runs.filter((run) => run.status === 'completed').length} />
       </>}
     </section>

@@ -205,13 +205,79 @@ export interface AciBudgetWatermarks {
   usedTokens?: number;
   maxTokens?: number;
   utilizationRatio?: number;
+  ratio?: number;
   reserveTokens?: number;
   postTestReserveActive?: boolean;
   dtocWatermark?: number;
   dtocMinPromptTokens?: number;
   dtocPolicy?: string | null;
+  projectedTotalTokens?: number;
   supervisorCircuitOpen?: boolean;
   circuitOpenUntil?: number | null;
+}
+
+export interface AciAdmissionDecisions {
+  DIRECT: number;
+  SUPPORTING: number;
+  DEFER: number;
+  DUPLICATE: number;
+  IRRELEVANT: number;
+}
+
+export interface AciTurnTelemetry {
+  turnId?: string;
+  aciProfile?: string | null;
+  dtocPolicy?: string | null;
+  admissionDecisions: AciAdmissionDecisions;
+  admissionTokensSaved: number;
+  partialRecoveries: number;
+  fullRecoveries: number;
+  recoveryTokensSaved: number;
+  supersededEvictions: number;
+  supersededTokensSaved: number;
+  trajectoryTriggeredEpochs: number;
+  antiThrashingTriggered?: number;
+  supervisorCircuitOpen?: boolean;
+  supervisorCalls?: number;
+  budgetWatermarks?: AciBudgetWatermarks | null;
+}
+
+export interface DiagnosticEntry {
+  file: string;
+  line: number;
+  column?: number;
+  severity: 'error' | 'warning' | 'info' | string;
+  code?: string;
+  message: string;
+  source?: string;
+  testName?: string;
+  expected?: string;
+  actual?: string;
+  operator?: string;
+}
+
+export interface FailingTestEntry {
+  name: string;
+  testName?: string;
+  file?: string;
+  line?: number;
+  column?: number;
+  assertion?: string;
+  expected?: string;
+  actual?: string;
+  operator?: string;
+}
+
+export interface ParsedDiagnosticsSummary {
+  ok?: boolean;
+  kind?: string;
+  diagnostics: DiagnosticEntry[];
+  failingTests: FailingTestEntry[];
+  compression?: {
+    rawLines: number;
+    keptLines: number;
+    truncatedCount: number;
+  };
 }
 
 export interface Evidence extends Entity {
@@ -1160,4 +1226,54 @@ export interface EvaluationRegressionSummary {
   durationDelta: number;
   baseline?: EvaluationScore;
   candidate?: EvaluationScore;
+}
+
+export interface AciAblationArmMetrics {
+  arm: string;
+  aciProfile?: string;
+  totalTrials: number;
+  passedTrials: number;
+  failedTrials?: number;
+  passRateCI: {
+    rate: number;
+    lower: number;
+    upper: number;
+    ci95HalfWidth?: number;
+  };
+  finalTaskSuccessRate?: number;
+  pairedPassTokenReduction: number | null;
+  pairedPassCount?: number;
+  tokensPerCompletedPass: number | null;
+  meanTokensOnPassedTrials?: number | null;
+  cacheHitRate: number;
+  supervisorCost: {
+    calls?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens: number;
+    durationMs?: number;
+    tokenShareOfTotal?: number;
+  };
+  tokenBreakdown?: {
+    totalTokens?: number;
+    meanTokens?: number;
+  };
+  supersededEvictions?: number;
+  supersededTokensSaved?: number;
+  partialRecoveries?: number;
+  recoveryTokensSaved?: number;
+  antiThrashingTriggered?: number;
+  decisions?: Partial<AciAdmissionDecisions>;
+}
+
+export interface AciAblationSummary {
+  available: boolean;
+  suite?: string;
+  model?: string;
+  createdAt?: number | string;
+  armOrder?: string[];
+  summaryByArm?: Record<string, AciAblationArmMetrics>;
+  latexTable?: string;
+  markdownTable?: string;
+  sourceFile?: string;
 }
