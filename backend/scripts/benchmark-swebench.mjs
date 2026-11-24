@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   appendFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -21,6 +22,8 @@ import { ACI_CONFIG_KEY } from '../src/context/supervisor.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { redactSecrets } from '../src/envelope.js';
 import {
+  SWEBENCH_HF_FULL_DATASET_ID,
+  SWEBENCH_HF_MINI_DATASET_ID,
   computePairedResolutionMetrics,
   evaluateSweBenchPredictions,
   fetchSweBenchVerifiedDataset,
@@ -36,6 +39,7 @@ import {
   ensureDockerImage,
   extractTestbedFromImage,
   isAuthorizedSweBenchCommand,
+  removeDockerImage,
   resolveSweBenchDockerImage,
   scrubAntiCheatGitRefs,
 } from '../src/evaluation/swebench-docker.js';
@@ -97,8 +101,9 @@ function printSweBenchUsage() {
       'Usage: node backend/scripts/benchmark-swebench.mjs [options]',
       '',
       'Options:',
-      '  --dataset <path|hf:verified>   Local .jsonl/.json dataset or "hf:verified" cache',
-      '  --fetch-dataset [path]         Download SWE-bench Verified from HuggingFace',
+      '  --dataset <path|hf:verified-mini|hf:verified-full>',
+      '                                 Local .jsonl/.json dataset or HF alias (default: verified-mini)',
+      '  --fetch-dataset [path]         Download SWE-bench Verified Mini (50-instance) from HuggingFace',
       '  --subset <smoke-5|paper-50>    Deterministic stratified benchmark subset',
       '  --seed <n>                     PRNG seed for --subset (default: 42)',
       '  --dry-run                      Run deterministic offline Python bug trajectory with 64-tok KV sim',
@@ -115,10 +120,13 @@ function printSweBenchUsage() {
       '  --docker-preset <epoch|official> Official or Epoch SWE-bench container image preset',
       '  --docker-image <pattern>       Custom Docker image pattern ({instance_id}, {repo}, {repo_slug})',
       '  --pull <missing|always|never>  Docker image pull policy (default: missing)',
+      '  --container-memory <size>      Docker container memory cap (default: 2g, swap 2.5g when 2g)',
+      '  --cleanup-images               Remove each instance Docker image immediately after finishing (default)',
+      '  --keep-images                  Keep per-instance Docker images on disk after completion',
       '  --instance-ids <csv>           Comma-separated subset of instance_id values to run',
       '  --limit <n>                    Maximum number of instances to run after filtering',
       '  --concurrency <n>              Concurrent isolated instance workers (default: 1)',
-      '  --resume                       Skip instance_ids already present in predictions/telemetry files',
+      '  --resume                       Skip completed instances and automatically retry env_error rows',
       '  --evaluate                     Run in-container FAIL_TO_PASS / PASS_TO_PASS grader after predictions',
       '  --eval-only                    Grade existing --predictions file without running agent inference',
       '  --predictions <path>           Existing predictions JSONL file for --eval-only',
@@ -127,14 +135,14 @@ function printSweBenchUsage() {
       '  --help                         Show this help message',
       '',
       'Examples:',
-      '  # 1. Fetch & cache HuggingFace SWE-bench Verified dataset',
+      '  # 1. Fetch & cache HuggingFace SWE-bench Verified Mini (50-instance) dataset',
       '  node backend/scripts/benchmark-swebench.mjs --fetch-dataset',
       '',
-      '  # 2. Fast 5-repo container smoke test with automated FAIL_TO_PASS evaluation',
-      '  node backend/scripts/benchmark-swebench.mjs --dataset hf:verified --subset smoke-5 --docker-preset epoch --evaluate',
+      '  # 2. Fast 5-instance container smoke test with instant image cleanup & 2g memory cap',
+      '  node backend/scripts/benchmark-swebench.mjs --dataset hf:verified-mini --subset smoke-5 --docker-preset epoch --use-app-pool --arms raw_full,full_aci --evaluate --cleanup-images --container-memory 2g',
       '',
-      '  # 3. Full 50-instance paired paper run using configured App AccountPool + LaTeX export',
-      '  node backend/scripts/benchmark-swebench.mjs --dataset hf:verified --subset paper-50 --arms raw_full,full_aci --docker-preset epoch --use-app-pool --evaluate --export-latex',
+      '  # 3. Full 50-instance paired paper run + LaTeX export (<=1 Docker image on disk at once)',
+      '  node backend/scripts/benchmark-swebench.mjs --dataset hf:verified-mini --subset paper-50 --arms raw_full,full_aci --docker-preset epoch --use-app-pool --evaluate --cleanup-images --container-memory 2g --export-latex',
       '',
       '  # 4. Offline deterministic KV-cache simulation',
       '  node backend/scripts/benchmark-swebench.mjs --dry-run',
@@ -157,6 +165,8 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     dockerImage: null,
     dockerPreset: null,
     pull: 'missing',
+    containerMemory: '2g',
+    cleanupImages: true,
     useAppPool: null,
     appDataDir: null,
     supervisorModel: null,
@@ -196,6 +206,8 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--resume') opts.resume = true;
     else if (arg === '--json') opts.json = true;
+    else if (arg === '--cleanup-images') opts.cleanupImages = true;
+    else if (arg === '--keep-images') opts.cleanupImages = false;
     else if (arg === '--use-app-pool') opts.useAppPool = true;
     else if (arg === '--no-use-app-pool') opts.useAppPool = false;
     else if (arg === '--deterministic-admission') opts.deterministicAdmission = true;
@@ -247,6 +259,8 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--docker-preset=')) opts.dockerPreset = splitEq('--docker-preset').trim().toLowerCase();
     else if (arg === '--pull') opts.pull = String(nextVal()).trim().toLowerCase();
     else if (arg.startsWith('--pull=')) opts.pull = splitEq('--pull').trim().toLowerCase();
+    else if (arg === '--container-memory') opts.containerMemory = String(nextVal()).trim();
+    else if (arg.startsWith('--container-memory=')) opts.containerMemory = splitEq('--container-memory').trim();
     else if (arg === '--subset') opts.subset = String(nextVal()).trim().toLowerCase();
     else if (arg.startsWith('--subset=')) opts.subset = splitEq('--subset').trim().toLowerCase();
     else if (arg === '--seed') opts.seed = Number(nextVal());
@@ -296,6 +310,9 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
   }
   if (!['missing', 'always', 'never'].includes(opts.pull)) {
     throw new Error(`Invalid --pull "${opts.pull}"; expected "missing", "always", or "never"`);
+  }
+  if (!opts.containerMemory || !/^\d+(?:\.\d+)?[bkmg]?$/i.test(opts.containerMemory)) {
+    throw new Error(`Invalid --container-memory "${opts.containerMemory}"; expected size like "2g" or "4096m"`);
   }
   if (opts.subset !== null && !['smoke-5', 'paper-50'].includes(opts.subset)) {
     throw new Error(`Invalid --subset "${opts.subset}"; expected "smoke-5" or "paper-50"`);
@@ -1003,7 +1020,8 @@ function readJsonlRecords(filePath, idField = 'instance_id') {
 }
 
 /**
- * Loads already completed `instance_id`s and rows for an arm from existing JSONL outputs.
+ * Loads already completed `instance_id`s and rows for an arm from existing JSONL outputs,
+ * deduplicating by `instance_id` (latest wins) and treating `status === 'env_error'` as incomplete.
  */
 export function loadCompletedInstanceIds(outputDir, arm) {
   const predPath = join(outputDir, `predictions.${arm}.jsonl`);
@@ -1016,12 +1034,19 @@ export function loadCompletedInstanceIds(outputDir, arm) {
   const completedIds = new Set();
   if (predExists && teleExists) {
     for (const id of predictionsById.keys()) {
-      if (telemetryById.has(id)) completedIds.add(id);
+      const tele = telemetryById.get(id);
+      if (tele && tele.status !== 'env_error') {
+        completedIds.add(id);
+      }
     }
   } else if (predExists) {
     for (const id of predictionsById.keys()) completedIds.add(id);
   } else if (teleExists) {
-    for (const id of telemetryById.keys()) completedIds.add(id);
+    for (const [id, tele] of telemetryById.entries()) {
+      if (tele?.status !== 'env_error') {
+        completedIds.add(id);
+      }
+    }
   }
 
   return { predictionsById, telemetryById, completedIds, predPath, telePath };
@@ -1446,60 +1471,143 @@ function buildEvalImageResolver(opts, runtimeDeps = {}) {
     });
 }
 
+function computeMemorySwap(memory) {
+  const norm = String(memory ?? '').trim().toLowerCase();
+  return norm === '2g' ? '2.5g' : undefined;
+}
+
+function isEnvironmentOrDockerError(err, { containerMode = false } = {}) {
+  if (!err) return false;
+  if (err.isEnvError === true) return true;
+  if (err.code === 'ENOSPC' || err.name === 'SandboxUnavailableError') return true;
+  const msg = String(err?.message || err || '');
+  if (/\bENOSPC\b|no space left on device|disk quota exceeded/i.test(msg)) return true;
+  if (
+    containerMode &&
+    /\bdocker\b|\bcontainer\b|\bpull\b|\bextract\b|\/testbed|image inspect|image not found|daemon/i.test(
+      msg,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function buildEnvErrorTelemetryRow({ instance, arm, modelName, wallClockMs = 1, error }) {
+  return {
+    instance_id: instance.instance_id,
+    arm,
+    model: modelName || 'env_error',
+    status: 'env_error',
+    wallClockMs,
+    steps: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cacheEligibleInputTokens: 0,
+    cacheHitRate: 0,
+    nonEmptyPatch: false,
+    patchBytes: 0,
+    admissionOriginalTokens: 0,
+    admissionInjectedTokens: 0,
+    admissionSavedTokens: 0,
+    admissionTokenReductionRate: 0,
+    epochTransitions: 0,
+    aciProfile: arm,
+    dtocPolicy: null,
+    admissionDecisions: null,
+    supervisorCost: null,
+    toolCallsCount: 0,
+    error: redactSecrets(String(error?.message || error || 'Environment error')),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function upsertRecordByInstanceId(list, record) {
+  const id = String(record?.instance_id ?? '');
+  if (!id) return;
+  const idx = list.findIndex((r) => String(r?.instance_id ?? '') === id);
+  if (idx >= 0) list[idx] = record;
+  else list.push(record);
+}
+
 function buildEvalDockerSessionFactory(opts, runtimeDeps = {}) {
   if (typeof runtimeDeps.createDockerSession === 'function') {
     return runtimeDeps.createDockerSession;
   }
-  return async ({ instance, image, pull }) => {
+  const defaultMemory = opts.containerMemory ?? '2g';
+  const defaultMemorySwap = computeMemorySwap(defaultMemory);
+
+  return async ({ instance, image, pull, memory = defaultMemory, memorySwap = defaultMemorySwap }) => {
     const evalWs = mkdtempSync(join(tmpdir(), 'agent-us-swe-eval-'));
-    const extractFn = runtimeDeps.extractTestbedFromImage ?? extractTestbedFromImage;
-    await extractFn({
-      image,
-      targetDir: evalWs,
-      baseCommit: instance.base_commit,
-      pull: pull ?? opts.pull ?? 'missing',
-    });
-    const dockerAdapter =
-      typeof runtimeDeps.createDockerAdapter === 'function'
-        ? runtimeDeps.createDockerAdapter({
-            image,
-            workspaceRoot: evalWs,
-            pull: pull === 'always' ? 'missing' : (pull ?? opts.pull ?? 'missing'),
-            timeoutMs: 300_000,
-            instance,
-          })
-        : new SweBenchDockerAdapter({
-            image,
-            workspaceRoot: evalWs,
-            pull: pull === 'always' ? 'missing' : (pull ?? opts.pull ?? 'missing'),
-            timeoutMs: 300_000,
-          });
-    await dockerAdapter.start?.();
-    return {
-      workspaceRoot: evalWs,
-      exec: (cmd, execOpts = {}) =>
-        dockerAdapter.exec(cmd, { ...execOpts, skipAntiCheatGuard: true }),
-      destroy: async () => {
-        try {
-          await dockerAdapter.destroy?.();
-        } finally {
-          rmSync(evalWs, { recursive: true, force: true });
-        }
-      },
-    };
+    const effectiveMem = memory ?? defaultMemory;
+    const effectiveSwap =
+      memorySwap !== undefined ? memorySwap : computeMemorySwap(effectiveMem);
+    try {
+      const extractFn = runtimeDeps.extractTestbedFromImage ?? extractTestbedFromImage;
+      await extractFn({
+        image,
+        targetDir: evalWs,
+        baseCommit: instance.base_commit,
+        pull: pull ?? opts.pull ?? 'missing',
+      });
+      const dockerAdapter =
+        typeof runtimeDeps.createDockerAdapter === 'function'
+          ? runtimeDeps.createDockerAdapter({
+              image,
+              workspaceRoot: evalWs,
+              pull: pull === 'always' ? 'missing' : (pull ?? opts.pull ?? 'missing'),
+              memory: effectiveMem,
+              ...(effectiveSwap ? { memorySwap: effectiveSwap } : {}),
+              timeoutMs: 300_000,
+              instance,
+            })
+          : new SweBenchDockerAdapter({
+              image,
+              workspaceRoot: evalWs,
+              pull: pull === 'always' ? 'missing' : (pull ?? opts.pull ?? 'missing'),
+              memory: effectiveMem,
+              ...(effectiveSwap ? { memorySwap: effectiveSwap } : {}),
+              timeoutMs: 300_000,
+            });
+      await dockerAdapter.start?.();
+      return {
+        workspaceRoot: evalWs,
+        exec: (cmd, execOpts = {}) =>
+          dockerAdapter.exec(cmd, { ...execOpts, skipAntiCheatGuard: true }),
+        destroy: async () => {
+          try {
+            await dockerAdapter.destroy?.();
+          } finally {
+            rmSync(evalWs, { recursive: true, force: true });
+          }
+        },
+      };
+    } catch (err) {
+      rmSync(evalWs, { recursive: true, force: true });
+      throw err;
+    }
   };
 }
 
 async function resolveDatasetInputPath(opts, runtimeDeps = {}) {
   const rawDs = String(opts.dataset ?? '').trim();
-  const isHfAlias = /^hf:(?:\/\/)?verified$/i.test(rawDs);
-  if (isHfAlias) {
+  const isHfFullAlias = /^hf:(?:\/\/)?verified-full$/i.test(rawDs);
+  const isHfMiniAlias = /^hf:(?:\/\/)?verified(?:-mini)?$/i.test(rawDs);
+
+  if (isHfFullAlias || isHfMiniAlias) {
+    const datasetId = isHfFullAlias ? SWEBENCH_HF_FULL_DATASET_ID : SWEBENCH_HF_MINI_DATASET_ID;
+    const defaultMiniPath = getDefaultSweBenchCachePath();
     const cachePath = opts.fetchDatasetPath
       ? resolve(String(opts.fetchDatasetPath))
-      : getDefaultSweBenchCachePath();
+      : isHfFullAlias
+        ? join(dirname(defaultMiniPath), 'swebench_verified.jsonl')
+        : defaultMiniPath;
     if (opts.fetchDataset || !existsSync(cachePath)) {
       const fetchFn = runtimeDeps.fetchSweBenchVerifiedDataset ?? fetchSweBenchVerifiedDataset;
-      await fetchFn({ outputPath: cachePath });
+      await fetchFn({ outputPath: cachePath, datasetId });
     }
     return cachePath;
   }
@@ -1508,7 +1616,7 @@ async function resolveDatasetInputPath(opts, runtimeDeps = {}) {
       ? resolve(String(opts.fetchDatasetPath))
       : resolve(rawDs);
     const fetchFn = runtimeDeps.fetchSweBenchVerifiedDataset ?? fetchSweBenchVerifiedDataset;
-    await fetchFn({ outputPath: targetPath });
+    await fetchFn({ outputPath: targetPath, datasetId: SWEBENCH_HF_MINI_DATASET_ID });
     return targetPath;
   }
   return resolve(rawDs);
@@ -1647,12 +1755,16 @@ async function runSweBenchInstanceArm({
       });
       const adapterPull =
         extractedFromImage && opts.pull === 'always' ? 'missing' : (opts.pull ?? 'missing');
+      const containerMemory = opts.containerMemory ?? '2g';
+      const containerMemorySwap = computeMemorySwap(containerMemory);
       sessionSandbox =
         typeof runtimeDeps.createDockerAdapter === 'function'
           ? runtimeDeps.createDockerAdapter({
               image: dockerImage,
               workspaceRoot,
               pull: adapterPull,
+              memory: containerMemory,
+              ...(containerMemorySwap ? { memorySwap: containerMemorySwap } : {}),
               timeoutMs: 120_000,
               instance,
             })
@@ -1660,6 +1772,8 @@ async function runSweBenchInstanceArm({
               image: dockerImage,
               workspaceRoot,
               pull: adapterPull,
+              memory: containerMemory,
+              ...(containerMemorySwap ? { memorySwap: containerMemorySwap } : {}),
               timeoutMs: 120_000,
             });
     }
@@ -1791,6 +1905,8 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     dockerImage: rawOpts.dockerImage ?? null,
     dockerPreset: rawOpts.dockerPreset ?? null,
     pull: rawOpts.pull ?? 'missing',
+    containerMemory: rawOpts.containerMemory ?? '2g',
+    cleanupImages: rawOpts.cleanupImages !== undefined ? Boolean(rawOpts.cleanupImages) : true,
     useAppPool: rawOpts.useAppPool !== undefined ? rawOpts.useAppPool : null,
     appDataDir: rawOpts.appDataDir ?? null,
     supervisorModel: rawOpts.supervisorModel ?? null,
@@ -1810,13 +1926,19 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     resume: Boolean(rawOpts.resume),
   };
 
-  // Standalone --fetch-dataset mode
+  const memorySwap = computeMemorySwap(opts.containerMemory);
+  const removeImgFn = runtimeDeps.removeDockerImage ?? removeDockerImage;
+
+  // Standalone --fetch-dataset mode (defaults to verified-mini 50-instance dataset)
   if (opts.fetchDataset && !opts.dataset && !opts.dryRun && !opts.evalOnly) {
     const targetPath = opts.fetchDatasetPath
       ? resolve(String(opts.fetchDatasetPath))
       : getDefaultSweBenchCachePath();
     const fetchFn = runtimeDeps.fetchSweBenchVerifiedDataset ?? fetchSweBenchVerifiedDataset;
-    const fetched = await fetchFn({ outputPath: targetPath });
+    const fetched = await fetchFn({
+      outputPath: targetPath,
+      datasetId: SWEBENCH_HF_MINI_DATASET_ID,
+    });
     return {
       benchmarkId: SWEBENCH_BENCHMARK_ID,
       version: SWEBENCH_BENCHMARK_VERSION,
@@ -1868,8 +1990,17 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       imageResolver,
       createDockerSession,
       pull: opts.pull,
+      memory: opts.containerMemory,
+      ...(memorySwap ? { memorySwap } : {}),
       concurrency: opts.concurrency,
       outputPath: evalOutPath,
+      ...(opts.cleanupImages
+        ? {
+            onInstanceDone: async ({ image, usedDocker }) => {
+              if (image && usedDocker !== false) await removeImgFn(image).catch(() => {});
+            },
+          }
+        : {}),
     });
 
     const predMap = readJsonlRecords(predPath, 'instance_id');
@@ -2018,6 +2149,8 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     const telemetryByArm = {};
     const completedByArm = {};
     const filePathsByArm = {};
+    const evalFiles = {};
+    const evalResultsByArm = {};
 
     for (const arm of opts.arms) {
       const resumeState = opts.resume
@@ -2037,6 +2170,17 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       telemetryByArm[arm] = [...resumeState.telemetryById.values()];
       completedByArm[arm] = resumeState.completedIds;
       filePathsByArm[arm] = { predPath: resumeState.predPath, telePath: resumeState.telePath };
+
+      if (opts.evaluate) {
+        const evalPath = join(outputDir, `eval.${arm}.jsonl`);
+        evalFiles[arm] = evalPath;
+        if (opts.resume && existsSync(evalPath)) {
+          evalResultsByArm[arm] = [...readJsonlRecords(evalPath, 'instance_id').values()];
+        } else {
+          prepareJsonlFile(evalPath, false);
+          evalResultsByArm[arm] = [];
+        }
+      }
     }
 
     const summaryPath = join(outputDir, 'summary.md');
@@ -2073,12 +2217,16 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       return metricsByArm;
     };
 
-    const persistResult = (arm, { prediction, telemetry }) => {
+    const persistResult = (arm, { prediction = null, telemetry }) => {
       const { predPath, telePath } = filePathsByArm[arm];
-      appendJsonlRecord(predPath, prediction);
-      appendJsonlRecord(telePath, telemetry);
-      predictionsByArm[arm].push(prediction);
-      telemetryByArm[arm].push(telemetry);
+      if (prediction) {
+        appendJsonlRecord(predPath, prediction);
+        upsertRecordByInstanceId(predictionsByArm[arm], prediction);
+      }
+      if (telemetry) {
+        appendJsonlRecord(telePath, telemetry);
+        upsertRecordByInstanceId(telemetryByArm[arm], telemetry);
+      }
       writeIncrementalSummary();
     };
 
@@ -2104,19 +2252,19 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         }
       }
     } else {
-      const planned = [];
-      for (const arm of opts.arms) {
-        for (const instance of instances) {
-          if (completedByArm[arm].has(instance.instance_id)) continue;
-          planned.push({ arm, instance });
-        }
-      }
+      const hasAnyPendingWork = instances.some((inst) =>
+        opts.arms.some((arm) => !completedByArm[arm].has(inst.instance_id)),
+      );
 
-      if (planned.length > 0 && useAppPoolMode && !runtimeDeps.loadAppPoolReadOnly) {
+      if (hasAnyPendingWork && useAppPoolMode && !runtimeDeps.loadAppPoolReadOnly) {
         const preDir = resolveAppDataDir(opts.appDataDir, {
           env: runtimeDeps.env ?? process.env,
         });
-        if (!preDir || !existsSync(join(preDir, 'engine.sqlite'))) {
+        const hasValidSource =
+          Boolean(preDir) &&
+          (existsSync(join(preDir, 'engine.sqlite')) ||
+            existsSync(join(preDir, '.provider-env.json')));
+        if (!hasValidSource) {
           throw new Error(
             `No App AccountPool database (engine.sqlite) found${preDir ? ` in ${preDir}` : ''}. ` +
               'Configure an enabled provider account in the app, pass --app-data-dir <dir>, or set an API key env var (DEEPSEEK_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, SWEBENCH_API_KEY).',
@@ -2124,74 +2272,212 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         }
       }
 
-      await runWithConcurrency(planned, opts.concurrency, async ({ arm, instance }) => {
+      const imageResolver = opts.evaluate ? buildEvalImageResolver(opts, runtimeDeps) : null;
+      const createDockerSession = opts.evaluate
+        ? buildEvalDockerSessionFactory(opts, runtimeDeps)
+        : null;
+      const evalFn = runtimeDeps.evaluateSweBenchPredictions ?? evaluateSweBenchPredictions;
+      const hasContainer = Boolean(opts.dockerImage || opts.dockerPreset);
+      const extractFn = runtimeDeps.extractTestbedFromImage ?? extractTestbedFromImage;
+
+      // Outer loop over instances -> inner loop over arms + per-instance eval + immediate docker rmi cleanup
+      await runWithConcurrency(instances, opts.concurrency, async (instance) => {
+        const pendingArms = opts.arms.filter(
+          (arm) => !completedByArm[arm].has(instance.instance_id),
+        );
+        const pendingEvalArms = opts.evaluate
+          ? opts.arms.filter((arm) => {
+              const hasPred = predictionsByArm[arm].some(
+                (p) => p.instance_id === instance.instance_id,
+              );
+              const teleRow = telemetryByArm[arm].find(
+                (t) => t.instance_id === instance.instance_id,
+              );
+              const alreadyEval = evalResultsByArm[arm]?.some(
+                (e) => e.instance_id === instance.instance_id,
+              );
+              return hasPred && teleRow?.status !== 'env_error' && !alreadyEval;
+            })
+          : [];
+
+        if (pendingArms.length === 0 && pendingEvalArms.length === 0) return;
+
+        const instanceImage = hasContainer
+          ? resolveSweBenchDockerImage({
+              dockerImage: opts.dockerImage,
+              dockerPreset: opts.dockerPreset,
+              instance,
+            })
+          : null;
+        const evalImage = opts.evaluate && imageResolver ? imageResolver(instance) : null;
+        const imagesToCleanup = [...new Set([instanceImage, evalImage].filter(Boolean))];
         const hasLocalWorkspace = Boolean(instance.workspace_path || opts.workspaceRoot);
-        let trialWs;
-        let extractedFromImage = false;
-        if (!hasLocalWorkspace && (opts.dockerImage || opts.dockerPreset)) {
-          trialWs = mkdtempSync(join(tmpdir(), 'agent-us-swe-ws-'));
-          const dockerImage = resolveSweBenchDockerImage({
-            dockerImage: opts.dockerImage,
-            dockerPreset: opts.dockerPreset,
-            instance,
-          });
-          const extractFn = runtimeDeps.extractTestbedFromImage ?? extractTestbedFromImage;
-          await extractFn({
-            image: dockerImage,
-            targetDir: trialWs,
-            baseCommit: instance.base_commit,
-            pull: opts.pull ?? 'missing',
-          });
-          extractedFromImage = true;
-        } else {
-          const sourceRepo = resolveSourceWorkspaceForInstance(instance, opts);
-          trialWs = await createIsolatedTrialWorkspace(sourceRepo, instance.base_commit);
-        }
+
+        let seedWs = null;
+        let setupEnvError = null;
         try {
-          const adapter = runtimeDeps.createAdapter
-            ? runtimeDeps.createAdapter({ arm, instance })
-            : runtimeDeps.adapter ?? null;
-          const result = await runSweBenchInstanceArm({
-            instance,
-            arm,
-            workspaceRoot: trialWs,
-            opts,
-            adapter,
-            providerConfig,
-            runtimeDeps,
-            extractedFromImage,
-          });
-          persistResult(arm, result);
+          if (pendingArms.length > 0 && !hasLocalWorkspace && hasContainer) {
+            seedWs = mkdtempSync(join(tmpdir(), 'agent-us-swe-seed-'));
+            try {
+              await extractFn({
+                image: instanceImage,
+                targetDir: seedWs,
+                baseCommit: instance.base_commit,
+                pull: opts.pull ?? 'missing',
+              });
+            } catch (err) {
+              setupEnvError = err;
+            }
+          }
+
+          if (setupEnvError) {
+            for (const arm of pendingArms) {
+              persistResult(arm, {
+                telemetry: buildEnvErrorTelemetryRow({
+                  instance,
+                  arm,
+                  modelName: opts.model || providerConfig?.model || `agent-us-${arm}`,
+                  error: setupEnvError,
+                }),
+              });
+            }
+            return;
+          }
+
+          for (const arm of pendingArms) {
+            const armStarted = performance.now();
+            let armWs = null;
+            try {
+              if (hasLocalWorkspace) {
+                const sourceRepo = resolveSourceWorkspaceForInstance(instance, opts);
+                armWs = await createIsolatedTrialWorkspace(sourceRepo, instance.base_commit);
+              } else if (pendingArms.length === 1 && seedWs) {
+                armWs = seedWs;
+              } else if (seedWs) {
+                armWs = mkdtempSync(join(tmpdir(), `agent-us-swe-ws-${arm}-`));
+                cpSync(seedWs, armWs, { recursive: true });
+              } else {
+                const sourceRepo = resolveSourceWorkspaceForInstance(instance, opts);
+                armWs = await createIsolatedTrialWorkspace(sourceRepo, instance.base_commit);
+              }
+
+              const adapter = runtimeDeps.createAdapter
+                ? runtimeDeps.createAdapter({ arm, instance })
+                : runtimeDeps.adapter ?? null;
+
+              const result = await runSweBenchInstanceArm({
+                instance,
+                arm,
+                workspaceRoot: armWs,
+                opts,
+                adapter,
+                providerConfig,
+                runtimeDeps,
+                extractedFromImage: !hasLocalWorkspace && hasContainer,
+              });
+              persistResult(arm, result);
+            } catch (err) {
+              if (isEnvironmentOrDockerError(err, { containerMode: hasContainer })) {
+                persistResult(arm, {
+                  telemetry: buildEnvErrorTelemetryRow({
+                    instance,
+                    arm,
+                    modelName: opts.model || providerConfig?.model || `agent-us-${arm}`,
+                    wallClockMs: Math.max(1, Math.round(performance.now() - armStarted)),
+                    error: err,
+                  }),
+                });
+              } else {
+                throw err;
+              }
+            } finally {
+              if (armWs && armWs !== seedWs) {
+                rmSync(armWs, { recursive: true, force: true });
+              }
+            }
+          }
+
+          if (opts.evaluate) {
+            for (const arm of opts.arms) {
+              const armPred = predictionsByArm[arm].find(
+                (p) => p.instance_id === instance.instance_id,
+              );
+              const teleRow = telemetryByArm[arm].find(
+                (t) => t.instance_id === instance.instance_id,
+              );
+              const alreadyEval = evalResultsByArm[arm]?.some(
+                (e) => e.instance_id === instance.instance_id,
+              );
+              if (!armPred || teleRow?.status === 'env_error' || alreadyEval) continue;
+
+              try {
+                const evalRes = await evalFn({
+                  instances: [instance],
+                  predictions: [armPred],
+                  imageResolver,
+                  createDockerSession,
+                  pull: hasContainer && opts.pull === 'always' ? 'missing' : opts.pull,
+                  memory: opts.containerMemory,
+                  ...(memorySwap ? { memorySwap } : {}),
+                  concurrency: 1,
+                });
+                const resRow = evalRes?.results?.[0];
+                if (resRow) {
+                  upsertRecordByInstanceId(evalResultsByArm[arm], resRow);
+                  writeJsonlRecords(evalFiles[arm], evalResultsByArm[arm]);
+                  telemetryByArm[arm] = mergeEvalResultsIntoTelemetry(
+                    telemetryByArm[arm],
+                    [resRow],
+                  );
+                  writeJsonlRecords(filePathsByArm[arm].telePath, telemetryByArm[arm]);
+                  writeIncrementalSummary();
+                }
+              } catch (evalErr) {
+                if (!isEnvironmentOrDockerError(evalErr, { containerMode: true })) {
+                  throw evalErr;
+                }
+                const errResRow = {
+                  instance_id: instance.instance_id,
+                  resolved: false,
+                  reason: 'env_error',
+                  error: redactSecrets(String(evalErr?.message || evalErr)),
+                };
+                upsertRecordByInstanceId(evalResultsByArm[arm], errResRow);
+                writeJsonlRecords(evalFiles[arm], evalResultsByArm[arm]);
+                telemetryByArm[arm] = mergeEvalResultsIntoTelemetry(
+                  telemetryByArm[arm],
+                  [errResRow],
+                );
+                writeJsonlRecords(filePathsByArm[arm].telePath, telemetryByArm[arm]);
+                writeIncrementalSummary();
+              }
+            }
+          }
         } finally {
-          rmSync(trialWs, { recursive: true, force: true });
+          if (seedWs) {
+            rmSync(seedWs, { recursive: true, force: true });
+          }
+          if (opts.cleanupImages && imagesToCleanup.length > 0) {
+            for (const img of imagesToCleanup) {
+              await removeImgFn(img).catch(() => {});
+            }
+          }
         }
       });
-    }
 
-    const evalFiles = {};
-    if (opts.evaluate) {
-      const imageResolver = buildEvalImageResolver(opts, runtimeDeps);
-      const createDockerSession = buildEvalDockerSessionFactory(opts, runtimeDeps);
-      const evalFn = runtimeDeps.evaluateSweBenchPredictions ?? evaluateSweBenchPredictions;
-      for (const arm of opts.arms) {
-        const evalOutPath = join(outputDir, `eval.${arm}.jsonl`);
-        const evalRes = await evalFn({
-          instances,
-          predictions: predictionsByArm[arm],
-          predictionsPath: filePathsByArm[arm].predPath,
-          imageResolver,
-          createDockerSession,
-          pull: opts.pull,
-          concurrency: opts.concurrency,
-          outputPath: evalOutPath,
-        });
-        evalFiles[arm] = evalOutPath;
-        evalByArm[arm] = evalRes;
-        telemetryByArm[arm] = mergeEvalResultsIntoTelemetry(
-          telemetryByArm[arm],
-          evalRes.results ?? [],
-        );
-        writeJsonlRecords(filePathsByArm[arm].telePath, telemetryByArm[arm]);
+      if (opts.evaluate) {
+        for (const arm of opts.arms) {
+          const results = evalResultsByArm[arm] ?? [];
+          const resolvedCount = results.filter((r) => Boolean(r?.resolved)).length;
+          const evaluatedCount = results.length;
+          evalByArm[arm] = {
+            totalInstances: instances.length,
+            evaluatedCount,
+            resolvedCount,
+            resolvedRate: evaluatedCount > 0 ? round4(resolvedCount / evaluatedCount) : 0,
+            results,
+          };
+        }
       }
     }
 

@@ -25,11 +25,15 @@ import {
   SWEBENCH_DOCKER_PRESETS,
   SweBenchDockerAdapter,
   isAuthorizedSweBenchCommand,
+  removeDockerImage,
   resolveSweBenchDockerImage,
   scrubAntiCheatGitRefs,
 } from '../../src/evaluation/swebench-docker.js';
 import {
+  SWEBENCH_HF_FULL_DATASET_ID,
+  SWEBENCH_HF_MINI_DATASET_ID,
   fetchSweBenchVerifiedDataset,
+  getDefaultSweBenchCachePath,
   parseEvalTestResults,
   selectSweBenchSubset,
 } from '../../src/evaluation/swebench-dataset-eval.js';
@@ -37,6 +41,7 @@ import {
   PrefixBlockCacheSimulatorAdapter,
   buildSweBenchPrompt,
   isAuthorizedBenchmarkToolCall,
+  loadCompletedInstanceIds,
   parseSweBenchCliArgs,
   resolveLiveProviderConfig,
   runSweBenchBenchmark,
@@ -255,21 +260,21 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     });
     assert.equal(helpProc.status, 0, `--help failed: ${helpProc.stderr}`);
     assert.match(helpProc.stdout, /--fetch-dataset/);
-    assert.match(helpProc.stdout, /--subset smoke-5 --docker-preset epoch --evaluate/);
-    assert.match(
-      helpProc.stdout,
-      /--subset paper-50 --arms raw_full,full_aci --docker-preset epoch --use-app-pool --evaluate --export-latex/,
-    );
+    assert.match(helpProc.stdout, /hf:verified-mini/);
+    assert.match(helpProc.stdout, /--cleanup-images/);
+    assert.match(helpProc.stdout, /--container-memory 2g/);
 
     // Optional path handling for --fetch-dataset and --export-latex
     const fetchDefault = parseSweBenchCliArgs(['--fetch-dataset']);
     assert.equal(fetchDefault.fetchDataset, true);
     assert.equal(fetchDefault.fetchDatasetPath, null);
+    assert.equal(fetchDefault.cleanupImages, true);
+    assert.equal(fetchDefault.containerMemory, '2g');
 
     const fetchBeforeFlag = parseSweBenchCliArgs([
       '--fetch-dataset',
       '--dataset',
-      'hf:verified',
+      'hf:verified-mini',
       '--subset',
       'smoke-5',
       '--docker-preset',
@@ -277,11 +282,13 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     ]);
     assert.equal(fetchBeforeFlag.fetchDataset, true);
     assert.equal(fetchBeforeFlag.fetchDatasetPath, null);
-    assert.equal(fetchBeforeFlag.dataset, 'hf:verified');
+    assert.equal(fetchBeforeFlag.dataset, 'hf:verified-mini');
     assert.equal(fetchBeforeFlag.subset, 'smoke-5');
     assert.equal(fetchBeforeFlag.dockerPreset, 'epoch');
     assert.equal(fetchBeforeFlag.pull, 'missing');
     assert.equal(fetchBeforeFlag.seed, 42);
+    assert.equal(fetchBeforeFlag.cleanupImages, true);
+    assert.equal(fetchBeforeFlag.containerMemory, '2g');
 
     const fullOpts = parseSweBenchCliArgs([
       '--dataset',
@@ -293,6 +300,9 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
       '99',
       '--docker-preset=official',
       '--pull=always',
+      '--container-memory',
+      '4g',
+      '--keep-images',
       '--use-app-pool',
       '--app-data-dir',
       './custom-data',
@@ -308,6 +318,8 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     assert.equal(fullOpts.seed, 99);
     assert.equal(fullOpts.dockerPreset, 'official');
     assert.equal(fullOpts.pull, 'always');
+    assert.equal(fullOpts.containerMemory, '4g');
+    assert.equal(fullOpts.cleanupImages, false);
     assert.equal(fullOpts.useAppPool, true);
     assert.equal(fullOpts.appDataDir, './custom-data');
     assert.equal(fullOpts.supervisorModel, 'deepseek-chat');
@@ -315,6 +327,14 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     assert.equal(fullOpts.evaluate, true);
     assert.equal(fullOpts.exportLatex, true);
     assert.equal(fullOpts.exportLatexPath, './out/paper.tex');
+
+    const cleanupExplicit = parseSweBenchCliArgs(['--dry-run', '--keep-images', '--cleanup-images']);
+    assert.equal(cleanupExplicit.cleanupImages, true);
+
+    assert.throws(
+      () => parseSweBenchCliArgs(['--dry-run', '--container-memory', 'not-a-size']),
+      /Invalid --container-memory/,
+    );
 
     const noPoolOpts = parseSweBenchCliArgs(['--dry-run', '--no-use-app-pool', '--export-latex']);
     assert.equal(noPoolOpts.useAppPool, false);
@@ -565,6 +585,8 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
 
       const runCall = mockDocker.calls.find((c) => c.args[0] === 'run');
       assert.ok(runCall, 'Docker container must be started');
+      assert.ok(runCall.args.includes('--memory=2g'));
+      assert.ok(runCall.args.includes('--memory-swap=2.5g'));
       assert.ok(runCall.args.some((a) => a.includes(DEFAULT_TESTBED_PATH)));
       assert.ok(runCall.args.some((a) => a.endsWith(':/testbed:rw')));
 
@@ -581,6 +603,10 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
       mockDocker.calls.some((c) => c.args[0] === 'rm' && c.args[1] === '-f'),
       'destroy() must run docker rm -f',
     );
+
+    const rmiRes = await removeDockerImage(epochImg, { execFileImpl: mockDocker.execFileImpl });
+    assert.equal(rmiRes.image, epochImg);
+    assert.ok(mockDocker.calls.some((c) => c.args[0] === 'rmi' && c.args.includes(epochImg)));
   });
 
   test('WP3 Live Integration: DEEPSEEK_API_KEY endpoint inference, --use-app-pool read-only clone, and deepseek-reasoner supervisor decoupling', async () => {
@@ -757,10 +783,14 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     }
   });
 
-  test('WP4/WP5: hf:verified fetch/subset, --evaluate, --eval-only, telemetry merge, LaTeX table, and --dry-run', async () => {
+  test('WP4/WP5: hf:verified-mini default, outer-instance loop, instant rmi & --keep-images, 2g memory, env_error --resume retry, --evaluate/--eval-only, LaTeX, and --dry-run', async () => {
+    assert.equal(SWEBENCH_HF_MINI_DATASET_ID, 'MariusHobbhahn/swe-bench-verified-mini');
+    assert.equal(SWEBENCH_HF_FULL_DATASET_ID, 'princeton-nlp/SWE-bench_Verified');
+    assert.match(getDefaultSweBenchCachePath(), /swebench_verified_mini\.jsonl$/);
+
     // 1. Test HuggingFace fetcher + smoke-5 / paper-50 subset reproducibility
     const cacheDir = makeTmp('swe-wp4-cache-');
-    const cachePath = join(cacheDir, 'swebench_verified.jsonl');
+    const cachePath = join(cacheDir, 'swebench_verified_mini.jsonl');
     const repoTemplates = [
       { repo: 'psf/requests', id: 'psf__requests-101', f2p: ['tests/test_req.py::test_hdr'] },
       { repo: 'pytest-dev/pytest', id: 'pytest-dev__pytest-202', f2p: ['testing/test_p.py::test_x'] },
@@ -805,9 +835,77 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     const paperA = selectSweBenchSubset(fetched.instances, { preset: 'paper-50', seed: 42 });
     assert.equal(paperA.instances.length, 6);
 
-    // 2. End-to-end --subset smoke-5 --docker-preset epoch --evaluate --export-latex (mocked extract + docker + eval session)
+    // Verify hf:verified-mini (and hf:verified) map to mini ID, while hf:verified-full maps to full ID
+    const seenFetchIds = [];
+    const miniAliasPath = join(makeTmp('swe-mini-alias-'), 'mini.jsonl');
+    const fullAliasPath = join(makeTmp('swe-full-alias-'), 'full.jsonl');
+    await runSweBenchBenchmark(
+      {
+        dataset: 'hf:verified-mini',
+        fetchDataset: true,
+        fetchDatasetPath: miniAliasPath,
+        limit: 1,
+        arms: ['raw_full'],
+        workspaceRoot: seedRepo,
+        outputDir: makeTmp('swe-mini-alias-out-'),
+      },
+      {
+        fetchSweBenchVerifiedDataset: async ({ outputPath, datasetId }) => {
+          seenFetchIds.push({ outputPath, datasetId });
+          writeFileSync(
+            outputPath,
+            JSON.stringify({
+              instance_id: repoTemplates[0].id,
+              repo: repoTemplates[0].repo,
+              base_commit: baseCommit,
+              problem_statement: 'Fix cap',
+            }) + '\n',
+            'utf8',
+          );
+          return { outputPath, count: 1, instances: [] };
+        },
+        createAdapter: () => new PrefixBlockCacheSimulatorAdapter(),
+      },
+    );
+    await runSweBenchBenchmark(
+      {
+        dataset: 'hf:verified-full',
+        fetchDataset: true,
+        fetchDatasetPath: fullAliasPath,
+        limit: 1,
+        arms: ['raw_full'],
+        workspaceRoot: seedRepo,
+        outputDir: makeTmp('swe-full-alias-out-'),
+      },
+      {
+        fetchSweBenchVerifiedDataset: async ({ outputPath, datasetId }) => {
+          seenFetchIds.push({ outputPath, datasetId });
+          writeFileSync(
+            outputPath,
+            JSON.stringify({
+              instance_id: repoTemplates[0].id,
+              repo: repoTemplates[0].repo,
+              base_commit: baseCommit,
+              problem_statement: 'Fix cap',
+            }) + '\n',
+            'utf8',
+          );
+          return { outputPath, count: 1, instances: [] };
+        },
+        createAdapter: () => new PrefixBlockCacheSimulatorAdapter(),
+      },
+    );
+    assert.equal(seenFetchIds[0].datasetId, SWEBENCH_HF_MINI_DATASET_ID);
+    assert.equal(seenFetchIds[1].datasetId, SWEBENCH_HF_FULL_DATASET_ID);
+
+    // 2. End-to-end --subset smoke-5 --docker-preset epoch --evaluate --export-latex
+    // Verifies outer-instance -> inner-arm -> eval -> instant removeDockerImage order + 2g memory cap
     const outDir = makeTmp('swe-wp5-out-');
-    const makeStubDockerAdapter = ({ workspaceRoot }) => {
+    const lifecycleEvents = [];
+    const seenAdapterMemories = [];
+    const seenEvalMemories = [];
+    const makeStubDockerAdapter = ({ workspaceRoot, memory, memorySwap }) => {
+      seenAdapterMemories.push({ memory, memorySwap });
       const adapterObj = {
         isSweBenchContainer: true,
         workspaceRoot,
@@ -832,18 +930,21 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
         seed: 42,
         arms: ['raw_full', 'full_aci'],
         dockerPreset: 'epoch',
+        containerMemory: '2g',
+        cleanupImages: true,
         evaluate: true,
         exportLatex: true,
         outputDir: outDir,
       },
       {
-        extractTestbedFromImage: async ({ targetDir }) => {
+        extractTestbedFromImage: async ({ targetDir, image }) => {
+          lifecycleEvents.push(`extract:${image}`);
           cpSync(seedRepo, targetDir, { recursive: true });
           return { targetDir, headCommit: baseCommit };
         },
         createDockerAdapter: makeStubDockerAdapter,
-        createAdapter: ({ instance }) => {
-          // Resolve the psf/requests instance on both arms; leave others unmodified (empty patch)
+        createAdapter: ({ arm, instance }) => {
+          lifecycleEvents.push(`run:${instance.instance_id}:${arm}`);
           if (instance.instance_id === 'psf__requests-101') {
             return new PrefixBlockCacheSimulatorAdapter();
           }
@@ -863,23 +964,31 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
             }
           })();
         },
-        createDockerSession: async ({ instance }) => ({
-          workspaceRoot: '/tmp/eval',
-          exec: async (cmd) => {
-            if (/\bgit\s+|rm\s+-f/.test(cmd)) {
-              return { exitCode: 0, stdout: 'Applied cleanly', stderr: '' };
-            }
-            if (instance.instance_id === 'psf__requests-101') {
-              return {
-                exitCode: 0,
-                stdout: 'PASSED tests/test_req.py::test_hdr\n1 passed in 0.1s\n',
-                stderr: '',
-              };
-            }
-            return { exitCode: 1, stdout: 'FAILED\n', stderr: '' };
-          },
-          destroy: async () => {},
-        }),
+        createDockerSession: async ({ instance, memory, memorySwap }) => {
+          seenEvalMemories.push({ memory, memorySwap });
+          lifecycleEvents.push(`eval:${instance.instance_id}`);
+          return {
+            workspaceRoot: '/tmp/eval',
+            exec: async (cmd) => {
+              if (/\bgit\s+|rm\s+-f/.test(cmd)) {
+                return { exitCode: 0, stdout: 'Applied cleanly', stderr: '' };
+              }
+              if (instance.instance_id === 'psf__requests-101') {
+                return {
+                  exitCode: 0,
+                  stdout: 'PASSED tests/test_req.py::test_hdr\n1 passed in 0.1s\n',
+                  stderr: '',
+                };
+              }
+              return { exitCode: 1, stdout: 'FAILED\n', stderr: '' };
+            },
+            destroy: async () => {},
+          };
+        },
+        removeDockerImage: async (image) => {
+          lifecycleEvents.push(`rmi:${image}`);
+          return { image, removed: true };
+        },
       },
     );
 
@@ -896,6 +1005,130 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
       'Expected full_aci pairedResolvedTokenReduction > 0',
     );
 
+    // Verify memory='2g' & memorySwap='2.5g' forwarded everywhere
+    assert.ok(seenAdapterMemories.length > 0);
+    for (const mem of seenAdapterMemories) {
+      assert.equal(mem.memory, '2g');
+      assert.equal(mem.memorySwap, '2.5g');
+    }
+    assert.ok(seenEvalMemories.length > 0);
+    for (const mem of seenEvalMemories) {
+      assert.equal(mem.memory, '2g');
+      assert.equal(mem.memorySwap, '2.5g');
+    }
+
+    // Verify outer-instance order: extract -> raw_full -> full_aci -> eval -> rmi per instance before next instance!
+    const firstId = subA.instances[0].instance_id;
+    const secondId = subA.instances[1].instance_id;
+    const firstRawIdx = lifecycleEvents.indexOf(`run:${firstId}:raw_full`);
+    const firstAciIdx = lifecycleEvents.indexOf(`run:${firstId}:full_aci`);
+    const firstRmiIdx = lifecycleEvents.findIndex((e) => e.startsWith(`rmi:`) && e.includes(firstId));
+    const secondRawIdx = lifecycleEvents.indexOf(`run:${secondId}:raw_full`);
+    assert.ok(firstRawIdx >= 0 && firstAciIdx > firstRawIdx);
+    assert.ok(firstRmiIdx > firstAciIdx && firstRmiIdx < secondRawIdx, 'Must rmi instance 1 before starting instance 2');
+
+    // Verify --keep-images (cleanupImages: false) skips removeDockerImage
+    const keepOut = makeTmp('swe-wp5-keep-');
+    const keepRmiCalls = [];
+    await runSweBenchBenchmark(
+      {
+        dataset: cachePath,
+        limit: 1,
+        arms: ['raw_full'],
+        dockerPreset: 'epoch',
+        cleanupImages: false,
+        outputDir: keepOut,
+      },
+      {
+        extractTestbedFromImage: async ({ targetDir }) => {
+          cpSync(seedRepo, targetDir, { recursive: true });
+          return { targetDir, headCommit: baseCommit };
+        },
+        createDockerAdapter: makeStubDockerAdapter,
+        createAdapter: () => new PrefixBlockCacheSimulatorAdapter(),
+        removeDockerImage: async (img) => {
+          keepRmiCalls.push(img);
+          return { image: img, removed: true };
+        },
+      },
+    );
+    assert.equal(keepRmiCalls.length, 0, '--keep-images must NOT invoke removeDockerImage');
+
+    // Verify env_error fault tolerance + --resume retry + latest-wins deduplication
+    const errOut = makeTmp('swe-wp5-enverr-');
+    const errRmiCalls = [];
+    let failFirstInstance = true;
+    const retriedIds = [];
+    const errRun1 = await runSweBenchBenchmark(
+      {
+        dataset: cachePath,
+        limit: 2,
+        arms: ['raw_full'],
+        dockerPreset: 'epoch',
+        cleanupImages: true,
+        outputDir: errOut,
+      },
+      {
+        extractTestbedFromImage: async ({ targetDir, image }) => {
+          if (failFirstInstance && image.includes(repoTemplates[0].id)) {
+            throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+          }
+          cpSync(seedRepo, targetDir, { recursive: true });
+          return { targetDir, headCommit: baseCommit };
+        },
+        createDockerAdapter: makeStubDockerAdapter,
+        createAdapter: ({ instance }) => {
+          retriedIds.push(instance.instance_id);
+          return new PrefixBlockCacheSimulatorAdapter();
+        },
+        removeDockerImage: async (img) => {
+          errRmiCalls.push(img);
+          return { image: img, removed: true };
+        },
+      },
+    );
+    assert.equal(errRun1.telemetryByArm.raw_full.length, 2);
+    assert.equal(errRun1.telemetryByArm.raw_full[0].status, 'env_error');
+    assert.equal(errRun1.telemetryByArm.raw_full[1].status, 'completed');
+    assert.equal(errRmiCalls.length, 2, 'Cleanup must still run after env_error');
+
+    const resumeBefore = loadCompletedInstanceIds(errOut, 'raw_full');
+    assert.equal(resumeBefore.completedIds.has(repoTemplates[0].id), false, 'env_error must NOT be treated as completed');
+    assert.equal(resumeBefore.completedIds.has(repoTemplates[1].id), true);
+
+    failFirstInstance = false;
+    retriedIds.length = 0;
+    const errRun2 = await runSweBenchBenchmark(
+      {
+        dataset: cachePath,
+        limit: 2,
+        arms: ['raw_full'],
+        dockerPreset: 'epoch',
+        resume: true,
+        outputDir: errOut,
+      },
+      {
+        extractTestbedFromImage: async ({ targetDir }) => {
+          cpSync(seedRepo, targetDir, { recursive: true });
+          return { targetDir, headCommit: baseCommit };
+        },
+        createDockerAdapter: makeStubDockerAdapter,
+        createAdapter: ({ instance }) => {
+          retriedIds.push(instance.instance_id);
+          return new PrefixBlockCacheSimulatorAdapter();
+        },
+        removeDockerImage: async (img) => ({ image: img, removed: true }),
+      },
+    );
+    assert.deepEqual(retriedIds, [repoTemplates[0].id], '--resume must retry ONLY the env_error instance');
+    const resumeAfter = loadCompletedInstanceIds(errOut, 'raw_full');
+    assert.equal(resumeAfter.completedIds.size, 2);
+    assert.equal(errRun2.telemetryByArm.raw_full.length, 2);
+    assert.equal(
+      errRun2.telemetryByArm.raw_full.every((t) => t.status === 'completed'),
+      true,
+    );
+
     const summaryMd = readFileSync(runRes.summaryPath, 'utf8');
     assert.match(summaryMd, /Resolved Rate \(%\)/);
     assert.match(summaryMd, /Tokens \/ Resolved/);
@@ -904,8 +1137,9 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     const latexText = readFileSync(runRes.latexPath, 'utf8');
     assert.match(latexText, /\\begin\{tabular\}|raw\\_full|full\\_aci/);
 
-    // 3. Standalone --eval-only on predictions.full_aci.jsonl
+    // 3. Standalone --eval-only on predictions.full_aci.jsonl + per-instance cleanup
     const evalOnlyOut = makeTmp('swe-wp5-evalonly-');
+    const evalOnlyRmi = [];
     const evalOnlyRes = await runSweBenchBenchmark(
       {
         evalOnly: true,
@@ -914,6 +1148,7 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
         subset: 'smoke-5',
         seed: 42,
         dockerPreset: 'epoch',
+        cleanupImages: true,
         outputDir: evalOnlyOut,
       },
       {
@@ -929,12 +1164,17 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
           },
           destroy: async () => {},
         }),
+        removeDockerImage: async (img) => {
+          evalOnlyRmi.push(img);
+          return { image: img, removed: true };
+        },
       },
     );
     assert.equal(evalOnlyRes.evalOnly, true);
     assert.equal(evalOnlyRes.metricsByArm.full_aci.resolvedInstances, 1);
     assert.equal(existsSync(join(evalOnlyOut, 'eval.full_aci.jsonl')), true);
     assert.equal(existsSync(evalOnlyRes.latexPath), true);
+    assert.ok(evalOnlyRmi.length >= 1, '--eval-only must trigger removeDockerImage per evaluated container');
 
     // Also verify parseEvalTestResults handles Django & SymPy cleanly
     const djangoParsed = parseEvalTestResults(

@@ -185,8 +185,9 @@ function readSourceTablesSet(srcDb) {
 }
 
 /**
- * Resolves the App data directory containing `engine.sqlite`.
- * Resolution order: `explicitDir`, `env.BACKEND_DATA`, `<repoRoot>/backend/data`, `<repoRoot>/backend/var`.
+ * Resolves the App data directory containing `engine.sqlite` (or `.provider-env.json` fallback).
+ * Resolution order: `explicitDir`, `env.BACKEND_DATA`, `<repoRoot>/backend/data`,
+ * `<repoRoot>/backend/var`, `%APPDATA%/agent-us-desktop/backend-var`.
  */
 export function resolveAppDataDir(
   explicitDir = null,
@@ -206,18 +207,197 @@ export function resolveAppDataDir(
   if (envData) candidates.push(resolve(cwd, envData));
   candidates.push(join(resolve(repoRoot), 'backend', 'data'));
   candidates.push(join(resolve(repoRoot), 'backend', 'var'));
+  const appDataEnv = String(env?.APPDATA ?? '').trim();
+  if (appDataEnv) {
+    candidates.push(join(resolve(cwd, appDataEnv), 'agent-us-desktop', 'backend-var'));
+  }
 
   for (const dir of candidates) {
     if (isExistingDir(dir) && existsSync(join(dir, 'engine.sqlite'))) {
       return dir;
     }
   }
+  for (const dir of candidates) {
+    if (isExistingDir(dir) && existsSync(join(dir, '.provider-env.json'))) {
+      return dir;
+    }
+  }
   return null;
+}
+
+const PROVIDER_ENV_PRESET_MAP = Object.freeze([
+  {
+    envKey: 'DEEPSEEK_API_KEY',
+    preset: 'deepseek',
+    label: 'DeepSeek (.provider-env)',
+    endpoint: 'https://api.deepseek.com/v1',
+    protocol: 'openai',
+    models: ['deepseek-chat', 'deepseek-reasoner'],
+  },
+  {
+    envKey: 'OPENAI_API_KEY',
+    preset: 'openai',
+    label: 'OpenAI (.provider-env)',
+    endpoint: 'https://api.openai.com/v1',
+    protocol: 'openai',
+    models: ['gpt-4o', 'gpt-4o-mini'],
+  },
+  {
+    envKey: 'ANTHROPIC_API_KEY',
+    preset: 'anthropic',
+    label: 'Anthropic (.provider-env)',
+    endpoint: 'https://api.anthropic.com',
+    protocol: 'anthropic',
+    models: ['claude-sonnet-4-5', 'claude-3-5-haiku-20241022'],
+  },
+  {
+    envKey: 'OPENROUTER_API_KEY',
+    preset: 'openrouter',
+    label: 'OpenRouter (.provider-env)',
+    endpoint: 'https://openrouter.ai/api/v1',
+    protocol: 'openai',
+    models: [],
+  },
+  {
+    envKey: 'GEMINI_API_KEY',
+    preset: 'gemini',
+    label: 'Gemini (.provider-env)',
+    endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    protocol: 'openai',
+    models: ['gemini-2.5-flash'],
+  },
+  {
+    envKey: 'SILICONFLOW_API_KEY',
+    preset: 'siliconflow',
+    label: 'SiliconFlow (.provider-env)',
+    endpoint: 'https://api.siliconflow.cn/v1',
+    protocol: 'openai',
+    models: [],
+  },
+  {
+    envKey: 'KIMI_API_KEY',
+    preset: 'kimi',
+    label: 'Kimi (.provider-env)',
+    endpoint: 'https://api.moonshot.cn/v1',
+    protocol: 'openai',
+    models: [],
+  },
+  {
+    envKey: 'ZHIPU_API_KEY',
+    preset: 'zhipu',
+    label: 'Zhipu (.provider-env)',
+    endpoint: 'https://open.bigmodel.cn/api/paas/v4',
+    protocol: 'openai',
+    models: [],
+  },
+  {
+    envKey: 'QWEN_API_KEY',
+    preset: 'qwen',
+    label: 'Qwen (.provider-env)',
+    endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    protocol: 'openai',
+    models: [],
+  },
+  {
+    envKey: 'GROQ_API_KEY',
+    preset: 'groq',
+    label: 'Groq (.provider-env)',
+    endpoint: 'https://api.groq.com/openai/v1',
+    protocol: 'openai',
+    models: [],
+  },
+  {
+    envKey: 'XAI_API_KEY',
+    preset: 'xai',
+    label: 'xAI (.provider-env)',
+    endpoint: 'https://api.x.ai/v1',
+    protocol: 'openai',
+    models: [],
+  },
+]);
+
+function cloneFromProviderEnvFallback({
+  sourceDataDir,
+  targetPool,
+  model = null,
+  env = process.env,
+}) {
+  const envFilePath = join(sourceDataDir, '.provider-env.json');
+  if (!existsSync(envFilePath)) return [];
+  const parsedEnv = parseJsonSafe(readFileSync(envFilePath, 'utf8'), null);
+  if (!parsedEnv || typeof parsedEnv !== 'object' || Array.isArray(parsedEnv)) return [];
+
+  const savedEnv = {};
+  for (const [k, v] of Object.entries(parsedEnv)) {
+    if (typeof v === 'string' && v.trim()) savedEnv[k] = v.trim();
+  }
+  const cloned = [];
+  const seenEndpoints = new Set();
+
+  const cfgPath = join(sourceDataDir, 'config.json');
+  if (existsSync(cfgPath)) {
+    const cfg = parseJsonSafe(readFileSync(cfgPath, 'utf8'), null);
+    for (const p of cfg?.providers ?? []) {
+      const ep = String(p?.endpoint ?? '').trim().replace(/\/+$/, '');
+      if (!ep || seenEndpoints.has(ep)) continue;
+      const key = p.keyRef ? savedEnv[p.keyRef] || String(env?.[p.keyRef] ?? '').trim() : '';
+      if (!key) continue;
+      const models = (cfg?.models ?? [])
+        .filter((m) => m?.provider === p.id && m?.model)
+        .map((m) => String(m.model).trim());
+      const preset = String(p.id || 'custom-openai');
+      const acc = targetPool.createAccount({
+        preset,
+        label: `env-fallback-${preset}`,
+        endpoint: ep,
+        credential: key,
+        ...(p.protocol ? { protocol: String(p.protocol) } : {}),
+        models,
+      });
+      seenEndpoints.add(ep);
+      cloned.push(acc);
+    }
+  }
+
+  for (const spec of PROVIDER_ENV_PRESET_MAP) {
+    const key = savedEnv[spec.envKey];
+    if (!key) continue;
+    const ep = spec.endpoint.replace(/\/+$/, '');
+    if (seenEndpoints.has(ep)) continue;
+    const acc = targetPool.createAccount({
+      preset: spec.preset,
+      label: spec.label,
+      endpoint: ep,
+      protocol: spec.protocol,
+      credential: key,
+      models: spec.models,
+    });
+    seenEndpoints.add(ep);
+    cloned.push(acc);
+  }
+
+  if (cloned.length === 0) {
+    const liveCfg = resolveLiveProviderConfig({ model }, savedEnv);
+    if (liveCfg.apiKey) {
+      const acc = targetPool.createAccount({
+        preset: liveCfg.preset,
+        label: 'env-fallback-bench',
+        endpoint: liveCfg.endpoint,
+        protocol: liveCfg.protocol,
+        credential: liveCfg.apiKey,
+        models: liveCfg.model ? [liveCfg.model] : [],
+      });
+      cloned.push(acc);
+    }
+  }
+
+  return cloned;
 }
 
 /**
  * Clones enabled provider accounts, native sessions, pool models, mappings, and
  * `pool.default_model` strictly read-only from the configured App `engine.sqlite`
+ * (with read-only `.provider-env.json` fallback when 0 enabled DB accounts exist)
  * into an isolated benchmark `targetStore` / `targetPool`.
  */
 export function loadAppPoolReadOnly({
@@ -238,16 +418,16 @@ export function loadAppPoolReadOnly({
   const requestedDir = explicitDir ?? appDataDir ?? null;
   const sourceDataDir = resolveAppDataDir(requestedDir, { cwd, repoRoot, env });
   const dbPath = sourceDataDir ? join(sourceDataDir, 'engine.sqlite') : null;
+  const envFallbackPath = sourceDataDir ? join(sourceDataDir, '.provider-env.json') : null;
+  const hasDb = Boolean(dbPath && existsSync(dbPath));
+  const hasEnvFallback = Boolean(envFallbackPath && existsSync(envFallbackPath));
 
-  if (!sourceDataDir || !dbPath || !existsSync(dbPath)) {
+  if (!sourceDataDir || (!hasDb && !hasEnvFallback)) {
     throw new Error(
       `No App AccountPool database (engine.sqlite) found${sourceDataDir ? ` in ${sourceDataDir}` : ''}. ` +
         'Configure an enabled provider account in the app, pass --app-data-dir <dir>, or set an API key env var (DEEPSEEK_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, SWEBENCH_API_KEY).',
     );
   }
-
-  const sourceKeys = readSourceMasterKeys(sourceDataDir, env);
-  const srcDb = new DatabaseSync(dbPath, { readOnly: true });
 
   let accountsCloned = 0;
   let modelsCloned = 0;
@@ -255,209 +435,228 @@ export function loadAppPoolReadOnly({
   const clonedAccountIds = new Set();
   const clonedAccounts = [];
 
-  try {
-    const tables = readSourceTablesSet(srcDb);
-    if (!tables.has('provider_accounts')) {
-      throw new Error(
-        `App database at ${dbPath} does not contain provider_accounts table. Configure an account or pass an API key env var.`,
-      );
-    }
+  if (hasDb) {
+    const sourceKeys = readSourceMasterKeys(sourceDataDir, env);
+    const srcDb = new DatabaseSync(dbPath, { readOnly: true });
 
-    const enabledRows = srcDb
-      .prepare('SELECT * FROM provider_accounts WHERE enabled = 1 ORDER BY priority ASC, createdAt ASC')
-      .all();
+    try {
+      const tables = readSourceTablesSet(srcDb);
+      if (!tables.has('provider_accounts')) {
+        throw new Error(
+          `App database at ${dbPath} does not contain provider_accounts table. Configure an account or pass an API key env var.`,
+        );
+      }
 
-    const hasNativeSessions = tables.has('native_provider_sessions');
-    const getNativeStmt = hasNativeSessions
-      ? srcDb.prepare('SELECT encrypted FROM native_provider_sessions WHERE accountId = ?')
-      : null;
+      const enabledRows = srcDb
+        .prepare('SELECT * FROM provider_accounts WHERE enabled = 1 ORDER BY priority ASC, createdAt ASC')
+        .all();
 
-    for (const acc of enabledRows) {
-      const headers = parseJsonSafe(acc.headers, {});
-      const models = parseJsonSafe(acc.models, []);
-      const meta = parseJsonSafe(acc.meta, {});
-      const protocol = meta?.protocol ? String(meta.protocol) : undefined;
+      const hasNativeSessions = tables.has('native_provider_sessions');
+      const getNativeStmt = hasNativeSessions
+        ? srcDb.prepare('SELECT encrypted FROM native_provider_sessions WHERE accountId = ?')
+        : null;
 
-      const decryptedSecret = acc.credentialEnc
-        ? decryptWithSourceKeys(acc.credentialEnc, sourceKeys, `account "${acc.label || acc.id}"`)
-        : '';
+      for (const acc of enabledRows) {
+        const headers = parseJsonSafe(acc.headers, {});
+        const models = parseJsonSafe(acc.models, []);
+        const meta = parseJsonSafe(acc.meta, {});
+        const protocol = meta?.protocol ? String(meta.protocol) : undefined;
 
-      let nativeSession = null;
-      if (getNativeStmt) {
-        const nativeRow = getNativeStmt.get(acc.id);
-        if (nativeRow?.encrypted) {
-          const plainNative = decryptWithSourceKeys(
-            nativeRow.encrypted,
-            sourceKeys,
-            `native session for "${acc.label || acc.id}"`,
-          );
-          nativeSession = parseJsonSafe(plainNative, null);
+        const decryptedSecret = acc.credentialEnc
+          ? decryptWithSourceKeys(acc.credentialEnc, sourceKeys, `account "${acc.label || acc.id}"`)
+          : '';
+
+        let nativeSession = null;
+        if (getNativeStmt) {
+          const nativeRow = getNativeStmt.get(acc.id);
+          if (nativeRow?.encrypted) {
+            const plainNative = decryptWithSourceKeys(
+              nativeRow.encrypted,
+              sourceKeys,
+              `native session for "${acc.label || acc.id}"`,
+            );
+            nativeSession = parseJsonSafe(plainNative, null);
+          }
+        }
+
+        const created = targetPool.createAccount(
+          {
+            id: acc.id,
+            preset: acc.preset,
+            label: acc.label,
+            category: acc.category || undefined,
+            priority: acc.priority,
+            enabled: true,
+            endpoint: acc.endpoint ?? undefined,
+            proxyUrl: acc.proxyUrl ?? undefined,
+            headers,
+            models: Array.isArray(models) ? models : [],
+            meta,
+            ...(protocol ? { protocol } : {}),
+            ...(acc.expiresAt != null ? { expiresAt: acc.expiresAt } : {}),
+            ...(decryptedSecret ? { credential: decryptedSecret } : {}),
+          },
+          nativeSession,
+        );
+
+        if (acc.status === 'healthy') {
+          targetStore.db
+            .prepare("UPDATE provider_accounts SET status='healthy', lastSuccessAt=? WHERE id=?")
+            .run(acc.lastSuccessAt ?? Date.now(), created.id);
+        }
+
+        clonedAccountIds.add(created.id);
+        clonedAccounts.push(created);
+        accountsCloned += 1;
+      }
+
+      if (tables.has('provider_priorities')) {
+        const priorityRows = srcDb
+          .prepare('SELECT preset, rank, updatedAt FROM provider_priorities ORDER BY rank ASC')
+          .all();
+        if (priorityRows.length > 0) {
+          targetStore.tx(() => {
+            const stmt = targetStore.db.prepare(
+              'INSERT OR REPLACE INTO provider_priorities(preset, rank, updatedAt) VALUES(?,?,?)',
+            );
+            for (const pr of priorityRows) {
+              stmt.run(pr.preset, pr.rank, pr.updatedAt ?? Date.now());
+            }
+          });
         }
       }
 
-      const created = targetPool.createAccount(
-        {
-          id: acc.id,
-          preset: acc.preset,
-          label: acc.label,
-          category: acc.category || undefined,
-          priority: acc.priority,
-          enabled: true,
-          endpoint: acc.endpoint ?? undefined,
-          proxyUrl: acc.proxyUrl ?? undefined,
-          headers,
-          models: Array.isArray(models) ? models : [],
-          meta,
-          ...(protocol ? { protocol } : {}),
-          ...(acc.expiresAt != null ? { expiresAt: acc.expiresAt } : {}),
-          ...(decryptedSecret ? { credential: decryptedSecret } : {}),
-        },
-        nativeSession,
-      );
-
-      if (acc.status === 'healthy') {
-        targetStore.db
-          .prepare("UPDATE provider_accounts SET status='healthy', lastSuccessAt=? WHERE id=?")
-          .run(acc.lastSuccessAt ?? Date.now(), created.id);
-      }
-
-      clonedAccountIds.add(created.id);
-      clonedAccounts.push(created);
-      accountsCloned += 1;
-    }
-
-    if (tables.has('provider_priorities')) {
-      const priorityRows = srcDb
-        .prepare('SELECT preset, rank, updatedAt FROM provider_priorities ORDER BY rank ASC')
-        .all();
-      if (priorityRows.length > 0) {
+      if (tables.has('pool_models') && clonedAccountIds.size > 0) {
+        const poolModelRows = srcDb
+          .prepare('SELECT * FROM pool_models ORDER BY preset ASC, upstreamModel ASC')
+          .all();
         targetStore.tx(() => {
-          const stmt = targetStore.db.prepare(
-            'INSERT OR REPLACE INTO provider_priorities(preset, rank, updatedAt) VALUES(?,?,?)',
+          const upsertStmt = targetStore.db.prepare(
+            `INSERT INTO pool_models(
+              id, accountId, preset, upstreamModel, displayName, enabled, visible,
+              source, multiplier, contextWindow, maxOutput, capabilities, createdAt, updatedAt
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(accountId, upstreamModel) DO UPDATE SET
+              displayName = excluded.displayName,
+              enabled = excluded.enabled,
+              visible = excluded.visible,
+              source = excluded.source,
+              multiplier = excluded.multiplier,
+              contextWindow = excluded.contextWindow,
+              maxOutput = excluded.maxOutput,
+              capabilities = excluded.capabilities,
+              updatedAt = excluded.updatedAt`,
           );
-          for (const pr of priorityRows) {
-            stmt.run(pr.preset, pr.rank, pr.updatedAt ?? Date.now());
+          for (const pm of poolModelRows) {
+            if (!clonedAccountIds.has(pm.accountId)) continue;
+            upsertStmt.run(
+              pm.id,
+              pm.accountId,
+              pm.preset,
+              pm.upstreamModel,
+              pm.displayName ?? pm.upstreamModel,
+              pm.enabled ?? 1,
+              pm.visible ?? 1,
+              pm.source ?? 'remote',
+              pm.multiplier ?? 1.0,
+              pm.contextWindow ?? 128000,
+              pm.maxOutput ?? 16384,
+              pm.capabilities ?? '{}',
+              pm.createdAt ?? Date.now(),
+              pm.updatedAt ?? Date.now(),
+            );
           }
         });
       }
-    }
 
-    if (tables.has('pool_models') && clonedAccountIds.size > 0) {
-      const poolModelRows = srcDb
-        .prepare('SELECT * FROM pool_models ORDER BY preset ASC, upstreamModel ASC')
-        .all();
-      targetStore.tx(() => {
-        const upsertStmt = targetStore.db.prepare(
-          `INSERT INTO pool_models(
-            id, accountId, preset, upstreamModel, displayName, enabled, visible,
-            source, multiplier, contextWindow, maxOutput, capabilities, createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-          ON CONFLICT(accountId, upstreamModel) DO UPDATE SET
-            displayName = excluded.displayName,
-            enabled = excluded.enabled,
-            visible = excluded.visible,
-            source = excluded.source,
-            multiplier = excluded.multiplier,
-            contextWindow = excluded.contextWindow,
-            maxOutput = excluded.maxOutput,
-            capabilities = excluded.capabilities,
-            updatedAt = excluded.updatedAt`,
-        );
-        for (const pm of poolModelRows) {
-          if (!clonedAccountIds.has(pm.accountId)) continue;
-          upsertStmt.run(
-            pm.id,
-            pm.accountId,
-            pm.preset,
-            pm.upstreamModel,
-            pm.displayName ?? pm.upstreamModel,
-            pm.enabled ?? 1,
-            pm.visible ?? 1,
-            pm.source ?? 'remote',
-            pm.multiplier ?? 1.0,
-            pm.contextWindow ?? 128000,
-            pm.maxOutput ?? 16384,
-            pm.capabilities ?? '{}',
-            pm.createdAt ?? Date.now(),
-            pm.updatedAt ?? Date.now(),
+      if (tables.has('model_mappings')) {
+        const mappingRows = srcDb
+          .prepare('SELECT * FROM model_mappings ORDER BY priority ASC, alias ASC')
+          .all();
+        targetStore.tx(() => {
+          const findStmt = targetStore.db.prepare(
+            `SELECT id FROM model_mappings
+             WHERE id = ? OR (alias = ? AND targetPreset IS ? AND targetAccountId IS ? AND targetModel = ?)`,
           );
-        }
-      });
-    }
-
-    if (tables.has('model_mappings')) {
-      const mappingRows = srcDb
-        .prepare('SELECT * FROM model_mappings ORDER BY priority ASC, alias ASC')
-        .all();
-      targetStore.tx(() => {
-        const findStmt = targetStore.db.prepare(
-          `SELECT id FROM model_mappings
-           WHERE id = ? OR (alias = ? AND targetPreset IS ? AND targetAccountId IS ? AND targetModel = ?)`,
-        );
-        const updateStmt = targetStore.db.prepare(
-          `UPDATE model_mappings
-           SET alias=?, targetPreset=?, targetAccountId=?, targetModel=?, enabled=?, isDefault=?, priority=?, updatedAt=?
-           WHERE id=?`,
-        );
-        const insertStmt = targetStore.db.prepare(
-          `INSERT INTO model_mappings(
-            id, alias, targetPreset, targetAccountId, targetModel, enabled, isDefault, priority, createdAt, updatedAt
-          ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-        );
-        for (const mm of mappingRows) {
-          if (mm.targetAccountId && !clonedAccountIds.has(mm.targetAccountId)) continue;
-          const existing = findStmt.get(
-            mm.id,
-            mm.alias,
-            mm.targetPreset ?? null,
-            mm.targetAccountId ?? null,
-            mm.targetModel,
+          const updateStmt = targetStore.db.prepare(
+            `UPDATE model_mappings
+             SET alias=?, targetPreset=?, targetAccountId=?, targetModel=?, enabled=?, isDefault=?, priority=?, updatedAt=?
+             WHERE id=?`,
           );
-          if (existing) {
-            updateStmt.run(
-              mm.alias,
-              mm.targetPreset ?? null,
-              mm.targetAccountId ?? null,
-              mm.targetModel,
-              mm.enabled ?? 1,
-              mm.isDefault ?? 0,
-              mm.priority ?? 100,
-              mm.updatedAt ?? Date.now(),
-              existing.id,
-            );
-          } else {
-            insertStmt.run(
+          const insertStmt = targetStore.db.prepare(
+            `INSERT INTO model_mappings(
+              id, alias, targetPreset, targetAccountId, targetModel, enabled, isDefault, priority, createdAt, updatedAt
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+          );
+          for (const mm of mappingRows) {
+            if (mm.targetAccountId && !clonedAccountIds.has(mm.targetAccountId)) continue;
+            const existing = findStmt.get(
               mm.id,
               mm.alias,
               mm.targetPreset ?? null,
               mm.targetAccountId ?? null,
               mm.targetModel,
-              mm.enabled ?? 1,
-              mm.isDefault ?? 0,
-              mm.priority ?? 100,
-              mm.createdAt ?? Date.now(),
-              mm.updatedAt ?? Date.now(),
             );
+            if (existing) {
+              updateStmt.run(
+                mm.alias,
+                mm.targetPreset ?? null,
+                mm.targetAccountId ?? null,
+                mm.targetModel,
+                mm.enabled ?? 1,
+                mm.isDefault ?? 0,
+                mm.priority ?? 100,
+                mm.updatedAt ?? Date.now(),
+                existing.id,
+              );
+            } else {
+              insertStmt.run(
+                mm.id,
+                mm.alias,
+                mm.targetPreset ?? null,
+                mm.targetAccountId ?? null,
+                mm.targetModel,
+                mm.enabled ?? 1,
+                mm.isDefault ?? 0,
+                mm.priority ?? 100,
+                mm.createdAt ?? Date.now(),
+                mm.updatedAt ?? Date.now(),
+              );
+            }
+          }
+        });
+      }
+
+      if (tables.has('kv_settings')) {
+        const defaultRow = srcDb
+          .prepare("SELECT value FROM kv_settings WHERE key = 'pool.default_model'")
+          .get();
+        if (defaultRow?.value != null) {
+          const parsedDefault = parseJsonSafe(defaultRow.value, defaultRow.value);
+          const cleanDefault = String(parsedDefault ?? '').trim();
+          if (cleanDefault) {
+            sourceDefaultModel = cleanDefault;
+            targetPool.setDefaultModel(cleanDefault);
           }
         }
-      });
-    }
-
-    if (tables.has('kv_settings')) {
-      const defaultRow = srcDb
-        .prepare("SELECT value FROM kv_settings WHERE key = 'pool.default_model'")
-        .get();
-      if (defaultRow?.value != null) {
-        const parsedDefault = parseJsonSafe(defaultRow.value, defaultRow.value);
-        const cleanDefault = String(parsedDefault ?? '').trim();
-        if (cleanDefault) {
-          sourceDefaultModel = cleanDefault;
-          targetPool.setDefaultModel(cleanDefault);
-        }
       }
+    } finally {
+      srcDb.close();
     }
-  } finally {
-    srcDb.close();
+  }
+
+  if (accountsCloned === 0 && hasEnvFallback) {
+    const envAccounts = cloneFromProviderEnvFallback({
+      sourceDataDir,
+      targetPool,
+      model,
+      env,
+    });
+    for (const acc of envAccounts) {
+      clonedAccountIds.add(acc.id);
+      clonedAccounts.push(acc);
+      accountsCloned += 1;
+    }
   }
 
   const cleanRequestedModel = typeof model === 'string' && model.trim() ? model.trim() : null;

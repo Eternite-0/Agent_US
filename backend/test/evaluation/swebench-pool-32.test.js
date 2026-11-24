@@ -76,6 +76,17 @@ describe('SWE-bench Pool, Provider Inference & Supervisor Decoupling (WP3)', () 
       resolveAppDataDir(explicitDir, { repoRoot, env: { BACKEND_DATA: envDataDir } }),
       explicitDir,
     );
+
+    // %APPDATA%/agent-us-desktop/backend-var fallback when repo dirs are empty
+    const emptyRepoRoot = makeTmp('swe-empty-repo-');
+    const appDataBase = makeTmp('swe-appdata-base-');
+    const desktopVar = join(appDataBase, 'agent-us-desktop', 'backend-var');
+    mkdirSync(desktopVar, { recursive: true });
+    writeFileSync(join(desktopVar, 'engine.sqlite'), '', 'utf8');
+    assert.equal(
+      resolveAppDataDir(null, { repoRoot: emptyRepoRoot, env: { APPDATA: appDataBase } }),
+      desktopVar,
+    );
   });
 
   test('loadAppPoolReadOnly clones enabled accounts, native sessions, pool_models, mappings, and default_model read-only', () => {
@@ -231,6 +242,49 @@ describe('SWE-bench Pool, Provider Inference & Supervisor Decoupling (WP3)', () 
       const routes = dstPool.resolveRoutes('claude-sonnet-4-5');
       assert.equal(routes[0].apiKey, 'sk-ant-master-999');
       assert.equal(routes[0].protocol, 'anthropic');
+    } finally {
+      dstStore.close();
+    }
+  });
+
+  test('loadAppPoolReadOnly falls back to read-only .provider-env.json when provider_accounts has 0 enabled rows', () => {
+    const srcDir = makeTmp('swe-env-fallback-src-');
+    const dstDir = makeTmp('swe-env-fallback-dst-');
+
+    // Create empty DB (0 enabled accounts) + .provider-env.json
+    const srcStore = new Store(join(srcDir, 'engine.sqlite'));
+    const srcPool = new AccountPool(srcStore, { root: srcDir });
+    srcPool.createAccount({
+      preset: 'openai',
+      label: 'Disabled',
+      enabled: false,
+      credential: 'sk-disabled',
+      models: ['gpt-4o'],
+    });
+    srcStore.close();
+
+    writeFileSync(
+      join(srcDir, '.provider-env.json'),
+      JSON.stringify({ DEEPSEEK_API_KEY: 'sk-provider-env-deepseek' }),
+      'utf8',
+    );
+
+    const dstStore = new Store(join(dstDir, 'swebench.sqlite'));
+    const dstPool = new AccountPool(dstStore, { root: dstDir });
+    try {
+      const cloned = loadAppPoolReadOnly({
+        explicitDir: srcDir,
+        targetStore: dstStore,
+        targetPool: dstPool,
+        model: 'deepseek-reasoner',
+      });
+      assert.equal(cloned.accountsCloned, 1);
+      assert.equal(cloned.defaultModel, 'deepseek-reasoner');
+      assert.ok(cloned.availableModels.includes('deepseek-chat'));
+      const routes = dstPool.resolveRoutes('deepseek-reasoner');
+      assert.equal(routes.length, 1);
+      assert.equal(routes[0].apiKey, 'sk-provider-env-deepseek');
+      assert.equal(routes[0].endpoint, 'https://api.deepseek.com/v1');
     } finally {
       dstStore.close();
     }
