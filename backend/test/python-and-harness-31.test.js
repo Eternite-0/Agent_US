@@ -358,6 +358,32 @@ test('WP5.2 test diagnostics: pytest pass/fail, -k filter, auto mode, collection
       testPattern: 'test_ok',
     });
     assert.equal(utFiltered.ok, true);
+
+    const { root: pyStyleRoot, put: putPyStyle } = createTempWorkspace(t, 'py-ut-pytest-style-');
+    putPyStyle('tests/test_standalone.py', 'def test_standalone():\n    assert True\n');
+    const utPyStyleRes = runDiagnostics(pyStyleRoot, { kind: 'test' });
+    assert.equal(utPyStyleRes.ok, false);
+    const pyUnavailableDiag = utPyStyleRes.diagnostics.find((d) => d.code === 'PYTEST_UNAVAILABLE');
+    assert.ok(pyUnavailableDiag, 'expected PYTEST_UNAVAILABLE diagnostic');
+    assert.equal(pyUnavailableDiag.code, 'PYTEST_UNAVAILABLE');
+    assert.equal(pyUnavailableDiag.source, 'unittest');
+    assert.equal(pyUnavailableDiag.file, 'tests/test_standalone.py');
+    assert.equal(pyUnavailableDiag.line, 1);
+    assert.match(
+      pyUnavailableDiag.message,
+      /Ran 0 tests|PYTEST_UNAVAILABLE: unittest discovered 0 tests for pytest-style functions/,
+    );
+
+    const utFilteredEmpty = runDiagnostics(utRoot, {
+      kind: 'test',
+      paths: ['tests'],
+      testPattern: 'nonexistent_case_xyz',
+    });
+    assert.equal(
+      utFilteredEmpty.diagnostics.some((d) => d.code === 'PYTEST_UNAVAILABLE'),
+      false,
+      'unittest.TestCase methods must never false-trigger PYTEST_UNAVAILABLE',
+    );
   } finally {
     process.env.PATH = prevPath;
   }

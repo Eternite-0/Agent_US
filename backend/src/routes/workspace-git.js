@@ -386,14 +386,28 @@ export async function stageGitPaths(cwd, { paths = null, all = false } = {}) {
     const candidates = [...new Set([...changes.unstaged.map((c) => c.path), ...changes.untracked.map((c) => c.path)])];
     const safePaths = [];
     const sensitivePaths = [];
+    const skippedInvalidPaths = [];
     for (const rel of candidates) {
-      if (isSensitiveGitPath(rel)) sensitivePaths.push(rel);
-      else safePaths.push(rel);
+      let confinedRel;
+      try {
+        confinedRel = confineGitPath(cwd, rel).rel;
+      } catch (err) {
+        if (err?.code === 'GIT_INVALID_PATH') {
+          skippedInvalidPaths.push(rel);
+          continue;
+        }
+        throw err;
+      }
+      if (isSensitiveGitPath(confinedRel)) sensitivePaths.push(confinedRel);
+      else safePaths.push(confinedRel);
     }
     if (safePaths.length === 0 && sensitivePaths.length > 0) {
       throw fault('GIT_SENSITIVE_FILE_BLOCKED', 400, `禁止暂存敏感文件: ${sensitivePaths.join(', ')}`, {
         blockedSensitive: sensitivePaths,
       });
+    }
+    if (safePaths.length === 0) {
+      return { ok: true, ...(await getGitChangesFor(cwd)) };
     }
     for (const chunk of chunkItems(safePaths)) {
       await git(cwd, ['add', '--', ...chunk]);
