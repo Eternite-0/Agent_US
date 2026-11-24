@@ -7,6 +7,7 @@ import { CommunicationValidationError, CommunicationStateError } from '../commun
 import { classifyTrafficSource } from '../observability/trace.js';
 import { intersectPolicies } from '../tools/policy.js';
 import { ContextSupervisor } from '../context/supervisor.js';
+import { loadLatestAciAblationSummary } from '../evaluation/service.js';
 
 function sameWorkspacePath(a, b) {
   if (!a || !b) return false;
@@ -50,6 +51,7 @@ export function registerIntelligenceRoutes(app, {
   directAgent = null,
   pool = null,
   store = null,
+  aciEvidenceDir = null,
 } = {}) {
   const effectiveReplanner = replanner ?? new AdaptiveReplanner({ planner });
   const effectivePool = pool ?? directAgent?.pool ?? null;
@@ -94,6 +96,16 @@ export function registerIntelligenceRoutes(app, {
       candidate: candidate.score ?? null,
       ...compareRegression(baseline, candidate),
     };
+  });
+
+  app.get('/v1/evaluations/aci-ablation', async () => {
+    if (aciEvidenceDir) {
+      return loadLatestAciAblationSummary({ evidenceDir: aciEvidenceDir });
+    }
+    if (typeof evaluation?.getAciAblationSummary === 'function') {
+      return evaluation.getAciAblationSummary();
+    }
+    return loadLatestAciAblationSummary();
   });
 
   app.post('/v1/evaluations', async (req) => {

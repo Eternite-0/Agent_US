@@ -879,7 +879,7 @@ async function runDeterministicArmTrial({ task, armName, armRuntime, rep, judgeS
       if (tool === 'bash') {
         return { allowed: allowedBashCmds.has(String(args?.command ?? '').trim()), argsDigest };
       }
-      if (['write_file', 'edit_file', 'apply_patch'].includes(tool)) {
+      if (['write_file', 'edit_file', 'apply_patch', 'read_file', 'query_symbol_graph', 'run_diagnostics'].includes(tool)) {
         return { allowed: true, argsDigest };
       }
       return { allowed: false, argsDigest };
@@ -1047,6 +1047,8 @@ function buildSafeArgsSummary(toolName, args) {
     raw = String(args.command ?? '');
   } else if (['write_file', 'edit_file', 'read_file'].includes(toolName)) {
     raw = String(args.path ?? args.filePath ?? '');
+  } else if (toolName === 'query_symbol_graph' || toolName === 'run_diagnostics') {
+    raw = String(args.symbol ?? args.path ?? args.filePath ?? '');
   } else if (toolName === 'apply_patch') {
     const patchText = String(args.patch ?? args.patchText ?? args.input ?? '');
     try {
@@ -1120,6 +1122,10 @@ export function authorizeRealBenchmarkApproval({
   for (const p of protectedSet ?? []) {
     const norm = normalizeRelativeRepoPath(String(p ?? ''));
     if (norm) normProtected.add(norm);
+  }
+
+  if (tool === 'query_symbol_graph' || tool === 'run_diagnostics') {
+    return true;
   }
 
   if (tool === 'write_file' || tool === 'edit_file') {
