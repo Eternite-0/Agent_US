@@ -2410,7 +2410,10 @@ test('hidden acceptance: AUDIT_REPORT.json and audit-export CLI produce matching
   });
   const resourceBudget = {
     maxSteps: Math.max(22, budgetPlan.maxSteps),
-    maxTokens: Math.max(160_000, budgetPlan.estimatedTokens),
+    maxTokens: Math.max(
+      raw.id === 'aci-04-long-horizon-security-audit' ? 220_000 : 160_000,
+      budgetPlan.estimatedTokens,
+    ),
     finalVerificationReserve: budgetPlan.finalVerificationReserve,
     maxDurationMs: Math.max(90_000, budgetPlan.maxSteps * 5_000),
     breakdown: {

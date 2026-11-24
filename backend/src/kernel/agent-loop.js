@@ -898,7 +898,12 @@ export class AgentLoop {
                   compressRefs,
                   activeMutationTargets,
                 });
-                if (compResult?.triggered && compResult.pairClosedValid !== false && Array.isArray(compResult.messages)) {
+                if (
+                  compResult?.triggered &&
+                  compResult.compressedCount > 0 &&
+                  compResult.pairClosedValid !== false &&
+                  Array.isArray(compResult.messages)
+                ) {
                   messages = [...compResult.messages];
                   requestOptions = { ...requestOptions, messages };
                   this.eventRouter.emitPersisted({

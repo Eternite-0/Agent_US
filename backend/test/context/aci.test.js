@@ -36,6 +36,7 @@ import {
 } from '../../src/context/aci-engine.js';
 import {
   ContextSupervisor,
+  DEFAULT_ACI_SUPERVISOR_CONFIG,
 } from '../../src/context/supervisor.js';
 import { registerIntelligenceRoutes } from '../../src/routes/intelligence-routes.js';
 
@@ -1261,4 +1262,197 @@ test('Stage 4: adaptive_single_step DTOC preserves short-task KV cache at tokens
   } finally {
     store.close();
   }
+});
+
+test('Stage 4 calibration: ACI-SKIP stubs, json_key outline + >2600 CONTRACT.json SUPPORTING, mixed grep decoy, one-shot emergencyUsed, and supervisor stream usage dedupe', async (t) => {
+  assert.equal(DEFAULT_ACI_SUPERVISOR_CONFIG.timeoutMs, 25000);
+
+  await makeTempPool(t, async ({ store, pool }) => {
+    pool.createAccount({
+      preset: 'deepseek',
+      apiKey: 'sk-test-placeholder-1234567890',
+      models: ['main-model', 'calib-flash-model'],
+    });
+    pool.setDefaultModel('calib-flash-model');
+
+    const aciStore = new ReversibleContextStore(store);
+    const ledger = new ContextEvidenceLedger();
+
+    // (a) ACI-SKIP stubs omit expand_context bait on IRRELEVANT & DUPLICATE while preserving ACI-REF on DEFER/SUPPORTING
+    const sampleRef = aciStore.put('export const a = 1;\n', {
+      path: 'src/noise.js',
+      toolName: 'read_file',
+      lineRange: 'L1-2',
+      symbolOutline: ['a@L1'],
+      step: 1,
+    });
+    const irrStd = formatAciRefStub(sampleRef, { decision: 'IRRELEVANT' });
+    const irrCmp = formatAciRefStub(sampleRef, { decision: 'IRRELEVANT', compact: true });
+    assert.ok(irrStd.startsWith('[ACI-SKIP '));
+    assert.ok(irrCmp.startsWith('[ACI-SKIP '));
+    assert.ok(!irrStd.includes('expand_context'));
+    assert.ok(!irrCmp.includes('expand_context'));
+
+    const dupStd = formatAciRefStub(sampleRef, { decision: 'DUPLICATE', priorStep: 3 });
+    const dupCmp = formatAciRefStub(sampleRef, { decision: 'DUPLICATE', priorStep: 3, compact: true });
+    assert.ok(dupStd.startsWith('[ACI-SKIP '));
+    assert.ok(dupCmp.startsWith('[ACI-SKIP '));
+    assert.ok(dupStd.includes('prior step=3'));
+    assert.ok(dupCmp.includes('prior step=3'));
+    assert.ok(!dupStd.includes('expand_context'));
+    assert.ok(!dupCmp.includes('expand_context'));
+
+    const defStub = formatAciRefStub(sampleRef, { decision: 'DEFER' });
+    const supStub = formatAciRefStub(sampleRef, { decision: 'SUPPORTING' });
+    assert.ok(defStub.startsWith('[ACI-REF '));
+    assert.ok(defStub.includes('expand_context('));
+    assert.ok(supStub.startsWith('[ACI-REF '));
+    assert.ok(supStub.includes('expand_context('));
+
+    // (b) JSON key outline extraction + >2600 prompt-cited CONTRACT.json enters SUPPORTING with compressed body & verbatim recovery
+    // (e) Multiple usage chunks across distinct usageRequestId values must NOT multiply inputTokens
+    let observedSupTokens = null;
+    const calibAdapter = {
+      async *stream(opts) {
+        const payload = JSON.parse(opts.messages[0].content[0].text);
+        const decisions = payload.candidates.map((c) => ({
+          id: c.id,
+          // Supervisor attempts IRRELEVANT on CONTRACT.json -> Critical Guardrail clamps to SUPPORTING
+          decision: 'IRRELEVANT',
+          focusSymbols: ['precedence', 'normalizationRules'],
+          reason: 'calibration test',
+        }));
+        for (let idx = 0; idx < 4; idx += 1) {
+          yield {
+            type: 'usage',
+            usageRequestId: `sup-chunk-${idx}`,
+            usage: { inputTokens: 756, outputTokens: 80 + idx * 15 },
+          };
+        }
+        yield { type: 'text-delta', text: JSON.stringify({ decisions, contractHints: [] }) };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+    const supervisor = new ContextSupervisor({ store, pool, adapter: calibAdapter });
+    const controller = new PreInjectionAdmissionController({ aciStore, ledger });
+
+    const contractObj = {
+      contractVersion: '2.4.0',
+      precedence: ['schema', 'normalizer', 'overrides', 'defaults'],
+      normalizationRules: Array.from({ length: 35 }, (_, i) => ({
+        ruleId: `rule_${i}`,
+        field: `field_${i}`,
+        description: `Deterministic normalization step ${i} requiring exact precedence order`,
+      })),
+    };
+    const contractText = JSON.stringify(contractObj, null, 2);
+    assert.ok(contractText.length > 2600);
+    const shortSpec = '# SPEC\nKeep normalizer precedence.\n' + '- Rule item\n'.repeat(120); // ~1850 chars <= 2600
+    assert.ok(shortSpec.length <= 2600);
+
+    const wrap = (seq, body) =>
+      `<untrusted id="deadbeef000011112222333344445555-tool-read_file-${seq}" bytes="${Buffer.byteLength(body, 'utf8')}">${body}</untrusted id="deadbeef000011112222333344445555-tool-read_file-${seq}">`;
+
+    const admitRes = await controller.admitBatch(
+      [
+        {
+          tc: { id: 'tc-spec', name: 'read_file', arguments: JSON.stringify({ path: 'SPEC.md' }) },
+          parsedArgs: { path: 'SPEC.md' },
+          output: wrap(1, shortSpec),
+          isError: false,
+        },
+        {
+          tc: { id: 'tc-contract', name: 'read_file', arguments: JSON.stringify({ path: 'CONTRACT.json' }) },
+          parsedArgs: { path: 'CONTRACT.json' },
+          output: wrap(2, contractText),
+          isError: false,
+        },
+      ],
+      { query: 'Update CONTRACT.json precedence per SPEC.md', step: 1, supervisor, supervisorEnabled: true },
+    );
+
+    const byId = Object.fromEntries(admitRes.admittedItems.map((it) => [it.tc.id, it]));
+    assert.equal(byId['tc-spec'].admission.decision, ADMISSION_DECISIONS.DIRECT);
+    assert.equal(byId['tc-contract'].admission.decision, ADMISSION_DECISIONS.SUPPORTING);
+    assert.match(byId['tc-contract'].admittedOutput, /\[json_key\]/);
+    assert.match(byId['tc-contract'].admittedOutput, /Expand omitted lines: expand_context\(/);
+    assert.ok(byId['tc-contract'].admittedOutput.length < wrap(2, contractText).length);
+
+    const uriMatch = byId['tc-contract'].admittedOutput.match(/artifact:\/\/[0-9a-f]{64}/);
+    assert.ok(uriMatch);
+    const restored = aciStore.restoreVerified(uriMatch[0]);
+    assert.equal(restored.verified, true);
+    assert.ok(restored.content.includes('"contractVersion": "2.4.0"'));
+
+    observedSupTokens = ledger.supervisorCalls[0];
+    assert.equal(observedSupTokens.inputTokens, 756, 'must deduplicate cumulative usage across usageRequestId chunks');
+    assert.equal(observedSupTokens.outputTokens, 125);
+    assert.equal(observedSupTokens.totalTokens, 881);
+
+    // (c) Mixed active+legacy grep: output must not be marked decoy; pure legacy grep: output is decoy
+    assert.equal(
+      isDecoyCue(
+        'grep:precedence',
+        'src/pipeline/normalizer.js:12: const precedence = [];\nsrc/legacy/v0-normalizer.js:4: // @deprecated',
+      ),
+      false,
+    );
+    assert.equal(
+      isDecoyCue(
+        'grep:legacy',
+        'src/legacy/v0-normalizer.js:4: // @deprecated\nsrc/v1-compat/shim.js:2: // legacy fallback',
+      ),
+      true,
+    );
+    assert.equal(isDecoyCue('glob:**/*.js', '   \n  '), false);
+
+    // (d) One-shot emergencyUsed prevents consecutive-step emergency_budget thrashing,
+    // and 0-compressed compressMessagesEpoch preserves epochCount while marking emergencyUsed
+    const mediumTool = 'export const medItem = "medium chunk data for emergency budget test";\n'.repeat(800);
+    const emergencyMsgs = [
+      { role: 'system', content: [{ type: 'text', text: 'static system prompt' }] },
+      { role: 'user', content: [{ type: 'text', text: 'check medium file' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm1', name: 'read_file', arguments: JSON.stringify({ path: 'src/med.js' }) }] },
+      { role: 'tool', toolCallId: 'm1', content: [{ type: 'text', text: mediumTool }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm2', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm2', content: [{ type: 'text', text: 'src/med.js' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm3', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm3', content: [{ type: 'text', text: 'package.json' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'm4', name: 'glob', arguments: '{"pattern":"*"}' }] },
+      { role: 'tool', toolCallId: 'm4', content: [{ type: 'text', text: 'README.md' }] },
+    ];
+    const emEngine = new ACIEngine({
+      store,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      singleStepBudget: 50000,
+    });
+    const comp1 = emEngine.compress(emergencyMsgs, { cumulativeUsedTokens: 135000 });
+    assert.equal(comp1.triggered, true);
+    assert.equal(comp1.reason, 'emergency_budget');
+    assert.equal(comp1.epoch, 1);
+    assert.equal(emEngine.epochState.emergencyUsed, true);
+
+    const probe2 = emEngine.inspectEpoch(emergencyMsgs, { cumulativeUsedTokens: 138000 });
+    assert.equal(probe2.emergencyTriggered, false);
+    assert.equal(probe2.triggered, false);
+
+    // 0-eligible emergency compress leaves epochCount=0 while setting emergencyUsed=true
+    const emptyComp = compressMessagesEpoch(emergencyMsgs, {
+      aciStore,
+      ledger,
+      maxTotalTokens: 160000,
+      contextWindow: 128000,
+      singleStepBudget: 50000,
+      cumulativeUsedTokens: 135000,
+      minAgeSteps: 99,
+      supersededMinAgeSteps: 99,
+      epochState: { lastWatermark: -1, epochCount: 0, emergencyUsed: false },
+    });
+    assert.equal(emptyComp.triggered, true);
+    assert.equal(emptyComp.compressedCount, 0);
+    assert.equal(emptyComp.epoch, 0);
+    assert.equal(emptyComp.epochState.epochCount, 0);
+    assert.equal(emptyComp.epochState.emergencyUsed, true);
+  });
 });

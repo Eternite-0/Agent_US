@@ -55,6 +55,10 @@ export function detectLanguageFromPath(filePath) {
   return null;
 }
 
+function isAciStubText(text) {
+  return typeof text === 'string' && (text.startsWith('[ACI-REF ') || text.startsWith('[ACI-SKIP '));
+}
+
 function tokenizeIdentifiers(text) {
   const tokens = new Set();
   const matches = String(text ?? '').match(/[A-Za-z_$][A-Za-z0-9_$]{2,}/g) ?? [];
@@ -330,7 +334,7 @@ function extractLocalContextCoverage(localContextMessages = [], activeDiff = '',
         : typeof m?.text === 'string'
           ? m.text
           : '';
-    if (!text || text.startsWith('[ACI-REF ')) continue;
+    if (!text || isAciStubText(text)) continue;
     if (m?.path) {
       for (const def of extractSymbolsFromText(m.path, text).definitions) {
         symbols.add(def.shortName || def.name);
@@ -789,7 +793,12 @@ function computeEpochTriggerState(
       }
     }
     const emergencyGate = Math.min(12000, Math.floor(contextWindow * 0.2));
-    if (hasCumulative && maxTotalTokens > 0 && tokensBefore >= emergencyGate) {
+    if (
+      !epochState?.emergencyUsed &&
+      hasCumulative &&
+      maxTotalTokens > 0 &&
+      tokensBefore >= emergencyGate
+    ) {
       const remainingBudget = Math.max(0, maxTotalTokens - usedCumulative);
       if (remainingBudget <= 2.5 * tokensBefore) {
         emergencyTriggered = true;
@@ -884,7 +893,7 @@ export function evaluateToolMessageEligibility(
     (b) => b?.type === 'text' && typeof b.text === 'string',
   );
   const rawText = textBlocks.map((b) => b.text).join('\n');
-  if (!rawText || rawText.startsWith('[ACI-REF ')) {
+  if (!rawText || isAciStubText(rawText)) {
     return { eligible: false, skipReason: 'empty_or_stub' };
   }
 
@@ -1105,7 +1114,11 @@ export function compressMessagesEpoch(
       compressedRefs: [],
       messages: srcMessages,
       pairClosedValid: pairClosed(srcMessages, 0, Math.max(0, srcMessages.length - 1)),
-      epochState: { lastWatermark: prevWatermark, epochCount: prevEpochCount },
+      epochState: {
+        lastWatermark: prevWatermark,
+        epochCount: prevEpochCount,
+        emergencyUsed: Boolean(epochState?.emergencyUsed),
+      },
     };
   }
 
@@ -1204,9 +1217,11 @@ export function compressMessagesEpoch(
     messages: outMessages,
   }).totalTokens;
 
+  const effectiveEpochCount = compressedRefs.length > 0 ? nextEpoch : prevEpochCount;
   const nextState = {
     lastWatermark: Math.max(prevWatermark, highestCrossedWatermark),
-    epochCount: nextEpoch,
+    epochCount: effectiveEpochCount,
+    emergencyUsed: Boolean(epochState?.emergencyUsed || emergencyTriggered),
   };
 
   return {
@@ -1217,7 +1232,7 @@ export function compressMessagesEpoch(
         ? 'single_step_budget'
         : 'emergency_budget',
     dtocPolicy: trigger.dtocPolicy,
-    epoch: nextEpoch,
+    epoch: effectiveEpochCount,
     watermark: highestCrossedWatermark,
     lastWatermark: nextState.lastWatermark,
     ratio,
@@ -1508,7 +1523,7 @@ export class ACIEngine {
       Number(maxSupervisorAdmissionCalls ?? DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS),
     );
     this.weights = { ...DEFAULT_ACI_WEIGHTS, ...weights };
-    this.epochState = { lastWatermark: -1, epochCount: 0 };
+    this.epochState = { lastWatermark: -1, epochCount: 0, emergencyUsed: false };
     this.admissionController = new PreInjectionAdmissionController({
       aciStore: this.aciStore,
       ledger: this.ledger,

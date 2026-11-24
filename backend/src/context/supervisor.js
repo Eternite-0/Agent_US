@@ -12,7 +12,7 @@ export const DEFAULT_ACI_SUPERVISOR_CONFIG = Object.freeze({
   maxBudgetRatio: 0.72,
   epochWatermarks: [0.6, 0.82],
   maxOutputTokens: 1200,
-  timeoutMs: 12000,
+  timeoutMs: 25000,
   admissionEnabled: true,
   dtocMinPromptTokens: 24000,
 });
@@ -48,6 +48,7 @@ const ADMISSION_SUPERVISOR_SYSTEM_PROMPT = [
   'Classify each ambiguous candidate output into one of:',
   '  DIRECT (keep verbatim), SUPPORTING (focused hunks + outline), DEFER (imports + symbol line map + restore ref), DUPLICATE (unchanged duplicate stub), IRRELEVANT (1-line stub).',
   'Never drop prompt-cited, error-trace, active-mutation, or genuine auth/permission/persistence/contract/hidden_acceptance files as IRRELEVANT.',
+  'For large (>2600 chars) multi-section active/config/contract files, prefer SUPPORTING (with key focusSymbols) or DEFER over DIRECT unless every line is immediately required; reserve IRRELEVANT strictly for unrelated/legacy/archived/sample decoys.',
   'Reject legacy/deprecated/archive/changelog/fixture/sample/mock-data decoys unless explicitly targeted.',
   'Return ONLY valid JSON with shape:',
   '  { "decisions": [{ "id": string, "decision": "DIRECT"|"SUPPORTING"|"DEFER"|"DUPLICATE"|"IRRELEVANT", "focusSymbols": string[], "reason": string }], "contractHints": string[] }',
@@ -437,7 +438,6 @@ export class ContextSupervisor {
 
     let rawOutput = '';
     const usage = { inputTokens: 0, outputTokens: 0 };
-    const usageByRequest = new Map();
 
     const finalizeUsage = () => {
       const hasReportedIn = usage.inputTokens > 0;
@@ -481,15 +481,7 @@ export class ContextSupervisor {
           throw new Error('Read-only supervisor attempted tool invocation');
         }
         if (chunk?.type === 'usage' && chunk.usage) {
-          const key = chunk.usageRequestId ?? '';
-          const previous = usageByRequest.get(key) ?? {};
-          const next = mergeUsageSnapshot({ ...previous }, chunk.usage);
-          for (const field of ['inputTokens', 'outputTokens']) {
-            if (next[field] != null) {
-              usage[field] = (usage[field] ?? 0) + next[field] - (previous[field] ?? 0);
-            }
-          }
-          usageByRequest.set(key, next);
+          Object.assign(usage, mergeUsageSnapshot({ ...usage }, chunk.usage));
         } else if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
           rawOutput += chunk.text;
         } else if (

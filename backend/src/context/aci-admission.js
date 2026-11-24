@@ -233,7 +233,9 @@ function extractStructure(filePath, codeText, startLineOffset = 1) {
     }
   }
 
-  if (definitions.length === 0) {
+  const isJsonLike =
+    String(filePath || '').toLowerCase().endsWith('.json') || /^\s*[\[{]/.test(raw);
+  if (definitions.length === 0 && !isJsonLike) {
     for (let i = 0; i < allLines.length; i += 1) {
       const hm = allLines[i].match(/^#{1,4}\s+(.+)$/);
       if (hm?.[1]) {
@@ -243,6 +245,20 @@ function extractStructure(filePath, codeText, startLineOffset = 1) {
           kind: 'heading',
           line: startLineOffset + i,
         });
+      }
+    }
+  }
+  if (definitions.length === 0) {
+    for (let i = 0; i < allLines.length; i += 1) {
+      const jm = allLines[i].match(/^\s{0,2}"([A-Za-z0-9_$-]{2,50})"\s*:/);
+      if (jm?.[1]) {
+        definitions.push({
+          name: jm[1],
+          shortName: jm[1],
+          kind: 'json_key',
+          line: startLineOffset + i,
+        });
+        if (definitions.length >= 24) break;
       }
     }
   }
@@ -313,10 +329,17 @@ function buildLineRangeLabel(args, parsedRead, innerText) {
  */
 export function isDecoyCue(path = '', content = '') {
   const normPath = String(path || '').replace(/\\/g, '/');
+  const headLines = String(content ?? '').split(/\r?\n/).slice(0, 16);
+  if (normPath.startsWith('grep:') || normPath.startsWith('glob:')) {
+    const nonEmpty = headLines.map((l) => l.trim()).filter(Boolean);
+    return (
+      nonEmpty.length > 0 &&
+      nonEmpty.every((line) => DECOY_CUE_RE.test(line) || DECOY_CONTENT_LINE_RE.test(line))
+    );
+  }
   if (normPath && DECOY_CUE_RE.test(normPath)) {
     return true;
   }
-  const headLines = String(content ?? '').split(/\r?\n/).slice(0, 16);
   for (const line of headLines) {
     if (DECOY_CONTENT_LINE_RE.test(line)) {
       return true;
@@ -511,12 +534,19 @@ function renderProgressivePayload({
 
   // SUPPORTING
   const header = formatAciRefStub(ref, { decision: ADMISSION_DECISIONS.SUPPORTING });
-  const maxBodyBudget = Math.max(240, Math.min(3200, originalLen - header.length - 120));
+  const maxBodyBudget = Math.max(
+    240,
+    Math.min(2000, Math.floor(originalLen * 0.55), originalLen - header.length - 120),
+  );
+  const restoreFooter = `Expand omitted lines: expand_context({ ref: "${ref.uri}", startLine, endLine })`;
   const outlineLines = structure.definitions
     .slice(0, 20)
     .map((d) => `L${d.line}: [${d.kind}] ${d.name}`);
   const outlineBlock = outlineLines.length ? `Outline:\n${outlineLines.join('\n')}` : '';
-  const hunkBudget = Math.max(160, maxBodyBudget - outlineBlock.length - 80);
+  const hunkBudget = Math.max(
+    160,
+    maxBodyBudget - outlineBlock.length - restoreFooter.length - 80,
+  );
   const hunks = buildFocusedHunks({
     lines,
     startLineOffset,
@@ -525,7 +555,7 @@ function renderProgressivePayload({
     contextLines: 6,
     maxChars: hunkBudget,
   });
-  const body = [outlineBlock, hunks ? `Focused Hunks:\n${hunks}` : '']
+  const body = [outlineBlock, hunks ? `Focused Hunks:\n${hunks}` : '', restoreFooter]
     .filter(Boolean)
     .join('\n\n');
   const fullRendered = wrapIfNeeded(header, body);
@@ -540,11 +570,19 @@ function renderProgressivePayload({
     needles: focusSymbols,
     definitions: structure.definitions,
     contextLines: 3,
-    maxChars: Math.max(120, Math.floor((originalLen - header.length - 80) * 0.7)),
+    maxChars: Math.max(
+      120,
+      Math.floor((originalLen - header.length - restoreFooter.length - 80) * 0.7),
+    ),
   });
-  const compactRendered = wrapIfNeeded(header, compactHunks);
+  const compactBody = [compactHunks, restoreFooter].filter(Boolean).join('\n\n');
+  const compactRendered = wrapIfNeeded(header, compactBody);
   if (compactRendered.length < originalLen) {
     return { text: compactRendered, decision };
+  }
+  const compactHunkOnly = wrapIfNeeded(header, compactHunks);
+  if (compactHunkOnly.length < originalLen) {
+    return { text: compactHunkOnly, decision };
   }
   if (header.length < originalLen) {
     return { text: header, decision };
@@ -893,9 +931,9 @@ export class PreInjectionAdmissionController {
           ctxRecord.priorStep = dupMatch.step ?? 0;
           ctxRecord.reason = `duplicate_unchanged_step_${ctxRecord.priorStep}`;
         } else if (
-          (promptTarget && !domainInfo.isDecoy && (innerText.length <= 6000 || domainInfo.isCritical)) ||
+          (promptTarget && !domainInfo.isDecoy && innerText.length <= 2600) ||
           ((errorTarget || mutatedTarget) && innerText.length <= 6000) ||
-          (score > 0.72 && innerText.length <= 6000 && !domainInfo.isDecoy)
+          (score > 0.72 && innerText.length <= 2600 && !domainInfo.isDecoy)
         ) {
           ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
           ctxRecord.reason = 'high_signal_direct';
@@ -916,7 +954,7 @@ export class PreInjectionAdmissionController {
           const decoyConflict =
             domainInfo.isDecoy && (domainInfo.rawDomains.length > 0 || querySymbolHits > 0);
           const ambiguousScore = score >= 0.15 && score <= 0.72;
-          const largeMultiSection = innerText.length >= 3600;
+          const largeMultiSection = innerText.length >= 2600;
           if (ambiguousScore || decoyConflict || largeMultiSection) {
             ambiguousQueue.push(ctxRecord);
           } else if (isProtectedCritical || callChainHits > 0 || score >= 0.35) {

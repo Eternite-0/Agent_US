@@ -133,6 +133,16 @@ export function formatAciRefStub(ref, opts = {}) {
     decision === 'DUPLICATE' && priorStep != null && Number.isFinite(Number(priorStep))
       ? ` | prior step=${Number(priorStep)}`
       : '';
+  if (decision === 'IRRELEVANT') {
+    return opts.compact === true
+      ? `[ACI-SKIP ${uri} | IRRELEVANT | ${pathPart} | ~${tok} tok | omitted noise]`
+      : `[ACI-SKIP ${uri} | IRRELEVANT | ${pathPart} | ${linesPart} | ~${tok} tok | omitted: non-target/archived noise — do NOT expand unless explicitly required]`;
+  }
+  if (decision === 'DUPLICATE') {
+    return opts.compact === true
+      ? `[ACI-SKIP ${uri} | DUPLICATE | ${pathPart} | ~${tok} tok${priorPart} | duplicate]`
+      : `[ACI-SKIP ${uri} | DUPLICATE | ${pathPart} | ${linesPart} | ~${tok} tok${priorPart} | already in context — no need to re-read or expand]`;
+  }
   const restoreCall = `expand_context({ ref: "${uri}", startLine, endLine })`;
   if (opts.compact === true) {
     return `[ACI-REF ${uri} | ${decision} | ${pathPart} | ${linesPart} | ~${tok} tok${priorPart} | ${restoreCall}]`;

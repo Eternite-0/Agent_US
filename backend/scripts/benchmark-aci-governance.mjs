@@ -89,6 +89,33 @@ export function resolveArmProfileConfig(arm, { dtocMinPromptTokens = 24000 } = {
   };
 }
 
+export function resolveBenchmarkTaskMaxTokens(task, opts = {}) {
+  return opts?.maxTokens ?? task?.resourceBudget?.maxTokens ?? 160_000;
+}
+
+export function mergeSupervisorCostTelemetry(rawSupCost = {}, wireSup = [], fallbackCalls = 0) {
+  const wireList = Array.isArray(wireSup) ? wireSup : [];
+  const supInput = wireList.reduce((s, r) => s + (Number(r?.inputTokens ?? 0) || 0), 0);
+  const supOutput = wireList.reduce((s, r) => s + (Number(r?.outputTokens ?? 0) || 0), 0);
+  const supMs = wireList.reduce((s, r) => s + (Number(r?.ms ?? 0) || 0), 0);
+
+  const rawCalls = Number(rawSupCost?.calls ?? fallbackCalls ?? 0) || 0;
+  const rawIn = Number(rawSupCost?.inputTokens ?? 0) || 0;
+  const rawOut = Number(rawSupCost?.outputTokens ?? 0) || 0;
+  const rawTotal = Number(rawSupCost?.totalTokens ?? 0) || 0;
+  const rawMs = Number(rawSupCost?.durationMs ?? 0) || 0;
+
+  const calls = Math.max(wireList.length, rawCalls);
+  const preferRaw = rawCalls > wireList.length || rawTotal > supInput + supOutput;
+  const inputTokens = preferRaw ? rawIn : Math.max(supInput, rawIn);
+  const outputTokens = preferRaw ? rawOut : Math.max(supOutput, rawOut);
+  const totalTokens = inputTokens + outputTokens;
+  const durationMs = preferRaw ? rawMs : Math.max(supMs, rawMs);
+  const fallbackCount = Number(rawSupCost?.fallbackCount ?? 0) || 0;
+
+  return { calls, inputTokens, outputTokens, totalTokens, durationMs, fallbackCount };
+}
+
 export function parseAciCliArgs(argv = process.argv.slice(2)) {
   const opts = {
     mode: 'deterministic',
@@ -900,7 +927,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       ledger: aciLedger,
       supervisor,
       contextWindow: 128_000,
-      maxTotalTokens: opts.maxTokens ?? 160_000,
+      maxTotalTokens: resolveBenchmarkTaskMaxTokens(task, opts),
       dtocPolicy: 'adaptive_single_step',
       dtocMinPromptTokens: opts.dtocMinPromptTokens,
     });
@@ -1253,7 +1280,7 @@ async function runRealAciTrial({
 
   try {
     const maxSteps = opts.maxSteps ?? task.resourceBudget?.maxSteps ?? 22;
-    const maxTokens = opts.maxTokens ?? task.resourceBudget?.maxTokens ?? 160_000;
+    const maxTokens = resolveBenchmarkTaskMaxTokens(task, opts);
     const session = direct.createSession({
       workspaceRoot,
       projectId: task.id,
@@ -1367,9 +1394,6 @@ async function runRealAciTrial({
     });
 
     const wireSup = wireRecords.filter((r) => r.isSupervisorCall);
-    const supInput = wireSup.reduce((s, r) => s + r.inputTokens, 0);
-    const supOutput = wireSup.reduce((s, r) => s + r.outputTokens, 0);
-    const supMs = wireSup.reduce((s, r) => s + (r.ms || 0), 0);
 
     let inputTokens = wireRecords.reduce((s, r) => s + r.inputTokens, 0);
     let outputTokens = wireRecords.reduce((s, r) => s + r.outputTokens, 0);
@@ -1385,17 +1409,11 @@ async function runRealAciTrial({
     const rm = diagnostics.reasoningMetrics ?? {};
     const aciMetrics = rm.aciMetrics ?? {};
     const rawSupCost = aciMetrics.supervisorCost ?? {};
-    const supervisorCost = {
-      calls: Math.max(wireSup.length, Number(rawSupCost.calls ?? aciMetrics.supervisorCalls ?? 0)),
-      inputTokens: supInput > 0 ? supInput : Number(rawSupCost.inputTokens ?? 0),
-      outputTokens: supOutput > 0 ? supOutput : Number(rawSupCost.outputTokens ?? 0),
-      totalTokens:
-        supInput + supOutput > 0
-          ? supInput + supOutput
-          : Number(rawSupCost.totalTokens ?? 0),
-      durationMs: supMs > 0 ? supMs : Number(rawSupCost.durationMs ?? 0),
-      fallbackCount: Number(rawSupCost.fallbackCount ?? 0),
-    };
+    const supervisorCost = mergeSupervisorCostTelemetry(
+      rawSupCost,
+      wireSup,
+      aciMetrics.supervisorCalls,
+    );
     const hasLedgerAdmissions = Array.isArray(aciMetrics?.ledger?.admissions) && aciMetrics.ledger.admissions.length > 0;
     const readFallback = extractReadAdmissionsFromTurnData({
       workspaceRoot,

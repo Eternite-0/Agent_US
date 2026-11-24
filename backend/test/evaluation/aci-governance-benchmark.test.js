@@ -37,9 +37,11 @@ import {
 } from '../../src/tools/benchmark-sandbox.js';
 import {
   buildSummaryOutputPath,
+  mergeSupervisorCostTelemetry,
   parseAciCliArgs,
   probeAciRuntimeCapabilities,
   resolveArmProfileConfig,
+  resolveBenchmarkTaskMaxTokens,
   runAciGovernanceBenchmark,
 } from '../../scripts/benchmark-aci-governance.mjs';
 
@@ -740,5 +742,73 @@ describe('Agent_US 2.4 Stage 4 ACI Governance Benchmark Suite', () => {
         }
       }
     }
+  });
+
+  test('Phase 4A calibration: aci-04 uses 220k budget, CLI respects per-task budget unless overridden, and supervisorCost merges wire/ledger cleanly', () => {
+    const dataset = createAciGovernanceDataset();
+    const byId = Object.fromEntries(dataset.map((t) => [t.id, t]));
+    assert.equal(byId['aci-01-auth-tenant-boundary'].resourceBudget.maxTokens, 160_000);
+    assert.equal(byId['aci-02-persistence-wal-ledger'].resourceBudget.maxTokens, 160_000);
+    assert.equal(byId['aci-03-contract-pipeline-refactor'].resourceBudget.maxTokens, 160_000);
+    assert.equal(byId['aci-04-long-horizon-security-audit'].resourceBudget.maxTokens, 220_000);
+
+    const defaultOpts = parseAciCliArgs([]);
+    assert.equal(defaultOpts.maxTokens, null);
+    assert.equal(resolveBenchmarkTaskMaxTokens(byId['aci-04-long-horizon-security-audit'], defaultOpts), 220_000);
+    assert.equal(resolveBenchmarkTaskMaxTokens(byId['aci-01-auth-tenant-boundary'], defaultOpts), 160_000);
+
+    const explicitOpts = parseAciCliArgs(['--max-tokens', '190000']);
+    assert.equal(resolveBenchmarkTaskMaxTokens(byId['aci-04-long-horizon-security-audit'], explicitOpts), 190_000);
+
+    // Case 1: rawSupCost captured calls missing from wireSup -> prefer rawSupCost fields
+    const mergedMissingWire = mergeSupervisorCostTelemetry(
+      { calls: 3, inputTokens: 2900, outputTokens: 1400, totalTokens: 4300, durationMs: 18000, fallbackCount: 1 },
+      [{ inputTokens: 756, outputTokens: 500, ms: 4000 }],
+      3,
+    );
+    assert.deepEqual(mergedMissingWire, {
+      calls: 3,
+      inputTokens: 2900,
+      outputTokens: 1400,
+      totalTokens: 4300,
+      durationMs: 18000,
+      fallbackCount: 1,
+    });
+
+    // Case 2: rawSupCost totalTokens exceeds wireSup even with matching call count -> prefer rawSupCost
+    const mergedHigherRaw = mergeSupervisorCostTelemetry(
+      { calls: 2, inputTokens: 2100, outputTokens: 900, totalTokens: 3000, durationMs: 9500, fallbackCount: 0 },
+      [
+        { inputTokens: 1000, outputTokens: 400, ms: 3000 },
+        { inputTokens: 500, outputTokens: 200, ms: 4000 },
+      ],
+      2,
+    );
+    assert.deepEqual(mergedHigherRaw, {
+      calls: 2,
+      inputTokens: 2100,
+      outputTokens: 900,
+      totalTokens: 3000,
+      durationMs: 9500,
+      fallbackCount: 0,
+    });
+
+    // Case 3: wireSup captures equal or higher tokens -> take Math.max per field
+    const mergedWireMax = mergeSupervisorCostTelemetry(
+      { calls: 2, inputTokens: 1200, outputTokens: 400, totalTokens: 1600, durationMs: 5000, fallbackCount: 0 },
+      [
+        { inputTokens: 700, outputTokens: 250, ms: 3100 },
+        { inputTokens: 600, outputTokens: 200, ms: 2900 },
+      ],
+      2,
+    );
+    assert.deepEqual(mergedWireMax, {
+      calls: 2,
+      inputTokens: 1300,
+      outputTokens: 450,
+      totalTokens: 1750,
+      durationMs: 6000,
+      fallbackCount: 0,
+    });
   });
 });
