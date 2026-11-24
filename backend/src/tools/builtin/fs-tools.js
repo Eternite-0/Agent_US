@@ -12,6 +12,8 @@ import { sha256Hex } from '../../integrity.js';
 import {
   applyCodexPatch,
   applyFuzzyEdit,
+  computeUnifiedDiff,
+  runDiagnostics,
   runQuickDiagnostics,
 } from '../../patch-and-diagnostics.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
@@ -213,10 +215,16 @@ export function createFsTools({
         onBeforeMutate(rel, full);
         writeFileSync(full, applied.after, 'utf8');
         trackFileHash(rel, applied.after);
+        const editDiff = computeUnifiedDiff(rel, before, applied.after, { action: 'updated' });
         onFileChanged({
           path: rel,
           before: Buffer.from(before, 'utf8').toString('base64'),
           after: Buffer.from(applied.after, 'utf8').toString('base64'),
+          action: 'updated',
+          unifiedDiff: editDiff.unifiedDiff,
+          additions: editDiff.additions,
+          deletions: editDiff.deletions,
+          sha256After: sha256Hex(applied.after),
         });
         const hookNotice = notifyIfHookConfig(rel, full, 'edit_file', 'edit');
         const diag = runQuickDiagnostics(full, rel);
@@ -250,10 +258,17 @@ export function createFsTools({
         mkdirSync(dirname(full), { recursive: true });
         writeFileSync(full, content, 'utf8');
         trackFileHash(rel, content);
+        const writeAction = existed ? 'updated' : 'added';
+        const writeDiff = computeUnifiedDiff(rel, before, content, { action: writeAction });
         onFileChanged({
           path: rel,
           before: before !== null ? Buffer.from(before, 'utf8').toString('base64') : null,
           after: Buffer.from(content, 'utf8').toString('base64'),
+          action: writeAction,
+          unifiedDiff: writeDiff.unifiedDiff,
+          additions: writeDiff.additions,
+          deletions: writeDiff.deletions,
+          sha256After: sha256Hex(content),
         });
         const hookNotice = notifyIfHookConfig(rel, full, 'write_file', existed ? 'overwrite' : 'create');
         const diag = runQuickDiagnostics(full, rel);
@@ -263,14 +278,27 @@ export function createFsTools({
 
     defineTool({
       name: 'apply_patch',
+      serializeZodSchema: false,
       description:
-        'Codex 风格多文件原子补丁工具：在一次调用中原子完成多处编辑、新建、移动与删除。格式：`*** Begin Patch` / `*** Update File: <path>` / `*** Add File: <path>` / `*** Delete File: <path>` / `@@ <context>` / `+`/`-`/` ` 行 / `*** End Patch`。',
+        '高精度多文件原子补丁工具（修改已有文件优先使用）：同时透明支持 Codex 补丁（`*** Begin Patch`...`*** End Patch`）与标准 unified diff（`--- a/...`/`+++ b/...`/`@@ ... @@`），支持 `expectedHashes` 乐观并发锁与提交前 JS/JSON 语法校验，并返回紧凑 diff 摘要与新 SHA-256。',
       effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
       riskLevel: RISK_LEVELS.MEDIUM,
       replayable: true,
       outward: false,
       zodSchema: z.object({
-        patch: z.string().min(1).describe('完整 Codex 补丁文本'),
+        patch: z.string().min(1).describe('完整补丁文本（Codex 格式或标准 unified diff）'),
+        format: z
+          .enum(['auto', 'codex', 'unified'])
+          .optional()
+          .describe('补丁格式（默认 auto 自动识别）'),
+        expectedHashes: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe('可选：按相对路径指定的期望 SHA-256 哈希映射，不匹配时原子拒绝并返回 OPTIMISTIC_LOCK_CONFLICT'),
+        allowSyntaxError: z
+          .boolean()
+          .optional()
+          .describe('是否允许写入存在语法错误的 JS/JSON 文件（默认 false，提交前校验失败原子拒绝）'),
       }),
       async execute(args, ctx) {
         const patch = String(args.patch ?? '');
@@ -279,23 +307,91 @@ export function createFsTools({
         const touched = applyCodexPatch(patch, {
           workspaceRoot,
           resolveSafePath: resolveConfinedPath,
+          format: args.format ?? 'auto',
+          expectedHashes: args.expectedHashes ?? null,
+          allowSyntaxError: Boolean(args.allowSyntaxError),
+          readFileState,
           checkStale: checkStaleFile,
           onBeforeMutate,
           onFileChanged,
         });
         const diagNotes = [];
         const hookNotices = [];
+        const summaryLines = [];
+        let totalHunkChars = 0;
         for (const t of touched) {
           const hn = notifyIfHookConfig(t.path, t.full, 'apply_patch', t.action);
           if (hn) hookNotices.push(hn);
-          if (t.action !== 'deleted' && existsSync(t.full)) {
+          if (t.fromPath) {
+            readFileState.delete(stateKeyFor(t.fromPath));
+          }
+          if (t.action === 'deleted') {
+            readFileState.delete(stateKeyFor(t.path));
+          } else if (existsSync(t.full)) {
             trackFileHash(t.path, readFileSync(t.full, 'utf8'));
             const d = runQuickDiagnostics(t.full, t.path);
             if (!d.ok) diagNotes.push(d.summary);
           }
+          const shaShort = t.sha256After ? `, sha256: ${t.sha256After.slice(0, 16)}` : '';
+          summaryLines.push(`- ${t.action}: ${t.path} (+${t.additions ?? 0}/-${t.deletions ?? 0}${shaShort})`);
+          if (t.compactHunks && totalHunkChars < 2400) {
+            const hunkSlice = t.compactHunks.slice(0, 2400 - totalHunkChars);
+            totalHunkChars += hunkSlice.length;
+            summaryLines.push(hunkSlice);
+          }
         }
-        const summary = touched.map((t) => `${t.action}: ${t.path}`).join('\n');
-        return `原子补丁已成功应用 (${touched.length} 个文件):\n${summary}${diagNotes.join('')}${hookNotices.join('')}`;
+        return `原子补丁已成功应用 (${touched.length} 个文件):\n${summaryLines.join('\n')}${diagNotes.join('')}${hookNotices.join('')}`;
+      },
+    }),
+
+    defineTool({
+      name: 'run_diagnostics',
+      serializeZodSchema: false,
+      description:
+        '只读结构化诊断工具（受工作区沙箱约束）：快速执行语法检查（node --check / JSON.parse）、类型检查（tsc --noEmit）或测试（node --test），并将冗长输出去重压缩为结构化 JSON（diagnostics、failingTests、compression）与精简摘要。',
+      effectClass: EFFECT_CLASSES.READ_ONLY,
+      riskLevel: RISK_LEVELS.LOW,
+      replayable: true,
+      outward: false,
+      zodSchema: z.object({
+        kind: z
+          .enum(['auto', 'syntax', 'typecheck', 'test', 'lint'])
+          .optional()
+          .describe('诊断类型：auto（默认）、syntax、typecheck、test、lint'),
+        paths: z
+          .array(z.string().min(1))
+          .max(50)
+          .optional()
+          .describe('可选：限定诊断的工作区内文件或子目录路径列表'),
+        testPattern: z
+          .string()
+          .max(240)
+          .optional()
+          .describe('可选：传递给 node --test --test-name-pattern 的测试名过滤模式'),
+        maxDiagnostics: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe('最多保留的诊断条目与失败测试条数（默认 25）'),
+      }),
+      async execute(args = {}, ctx) {
+        await guardFallback('run_diagnostics', args, ctx);
+        const result = runDiagnostics(workspaceRoot, {
+          kind: args.kind ?? 'auto',
+          paths: args.paths ?? [],
+          testPattern: args.testPattern ?? '',
+          maxDiagnostics: args.maxDiagnostics ?? 25,
+        });
+        const structuredJson = JSON.stringify({
+          ok: result.ok,
+          kind: result.kind,
+          diagnostics: result.diagnostics,
+          failingTests: result.failingTests,
+          compression: result.compression,
+        });
+        return wrapResult('run_diagnostics', `${result.summary}\n\n${structuredJson}`);
       },
     }),
 

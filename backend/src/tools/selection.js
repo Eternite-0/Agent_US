@@ -1,6 +1,11 @@
 // Advisory wire catalog, never a permit. Do not infer capabilities from provider/MCP text.
-const lookup = [['inspect_repository', '仓库入口/测试命令'], ['glob', '找文件/列目录'],
-  ['grep', '搜索内容'], ['read_file', '已知路径直接读']];
+const lookup = [
+  ['inspect_repository', '仓库入口/测试命令'],
+  ['run_diagnostics', '结构化语法/类型/测试诊断'],
+  ['glob', '找文件/列目录'],
+  ['grep', '搜索内容'],
+  ['read_file', '已知路径直接读'],
+];
 function alternatives(names) {
   return lookup.filter(([name]) => names.has(name)).map(([name, role]) => `${role}用 ${name}`).join('，');
 }
@@ -16,8 +21,27 @@ export function modelToolCatalog(tools, policy, live) {
     if (decision !== 'deny') entries.push({ tool, decision });
   }
   const names = new Set(entries.map(({ tool }) => tool.name));
-  return entries.map(({ tool, decision }) => {
+  // Promote `apply_patch` before `write_file`/`edit_file` and `run_diagnostics` before `bash` deterministically.
+  const priority = (name) => {
+    if (name === 'apply_patch') return 0;
+    if (name === 'run_diagnostics') return 1;
+    if (name === 'edit_file') return 2;
+    if (name === 'write_file') return 3;
+    if (name === 'bash') return 4;
+    return 2;
+  };
+  const indexed = entries.map((entry, idx) => ({ entry, idx }));
+  indexed.sort((a, b) => priority(a.entry.tool.name) - priority(b.entry.tool.name) || a.idx - b.idx);
+
+  return indexed.map(({ entry: { tool, decision } }) => {
     let description = tool.description;
+    if (tool.name === 'apply_patch') {
+      description += ' 优先推荐：修改已有文件时首选此工具而非整文件 write_file。';
+    } else if (tool.name === 'write_file' && names.has('apply_patch')) {
+      description += ' 修改已有文件优先使用 apply_patch；write_file 仅用于新建文件或整文件覆写。';
+    } else if (tool.name === 'run_diagnostics') {
+      description += ' 优先用于快速结构化语法/类型/测试检查。';
+    }
     if (decision === 'conditional') {
       const routes = tool.name === 'bash' && alternatives(names);
       description += `${routes ? ` 仓库侦察不用 shell：${routes}。` : ''}命令受策略逐条检查${live.permissionMode === 'read-only' ? '，仅限策略识别的只读命令' : '，可能需审批'}。`;

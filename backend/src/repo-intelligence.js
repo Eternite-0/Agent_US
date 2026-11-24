@@ -4,7 +4,14 @@ import { constants, existsSync, lstatSync, realpathSync, statSync } from 'node:f
 import { lstat, open, opendir, realpath } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { extractRepositorySymbols, linkRepositoryCalls, findRepositorySymbols, traceRepositoryCalls } from './repo-symbols.js';
+import {
+  extractRepositorySymbols,
+  linkRepositoryCalls,
+  findRepositorySymbols,
+  traceRepositoryCalls,
+  findCrossFileReferencesFromAnalysis,
+  findRelatedTestsFromAnalysis,
+} from './repo-symbols.js';
 export { findRepositorySymbols, traceRepositoryCalls };
 import { promisify } from 'node:util';
 import { redactSecrets, sanitize } from './envelope.js';
@@ -706,7 +713,7 @@ function extractPackageJsonExports(exportsField, pkgDirRel, out = []) {
   return out;
 }
 
-async function safeReadUtf8(root, rel, { whole = false } = {}) {
+async function safeReadUtf8WithMeta(root, rel, { whole = false } = {}) {
   const full = join(root, rel);
   let handle;
   try {
@@ -725,9 +732,21 @@ async function safeReadUtf8(root, rel, { whole = false } = {}) {
       offset += bytesRead;
     }
     const bytes = buffer.subarray(0, offset);
-    return isProbablyBinary(bytes) ? null : bytes.toString('utf8');
+    if (isProbablyBinary(bytes)) return null;
+    const text = bytes.toString('utf8');
+    return {
+      text,
+      size: Number(st.size),
+      mtimeMs: Number(st.mtimeNs / 1000000n),
+      sha256: contentDigest(text),
+    };
   } catch { return null; }
   finally { await handle?.close(); }
+}
+
+async function safeReadUtf8(root, rel, { whole = false } = {}) {
+  const res = await safeReadUtf8WithMeta(root, rel, { whole });
+  return res ? res.text : null;
 }
 
 function classifyPackageScripts(scripts, pm, { prefixDir = '' } = {}) {
@@ -1163,6 +1182,26 @@ function parseNamedSpecifiers(clause) {
   return symbols;
 }
 
+function parseImportNamedSpecifiers(clause) {
+  const symbols = [];
+  const originalSymbols = [];
+  const inner = String(clause ?? '').trim();
+  if (!inner) return { symbols, originalSymbols };
+  for (const part of inner.split(',')) {
+    const cleaned = part.trim().replace(/^type\s+/, '');
+    if (!cleaned) continue;
+    const asMatch = /^(\S+)\s+as\s+(\S+)$/.exec(cleaned);
+    if (asMatch) {
+      originalSymbols.push(asMatch[1]);
+      symbols.push(asMatch[2]);
+    } else {
+      originalSymbols.push(cleaned);
+      symbols.push(cleaned);
+    }
+  }
+  return { symbols, originalSymbols };
+}
+
 function parseJsTsFile(text) {
   const cleaned = stripCommentsPreserveStrings(text);
   const imports = [];
@@ -1175,13 +1214,24 @@ function parseJsTsFile(text) {
     const clause = m[1].trim();
     const spec = m[2].trim();
     const symbols = [];
+    const originalSymbols = [];
     const braceMatch = /\{([^}]*)\}/.exec(clause);
-    if (braceMatch) symbols.push(...parseNamedSpecifiers(braceMatch[1]));
+    if (braceMatch) {
+      const parsedBrace = parseImportNamedSpecifiers(braceMatch[1]);
+      symbols.push(...parsedBrace.symbols);
+      originalSymbols.push(...parsedBrace.originalSymbols);
+    }
     const starMatch = /\*\s+as\s+([A-Za-z_$][\w$]*)/.exec(clause);
-    if (starMatch) symbols.push(`* as ${starMatch[1]}`);
+    if (starMatch) {
+      symbols.push(`* as ${starMatch[1]}`);
+      originalSymbols.push(`* as ${starMatch[1]}`);
+    }
     const defaultPart = clause.replace(/\{[^}]*\}/, '').replace(/\*\s+as\s+\S+/, '').replace(/,/g, '').trim();
-    if (defaultPart) symbols.push('default');
-    imports.push({ specifier: spec, kind: 'esm-import', symbols });
+    if (defaultPart) {
+      symbols.push('default');
+      originalSymbols.push('default');
+    }
+    imports.push({ specifier: spec, kind: 'esm-import', symbols, originalSymbols });
   }
 
   // 2. ES side-effect import '...'
@@ -1492,6 +1542,9 @@ function buildCallGraph(records, files, { sourceFiles, testFiles, entryPointSet,
           for (const sym of imp.symbols) {
             if (!existing.symbols.includes(sym)) existing.symbols.push(sym);
           }
+          for (const sym of imp.originalSymbols ?? []) {
+            if (!existing.originalSymbols.includes(sym)) existing.originalSymbols.push(sym);
+          }
         } else {
           edgeMap.set(edgeKey, {
             from: rel,
@@ -1499,6 +1552,7 @@ function buildCallGraph(records, files, { sourceFiles, testFiles, entryPointSet,
             specifier: imp.specifier,
             kind: imp.kind,
             symbols: [...new Set(imp.symbols)],
+            originalSymbols: [...new Set(imp.originalSymbols ?? imp.symbols)],
           });
         }
       } else if (!target && !imp.specifier.startsWith('.')) {
@@ -1793,6 +1847,25 @@ export function formatRepositorySummary(
       `${snippet.path}:${snippet.startLine}-${snippet.endLine}\n${snippet.text}`)].join('\n'));
   }
 
+  if (Array.isArray(analysis?.crossFileReferences) && analysis.crossFileReferences.length) {
+    const refLines = ['## Cross-File References'];
+    for (const ref of analysis.crossFileReferences.slice(0, 6)) {
+      const defs = (ref.definitions ?? []).slice(0, 4).map((d) => `${d.path}:${d.line}`).join(', ') || 'none';
+      const callers = (ref.callers ?? []).slice(0, 6).map((c) => `${c.fromName}@${c.path}:${c.line}`).join(', ') || 'none';
+      const importers = (ref.importers ?? []).slice(0, 6).map((im) => im.from).join(', ') || 'none';
+      refLines.push(`- ${ref.symbol}: defs=[${defs}] | callers=[${callers}] | importers=[${importers}]`);
+    }
+    blocks.push(refLines.join('\n'));
+  }
+
+  if (analysis?.relatedTests?.tests?.length) {
+    const testLines = ['## Related Tests'];
+    for (const detail of (analysis.relatedTests.details ?? []).slice(0, 12)) {
+      testLines.push(`- ${detail.path} (${detail.reasons.join(', ')})`);
+    }
+    blocks.push(testLines.join('\n'));
+  }
+
   // 2. Commands
   const cmdLines = ['## Commands'];
   if (project.testCommands?.length) cmdLines.push(`- Test: ${project.testCommands.join(' ; ')}`);
@@ -1896,6 +1969,22 @@ export function formatRepositorySummary(
  * and issue-ranked file relevance within strict sandbox and byte/file bounds.
  */
 const sharedIndexes = new Map();
+const sharedFileCaches = new Map();
+const MAX_FILE_CACHE_ENTRIES = 5000;
+
+function getOrCreateFileCache(realRoot) {
+  let cache = sharedFileCaches.get(realRoot);
+  if (!cache) {
+    cache = new Map();
+  } else {
+    sharedFileCaches.delete(realRoot);
+  }
+  sharedFileCaches.set(realRoot, cache);
+  if (sharedFileCaches.size > 8) {
+    sharedFileCaches.delete(sharedFileCaches.keys().next().value);
+  }
+  return cache;
+}
 
 async function fingerprint(path, type) {
   try {
@@ -1939,30 +2028,74 @@ async function indexChanged(root, stamps) {
   return false;
 }
 
-function createIndex(root) {
+function createIndex(root, fileCache = new Map()) {
   const stamps = new Map();
-  return { walker: walkWorkspace(root, stamps), stamps, records: new Map(), dirs: [], complete: false, tail: Promise.resolve() };
+  return {
+    walker: walkWorkspace(root, stamps),
+    stamps,
+    records: new Map(),
+    fileCache,
+    dirs: [],
+    complete: false,
+    tail: Promise.resolve(),
+  };
 }
 
-async function indexFile(root, path, stamps) {
+async function indexFile(root, path, stamps, fileCache) {
   const ext = posix.extname(path).toLowerCase();
   const language = CODE_EXTENSIONS.get(ext);
   const manifest = MANIFEST_NAMES.has(posix.basename(path));
-  if (!language && !manifest) return {};
-  const text = await safeReadUtf8(root, path, { whole: manifest });
+  if (!language && !manifest) return { record: {}, cacheHit: false, parsed: false };
+  const meta = await safeReadUtf8WithMeta(root, path, { whole: manifest });
+  const text = meta?.text ?? null;
   stamps.set(path, fileStamp(stamps.get(path).stamp, text, manifest));
-  if (text === null) return {};
-  if (manifest) return { manifest: text };
-  const parsed = JS_TS_EXTENSIONS.has(ext) ? parseJsTsFile(text)
-    : language === 'python' ? parsePythonFile(text)
-    : language === 'go' ? parseGoFile(text)
-    : language === 'rust' ? parseRustFile(text) : { exports: [], imports: [] };
-  const keywords = new Set();
-  for (const m of text.matchAll(/[\p{L}\p{N}_$]{2,80}/gu)) {
-    keywords.add(m[0].toLowerCase());
-    if (keywords.size >= 2048) break;
+  if (!meta || text === null) {
+    fileCache?.delete(path);
+    return { record: {}, cacheHit: false, parsed: false };
   }
-  return { parsed, keywords, ...extractRepositorySymbols(path, language, text) };
+
+  const cached = fileCache?.get(path);
+  if (
+    cached &&
+    cached.ext === ext &&
+    cached.size === meta.size &&
+    cached.mtimeMs === meta.mtimeMs &&
+    cached.sha256 === meta.sha256
+  ) {
+    return { record: cached.record, cacheHit: true, parsed: false };
+  }
+
+  let record;
+  if (manifest) {
+    record = { manifest: text };
+  } else {
+    const parsed = JS_TS_EXTENSIONS.has(ext) ? parseJsTsFile(text)
+      : language === 'python' ? parsePythonFile(text)
+      : language === 'go' ? parseGoFile(text)
+      : language === 'rust' ? parseRustFile(text) : { exports: [], imports: [] };
+    const keywords = new Set();
+    for (const m of text.matchAll(/[\p{L}\p{N}_$]{2,80}/gu)) {
+      keywords.add(m[0].toLowerCase());
+      if (keywords.size >= 2048) break;
+    }
+    record = { parsed, keywords, ...extractRepositorySymbols(path, language, text) };
+  }
+
+  if (fileCache) {
+    fileCache.delete(path);
+    fileCache.set(path, {
+      ext,
+      size: meta.size,
+      mtimeMs: meta.mtimeMs,
+      sha256: meta.sha256,
+      record,
+    });
+    if (fileCache.size > MAX_FILE_CACHE_ENTRIES) {
+      fileCache.delete(fileCache.keys().next().value);
+    }
+  }
+
+  return { record, cacheHit: false, parsed: true };
 }
 
 /** maxFiles is a per-request I/O budget. Opt into a shared, process-local scan
@@ -1970,8 +2103,10 @@ async function indexFile(root, path, stamps) {
  * Existing one-shot callers always see fresh bounded results. */
 export async function analyzeRepository(workspaceRoot, options = {}) {
   const { absRoot, realRoot } = assertSafeWorkspaceRoot(workspaceRoot);
+  const fileCache = getOrCreateFileCache(realRoot);
   let index = options.progressive && sharedIndexes.get(realRoot);
-  if (!index) index = createIndex(realRoot);
+  if (!index) index = createIndex(realRoot, fileCache);
+  else if (!index.fileCache) index.fileCache = fileCache;
   if (options.progressive) {
     sharedIndexes.delete(realRoot);
     sharedIndexes.set(realRoot, index);
@@ -1987,8 +2122,8 @@ async function analyzePage(absRoot, realRoot, index, { issueText = '', maxBytes 
   const boundedBytes = Math.max(256, Math.trunc(Number(maxBytes) || DEFAULT_MAX_BYTES));
   if (refresh || await indexChanged(realRoot, index.stamps)) {
     await index.walker.return();
-    // Keep the queue shared by concurrent callers; only replace scan state.
-    Object.assign(index, createIndex(realRoot), { tail: index.tail });
+    // Keep the queue and per-file parse cache shared by concurrent callers; only replace scan state.
+    Object.assign(index, createIndex(realRoot, index.fileCache), { tail: index.tail });
   }
   let visitedDirs = 0;
   const page = [];
@@ -2004,11 +2139,31 @@ async function analyzePage(absRoot, realRoot, index, { issueText = '', maxBytes 
     }
     else { visitedDirs++; if (value.dir) index.dirs.push(value.dir); }
   }
+  let cacheHits = 0;
+  let cacheMisses = 0;
+  let parsedFiles = 0;
   for (let i = 0; i < page.length; i += 16) {
     const batch = page.slice(i, i + 16);
-    const records = await Promise.all(batch.map(path => indexFile(realRoot, path, index.stamps)));
-    batch.forEach((path, n) => index.records.set(path, records[n]));
+    const entries = await Promise.all(batch.map(path => indexFile(realRoot, path, index.stamps, index.fileCache)));
+    batch.forEach((path, n) => {
+      const entry = entries[n];
+      index.records.set(path, entry.record);
+      if (entry.cacheHit) cacheHits++;
+      else if (entry.parsed) {
+        cacheMisses++;
+        parsedFiles++;
+      }
+    });
   }
+  if (index.complete && index.fileCache) {
+    for (const cachedPath of index.fileCache.keys()) {
+      if (!index.records.has(cachedPath)) {
+        index.fileCache.delete(cachedPath);
+      }
+    }
+  }
+  const reusedFiles =
+    page.length === 0 && index.complete ? index.records.size : cacheHits;
   // Git refs and staging can change without touching workspace files. Keep
   // the scan cursor, but refresh Git metadata for all indexed paths.
   const git = await collectGitMetadata(realRoot, [...index.records.keys()]);
@@ -2082,6 +2237,13 @@ async function analyzePage(absRoot, realRoot, index, { issueText = '', maxBytes 
     analyzedAt: new Date().toISOString(),
     workspaceRoot: absRoot,
     index: { complete: index.complete, indexedFiles: index.records.size, batchFiles: page.length },
+    cacheStats: {
+      hits: page.length === 0 && index.complete ? index.records.size : cacheHits,
+      misses: cacheMisses,
+      parsedFiles,
+      reusedFiles,
+      cachedEntries: index.fileCache?.size ?? 0,
+    },
     git,
     project,
     structure,
@@ -2157,4 +2319,30 @@ export function getRelatedRepositoryContext(analysis, query, { exactSymbol = '' 
   const tests = new Set();
   for (const p of files) for (const test of linked.get(p) ?? []) tests.add(test);
   return { symbols, calls, files: [...files].slice(0, 40), tests: [...tests].slice(0, 20) };
+}
+
+async function analyzeRepositoryComplete(root, options = {}) {
+  let analysis = await analyzeRepository(root, { progressive: true, maxFiles: 1000, ...options });
+  for (let iter = 0; iter < 16 && !analysis.index.complete; iter++) {
+    analysis = await analyzeRepository(root, { progressive: true, maxFiles: 1000, ...options });
+  }
+  return analysis;
+}
+
+export function findCrossFileReferences(indexOrRoot, symbolName, options = {}) {
+  if (typeof indexOrRoot === 'string') {
+    return analyzeRepositoryComplete(indexOrRoot, options).then((analysis) =>
+      findCrossFileReferencesFromAnalysis(analysis, symbolName, options),
+    );
+  }
+  return findCrossFileReferencesFromAnalysis(indexOrRoot, symbolName, options);
+}
+
+export function findRelatedTests(indexOrRoot, filePaths, options = {}) {
+  if (typeof indexOrRoot === 'string') {
+    return analyzeRepositoryComplete(indexOrRoot, options).then((analysis) =>
+      findRelatedTestsFromAnalysis(analysis, filePaths, options),
+    );
+  }
+  return findRelatedTestsFromAnalysis(indexOrRoot, filePaths, options);
 }

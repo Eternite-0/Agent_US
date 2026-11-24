@@ -8,7 +8,12 @@ import {
 } from './permits.js';
 import { PolicyError } from './kernel/errors.js';
 import { canonicalizeCommandPrefix } from './patch-and-diagnostics.js';
-import { analyzeRepository, formatRepositorySummary } from './repo-intelligence.js';
+import {
+  analyzeRepository,
+  findCrossFileReferences,
+  findRelatedTests,
+  formatRepositorySummary,
+} from './repo-intelligence.js';
 import { EFFECT_CLASSES, RISK_LEVELS, ToolRegistry, defineTool } from './tools/registry.js';
 import { ToolPermissionPolicy } from './tools/policy.js';
 import {
@@ -34,6 +39,7 @@ export const WORKSPACE_TOOL_META = Object.freeze({
   expand_context: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   compute_file_digest: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   inspect_repository: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
+  run_diagnostics: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   web_fetch: { readOnly: true, risk: 'low', effectClass: 'external_network', replayable: true, outward: false },
   search_history: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
   read_process_output: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
@@ -98,6 +104,7 @@ function isBlockedRepoFocusRel(relPath) {
 function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback }) {
   return defineTool({
     name: 'inspect_repository',
+    serializeZodSchema: false,
     description:
       '陌生仓库优先用此工具定位入口、测试/构建命令及相关模块；然后用 grep/read_file 核对实际代码。输出建议命令不代表已运行或通过。',
     effectClass: EFFECT_CLASSES.READ_ONLY,
@@ -123,6 +130,15 @@ function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback 
         .max(500)
         .optional()
         .describe('每次继续索引的文件数量（默认 120）'),
+      relatedTo: z
+        .array(z.string().min(1))
+        .max(20)
+        .optional()
+        .describe('可选：指定工作区内文件路径或符号名称列表，返回跨文件引用与关联测试'),
+      includeRelatedTests: z
+        .boolean()
+        .optional()
+        .describe('是否在摘要中包含候选关联测试文件列表（传入 relatedTo 时默认开启）'),
     }),
     async execute(args = {}, ctx) {
       await guardFallback('inspect_repository', args, ctx);
@@ -151,15 +167,102 @@ function createInspectRepositoryTool({ workspaceRoot, wrapResult, guardFallback 
           issueText = rawFocus;
         }
       }
+      const relatedToItems = Array.isArray(args.relatedTo)
+        ? args.relatedTo.map((item) => String(item ?? '').trim()).filter(Boolean)
+        : [];
+      for (const item of relatedToItems) {
+        const confined = resolveConfinedPath(workspaceRoot, item);
+        if (isBlockedRepoFocusRel(confined.rel)) {
+          throw new Error(`受保护目录或密钥文件不允许访问: ${item}`);
+        }
+        if (existsSync(confined.full)) {
+          const realRoot = realpathSync(resolve(workspaceRoot));
+          const realTarget = realpathSync(confined.full);
+          const realRel = relative(realRoot, realTarget).replace(/\\/g, '/');
+          if (isBlockedRepoFocusRel(realRel)) {
+            throw new Error(`受保护目录或密钥文件不允许访问: ${item}`);
+          }
+        }
+      }
+
       const includeGraph = args.includeGraph !== false;
       const maxFiles = args.maxFiles ? Number(args.maxFiles) : 120;
       const analysis = await analyzeRepository(targetRoot, {
         progressive: true,
         refresh: args.refresh === true,
         symbol: args.symbol ?? '',
-        issueText,
+        issueText: issueText || relatedToItems.join(' '),
         maxFiles,
       });
+
+      const wantRefsOrTests =
+        relatedToItems.length > 0 || args.includeRelatedTests === true || Boolean(args.symbol);
+      if (wantRefsOrTests) {
+        const modules = analysis.callGraph?.modules ?? [];
+        const allPaths = [
+          ...new Set([
+            ...modules.map((m) => m.path),
+            ...(analysis.structure?.sourceFiles ?? []),
+            ...(analysis.structure?.testFiles ?? []),
+          ]),
+        ];
+        const matchKnownFile = (raw) => {
+          const norm = raw.replace(/\\/g, '/').replace(/^\.\//, '');
+          if (allPaths.includes(norm)) return norm;
+          const lower = norm.toLowerCase();
+          return (
+            allPaths.find((p) => p.toLowerCase() === lower) ??
+            allPaths.find((p) => p.toLowerCase().endsWith(`/${lower}`)) ??
+            null
+          );
+        };
+
+        const targetFiles = [];
+        const targetSymbols = [];
+        if (typeof args.symbol === 'string' && args.symbol.trim()) {
+          targetSymbols.push(args.symbol.trim());
+        }
+        for (const item of relatedToItems) {
+          const matchedFile = matchKnownFile(item);
+          if (matchedFile) {
+            if (!targetFiles.includes(matchedFile)) targetFiles.push(matchedFile);
+          } else if (!targetSymbols.includes(item)) {
+            targetSymbols.push(item);
+          }
+        }
+        if (targetFiles.length && targetSymbols.length === 0) {
+          const modMap = new Map(modules.map((m) => [m.path, m]));
+          for (const tf of targetFiles) {
+            for (const exp of modMap.get(tf)?.exports ?? []) {
+              if (exp !== 'default' && !targetSymbols.includes(exp) && targetSymbols.length < 4) {
+                targetSymbols.push(exp);
+              }
+            }
+          }
+        }
+        if (targetSymbols.length > 0) {
+          analysis.crossFileReferences = targetSymbols
+            .slice(0, 6)
+            .map((sym) => findCrossFileReferences(analysis, sym));
+        }
+
+        const wantTests =
+          args.includeRelatedTests === true ||
+          (relatedToItems.length > 0 && args.includeRelatedTests !== false);
+        if (wantTests) {
+          const testSeedFiles = targetFiles.length
+            ? targetFiles
+            : issueText && matchKnownFile(issueText)
+              ? [matchKnownFile(issueText)]
+              : (analysis.relatedContext?.files?.slice(0, 5) ??
+                analysis.callGraph?.relevantFiles?.slice(0, 3).map((r) => r.path) ??
+                []);
+          if (testSeedFiles.length > 0) {
+            analysis.relatedTests = findRelatedTests(analysis, testSeedFiles);
+          }
+        }
+      }
+
       const summary = formatRepositorySummary(analysis, {
         maxBytes: 8000,
         includeGraph,
