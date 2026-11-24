@@ -1,5 +1,11 @@
 import { useId, useMemo, useState } from 'react';
-import { buildDiffPresentation, type ComputedFileDiff, type DiffLine, type DiffSpan } from '../utils/diff';
+import {
+  buildDiffPresentation,
+  foldDiffLines,
+  type ComputedFileDiff,
+  type DiffLine,
+  type DiffSpan,
+} from '../utils/diff';
 import { splitPath } from '../utils/format';
 import { ActivityCopyButton } from './ActivityPresentation';
 import { Collapsible } from './Collapsible';
@@ -30,11 +36,19 @@ export function DiffLineSign({ kind }: { kind?: DiffLine['kind'] }) {
   return <span className="codex-diff-sign">{kind === 'add' ? '+' : kind === 'del' ? '-' : ''}</span>;
 }
 
-function InlineDiff({ lines, hunks }: { lines: readonly DiffLine[]; hunks?: ComputedFileDiff['hunks'] }) {
+export function InlineDiff({ lines, hunks }: { lines: readonly DiffLine[]; hunks?: ComputedFileDiff['hunks'] }) {
+  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleFold = (foldId: string) => {
+    setExpandedFolds((prev) => {
+      const next = new Set(prev);
+      next.add(foldId);
+      return next;
+    });
+  };
   const { spansByLine } = useMemo(() => buildDiffPresentation(lines), [lines]);
   const visibleHunks = useMemo(() => {
     if (!hunks?.length) return null;
-    let remaining = 120;
+    let remaining = 180;
     const out: Array<{ header: string; lines: readonly DiffLine[]; spansByLine: ReturnType<typeof buildDiffPresentation>['spansByLine'] }> = [];
     for (const hunk of hunks) {
       if (remaining <= 0) break;
@@ -44,51 +58,90 @@ function InlineDiff({ lines, hunks }: { lines: readonly DiffLine[]; hunks?: Comp
     }
     return out;
   }, [hunks]);
-  const visibleLines = useMemo(() => {
-    const keep = new Set<number>();
-    lines.forEach((line, index) => {
-      if (line.kind === 'context') return;
-      for (let i = Math.max(0, index - 2); i <= Math.min(lines.length - 1, index + 2); i++) keep.add(i);
-    });
-    return keep.size ? lines.filter((_, index) => keep.has(index)).slice(0, 120) : lines.slice(0, 60);
-  }, [lines]);
+  const foldedLines = useMemo(() => {
+    if (visibleHunks) return [];
+    const base = lines.length > 400 ? lines.slice(0, 400) : lines;
+    return foldDiffLines(base, expandedFolds);
+  }, [lines, visibleHunks, expandedFolds]);
 
   return (
     <div className="codex-inline-diff-body" role="region" aria-label="内联文件差异" tabIndex={0}>
       {visibleHunks ? (
-        visibleHunks.map((hunk, hIdx) => (
-          <div key={`${hunk.header}-${hIdx}`} className="codex-inline-diff-hunk">
-            <div
-              className="codex-inline-diff-row"
-              data-kind="hunk"
-              style={{
-                color: 'var(--text-tertiary)',
-                background: 'var(--bg-surface-secondary)',
-                borderTop: hIdx > 0 ? '1px solid var(--border-subtle)' : undefined,
-                borderBottom: '1px solid var(--border-subtle)',
-              }}
-            >
-              <span className="codex-inline-diff-ln">@@</span>
-              <span>{hunk.header}</span>
-            </div>
-            {hunk.lines.map((line, lIdx) => (
-              <div key={`${hIdx}:${lIdx}:${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
-                <span className="codex-inline-diff-ln">{line.newLine ?? line.oldLine ?? ''}</span>
-                <DiffLineSign kind={line.kind} />
-                <DiffLineText line={line} spans={hunk.spansByLine.get(line)} />
+        visibleHunks.map((hunk, hIdx) => {
+          const hunkScopedExpanded = new Set(
+            [...expandedFolds]
+              .filter((id) => id.startsWith(`h${hIdx}:`))
+              .map((id) => id.slice(`h${hIdx}:`.length)),
+          );
+          const entries = foldDiffLines(hunk.lines, hunkScopedExpanded);
+          return (
+            <div key={`${hunk.header}-${hIdx}`} className="codex-inline-diff-hunk">
+              <div
+                className="codex-inline-diff-row"
+                data-kind="hunk"
+                style={{
+                  color: 'var(--text-tertiary)',
+                  background: 'var(--bg-surface-secondary)',
+                  borderTop: hIdx > 0 ? '1px solid var(--border-subtle)' : undefined,
+                  borderBottom: '1px solid var(--border-subtle)',
+                }}
+              >
+                <span className="codex-inline-diff-ln">@@</span>
+                <span>{hunk.header}</span>
               </div>
-            ))}
-          </div>
-        ))
-      ) : visibleLines.length === 0 ? (
+              {entries.map((entry) =>
+                entry.kind === 'fold' ? (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    className="codex-diff-fold-btn"
+                    aria-expanded={false}
+                    onClick={() => toggleFold(`h${hIdx}:${entry.id}`)}
+                  >
+                    展开 {entry.count} 行上下文
+                  </button>
+                ) : (
+                  <div
+                    key={`${hIdx}:${entry.index}:${entry.item.kind}:${entry.item.oldLine ?? ''}:${entry.item.newLine ?? ''}`}
+                    className="codex-inline-diff-row"
+                    data-kind={entry.item.kind}
+                  >
+                    <span className="codex-inline-diff-ln">{entry.item.newLine ?? entry.item.oldLine ?? ''}</span>
+                    <DiffLineSign kind={entry.item.kind} />
+                    <DiffLineText line={entry.item} spans={hunk.spansByLine.get(entry.item)} />
+                  </div>
+                ),
+              )}
+            </div>
+          );
+        })
+      ) : foldedLines.length === 0 ? (
         <div style={{ padding: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>无文本行差异</div>
-      ) : visibleLines.map((line, lIdx) => (
-        <div key={`${lIdx}:${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
-          <span className="codex-inline-diff-ln">{line.newLine ?? line.oldLine ?? ''}</span>
-          <DiffLineSign kind={line.kind} />
-          <DiffLineText line={line} spans={spansByLine.get(line)} />
-        </div>
-      ))}
+      ) : (
+        foldedLines.map((entry) =>
+          entry.kind === 'fold' ? (
+            <button
+              key={entry.id}
+              type="button"
+              className="codex-diff-fold-btn"
+              aria-expanded={false}
+              onClick={() => toggleFold(entry.id)}
+            >
+              展开 {entry.count} 行上下文
+            </button>
+          ) : (
+            <div
+              key={`${entry.index}:${entry.item.kind}:${entry.item.oldLine ?? ''}:${entry.item.newLine ?? ''}`}
+              className="codex-inline-diff-row"
+              data-kind={entry.item.kind}
+            >
+              <span className="codex-inline-diff-ln">{entry.item.newLine ?? entry.item.oldLine ?? ''}</span>
+              <DiffLineSign kind={entry.item.kind} />
+              <DiffLineText line={entry.item} spans={spansByLine.get(entry.item)} />
+            </div>
+          ),
+        )
+      )}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { parseDiagnosticsForDisplay } from '../utils/diagnostics.ts';
 import { fmtDuration } from '../utils/format';
 import {
   IconArrowUpRight, IconCheck, IconChevronRight, IconFileDoc, IconFileEdit,
@@ -136,13 +137,17 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
   meta?: string;
   eventType?: string;
   defaultOpen?: boolean;
-  onInspectFile?: (path: string) => void;
+  onInspectFile?: (path: string, line?: number) => void;
   onCopy?: (msg: string) => void;
 }) {
   const panelId = useId();
   const [open, setOpen] = useActivityDisclosure(toolDisclosureId(id), defaultOpen);
   const Icon = activityToolLabels[kind].icon;
   const displayOutput = output ?? liveOutput;
+  const parsedDiagnostics = useMemo(
+    () => parseDiagnosticsForDisplay(name, displayOutput, { status }),
+    [name, displayOutput, status],
+  );
   const isShell = kind === 'command' || kind === 'test';
   const outputLabel = output === undefined && liveOutput !== undefined ? '实时工具输出' : '工具输出';
   const showHeader = !isShell || Boolean(meta);
@@ -185,6 +190,80 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
             {displayOutput && <ActivityCopyButton label="复制输出" text={displayOutput} onCopy={onCopy} />}
           </div>
         </div>
+        {parsedDiagnostics && (parsedDiagnostics.diagnostics.length > 0 || parsedDiagnostics.failingTests.length > 0) && (
+          <div className="codex-tool-diagnostics" aria-label="结构化诊断与测试失败">
+            {parsedDiagnostics.diagnostics.map((d, dIdx) => {
+              const loc = `${d.file}:${d.line}${d.column ? `:${d.column}` : ''}`;
+              return (
+                <div key={`${loc}-${dIdx}`} className="codex-diag-test-item">
+                  {onInspectFile ? (
+                    <button
+                      type="button"
+                      className="codex-diag-row"
+                      data-severity={d.severity}
+                      onClick={() => onInspectFile(d.file, d.line)}
+                      title={`跳转到 ${loc}`}
+                    >
+                      <code className="codex-diag-loc">{loc}</code>
+                      {d.code && <span className="codex-diag-code">{d.code}</span>}
+                      <span className="codex-diag-msg">{d.testName ? `${d.testName}: ${d.message}` : d.message}</span>
+                      <IconArrowUpRight size={12} aria-hidden="true" />
+                    </button>
+                  ) : (
+                    <div className="codex-diag-row" data-severity={d.severity}>
+                      <code className="codex-diag-loc">{loc}</code>
+                      {d.code && <span className="codex-diag-code">{d.code}</span>}
+                      <span className="codex-diag-msg">{d.testName ? `${d.testName}: ${d.message}` : d.message}</span>
+                    </div>
+                  )}
+                  {(d.expected !== undefined || d.actual !== undefined) && (
+                    <div className="codex-diag-diff">
+                      <span data-kind="expected">预期: <code>{d.expected ?? '—'}</code></span>
+                      <span data-kind="actual">实际: <code>{d.actual ?? '—'}</code></span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {parsedDiagnostics.failingTests.map((t, tIdx) => {
+              const title = t.testName || t.name;
+              const loc = t.file ? `${t.file}${t.line ? `:${t.line}` : ''}${t.column ? `:${t.column}` : ''}` : '';
+              const canJump = Boolean(t.file && onInspectFile);
+              return (
+                <div key={`${title}-${tIdx}`} className="codex-diag-test-item">
+                  {canJump ? (
+                    <button
+                      type="button"
+                      className="codex-diag-row"
+                      data-severity="error"
+                      onClick={() => onInspectFile!(t.file!, t.line)}
+                      title={`跳转到 ${loc}`}
+                    >
+                      <span className="codex-diag-code">FAIL</span>
+                      <span className="codex-diag-msg">{title}</span>
+                      {loc && <code className="codex-diag-loc">{loc}</code>}
+                      <IconArrowUpRight size={12} aria-hidden="true" />
+                    </button>
+                  ) : (
+                    <div className="codex-diag-row" data-severity="error">
+                      <span className="codex-diag-code">FAIL</span>
+                      <span className="codex-diag-msg">{title}</span>
+                      {loc && <code className="codex-diag-loc">{loc}</code>}
+                    </div>
+                  )}
+                  {(t.expected !== undefined || t.actual !== undefined) ? (
+                    <div className="codex-diag-diff">
+                      <span data-kind="expected">预期: <code>{t.expected ?? '—'}</code></span>
+                      <span data-kind="actual">实际: <code>{t.actual ?? '—'}</code></span>
+                    </div>
+                  ) : t.assertion ? (
+                    <div className="codex-diag-assertion">{t.assertion}</div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
         {error && error !== displayOutput && <div className="codex-event-error">{error}</div>}
       </div>
     </AnimatedDetails>

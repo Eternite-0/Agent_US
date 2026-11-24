@@ -15,7 +15,7 @@ export const DEFAULT_ACI_SUPERVISOR_CONFIG = Object.freeze({
   model: null,
   maxBudgetRatio: 0.72,
   epochWatermarks: [0.6, 0.82],
-  maxOutputTokens: 1200,
+  maxOutputTokens: 2048,
   timeoutMs: DEFAULT_SUPERVISOR_TIMEOUT_MS,
   admissionEnabled: true,
   dtocMinPromptTokens: 24000,

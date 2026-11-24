@@ -176,8 +176,8 @@ export const Composer: React.FC<ComposerProps> = ({
   onSubmit,
   onStop,
 }) => {
-  const snapshot = useSyncExternalStore(draftStore.subscribe, draftStore.read);
-  const sendingDraft = useSyncExternalStore(draftStore.subscribe, draftStore.isSending);
+  const snapshot = useSyncExternalStore(draftStore.subscribe, draftStore.read, draftStore.read);
+  const sendingDraft = useSyncExternalStore(draftStore.subscribe, draftStore.isSending, draftStore.isSending);
   const submitting = externalSubmitPending || sendingDraft;
   const { text, files, mode: draftMode } = snapshot;
   const setText = (next: React.SetStateAction<ComposerDraft['text']>) => draftStore.update('text', next);
@@ -199,7 +199,7 @@ export const Composer: React.FC<ComposerProps> = ({
   const [reviewBranch, setReviewBranch] = useState('');
   const [reviewError, setReviewError] = useState('');
   const [reviewBusy, setReviewBusy] = useState(false);
-  const canCaptureWindow = Boolean(window.codexDesktop?.captureWindow);
+  const canCaptureWindow = Boolean(typeof window !== 'undefined' && window.codexDesktop?.captureWindow);
   const [caret, setCaret] = useState(0);
   const [addContextOpen, setAddContextOpen] = useState(false);
   const [menuDismissed, setMenuDismissed] = useState(false);

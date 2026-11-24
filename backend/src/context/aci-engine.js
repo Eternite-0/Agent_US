@@ -6,6 +6,7 @@ import { classifyMutationPath, isVerificationCommand } from '../kernel/execution
 import { extractRepositorySymbols } from '../repo-symbols.js';
 import {
   ReversibleContextStore,
+  computeSliceSha256,
   formatAciRefStub,
   normalizeContextPath,
 } from './aci-store.js';
@@ -25,21 +26,46 @@ export const DEFAULT_ACI_WEIGHTS = Object.freeze({
 
 export const DEFAULT_EPOCH_WATERMARKS = Object.freeze([0.6, 0.82]);
 export const PHASE_WATERMARK_V25_EPOCH_WATERMARKS = Object.freeze([0.78, 0.9]);
+export const TRAJECTORY_EVICTION_V26_EPOCH_WATERMARKS = Object.freeze([0.78, 0.9]);
 export const DEFAULT_SINGLE_STEP_BUDGET = 8000;
 export const DEFAULT_DTOC_MIN_CHARS = 700;
 export const DEFAULT_DTOC_SUPERSEDED_MIN_CHARS = 600;
 export const DEFAULT_DTOC_POLICY = 'adaptive_single_step';
 export const PHASE_WATERMARK_V25_DTOC_POLICY = 'phase_watermark_v25';
+export const TRAJECTORY_EVICTION_V26_DTOC_POLICY = 'trajectory_eviction_v26';
 export const VALID_DTOC_POLICIES = Object.freeze([
   DEFAULT_DTOC_POLICY,
   'cumulative',
   PHASE_WATERMARK_V25_DTOC_POLICY,
+  TRAJECTORY_EVICTION_V26_DTOC_POLICY,
 ]);
 export const DEFAULT_DTOC_MIN_PROMPT_TOKENS = 24000;
 export const DEFAULT_DTOC_PRESSURE_MIN_TOKENS = 28000;
 export const DEFAULT_DTOC_PRESSURE_RATIO = 0.65;
 export const DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS = 1200;
 export const DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS = 4;
+export const DEFAULT_V26_SUPERSEDED_MIN_NET_SAVINGS_TOKENS = 450;
+export const DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS = 750;
+export const DEFAULT_V26_TRAJECTORY_PRESSURE_MIN_TOKENS = 10000;
+export const DEFAULT_V26_TRAJECTORY_HIGH_CUMULATIVE_MIN_TOKENS = 6500;
+export const DEFAULT_V26_TRAJECTORY_PROJECTED_RATIO = 0.78;
+export const DEFAULT_V26_EVICTION_COOLDOWN_STEPS = 3;
+export const DEFAULT_V26_MIN_SUPERSEDED_STEP = 4;
+export const DEFAULT_V26_ACTIVE_READ_PROTECT_AGE = 2;
+export const DEFAULT_V26_HEAD_PREFIX_PROTECT_MESSAGES = 3;
+export const DEFAULT_V26_SUPERSEDED_MIN_CHARS = 360;
+export const DEFAULT_V26_AGED_MIN_CHARS = 480;
+export const EVIDENCE_READ_TOOLS = Object.freeze(
+  new Set([
+    'read_file',
+    'read_blob',
+    'expand_context',
+    'glob',
+    'grep',
+    'inspect_repository',
+    'query_symbol_graph',
+  ]),
+);
 export const ACON_SETTINGS_KEY = 'aci.learned_guidelines';
 export const ACON_MAX_GUIDELINES = 12;
 
@@ -47,6 +73,7 @@ export function normalizeDtocPolicy(dtocPolicy) {
   if (
     dtocPolicy === 'cumulative' ||
     dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||
+    dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY ||
     dtocPolicy === DEFAULT_DTOC_POLICY
   ) {
     return dtocPolicy;
@@ -61,12 +88,29 @@ export function resolveWatermarksForPolicy(dtocPolicy, explicitWatermarks = null
       .filter((n) => Number.isFinite(n) && n > 0 && n < 1);
     if (cleaned.length > 0) return cleaned;
   }
-  return normalizeDtocPolicy(dtocPolicy) === PHASE_WATERMARK_V25_DTOC_POLICY
-    ? [...PHASE_WATERMARK_V25_EPOCH_WATERMARKS]
-    : [...DEFAULT_EPOCH_WATERMARKS];
+  const normalized = normalizeDtocPolicy(dtocPolicy);
+  if (normalized === TRAJECTORY_EVICTION_V26_DTOC_POLICY) {
+    return [...TRAJECTORY_EVICTION_V26_EPOCH_WATERMARKS];
+  }
+  if (normalized === PHASE_WATERMARK_V25_DTOC_POLICY) {
+    return [...PHASE_WATERMARK_V25_EPOCH_WATERMARKS];
+  }
+  return [...DEFAULT_EPOCH_WATERMARKS];
 }
 
 const COMPRESSIBLE_TOOLS = new Set(['read_file', 'glob', 'grep', 'bash']);
+const V26_COMPRESSIBLE_TOOLS = new Set([
+  'read_file',
+  'read_blob',
+  'expand_context',
+  'run_diagnostics',
+  'glob',
+  'grep',
+  'bash',
+  'start_process',
+  'inspect_repository',
+  'query_symbol_graph',
+]);
 const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delete_file']);
 
 const ERROR_OUTPUT_RE =
@@ -96,7 +140,22 @@ export function detectLanguageFromPath(filePath) {
 }
 
 function isAciStubText(text) {
-  return typeof text === 'string' && (text.startsWith('[ACI-REF ') || text.startsWith('[ACI-SKIP '));
+  if (typeof text !== 'string') return false;
+  if (text.startsWith('[ACI-SKIP ')) return true;
+  if (!text.startsWith('[ACI-REF ')) return false;
+  // SUPPORTING payloads carry an extracted slice after the [ACI-REF ...] header line;
+  // only single-line pointer stubs count as already-offloaded stubs.
+  const newlineIdx = text.indexOf('\n');
+  if (newlineIdx !== -1 && text.slice(newlineIdx + 1).trim().length > 0) {
+    return false;
+  }
+  return true;
+}
+
+function extractSupportingUriFromText(text) {
+  if (typeof text !== 'string' || !text.startsWith('[ACI-REF ')) return null;
+  const m = text.match(/^\[ACI-REF\s+(artifact:\/\/[a-f0-9]{64})\s*\|\s*SUPPORTING\b/);
+  return m?.[1] ?? null;
 }
 
 function tokenizeIdentifiers(text) {
@@ -804,12 +863,327 @@ function derivePhaseSignalsFromMessages(srcMessages = [], toolCallsById = new Ma
   return { verificationCount, unverifiedSrcMutations };
 }
 
+const V26_VERIF_CMD_HINT_RE =
+  /\b(?:node\s+--test|node\s+--check|npm\s+test|npm\s+run\s+(?:test|check|typecheck|lint|build)|pnpm\s+(?:test|run\s+(?:test|check|typecheck))|npx\s+(?:tsc|vitest|jest|eslint|pytest)|pytest|vitest|jest|cargo\s+test|go\s+test)\b/i;
+
+function unwrapUntrustedText(rawText) {
+  const raw = String(rawText ?? '');
+  const m = raw.match(
+    /^<untrusted\s+id="([^"]+)"\s+bytes="\d+">([\s\S]*)<\/untrusted\s+id="\1">$/,
+  );
+  return m ? m[2] : raw;
+}
+
+function isVerificationToolCall(lowerTool, args = {}) {
+  if (lowerTool === 'run_diagnostics') return true;
+  if (lowerTool === 'bash' || lowerTool === 'start_process') {
+    const cmd = typeof args?.command === 'string' ? args.command.trim() : typeof args?.cmd === 'string' ? args.cmd.trim() : '';
+    return Boolean(cmd && (isVerificationCommand(cmd) || V26_VERIF_CMD_HINT_RE.test(cmd)));
+  }
+  return false;
+}
+
+function parseReadOrExpandMetadata(lowerTool, args = {}, rawText = '', uriToPath = new Map(), aciStore = null) {
+  const inner = unwrapUntrustedText(rawText);
+  let filePath = String(
+    args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '',
+  ).trim();
+  const rawRef = String(args?.ref ?? args?.uri ?? args?.refId ?? '').trim();
+
+  if (!filePath && rawRef) {
+    const cleanRef = rawRef.replace(/^ref:/i, '').replace(/^aci:\/\//i, '');
+    const storeRef = aciStore?.getRef?.(cleanRef) ?? null;
+    if (storeRef?.path) {
+      filePath = storeRef.path;
+    } else if (uriToPath.has(cleanRef)) {
+      filePath = uriToPath.get(cleanRef);
+    } else if (uriToPath.has(rawRef)) {
+      filePath = uriToPath.get(rawRef);
+    }
+  }
+
+  // Parse `File: <path> (lines S-E of T)` from read_file output
+  const rfHeader = inner.match(/^File:\s*([^\r\n]+?)\s*\(lines\s+(\d+)-(\d+)\s+of\s+(\d+)\)/m);
+  if (!filePath && rfHeader?.[1]) {
+    filePath = rfHeader[1].trim();
+  }
+  const outlineHeader = inner.match(/^\[ACI-(?:OUTLINE|HUNK)\s+([^\s|\]]+)/m);
+  if (!filePath && outlineHeader?.[1]) {
+    filePath = outlineHeader[1].trim();
+  }
+  const supportingHeader = inner.match(
+    /^\[ACI-REF\s+(artifact:\/\/[a-f0-9]{64})\s*\|\s*SUPPORTING\s*\|\s*([^|\r\n]+?)\s*\|\s*L(\d+)-(\d+|EOF)/m,
+  );
+  if (!filePath && supportingHeader?.[2]) {
+    filePath = supportingHeader[2].trim();
+  }
+  const expandRangeHeader = inner.match(
+    /^\[expand_context\s+sha256:[a-f0-9]{12}[^\]]*\blines\s+(\d+)-(\d+)\/(\d+)/im,
+  );
+  const expandModeMatch = inner.match(/\bmode=(symbol|lines|outline|hunk|full)\b/i);
+
+  const normPath = normalizeContextPath(filePath);
+  const symbols = [
+    ...(args?.symbol ? [String(args.symbol).trim()] : []),
+    ...(Array.isArray(args?.symbols) ? args.symbols.map((s) => String(s || '').trim()) : []),
+  ]
+    .filter(Boolean)
+    .map((s) => s.toLowerCase());
+
+  let start = 1;
+  let end = Infinity;
+  let isFull = false;
+  let isOutline = false;
+
+  if (lowerTool === 'read_file') {
+    if (supportingHeader) {
+      start = Math.max(1, Number(supportingHeader[3]));
+      end = supportingHeader[4] === 'EOF' ? Infinity : Math.max(start, Number(supportingHeader[4]));
+      isOutline = true;
+      isFull = false;
+    } else if (rfHeader) {
+      start = Math.max(1, Number(rfHeader[2]));
+      end = Math.max(start, Number(rfHeader[3]));
+      const total = Math.max(end, Number(rfHeader[4]));
+      isFull = start <= 1 && end >= total;
+    } else if (args?.startLine != null || args?.endLine != null || args?.start_line != null || args?.end_line != null) {
+      start = Math.max(1, Number(args.startLine ?? args.start_line ?? 1));
+      const rawEnd = args.endLine ?? args.end_line;
+      end = rawEnd != null && Number.isFinite(Number(rawEnd)) ? Math.max(start, Number(rawEnd)) : Infinity;
+      isFull = start <= 1 && rawEnd == null;
+    } else {
+      isFull = true;
+    }
+  } else if (lowerTool === 'expand_context') {
+    const reqLevel = String(args?.level || '').toLowerCase();
+    const detectedMode = expandModeMatch?.[1]?.toLowerCase() ?? '';
+    isOutline = reqLevel === 'outline' || detectedMode === 'outline';
+    if (args?.startLine != null || args?.endLine != null) {
+      start = Math.max(1, Number(args.startLine ?? 1));
+      end = args.endLine != null && Number.isFinite(Number(args.endLine)) ? Math.max(start, Number(args.endLine)) : Infinity;
+      isFull = false;
+    } else if (expandRangeHeader) {
+      start = Math.max(1, Number(expandRangeHeader[1]));
+      end = Math.max(start, Number(expandRangeHeader[2]));
+      const total = Math.max(end, Number(expandRangeHeader[3]));
+      isFull = start <= 1 && end >= total && symbols.length === 0 && !isOutline;
+    } else if (symbols.length > 0 || reqLevel === 'hunk' || detectedMode === 'symbol') {
+      isFull = false;
+    } else if (!isOutline && (detectedMode === 'full' || (args?.offset == null && args?.limit == null))) {
+      isFull = true;
+    }
+  } else {
+    isFull = true;
+  }
+
+  return {
+    filePath,
+    normPath,
+    start,
+    end,
+    isFull,
+    isOutline,
+    symbols,
+  };
+}
+
+function readSpansOverlapOrSupersede(earlier, later) {
+  if (!earlier || !later) return false;
+  if (later.isFull) return true;
+  if (earlier.isOutline) {
+    // Any later non-outline read or later outline supersedes an earlier outline
+    return true;
+  }
+  if (later.isOutline) return false;
+  if (earlier.symbols?.length && later.symbols?.length) {
+    const laterSet = new Set(later.symbols);
+    if (earlier.symbols.every((s) => laterSet.has(s))) return true;
+    if (earlier.symbols.some((s) => laterSet.has(s)) && earlier.symbols.length <= 2) return true;
+  }
+  if (
+    Number.isFinite(earlier.start) &&
+    Number.isFinite(later.start) &&
+    (Number.isFinite(earlier.end) || Number.isFinite(later.end))
+  ) {
+    const s1 = earlier.start;
+    const e1 = Number.isFinite(earlier.end) ? earlier.end : s1 + 400;
+    const s2 = later.start;
+    const e2 = Number.isFinite(later.end) ? later.end : s2 + 400;
+    if (s2 <= s1 && e2 >= e1) return true;
+    const overlap = Math.min(e1, e2) - Math.max(s1, s2) + 1;
+    if (overlap > 0) {
+      const len1 = Math.max(1, e1 - s1 + 1);
+      if (overlap >= len1 * 0.5 || (earlier.toolName === 'read_file' && later.toolName === 'read_file')) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function analyzeSupersededToolMessages(
+  srcMessages = [],
+  { toolCallsById = new Map(), msgSteps = [], aciStore = null } = {},
+) {
+  const uriToPath = new Map();
+  const readEntries = [];
+  const mutationsByPath = new Map(); // normPath -> number[] (indices)
+  const verificationRuns = []; // { index, step, toolName, ok, isErr }
+  const toolMetaByIndex = new Map();
+
+  for (let i = 0; i < srcMessages.length; i += 1) {
+    const m = srcMessages[i];
+    if (m?.role !== 'tool') continue;
+    const tc = m.toolCallId ? toolCallsById.get(m.toolCallId) : null;
+    const toolName = String(tc?.name || m.toolName || m.name || '').trim();
+    const lowerTool = toolName.toLowerCase();
+    const args = tc?.args ?? {};
+    const step = tc?.step ?? msgSteps[i] ?? 0;
+    const rawText = extractTextFromToolMessage(m);
+    const isErr = isErrorToolMessage(m, rawText);
+
+    // Harvest uri -> path mappings from any existing ACI-REF/ACI-SKIP stubs in context
+    for (const stubMatch of rawText.matchAll(/^\[ACI-(?:REF|SKIP)\s+(artifact:\/\/[a-f0-9]{64})\s*\|\s*[^|]+\|\s*([^|\r\n]+)/gm)) {
+      const u = stubMatch[1].trim();
+      const p = stubMatch[2].trim();
+      if (u && p && p !== 'output') {
+        uriToPath.set(u, p);
+        uriToPath.set(u.replace(/^artifact:\/\//, ''), p);
+      }
+    }
+
+    if (MUTATION_TOOLS.has(lowerTool) && !isErr) {
+      for (const normMut of extractPathsFromMutationToolCall(lowerTool, args)) {
+        const list = mutationsByPath.get(normMut) ?? [];
+        list.push(i);
+        mutationsByPath.set(normMut, list);
+      }
+    }
+
+    if (isVerificationToolCall(lowerTool, args)) {
+      verificationRuns.push({
+        index: i,
+        step,
+        toolName: lowerTool,
+        ok: !isErr,
+        isErr,
+      });
+    }
+
+    if (
+      !isErr &&
+      !isAciStubText(rawText) &&
+      (lowerTool === 'read_file' || lowerTool === 'expand_context' || lowerTool === 'read_blob')
+    ) {
+      const parsed = parseReadOrExpandMetadata(lowerTool, args, rawText, uriToPath, aciStore);
+      const entry = {
+        index: i,
+        step,
+        toolName: lowerTool,
+        ...parsed,
+      };
+      readEntries.push(entry);
+      toolMetaByIndex.set(i, { readEntry: entry });
+    }
+  }
+
+  const supersededByIndex = new Map(); // index -> { superseded: true, reason: string }
+  const latestActiveReadIndexByPath = new Map(); // normPath -> index (post-mutation / non-superseded)
+
+  // (a) Earlier read_file / expand_context of file F superseded by later mutation on F or later full/overlapping read of F
+  for (let rIdx = 0; rIdx < readEntries.length; rIdx += 1) {
+    const cur = readEntries[rIdx];
+    if (!cur.normPath) continue;
+
+    let mutAfter = false;
+    for (const [mutPath, mutIndices] of mutationsByPath.entries()) {
+      if (
+        cur.normPath === mutPath ||
+        cur.normPath.endsWith(`/${mutPath}`) ||
+        mutPath.endsWith(`/${cur.normPath}`)
+      ) {
+        if (mutIndices.some((mi) => mi > cur.index)) {
+          mutAfter = true;
+          break;
+        }
+      }
+    }
+    if (mutAfter) {
+      supersededByIndex.set(cur.index, {
+        superseded: true,
+        reason: 'mutated_later',
+      });
+      continue;
+    }
+
+    let readAfter = false;
+    for (let j = rIdx + 1; j < readEntries.length; j += 1) {
+      const later = readEntries[j];
+      if (!later.normPath) continue;
+      const sameFile =
+        cur.normPath === later.normPath ||
+        cur.normPath.endsWith(`/${later.normPath}`) ||
+        later.normPath.endsWith(`/${cur.normPath}`);
+      if (sameFile && readSpansOverlapOrSupersede(cur, later)) {
+        readAfter = true;
+        break;
+      }
+    }
+    if (readAfter) {
+      supersededByIndex.set(cur.index, {
+        superseded: true,
+        reason: 'read_superseded',
+      });
+    } else {
+      latestActiveReadIndexByPath.set(cur.normPath, cur.index);
+    }
+  }
+
+  // (b) Earlier failing run_diagnostics / test bash outputs superseded by a newer verification run
+  for (let vIdx = 0; vIdx < verificationRuns.length; vIdx += 1) {
+    const v = verificationRuns[vIdx];
+    if (!v.isErr) continue;
+    const laterRuns = verificationRuns.slice(vIdx + 1);
+    if (laterRuns.length > 0) {
+      const resolvedByPass = laterRuns.some((lr) => lr.ok);
+      supersededByIndex.set(v.index, {
+        superseded: true,
+        reason: resolvedByPass ? 'verification_resolved' : 'verification_superseded',
+      });
+    }
+  }
+
+  // Compute latest unresolved error index for v26 protection
+  let latestUnresolvedErrorIndex = -1;
+  for (let i = srcMessages.length - 1; i >= 0; i -= 1) {
+    const m = srcMessages[i];
+    if (m?.role !== 'tool') continue;
+    const supInfo = supersededByIndex.get(i);
+    if (supInfo?.superseded) continue;
+    if (isErrorToolMessage(m, extractTextFromToolMessage(m))) {
+      latestUnresolvedErrorIndex = i;
+      break;
+    }
+  }
+
+  return {
+    supersededByIndex,
+    latestActiveReadIndexByPath,
+    latestUnresolvedErrorIndex,
+    uriToPath,
+    toolMetaByIndex,
+  };
+}
+
 function extractToolTargetPath(toolName, args) {
   const lower = String(toolName || '').toLowerCase();
   const filePath = String(
     args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '',
   ).trim();
   if (filePath) return filePath.replace(/\\/g, '/');
+  if (lower === 'query_symbol_graph' && args?.symbol) {
+    return `query_symbol_graph:${String(args.symbol).slice(0, 60)}`;
+  }
   if (lower === 'grep' && args?.pattern) {
     return `grep:${String(args.pattern).slice(0, 60)}`;
   }
@@ -855,6 +1229,7 @@ function buildDtocCandidateContext(
     activeMutationTargets = [],
     keepRefs = [],
     compressRefs = [],
+    aciStore = null,
   } = {},
 ) {
   const { msgSteps, effectiveCurrentStep } = assignMessageSteps(srcMessages, currentStep);
@@ -865,6 +1240,11 @@ function buildDtocCandidateContext(
     lastMutationStepByPath,
   } = indexToolCallsAndMutations(srcMessages, msgSteps, activeMutationTargets);
   const latestErrorIndex = findLatestErrorToolMessageIndex(srcMessages);
+  const supersededAnalysis = analyzeSupersededToolMessages(srcMessages, {
+    toolCallsById,
+    msgSteps,
+    aciStore,
+  });
   const keepSet = normalizeIdSet(keepRefs);
   const preferCompressSet = normalizeIdSet(compressRefs);
   return {
@@ -875,6 +1255,7 @@ function buildDtocCandidateContext(
     explicitActiveMutations,
     lastMutationStepByPath,
     latestErrorIndex,
+    supersededAnalysis,
     keepSet,
     preferCompressSet,
   };
@@ -883,6 +1264,7 @@ function buildDtocCandidateContext(
 function computeEpochTriggerState(
   messages,
   {
+    aciStore = null,
     maxTotalTokens = 128000,
     contextWindow = 128000,
     cumulativeUsedTokens = null,
@@ -890,18 +1272,20 @@ function computeEpochTriggerState(
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
     dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
-    minNetSavingsTokens = DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS,
+    minNetSavingsTokens = undefined,
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     epochState = { lastWatermark: -1, epochCount: 0 },
     singleStepTokens = undefined,
     currentStep = undefined,
+    maxSteps = undefined,
+    estRemainingSteps = undefined,
     verificationCount = undefined,
     unverifiedSrcMutations = undefined,
-    minAgeSteps = 3,
-    minChars = DEFAULT_DTOC_MIN_CHARS,
-    supersededMinAgeSteps = 2,
-    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
-    compressibleTools = COMPRESSIBLE_TOOLS,
+    minAgeSteps = undefined,
+    minChars = undefined,
+    supersededMinAgeSteps = undefined,
+    supersededMinChars = undefined,
+    compressibleTools = undefined,
     keepRefs = [],
     compressRefs = [],
     activeMutationTargets = [],
@@ -912,13 +1296,26 @@ function computeEpochTriggerState(
 ) {
   const srcMessages = Array.isArray(messages) ? messages : [];
   const policy = normalizeDtocPolicy(dtocPolicy);
+  const isV26 = policy === TRAJECTORY_EVICTION_V26_DTOC_POLICY;
+  const effectiveCompressibleTools =
+    compressibleTools ?? (isV26 ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
+  const effectiveMinAgeSteps = minAgeSteps ?? (isV26 ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
+  const effectiveMinChars = minChars ?? (isV26 ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
+  const effectiveSupersededMinAgeSteps = supersededMinAgeSteps ?? (isV26 ? 0 : 2);
+  const effectiveSupersededMinChars =
+    supersededMinChars ?? (isV26 ? DEFAULT_V26_SUPERSEDED_MIN_CHARS : DEFAULT_DTOC_SUPERSEDED_MIN_CHARS);
   const minPromptTokens = Math.max(
     1000,
     Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
   );
   const effectiveMinNetSavings = Math.max(
     0,
-    Number(minNetSavingsTokens ?? DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS),
+    Number(
+      minNetSavingsTokens ??
+        (isV26
+          ? DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS
+          : DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS),
+    ),
   );
   const effectiveShieldSteps = Math.max(
     0,
@@ -973,12 +1370,294 @@ function computeEpochTriggerState(
   const prevWatermark = Number(epochState?.lastWatermark ?? -1);
   const prevEpochCount = Number(epochState?.epochCount ?? 0);
 
+  if (policy === TRAJECTORY_EVICTION_V26_DTOC_POLICY) {
+    const candCtx = buildDtocCandidateContext(srcMessages, {
+      currentStep,
+      activeMutationTargets,
+      keepRefs,
+      compressRefs,
+      aciStore,
+    });
+    const derivedPhase = derivePhaseSignalsFromMessages(
+      srcMessages,
+      candCtx.toolCallsById,
+      candCtx.lastMutationStepByPath,
+    );
+    const effectiveVerificationCount =
+      verificationCount != null && verificationCount !== '' && Number.isFinite(Number(verificationCount))
+        ? Math.max(0, Math.trunc(Number(verificationCount)))
+        : derivedPhase.verificationCount;
+    const effectiveUnverifiedSrc =
+      unverifiedSrcMutations != null &&
+      unverifiedSrcMutations !== '' &&
+      Number.isFinite(Number(unverifiedSrcMutations))
+        ? Math.max(0, Math.trunc(Number(unverifiedSrcMutations)))
+        : derivedPhase.unverifiedSrcMutations;
+
+    const hasAnyMutations =
+      candCtx.lastMutationStepByPath.size > 0 ||
+      (candCtx.activeMutations?.length ?? 0) > 0;
+    const highCumulativeTrajectoryBypass =
+      maxTotalTokens > 0 &&
+      usedCumulative >= 0.72 * maxTotalTokens &&
+      candCtx.effectiveCurrentStep >= 6;
+    const phasePassed =
+      effectiveVerificationCount >= 1 ||
+      highCumulativeTrajectoryBypass ||
+      (candCtx.effectiveCurrentStep >= 6 && hasAnyMutations && effectiveUnverifiedSrc === 0);
+
+    const hasExplicitEstRemaining =
+      estRemainingSteps != null &&
+      estRemainingSteps !== '' &&
+      Number.isFinite(Number(estRemainingSteps));
+    const effectiveEstRemainingSteps = hasExplicitEstRemaining
+      ? Math.max(0, Number(estRemainingSteps))
+      : maxSteps != null && maxSteps !== '' && Number.isFinite(Number(maxSteps))
+        ? Math.min(6, Math.max(1, Math.trunc(Number(maxSteps)) - candCtx.effectiveCurrentStep))
+        : 6;
+
+    const projectedTotalTokens = usedCumulative + effectiveEstRemainingSteps * tokensBefore;
+    const trajectoryRatio = maxTotalTokens > 0 ? projectedTotalTokens / maxTotalTokens : 0;
+
+    const lastEvictionStep =
+      epochState?.lastEvictionStep != null && Number.isFinite(Number(epochState.lastEvictionStep))
+        ? Number(epochState.lastEvictionStep)
+        : null;
+    const stepsSinceLastEviction =
+      lastEvictionStep !== null
+        ? Math.max(0, candCtx.effectiveCurrentStep - lastEvictionStep)
+        : Infinity;
+    const cooldownPassed = stepsSinceLastEviction >= DEFAULT_V26_EVICTION_COOLDOWN_STEPS;
+
+    const supersededMinSavings =
+      minNetSavingsTokens != null && Number.isFinite(Number(minNetSavingsTokens))
+        ? Math.max(0, Number(minNetSavingsTokens))
+        : DEFAULT_V26_SUPERSEDED_MIN_NET_SAVINGS_TOKENS;
+    const trajectoryMinSavings =
+      minNetSavingsTokens != null && Number.isFinite(Number(minNetSavingsTokens))
+        ? Math.max(0, Number(minNetSavingsTokens))
+        : DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS;
+
+    let tier1Count = 0;
+    let tier2Count = 0;
+    const tier1Messages = srcMessages.map((m, idx) => {
+      if (m?.role !== 'tool') return m;
+      const ev = evaluateToolMessageEligibility(m, {
+        index: idx,
+        toolCallsById: candCtx.toolCallsById,
+        activeMutations: candCtx.activeMutations,
+        explicitActiveMutations: candCtx.explicitActiveMutations,
+        lastMutationStepByPath: candCtx.lastMutationStepByPath,
+        effectiveCurrentStep: candCtx.effectiveCurrentStep,
+        fallbackStep: candCtx.msgSteps[idx],
+        compressibleTools: effectiveCompressibleTools,
+        minAgeSteps: effectiveMinAgeSteps,
+        minChars: effectiveMinChars,
+        supersededMinAgeSteps: effectiveSupersededMinAgeSteps,
+        supersededMinChars: effectiveSupersededMinChars,
+        singleStepTriggered: false,
+        singleStepBudget,
+        keepSet: candCtx.keepSet,
+        preferCompressSet: candCtx.preferCompressSet,
+        dtocPolicy: policy,
+        recentEditShieldSteps: effectiveShieldSteps,
+        contractFiles,
+        latestErrorIndex: candCtx.latestErrorIndex,
+        supersededAnalysis: candCtx.supersededAnalysis,
+      });
+      if (!ev.eligible) return m;
+      if (ev.superseded) tier1Count += 1;
+      else tier2Count += 1;
+      if (!ev.superseded) return m;
+      const stubText = formatAciRefStub(
+        {
+          uri: `artifact://${sha256HexLocal(ev.rawText)}`,
+          path: ev.rawFilePath || ev.targetPath,
+          lineRange: extractLineRangeLabel(ev.args, ev.rawText),
+          symbolOutline: [],
+          originalTokens: ev.rawTokens,
+          decision: 'DEFER',
+        },
+        { decision: 'DEFER' },
+      );
+      const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
+      return { ...m, content: [...nonTextBlocks, { type: 'text', text: stubText }] };
+    });
+
+    const tier1NetSavings =
+      tier1Count > 0
+        ? Math.max(
+            0,
+            tokensBefore -
+              measureRequestComposition({
+                system: systemPrompt,
+                tools,
+                messages: tier1Messages,
+              }).totalTokens,
+          )
+        : 0;
+
+    let combinedNetSavings = tier1NetSavings;
+    if (tier2Count > 0) {
+      const combinedMessages = srcMessages.map((m, idx) => {
+        if (m?.role !== 'tool') return m;
+        if (tier1Messages[idx] !== m) return tier1Messages[idx];
+        const ev = evaluateToolMessageEligibility(m, {
+          index: idx,
+          toolCallsById: candCtx.toolCallsById,
+          activeMutations: candCtx.activeMutations,
+          explicitActiveMutations: candCtx.explicitActiveMutations,
+          lastMutationStepByPath: candCtx.lastMutationStepByPath,
+          effectiveCurrentStep: candCtx.effectiveCurrentStep,
+          fallbackStep: candCtx.msgSteps[idx],
+          compressibleTools: effectiveCompressibleTools,
+          minAgeSteps: effectiveMinAgeSteps,
+          minChars: effectiveMinChars,
+          supersededMinAgeSteps: effectiveSupersededMinAgeSteps,
+          supersededMinChars: effectiveSupersededMinChars,
+          singleStepTriggered: false,
+          singleStepBudget,
+          keepSet: candCtx.keepSet,
+          preferCompressSet: candCtx.preferCompressSet,
+          dtocPolicy: policy,
+          recentEditShieldSteps: effectiveShieldSteps,
+          contractFiles,
+          latestErrorIndex: candCtx.latestErrorIndex,
+          supersededAnalysis: candCtx.supersededAnalysis,
+        });
+        if (!ev.eligible) return m;
+        const stubText = formatAciRefStub(
+          {
+            uri: `artifact://${sha256HexLocal(ev.rawText)}`,
+            path: ev.rawFilePath || ev.targetPath,
+            lineRange: extractLineRangeLabel(ev.args, ev.rawText),
+            symbolOutline: [],
+            originalTokens: ev.rawTokens,
+            decision: 'DEFER',
+          },
+          { decision: 'DEFER' },
+        );
+        const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
+        return { ...m, content: [...nonTextBlocks, { type: 'text', text: stubText }] };
+      });
+      combinedNetSavings = Math.max(
+        0,
+        tokensBefore -
+          measureRequestComposition({
+            system: systemPrompt,
+            tools,
+            messages: combinedMessages,
+          }).totalTokens,
+      );
+    }
+
+    const supersededTriggered =
+      candCtx.effectiveCurrentStep >= DEFAULT_V26_MIN_SUPERSEDED_STEP &&
+      cooldownPassed &&
+      tier1Count > 0 &&
+      tier1NetSavings >= supersededMinSavings;
+
+    const trajectoryPressureMet =
+      (maxTotalTokens > 0 &&
+        projectedTotalTokens >= DEFAULT_V26_TRAJECTORY_PROJECTED_RATIO * maxTotalTokens) ||
+      singleStepRatio >= 0.9;
+    const v26MinPrompt =
+      maxTotalTokens > 0 && usedCumulative >= 0.45 * maxTotalTokens
+        ? DEFAULT_V26_TRAJECTORY_HIGH_CUMULATIVE_MIN_TOKENS
+        : DEFAULT_V26_TRAJECTORY_PRESSURE_MIN_TOKENS;
+    const pressureTriggered = trajectoryPressureMet && tokensBefore >= v26MinPrompt;
+    const trajectoryTriggered =
+      pressureTriggered &&
+      phasePassed &&
+      cooldownPassed &&
+      tier1Count + tier2Count > 0 &&
+      combinedNetSavings >= trajectoryMinSavings;
+
+    const triggered = supersededTriggered || trajectoryTriggered;
+    const estimatedNetSavingsTokens = trajectoryTriggered
+      ? combinedNetSavings
+      : supersededTriggered
+        ? tier1NetSavings
+        : Math.max(tier1NetSavings, combinedNetSavings);
+    const netSavingsMet = trajectoryTriggered
+      ? combinedNetSavings >= trajectoryMinSavings
+      : supersededTriggered;
+
+    let highestCrossedWatermark = -1;
+    if (triggered) {
+      for (const wm of sortedWatermarks) {
+        if (singleStepRatio >= wm || trajectoryRatio >= wm) highestCrossedWatermark = wm;
+      }
+      if (highestCrossedWatermark < 0) {
+        highestCrossedWatermark = Number(
+          Math.max(singleStepRatio, Math.min(0.9999, trajectoryRatio)).toFixed(4),
+        );
+      }
+    }
+
+    const reason = !cooldownPassed
+      ? 'eviction_cooldown'
+      : trajectoryTriggered && supersededTriggered
+        ? 'trajectory_and_superseded_eviction_v26'
+        : trajectoryTriggered
+          ? 'trajectory_prediction_v26'
+          : supersededTriggered
+            ? 'superseded_eviction_v26'
+            : trajectoryPressureMet && tokensBefore < v26MinPrompt
+              ? 'below_v26_min_prompt_tokens'
+              : trajectoryPressureMet && !phasePassed
+                ? 'phase_gate_active'
+                : tier1Count > 0 || (pressureTriggered && phasePassed)
+                  ? 'insufficient_net_savings'
+                  : 'below_trajectory_threshold';
+
+    return {
+      srcMessages,
+      dtocPolicy: policy,
+      dtocMinPromptTokens: minPromptTokens,
+      minNetSavingsTokens: trajectoryTriggered ? trajectoryMinSavings : supersededMinSavings,
+      supersededMinNetSavingsTokens: supersededMinSavings,
+      trajectoryMinNetSavingsTokens: trajectoryMinSavings,
+      recentEditShieldSteps: effectiveShieldSteps,
+      tokensBefore,
+      singleStepRatio,
+      cumulativeRatio,
+      ratio: singleStepRatio,
+      highestCrossedWatermark,
+      measuredSingleStep,
+      prevWatermark,
+      prevEpochCount,
+      watermarkTriggered: triggered && highestCrossedWatermark > prevWatermark,
+      singleStepTriggered: false,
+      emergencyTriggered: false,
+      phasePassed,
+      pressureTriggered,
+      netSavingsMet,
+      estimatedNetSavingsTokens,
+      supersededNetSavingsTokens: tier1NetSavings,
+      combinedNetSavingsTokens: combinedNetSavings,
+      estRemainingSteps: effectiveEstRemainingSteps,
+      projectedTotalTokens,
+      trajectoryRatio,
+      cooldownPassed,
+      stepsSinceLastEviction,
+      supersededTriggered,
+      trajectoryTriggered,
+      verificationCount: effectiveVerificationCount,
+      unverifiedSrcMutations: effectiveUnverifiedSrc,
+      currentStep: candCtx.effectiveCurrentStep,
+      reason,
+      triggered,
+    };
+  }
+
   if (policy === PHASE_WATERMARK_V25_DTOC_POLICY) {
     const candCtx = buildDtocCandidateContext(srcMessages, {
       currentStep,
       activeMutationTargets,
       keepRefs,
       compressRefs,
+      aciStore,
     });
     const derivedPhase = derivePhaseSignalsFromMessages(
       srcMessages,
@@ -1032,11 +1711,11 @@ function computeEpochTriggerState(
           lastMutationStepByPath: candCtx.lastMutationStepByPath,
           effectiveCurrentStep: candCtx.effectiveCurrentStep,
           fallbackStep: candCtx.msgSteps[idx],
-          compressibleTools,
-          minAgeSteps,
-          minChars,
-          supersededMinAgeSteps,
-          supersededMinChars,
+          compressibleTools: effectiveCompressibleTools,
+          minAgeSteps: effectiveMinAgeSteps,
+          minChars: effectiveMinChars,
+          supersededMinAgeSteps: effectiveSupersededMinAgeSteps,
+          supersededMinChars: effectiveSupersededMinChars,
           singleStepTriggered: false,
           singleStepBudget,
           keepSet: candCtx.keepSet,
@@ -1197,6 +1876,27 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
     ...(state.estimatedNetSavingsTokens !== undefined
       ? { estimatedNetSavingsTokens: state.estimatedNetSavingsTokens }
       : {}),
+    ...(state.supersededNetSavingsTokens !== undefined
+      ? { supersededNetSavingsTokens: state.supersededNetSavingsTokens }
+      : {}),
+    ...(state.combinedNetSavingsTokens !== undefined
+      ? { combinedNetSavingsTokens: state.combinedNetSavingsTokens }
+      : {}),
+    ...(state.estRemainingSteps !== undefined ? { estRemainingSteps: state.estRemainingSteps } : {}),
+    ...(state.projectedTotalTokens !== undefined
+      ? { projectedTotalTokens: state.projectedTotalTokens }
+      : {}),
+    ...(state.trajectoryRatio !== undefined ? { trajectoryRatio: state.trajectoryRatio } : {}),
+    ...(state.cooldownPassed !== undefined ? { cooldownPassed: state.cooldownPassed } : {}),
+    ...(state.stepsSinceLastEviction !== undefined
+      ? { stepsSinceLastEviction: state.stepsSinceLastEviction }
+      : {}),
+    ...(state.supersededTriggered !== undefined
+      ? { supersededTriggered: state.supersededTriggered }
+      : {}),
+    ...(state.trajectoryTriggered !== undefined
+      ? { trajectoryTriggered: state.trajectoryTriggered }
+      : {}),
     ...(state.verificationCount !== undefined ? { verificationCount: state.verificationCount } : {}),
     ...(state.unverifiedSrcMutations !== undefined
       ? { unverifiedSrcMutations: state.unverifiedSrcMutations }
@@ -1219,11 +1919,11 @@ export function evaluateToolMessageEligibility(
     lastMutationStepByPath,
     effectiveCurrentStep = 0,
     fallbackStep = 0,
-    compressibleTools = COMPRESSIBLE_TOOLS,
-    minAgeSteps = 3,
-    minChars = DEFAULT_DTOC_MIN_CHARS,
-    supersededMinAgeSteps = 2,
-    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
+    compressibleTools = undefined,
+    minAgeSteps = undefined,
+    minChars = undefined,
+    supersededMinAgeSteps = undefined,
+    supersededMinChars = undefined,
     singleStepTriggered = false,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     keepSet = new Set(),
@@ -1232,6 +1932,8 @@ export function evaluateToolMessageEligibility(
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     contractFiles = [],
     latestErrorIndex = -1,
+    supersededAnalysis = null,
+    onlySuperseded = false,
   } = {},
 ) {
   if (!msg || msg.role !== 'tool') {
@@ -1242,9 +1944,11 @@ export function evaluateToolMessageEligibility(
   const lowerTool = toolName.toLowerCase();
   const args = tc?.args ?? {};
   const targetPath = extractToolTargetPath(toolName, args);
-  const rawFilePath = String(
+  const rawFilePathArg = String(
     args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '',
   ).trim();
+  const resolvedMetaPath = supersededAnalysis?.toolMetaByIndex?.get(index)?.readEntry?.filePath || '';
+  const rawFilePath = rawFilePathArg || resolvedMetaPath;
 
   const textBlocks = (msg.content ?? []).filter(
     (b) => b?.type === 'text' && typeof b.text === 'string',
@@ -1261,8 +1965,63 @@ export function evaluateToolMessageEligibility(
   const normRawPath = normalizeContextPath(rawFilePath);
   const normTargetPath = normalizeContextPath(targetPath);
 
-  const isPhaseV25 = normalizeDtocPolicy(dtocPolicy) === PHASE_WATERMARK_V25_DTOC_POLICY;
-  const isErr = isErrorToolMessage(msg, rawText) || (isPhaseV25 && latestErrorIndex >= 0 && index === latestErrorIndex);
+  const normalizedPolicy = normalizeDtocPolicy(dtocPolicy);
+  const isPhaseV25 = normalizedPolicy === PHASE_WATERMARK_V25_DTOC_POLICY;
+  const isTrajectoryV26 = normalizedPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY;
+
+  const effectiveCompressibleTools =
+    compressibleTools ?? (isTrajectoryV26 ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
+  const effectiveMinAgeSteps =
+    minAgeSteps ?? (isTrajectoryV26 ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
+  const effectiveMinChars =
+    minChars ?? (isTrajectoryV26 ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
+  const effectiveSupersededMinAgeSteps =
+    supersededMinAgeSteps ?? (isTrajectoryV26 ? 0 : 2);
+  const effectiveSupersededMinChars =
+    supersededMinChars ??
+    (isTrajectoryV26 ? DEFAULT_V26_SUPERSEDED_MIN_CHARS : DEFAULT_DTOC_SUPERSEDED_MIN_CHARS);
+
+  const isHeadPrefixProtected =
+    isTrajectoryV26 && index < DEFAULT_V26_HEAD_PREFIX_PROTECT_MESSAGES;
+
+  const effectiveLatestErrIdx = isTrajectoryV26
+    ? (supersededAnalysis?.latestUnresolvedErrorIndex ?? latestErrorIndex)
+    : latestErrorIndex;
+
+  let superseded = false;
+  let supersededReason = null;
+  let isActiveMutation = false;
+
+  if (isTrajectoryV26) {
+    const supInfo = supersededAnalysis?.supersededByIndex?.get(index) ?? null;
+    if (supInfo?.superseded) {
+      superseded = true;
+      supersededReason = supInfo.reason || 'superseded';
+    }
+  } else if (rawFilePath) {
+    const mutStep = findLastMutationStep(rawFilePath, lastMutationStepByPath);
+    const inExplicitTargets = explicitActiveMutations && pathMatchesAny(rawFilePath, explicitActiveMutations);
+    const mutWithinShieldWindow = mutStep >= 0 && effectiveCurrentStep - mutStep <= recentEditShieldSteps;
+    if (isPhaseV25 && (inExplicitTargets || mutWithinShieldWindow)) {
+      isActiveMutation = true;
+    } else if (lowerTool === 'read_file' && mutStep >= 0) {
+      if (msgStep < mutStep) {
+        superseded = true;
+        supersededReason = 'mutated_later';
+      } else {
+        isActiveMutation = true;
+      }
+    } else if (pathMatchesAny(rawFilePath, activeMutations)) {
+      isActiveMutation = true;
+    }
+  }
+
+  const isLatestProtectedError =
+    effectiveLatestErrIdx >= 0 && index === effectiveLatestErrIdx;
+  const isErr = isTrajectoryV26
+    ? isLatestProtectedError || (!superseded && isErrorToolMessage(msg, rawText))
+    : isErrorToolMessage(msg, rawText) || (isPhaseV25 && latestErrorIndex >= 0 && index === latestErrorIndex);
+
   const isPinnedKeep =
     (msg.toolCallId && keepSet.has(msg.toolCallId)) ||
     keepSet.has(fallbackMsgId) ||
@@ -1272,31 +2031,15 @@ export function evaluateToolMessageEligibility(
     (normTargetPath && keepSet.has(normTargetPath));
 
   const isContractShielded =
-    isPhaseV25 &&
+    (isPhaseV25 || isTrajectoryV26) &&
     ((rawFilePath && isStrictDtocContractPath(rawFilePath, contractFiles)) ||
       (targetPath && isStrictDtocContractPath(targetPath, contractFiles)));
 
-  let isActiveMutation = false;
-  let superseded = false;
-  if (rawFilePath) {
-    const mutStep = findLastMutationStep(rawFilePath, lastMutationStepByPath);
-    const inExplicitTargets = explicitActiveMutations && pathMatchesAny(rawFilePath, explicitActiveMutations);
-    const mutWithinShieldWindow = mutStep >= 0 && effectiveCurrentStep - mutStep <= recentEditShieldSteps;
-    if (isPhaseV25 && (inExplicitTargets || mutWithinShieldWindow)) {
-      isActiveMutation = true;
-    } else if (lowerTool === 'read_file' && mutStep >= 0) {
-      if (msgStep < mutStep) {
-        superseded = true;
-      } else {
-        isActiveMutation = true;
-      }
-    } else if (pathMatchesAny(rawFilePath, activeMutations)) {
-      isActiveMutation = true;
-    }
-  }
+  const isRecentShielded = isTrajectoryV26
+    ? !superseded && age <= DEFAULT_V26_ACTIVE_READ_PROTECT_AGE
+    : isPhaseV25 && age <= recentEditShieldSteps;
 
-  const isRecentShielded = isPhaseV25 && age <= recentEditShieldSteps;
-  const isCompressibleTool = compressibleTools.has(lowerTool);
+  const isCompressibleTool = effectiveCompressibleTools.has(lowerTool);
   const isSingleStepOverflow = singleStepTriggered && rawTokens > singleStepBudget;
   const isPreferred =
     (msg.toolCallId && preferCompressSet.has(msg.toolCallId)) ||
@@ -1306,35 +2049,48 @@ export function evaluateToolMessageEligibility(
     preferCompressSet.has(targetPath) ||
     (normTargetPath && preferCompressSet.has(normTargetPath));
 
-  const thresholdChars = superseded ? supersededMinChars : minChars;
-  const baseAgeThreshold = superseded ? supersededMinAgeSteps : minAgeSteps;
+  const thresholdChars = superseded ? effectiveSupersededMinChars : effectiveMinChars;
+  const baseAgeThreshold = superseded ? effectiveSupersededMinAgeSteps : effectiveMinAgeSteps;
   const thresholdAge = isPhaseV25
     ? Math.max(baseAgeThreshold, recentEditShieldSteps + 1)
     : baseAgeThreshold;
   const meetsSizeAndAge = rawText.length >= thresholdChars && age >= thresholdAge;
-  const meetsPreferred = isPreferred && rawText.length >= thresholdChars && age >= (isPhaseV25 ? recentEditShieldSteps + 1 : 1);
+  const meetsPreferred =
+    isPreferred &&
+    rawText.length >= thresholdChars &&
+    age >= (isPhaseV25 ? recentEditShieldSteps + 1 : isTrajectoryV26 && !superseded ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 1);
+
+  const blockedByTierFilter = Boolean(isTrajectoryV26 && onlySuperseded && !superseded);
 
   const eligible =
     isCompressibleTool &&
+    !isHeadPrefixProtected &&
     !isErr &&
     !isActiveMutation &&
     !isContractShielded &&
     !isRecentShielded &&
     !isPinnedKeep &&
+    !blockedByTierFilter &&
     (meetsSizeAndAge || isSingleStepOverflow || meetsPreferred);
 
-  const reason = isErr
-    ? 'error_preserved'
-    : isActiveMutation
-      ? 'active_mutation'
-      : isContractShielded
-        ? 'contract_preserved'
-        : 'recent_or_pinned';
+  const reason = isHeadPrefixProtected
+    ? 'head_prefix_protected'
+    : isErr
+      ? 'error_preserved'
+      : isActiveMutation
+        ? 'active_mutation'
+        : isContractShielded
+          ? 'contract_preserved'
+          : blockedByTierFilter
+            ? 'aged_preserved_below_trajectory'
+            : 'recent_or_pinned';
 
   return {
     eligible,
     reason,
     superseded,
+    supersededReason,
+    evictionTier: superseded ? 'superseded' : 'aged',
     id: msg.toolCallId || fallbackMsgId,
     toolName,
     args,
@@ -1354,11 +2110,12 @@ export function evaluateToolMessageEligibility(
 export function selectOffloadableAciCandidates(
   messages = [],
   {
-    compressibleTools = COMPRESSIBLE_TOOLS,
-    minAgeSteps = 3,
-    minChars = DEFAULT_DTOC_MIN_CHARS,
-    supersededMinAgeSteps = 2,
-    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
+    aciStore = null,
+    compressibleTools = undefined,
+    minAgeSteps = undefined,
+    minChars = undefined,
+    supersededMinAgeSteps = undefined,
+    supersededMinChars = undefined,
     currentStep = undefined,
     singleStepTriggered = false,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
@@ -1368,6 +2125,7 @@ export function selectOffloadableAciCandidates(
     dtocPolicy = DEFAULT_DTOC_POLICY,
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     contractFiles = [],
+    onlySuperseded = false,
   } = {},
 ) {
   const srcMessages = Array.isArray(messages) ? messages : [];
@@ -1376,6 +2134,7 @@ export function selectOffloadableAciCandidates(
     activeMutationTargets,
     keepRefs,
     compressRefs,
+    aciStore,
   });
   const candidates = [];
 
@@ -1403,6 +2162,8 @@ export function selectOffloadableAciCandidates(
       recentEditShieldSteps,
       contractFiles,
       latestErrorIndex: candCtx.latestErrorIndex,
+      supersededAnalysis: candCtx.supersededAnalysis,
+      onlySuperseded,
     });
     if (!ev.eligible) continue;
     candidates.push({
@@ -1414,18 +2175,21 @@ export function selectOffloadableAciCandidates(
       chars: ev.chars,
       ageSteps: ev.age,
       superseded: ev.superseded,
+      supersededReason: ev.supersededReason ?? null,
+      evictionTier: ev.evictionTier,
       hasError: false,
       excerpt: ev.rawText.slice(0, 260),
     });
   }
+  candidates.sort((a, b) => Number(b.superseded) - Number(a.superseded));
   return candidates;
 }
 
 /**
  * Epoch-based DTOC Reversible Compression:
- * Triggers ONLY when crossing budget watermarks (60%, 82% of maxTotalTokens),
- * when a single-step input exceeds `singleStepBudget`, or under `phase_watermark_v25`
- * when phase, prompt pressure, and net savings (>= 1200 tokens) ALL hold.
+ * Triggers under `trajectory_eviction_v26` on (i) superseded stale outputs (>=700 tokens saved)
+ * or (ii) projected total budget trajectory >= 0.78 * maxTotalTokens (>=900 tokens saved),
+ * under `phase_watermark_v25` when phase, pressure, and savings hold, or on Stage-4 watermarks.
  * Keeps prefix bytes 100% untouched between epochs so KV Prompt Cache stays warm.
  */
 export function compressMessagesEpoch(
@@ -1440,15 +2204,17 @@ export function compressMessagesEpoch(
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
     dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
-    minNetSavingsTokens = DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS,
+    minNetSavingsTokens = undefined,
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
-    epochState = { lastWatermark: -1, epochCount: 0 },
-    minAgeSteps = 3,
-    minChars = DEFAULT_DTOC_MIN_CHARS,
-    supersededMinAgeSteps = 2,
-    supersededMinChars = DEFAULT_DTOC_SUPERSEDED_MIN_CHARS,
-    compressibleTools = COMPRESSIBLE_TOOLS,
+    epochState = { lastWatermark: -1, epochCount: 0, lastEvictionStep: null },
+    minAgeSteps = undefined,
+    minChars = undefined,
+    supersededMinAgeSteps = undefined,
+    supersededMinChars = undefined,
+    compressibleTools = undefined,
     currentStep = undefined,
+    maxSteps = undefined,
+    estRemainingSteps = undefined,
     singleStepTokens = undefined,
     verificationCount = undefined,
     unverifiedSrcMutations = undefined,
@@ -1461,6 +2227,7 @@ export function compressMessagesEpoch(
   } = {},
 ) {
   const trigger = computeEpochTriggerState(messages, {
+    aciStore,
     maxTotalTokens,
     contextWindow,
     cumulativeUsedTokens,
@@ -1473,6 +2240,8 @@ export function compressMessagesEpoch(
     epochState,
     singleStepTokens,
     currentStep,
+    maxSteps,
+    estRemainingSteps,
     verificationCount,
     unverifiedSrcMutations,
     minAgeSteps,
@@ -1513,6 +2282,12 @@ export function compressMessagesEpoch(
       tokensAfter: tokensBefore,
       netSavingsTokens: 0,
       minNetSavingsTokens: trigger.minNetSavingsTokens,
+      supersededEvictions: 0,
+      supersededTokensSaved: 0,
+      trajectoryTriggered: Boolean(trigger.trajectoryTriggered),
+      supersededTriggered: Boolean(trigger.supersededTriggered),
+      projectedTotalTokens: trigger.projectedTotalTokens ?? null,
+      estRemainingSteps: trigger.estRemainingSteps ?? null,
       compressedCount: 0,
       compressedRefs: [],
       messages: srcMessages,
@@ -1521,6 +2296,7 @@ export function compressMessagesEpoch(
         lastWatermark: prevWatermark,
         epochCount: prevEpochCount,
         emergencyUsed: Boolean(epochState?.emergencyUsed),
+        lastEvictionStep: epochState?.lastEvictionStep ?? null,
       },
     };
   }
@@ -1530,15 +2306,21 @@ export function compressMessagesEpoch(
     activeMutationTargets,
     keepRefs,
     compressRefs,
+    aciStore,
   });
   const nextEpoch = prevEpochCount + 1;
+  const isTrajectoryV26 = trigger.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY;
+  const onlySuperseded = Boolean(
+    isTrajectoryV26 && trigger.supersededTriggered && !trigger.trajectoryTriggered,
+  );
 
   const outMessages = srcMessages.map((m) => ({
     ...m,
     content: Array.isArray(m?.content) ? m.content.map((b) => ({ ...b })) : m?.content,
   }));
 
-  const stagedCompressions = [];
+  const stagedSuperseded = [];
+  const stagedAged = [];
   const keptItems = [];
 
   for (let i = 0; i < outMessages.length; i += 1) {
@@ -1566,6 +2348,8 @@ export function compressMessagesEpoch(
       recentEditShieldSteps: trigger.recentEditShieldSteps,
       contractFiles,
       latestErrorIndex: candCtx.latestErrorIndex,
+      supersededAnalysis: candCtx.supersededAnalysis,
+      onlySuperseded,
     });
 
     if (ev.skipReason === 'empty_or_stub') continue;
@@ -1583,30 +2367,43 @@ export function compressMessagesEpoch(
       continue;
     }
 
-    const extracted = extractSymbolsFromText(ev.rawFilePath || ev.targetPath, ev.rawText);
+    const resolvedPath =
+      ev.rawFilePath ||
+      candCtx.supersededAnalysis?.toolMetaByIndex?.get(i)?.readEntry?.filePath ||
+      ev.targetPath;
+    const extracted = extractSymbolsFromText(resolvedPath, ev.rawText);
     const outlineWithLines = extracted.definitions.length
       ? extracted.definitions.slice(0, 12).map((d) => (d.line ? `${d.name}@L${d.line}` : d.name))
       : extracted.names;
     const putMeta = {
       toolName: ev.toolName,
-      path: ev.rawFilePath || ev.targetPath,
+      path: resolvedPath,
       lineRange: extractLineRangeLabel(ev.args, ev.rawText),
       symbolOutline: outlineWithLines,
       originalTokens: ev.rawTokens,
       step: ev.msgStep,
       decision: 'DEFER',
+      superseded: Boolean(ev.superseded),
+      supersededReason: ev.supersededReason ?? null,
+      evictionTier: ev.evictionTier || 'aged',
     };
+    const supportingUri = extractSupportingUriFromText(ev.rawText);
     const previewStub = formatAciRefStub(
       {
-        uri: `artifact://${sha256HexLocal(ev.rawText)}`,
+        uri: supportingUri || `artifact://${sha256HexLocal(ev.rawText)}`,
         ...putMeta,
       },
       putMeta,
     );
     const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
     m.content = [...nonTextBlocks, { type: 'text', text: previewStub }];
-    stagedCompressions.push({ msg: m, ev, putMeta, nonTextBlocks });
+    const stagedItem = { msg: m, ev, putMeta, nonTextBlocks, supportingUri };
+    if (ev.superseded) stagedSuperseded.push(stagedItem);
+    else stagedAged.push(stagedItem);
   }
+
+  // Evict Tier 1 superseded outputs first, Tier 2 aged non-active outputs second
+  const stagedCompressions = [...stagedSuperseded, ...stagedAged];
 
   const tokensAfterPreview = measureRequestComposition({
     system: systemPrompt,
@@ -1616,7 +2413,8 @@ export function compressMessagesEpoch(
   const netSavingsTokens = Math.max(0, tokensBefore - tokensAfterPreview);
 
   if (
-    trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY &&
+    (trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||
+      trigger.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY) &&
     (stagedCompressions.length === 0 || netSavingsTokens < trigger.minNetSavingsTokens)
   ) {
     return {
@@ -1631,6 +2429,12 @@ export function compressMessagesEpoch(
       tokensAfter: tokensBefore,
       netSavingsTokens,
       minNetSavingsTokens: trigger.minNetSavingsTokens,
+      supersededEvictions: 0,
+      supersededTokensSaved: 0,
+      trajectoryTriggered: Boolean(trigger.trajectoryTriggered),
+      supersededTriggered: Boolean(trigger.supersededTriggered),
+      projectedTotalTokens: trigger.projectedTotalTokens ?? null,
+      estRemainingSteps: trigger.estRemainingSteps ?? null,
       compressedCount: 0,
       compressedRefs: [],
       messages: srcMessages,
@@ -1639,15 +2443,58 @@ export function compressMessagesEpoch(
         lastWatermark: prevWatermark,
         epochCount: prevEpochCount,
         emergencyUsed: Boolean(epochState?.emergencyUsed),
+        lastEvictionStep: epochState?.lastEvictionStep ?? null,
       },
     };
   }
 
   const compressedRefs = [];
+  let supersededEvictions = 0;
+  let supersededTokensSaved = 0;
+
   for (const item of stagedCompressions) {
-    const ref = aciStore.put(item.ev.rawText, item.putMeta);
+    const existingRef = item.supportingUri ? aciStore.getRef?.(item.supportingUri) : null;
+    const ref = existingRef
+      ? (() => {
+          const stubText = formatAciRefStub(
+            {
+              ...existingRef,
+              lineRange: item.putMeta.lineRange || existingRef.lineRange,
+              symbolOutline: item.putMeta.symbolOutline?.length
+                ? item.putMeta.symbolOutline
+                : existingRef.symbolOutline,
+              originalTokens: existingRef.originalTokens || item.ev.rawTokens,
+              decision: 'DEFER',
+            },
+            {
+              decision: 'DEFER',
+              superseded: item.putMeta.superseded,
+              supersededReason: item.putMeta.supersededReason,
+              evictionTier: item.putMeta.evictionTier,
+            },
+          );
+          return {
+            ...existingRef,
+            decision: 'DEFER',
+            superseded: Boolean(item.putMeta.superseded),
+            supersededReason: item.putMeta.supersededReason ?? null,
+            evictionTier: item.putMeta.evictionTier ?? null,
+            stubText,
+            stubTokens: estimateTokens(stubText),
+          };
+        })()
+      : aciStore.put(item.ev.rawText, item.putMeta);
     item.msg.content = [...item.nonTextBlocks, { type: 'text', text: ref.stubText }];
     compressedRefs.push(ref);
+    const savedForRef = Math.max(
+      0,
+      Number(item.ev.rawTokens ?? ref.originalTokens ?? 0) -
+        Number(ref.stubTokens ?? estimateTokens(ref.stubText)),
+    );
+    if (item.ev.superseded) {
+      supersededEvictions += 1;
+      supersededTokensSaved += savedForRef;
+    }
     ledger?.recordCompressed({
       refId: ref.refId,
       uri: ref.uri,
@@ -1656,6 +2503,9 @@ export function compressMessagesEpoch(
       stubTokens: ref.stubTokens,
       step: item.ev.msgStep,
       epoch: nextEpoch,
+      superseded: Boolean(item.ev.superseded),
+      supersededReason: item.ev.supersededReason ?? null,
+      evictionTier: item.ev.evictionTier || 'aged',
     });
   }
 
@@ -1668,24 +2518,48 @@ export function compressMessagesEpoch(
     tools,
     messages: outMessages,
   }).totalTokens;
+  const actualNetSavings = Math.max(0, tokensBefore - tokensAfter);
 
   const effectiveEpochCount = compressedRefs.length > 0 ? nextEpoch : prevEpochCount;
-  const nextState = {
-    lastWatermark: Math.max(prevWatermark, highestCrossedWatermark),
-    epochCount: effectiveEpochCount,
-    emergencyUsed: Boolean(epochState?.emergencyUsed || emergencyTriggered),
-  };
-
-  return {
-    triggered: true,
-    reason:
-      trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY
+  const reason =
+    trigger.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
+      ? trigger.reason || TRAJECTORY_EVICTION_V26_DTOC_POLICY
+      : trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY
         ? PHASE_WATERMARK_V25_DTOC_POLICY
         : watermarkTriggered
           ? 'watermark_crossed'
           : singleStepTriggered
             ? 'single_step_budget'
-            : 'emergency_budget',
+            : 'emergency_budget';
+
+  if (compressedRefs.length > 0) {
+    ledger?.recordEpoch?.({
+      epoch: effectiveEpochCount,
+      reason,
+      dtocPolicy: trigger.dtocPolicy,
+      trajectoryTriggered: Boolean(trigger.trajectoryTriggered),
+      supersededTriggered: Boolean(trigger.supersededTriggered),
+      supersededEvictions,
+      supersededTokensSaved,
+      netSavingsTokens: actualNetSavings,
+      projectedTotalTokens: trigger.projectedTotalTokens ?? null,
+      step: candCtx.effectiveCurrentStep,
+    });
+  }
+
+  const nextState = {
+    lastWatermark: Math.max(prevWatermark, highestCrossedWatermark),
+    epochCount: effectiveEpochCount,
+    emergencyUsed: Boolean(epochState?.emergencyUsed || emergencyTriggered),
+    lastEvictionStep:
+      compressedRefs.length > 0
+        ? candCtx.effectiveCurrentStep
+        : (epochState?.lastEvictionStep ?? null),
+  };
+
+  return {
+    triggered: true,
+    reason,
     dtocPolicy: trigger.dtocPolicy,
     epoch: effectiveEpochCount,
     watermark: highestCrossedWatermark,
@@ -1694,8 +2568,14 @@ export function compressMessagesEpoch(
     singleStepTokens: measuredSingleStep,
     tokensBefore,
     tokensAfter,
-    netSavingsTokens: Math.max(0, tokensBefore - tokensAfter),
+    netSavingsTokens: actualNetSavings,
     minNetSavingsTokens: trigger.minNetSavingsTokens,
+    supersededEvictions,
+    supersededTokensSaved,
+    trajectoryTriggered: Boolean(trigger.trajectoryTriggered),
+    supersededTriggered: Boolean(trigger.supersededTriggered),
+    projectedTotalTokens: trigger.projectedTotalTokens ?? null,
+    estRemainingSteps: trigger.estRemainingSteps ?? null,
     compressedCount: compressedRefs.length,
     compressedRefs,
     messages: outMessages,
@@ -1704,23 +2584,255 @@ export function compressMessagesEpoch(
   };
 }
 
+function computeBraceOrIndentSpan(allLines, startLineNum, { lang = null, maxSpanLines = 220, fallbackRadius = 12 } = {}) {
+  const totalLines = allLines.length;
+  const startIdx = Math.max(0, Math.min(totalLines - 1, Number(startLineNum) - 1));
+  if (lang === 'python') {
+    const firstLine = allLines[startIdx] ?? '';
+    const baseIndent = firstLine.match(/^(\s*)/)?.[1]?.length ?? 0;
+    let endIdx = startIdx;
+    for (let i = startIdx + 1; i < Math.min(totalLines, startIdx + maxSpanLines); i += 1) {
+      const line = allLines[i];
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) {
+        endIdx = i;
+        continue;
+      }
+      const indent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
+      if (indent <= baseIndent && !/^[)\]}]+[:\s]*$/.test(trimmed)) break;
+      endIdx = i;
+    }
+    return {
+      from: startIdx + 1,
+      to: endIdx > startIdx ? endIdx + 1 : Math.min(totalLines, startIdx + 1 + fallbackRadius),
+    };
+  }
+
+  let depth = 0;
+  let seenBrace = false;
+  let inSingle = false;
+  let inDouble = false;
+  let inTemplate = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = startIdx; i < Math.min(totalLines, startIdx + maxSpanLines); i += 1) {
+    const line = allLines[i] ?? '';
+    inLineComment = false;
+    for (let j = 0; j < line.length; j += 1) {
+      const ch = line[j];
+      const next = line[j + 1] ?? '';
+      if (inBlockComment) {
+        if (ch === '*' && next === '/') {
+          inBlockComment = false;
+          j += 1;
+        }
+        continue;
+      }
+      if (inLineComment) break;
+      if (inSingle) {
+        if (ch === '\\') { j += 1; continue; }
+        if (ch === '\'') inSingle = false;
+        continue;
+      }
+      if (inDouble) {
+        if (ch === '\\') { j += 1; continue; }
+        if (ch === '"') inDouble = false;
+        continue;
+      }
+      if (inTemplate) {
+        if (ch === '\\') { j += 1; continue; }
+        if (ch === '`') inTemplate = false;
+        continue;
+      }
+      if (ch === '/' && next === '/') { inLineComment = true; break; }
+      if (ch === '/' && next === '*') { inBlockComment = true; j += 1; continue; }
+      if (ch === '\'') { inSingle = true; continue; }
+      if (ch === '"') { inDouble = true; continue; }
+      if (ch === '`') { inTemplate = true; continue; }
+
+      if (ch === '{') {
+        depth += 1;
+        seenBrace = true;
+      } else if (ch === '}') {
+        depth = Math.max(0, depth - 1);
+        if (seenBrace && depth === 0) {
+          return { from: startIdx + 1, to: i + 1 };
+        }
+      }
+    }
+    if (!seenBrace && line.trimEnd().endsWith(';') && i <= startIdx + 4) {
+      return { from: startIdx + 1, to: i + 1 };
+    }
+  }
+
+  return {
+    from: startIdx + 1,
+    to: Math.min(totalLines, startIdx + 1 + fallbackRadius),
+  };
+}
+
+/**
+ * Extracts exact bounded definition span(s) for requested symbols (with +-fallbackRadius fallback).
+ */
+export function extractBoundedSymbolSpans(
+  filePath,
+  fullText,
+  requestedSymbols,
+  { fallbackRadius = 12, maxSpans = 16, maxChars = 32768 } = {},
+) {
+  const symList = [
+    ...new Set(
+      (Array.isArray(requestedSymbols) ? requestedSymbols : [requestedSymbols])
+        .map((s) => String(s ?? '').trim())
+        .filter(Boolean),
+    ),
+  ];
+  const raw = String(fullText ?? '');
+  const allLines = raw.split(/\r?\n/);
+  if (!symList.length || !allLines.length) {
+    return {
+      matchedSymbols: [],
+      unmatchedSymbols: symList,
+      windows: [],
+      totalLines: allLines.length,
+      text: '',
+      rangeDesc: '',
+    };
+  }
+
+  const lang = detectLanguageFromPath(filePath);
+  const extracted = extractSymbolsFromText(filePath || 'unknown.js', raw);
+  const defs = extracted.definitions ?? [];
+  const rawWindows = [];
+  const matchedSymbols = [];
+  const unmatchedSymbols = [];
+
+  for (const sym of symList) {
+    if (rawWindows.length >= maxSpans) break;
+    const symLower = sym.toLowerCase();
+    let matchedDefs = defs.filter((d) => String(d.name || '').toLowerCase() === symLower);
+    if (!matchedDefs.length) {
+      matchedDefs = defs.filter((d) => {
+        const dn = String(d.name || '').toLowerCase();
+        return dn.endsWith(`.${symLower}`) || dn.includes(symLower);
+      });
+    }
+
+    if (matchedDefs.length > 0) {
+      matchedSymbols.push(sym);
+      for (const d of matchedDefs.slice(0, 3)) {
+        const span = d.line
+          ? computeBraceOrIndentSpan(allLines, d.line, { lang, fallbackRadius })
+          : { from: 1, to: Math.min(allLines.length, 1 + fallbackRadius * 2) };
+        rawWindows.push({ ...span, symbol: d.name || sym, kind: d.kind || 'symbol' });
+      }
+      continue;
+    }
+
+    // Fallback +-12 lines around lexical occurrence
+    const escaped = sym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const wordRe = new RegExp(`\\b${escaped}\\b`, 'i');
+    let hitLine = -1;
+    for (let i = 0; i < allLines.length; i += 1) {
+      if (wordRe.test(allLines[i])) {
+        hitLine = i + 1;
+        break;
+      }
+    }
+    if (hitLine < 0) {
+      for (let i = 0; i < allLines.length; i += 1) {
+        if (allLines[i].toLowerCase().includes(symLower)) {
+          hitLine = i + 1;
+          break;
+        }
+      }
+    }
+    if (hitLine > 0) {
+      matchedSymbols.push(sym);
+      rawWindows.push({
+        from: Math.max(1, hitLine - fallbackRadius),
+        to: Math.min(allLines.length, hitLine + fallbackRadius),
+        symbol: sym,
+        kind: 'fallback',
+      });
+    } else {
+      unmatchedSymbols.push(sym);
+    }
+  }
+
+  rawWindows.sort((a, b) => a.from - b.from || a.to - b.to);
+  const windows = [];
+  for (const w of rawWindows) {
+    if (windows.length > 0 && w.from <= windows.at(-1).to + 2) {
+      windows.at(-1).to = Math.max(windows.at(-1).to, w.to);
+      if (w.symbol && !windows.at(-1).symbols.includes(w.symbol)) {
+        windows.at(-1).symbols.push(w.symbol);
+      }
+    } else {
+      windows.push({
+        from: w.from,
+        to: w.to,
+        symbols: w.symbol ? [w.symbol] : [],
+      });
+    }
+  }
+
+  if (!windows.length) {
+    return {
+      matchedSymbols,
+      unmatchedSymbols,
+      windows: [],
+      totalLines: allLines.length,
+      text: '',
+      rangeDesc: '',
+    };
+  }
+
+  const blocks = windows.map((w) => {
+    const header = w.symbols.length
+      ? `@@ ${w.symbols.join(', ')} L${w.from}-${w.to} @@`
+      : `@@ L${w.from}-${w.to} @@`;
+    const body = [];
+    for (let ln = w.from; ln <= w.to; ln += 1) {
+      body.push(`L${ln}: ${allLines[ln - 1] ?? ''}`);
+    }
+    return `${header}\n${body.join('\n')}`;
+  });
+
+  const text = blocks.join('\n...\n').slice(0, maxChars);
+  const spanList = windows.map((w) => `L${w.from}-${w.to}`).join(',');
+  const rangeDesc = `symbols(${matchedSymbols.slice(0, 4).join(',')}) ${spanList}/${allLines.length}`;
+  return {
+    matchedSymbols,
+    unmatchedSymbols,
+    windows,
+    totalLines: allLines.length,
+    text,
+    rangeDesc,
+  };
+}
+
 /**
  * Progressive Expansion (`outline` -> `hunk` -> `verbatim`) backed by `aciStore`.
+ * Supports bounded symbol recovery + `sliceSha256` verification.
  */
 export function expandContext(
   aciStore,
   uriOrRefId,
   {
-    level = 'outline',
+    level = undefined,
     query = '',
+    symbol = undefined,
     symbols = [],
     startLine = null,
     endLine = null,
-    contextLines = 15,
+    contextLines = 12,
     maxChars = 6000,
     step = 0,
     expectedSha256 = undefined,
     ledger = null,
+    recordRecovery = false,
   } = {},
 ) {
   const verified = typeof aciStore.restoreVerified === 'function'
@@ -1729,23 +2841,120 @@ export function expandContext(
   const raw = verified.content;
   const ref = aciStore.getRef(uriOrRefId);
   const path = verified.path || ref?.path || 'unknown';
+  const fullTokens = estimateTokens(raw);
+  const requestedSymbols = [
+    ...(symbol ? [symbol] : []),
+    ...(Array.isArray(symbols) ? symbols : []),
+  ]
+    .map((s) => String(s ?? '').trim())
+    .filter(Boolean);
+
+  const hasStartLine = startLine != null && startLine !== '' && Number.isFinite(Number(startLine));
+  const hasEndLine = endLine != null && endLine !== '' && Number.isFinite(Number(endLine));
+  const allLines = raw.split(/\r?\n/);
+
+  const explicitLevel = level === undefined || level === null || level === '' ? null : String(level);
   const normalizedLevel =
-    level === 'relevant_hunk' ? 'hunk' : level === 'verbatim' || level === 'hunk' ? level : 'outline';
+    explicitLevel === 'relevant_hunk'
+      ? 'hunk'
+      : explicitLevel === 'verbatim' || explicitLevel === 'hunk' || explicitLevel === 'outline'
+        ? explicitLevel
+        : requestedSymbols.length > 0 || hasStartLine || hasEndLine
+          ? 'verbatim'
+          : 'outline';
+
+  const finalize = (payload) => {
+    const sliceSha256 = computeSliceSha256(payload.text);
+    const tokens = estimateTokens(payload.text);
+    const isPartial = Boolean(payload.isPartial);
+    const tokensSaved = isPartial ? Math.max(0, fullTokens - tokens) : 0;
+    const out = {
+      ...payload,
+      sha256: verified.sha256 ?? null,
+      sliceSha256,
+      verified: Boolean(verified.verified),
+      fullTokens,
+      tokens,
+      tokensSaved,
+    };
+    ledger?.recordExpanded?.({ ...out, step });
+    if (recordRecovery) {
+      ledger?.recordRecovery?.({
+        refId: out.refId,
+        uri: out.uri,
+        sha256: out.sha256,
+        sliceSha256,
+        path: out.path,
+        level: out.level,
+        mode: out.mode,
+        isPartial: out.isPartial,
+        fullTokens,
+        tokensRestored: tokens,
+        tokensSaved,
+        verified: out.verified,
+        step,
+      });
+    }
+    return out;
+  };
 
   if (normalizedLevel === 'verbatim') {
-    const out = {
+    if (requestedSymbols.length > 0) {
+      const spanRes = extractBoundedSymbolSpans(path, raw, requestedSymbols, {
+        fallbackRadius: Math.max(4, Number(contextLines ?? 12)),
+        maxChars,
+      });
+      if (spanRes.text) {
+        return finalize({
+          level: 'verbatim',
+          mode: 'symbol',
+          isPartial: true,
+          refId: ref?.refId ?? null,
+          uri: ref?.uri ?? (String(uriOrRefId).startsWith('artifact://') ? uriOrRefId : null),
+          path,
+          symbols: spanRes.matchedSymbols,
+          windows: spanRes.windows,
+          totalLines: spanRes.totalLines,
+          rangeDesc: spanRes.rangeDesc,
+          text: spanRes.text,
+        });
+      }
+    }
+
+    if (hasStartLine || hasEndLine) {
+      const sLine = Math.max(1, hasStartLine ? Number(startLine) : 1);
+      const eLine = Math.min(
+        allLines.length,
+        hasEndLine ? Math.max(sLine, Number(endLine)) : allLines.length,
+      );
+      const selected = allLines.slice(sLine - 1, eLine).join('\n').slice(0, maxChars);
+      const isPartialSlice = sLine > 1 || eLine < allLines.length || selected.length < raw.length;
+      return finalize({
+        level: 'verbatim',
+        mode: isPartialSlice ? 'lines' : 'full',
+        isPartial: isPartialSlice,
+        refId: ref?.refId ?? null,
+        uri: ref?.uri ?? (String(uriOrRefId).startsWith('artifact://') ? uriOrRefId : null),
+        path,
+        windows: [{ from: sLine, to: eLine }],
+        totalLines: allLines.length,
+        rangeDesc: `lines ${sLine}-${eLine}/${allLines.length}`,
+        text: selected,
+      });
+    }
+
+    return finalize({
       level: 'verbatim',
+      mode: 'full',
+      isPartial: false,
       refId: ref?.refId ?? null,
       uri: ref?.uri ?? (String(uriOrRefId).startsWith('artifact://') ? uriOrRefId : null),
       path,
+      totalLines: allLines.length,
+      rangeDesc: `chars 0-${raw.length}/${raw.length}`,
       text: raw,
-      tokens: estimateTokens(raw),
-    };
-    ledger?.recordExpanded({ ...out, step });
-    return out;
+    });
   }
-
-  const allLines = raw.split(/\r?\n/);
 
   if (normalizedLevel === 'outline') {
     const extracted = extractSymbolsFromText(path, raw);
@@ -1765,24 +2974,45 @@ export function expandContext(
       sections.push(allLines.slice(0, 20).map((l, idx) => `L${idx + 1}: ${l}`).join('\n'));
     }
     const text = sections.join('\n\n').slice(0, maxChars);
-    const out = {
+    return finalize({
       level: 'outline',
+      mode: 'outline',
+      isPartial: true,
       refId: ref?.refId ?? null,
       uri: ref?.uri ?? null,
       path,
       symbols: extracted.names,
       totalLines: allLines.length,
+      rangeDesc: `outline (${allLines.length} lines)`,
       text,
-      tokens: estimateTokens(text),
-    };
-    ledger?.recordExpanded({ ...out, step });
-    return out;
+    });
   }
 
   // 'hunk' mode
+  if (!hasStartLine && !hasEndLine && requestedSymbols.length > 0 && !String(query || '').trim()) {
+    const spanRes = extractBoundedSymbolSpans(path, raw, requestedSymbols, {
+      fallbackRadius: Math.max(4, Number(contextLines ?? 12)),
+      maxChars: Math.max(200, maxChars - 120),
+    });
+    if (spanRes.text) {
+      const text = `[ACI-HUNK ${path}]\n${spanRes.text}`.slice(0, maxChars);
+      return finalize({
+        level: 'hunk',
+        mode: 'symbol',
+        isPartial: true,
+        refId: ref?.refId ?? null,
+        uri: ref?.uri ?? null,
+        path,
+        symbols: spanRes.matchedSymbols,
+        windows: spanRes.windows,
+        totalLines: spanRes.totalLines,
+        rangeDesc: `hunk (${spanRes.rangeDesc})`,
+        text,
+      });
+    }
+  }
+
   const windows = [];
-  const hasStartLine = startLine != null && startLine !== '' && Number.isFinite(Number(startLine));
-  const hasEndLine = endLine != null && endLine !== '' && Number.isFinite(Number(endLine));
   if (hasStartLine || hasEndLine) {
     const from = Math.max(1, hasStartLine ? Number(startLine) : 1);
     const to = Math.min(
@@ -1792,7 +3022,7 @@ export function expandContext(
     windows.push({ from, to });
   } else {
     const needles = [
-      ...(symbols ?? []).map((s) => String(s || '').trim()).filter(Boolean),
+      ...requestedSymbols,
       ...[...tokenizeIdentifiers(query)],
     ];
     const matchLines = [];
@@ -1827,17 +3057,18 @@ export function expandContext(
     return `@@ L${w.from}-${w.to} @@\n${slice.join('\n')}`;
   });
   const text = `[ACI-HUNK ${path}]\n${hunkBlocks.join('\n...\n')}`.slice(0, maxChars);
-  const out = {
+  return finalize({
     level: 'hunk',
+    mode: 'hunk',
+    isPartial: true,
     refId: ref?.refId ?? null,
     uri: ref?.uri ?? null,
     path,
     windows,
+    totalLines: allLines.length,
+    rangeDesc: `hunk (${windows.length} window${windows.length === 1 ? '' : 's'})`,
     text,
-    tokens: estimateTokens(text),
-  };
-  ledger?.recordExpanded({ ...out, step });
-  return out;
+  });
 }
 
 const EXTRA_SECRET_PATTERNS = [
@@ -1954,7 +3185,7 @@ export class ACIEngine {
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
     dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
-    minNetSavingsTokens = DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS,
+    minNetSavingsTokens = undefined,
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     admissionMinChars = DEFAULT_ADMISSION_MIN_CHARS,
     maxSupervisorAdmissionCalls = DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
@@ -1966,16 +3197,25 @@ export class ACIEngine {
     this.supervisor = supervisor;
     this.maxTotalTokens = maxTotalTokens;
     this.contextWindow = contextWindow;
+    this.singleStepBudget = singleStepBudget;
     this.dtocPolicy = normalizeDtocPolicy(dtocPolicy);
     this.watermarks = resolveWatermarksForPolicy(this.dtocPolicy, watermarks);
     this.dtocMinPromptTokens = Math.max(
       1000,
       Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
     );
-    this.minNetSavingsTokens = Math.max(
-      0,
-      Number(minNetSavingsTokens ?? DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS),
-    );
+    const hasExplicitSavings =
+      minNetSavingsTokens !== undefined &&
+      minNetSavingsTokens !== null &&
+      Number.isFinite(Number(minNetSavingsTokens));
+    this._explicitMinNetSavingsTokens = hasExplicitSavings
+      ? Math.max(0, Number(minNetSavingsTokens))
+      : undefined;
+    this.minNetSavingsTokens =
+      this._explicitMinNetSavingsTokens ??
+      (this.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
+        ? DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS
+        : DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS);
     this.recentEditShieldSteps = Math.max(
       0,
       Number(recentEditShieldSteps ?? DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS),
@@ -1989,7 +3229,12 @@ export class ACIEngine {
       Number(maxSupervisorAdmissionCalls ?? DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS),
     );
     this.weights = { ...DEFAULT_ACI_WEIGHTS, ...weights };
-    this.epochState = { lastWatermark: -1, epochCount: 0, emergencyUsed: false };
+    this.epochState = {
+      lastWatermark: -1,
+      epochCount: 0,
+      emergencyUsed: false,
+      lastEvictionStep: null,
+    };
     this.admissionController = new PreInjectionAdmissionController({
       aciStore: this.aciStore,
       ledger: this.ledger,
@@ -2023,13 +3268,14 @@ export class ACIEngine {
 
   inspectEpoch(messages, options = {}) {
     return shouldTriggerAciEpoch(messages, {
+      aciStore: this.aciStore,
       maxTotalTokens: this.maxTotalTokens,
       contextWindow: this.contextWindow,
       watermarks: this.watermarks,
       singleStepBudget: this.singleStepBudget,
       dtocPolicy: this.dtocPolicy,
       dtocMinPromptTokens: this.dtocMinPromptTokens,
-      minNetSavingsTokens: this.minNetSavingsTokens,
+      minNetSavingsTokens: this._explicitMinNetSavingsTokens,
       recentEditShieldSteps: this.recentEditShieldSteps,
       epochState: this.epochState,
       ...options,
@@ -2046,7 +3292,7 @@ export class ACIEngine {
       singleStepBudget: this.singleStepBudget,
       dtocPolicy: this.dtocPolicy,
       dtocMinPromptTokens: this.dtocMinPromptTokens,
-      minNetSavingsTokens: this.minNetSavingsTokens,
+      minNetSavingsTokens: this._explicitMinNetSavingsTokens,
       recentEditShieldSteps: this.recentEditShieldSteps,
       epochState: this.epochState,
       ...options,

@@ -6,6 +6,10 @@ function sha256Hex(text) {
   return createHash('sha256').update(String(text), 'utf8').digest('hex');
 }
 
+export function computeSliceSha256(text) {
+  return sha256Hex(String(text ?? ''));
+}
+
 const VALID_DECISION_TAGS = new Set([
   'DIRECT',
   'SUPPORTING',
@@ -307,6 +311,9 @@ export class ReversibleContextStore {
       step,
       decision,
       priorStep,
+      superseded: Boolean(meta.superseded),
+      supersededReason: meta.supersededReason ?? null,
+      evictionTier: meta.evictionTier ?? null,
       active: meta.active !== false,
       restoredCount: 0,
       bytes: saved.bytes,
@@ -529,12 +536,27 @@ export class ReversibleContextStore {
       bytes: Buffer.byteLength(raw, 'utf8'),
     };
   }
+
+  /**
+   * Verifies the parent blob SHA-256 and computes a verified SHA-256 digest for
+   * a bounded partial recovery slice without weakening parent integrity checks.
+   */
+  restoreVerifiedSlice(uriOrRefId, { expectedSha256, sliceFn = null } = {}) {
+    const base = this.restoreVerified(uriOrRefId, { expectedSha256 });
+    const slice =
+      typeof sliceFn === 'function' ? String(sliceFn(base.content, base) ?? '') : base.content;
+    return {
+      ...base,
+      slice,
+      sliceSha256: sha256Hex(slice),
+    };
+  }
 }
 
 /**
  * ContextEvidenceLedger records discovered candidates, kept/compressed/expanded
  * items, pre-injection admissions, supervisor calls, hash-verified recoveries,
- * abstentions, and computes Stage 3/4 governance metrics against ground truth.
+ * DTOC epochs, abstentions, and computes Stage 3/4/2.6 governance metrics.
  */
 export class ContextEvidenceLedger {
   constructor() {
@@ -546,6 +568,7 @@ export class ContextEvidenceLedger {
     this.admissions = [];
     this.supervisorCalls = [];
     this.recoveries = [];
+    this.epochs = [];
     this.taskOutcome = null;
   }
 
@@ -586,18 +609,49 @@ export class ContextEvidenceLedger {
       if (!item || typeof item !== 'object') continue;
       const originalTokens = Number(item.originalTokens ?? 0);
       const stubTokens = Number(item.stubTokens ?? 0);
+      const tokensSaved =
+        item.tokensSaved != null && Number.isFinite(Number(item.tokensSaved))
+          ? Math.max(0, Number(item.tokensSaved))
+          : Math.max(0, originalTokens - stubTokens);
       this.compressed.push({
         refId: item.refId ?? null,
         uri: item.uri ?? null,
         path: item.path ? String(item.path) : '',
         originalTokens,
         stubTokens,
-        tokensSaved: Math.max(0, originalTokens - stubTokens),
+        tokensSaved,
+        superseded: Boolean(item.superseded),
+        supersededReason: item.supersededReason ? String(item.supersededReason) : null,
+        evictionTier: item.evictionTier
+          ? String(item.evictionTier)
+          : item.superseded
+            ? 'superseded'
+            : 'aged',
         step: Number.isFinite(Number(item.step)) ? Number(item.step) : 0,
         epoch: Number.isFinite(Number(item.epoch)) ? Number(item.epoch) : null,
         at: Date.now(),
       });
     }
+  }
+
+  recordEpoch(entry) {
+    if (!entry || typeof entry !== 'object') return;
+    this.epochs.push({
+      epoch: Number.isFinite(Number(entry.epoch)) ? Number(entry.epoch) : this.epochs.length + 1,
+      reason: String(entry.reason || 'dtoc'),
+      dtocPolicy: entry.dtocPolicy ? String(entry.dtocPolicy) : null,
+      trajectoryTriggered: Boolean(entry.trajectoryTriggered),
+      supersededTriggered: Boolean(entry.supersededTriggered),
+      supersededEvictions: Math.max(0, Math.trunc(Number(entry.supersededEvictions ?? 0))),
+      supersededTokensSaved: Math.max(0, Math.trunc(Number(entry.supersededTokensSaved ?? 0))),
+      netSavingsTokens: Math.max(0, Math.trunc(Number(entry.netSavingsTokens ?? 0))),
+      projectedTotalTokens:
+        entry.projectedTotalTokens != null && Number.isFinite(Number(entry.projectedTotalTokens))
+          ? Math.max(0, Math.trunc(Number(entry.projectedTotalTokens)))
+          : null,
+      step: Number.isFinite(Number(entry.step)) ? Number(entry.step) : 0,
+      at: Date.now(),
+    });
   }
 
   recordExpanded(items) {
@@ -682,14 +736,39 @@ export class ContextEvidenceLedger {
 
   recordRecovery(entry) {
     if (!entry || typeof entry !== 'object') return;
+    const level = String(entry.level || 'verbatim');
+    const mode = entry.mode
+      ? String(entry.mode)
+      : level === 'outline'
+        ? 'outline'
+        : level === 'hunk'
+          ? 'lines'
+          : 'full';
+    const isPartial =
+      entry.isPartial !== undefined
+        ? Boolean(entry.isPartial)
+        : mode !== 'full';
+    const tokensRestored = Math.max(0, Number(entry.tokensRestored ?? 0));
+    const fullTokens = Math.max(tokensRestored, Number(entry.fullTokens ?? tokensRestored));
+    const tokensSaved =
+      entry.tokensSaved != null && Number.isFinite(Number(entry.tokensSaved))
+        ? Math.max(0, Number(entry.tokensSaved))
+        : isPartial
+          ? Math.max(0, fullTokens - tokensRestored)
+          : 0;
     this.recoveries.push({
       refId: entry.refId ?? null,
       uri: entry.uri ?? null,
       sha256: entry.sha256 ?? null,
+      sliceSha256: entry.sliceSha256 ? String(entry.sliceSha256) : null,
       path: entry.path ? String(entry.path) : '',
-      level: String(entry.level || 'verbatim'),
+      level,
+      mode,
+      isPartial,
       verified: Boolean(entry.verified),
-      tokensRestored: Math.max(0, Number(entry.tokensRestored ?? 0)),
+      tokensRestored,
+      fullTokens,
+      tokensSaved,
       triggeredBy: String(entry.triggeredBy || 'expand_context'),
       step: Number.isFinite(Number(entry.step)) ? Number(entry.step) : 0,
       at: Date.now(),
@@ -770,6 +849,13 @@ export class ContextEvidenceLedger {
             x.tokensSaved != null && Number.isFinite(Number(x.tokensSaved))
               ? Math.max(0, Number(x.tokensSaved))
               : Math.max(0, originalTokens - stubTokens),
+          superseded: Boolean(x.superseded),
+          supersededReason: x.supersededReason ? String(x.supersededReason) : null,
+          evictionTier: x.evictionTier
+            ? String(x.evictionTier)
+            : x.superseded
+              ? 'superseded'
+              : 'aged',
           step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
           epoch: Number.isFinite(Number(x.epoch)) ? Number(x.epoch) : null,
           at: x.at ?? 0,
@@ -869,16 +955,63 @@ export class ContextEvidenceLedger {
       this.recoveries,
       other.recoveries,
       (x) =>
-        `${x.refId ?? ''}|${x.uri ?? ''}|${x.sha256 ?? ''}|${normalizeContextPath(x.path)}|${x.level ?? ''}|${x.tokensRestored ?? 0}|${x.step ?? 0}|${x.at ?? ''}`,
+        `${x.refId ?? ''}|${x.uri ?? ''}|${x.sha256 ?? ''}|${x.sliceSha256 ?? ''}|${normalizeContextPath(x.path)}|${x.level ?? ''}|${x.tokensRestored ?? 0}|${x.step ?? 0}|${x.at ?? ''}`,
+      (x) => {
+        const level = String(x.level || 'verbatim');
+        const mode = x.mode
+          ? String(x.mode)
+          : level === 'outline'
+            ? 'outline'
+            : level === 'hunk'
+              ? 'lines'
+              : 'full';
+        const isPartial =
+          x.isPartial !== undefined ? Boolean(x.isPartial) : mode !== 'full';
+        const tokensRestored = Math.max(0, Number(x.tokensRestored ?? 0));
+        const fullTokens = Math.max(tokensRestored, Number(x.fullTokens ?? tokensRestored));
+        const tokensSaved =
+          x.tokensSaved != null && Number.isFinite(Number(x.tokensSaved))
+            ? Math.max(0, Number(x.tokensSaved))
+            : isPartial
+              ? Math.max(0, fullTokens - tokensRestored)
+              : 0;
+        return {
+          refId: x.refId ?? null,
+          uri: x.uri ?? null,
+          sha256: x.sha256 ?? null,
+          sliceSha256: x.sliceSha256 ? String(x.sliceSha256) : null,
+          path: x.path ? String(x.path) : '',
+          level,
+          mode,
+          isPartial,
+          verified: Boolean(x.verified),
+          tokensRestored,
+          fullTokens,
+          tokensSaved,
+          triggeredBy: String(x.triggeredBy || 'expand_context'),
+          step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
+          at: x.at ?? 0,
+        };
+      },
+    );
+
+    mergeUnique(
+      this.epochs,
+      other.epochs,
+      (x) => `${x.epoch ?? ''}|${x.reason ?? ''}|${x.step ?? 0}|${x.netSavingsTokens ?? 0}`,
       (x) => ({
-        refId: x.refId ?? null,
-        uri: x.uri ?? null,
-        sha256: x.sha256 ?? null,
-        path: x.path ? String(x.path) : '',
-        level: String(x.level || 'verbatim'),
-        verified: Boolean(x.verified),
-        tokensRestored: Math.max(0, Number(x.tokensRestored ?? 0)),
-        triggeredBy: String(x.triggeredBy || 'expand_context'),
+        epoch: Number.isFinite(Number(x.epoch)) ? Number(x.epoch) : 0,
+        reason: String(x.reason || 'dtoc'),
+        dtocPolicy: x.dtocPolicy ? String(x.dtocPolicy) : null,
+        trajectoryTriggered: Boolean(x.trajectoryTriggered),
+        supersededTriggered: Boolean(x.supersededTriggered),
+        supersededEvictions: Math.max(0, Math.trunc(Number(x.supersededEvictions ?? 0))),
+        supersededTokensSaved: Math.max(0, Math.trunc(Number(x.supersededTokensSaved ?? 0))),
+        netSavingsTokens: Math.max(0, Math.trunc(Number(x.netSavingsTokens ?? 0))),
+        projectedTotalTokens:
+          x.projectedTotalTokens != null && Number.isFinite(Number(x.projectedTotalTokens))
+            ? Math.max(0, Math.trunc(Number(x.projectedTotalTokens)))
+            : null,
         step: Number.isFinite(Number(x.step)) ? Number(x.step) : 0,
         at: x.at ?? 0,
       }),
@@ -972,6 +1105,61 @@ export class ContextEvidenceLedger {
       matched,
       missing,
       compressedOnly,
+    };
+  }
+
+  #computeV26Rollup() {
+    const decisions = {
+      DIRECT: 0,
+      SUPPORTING: 0,
+      DEFER: 0,
+      DUPLICATE: 0,
+      IRRELEVANT: 0,
+    };
+    for (const a of this.admissions) {
+      const dec = VALID_DECISION_TAGS.has(a?.decision) ? a.decision : 'DIRECT';
+      decisions[dec] += 1;
+    }
+
+    let partialRecoveries = 0;
+    let fullRecoveries = 0;
+    let recoveryTokensSaved = 0;
+    for (const r of this.recoveries) {
+      const isPartial =
+        r?.isPartial !== undefined
+          ? Boolean(r.isPartial)
+          : r?.mode
+            ? r.mode !== 'full'
+            : r?.level === 'outline' || r?.level === 'hunk';
+      if (isPartial) partialRecoveries += 1;
+      else fullRecoveries += 1;
+      const saved =
+        r?.tokensSaved != null && Number.isFinite(Number(r.tokensSaved))
+          ? Math.max(0, Number(r.tokensSaved))
+          : isPartial
+            ? Math.max(0, Number(r?.fullTokens ?? 0) - Number(r?.tokensRestored ?? 0))
+            : 0;
+      recoveryTokensSaved += saved;
+    }
+
+    let supersededEvictions = 0;
+    let supersededTokensSaved = 0;
+    for (const c of this.compressed) {
+      if (c?.superseded) {
+        supersededEvictions += 1;
+        supersededTokensSaved += Math.max(0, Number(c.tokensSaved || 0));
+      }
+    }
+    const trajectoryTriggeredEpochs = this.epochs.filter((e) => Boolean(e?.trajectoryTriggered)).length;
+
+    return {
+      decisions,
+      partialRecoveries,
+      fullRecoveries,
+      recoveryTokensSaved,
+      supersededEvictions,
+      supersededTokensSaved,
+      trajectoryTriggeredEpochs,
     };
   }
 
@@ -1108,10 +1296,14 @@ export class ContextEvidenceLedger {
       fallbackCount: this.supervisorCalls.filter((c) => Boolean(c.fallback)).length,
     };
 
+    const rollup = this.#computeV26Rollup();
     const recoveryStats = {
       totalRecoveries: this.recoveries.length,
       hashVerifiedCount: this.recoveries.filter((r) => r.verified).length,
       tokensRestored: totalRecoveriesTokens,
+      partialRecoveries: rollup.partialRecoveries,
+      fullRecoveries: rollup.fullRecoveries,
+      recoveryTokensSaved: rollup.recoveryTokensSaved,
     };
 
     return {
@@ -1121,6 +1313,13 @@ export class ContextEvidenceLedger {
       usefulTokenRatio,
       admissionTokenReduction,
       decisionCounts,
+      decisions: { ...decisionCounts },
+      partialRecoveries: rollup.partialRecoveries,
+      fullRecoveries: rollup.fullRecoveries,
+      recoveryTokensSaved: rollup.recoveryTokensSaved,
+      supersededEvictions: rollup.supersededEvictions,
+      supersededTokensSaved: rollup.supersededTokensSaved,
+      trajectoryTriggeredEpochs: rollup.trajectoryTriggeredEpochs,
       supervisorCost,
       recoveryStats,
     };
@@ -1132,6 +1331,7 @@ export class ContextEvidenceLedger {
       (sum, item) => sum + (item.tokensSaved || 0),
       0,
     );
+    const rollup = this.#computeV26Rollup();
     return {
       discoveredCount: this.discovered.length,
       keptCount: this.kept.length,
@@ -1143,6 +1343,14 @@ export class ContextEvidenceLedger {
       admissionTokensSaved,
       supervisorCallsCount: this.supervisorCalls.length,
       recoveriesCount: this.recoveries.length,
+      epochsCount: this.epochs.length,
+      decisions: rollup.decisions,
+      partialRecoveries: rollup.partialRecoveries,
+      fullRecoveries: rollup.fullRecoveries,
+      recoveryTokensSaved: rollup.recoveryTokensSaved,
+      supersededEvictions: rollup.supersededEvictions,
+      supersededTokensSaved: rollup.supersededTokensSaved,
+      trajectoryTriggeredEpochs: rollup.trajectoryTriggeredEpochs,
     };
   }
 
@@ -1156,6 +1364,7 @@ export class ContextEvidenceLedger {
       admissions: [...this.admissions],
       supervisorCalls: [...this.supervisorCalls],
       recoveries: [...this.recoveries],
+      epochs: [...this.epochs],
       taskOutcome: this.taskOutcome ? { ...this.taskOutcome } : null,
       summary: this.summary(),
     };

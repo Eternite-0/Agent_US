@@ -11,8 +11,9 @@ import {
   traceRepositoryCalls,
   findCrossFileReferencesFromAnalysis,
   findRelatedTestsFromAnalysis,
+  querySymbolGraphFromAnalysis,
 } from './repo-symbols.js';
-export { findRepositorySymbols, traceRepositoryCalls };
+export { findRepositorySymbols, traceRepositoryCalls, querySymbolGraphFromAnalysis };
 import { promisify } from 'node:util';
 import { redactSecrets, sanitize } from './envelope.js';
 import {
@@ -2345,4 +2346,18 @@ export function findRelatedTests(indexOrRoot, filePaths, options = {}) {
     );
   }
   return findRelatedTestsFromAnalysis(indexOrRoot, filePaths, options);
+}
+
+export async function querySymbolGraph(indexOrRoot, options = {}) {
+  if (typeof indexOrRoot === 'string') {
+    if (options?.path && protectedRootPath(options.path)) {
+      throw new Error(`Access to protected path is prohibited: ${options.path}`);
+    }
+    const analysis = await analyzeRepositoryComplete(indexOrRoot, {
+      symbol: options?.symbol ?? '',
+      refresh: options?.refresh === true,
+    });
+    return querySymbolGraphFromAnalysis(analysis, options);
+  }
+  return querySymbolGraphFromAnalysis(indexOrRoot, options);
 }

@@ -277,9 +277,181 @@ export interface DiffSpan {
   changed: boolean;
 }
 
-interface SplitDiffRow {
+export interface SplitDiffRow {
   left: DiffLine | null;
   right: DiffLine | null;
+}
+
+export const DEFAULT_FOLD_THRESHOLD = 6;
+export const DEFAULT_FOLD_EDGE_CONTEXT = 3;
+
+export interface FoldRangeOptions {
+  threshold?: number;
+  keepEdge?: number;
+  revealLine?: number | null;
+}
+
+export type FoldedEntry<T> =
+  | { kind: 'item'; item: T; index: number }
+  | { kind: 'fold'; id: string; count: number; startIndex: number; endIndex: number };
+
+export interface DiffHunkAnchor {
+  index: number;
+  startLineIndex: number;
+  endLineIndex: number;
+  firstLine: DiffLine;
+  oldLine: number | null;
+  newLine: number | null;
+}
+
+function foldItemsByPredicate<T>(
+  items: readonly T[],
+  isContext: (item: T) => boolean,
+  matchesRevealLine: (item: T, line: number) => boolean,
+  expandedFoldIds: ReadonlySet<string>,
+  options?: FoldRangeOptions,
+): FoldedEntry<T>[] {
+  const threshold = Math.max(1, options?.threshold ?? DEFAULT_FOLD_THRESHOLD);
+  const keepEdge = Math.max(0, options?.keepEdge ?? DEFAULT_FOLD_EDGE_CONTEXT);
+  const revealLine = typeof options?.revealLine === 'number' && options.revealLine > 0 ? options.revealLine : null;
+
+  const out: FoldedEntry<T>[] = [];
+  let i = 0;
+  while (i < items.length) {
+    if (!isContext(items[i])) {
+      out.push({ kind: 'item', item: items[i], index: i });
+      i++;
+      continue;
+    }
+
+    const start = i;
+    while (i < items.length && isContext(items[i])) i++;
+    const end = i;
+    const len = end - start;
+
+    if (len <= threshold) {
+      for (let k = start; k < end; k++) out.push({ kind: 'item', item: items[k], index: k });
+      continue;
+    }
+
+    const hasChangeBefore = start > 0;
+    const hasChangeAfter = end < items.length;
+    const leadKeep = hasChangeBefore
+      ? Math.min(keepEdge, len)
+      : !hasChangeAfter
+        ? Math.min(keepEdge, len)
+        : 0;
+    const trailKeep = hasChangeAfter ? Math.min(keepEdge, Math.max(0, len - leadKeep)) : 0;
+    const foldStart = start + leadKeep;
+    const foldEnd = end - trailKeep;
+    const foldCount = foldEnd - foldStart;
+    const foldId = `fold:${start}:${end}`;
+
+    const revealsHidden =
+      revealLine !== null &&
+      foldCount > 0 &&
+      items.slice(foldStart, foldEnd).some((entry) => matchesRevealLine(entry, revealLine));
+
+    if (foldCount <= 0 || expandedFoldIds.has(foldId) || revealsHidden) {
+      for (let k = start; k < end; k++) out.push({ kind: 'item', item: items[k], index: k });
+      continue;
+    }
+
+    for (let k = start; k < foldStart; k++) out.push({ kind: 'item', item: items[k], index: k });
+    out.push({ kind: 'fold', id: foldId, count: foldCount, startIndex: foldStart, endIndex: foldEnd });
+    for (let k = foldEnd; k < end; k++) out.push({ kind: 'item', item: items[k], index: k });
+  }
+  return out;
+}
+
+export function foldDiffLines(
+  lines: readonly DiffLine[],
+  expandedFoldIds: ReadonlySet<string> = new Set(),
+  options?: FoldRangeOptions,
+): FoldedEntry<DiffLine>[] {
+  return foldItemsByPredicate(
+    lines,
+    (line) => line.kind === 'context',
+    (line, target) => line.newLine === target || line.oldLine === target,
+    expandedFoldIds,
+    options,
+  );
+}
+
+export function foldSplitDiffRows(
+  rows: readonly SplitDiffRow[],
+  expandedFoldIds: ReadonlySet<string> = new Set(),
+  options?: FoldRangeOptions,
+): FoldedEntry<SplitDiffRow>[] {
+  return foldItemsByPredicate(
+    rows,
+    (row) => Boolean(row.left && row.right && row.left.kind === 'context' && row.right.kind === 'context'),
+    (row, target) =>
+      row.left?.oldLine === target ||
+      row.left?.newLine === target ||
+      row.right?.oldLine === target ||
+      row.right?.newLine === target,
+    expandedFoldIds,
+    options,
+  );
+}
+
+export function extractDiffHunks(lines: readonly DiffLine[]): DiffHunkAnchor[] {
+  const hunks: DiffHunkAnchor[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].kind === 'context') {
+      i++;
+      continue;
+    }
+    const start = i;
+    let firstOld: number | null = null;
+    let firstNew: number | null = null;
+    while (i < lines.length && lines[i].kind !== 'context') {
+      if (firstOld === null && lines[i].oldLine !== null) firstOld = lines[i].oldLine;
+      if (firstNew === null && lines[i].newLine !== null) firstNew = lines[i].newLine;
+      i++;
+    }
+    const end = i - 1;
+    const firstLine = lines[start];
+    hunks.push({
+      index: hunks.length,
+      startLineIndex: start,
+      endLineIndex: end,
+      firstLine,
+      oldLine: firstOld,
+      newLine: firstNew,
+    });
+  }
+  return hunks;
+}
+
+export function stepHunkIndex(current: number, delta: number, total: number): number {
+  if (total <= 0) return 0;
+  const norm = ((current % total) + total) % total;
+  return (((norm + delta) % total) + total) % total;
+}
+
+export function isReducedMotionPreferred(): boolean {
+  if (typeof document !== 'undefined' && document.documentElement?.getAttribute('data-reduced-motion') === 'true') {
+    return true;
+  }
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+  return false;
+}
+
+export function scrollIntoViewSafe(
+  el: HTMLElement | null | undefined,
+  block: ScrollLogicalPosition = 'center',
+): void {
+  if (!el || typeof el.scrollIntoView !== 'function') return;
+  el.scrollIntoView({
+    block,
+    inline: 'nearest',
+    behavior: isReducedMotionPreferred() ? 'auto' : 'smooth',
+  });
 }
 
 const MAX_ALIGNMENT_CELLS = 256;

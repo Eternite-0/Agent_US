@@ -652,7 +652,7 @@ test('ContextEvidenceLedger.mergeFrom is idempotent, toSharedDigest & buildShare
     const session = runtime.createSession({ model: 'main-test-model', workspaceRoot: workDir });
     const { turn } = runtime.startTurn(session.id, {
       input: 'Read src/small.js and summarize without losing context across retry.',
-      aciProfile: 'full_aci',
+      aciProfile: 'aci_25',
       aciOptions: { admissionMinChars: 1200 },
     });
 
@@ -675,7 +675,7 @@ test('ContextEvidenceLedger.mergeFrom is idempotent, toSharedDigest & buildShare
       rm.aciMetrics.ledger.admissions.length >= 1,
       'ACI admissions from attempt 1 must survive mid-turn retry',
     );
-    assert.equal(rm.aciMetrics.aciProfile, 'full_aci');
+    assert.equal(rm.aciMetrics.aciProfile, 'aci_25');
     assert.equal(rm.aciMetrics.dtocPolicy, 'phase_watermark_v25');
     assert.ok(data.budgetWatermarks, 'TURN_COMPLETED must carry budgetWatermarks');
   } finally {
@@ -870,8 +870,8 @@ test('Post-test completion reserve gates non-essential tools, runs Stage-1 stale
           arguments: JSON.stringify({ command: 'node --test test/app.test.js' }),
         },
       };
-      // Consume enough tokens that remaining (~5000) <= completionReserveTokens (~9000) while unpruned prompt > 5000!
-      yield { type: 'usage', usage: { inputTokens: 10600, outputTokens: 1000 } };
+      // Consume enough tokens that remaining (~5500) <= completionReserveTokens (~9000) while unpruned prompt > 5500!
+      yield { type: 'usage', usage: { inputTokens: 10100, outputTokens: 1000 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }

@@ -1,5 +1,8 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import type { AciTurnTelemetry } from '../types/backend';
+import { sumAdmissionDecisions } from '../utils/aciTelemetry.ts';
 import { directToolOutput, reasoningHeadline, type DirectTimelineBlock, type DirectToolActivity, type DirectTurnTiming } from '../utils/directMessages';
+import { fmtTokens } from '../utils/format';
 import {
   ActivityDisclosureScope, ActivityStatusText, ActivityToolRow, activityToolKind, activityToolLabels,
   toolActionLabel, toolDisclosureId, useActivityDisclosure, useAnyExplicitActivityOpen, type ActivityStatus,
@@ -49,7 +52,7 @@ function presentTool(row: DirectToolActivity) {
 
 export function DirectActivityGroup({ block, onInspectFile, onCopy }: {
   block: Extract<DirectTimelineBlock, { kind: 'activity' }>;
-  onInspectFile?: (path: string) => void;
+  onInspectFile?: (path: string, line?: number) => void;
   onCopy?: (msg: string) => void;
 }) {
   const panelId = useId();
@@ -162,5 +165,70 @@ function DirectProcessPanel({ activityId, active, timing, children, blocks, fina
         )) : <Collapsible open={open && hasProcess} keepMounted>{children}</Collapsible>}
       </div>
     </>
+  );
+}
+
+const ADMISSION_LEVELS = ['DIRECT', 'SUPPORTING', 'DEFER', 'DUPLICATE', 'IRRELEVANT'] as const;
+
+export function AciTurnTelemetryStrip({ telemetry }: { telemetry: AciTurnTelemetry }) {
+  const totalDecisions = sumAdmissionDecisions(telemetry.admissionDecisions);
+  const bw = telemetry.budgetWatermarks;
+  const hasWatermarks = Boolean(
+    bw && (bw.usedTokens !== undefined || bw.dtocWatermark !== undefined || bw.projectedTotalTokens !== undefined || bw.postTestReserveActive),
+  );
+  const hasRecovery = telemetry.partialRecoveries > 0 || telemetry.fullRecoveries > 0;
+  const hasEviction = telemetry.supersededEvictions > 0 || telemetry.trajectoryTriggeredEpochs > 0;
+  const hasCircuit = telemetry.supervisorCircuitOpen !== undefined;
+
+  if (!totalDecisions && !hasWatermarks && !hasRecovery && !hasEviction && !hasCircuit) {
+    return null;
+  }
+
+  return (
+    <div className="codex-aci-telemetry" aria-label="单轮 ACI 上下文治理遥测">
+      {totalDecisions > 0 && (
+        <span className="codex-aci-group" aria-label="5 级准入分布">
+          <span className="codex-aci-label">准入</span>
+          {ADMISSION_LEVELS.map((level) => (
+            <span key={level} className="codex-aci-pill tabular-nums" data-level={level}>
+              {level} {telemetry.admissionDecisions[level]}
+            </span>
+          ))}
+        </span>
+      )}
+      {telemetry.partialRecoveries > 0 && (
+        <span className="codex-aci-pill tabular-nums" data-tone="accent">
+          局部恢复 {telemetry.partialRecoveries} 次 · 省 {fmtTokens(telemetry.recoveryTokensSaved)} tok
+        </span>
+      )}
+      {telemetry.fullRecoveries > 0 && (
+        <span className="codex-aci-pill tabular-nums">
+          全量恢复 {telemetry.fullRecoveries} 次
+        </span>
+      )}
+      {hasEviction && (
+        <span className="codex-aci-pill tabular-nums">
+          过期驱逐 {telemetry.supersededEvictions} 次
+          {telemetry.supersededTokensSaved > 0 ? ` · 省 ${fmtTokens(telemetry.supersededTokensSaved)} tok` : ''}
+        </span>
+      )}
+      {hasCircuit && (
+        <span className="codex-aci-pill" data-tone={telemetry.supervisorCircuitOpen ? 'warning' : 'success'}>
+          {telemetry.supervisorCircuitOpen ? 'Supervisor 熔断开启' : 'Supervisor 正常'}
+        </span>
+      )}
+      {hasWatermarks && bw && (
+        <span className="codex-aci-pill tabular-nums">
+          {bw.usedTokens !== undefined && bw.maxTokens !== undefined
+            ? `预算 ${fmtTokens(bw.usedTokens)}/${fmtTokens(bw.maxTokens)}`
+            : '水位'}
+          {bw.projectedTotalTokens !== undefined ? ` · 预测 ${fmtTokens(bw.projectedTotalTokens)}` : ''}
+          {bw.dtocWatermark !== undefined
+            ? ` · DTOC ${bw.dtocWatermark <= 2 ? `${Math.round(bw.dtocWatermark * 100)}%` : `${fmtTokens(bw.dtocWatermark)}`}`
+            : ''}
+          {bw.postTestReserveActive ? ' · 完工保留已激活' : ''}
+        </span>
+      )}
+    </div>
   );
 }

@@ -48,9 +48,43 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(SCRIPT_DIR, '..', '..');
 const VALID_ARMS = new Set(['A', 'B', 'C', 'D']);
 const TRIAL_HEADER_NAME = 'x-agent-us-bench-trial';
+const SUPERVISOR_WIRE_MARKER = 'Supervisor for Adaptive Context Intelligence (ACI)';
 const TRIAL_FETCH_ALS = new AsyncLocalStorage();
 const ACTIVE_FETCH_CAPTURES = new Map();
 let baseOriginalFetch = null;
+
+function extractWireMessageText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          return extractWireMessageText(item.text ?? item.content ?? '');
+        }
+        return '';
+      })
+      .join('\n');
+  }
+  if (content && typeof content === 'object') {
+    return extractWireMessageText(content.text ?? content.content ?? '');
+  }
+  return '';
+}
+
+export function isAciSupervisorWireRequest(parsedReq) {
+  if (!parsedReq || typeof parsedReq !== 'object') return false;
+  if (Array.isArray(parsedReq.tools) && parsedReq.tools.length > 0) return false;
+  if (extractWireMessageText(parsedReq.system).includes(SUPERVISOR_WIRE_MARKER)) {
+    return true;
+  }
+  const messages = Array.isArray(parsedReq.messages) ? parsedReq.messages : [];
+  return messages.some(
+    (msg) =>
+      (msg?.role === 'system' || msg?.role === 'developer') &&
+      extractWireMessageText(msg.content).includes(SUPERVISOR_WIRE_MARKER),
+  );
+}
 
 function printUsage() {
   console.log([
@@ -59,7 +93,7 @@ function printUsage() {
     'Options:',
     '  --mode <deterministic|real>         Evaluation mode (default: deterministic)',
     '  --arms <A,B,C,D>                    Comma-separated arms (default: A,B,C,D)',
-    '  --suite <aci|aci25|ar|all>          Dataset suite (default: aci)',
+    '  --suite <aci|aci25|aci26|ar|all>    Dataset suite (default: aci)',
     '  --tasks <all|id1,id2,...>           Task filter (default: all)',
     '  --repeats <n>                       Repeats per task (1..20, default: 1)',
     '  --concurrency <n>                   Concurrent isolated trials 1..16 (default: 1)',
@@ -67,9 +101,11 @@ function printUsage() {
     '  --lane <idx>                        Worker shard index (default: 0)',
     '  --lanes <count>                     Worker shard count (default: 1)',
     '  --output <path>                     JSONL output path (also writes -summary.json)',
+    '  --archive-dir <dir>                 Archive directory for sanitized jsonl/summary/md/tex',
+    '  --archive-prefix <name>             Archive filename prefix (default: aci-<suite>-ablation)',
     '  --export-paper <path>               Write Markdown paper tables (or LaTeX if .tex)',
     '  --export-latex <path>               Write LaTeX paper tables',
-    '  --aci-profile <full_aci|aci_25>     Override Arm D ACI profile label',
+    '  --aci-profile <full_aci|aci_25|aci_26>  Override Arm D ACI profile label',
     '  --dtoc-policy <policy>              Optional DTOC policy override',
     '  --max-steps <n>                     Override max steps per turn',
     '  --max-tokens <n>                    Override max total tokens per turn',
@@ -126,32 +162,61 @@ export function loadResumeStateFromJsonl(outputPath) {
 
 export function resolveArmProfileConfig(
   arm,
-  { dtocMinPromptTokens = 24000, aciProfile = null, dtocPolicy = null } = {},
+  { dtocMinPromptTokens = 24000, aciProfile = null, dtocPolicy = null, suite = 'aci' } = {},
 ) {
   const key = String(arm || 'A').trim().toUpperCase();
   const profile = ACI_ARM_PROFILES[key];
   if (!profile) {
     throw new Error(`Unsupported arm "${arm}"; expected A, B, C, or D`);
   }
+  const cleanProfile = aciProfile ? String(aciProfile).trim() : null;
   const resolvedProfile =
-    key === 'D' && aciProfile && ['full_aci', 'aci_25'].includes(String(aciProfile).trim())
-      ? normalizeAciProfileName(aciProfile)
+    key === 'D' && cleanProfile && ['full_aci', 'aci_25', 'aci_26'].includes(cleanProfile)
+      ? normalizeAciProfileName(cleanProfile)
       : profile.aciProfile;
+  const cleanSuite = String(suite || 'aci').trim().toLowerCase();
+  const explicitPolicy = dtocPolicy ? String(dtocPolicy).trim() : null;
+  let effectiveDtocPolicy = explicitPolicy;
+  if (!effectiveDtocPolicy && key === 'D') {
+    if (
+      (cleanSuite === 'aci26' || cleanSuite === 'all' || resolvedProfile === 'aci_26') &&
+      resolvedProfile !== 'aci_25'
+    ) {
+      effectiveDtocPolicy = 'trajectory_eviction_v26';
+    } else if (cleanSuite === 'aci25' || resolvedProfile === 'aci_25') {
+      effectiveDtocPolicy = 'phase_watermark_v25';
+    }
+  }
   return {
     arm: profile.arm,
     aciProfile: resolvedProfile,
+    supervisor: key === 'C' || key === 'D',
     aciOptions: {
       dtocMinPromptTokens: Number(dtocMinPromptTokens) || 24000,
-      ...(dtocPolicy ? { dtocPolicy: String(dtocPolicy).trim() } : {}),
+      ...(effectiveDtocPolicy ? { dtocPolicy: effectiveDtocPolicy } : {}),
     },
   };
 }
 
 export function resolveBenchmarkTaskMaxTokens(task, opts = {}) {
-  return opts?.maxTokens ?? task?.resourceBudget?.maxTokens ?? 160_000;
+  return opts?.maxTokens ?? task?.resourceBudget?.maxTotalTokens ?? task?.resourceBudget?.maxTokens ?? 160_000;
 }
 
-export function mergeSupervisorCostTelemetry(rawSupCost = {}, wireSup = [], fallbackCalls = 0) {
+export function mergeSupervisorCostTelemetry(
+  rawSupCost = {},
+  wireSup = [],
+  fallbackCalls = 0,
+  opts = {},
+) {
+  const supervisorDisabled =
+    opts === false ||
+    opts?.supervisorEnabled === false ||
+    opts?.supervisor === false ||
+    opts?.disabled === true;
+  if (supervisorDisabled) {
+    return { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 0, fallbackCount: 0 };
+  }
+
   const wireList = Array.isArray(wireSup) ? wireSup : [];
   const supInput = wireList.reduce((s, r) => s + (Number(r?.inputTokens ?? 0) || 0), 0);
   const supOutput = wireList.reduce((s, r) => s + (Number(r?.outputTokens ?? 0) || 0), 0);
@@ -186,6 +251,8 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
     lane: 0,
     lanes: 1,
     output: null,
+    archiveDir: null,
+    archivePrefix: null,
     exportPaper: null,
     exportLatex: null,
     aciProfile: null,
@@ -230,6 +297,10 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--lanes=')) opts.lanes = Number(arg.slice('--lanes='.length));
     else if (arg === '--output') opts.output = String(nextVal());
     else if (arg.startsWith('--output=')) opts.output = arg.slice('--output='.length);
+    else if (arg === '--archive-dir') opts.archiveDir = String(nextVal());
+    else if (arg.startsWith('--archive-dir=')) opts.archiveDir = arg.slice('--archive-dir='.length);
+    else if (arg === '--archive-prefix') opts.archivePrefix = String(nextVal());
+    else if (arg.startsWith('--archive-prefix=')) opts.archivePrefix = arg.slice('--archive-prefix='.length);
     else if (arg === '--export-paper') opts.exportPaper = String(nextVal());
     else if (arg.startsWith('--export-paper=')) opts.exportPaper = arg.slice('--export-paper='.length);
     else if (arg === '--export-latex') opts.exportLatex = String(nextVal());
@@ -252,8 +323,8 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
   if (!['deterministic', 'real'].includes(opts.mode)) {
     throw new Error(`Unsupported --mode "${opts.mode}"; expected deterministic or real`);
   }
-  if (!['aci', 'aci25', 'ar', 'all'].includes(opts.suite)) {
-    throw new Error(`Unsupported --suite "${opts.suite}"; expected aci, aci25, ar, or all`);
+  if (!['aci', 'aci25', 'aci26', 'ar', 'all'].includes(opts.suite)) {
+    throw new Error(`Unsupported --suite "${opts.suite}"; expected aci, aci25, aci26, ar, or all`);
   }
   if (!opts.arms.length || opts.arms.some((a) => !VALID_ARMS.has(a))) {
     throw new Error(`Invalid --arms "${opts.arms.join(',')}"; expected subset of A,B,C,D`);
@@ -277,8 +348,15 @@ export function parseAciCliArgs(argv = process.argv.slice(2)) {
   if (opts.maxTokens !== null && (!Number.isInteger(opts.maxTokens) || opts.maxTokens < 1024)) {
     throw new Error('--max-tokens must be an integer >= 1024');
   }
-  if (opts.aciProfile !== null && !['full_aci', 'aci_25'].includes(opts.aciProfile.trim())) {
-    throw new Error('--aci-profile must be full_aci or aci_25');
+  if (opts.aciProfile !== null && !['full_aci', 'aci_25', 'aci_26'].includes(opts.aciProfile.trim())) {
+    throw new Error('--aci-profile must be full_aci or aci_25 (or aci_26)');
+  }
+  if (opts.archivePrefix !== null) {
+    const cleanPrefix = opts.archivePrefix.trim();
+    if (!cleanPrefix || cleanPrefix.includes('..') || !/^[A-Za-z0-9._-]+$/.test(cleanPrefix)) {
+      throw new Error('--archive-prefix must be a safe filename prefix matching /^[A-Za-z0-9._-]+$/');
+    }
+    opts.archivePrefix = cleanPrefix;
   }
   return opts;
 }
@@ -382,6 +460,11 @@ export async function probeAciRuntimeCapabilities(repoRoot = DEFAULT_REPO_ROOT) 
         aciEngineMod?.PHASE_WATERMARK_V25 ||
         aciEngineMod?.ACI_25_VERSION,
     ),
+    trajectoryEvictionV26: Boolean(
+      aciEngineMod?.TRAJECTORY_EVICTION_V26_DTOC_POLICY ||
+        aciEngineMod?.DTOC_POLICIES?.trajectory_eviction_v26 ||
+        aciEngineMod?.VALID_DTOC_POLICIES?.includes?.('trajectory_eviction_v26'),
+    ),
   };
 
   return {
@@ -420,11 +503,13 @@ function getTaskDataset(opts) {
           suite: opts.suite,
         });
   const arTasks =
-    opts.suite === 'aci' || opts.suite === 'aci25'
+    opts.suite === 'aci' || opts.suite === 'aci25' || opts.suite === 'aci26'
       ? []
       : createAutonomousReasoningDataset({ sandboxOptions: buildSandboxOptions(opts.sandbox) });
+  const fallbackSuite =
+    opts.suite === 'aci26' ? 'aci26' : opts.suite === 'aci25' ? 'aci25' : 'aci';
   const combined = [
-    ...aciTasks.map((t) => ({ ...t, _suite: t.suite || (opts.suite === 'aci25' ? 'aci25' : 'aci') })),
+    ...aciTasks.map((t) => ({ ...t, _suite: t.suite || fallbackSuite })),
     ...arTasks.map((t) => ({ ...t, _suite: 'ar' })),
   ];
   if (!opts.tasks) return combined;
@@ -956,12 +1041,78 @@ function buildArmAdmissionTelemetry({
   return { admissions, supervisorCalls, recoveries };
 }
 
+function extractTrial26Telemetry({ aciMetrics = {}, reasoningMetrics = {}, ledger = null } = {}) {
+  const rawDecisions =
+    aciMetrics?.admissionDecisions ?? aciMetrics?.decisions ?? ledger?.decisionCounts ?? null;
+  const decisions = { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 };
+  const hasExplicit =
+    rawDecisions &&
+    typeof rawDecisions === 'object' &&
+    ['DIRECT', 'SUPPORTING', 'DEFER', 'DUPLICATE', 'IRRELEVANT'].some(
+      (k) => Number(rawDecisions[k] || 0) > 0,
+    );
+  if (hasExplicit) {
+    for (const k of Object.keys(decisions)) {
+      decisions[k] = Math.max(0, Math.trunc(Number(rawDecisions[k] ?? 0) || 0));
+    }
+  } else if (Array.isArray(ledger?.admissions)) {
+    for (const adm of ledger.admissions) {
+      const k = String(adm?.decision || '').toUpperCase();
+      if (Object.hasOwn(decisions, k)) decisions[k] += 1;
+    }
+  }
+  const rawAnti =
+    reasoningMetrics?.antiThrashingTriggered ?? aciMetrics?.antiThrashingTriggered ?? 0;
+  const antiThrashingTriggered =
+    typeof rawAnti === 'boolean'
+      ? rawAnti
+        ? 1
+        : 0
+      : Math.max(0, Math.trunc(Number(rawAnti) || 0));
+
+  return {
+    supersededEvictions: Math.max(
+      0,
+      Math.trunc(Number(aciMetrics?.supersededEvictions ?? ledger?.supersededEvictions ?? 0) || 0),
+    ),
+    supersededTokensSaved: Math.max(
+      0,
+      Math.trunc(Number(aciMetrics?.supersededTokensSaved ?? ledger?.supersededTokensSaved ?? 0) || 0),
+    ),
+    partialRecoveries: Math.max(
+      0,
+      Math.trunc(
+        Number(
+          aciMetrics?.partialRecoveries ??
+            aciMetrics?.recoveryStats?.partialRecoveries ??
+            ledger?.partialRecoveries ??
+            0,
+        ) || 0,
+      ),
+    ),
+    recoveryTokensSaved: Math.max(
+      0,
+      Math.trunc(
+        Number(
+          aciMetrics?.recoveryTokensSaved ??
+            aciMetrics?.recoveryStats?.recoveryTokensSaved ??
+            ledger?.recoveryTokensSaved ??
+            0,
+        ) || 0,
+      ),
+    ),
+    antiThrashingTriggered,
+    decisions,
+  };
+}
+
 async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, judgeSandbox }) {
   const started = performance.now();
   const armCfg = resolveArmProfileConfig(armName, {
     dtocMinPromptTokens: opts.dtocMinPromptTokens,
     aciProfile: opts.aciProfile,
     dtocPolicy: opts.dtocPolicy,
+    suite: opts.suite,
   });
   const trialNonce = randomUUID().slice(0, 8);
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-aci-det-${armName}-${trialNonce}-`));
@@ -1030,7 +1181,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       supervisor,
       contextWindow: 128_000,
       maxTotalTokens: resolveBenchmarkTaskMaxTokens(task, opts),
-      dtocPolicy: opts.dtocPolicy || 'adaptive_single_step',
+      dtocPolicy: armCfg.aciOptions?.dtocPolicy || opts.dtocPolicy || 'adaptive_single_step',
       dtocMinPromptTokens: opts.dtocMinPromptTokens,
     });
 
@@ -1101,7 +1252,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       if (tool === 'bash') {
         return { allowed: allowedBashCmds.has(String(args?.command ?? '').trim()), argsDigest };
       }
-      if (['write_file', 'edit_file', 'apply_patch', 'read_file', 'expand_context'].includes(tool)) {
+      if (['write_file', 'edit_file', 'apply_patch', 'read_file', 'expand_context', 'query_symbol_graph', 'run_diagnostics'].includes(tool)) {
         return { allowed: true, argsDigest };
       }
       return { allowed: false, argsDigest };
@@ -1183,19 +1334,35 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
     });
     const existingRm = loopResult.reasoningMetrics ?? {};
     const existingAci = existingRm.aciMetrics ?? {};
-    const supCallsArr = telemetry.supervisorCalls;
+    const supervisorDisabled = armName === 'A' || armName === 'B' || armCfg?.supervisor === false;
+    const supCallsArr = supervisorDisabled ? [] : telemetry.supervisorCalls;
     const supTokensIn = supCallsArr.reduce((s, c) => s + Number(c.inputTokens || 0), 0);
     const supTokensOut = supCallsArr.reduce((s, c) => s + Number(c.outputTokens || 0), 0);
     const supDurMs = supCallsArr.reduce((s, c) => s + Number(c.durationMs || 0), 0);
-    const supervisorCost = existingAci.supervisorCost && Number(existingAci.supervisorCost.calls ?? 0) >= supCallsArr.length
-      ? existingAci.supervisorCost
-      : {
-          calls: supCallsArr.length,
-          inputTokens: supTokensIn,
-          outputTokens: supTokensOut,
-          totalTokens: supTokensIn + supTokensOut,
-          durationMs: supDurMs,
-        };
+    const supervisorCost = supervisorDisabled
+      ? { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 0, fallbackCount: 0 }
+      : existingAci.supervisorCost && Number(existingAci.supervisorCost.calls ?? 0) >= supCallsArr.length
+        ? existingAci.supervisorCost
+        : {
+            calls: supCallsArr.length,
+            inputTokens: supTokensIn,
+            outputTokens: supTokensOut,
+            totalTokens: supTokensIn + supTokensOut,
+            durationMs: supDurMs,
+            fallbackCount: 0,
+          };
+
+    const ledgerSnapshot = {
+      ...(existingAci.ledger ?? {}),
+      admissions: telemetry.admissions,
+      supervisorCalls: supCallsArr,
+      recoveries: telemetry.recoveries,
+    };
+    const v26Telemetry = extractTrial26Telemetry({
+      aciMetrics: existingAci,
+      reasoningMetrics: existingRm,
+      ledger: ledgerSnapshot,
+    });
 
     const baseIn = Number(loopResult.usage?.inputTokens ?? 0);
     const baseOut = Number(loopResult.usage?.outputTokens ?? 0);
@@ -1226,6 +1393,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       sseCacheReported: baseCacheRead > 0,
       durationMs,
       supervisorCost,
+      ...v26Telemetry,
       aciMetrics: {
         ...existingAci,
         aciProfile: armCfg.aciProfile,
@@ -1242,13 +1410,9 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
           Number(existingAci.hashVerifiedRestores ?? 0),
           telemetry.recoveries.filter((r) => r.verified !== false).length,
         ),
+        ...v26Telemetry,
         supervisorCost,
-        ledger: {
-          ...(existingAci.ledger ?? {}),
-          admissions: telemetry.admissions,
-          supervisorCalls: supCallsArr,
-          recoveries: telemetry.recoveries,
-        },
+        ledger: ledgerSnapshot,
       },
       failureCategory: judgment.evidence.failureCategory,
       failureAttribution: judgment.evidence.failureAttribution,
@@ -1333,7 +1497,7 @@ function acquireFetchWireCapture(trialId, endpoint, wireRecords, pendingWireProm
       if (typeof cleanInit?.body === 'string') {
         try {
           const parsedReq = JSON.parse(cleanInit.body);
-          isSupervisorCall = !Array.isArray(parsedReq?.tools) || parsedReq.tools.length === 0;
+          isSupervisorCall = isAciSupervisorWireRequest(parsedReq);
         } catch {
           isSupervisorCall = false;
         }
@@ -1411,7 +1575,7 @@ function authorizeAciBenchmarkApproval({
   protectedSet,
   allowWorkspaceNodeCli,
 }) {
-  if (toolName === 'run_diagnostics') return true;
+  if (toolName === 'run_diagnostics' || toolName === 'query_symbol_graph') return true;
   if (
     authorizeRealBenchmarkApproval({
       toolName,
@@ -1476,6 +1640,7 @@ async function runRealAciTrial({
     dtocMinPromptTokens: opts.dtocMinPromptTokens,
     aciProfile: opts.aciProfile,
     dtocPolicy: opts.dtocPolicy,
+    suite: opts.suite,
   });
   const trialId = `${task.id}--${armName}--${rep}--${randomUUID().slice(0, 8)}`;
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-aci-real-${armName}-${trialId.slice(-8)}-`));
@@ -1642,7 +1807,11 @@ async function runRealAciTrial({
         },
       });
 
-      const wireSup = wireRecords.filter((r) => r.isSupervisorCall);
+      const supervisorDisabled =
+        armName === 'A' || armName === 'B' || armCfg?.supervisor === false;
+      const wireSup = supervisorDisabled
+        ? []
+        : wireRecords.filter((r) => r.isSupervisorCall);
 
       let inputTokens = wireRecords.reduce((s, r) => s + r.inputTokens, 0);
       let outputTokens = wireRecords.reduce((s, r) => s + r.outputTokens, 0);
@@ -1659,9 +1828,10 @@ async function runRealAciTrial({
       const aciMetrics = rm.aciMetrics ?? {};
       const rawSupCost = aciMetrics.supervisorCost ?? {};
       const supervisorCost = mergeSupervisorCostTelemetry(
-        rawSupCost,
+        supervisorDisabled ? {} : rawSupCost,
         wireSup,
-        aciMetrics.supervisorCalls,
+        supervisorDisabled ? 0 : aciMetrics.supervisorCalls,
+        { supervisorEnabled: !supervisorDisabled },
       );
       const hasLedgerAdmissions = Array.isArray(aciMetrics?.ledger?.admissions) && aciMetrics.ledger.admissions.length > 0;
       const readFallback = extractReadAdmissionsFromTurnData({
@@ -1669,6 +1839,11 @@ async function runRealAciTrial({
         eventRows,
         assistantMessageRows,
         filesRead: rm.filesRead ?? [],
+      });
+      const v26Telemetry = extractTrial26Telemetry({
+        aciMetrics,
+        reasoningMetrics: rm,
+        ledger: aciMetrics.ledger ?? null,
       });
 
       return {
@@ -1696,6 +1871,7 @@ async function runRealAciTrial({
         sseCacheReported,
         durationMs,
         supervisorCost,
+        ...v26Telemetry,
         recoveryStats: aciMetrics.recoveryStats ?? null,
         readFiles: Array.isArray(rm.filesRead) ? rm.filesRead : [],
         fileTokensMap: readFallback.fileTokensMap,
@@ -1704,6 +1880,7 @@ async function runRealAciTrial({
         reasoningMetrics: rm,
         aciMetrics: {
           ...aciMetrics,
+          ...v26Telemetry,
           supervisorCost,
         },
         assistantExcerpt: safeRedactValue(String(assistantMsgs?.content ?? '').slice(0, 600), benchKey),
@@ -1752,19 +1929,26 @@ export async function runAciGovernanceBenchmark(opts) {
   const dataset = getTaskDataset(opts);
   const armRuntime = await probeAciRuntimeCapabilities(DEFAULT_REPO_ROOT);
 
-  const resumeEnabled = Boolean(opts.resume && opts.output);
+  const archiveDir = opts.archiveDir ? resolve(String(opts.archiveDir)) : null;
+  const archivePrefix = archiveDir
+    ? String(opts.archivePrefix || `aci-${opts.suite}-ablation`).trim()
+    : null;
+  const archiveJsonlPath = archiveDir ? join(archiveDir, `${archivePrefix}.jsonl`) : null;
+  const effectiveOutputPath = opts.output ? resolve(String(opts.output)) : archiveJsonlPath;
+
+  const resumeEnabled = Boolean(opts.resume && effectiveOutputPath);
   const resumeState = resumeEnabled
-    ? loadResumeStateFromJsonl(opts.output)
+    ? loadResumeStateFromJsonl(effectiveOutputPath)
     : { existingRows: [], completedKeys: new Set(), hadCorruptLines: false };
 
-  if (opts.output) {
-    mkdirSync(dirname(opts.output), { recursive: true });
-    if (!resumeEnabled || !existsSync(opts.output)) {
-      writeFileSync(opts.output, '', { encoding: 'utf8', mode: 0o600 });
+  if (effectiveOutputPath) {
+    mkdirSync(dirname(effectiveOutputPath), { recursive: true });
+    if (!resumeEnabled || !existsSync(effectiveOutputPath)) {
+      writeFileSync(effectiveOutputPath, '', { encoding: 'utf8', mode: 0o600 });
     } else {
-      const existingRaw = readFileSync(opts.output, 'utf8');
+      const existingRaw = readFileSync(effectiveOutputPath, 'utf8');
       if (existingRaw.length > 0 && !existingRaw.endsWith('\n')) {
-        appendFileSync(opts.output, '\n', { encoding: 'utf8', mode: 0o600 });
+        appendFileSync(effectiveOutputPath, '\n', { encoding: 'utf8', mode: 0o600 });
       }
     }
   }
@@ -1808,7 +1992,7 @@ export async function runAciGovernanceBenchmark(opts) {
               opts,
               judgeSandbox,
             });
-      writeJsonlRow(opts.output, trial, benchKey);
+      writeJsonlRow(effectiveOutputPath, trial, benchKey);
       return trial;
     },
   );
@@ -1816,12 +2000,17 @@ export async function runAciGovernanceBenchmark(opts) {
   const allTrials = [...resumeState.existingRows, ...newlyCompleted];
   const baselineArm = opts.arms.includes('A') ? 'A' : opts.arms[0];
   const metrics = computeAciGovernanceMetrics(allTrials, { baselineArm });
+  const createdAt = new Date().toISOString();
+  const effectiveModel =
+    requestedModel || (opts.mode === 'deterministic' ? 'deterministic-probe' : null);
   const summary = safeRedactValue(
     {
       benchmarkId: ACI_GOVERNANCE_BENCHMARK_ID,
       version: VERSION,
       mode: opts.mode,
       suite: opts.suite,
+      model: effectiveModel,
+      createdAt,
       sandboxBackend: judgeSandbox.resolveBackend().mode,
       concurrency: opts.concurrency ?? 1,
       resumed: resumeEnabled,
@@ -1835,6 +2024,7 @@ export async function runAciGovernanceBenchmark(opts) {
             dtocMinPromptTokens: opts.dtocMinPromptTokens,
             aciProfile: opts.aciProfile,
             dtocPolicy: opts.dtocPolicy,
+            suite: opts.suite,
           }),
         ]),
       ),
@@ -1844,6 +2034,13 @@ export async function runAciGovernanceBenchmark(opts) {
     },
     benchKey,
   );
+
+  const scrubText = (txt) => {
+    const clean = benchKey ? String(txt ?? '').split(benchKey).join('[REDACTED]') : String(txt ?? '');
+    return redactSecrets(clean);
+  };
+  const markdownTable = scrubText(exportPaperTablesMarkdown(summary));
+  const latexTable = scrubText(exportPaperTablesLatex(summary));
 
   const summaryPath = buildSummaryOutputPath(opts.output);
   if (summaryPath) {
@@ -1857,15 +2054,37 @@ export async function runAciGovernanceBenchmark(opts) {
   if (opts.exportPaper) {
     const outPath = resolve(String(opts.exportPaper));
     mkdirSync(dirname(outPath), { recursive: true });
-    const content = /\.tex$/i.test(outPath)
-      ? exportPaperTablesLatex(summary)
-      : exportPaperTablesMarkdown(summary);
+    const content = /\.tex$/i.test(outPath) ? latexTable : markdownTable;
     writeFileSync(outPath, content, { encoding: 'utf8', mode: 0o600 });
   }
   if (opts.exportLatex) {
     const texPath = resolve(String(opts.exportLatex));
     mkdirSync(dirname(texPath), { recursive: true });
-    writeFileSync(texPath, exportPaperTablesLatex(summary), { encoding: 'utf8', mode: 0o600 });
+    writeFileSync(texPath, latexTable, { encoding: 'utf8', mode: 0o600 });
+  }
+
+  if (archiveDir && archivePrefix) {
+    mkdirSync(archiveDir, { recursive: true });
+    const sanitizedJsonl =
+      allTrials.map((row) => JSON.stringify(safeRedactValue(row, benchKey))).join('\n') +
+      (allTrials.length > 0 ? '\n' : '');
+    writeFileSync(join(archiveDir, `${archivePrefix}.jsonl`), sanitizedJsonl, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    writeFileSync(
+      join(archiveDir, `${archivePrefix}-summary.json`),
+      JSON.stringify(summary, null, 2) + '\n',
+      { encoding: 'utf8', mode: 0o600 },
+    );
+    writeFileSync(join(archiveDir, `${archivePrefix}-paper-tables.md`), markdownTable, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    writeFileSync(join(archiveDir, `${archivePrefix}-paper-tables.tex`), latexTable, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
   }
 
   return summary;

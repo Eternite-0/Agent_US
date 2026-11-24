@@ -35,6 +35,7 @@ const NON_ESSENTIAL_POST_TEST_TOOLS = new Set([
   'grep',
   'glob',
   'inspect_repository',
+  'query_symbol_graph',
   'search_history',
   'expand_context',
   'update_plan',
@@ -508,16 +509,19 @@ export class AgentLoop {
       : resolvedInitialSup?.effectiveModel ?? null;
     const rawAciCritical = aci?.criticalFiles ?? execution?.evidenceContract?.requiredChangedFiles ?? [];
     const resolvedAciCriticalFiles = resolveBaselineCriticalFiles(workspaceRoot, rawAciCritical);
-    const syncAciMetrics = () => {
-      if (!aci?.engine && !aci?.aciStore && !aci?.ledger) return;
-      const refs = aci.aciStore?.listRefs?.() ?? [];
-      const ledgerSummary = aci.ledger?.summary?.() ?? {
+    let latestAciSnapshot = null;
+    const syncAciMetrics = (watermarksSnapshot = null) => {
+      if (!aci?.engine && !aci?.aciStore && !aci?.ledger && !reasoningTracker._antiThrashingTriggered) {
+        return null;
+      }
+      const refs = aci?.aciStore?.listRefs?.() ?? [];
+      const ledgerSummary = aci?.ledger?.summary?.() ?? {
         compressedCount: 0,
         expandedCount: 0,
         totalTokensSaved: 0,
         admissionTokensSaved: 0,
       };
-      const admissions = aci.ledger?.admissions ?? [];
+      const admissions = aci?.ledger?.admissions ?? [];
       const admissionDecisions = { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 };
       let admissionOriginalTokens = 0;
       let admissionInjectedTokens = 0;
@@ -530,16 +534,59 @@ export class AgentLoop {
         admissionInjectedTokens += Number(a?.injectedTokens || 0);
         admissionSavedTokens += Number(a?.tokensSaved || 0);
       }
-      const recoveries = aci.ledger?.recoveries ?? [];
+      const decisions = ledgerSummary.decisions
+        ? {
+            DIRECT: Number(ledgerSummary.decisions.DIRECT || 0),
+            SUPPORTING: Number(ledgerSummary.decisions.SUPPORTING || 0),
+            DEFER: Number(ledgerSummary.decisions.DEFER || 0),
+            DUPLICATE: Number(ledgerSummary.decisions.DUPLICATE || 0),
+            IRRELEVANT: Number(ledgerSummary.decisions.IRRELEVANT || 0),
+          }
+        : { ...admissionDecisions };
+      const recoveries = aci?.ledger?.recoveries ?? [];
       const hashVerifiedRestores = recoveries.filter((r) => r?.verified).length;
       const refsRestoredCount = refs.reduce((s, r) => s + Number(r.restoredCount || 0), 0);
       const restoredCount = Math.max(refsRestoredCount, recoveries.length);
+      const partialRecoveries =
+        ledgerSummary.partialRecoveries != null
+          ? Number(ledgerSummary.partialRecoveries)
+          : recoveries.filter((r) =>
+              r?.isPartial !== undefined ? Boolean(r.isPartial) : r?.mode ? r.mode !== 'full' : r?.level === 'outline' || r?.level === 'hunk',
+            ).length;
+      const fullRecoveries =
+        ledgerSummary.fullRecoveries != null
+          ? Number(ledgerSummary.fullRecoveries)
+          : Math.max(0, recoveries.length - partialRecoveries);
+      const recoveryTokensSaved =
+        ledgerSummary.recoveryTokensSaved != null
+          ? Number(ledgerSummary.recoveryTokensSaved)
+          : recoveries.reduce((s, r) => s + Math.max(0, Number(r?.tokensSaved || 0)), 0);
+      const compressedList = aci?.ledger?.compressed ?? [];
+      const supersededEvictions =
+        ledgerSummary.supersededEvictions != null
+          ? Number(ledgerSummary.supersededEvictions)
+          : compressedList.filter((c) => Boolean(c?.superseded)).length;
+      const supersededTokensSaved =
+        ledgerSummary.supersededTokensSaved != null
+          ? Number(ledgerSummary.supersededTokensSaved)
+          : compressedList
+              .filter((c) => Boolean(c?.superseded))
+              .reduce((s, c) => s + Math.max(0, Number(c?.tokensSaved || 0)), 0);
+      const epochsList = aci?.ledger?.epochs ?? [];
+      const trajectoryTriggeredEpochs =
+        ledgerSummary.trajectoryTriggeredEpochs != null
+          ? Number(ledgerSummary.trajectoryTriggeredEpochs)
+          : epochsList.filter((e) => Boolean(e?.trajectoryTriggered)).length;
       const offloadedCount = Math.max(refs.length, Number(ledgerSummary.compressedCount || 0));
       const savedTokens = Number(ledgerSummary.totalTokensSaved || 0);
       const totalAciSavedTokens = savedTokens + admissionSavedTokens;
-      const epochTransitions = Number(aci.engine?.epochState?.epochCount || 0);
-      const supLog = aci.ledger?.supervisorCalls ?? [];
+      const epochTransitions = Number(aci?.engine?.epochState?.epochCount || 0);
+      const supLog = aci?.ledger?.supervisorCalls ?? [];
       const effectiveSupCalls = Math.max(aciSupervisorCalls, supLog.length);
+      const supervisorCircuitOpen = Boolean(
+        aci?.supervisor?.isCircuitOpen?.() || aci?.supervisor?.getStatus?.()?.circuitOpen,
+      );
+      const antiThrashingTriggered = Boolean(reasoningTracker._antiThrashingTriggered);
       const supervisorCost = {
         calls: effectiveSupCalls,
         inputTokens: supLog.reduce((s, c) => s + Number(c.inputTokens || 0), 0),
@@ -552,23 +599,51 @@ export class AgentLoop {
         totalRecoveries: recoveries.length,
         hashVerifiedCount: hashVerifiedRestores,
         tokensRestored: recoveries.reduce((s, r) => s + Number(r.tokensRestored || 0), 0),
+        partialRecoveries,
+        fullRecoveries,
+        recoveryTokensSaved,
       };
-      const criticalContextRecall = computeActiveCriticalContextRecall({
-        criticalFiles: resolvedAciCriticalFiles,
-        reasoningTracker,
-        aciStore: aci.aciStore ?? null,
-        ledger: aci.ledger ?? null,
-      });
+      const criticalContextRecall = aci?.engine || aci?.aciStore || aci?.ledger
+        ? computeActiveCriticalContextRecall({
+            criticalFiles: resolvedAciCriticalFiles,
+            reasoningTracker,
+            aciStore: aci.aciStore ?? null,
+            ledger: aci.ledger ?? null,
+          })
+        : null;
       const governance =
-        aci.ledger?.computeGovernanceMetrics?.({
+        aci?.ledger?.computeGovernanceMetrics?.({
           groundTruthCriticalFiles: resolvedAciCriticalFiles,
         }) ?? null;
+      const wmForTelemetry = watermarksSnapshot ?? reasoningTracker._budgetWatermarks ?? null;
+      const dtocPolicyVal = aci?.engine?.dtocPolicy ?? aci?.dtocPolicy ?? 'adaptive_single_step';
+      latestAciSnapshot = {
+        aciProfile,
+        dtocPolicy: dtocPolicyVal,
+        decisions,
+        admissionDecisions: { ...admissionDecisions },
+        partialRecoveries,
+        fullRecoveries,
+        recoveryTokensSaved,
+        supersededEvictions,
+        supersededTokensSaved,
+        trajectoryTriggeredEpochs,
+        epochTransitions,
+        offloadedCount,
+        savedTokens,
+        admissionSavedTokens,
+        totalAciSavedTokens,
+        antiThrashingTriggered,
+        supervisorCircuitOpen,
+        budgetWatermarks: wmForTelemetry ? { ...wmForTelemetry } : null,
+      };
       reasoningTracker.updateAciMetrics({
         aciProfile,
         admissionEnabled: aciAdmissionEnabled,
         dtocEnabled: aciDtocEnabled,
-        dtocPolicy: aci.engine?.dtocPolicy ?? 'adaptive_single_step',
-        dtocMinPromptTokens: aci.engine?.dtocMinPromptTokens ?? 24000,
+        dtocPolicy: dtocPolicyVal,
+        dtocMinPromptTokens: aci?.engine?.dtocMinPromptTokens ?? 24000,
+        decisions,
         admissionDecisions,
         admissionOriginalTokens,
         admissionInjectedTokens,
@@ -578,6 +653,14 @@ export class AgentLoop {
         totalAciSavedTokens,
         restoredCount,
         hashVerifiedRestores,
+        partialRecoveries,
+        fullRecoveries,
+        recoveryTokensSaved,
+        supersededEvictions,
+        supersededTokensSaved,
+        trajectoryTriggeredEpochs,
+        antiThrashingTriggered,
+        supervisorCircuitOpen,
         criticalContextRecall,
         supervisorCalls: effectiveSupCalls,
         supervisorMode: aciSupervisorMode,
@@ -585,27 +668,31 @@ export class AgentLoop {
         supervisorCost,
         recoveryStats,
         epochTransitions,
-        ledger: {
-          summary: ledgerSummary,
-          governance,
-          admissions: admissions.map((a) => ({
-            path: a.path,
-            toolName: a.toolName,
-            decision: a.decision,
-            criticalDomains: a.criticalDomains,
-            score: a.score,
-            originalTokens: a.originalTokens,
-            injectedTokens: a.injectedTokens,
-            tokensSaved: a.tokensSaved,
-            step: a.step,
-            reason: a.reason,
-            uri: a.uri,
-            sha256: a.sha256,
-          })),
-          supervisorCalls: supLog,
-          recoveries,
-        },
+        aciTelemetry: latestAciSnapshot,
+        ledger: aci?.ledger
+          ? {
+              summary: ledgerSummary,
+              governance,
+              admissions: admissions.map((a) => ({
+                path: a.path,
+                toolName: a.toolName,
+                decision: a.decision,
+                criticalDomains: a.criticalDomains,
+                score: a.score,
+                originalTokens: a.originalTokens,
+                injectedTokens: a.injectedTokens,
+                tokensSaved: a.tokensSaved,
+                step: a.step,
+                reason: a.reason,
+                uri: a.uri,
+                sha256: a.sha256,
+              })),
+              supervisorCalls: supLog,
+              recoveries,
+            }
+          : null,
       });
+      return latestAciSnapshot;
     };
     let taskContract = null;
     let lastContractFilesReadCount = -1;
@@ -618,6 +705,7 @@ export class AgentLoop {
         const repoCtxIdx = rawPrompt.search(/\r?\n\r?\n\[Repository Intelligence(?: Context)?\]\r?\n/);
         const contractPrompt = repoCtxIdx >= 0 ? rawPrompt.slice(0, repoCtxIdx) : rawPrompt;
         taskContract = extractTaskContract({ prompt: contractPrompt, workspaceRoot, filesRead });
+        reasoningTracker.setTaskContract?.(taskContract);
         lastContractFilesReadCount = filesRead.length;
       }
       lastContractReadiness = evaluateContractReadiness({
@@ -686,6 +774,12 @@ export class AgentLoop {
       };
       reasoningTracker.updateBudgetWatermarks(snapshot);
       return snapshot;
+    };
+    const buildAciTelemetry = (watermarksSnapshot = null) => {
+      const wm =
+        watermarksSnapshot ?? reasoningTracker._budgetWatermarks ?? buildBudgetWatermarks();
+      const snap = syncAciMetrics(wm);
+      return snap ? { ...snap, budgetWatermarks: wm ? { ...wm } : null } : null;
     };
     let finalStepAdvised = false;
     let repairedOnce = false;
@@ -959,15 +1053,24 @@ export class AgentLoop {
           if (aciDtocEnabled) {
             const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
             const epochContextWindow = aci.engine.contextWindow ?? 128000;
+            const epochMaxTotalTokens =
+              effectiveWatermarkMaxTokens ?? aci.engine.maxTotalTokens ?? epochContextWindow;
+            // Only shield genuine spec/contract docs (SPEC.md, CONTRACT.json, etc.), never target src/ files to be edited.
+            const strictContractDocRe =
+              /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
             const contractFiles = [
-              ...(execution?.evidenceContract?.requiredChangedFiles ?? []),
-              ...(taskContract?.requiredFiles ?? []),
-            ];
+              ...(taskContract?.contractFilesOnDisk ?? []),
+            ].filter((filePath) =>
+              strictContractDocRe.test(String(filePath || '').replace(/\\/g, '/')),
+            );
             const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
               currentStep: steps,
+              maxSteps,
               tools: requestOptions.tools,
               cumulativeUsedTokens,
               contextWindow: epochContextWindow,
+              maxTotalTokens: epochMaxTotalTokens,
+              contractFiles,
               verificationCount: reasoningTracker.verificationCount,
               unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
             });
@@ -975,24 +1078,34 @@ export class AgentLoop {
             if (epochProbe?.triggered) {
               const activeMutationTargets = [...reasoningTracker.filesMutated];
               const eligibleCandidates = selectOffloadableAciCandidates(requestOptions.messages, {
+                aciStore: aci.aciStore ?? aci.engine.aciStore ?? null,
                 currentStep: steps,
                 singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
                 singleStepBudget: aci.engine.singleStepBudget,
                 activeMutationTargets,
                 dtocPolicy: aci.engine.dtocPolicy,
                 contractFiles,
+                onlySuperseded: Boolean(
+                  epochProbe.supersededTriggered && !epochProbe.trajectoryTriggered,
+                ),
               });
               if (eligibleCandidates.length > 0) {
                 let keepRefs = [];
                 let compressRefs = [];
-                const totalEligibleChars = eligibleCandidates.reduce(
+                const isTrajectoryOnlyV26 = aci.engine.dtocPolicy === 'trajectory_eviction_v26';
+                const supervisorCandidates = isTrajectoryOnlyV26
+                  ? epochProbe.trajectoryTriggered
+                    ? eligibleCandidates.filter((c) => !c.superseded)
+                    : []
+                  : eligibleCandidates;
+                const totalEligibleChars = supervisorCandidates.reduce(
                   (sum, c) => sum + (Number(c.chars) || 0),
                   0,
                 );
                 if (
                   aciSupervisorEnabled &&
                   aci.supervisor &&
-                  eligibleCandidates.length >= 2 &&
+                  supervisorCandidates.length >= 2 &&
                   totalEligibleChars >= 2400 &&
                   dtocSupervisorCalls < 2
                 ) {
@@ -1006,7 +1119,7 @@ export class AgentLoop {
                   const supRes = await aci.supervisor
                     .supervise({
                       query: input,
-                      candidates: eligibleCandidates,
+                      candidates: supervisorCandidates,
                       errorSummary: lastErrFp,
                       budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
                       learnedGuidelines: aci.engine.getGuidelines?.() ?? [],
@@ -1023,7 +1136,7 @@ export class AgentLoop {
                     aci.ledger?.recordSupervisorCall?.({
                       stage: 'dtoc',
                       model: supRes.model ?? aciSupervisorModel,
-                      candidateCount: eligibleCandidates.length,
+                      candidateCount: supervisorCandidates.length,
                       decisions: {
                         keepRefs: supRes.keepRefs ?? [],
                         compressRefs: supRes.compressRefs ?? [],
@@ -1042,9 +1155,11 @@ export class AgentLoop {
                 }
                 const compResult = aci.engine.compress(requestOptions.messages, {
                   currentStep: steps,
+                  maxSteps,
                   tools: requestOptions.tools,
                   cumulativeUsedTokens,
                   contextWindow: epochContextWindow,
+                  maxTotalTokens: epochMaxTotalTokens,
                   keepRefs,
                   compressRefs,
                   activeMutationTargets,
@@ -1060,6 +1175,8 @@ export class AgentLoop {
                 ) {
                   messages = [...compResult.messages];
                   requestOptions = { ...requestOptions, messages };
+                  const dtocWatermarks = buildBudgetWatermarks();
+                  const dtocTelemetry = buildAciTelemetry(dtocWatermarks);
                   this.eventRouter.emitPersisted({
                     sessionId,
                     turnId,
@@ -1072,12 +1189,17 @@ export class AgentLoop {
                       step: steps,
                       compressedCount: compResult.compressedCount,
                       netSavingsTokens: compResult.netSavingsTokens ?? 0,
+                      supersededEvictions: compResult.supersededEvictions ?? 0,
+                      supersededTokensSaved: compResult.supersededTokensSaved ?? 0,
+                      trajectoryTriggered: Boolean(compResult.trajectoryTriggered),
+                      projectedTotalTokens: compResult.projectedTotalTokens ?? null,
                       tokens: {
                         before: compResult.tokensBefore,
                         after: compResult.tokensAfter,
                       },
                       pairClosedValid: compResult.pairClosedValid,
-                      budgetWatermarks: buildBudgetWatermarks(),
+                      budgetWatermarks: dtocWatermarks,
+                      ...(dtocTelemetry ? { aciTelemetry: dtocTelemetry } : {}),
                     },
                     audit: false,
                   });
@@ -1228,6 +1350,8 @@ export class AgentLoop {
           estimatedInputTokens = nextEstimated;
           lastEstimatedInputTokens = nextEstimated;
           reasoningTracker.recordBudgetPrune();
+          const pruneWatermarks = buildBudgetWatermarks();
+          const pruneTelemetry = buildAciTelemetry(pruneWatermarks);
           this.eventRouter.emitPersisted({
             sessionId,
             turnId,
@@ -1238,7 +1362,8 @@ export class AgentLoop {
                 : 'budget_prune',
               step: steps,
               tokens: emergency?.tokens ?? estimatedInputTokens,
-              budgetWatermarks: buildBudgetWatermarks(),
+              budgetWatermarks: pruneWatermarks,
+              ...(pruneTelemetry ? { aciTelemetry: pruneTelemetry } : {}),
             },
             audit: false,
           });
@@ -1782,6 +1907,7 @@ export class AgentLoop {
 
         let detectedThrashing = false;
         let batchTrigger = null;
+        let batchAntiThrashing = null;
         for (let batchIdx = 0; batchIdx < preparedBatch.length; batchIdx += 1) {
           const item = preparedBatch[batchIdx];
           const { tc, isError, durationMs, receipt, output } = item;
@@ -1852,6 +1978,9 @@ export class AgentLoop {
             } else if (tmRepeat) {
               detectedThrashing = true;
             }
+            if (reasoningEvent?.antiThrashing) {
+              batchAntiThrashing = reasoningEvent.antiThrashing;
+            }
           }
         }
 
@@ -1874,6 +2003,22 @@ export class AgentLoop {
 
         refreshContractReadiness();
 
+        if (aci?.engine || aci?.aciStore || aci?.ledger || reasoningTracker._antiThrashingTriggered) {
+          const stepWm = buildBudgetWatermarks();
+          const stepAciTelemetry = buildAciTelemetry(stepWm);
+          if (stepAciTelemetry && typeof this.eventRouter.emitEphemeral === 'function') {
+            this.eventRouter.emitEphemeral({
+              sessionId,
+              turnId,
+              type: 'aci/telemetry',
+              data: {
+                step: steps,
+                aciTelemetry: stepAciTelemetry,
+              },
+            });
+          }
+        }
+
         if (detectedThrashing) {
           const isNonFatalPattern =
             batchTrigger?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP ||
@@ -1884,7 +2029,12 @@ export class AgentLoop {
               if (batchTrigger.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
                 policyBlockWarned = true;
               }
-              const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(batchTrigger);
+              const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(
+                batchTrigger,
+                batchAntiThrashing,
+              );
+              const warnWm = buildBudgetWatermarks();
+              const warnTelemetry = buildAciTelemetry(warnWm);
               this.eventRouter.emitPersisted({
                 sessionId,
                 turnId,
@@ -1894,6 +2044,18 @@ export class AgentLoop {
                   pattern: batchTrigger.pattern,
                   fingerprint: batchTrigger.fingerprint ?? null,
                   falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
+                  antiThrashingTriggered: reasoningTracker._antiThrashingTriggered,
+                  ...(batchAntiThrashing
+                    ? {
+                        antiThrashing: {
+                          file: batchAntiThrashing.file,
+                          streak: batchAntiThrashing.streak,
+                          contracts: batchAntiThrashing.contracts,
+                          callers: batchAntiThrashing.callers,
+                        },
+                      }
+                    : {}),
+                  ...(warnTelemetry ? { aciTelemetry: warnTelemetry } : {}),
                 },
                 audit: false,
               });
@@ -1911,7 +2073,12 @@ export class AgentLoop {
             )
           ) {
             tm.thrashWarned = true;
-            const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(batchTrigger);
+            const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(
+              batchTrigger,
+              batchAntiThrashing,
+            );
+            const warnWm = buildBudgetWatermarks();
+            const warnTelemetry = buildAciTelemetry(warnWm);
             this.eventRouter.emitPersisted({
               sessionId,
               turnId,
@@ -1921,6 +2088,18 @@ export class AgentLoop {
                 pattern: batchTrigger?.pattern ?? 'exact_repeat',
                 fingerprint: batchTrigger?.fingerprint ?? null,
                 falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
+                antiThrashingTriggered: reasoningTracker._antiThrashingTriggered,
+                ...(batchAntiThrashing
+                  ? {
+                      antiThrashing: {
+                        file: batchAntiThrashing.file,
+                        streak: batchAntiThrashing.streak,
+                        contracts: batchAntiThrashing.contracts,
+                        callers: batchAntiThrashing.callers,
+                      },
+                    }
+                  : {}),
+                ...(warnTelemetry ? { aciTelemetry: warnTelemetry } : {}),
               },
               audit: false,
             });
@@ -1937,6 +2116,36 @@ export class AgentLoop {
             stopReason = 'thrashing_circuit_break';
             break;
           }
+        } else if (batchAntiThrashing) {
+          const guidanceText =
+            batchAntiThrashing.guidance ||
+            reasoningTracker.buildAntiThrashingGuidance(batchAntiThrashing);
+          const warnWm = buildBudgetWatermarks();
+          const warnTelemetry = buildAciTelemetry(warnWm);
+          this.eventRouter.emitPersisted({
+            sessionId,
+            turnId,
+            type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
+            data: {
+              step: steps,
+              pattern: 'anti_thrashing_self_diagnosis',
+              antiThrashingTriggered: true,
+              antiThrashing: {
+                file: batchAntiThrashing.file,
+                streak: batchAntiThrashing.streak,
+                contracts: batchAntiThrashing.contracts,
+                callers: batchAntiThrashing.callers,
+              },
+              fingerprint: batchAntiThrashing.fingerprint ?? null,
+              falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
+              ...(warnTelemetry ? { aciTelemetry: warnTelemetry } : {}),
+            },
+            audit: false,
+          });
+          messages.push({
+            role: 'user',
+            content: [{ type: 'text', text: guidanceText }],
+          });
         }
       }
 
@@ -2003,8 +2212,8 @@ export class AgentLoop {
         stopReason,
         steps,
       });
-      syncAciMetrics();
       const budgetWatermarks = buildBudgetWatermarks();
+      const aciTelemetry = buildAciTelemetry(budgetWatermarks);
       const reasoningMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: outcome.status === 'completed' && outcome.verdict?.accepted !== false,
         stopReason,
@@ -2030,6 +2239,7 @@ export class AgentLoop {
         failureKind: outcome.failureKind,
         reasoningMetrics,
         budgetWatermarks,
+        ...(aciTelemetry ? { aciTelemetry } : {}),
         verifierEvents,
         phaseHistory: sm.history,
         deferredPhaseTransition: sm.deferredTerminalTransition ?? null,
@@ -2049,8 +2259,8 @@ export class AgentLoop {
         stopReason: classified.code || err?.code || 'aborted',
         steps,
       });
-      syncAciMetrics();
       const catchWatermarks = buildBudgetWatermarks();
+      const catchAciTelemetry = buildAciTelemetry(catchWatermarks);
       const catchMetrics = reasoningTracker.getMetrics({
         finalOutcomePassed: false,
         stopReason: classified.code || err?.code || 'aborted',
@@ -2058,12 +2268,14 @@ export class AgentLoop {
       if (err && typeof err === 'object') {
         err.reasoningMetrics = catchMetrics;
         err.budgetWatermarks = catchWatermarks;
+        if (catchAciTelemetry) err.aciTelemetry = catchAciTelemetry;
       }
       classified.usage = catchUsage;
       classified.steps = steps;
       classified.route = lastRoute;
       classified.reasoningMetrics = catchMetrics;
       classified.budgetWatermarks = catchWatermarks;
+      if (catchAciTelemetry) classified.aciTelemetry = catchAciTelemetry;
       // Fix D6: On LEASE_LOST (or if lease was already lost before error), exit cleanly without corrupting turn phase
       if (isLeaseLostError(classified) || !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
         const leaseErr = isLeaseLostError(classified)
@@ -2074,6 +2286,7 @@ export class AgentLoop {
             });
         leaseErr.reasoningMetrics = catchMetrics;
         leaseErr.budgetWatermarks = catchWatermarks;
+        if (catchAciTelemetry) leaseErr.aciTelemetry = catchAciTelemetry;
         throw leaseErr;
       }
       if (isShutdownAbort(signal, err) || isShutdownAbort(signal, classified)) {

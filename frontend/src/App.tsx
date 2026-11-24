@@ -252,6 +252,8 @@ export const App: React.FC = () => {
   const [inspectorRequest, setInspectorRequest] = useState(0);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('subagents');
   const [inspectorFile, setInspectorFile] = useState<string | null>(null);
+  const [inspectorLine, setInspectorLine] = useState<number | null>(null);
+  const [inspectorLineRequest, setInspectorLineRequest] = useState(0);
   const [inspectorSubagentId, setInspectorSubagentId] = useState<string | null>(null);
   const [inspectorTaskId, setInspectorTaskId] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -361,9 +363,15 @@ export const App: React.FC = () => {
     [],
   );
 
-  const handleOpenThreadInspector = useCallback((tab: InspectorTab, filePath?: string, targetTaskId?: string) => {
+  const handleOpenThreadInspector = useCallback((tab: InspectorTab, filePath?: string, targetTaskId?: string, line?: number) => {
     setInspectorTab(tab);
     if (filePath) setInspectorFile(filePath);
+    if (typeof line === 'number' && line > 0) {
+      setInspectorLine(line);
+      setInspectorLineRequest((v) => v + 1);
+    } else {
+      setInspectorLine(null);
+    }
     if (targetTaskId) setInspectorTaskId(targetTaskId);
     setInspectorOpen(true);
   }, []);
@@ -2375,6 +2383,8 @@ export const App: React.FC = () => {
             tabRequest={inspectorRequest}
             swarmSectionRequest={swarmSectionRequest}
             selectedFile={inspectorFile}
+            selectedLine={inspectorLine}
+            lineRequest={inspectorLineRequest}
             selectedSubagentId={inspectorSubagentId}
             projectName={selectedProject?.name || 'Agent_US'}
             bundle={inspectorBundle}

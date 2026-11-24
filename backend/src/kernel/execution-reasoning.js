@@ -1,6 +1,7 @@
-import { existsSync, readdirSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { sha256Hex } from '../integrity.js';
+import { extractRepositorySymbols } from '../repo-symbols.js';
 import { computeArgsDigest } from '../tools/dispatcher.js';
 import { scanCommandSyntax } from '../tools/command-analyzer.js';
 
@@ -23,6 +24,7 @@ export const READ_TOOLS = Object.freeze(
     'grep',
     'glob',
     'inspect_repository',
+    'query_symbol_graph',
     'search_history',
   ]),
 );
@@ -509,6 +511,15 @@ export class ExecutionReasoningTracker {
     this._hasPendingEditInCycle = false;
     this._pendingCycleEditCategories = new Set();
     this._baselineTestFailedInCycle = false;
+    this._sameFileFailedEditStreaks = new Map();
+    this._pendingEditedFilesInCycle = new Set();
+    this._antiThrashingTriggered = false;
+    this._antiThrashingFiles = new Set();
+    this._antiThrashingEvents = [];
+    this._lastAntiThrashing = null;
+    this._knownContractFiles = [];
+    this._knownCrossFileCallers = new Map();
+    this._antiThrashingCooldownByFile = new Map();
 
     // Action history for exact_repeat and ping_pong
     this._actionHistory = [];
@@ -537,6 +548,7 @@ export class ExecutionReasoningTracker {
       dtocEnabled: null,
       dtocPolicy: null,
       dtocMinPromptTokens: null,
+      decisions: { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 },
       admissionDecisions: { DIRECT: 0, SUPPORTING: 0, DEFER: 0, DUPLICATE: 0, IRRELEVANT: 0 },
       admissionOriginalTokens: 0,
       admissionInjectedTokens: 0,
@@ -546,14 +558,30 @@ export class ExecutionReasoningTracker {
       totalAciSavedTokens: 0,
       restoredCount: 0,
       hashVerifiedRestores: 0,
+      partialRecoveries: 0,
+      fullRecoveries: 0,
+      recoveryTokensSaved: 0,
+      supersededEvictions: 0,
+      supersededTokensSaved: 0,
+      trajectoryTriggeredEpochs: 0,
+      antiThrashingTriggered: false,
+      supervisorCircuitOpen: false,
       criticalContextRecall: null,
       supervisorCalls: 0,
       supervisorMode: null,
       supervisorModel: null,
       supervisorCost: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 0, fallbackCount: 0 },
-      recoveryStats: { totalRecoveries: 0, hashVerifiedCount: 0, tokensRestored: 0 },
+      recoveryStats: {
+        totalRecoveries: 0,
+        hashVerifiedCount: 0,
+        tokensRestored: 0,
+        partialRecoveries: 0,
+        fullRecoveries: 0,
+        recoveryTokensSaved: 0,
+      },
       epochTransitions: 0,
       ledger: null,
+      aciTelemetry: null,
     };
     this._budgetWatermarks = null;
   }
@@ -645,6 +673,15 @@ export class ExecutionReasoningTracker {
         IRRELEVANT: Number(patch.admissionDecisions.IRRELEVANT || 0),
       };
     }
+    if (patch.decisions && typeof patch.decisions === 'object') {
+      this._aciMetrics.decisions = {
+        DIRECT: Number(patch.decisions.DIRECT || 0),
+        SUPPORTING: Number(patch.decisions.SUPPORTING || 0),
+        DEFER: Number(patch.decisions.DEFER || 0),
+        DUPLICATE: Number(patch.decisions.DUPLICATE || 0),
+        IRRELEVANT: Number(patch.decisions.IRRELEVANT || 0),
+      };
+    }
     if (patch.admissionOriginalTokens != null && Number.isFinite(Number(patch.admissionOriginalTokens))) {
       this._aciMetrics.admissionOriginalTokens = Math.max(0, Math.trunc(Number(patch.admissionOriginalTokens)));
     }
@@ -668,6 +705,35 @@ export class ExecutionReasoningTracker {
     }
     if (patch.hashVerifiedRestores != null && Number.isFinite(Number(patch.hashVerifiedRestores))) {
       this._aciMetrics.hashVerifiedRestores = Math.max(0, Math.trunc(Number(patch.hashVerifiedRestores)));
+    }
+    if (patch.partialRecoveries != null && Number.isFinite(Number(patch.partialRecoveries))) {
+      this._aciMetrics.partialRecoveries = Math.max(0, Math.trunc(Number(patch.partialRecoveries)));
+    }
+    if (patch.fullRecoveries != null && Number.isFinite(Number(patch.fullRecoveries))) {
+      this._aciMetrics.fullRecoveries = Math.max(0, Math.trunc(Number(patch.fullRecoveries)));
+    }
+    if (patch.recoveryTokensSaved != null && Number.isFinite(Number(patch.recoveryTokensSaved))) {
+      this._aciMetrics.recoveryTokensSaved = Math.max(0, Math.trunc(Number(patch.recoveryTokensSaved)));
+    }
+    if (patch.supersededEvictions != null && Number.isFinite(Number(patch.supersededEvictions))) {
+      this._aciMetrics.supersededEvictions = Math.max(0, Math.trunc(Number(patch.supersededEvictions)));
+    }
+    if (patch.supersededTokensSaved != null && Number.isFinite(Number(patch.supersededTokensSaved))) {
+      this._aciMetrics.supersededTokensSaved = Math.max(0, Math.trunc(Number(patch.supersededTokensSaved)));
+    }
+    if (patch.trajectoryTriggeredEpochs != null && Number.isFinite(Number(patch.trajectoryTriggeredEpochs))) {
+      this._aciMetrics.trajectoryTriggeredEpochs = Math.max(
+        0,
+        Math.trunc(Number(patch.trajectoryTriggeredEpochs)),
+      );
+    }
+    if (patch.antiThrashingTriggered !== undefined) {
+      this._aciMetrics.antiThrashingTriggered = Boolean(
+        patch.antiThrashingTriggered || this._antiThrashingTriggered,
+      );
+    }
+    if (patch.supervisorCircuitOpen !== undefined) {
+      this._aciMetrics.supervisorCircuitOpen = Boolean(patch.supervisorCircuitOpen);
     }
     if (patch.criticalContextRecall !== undefined) {
       if (patch.criticalContextRecall === null) {
@@ -703,6 +769,11 @@ export class ExecutionReasoningTracker {
         totalRecoveries: Number(patch.recoveryStats.totalRecoveries || 0),
         hashVerifiedCount: Number(patch.recoveryStats.hashVerifiedCount || 0),
         tokensRestored: Number(patch.recoveryStats.tokensRestored || 0),
+        partialRecoveries: Number(patch.recoveryStats.partialRecoveries ?? this._aciMetrics.partialRecoveries ?? 0),
+        fullRecoveries: Number(patch.recoveryStats.fullRecoveries ?? this._aciMetrics.fullRecoveries ?? 0),
+        recoveryTokensSaved: Number(
+          patch.recoveryStats.recoveryTokensSaved ?? this._aciMetrics.recoveryTokensSaved ?? 0,
+        ),
       };
     }
     if (patch.epochTransitions != null && Number.isFinite(Number(patch.epochTransitions))) {
@@ -711,6 +782,176 @@ export class ExecutionReasoningTracker {
     if (patch.ledger !== undefined) {
       this._aciMetrics.ledger = patch.ledger ? structuredClone(patch.ledger) : null;
     }
+    if (patch.aciTelemetry !== undefined) {
+      this._aciMetrics.aciTelemetry = patch.aciTelemetry ? structuredClone(patch.aciTelemetry) : null;
+    }
+  }
+
+  setTaskContract(contract = null) {
+    if (!contract || typeof contract !== 'object') return;
+    const files = [];
+    for (const raw of [
+      ...(Array.isArray(contract.contractFiles) ? contract.contractFiles : []),
+      ...(Array.isArray(contract.requiredFiles) ? contract.requiredFiles : []),
+      ...(Array.isArray(contract.deliverables) ? contract.deliverables : []),
+    ]) {
+      const p = normalizeReasoningPath(typeof raw === 'string' ? raw : raw?.path, this.workspaceRoot);
+      if (p && !files.includes(p)) files.push(p);
+    }
+    for (const p of files) {
+      if (!this._knownContractFiles.includes(p)) this._knownContractFiles.push(p);
+    }
+  }
+
+  recordCrossFileCallerHint(targetFile, callerInfo) {
+    const normTarget = normalizeReasoningPath(targetFile, this.workspaceRoot);
+    const info = String(callerInfo ?? '').trim();
+    if (!normTarget || !info) return;
+    if (!this._knownCrossFileCallers.has(normTarget)) {
+      this._knownCrossFileCallers.set(normTarget, new Set());
+    }
+    this._knownCrossFileCallers.get(normTarget).add(info);
+  }
+
+  #collectKnownContracts() {
+    const out = [...this._knownContractFiles];
+    const pushUnique = (val) => {
+      const s = String(val ?? '').trim();
+      if (s && !out.includes(s)) out.push(s);
+    };
+    const standardNames = ['SPEC.md', 'CONTRACT.json', 'CONSTRAINTS.md', 'AGENTS.md'];
+    if (this.workspaceRoot && existsSync(this.workspaceRoot)) {
+      for (const name of standardNames) {
+        if (existsSync(join(this.workspaceRoot, name))) pushUnique(name);
+      }
+    }
+    for (const f of this.filesRead) {
+      if (/(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md|.*contract.*|.*schema.*)$/i.test(f)) {
+        pushUnique(f);
+      }
+    }
+    for (const sym of this._contractComplianceSignals.missingExportedSymbols ?? []) {
+      pushUnique(`missingExport:${sym}`);
+    }
+    for (const deliv of this._contractComplianceSignals.missingDeliverables ?? []) {
+      pushUnique(`deliverable:${deliv}`);
+    }
+    return out.slice(0, 8);
+  }
+
+  #discoverCrossFileCallers(targetRelPath, maxFiles = 80) {
+    const callers = [];
+    const seen = new Set();
+    const pushCaller = (label) => {
+      const clean = String(label ?? '').trim();
+      if (clean && !seen.has(clean)) {
+        seen.add(clean);
+        callers.push(clean);
+      }
+    };
+    for (const explicit of this._knownCrossFileCallers.get(targetRelPath) ?? []) {
+      pushCaller(explicit);
+    }
+    if (!this.workspaceRoot || !existsSync(this.workspaceRoot)) {
+      return callers.slice(0, 8);
+    }
+
+    const absTarget = resolve(this.workspaceRoot, targetRelPath);
+    let symbolNames = [];
+    try {
+      if (existsSync(absTarget)) {
+        const targetText = readFileSync(absTarget, 'utf8').slice(0, 64 * 1024);
+        const extracted = extractRepositorySymbols(targetRelPath, targetText);
+        const defs = (extracted.exported?.length ? extracted.exported : extracted.definitions) ?? [];
+        symbolNames = defs
+          .map((d) => String(d?.name || '').trim())
+          .filter((n) => n.length >= 3)
+          .slice(0, 10);
+      }
+    } catch {
+      symbolNames = [];
+    }
+
+    const stem = basename(targetRelPath, extname(targetRelPath));
+    const codeExts = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.go', '.rs']);
+    const skipDirs = new Set(['node_modules', '.git', 'upstream', 'var', 'dist', 'build', 'coverage']);
+    const candidateFiles = [];
+    const walk = (dir, depth = 0) => {
+      if (depth > 4 || candidateFiles.length >= maxFiles) return;
+      let entries = [];
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const ent of entries) {
+        if (candidateFiles.length >= maxFiles) break;
+        if (ent.name.startsWith('.') && ent.name !== '.github') continue;
+        const full = join(dir, ent.name);
+        if (ent.isDirectory()) {
+          if (!skipDirs.has(ent.name)) walk(full, depth + 1);
+        } else if (ent.isFile() && codeExts.has(extname(ent.name).toLowerCase())) {
+          const rel = relative(this.workspaceRoot, full).replace(/\\/g, '/');
+          if (rel !== targetRelPath) candidateFiles.push({ rel, full });
+        }
+      }
+    };
+    walk(this.workspaceRoot, 0);
+
+    const escapedSyms = symbolNames.map((s) => ({
+      name: s,
+      re: new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`),
+    }));
+    const stemImportRe =
+      stem && stem.length >= 2 && stem !== 'index'
+        ? new RegExp(`(?:from\\s+['"][^'"]*\\b${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.[a-z]+)?['"]|require\\([^)]*\\b${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}|\\b${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b)`)
+        : null;
+
+    for (const cand of candidateFiles) {
+      if (callers.length >= 8) break;
+      let content = '';
+      try {
+        content = readFileSync(cand.full, 'utf8');
+      } catch {
+        continue;
+      }
+      if (content.length > 64 * 1024) content = content.slice(0, 64 * 1024);
+      const lines = content.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        const symHit = escapedSyms.find((s) => s.re.test(line));
+        if (symHit) {
+          pushCaller(`${cand.rel}:L${i + 1} (${symHit.name})`);
+          break;
+        }
+        if (stemImportRe && stemImportRe.test(line)) {
+          pushCaller(`${cand.rel}:L${i + 1} (${stem})`);
+          break;
+        }
+      }
+    }
+    return callers.slice(0, 8);
+  }
+
+  buildAntiThrashingGuidance(antiThrashing = null) {
+    const info = antiThrashing ?? this._lastAntiThrashing;
+    if (!info) return '';
+    const contractsText = info.contracts?.length
+      ? info.contracts.join(', ')
+      : '(none indexed; check SPEC.md / CONTRACT.json / exported function signatures)';
+    const callersText = info.callers?.length
+      ? info.callers.join(', ')
+      : '(no static cross-file callers detected; run query_symbol_graph to confirm)';
+    return [
+      `[Anti-Thrashing Self-Diagnosis] Detected repeated failed edits on \`${info.file}\` (sameFileFailedEditStreak=${info.streak}).`,
+      `- Thrashing file: ${info.file}`,
+      `- Known contracts: ${contractsText}`,
+      `- Cross-file callers: ${callersText}`,
+      info.fingerprint?.summary ? `- Latest failure: ${info.fingerprint.summary}` : null,
+      `STOP blind patching \`${info.file}\`. Before another mutation on \`${info.file}\`, run \`query_symbol_graph\`, \`inspect_repository\`, or \`read_file\` on \`${info.file}\` and its callers/contracts to align caller expectations and invariants.`,
+    ]
+      .filter(Boolean)
+      .join('\n');
   }
 
   updateContractEvaluation(evalResult = null) {
@@ -950,6 +1191,7 @@ export class ExecutionReasoningTracker {
         if (kind !== 'doc') {
           touchesNonDoc = true;
           this._pendingCycleEditCategories.add(kind);
+          this._pendingEditedFilesInCycle.add(f);
         }
       }
 
@@ -971,6 +1213,7 @@ export class ExecutionReasoningTracker {
 
     // 3. Track verification commands (bash / start_process / run_diagnostics tests)
     let verificationRecord = null;
+    let antiThrashingEvent = null;
     const cmd = typeof parsedArgs.command === 'string' ? parsedArgs.command.trim() : '';
     const isBashLike = toolName === 'bash' || toolName === 'start_process';
     const isRunDiagnosticsVerif =
@@ -1009,6 +1252,9 @@ export class ExecutionReasoningTracker {
         this._pendingCycleEditCategories.clear();
         this._baselineTestFailedInCycle = false;
         this._lastEditPendingVerification = null;
+        this._sameFileFailedEditStreaks.clear();
+        this._pendingEditedFilesInCycle.clear();
+        this._antiThrashingCooldownByFile.clear();
         if (this._reproducedFailureBeforeEdit && this._firstCodeMutationSeq > -1 && seq > this._firstCodeMutationSeq) {
           this._rootCauseVerifiedAfterEdit = true;
           this.rootCauseLedger.resolvedSignatures = [...this.rootCauseLedger.preEditFailureSignatures];
@@ -1019,10 +1265,15 @@ export class ExecutionReasoningTracker {
           };
         }
       } else {
-        this.#recordVerificationFailure({ fingerprint, command: verifCmdLabel, step, seq });
+        antiThrashingEvent = this.#recordVerificationFailure({
+          fingerprint,
+          command: verifCmdLabel,
+          step,
+          seq,
+        });
       }
     } else if (isTestFailHint && !isPolicyRejection) {
-      this.#recordVerificationFailure({ fingerprint, command: cmd, step, seq });
+      antiThrashingEvent = this.#recordVerificationFailure({ fingerprint, command: cmd, step, seq });
     } else if (isPolicyRejection) {
       this.ineffectiveActionCount += 1;
     } else if (effectiveIsError) {
@@ -1117,6 +1368,7 @@ export class ExecutionReasoningTracker {
       verification: verificationRecord,
       mutatedFiles,
       readFiles,
+      antiThrashing: antiThrashingEvent,
     };
   }
 
@@ -1180,6 +1432,55 @@ export class ExecutionReasoningTracker {
       this._hasPendingEditInCycle = false;
       this._pendingCycleEditCategories.clear();
     }
+
+    let antiThrashing = null;
+    if (this._pendingEditedFilesInCycle.size > 0) {
+      const contracts = this.#collectKnownContracts();
+      const candidates = [];
+      for (const file of this._pendingEditedFilesInCycle) {
+        const streak = (this._sameFileFailedEditStreaks.get(file) ?? 0) + 1;
+        this._sameFileFailedEditStreaks.set(file, streak);
+        if (streak >= 2) {
+          this._antiThrashingTriggered = true;
+          this._antiThrashingFiles.add(file);
+          const lastWarnedStreak = this._antiThrashingCooldownByFile.get(file) ?? 0;
+          if (streak > lastWarnedStreak) {
+            this._antiThrashingCooldownByFile.set(file, streak);
+            const callers = this.#discoverCrossFileCallers(file);
+            const item = {
+              file,
+              streak,
+              contracts,
+              callers,
+              fingerprint: fingerprint
+                ? {
+                    signature: fingerprint.signature,
+                    summary: fingerprint.summary,
+                    location: fingerprint.location ?? null,
+                  }
+                : null,
+              step,
+              seq,
+              guidance: '',
+            };
+            item.guidance = this.buildAntiThrashingGuidance(item);
+            this._antiThrashingEvents.push(item);
+            if (this._antiThrashingEvents.length > 20) {
+              this._antiThrashingEvents.shift();
+            }
+            candidates.push(item);
+          }
+        }
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => b.streak - a.streak);
+        antiThrashing = candidates[0];
+        this._lastAntiThrashing = antiThrashing;
+      }
+      this._pendingEditedFilesInCycle.clear();
+    }
+
+    return antiThrashing;
   }
 
   #recordFingerprint(fp, step, seq) {
@@ -1313,8 +1614,11 @@ export class ExecutionReasoningTracker {
    * Builds a rich diagnostic steering message listing normalized error fingerprint,
    * falsified attempts, and structured root-cause pivot guidance.
    */
-  buildDiagnosticSteeringMessage(detection = null) {
+  buildDiagnosticSteeringMessage(detection = null, antiThrashing = null) {
     const active = detection ?? this.stuckDetections.at(-1) ?? null;
+    if (!active && (antiThrashing ?? this._lastAntiThrashing)) {
+      return this.buildAntiThrashingGuidance(antiThrashing ?? this._lastAntiThrashing);
+    }
     if (active?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
       return [
         `[策略拦截纠偏提示] 检测到多次工具调用在执行前被策略/审批拦截 (${active.summary || 'APPROVAL_DENIED / POLICY_DENIED'})，请立即停止尝试被禁止的 bash 命令（如 ls、git、node -e 等）。`,
@@ -1358,10 +1662,20 @@ export class ExecutionReasoningTracker {
       }
     }
 
+    const antiInfo =
+      antiThrashing ??
+      (active?.pattern === STUCK_PATTERNS.EDIT_TEST_FAIL_LOOP ||
+      active?.pattern === STUCK_PATTERNS.SAME_ERROR_STREAK
+        ? this._lastAntiThrashing
+        : null);
+    if (antiInfo) {
+      lines.push(this.buildAntiThrashingGuidance(antiInfo));
+    }
+
     lines.push(
       '强制根因诊断与纠偏要求 (Root-Cause Evidence Before Editing):',
       '1. 立即停止盲目重试相同命令或在未读取关联代码的情况下继续试探性修改。',
-      '2. 在下一次 edit_file/write_file/apply_patch 之前，必须先使用 read_file / grep / inspect_repository 读取报错位置、调用链上游及关联测试代码，获取并引用具体的 file:line 根因证据。',
+      '2. 在下一次 edit_file/write_file/apply_patch 之前，必须先使用 read_file / grep / query_symbol_graph / inspect_repository 读取报错位置、调用链上游及关联测试代码，获取并引用具体的 file:line 根因证据。',
       '3. 明确陈述与已证伪尝试不同的新假设（解释为何此前尝试未能解决根因），再做最小精确修改并运行验证命令确认通过；若确认无法推进，请如实向用户汇报阻塞点。',
     );
 
@@ -1396,7 +1710,15 @@ export class ExecutionReasoningTracker {
       falsifiedAttempts: this.falsifiedAttempts.map((a) => ({ ...a })),
       stuckDetections: this.stuckDetections.map((d) => ({ ...d })),
       repairRounds: this._repairRounds,
-      aciMetrics: structuredClone(this._aciMetrics),
+      antiThrashingTriggered: this._antiThrashingTriggered,
+      antiThrashingFiles: [...this._antiThrashingFiles],
+      sameFileFailedEditStreaks: Object.fromEntries(this._sameFileFailedEditStreaks),
+      aciMetrics: structuredClone({
+        ...this._aciMetrics,
+        antiThrashingTriggered: Boolean(
+          this._aciMetrics.antiThrashingTriggered || this._antiThrashingTriggered,
+        ),
+      }),
       budgetWatermarks: this._budgetWatermarks ? { ...this._budgetWatermarks } : null,
     };
   }
@@ -1482,6 +1804,9 @@ export class ExecutionReasoningTracker {
         warningIssued: d.warningIssued,
       })),
       repairRounds: this._repairRounds,
+      antiThrashingTriggered: this._antiThrashingTriggered,
+      antiThrashingFiles: [...this._antiThrashingFiles],
+      sameFileFailedEditStreaks: Object.fromEntries(this._sameFileFailedEditStreaks),
       thrashWarned: [...this._warnedPatterns].some(
         (p) =>
           p !== STUCK_PATTERNS.POLICY_BLOCK_LOOP &&
@@ -1489,7 +1814,12 @@ export class ExecutionReasoningTracker {
       ),
       circuitBroken: stopReason === 'thrashing_circuit_break',
       latestVerificationPassed: latestVerification ? latestVerification.passed : null,
-      aciMetrics: structuredClone(this._aciMetrics),
+      aciMetrics: structuredClone({
+        ...this._aciMetrics,
+        antiThrashingTriggered: Boolean(
+          this._aciMetrics.antiThrashingTriggered || this._antiThrashingTriggered,
+        ),
+      }),
       budgetWatermarks: this._budgetWatermarks ? { ...this._budgetWatermarks } : null,
     };
   }

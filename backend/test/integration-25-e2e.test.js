@@ -13,6 +13,7 @@ import { DirectAgentRuntime } from '../src/direct-agent.js';
 import {
   PHASE_WATERMARK_V25_DTOC_POLICY,
   PHASE_WATERMARK_V25_EPOCH_WATERMARKS,
+  TRAJECTORY_EVICTION_V26_DTOC_POLICY,
 } from '../src/context/aci-engine.js';
 import {
   ContextEvidenceLedger,
@@ -234,7 +235,8 @@ test('E2E 2.5: inspect_repository (relatedTo) -> unified-diff apply_patch -> run
 
   const turnCompleted = events.find((e) => e.type === 'turn/completed');
   assert.ok(turnCompleted, 'expected turn/completed event');
-  assert.equal(turnCompleted.data.reasoningMetrics.aciMetrics.dtocPolicy, PHASE_WATERMARK_V25_DTOC_POLICY);
+  assert.equal(turnCompleted.data.reasoningMetrics.aciMetrics.dtocPolicy, TRAJECTORY_EVICTION_V26_DTOC_POLICY);
+  assert.equal(PHASE_WATERMARK_V25_DTOC_POLICY, 'phase_watermark_v25');
   assert.deepEqual(PHASE_WATERMARK_V25_EPOCH_WATERMARKS, [0.78, 0.9]);
   assert.ok(turnCompleted.data.budgetWatermarks, 'expected budgetWatermarks on turn/completed');
   assert.equal(turnCompleted.data.budgetWatermarks.maxTokens, 120000);
