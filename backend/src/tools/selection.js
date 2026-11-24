@@ -22,13 +22,13 @@ export function modelToolCatalog(tools, policy, live) {
     if (decision !== 'deny') entries.push({ tool, decision });
   }
   const names = new Set(entries.map(({ tool }) => tool.name));
-  // Promote `apply_patch` before `write_file`/`edit_file`, `run_diagnostics` before `bash`,
-  // and `query_symbol_graph` alongside `inspect_repository` deterministically.
+  // Promote `edit_file` (#1 single-file) -> `apply_patch` (#2 multi-file) -> `run_diagnostics`
+  // -> `inspect_repository`/`query_symbol_graph` -> `write_file` -> `bash` deterministically.
   const priority = (name) => {
-    if (name === 'apply_patch') return 0;
-    if (name === 'run_diagnostics') return 1;
-    if (name === 'inspect_repository' || name === 'query_symbol_graph') return 2;
-    if (name === 'edit_file') return 3;
+    if (name === 'edit_file') return 0;
+    if (name === 'apply_patch') return 1;
+    if (name === 'run_diagnostics') return 2;
+    if (name === 'inspect_repository' || name === 'query_symbol_graph') return 3;
     if (name === 'write_file') return 4;
     if (name === 'bash') return 5;
     return 3;
@@ -38,10 +38,12 @@ export function modelToolCatalog(tools, policy, live) {
 
   return indexed.map(({ entry: { tool, decision } }) => {
     let description = tool.description;
-    if (tool.name === 'apply_patch') {
-      description += ' 优先推荐：修改已有文件时首选此工具而非整文件 write_file。';
-    } else if (tool.name === 'write_file' && names.has('apply_patch')) {
-      description += ' 修改已有文件优先使用 apply_patch；write_file 仅用于新建文件或整文件覆写。';
+    if (tool.name === 'edit_file') {
+      description += ' 首选推荐：单文件精确上下文局部修改首选 edit_file；target 直接复制自 read_file 的原始代码内容（不要包含行号前缀）。';
+    } else if (tool.name === 'apply_patch') {
+      description += ' 多文件或多处不连续 hunk 的原子修改优先使用 apply_patch（而非整文件 write_file）。';
+    } else if (tool.name === 'write_file' && (names.has('edit_file') || names.has('apply_patch'))) {
+      description += ' 修改已有文件优先使用 edit_file 或 apply_patch；write_file 仅用于新建文件或整文件覆写。';
     } else if (tool.name === 'run_diagnostics') {
       description += ' 优先用于快速结构化语法/类型/测试检查。';
     } else if (tool.name === 'query_symbol_graph') {

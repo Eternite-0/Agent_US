@@ -203,10 +203,27 @@ export class ToolPermissionPolicy {
           commandPrefix: analysis.commandPrefix,
         };
       }
-      if (effectiveMode === 'auto-safe' && analysis.isReadOnly) {
+      if (
+        (effectiveMode === 'auto-safe' || effectiveMode === 'workspace-write') &&
+        analysis.isReadOnly &&
+        !tainted &&
+        !args?.cwd
+      ) {
         return {
           decision: 'allow',
           reason: 'strict read-only command allowlist',
+          commandPrefix: analysis.commandPrefix,
+        };
+      }
+      if (
+        effectiveMode === 'workspace-write' &&
+        analysis.isSafeLocalTest &&
+        !tainted &&
+        !args?.cwd
+      ) {
+        return {
+          decision: 'allow',
+          reason: 'workspace-write safe local test allowlist',
           commandPrefix: analysis.commandPrefix,
         };
       }
