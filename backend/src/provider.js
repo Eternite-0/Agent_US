@@ -7,20 +7,25 @@ const flatten = (blocks) =>
     .filter((x) => x.type === 'text')
     .map((x) => x.text)
     .join('\n');
-function messages(o) {
+export function messages(o) {
   return [
     ...(o.system ? [{ role: 'system', content: o.system }] : []),
     ...o.messages.map((m) => {
-      const calls = m.content
-        .filter((b) => b.type === 'tool-call')
+      const blocks = Array.isArray(m.content) ? m.content : [];
+      const calls = blocks
+        .filter((b) => b && b.type === 'tool-call')
         .map((b) => ({
           id: b.id,
           type: 'function',
           function: { name: b.name, arguments: b.arguments },
         }));
+      const text = typeof m.content === 'string' ? m.content : flatten(blocks);
       return {
         role: m.role,
-        content: flatten(m.content),
+        content: calls.length && !text ? null : text,
+        ...(m.role === 'assistant' && typeof m.reasoning === 'string' && m.reasoning.length > 0
+          ? { reasoning_content: m.reasoning }
+          : {}),
         ...(m.role === 'tool' ? { tool_call_id: m.toolCallId } : {}),
         ...(calls.length ? { tool_calls: calls } : {}),
       };

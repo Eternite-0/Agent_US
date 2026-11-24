@@ -470,8 +470,8 @@ export class AgentLoop {
     const explicitMaxSteps = normalizeBudgetLimit(budget.maxSteps);
     const maxSteps =
       explicitMaxSteps !== null
-        ? Math.min(60, explicitMaxSteps)
-        : Math.min(60, Math.max(1, Number(profile?.defaultMaxSteps ?? 24)));
+        ? Math.min(80, explicitMaxSteps)
+        : Math.min(80, Math.max(1, Number(profile?.defaultMaxSteps ?? 40)));
     const explicitMaxDuration = normalizeBudgetLimit(budget.maxDurationMs);
     const deadlineAt = explicitMaxDuration !== null ? Date.now() + explicitMaxDuration : null;
     const maxTotalTokens = normalizeBudgetLimit(budget.maxTokens);
@@ -1656,6 +1656,9 @@ export class AgentLoop {
         ) {
           const assistantMsg = {
             role: 'assistant',
+            ...(typeof stepResult.reasoning === 'string' && stepResult.reasoning.length > 0
+              ? { reasoning: stepResult.reasoning }
+              : {}),
             content: [
               ...(stepResult.text ? [{ type: 'text', text: stepResult.text }] : []),
               ...stepResult.toolCalls,
@@ -1981,10 +1984,11 @@ export class AgentLoop {
         for (let batchIdx = 0; batchIdx < preparedBatch.length; batchIdx += 1) {
           const item = preparedBatch[batchIdx];
           const { tc, isError, durationMs, receipt, output } = item;
-          const promptOutput = admittedOutputs[batchIdx] ?? output;
+          const promptOutput = excerpt(String(admittedOutputs[batchIdx] ?? output ?? ''), 32000);
           await onToolResult?.({
             tc,
             output,
+            promptOutput,
             isError,
             durationMs,
             receipt,
