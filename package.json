@@ -1,10 +1,18 @@
 {
   "name": "agent-us",
-  "version": "0.1.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
-  "description": "A ticket-based, approval-gated coding agent backed by Codex",
+  "description": "Agent_US 3.0 — local-first AI coding & autonomous swarm workbench with Terminal CLI, Desktop GUI, and Web UI",
   "engines": { "node": ">=24.9.0" },
-  "scripts": { "agent": "node src/cli.js", "serve": "node src/serve.js", "test": "node --test test/*.test.js" },
+  "bin": {
+    "agent-us": "./backend/bin/agent-us.mjs"
+  },
+  "scripts": {
+    "agent-us": "node backend/bin/agent-us.mjs",
+    "start:backend": "node backend/src/main.js",
+    "serve": "node backend/src/main.js",
+    "test": "node --test backend/test/*.test.js"
+  },
   "dependencies": { "@openai/codex-sdk": "0.170.0" }
 }

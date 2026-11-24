@@ -23,9 +23,18 @@ import type {
   EvaluationRun,
   EvaluationStartInput,
   Evidence,
+  ExternalConfigDetectResult,
+  ExternalImportResult,
   FileChangeDelta,
+  GitChangesResponse,
+  GitCommitResult,
+  GitMergeResult,
   GitStatus,
   GitReviewInput,
+  RedoRewindResult,
+  RewindFileResult,
+  RewindScope,
+  RewindSessionResult,
   SessionPermissionMode,
   MemoryItem,
   ModelSpec,
@@ -48,6 +57,7 @@ import type {
   ScheduleRunRecord,
   SessionHistoryItem,
   SessionRecord,
+  SessionSnapshotsResponse,
   Submission,
   SwarmApplyAllResult,
   SwarmArtifactFile,
@@ -59,6 +69,7 @@ import type {
   SwarmReviewerVerdict,
   SwarmReviewerVerification,
   McpServerStatus,
+  WorkspaceCustomizations,
   WorkspaceEntryKind,
   SwarmRunRecord,
   SwarmSubmitResponse,
@@ -225,14 +236,24 @@ export interface AgentBackendClient {
   steerSession?: (
     sessionId: string,
     input: string,
+    opts?: { files?: Record<string, string> },
   ) => Promise<{ steered: boolean; sessionId?: string; turnId?: string; queued?: number }>;
   compactSession?: (
     sessionId: string,
   ) => Promise<{ compacted: boolean; compressedCount?: number; summary?: string; reason?: string }>;
+  getSessionSnapshots?: (sessionId: string) => Promise<SessionSnapshotsResponse>;
   rewindSession?: (
     sessionId: string,
-    opts?: { turnId?: string; scope?: 'code' | 'conversation' | 'both' },
-  ) => Promise<{ ok: boolean; restoredFiles: string[]; removedMessages: number; scope: string }>;
+    opts?: { turnId?: string | null; scope?: RewindScope; paths?: string[] },
+  ) => Promise<RewindSessionResult>;
+  rewindSessionFile?: (
+    sessionId: string,
+    opts: { path: string; turnId?: string | null },
+  ) => Promise<RewindFileResult>;
+  redoSessionRewind?: (
+    sessionId: string,
+    opts?: { redoId?: string | null },
+  ) => Promise<RedoRewindResult>;
   searchHistory?: (query: string, limit?: number, signal?: AbortSignal) => Promise<{ items: ChatHistoryMatch[] }>;
   controlTask(
     id: string,
@@ -341,10 +362,53 @@ export interface AgentBackendClient {
   listProviders(): Promise<ProviderDirectory>;
   providersHealth(): Promise<ProvidersHealth>;
   getGitStatus?: (sessionId?: string) => Promise<GitStatus>;
+  getGitChanges?: (sessionId?: string, signal?: AbortSignal) => Promise<GitChangesResponse>;
+  stageGitFiles?: (input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    paths?: string[];
+    all?: boolean;
+  }) => Promise<GitChangesResponse>;
+  unstageGitFiles?: (input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    paths?: string[];
+    all?: boolean;
+  }) => Promise<GitChangesResponse>;
+  commitGitChanges?: (input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    message: string;
+    paths?: string[];
+  }) => Promise<GitCommitResult>;
+  mergeGitBranch?: (input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    sourceBranch?: string;
+    sourceSessionId?: string;
+    noFf?: boolean;
+    message?: string;
+  }) => Promise<GitMergeResult>;
   checkoutGitBranch?: (branch: string, create?: boolean, sessionId?: string, expectedWorkspaceRoot?: string) => Promise<GitStatus>;
   initGitRepo?: (initialBranch?: string, sessionId?: string, expectedWorkspaceRoot?: string) => Promise<GitStatus>;
   startGitReview?: (input: GitReviewInput) => Promise<Task>;
   updateSessionPermission?: (sessionId: string, mode: PermissionMode) => Promise<SessionPermissionMode>;
+  detectExternalConfigs?: (params?: {
+    sessionId?: string;
+    force?: boolean;
+    throwOnError?: boolean;
+    signal?: AbortSignal;
+  }) => Promise<ExternalConfigDetectResult>;
+  importExternalConfigs?: (input: {
+    sessionId?: string;
+    action?: 'import' | 'skip';
+    itemIds?: string[];
+    targetScope?: 'auto' | 'user' | 'workspace';
+  }) => Promise<ExternalImportResult>;
+  getWorkspaceCustomizations?: (params?: {
+    sessionId?: string;
+    signal?: AbortSignal;
+  }) => Promise<WorkspaceCustomizations>;
   // Account Pool
   providerPresets?: () => Promise<ProviderPresetCatalog>;
   listAccounts?: (params?: {
@@ -1048,11 +1112,12 @@ export class LiveBackendClient implements AgentBackendClient {
     );
   }
 
-  steerSession(sessionId: string, input: string) {
+  steerSession(sessionId: string, input: string, opts?: { files?: Record<string, string> }) {
+    const hasFiles = Boolean(opts?.files && Object.keys(opts.files).length > 0);
     return this.req<{ steered: boolean; sessionId?: string; turnId?: string; queued?: number }>(
       'POST',
       `/v1/sessions/${encodeURIComponent(sessionId)}/steer`,
-      { body: { input } },
+      { body: hasFiles ? { input, files: opts!.files } : { input } },
     );
   }
 
@@ -1063,14 +1128,55 @@ export class LiveBackendClient implements AgentBackendClient {
     );
   }
 
+  async getSessionSnapshots(sessionId: string): Promise<SessionSnapshotsResponse> {
+    try {
+      const raw = await this.req<SessionSnapshotsResponse>(
+        'GET',
+        `/v1/sessions/${encodeURIComponent(sessionId)}/snapshots`,
+      );
+      return raw && typeof raw === 'object'
+        ? {
+            items: Array.isArray(raw.items) ? raw.items : [],
+            turns: Array.isArray(raw.turns) ? raw.turns : [],
+            canRedo: Boolean(raw.canRedo),
+            latestRedoId: typeof raw.latestRedoId === 'string' ? raw.latestRedoId : null,
+          }
+        : { items: [], turns: [], canRedo: false, latestRedoId: null };
+    } catch {
+      return { items: [], turns: [], canRedo: false, latestRedoId: null };
+    }
+  }
+
   rewindSession(
     sessionId: string,
-    opts?: { turnId?: string; scope?: 'code' | 'conversation' | 'both' },
-  ) {
-    return this.req<{ ok: boolean; restoredFiles: string[]; removedMessages: number; scope: string }>(
+    opts?: { turnId?: string | null; scope?: RewindScope; paths?: string[] },
+  ): Promise<RewindSessionResult> {
+    return this.req<RewindSessionResult>(
       'POST',
       `/v1/sessions/${encodeURIComponent(sessionId)}/rewind`,
       { body: opts ?? { scope: 'both' } },
+    );
+  }
+
+  rewindSessionFile(
+    sessionId: string,
+    opts: { path: string; turnId?: string | null },
+  ): Promise<RewindFileResult> {
+    return this.req<RewindFileResult>(
+      'POST',
+      `/v1/sessions/${encodeURIComponent(sessionId)}/rewind/file`,
+      { body: opts },
+    );
+  }
+
+  redoSessionRewind(
+    sessionId: string,
+    opts?: { redoId?: string | null },
+  ): Promise<RedoRewindResult> {
+    return this.req<RedoRewindResult>(
+      'POST',
+      `/v1/sessions/${encodeURIComponent(sessionId)}/rewind/redo`,
+      { body: opts ?? {} },
     );
   }
 
@@ -1318,6 +1424,66 @@ export class LiveBackendClient implements AgentBackendClient {
     return this.req('GET', '/v1/git/status', { query: { sessionId } });
   }
 
+  async getGitChanges(sessionId?: string, signal?: AbortSignal): Promise<GitChangesResponse> {
+    try {
+      const raw = await this.req<Partial<GitChangesResponse>>('GET', '/v1/git/changes', {
+        query: { sessionId },
+        signal,
+      });
+      return normalizeGitChangesResponse(raw);
+    } catch {
+      return emptyGitChanges();
+    }
+  }
+
+  async stageGitFiles(input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    paths?: string[];
+    all?: boolean;
+  }): Promise<GitChangesResponse> {
+    const raw = await this.req<Partial<GitChangesResponse> & { changes?: Partial<GitChangesResponse> }>(
+      'POST',
+      '/v1/git/stage',
+      { body: input },
+    );
+    return normalizeGitChangesResponse(raw?.changes ?? raw);
+  }
+
+  async unstageGitFiles(input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    paths?: string[];
+    all?: boolean;
+  }): Promise<GitChangesResponse> {
+    const raw = await this.req<Partial<GitChangesResponse> & { changes?: Partial<GitChangesResponse> }>(
+      'POST',
+      '/v1/git/unstage',
+      { body: input },
+    );
+    return normalizeGitChangesResponse(raw?.changes ?? raw);
+  }
+
+  commitGitChanges(input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    message: string;
+    paths?: string[];
+  }): Promise<GitCommitResult> {
+    return this.req('POST', '/v1/git/commit', { body: input });
+  }
+
+  mergeGitBranch(input: {
+    sessionId?: string;
+    expectedWorkspaceRoot?: string;
+    sourceBranch?: string;
+    sourceSessionId?: string;
+    noFf?: boolean;
+    message?: string;
+  }): Promise<GitMergeResult> {
+    return this.req('POST', '/v1/git/merge', { body: input });
+  }
+
   checkoutGitBranch(branch: string, create = false, sessionId?: string, expectedWorkspaceRoot?: string): Promise<GitStatus> {
     return this.req('POST', '/v1/git/checkout', { body: { branch, create, sessionId, expectedWorkspaceRoot } });
   }
@@ -1334,6 +1500,68 @@ export class LiveBackendClient implements AgentBackendClient {
   async updateSessionPermission(sessionId: string, mode: PermissionMode): Promise<SessionPermissionMode> {
     const result = await this.req<{ permissionMode: SessionPermissionMode }>('PATCH', `/v1/sessions/${encodeURIComponent(sessionId)}`, { body: { permissionMode: mode } });
     return result.permissionMode;
+  }
+
+  async detectExternalConfigs(params?: {
+    sessionId?: string;
+    force?: boolean;
+    throwOnError?: boolean;
+    signal?: AbortSignal;
+  }): Promise<ExternalConfigDetectResult> {
+    try {
+      const raw = await this.req<Partial<ExternalConfigDetectResult>>(
+        'GET',
+        '/v1/onboarding/detect-external',
+        {
+          query: {
+            sessionId: params?.sessionId,
+            force: params?.force ? '1' : undefined,
+          },
+          signal: params?.signal,
+        },
+      );
+      return normalizeExternalDetect(raw);
+    } catch (error) {
+      if (params?.throwOnError && !(error instanceof ApiError && (error.status === 404 || error.status === 405 || error.status === 501))) {
+        throw error;
+      }
+      return emptyExternalDetect();
+    }
+  }
+
+  importExternalConfigs(input: {
+    sessionId?: string;
+    action?: 'import' | 'skip';
+    itemIds?: string[];
+    targetScope?: 'auto' | 'user' | 'workspace';
+  }): Promise<ExternalImportResult> {
+    return this.req('POST', '/v1/onboarding/import-external', {
+      body: {
+        action: input.action ?? 'import',
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.itemIds ? { itemIds: input.itemIds } : {}),
+        ...(input.targetScope ? { targetScope: input.targetScope } : {}),
+      },
+    });
+  }
+
+  async getWorkspaceCustomizations(params?: {
+    sessionId?: string;
+    signal?: AbortSignal;
+  }): Promise<WorkspaceCustomizations> {
+    try {
+      const raw = await this.req<Partial<WorkspaceCustomizations>>(
+        'GET',
+        '/v1/workspace/customizations',
+        {
+          query: { sessionId: params?.sessionId },
+          signal: params?.signal,
+        },
+      );
+      return normalizeWorkspaceCustomizations(raw);
+    } catch {
+      return emptyWorkspaceCustomizations();
+    }
   }
 
   // ---- Account Pool ----
@@ -2498,5 +2726,143 @@ export function formatSwarmApplyAllFeedback(
       ? `已将 ${appliedCount} 个产物（${filesCount} 个文件）应用到父工作区。`
       : `已将 ${appliedCount} 个产物应用到父工作区。`,
     failed: false,
+  };
+}
+
+export function emptyGitChanges(): GitChangesResponse {
+  return {
+    available: false,
+    branch: null,
+    staged: [],
+    unstaged: [],
+    untracked: [],
+    blockedSensitive: [],
+  };
+}
+
+export function normalizeGitChangesResponse(
+  raw: Partial<GitChangesResponse> | null | undefined,
+): GitChangesResponse {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return emptyGitChanges();
+  const toEntries = (arr: unknown, defaultStatus = 'M') =>
+    Array.isArray(arr)
+      ? arr
+          .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+          .map((item) => ({
+            path: String(item.path ?? '').trim(),
+            status: String(item.status ?? defaultStatus).trim() || defaultStatus,
+            ...(typeof item.oldPath === 'string' && item.oldPath.trim() ? { oldPath: item.oldPath.trim() } : {}),
+          }))
+          .filter((entry) => Boolean(entry.path))
+      : [];
+  const staged = toEntries(raw.staged);
+  const unstaged = toEntries(raw.unstaged);
+  const untracked = toEntries(raw.untracked, '?');
+  const blockedSensitive = Array.isArray(raw.blockedSensitive)
+    ? raw.blockedSensitive.map((s) => String(s ?? '').trim()).filter(Boolean)
+    : [];
+  const available = typeof raw.available === 'boolean' ? raw.available : Boolean(raw.branch || staged.length || unstaged.length || untracked.length);
+  return {
+    available,
+    branch: typeof raw.branch === 'string' && raw.branch.trim() ? raw.branch.trim() : null,
+    ahead: finiteNumber(raw.ahead),
+    behind: finiteNumber(raw.behind),
+    headSha: typeof raw.headSha === 'string' && raw.headSha.trim() ? raw.headSha.trim() : null,
+    clean: typeof raw.clean === 'boolean' ? raw.clean : (staged.length === 0 && unstaged.length === 0 && untracked.length === 0),
+    staged,
+    unstaged,
+    untracked,
+    blockedSensitive,
+    workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot : undefined,
+  };
+}
+
+export function emptyExternalDetect(): ExternalConfigDetectResult {
+  return {
+    promptNeeded: false,
+    counts: { rules: 0, commands: 0, skills: 0, agents: 0, mcp: 0, total: 0 },
+    providers: [],
+    items: [],
+  };
+}
+
+export function normalizeExternalDetect(
+  raw: Partial<ExternalConfigDetectResult> | null | undefined,
+): ExternalConfigDetectResult {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return emptyExternalDetect();
+  const items = Array.isArray(raw.items)
+    ? raw.items
+        .filter((item): item is NonNullable<typeof raw.items>[number] => Boolean(item && typeof item === 'object' && typeof item.id === 'string'))
+        .map((item) => ({
+          id: String(item.id),
+          provider: String(item.provider ?? 'external'),
+          scope: String(item.scope ?? 'user'),
+          kind: String(item.kind ?? 'rule'),
+          name: String(item.name ?? item.id),
+          displayPath: String(item.displayPath ?? ''),
+          summary: typeof item.summary === 'string' ? item.summary : undefined,
+          bytes: finiteNumber(item.bytes),
+        }))
+    : [];
+  const countsRaw = raw.counts && typeof raw.counts === 'object' ? raw.counts : ({} as Record<string, unknown>);
+  const rules = finiteNumber((countsRaw as Record<string, unknown>).rules) ?? items.filter((i) => i.kind === 'rule').length;
+  const commands = finiteNumber((countsRaw as Record<string, unknown>).commands) ?? items.filter((i) => i.kind === 'command').length;
+  const skills = finiteNumber((countsRaw as Record<string, unknown>).skills) ?? items.filter((i) => i.kind === 'skill').length;
+  const agents = finiteNumber((countsRaw as Record<string, unknown>).agents) ?? items.filter((i) => i.kind === 'agent').length;
+  const mcp = finiteNumber((countsRaw as Record<string, unknown>).mcp) ?? items.filter((i) => i.kind === 'mcp').length;
+  const total = finiteNumber((countsRaw as Record<string, unknown>).total) ?? items.length;
+  return {
+    promptNeeded: Boolean(raw.promptNeeded) && items.length > 0,
+    onboardingState: raw.onboardingState && typeof raw.onboardingState === 'object' ? raw.onboardingState : undefined,
+    counts: { rules, commands, skills, agents, mcp, total },
+    providers: Array.isArray(raw.providers) ? raw.providers.map(String).filter(Boolean) : [],
+    items,
+  };
+}
+
+export function emptyWorkspaceCustomizations(): WorkspaceCustomizations {
+  return {
+    workspaceRoot: '',
+    commands: [],
+    agents: [],
+    skills: [],
+    rules: [],
+    mcpServers: [],
+  };
+}
+
+export function normalizeWorkspaceCustomizations(
+  raw: Partial<WorkspaceCustomizations> | null | undefined,
+): WorkspaceCustomizations {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return emptyWorkspaceCustomizations();
+  const toList = (arr: unknown) =>
+    Array.isArray(arr)
+      ? arr
+          .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object'))
+          .map((entry) => ({
+            ...(typeof entry.id === 'string' ? { id: entry.id } : {}),
+            name: String(entry.name ?? entry.command ?? '').trim(),
+            ...(typeof entry.command === 'string' ? { command: entry.command } : {}),
+            ...(typeof entry.description === 'string' ? { description: entry.description } : {}),
+            ...(typeof entry.argumentHint === 'string' ? { argumentHint: entry.argumentHint } : {}),
+            ...(typeof entry.summary === 'string' ? { summary: entry.summary } : {}),
+            ...(typeof entry.scope === 'string' ? { scope: entry.scope } : {}),
+            ...(typeof entry.source === 'string' ? { source: entry.source } : {}),
+            ...(typeof entry.path === 'string' ? { path: entry.path } : {}),
+            ...(typeof entry.displayPath === 'string' ? { displayPath: entry.displayPath } : {}),
+            ...(typeof entry.enabled === 'boolean' ? { enabled: entry.enabled } : {}),
+            ...(typeof entry.disabled === 'boolean' ? { disabled: entry.disabled } : {}),
+            ...(typeof entry.trusted === 'boolean' ? { trusted: entry.trusted } : {}),
+            ...(typeof entry.transport === 'string' ? { transport: entry.transport } : {}),
+          }))
+          .filter((entry) => Boolean(entry.name))
+      : [];
+  return {
+    workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot : '',
+    commands: toList(raw.commands),
+    agents: toList(raw.agents),
+    skills: toList(raw.skills),
+    rules: toList(raw.rules),
+    mcpServers: toList(raw.mcpServers),
   };
 }

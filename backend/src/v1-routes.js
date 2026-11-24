@@ -5,17 +5,28 @@ import { redactSecrets, sanitize } from './envelope.js';
 import { decide as decideLegacyApproval } from './tools.js';
 import { AuditLedgerService } from './governance/audit.js';
 import { ScheduledTaskRunner } from './governance/scheduler.js';
-import { forkChatSession } from './routes/session-fork.js';
+import { forkChatSession, resolveForkBranchForSession } from './routes/session-fork.js';
 import { registerRuntimeRoutes } from './routes/runtime-routes.js';
 import { registerSwarmRoutes } from './routes/swarm-routes.js';
 import { registerScheduleRoutes } from './routes/schedule-routes.js';
 import { getTraceContext, withTraceContext } from './observability/trace.js';
 import { MetricsCollector } from './observability/metrics.js';
 import { registerIntelligenceRoutes } from './routes/intelligence-routes.js';
+import { WorkspaceRewindManager } from './durable/checkpoint.js';
 
 import { PERMISSION_RANK } from './tools/policy.js';
 import {
-  checkoutWorkspaceBranch, collectReviewEvidence, getGitStatusFor, initWorkspaceGit, runGit, validateWorkspace,
+  checkoutWorkspaceBranch,
+  collectReviewEvidence,
+  commitGitChanges,
+  getGitChangesFor,
+  getGitStatusFor,
+  initWorkspaceGit,
+  mergeGitBranch,
+  runGit,
+  stageGitPaths,
+  unstageGitPaths,
+  validateWorkspace,
 } from './routes/workspace-git.js';
 
 function assertPermissionMode(value) {
@@ -61,6 +72,35 @@ export function v1Routes(
   registerIntelligenceRoutes(app, { ...(intelligence ?? {}), directAgent, pool, store });
   if (!pool || !directAgent) return;
 
+  const rewindManager = new WorkspaceRewindManager({
+    store,
+    directAgent,
+    eventRouter: directAgent.eventRouter,
+  });
+
+  const sendGitFault = (reply, req, err) => {
+    if (
+      err instanceof Fault &&
+      err.detail &&
+      (err.detail.conflicts || err.detail.blockedSensitive || err.detail.kinds)
+    ) {
+      return reply.code(err.status).send({
+        ...(err.detail.conflicts ? { conflicts: err.detail.conflicts } : {}),
+        ...(err.detail.blockedSensitive ? { blockedSensitive: err.detail.blockedSensitive } : {}),
+        ...(err.detail.kinds ? { kinds: err.detail.kinds } : {}),
+        error: {
+          code: err.code,
+          ...(typeof err.detail.message === 'string' ? { message: err.detail.message } : {}),
+          ...(err.detail.conflicts ? { conflicts: err.detail.conflicts } : {}),
+          ...(err.detail.blockedSensitive ? { blockedSensitive: err.detail.blockedSensitive } : {}),
+          ...(err.detail.kinds ? { kinds: err.detail.kinds } : {}),
+          requestId: req.id,
+        },
+      });
+    }
+    throw err;
+  };
+
   const streams = new Set();
   app.addHook('preClose', async () => {
     for (const cleanup of streams) cleanup();
@@ -101,6 +141,59 @@ export function v1Routes(
     const root = await workspaceFor(q.sessionId);
     const kind = q.kind === 'folder' || q.kind === 'all' ? q.kind : 'file';
     return { items: await searchWorkspaceFiles(root, { search: q.q, limit: q.limit, kind }) };
+  });
+
+  app.get('/v1/workspace/customizations', async (req) => {
+    const q = req.query ?? {};
+    const workspaceRoot = q.sessionId
+      ? await workspaceFor(String(q.sessionId))
+      : directAgent.getWorkspaceRoot?.();
+    return (
+      (await directAgent.getWorkspaceCustomizations?.(workspaceRoot)) ?? {
+        workspaceRoot,
+        commands: [],
+        agents: [],
+        skills: [],
+        rules: [],
+        mcpServers: [],
+      }
+    );
+  });
+
+  app.get('/v1/onboarding/detect-external', async (req) => {
+    const q = req.query ?? {};
+    const workspaceRoot = q.sessionId
+      ? await workspaceFor(String(q.sessionId))
+      : directAgent.getWorkspaceRoot?.();
+    const force = q.force === '1' || q.force === 'true' || q.force === true;
+    return (
+      (await directAgent.detectExternalConfigs?.({ workspaceRoot, force })) ?? {
+        promptNeeded: false,
+        counts: { rules: 0, commands: 0, skills: 0, agents: 0, mcp: 0, total: 0 },
+        providers: [],
+        items: [],
+      }
+    );
+  });
+
+  app.post('/v1/onboarding/import-external', async (req) => {
+    const body = req.body ?? {};
+    const workspaceRoot = body.sessionId
+      ? await workspaceFor(String(body.sessionId))
+      : directAgent.getWorkspaceRoot?.();
+    return (
+      (await directAgent.importExternalConfigs?.({
+        workspaceRoot,
+        action: body.action ?? 'import',
+        itemIds: body.itemIds,
+        targetScope: body.targetScope,
+      })) ?? {
+        ok: true,
+        action: body.action ?? 'skip',
+        importedCount: 0,
+        promptNeeded: false,
+      }
+    );
   });
 
   app.put('/v1/workspace', async (req) =>
@@ -186,10 +279,14 @@ export function v1Routes(
     };
     assertPermissionMode(body.permissionMode);
     assertReviewInput(directAgent.getSession(req.params.id), body.input, body.permissionMode);
-    await workspaceFor(req.params.id);
+    const workspaceRoot = await workspaceFor(req.params.id);
     const command = handleChatCommand(directAgent, req.params.id, body, traffic);
     if (command) return command;
-    return directAgent.startTurn(req.params.id, {
+    const shouldScanBaseline =
+      Boolean(String(body.input ?? '').trim()) &&
+      !(directAgent.activeSessionTurn?.has(req.params.id) && !body.clientTurnId);
+    const preScanned = shouldScanBaseline ? await rewindManager.scanBaseline(workspaceRoot) : null;
+    const result = directAgent.startTurn(req.params.id, {
       input: body.input,
       clientTurnId: body.clientTurnId,
       model: body.model,
@@ -201,6 +298,14 @@ export function v1Routes(
       ...(body.aciOptions !== undefined ? { aciOptions: body.aciOptions } : {}),
       ...(traffic ? { trafficSource: traffic.trafficSource, isSynthetic: traffic.isSynthetic } : {}),
     });
+    if (preScanned && result?.turn?.id && !result?.steered) {
+      const hadBaseline = Boolean(store.getSetting(`turn_baseline:${req.params.id}:${result.turn.id}`, null));
+      if (!hadBaseline) {
+        rewindManager.saveTurnBaseline(req.params.id, result.turn.id, workspaceRoot, preScanned);
+        rewindManager.clearRedo(req.params.id);
+      }
+    }
+    return result;
   });
 
   app.post('/v1/sessions/:id/steer', async (req) => {
@@ -208,22 +313,51 @@ export function v1Routes(
     const input = body.input ?? body.text ?? '';
     assertReviewInput(directAgent.getSession(req.params.id), input, body.permissionMode);
     const command = handleChatCommand(directAgent, req.params.id, { ...body, input }, {});
-    return command ?? directAgent.steerSession(req.params.id, input);
+    if (command) return command;
+    const isSteerIntoActive = Boolean(directAgent.activeSessionTurn?.has(req.params.id));
+    let workspaceRoot = null;
+    let preScanned = null;
+    if (!isSteerIntoActive && String(input ?? '').trim()) {
+      workspaceRoot = await workspaceFor(req.params.id);
+      preScanned = await rewindManager.scanBaseline(workspaceRoot);
+    }
+    const result = directAgent.steerSession(req.params.id, input, { files: body.files });
+    if (preScanned && result && result.steered === false && result.turn?.id) {
+      rewindManager.saveTurnBaseline(req.params.id, result.turn.id, workspaceRoot, preScanned);
+      rewindManager.clearRedo(req.params.id);
+    }
+    return result;
   });
 
   app.post('/v1/sessions/:id/compact', async (req) =>
     directAgent.compactSession(req.params.id),
   );
 
-  app.get('/v1/sessions/:id/snapshots', async (req) => ({
-    items: directAgent.listSnapshots(req.params.id),
-  }));
+  app.get('/v1/sessions/:id/snapshots', async (req) =>
+    rewindManager.listSnapshots(req.params.id),
+  );
 
   app.post('/v1/sessions/:id/rewind', async (req) => {
     const body = req.body ?? {};
-    return directAgent.rewindSession(req.params.id, {
+    return rewindManager.rewindSession(req.params.id, {
       turnId: body.turnId ?? null,
       scope: body.scope ?? 'both',
+      paths: Array.isArray(body.paths) ? body.paths : null,
+    });
+  });
+
+  app.post('/v1/sessions/:id/rewind/file', async (req) => {
+    const body = req.body ?? {};
+    return rewindManager.rewindFile(req.params.id, {
+      path: body.path,
+      turnId: body.turnId ?? null,
+    });
+  });
+
+  app.post('/v1/sessions/:id/rewind/redo', async (req) => {
+    const body = req.body ?? {};
+    return rewindManager.redoRewind(req.params.id, {
+      redoId: body.redoId ?? null,
     });
   });
 
@@ -714,6 +848,82 @@ export function v1Routes(
   app.get('/v1/git/status', async (req) => {
     const workspaceRoot = await workspaceFor(req.query?.sessionId);
     return { ...await getGitStatusFor(workspaceRoot), workspaceRoot };
+  });
+
+  app.get('/v1/git/changes', async (req) => {
+    const workspaceRoot = await workspaceFor(req.query?.sessionId);
+    return { ...await getGitChangesFor(workspaceRoot), workspaceRoot };
+  });
+
+  app.post('/v1/git/stage', async (req, reply) => {
+    const body = req.body ?? {};
+    const workspaceRoot = await workspaceFor(body.sessionId, body.expectedWorkspaceRoot);
+    try {
+      const result = await stageGitPaths(workspaceRoot, {
+        paths: body.paths,
+        all: body.all === true,
+      });
+      return { ...result, workspaceRoot };
+    } catch (err) {
+      return sendGitFault(reply, req, err);
+    }
+  });
+
+  app.post('/v1/git/unstage', async (req, reply) => {
+    const body = req.body ?? {};
+    const workspaceRoot = await workspaceFor(body.sessionId, body.expectedWorkspaceRoot);
+    try {
+      const result = await unstageGitPaths(workspaceRoot, {
+        paths: body.paths,
+        all: body.all === true,
+      });
+      return { ...result, workspaceRoot };
+    } catch (err) {
+      return sendGitFault(reply, req, err);
+    }
+  });
+
+  app.post('/v1/git/commit', async (req, reply) => {
+    const body = req.body ?? {};
+    const workspaceRoot = await workspaceFor(body.sessionId, body.expectedWorkspaceRoot);
+    try {
+      const result = await commitGitChanges(workspaceRoot, {
+        message: body.message,
+        paths: body.paths,
+      });
+      return {
+        ...result,
+        changes: { ...result.changes, workspaceRoot },
+      };
+    } catch (err) {
+      return sendGitFault(reply, req, err);
+    }
+  });
+
+  app.post('/v1/git/merge', async (req, reply) => {
+    const body = req.body ?? {};
+    const workspaceRoot = await workspaceFor(body.sessionId, body.expectedWorkspaceRoot);
+    let sourceBranch = typeof body.sourceBranch === 'string' ? body.sourceBranch.trim() : '';
+    if (!sourceBranch && body.sourceSessionId) {
+      sourceBranch = await resolveForkBranchForSession({ directAgent, runGit }, String(body.sourceSessionId));
+    }
+    if (!sourceBranch) {
+      throw new Fault('GIT_SOURCE_BRANCH_REQUIRED', 400, { message: '请指定要合并的源分支或分叉会话。' });
+    }
+    try {
+      const result = await mergeGitBranch(workspaceRoot, {
+        sourceBranch,
+        noFf: body.noFf === true,
+        message: body.message,
+      });
+      return {
+        ...result,
+        changes: { ...result.changes, workspaceRoot },
+        workspaceRoot,
+      };
+    } catch (err) {
+      return sendGitFault(reply, req, err);
+    }
   });
 
   app.post('/v1/git/checkout', async (req) => {

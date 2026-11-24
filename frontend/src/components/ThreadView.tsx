@@ -14,7 +14,9 @@ import type {
   InspectorTab,
   ModelSpec,
   PermissionMode,
+  RewindScope,
   SessionPermissionMode,
+  WorkspaceCustomizations,
   WorkspaceEntryKind,
   Project,
   Task,
@@ -64,6 +66,7 @@ import {
   IconRightPanelToggle,
   IconSearch,
   IconShieldAlert,
+  IconUndo,
 } from './Icons';
 import {
   ImageLightbox,
@@ -131,6 +134,15 @@ function extractConciseClosing(raw: string): { shortText: string; isTruncated: b
   };
 }
 
+export interface RewindNoticeState {
+  sessionId: string;
+  scope: RewindScope;
+  restoredCount: number;
+  deletedCount?: number;
+  removedMessages: number;
+  redoId?: string | null;
+}
+
 interface ThreadViewProps {
   interaction: ThreadInteraction;
   bundles: TaskBundle[];
@@ -140,7 +152,10 @@ interface ThreadViewProps {
   liveStreams?: Record<string, DirectLiveStream>;
   liveToolOutputs?: Record<string, DirectLiveToolOutput[]>;
   recentRuntimeEvents?: readonly EventEnvelope[];
-  onRewindSession?: (sessionId: string, scope: 'code' | 'conversation' | 'both', turnId?: string) => Promise<void>;
+  onRewindSession?: (sessionId: string, scope: RewindScope, turnId?: string) => Promise<void>;
+  onRedoRewind?: (sessionId: string, redoId?: string) => Promise<void>;
+  rewindNotice?: RewindNoticeState | null;
+  onDismissRewindNotice?: () => void;
   onCompactSession?: (sessionId: string) => Promise<void>;
   codexMode: CodexMode;
   projects: Project[];
@@ -172,8 +187,10 @@ interface ThreadViewProps {
   onStartReview?: (baseBranch?: string) => Promise<void>;
   onSlashCommand: (command: SlashCommand) => void;
   commandAvailability?: CommandAvailability;
+  customizations?: WorkspaceCustomizations | null;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
+  onSteerSession?: (text: string, files: Record<string, string>) => Promise<boolean | void>;
   onSubmitFollowup: (text: string, files: Record<string, string>) => Promise<boolean | void>;
   onControlTask: (task: Task, action: 'pause' | 'resume' | 'cancel' | 'retry') => Promise<void>;
   archiving: boolean;
@@ -236,6 +253,9 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   liveToolOutputs = {},
   recentRuntimeEvents,
   onRewindSession,
+  onRedoRewind,
+  rewindNotice,
+  onDismissRewindNotice,
   onCompactSession,
   codexMode,
   projects,
@@ -267,8 +287,10 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   onStartReview,
   onSlashCommand,
   commandAvailability,
+  customizations,
   searchMentionFiles,
   onSubmitGoal,
+  onSteerSession,
   onSubmitFollowup,
   onControlTask,
   archiving,
@@ -296,6 +318,28 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   const [hoveredTurnIdx, setHoveredTurnIdx] = useState<number | null>(null);
   const [bookmarkedTurns, setBookmarkedTurns] = useState<Record<string, boolean>>({});
   const [flashedKey, setFlashedKey] = useState<string | null>(null);
+  const [rewindingSessionId, setRewindingSessionId] = useState<string | null>(null);
+  const [redoingRewind, setRedoingRewind] = useState(false);
+
+  const runRewind = useCallback(async (sessionId: string, scope: RewindScope, turnId?: string) => {
+    if (!onRewindSession || rewindingSessionId) return;
+    setRewindingSessionId(sessionId);
+    try {
+      await onRewindSession(sessionId, scope, turnId);
+    } finally {
+      setRewindingSessionId((current) => (current === sessionId ? null : current));
+    }
+  }, [onRewindSession, rewindingSessionId]);
+
+  const runRedo = useCallback(async (sessionId: string, redoId?: string) => {
+    if (!onRedoRewind || redoingRewind) return;
+    setRedoingRewind(true);
+    try {
+      await onRedoRewind(sessionId, redoId);
+    } finally {
+      setRedoingRewind(false);
+    }
+  }, [onRedoRewind, redoingRewind]);
 
   // In-thread Ctrl+F find bar
   const [findOpen, setFindOpen] = useState(false);
@@ -512,7 +556,10 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
 
     const hasRuntimeActivity = visibleEvents.some((ev) =>
       /^(tool|command|file|plan|node|worker|approval|turn\.failed|message\.failed)/.test(ev.type)
-      || ev.type.includes('compact'),
+      || ev.type.includes('compact')
+      || ev.type === 'turn/steer_injected'
+      || ev.type === 'turn/steered'
+      || ev.type === 'turn/route_failover',
     );
     const hasProcess = Boolean(
       visibleEvidence.length || task.plan || isLive || workers.length > 0 || hasRuntimeActivity,
@@ -567,8 +614,10 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       (event.taskId === bundle.task.id || event.payload?.sessionId === bundle.task.id) &&
       (event.type === 'assistant/message' || event.type === 'tool/call' || event.type === 'tool/result' ||
         event.type === 'tool/receipt' || event.type === 'turn/started' || isDirectTurnEnd(event.type) ||
-        event.type === 'session/rewound' || event.type === 'aci/telemetry' || event.type === 'context/compacted' ||
-        event.type === 'loop/thrashing_warning')) ?? [];
+        event.type === 'turn/steer_injected' || event.type === 'turn/steered' || event.type === 'turn/route_failover' ||
+        event.type === 'file/reverted' || event.type === 'session/rewound' || event.type === 'session/rewind_redone' ||
+        event.type === 'aci/telemetry' || event.type === 'context/compacted' ||
+        event.type === 'loop/thrashing_warning' || event.type === 'onboarding/imported')) ?? [];
     const cached = turnModelCache.get(bundle);
     if (cached && cached.stream === stream && cached.output === output &&
         cached.recent.length === recent.length && cached.recent.every((event, index) => event === recent[index])) return cached.model;
@@ -742,6 +791,13 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
 
   const activeTask = latestBundle.task;
   const anyLive = turnModels.some((tm) => tm.isLive);
+  const activeRewindNotice =
+    rewindNotice &&
+    (rewindNotice.sessionId === activeTask.id ||
+      rewindNotice.sessionId === primaryBundle.task.id ||
+      bundles.some((b) => b.task.id === rewindNotice.sessionId))
+      ? rewindNotice
+      : null;
   const companionDiffs = turnModels.at(-1)?.computedFiles ?? [];
   const allSourceFiles = Array.from(
     new Set([
@@ -1449,17 +1505,17 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                           files={computedFiles}
                           onInspectFile={(path) => onOpenInspector('diff', path, tid)}
                           onCopy={onToast}
-                          onUndo={() => {
-                            if (onRewindSession) {
-                              void onRewindSession(tid, 'code');
-                              return;
-                            }
-                            const fileList = computedFiles.map((f) => f.path).join(', ');
-                            injectDraft(
-                              `请撤销上一轮对以下文件的改动并恢复至修改前状态：${fileList}`,
-                              'replace',
-                            );
-                          }}
+                          rewinding={rewindingSessionId === tid}
+                          onRewind={
+                            onRewindSession
+                              ? (scope) => {
+                                  const latestTurnId = [...tm.directExchanges]
+                                    .reverse()
+                                    .find((ex) => ex.turnId)?.turnId;
+                                  return runRewind(tid, scope, latestTurnId);
+                                }
+                              : undefined
+                          }
                         />
                       </div>
                     )}
@@ -1487,11 +1543,26 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                                 setOpenTurnMenuId(null);
                                 void onCompactSession(tid);
                               }}>压缩上下文</button>}
-                              {onRewindSession && <button type="button" className="codex-popover-item" onClick={() => {
-                                turnMenuRef.current?.querySelector('button')?.focus();
-                                setOpenTurnMenuId(null);
-                                void onRewindSession(tid, 'code');
-                              }}>回退代码</button>}
+                              {onRewindSession && (
+                                <>
+                                  <button type="button" className="codex-popover-item" onClick={() => {
+                                    turnMenuRef.current?.querySelector('button')?.focus();
+                                    setOpenTurnMenuId(null);
+                                    const latestTurnId = [...tm.directExchanges]
+                                      .reverse()
+                                      .find((ex) => ex.turnId)?.turnId;
+                                    void runRewind(tid, 'files', latestTurnId);
+                                  }}>仅还原文件</button>
+                                  <button type="button" className="codex-popover-item" onClick={() => {
+                                    turnMenuRef.current?.querySelector('button')?.focus();
+                                    setOpenTurnMenuId(null);
+                                    const latestTurnId = [...tm.directExchanges]
+                                      .reverse()
+                                      .find((ex) => ex.turnId)?.turnId;
+                                    void runRewind(tid, 'both', latestTurnId);
+                                  }}>文件 + 对话回退</button>
+                                </>
+                              )}
                             </div>
                           )}
                         </div>
@@ -1874,14 +1945,8 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                         files={computedFiles}
                         onInspectFile={(path) => onOpenInspector('diff', path, tid)}
                         onCopy={onToast}
-                        onUndo={() => {
-                          const fileList = computedFiles.map((f) => f.path).join(', ');
-                          injectDraft(
-                            `请撤销上一轮对以下文件的改动并恢复至修改前状态：${fileList}`,
-                            'replace',
-                          );
-                          onToast('已生成撤销变更指令，确认后按 Enter 提交');
-                        }}
+                        rewinding={rewindingSessionId === tid}
+                        onRewind={onRewindSession ? (scope) => runRewind(tid, scope) : undefined}
                       />
                     </div>
                   )}
@@ -1973,6 +2038,36 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                               </span>
                             </button>
                             <div className="codex-popover-divider" />
+                            {onRewindSession && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="codex-popover-item"
+                                  onClick={() => {
+                                    setOpenTurnMenuId(null);
+                                    void runRewind(tid, 'files');
+                                  }}
+                                >
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+                                    <IconUndo size={13} />
+                                    <span>仅还原文件</span>
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  className="codex-popover-item"
+                                  onClick={() => {
+                                    setOpenTurnMenuId(null);
+                                    void runRewind(tid, 'both');
+                                  }}
+                                >
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+                                    <IconUndo size={13} />
+                                    <span>文件 + 对话回退</span>
+                                  </span>
+                                </button>
+                              </>
+                            )}
                             <button
                               type="button"
                               className="codex-popover-item"
@@ -2031,6 +2126,39 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
         >
           <IconArrowDown size={15} />
         </button>
+        {activeRewindNotice && onRedoRewind && (
+          <div className="codex-rewind-bar" role="status" aria-live="polite">
+            <div className="codex-rewind-bar-info">
+              <IconUndo size={14} aria-hidden="true" />
+              <span>
+                已还原 {activeRewindNotice.restoredCount} 个文件
+                {activeRewindNotice.deletedCount ? `，清理 ${activeRewindNotice.deletedCount} 个新增文件` : ''}
+                {activeRewindNotice.removedMessages > 0 ? `，并回退 ${activeRewindNotice.removedMessages} 条对话消息` : ''}
+              </span>
+            </div>
+            <div className="codex-rewind-bar-actions">
+              <button
+                type="button"
+                className="codex-toolbar-btn"
+                data-variant="primary"
+                disabled={redoingRewind}
+                onClick={() => void runRedo(activeRewindNotice.sessionId, activeRewindNotice.redoId ?? undefined)}
+              >
+                {redoingRewind ? '重做中…' : '重做撤销 (Redo)'}
+              </button>
+              {onDismissRewindNotice && (
+                <button
+                  type="button"
+                  className="codex-icon-btn"
+                  aria-label="关闭回退提示"
+                  onClick={onDismissRewindNotice}
+                >
+                  <IconClose size={13} />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
         <Composer
           variant="thread"
           draftStore={interaction.draft}
@@ -2066,8 +2194,10 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
             } else onSlashCommand(command);
           }}
           commandAvailability={commandAvailability}
+          customizations={customizations}
           searchMentionFiles={searchMentionFiles}
           onSubmitGoal={onSubmitGoal}
+          onSteer={onSteerSession}
           onSubmit={onSubmitFollowup}
           onStop={anyLive ? () => void onControlTask(activeTask, 'pause') : undefined}
         />

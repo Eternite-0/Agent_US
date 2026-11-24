@@ -28,7 +28,16 @@ export interface DirectToolActivity {
   exitCode?: number;
 }
 
-type ActivityItem = DirectToolActivity | { kind: 'reasoning'; id: string; text: string; live?: boolean };
+export interface DirectActivityNotice {
+  kind: 'notice';
+  id: string;
+  eventType: 'turn/steer_injected' | 'turn/route_failover';
+  tone: 'steer' | 'failover';
+  title: string;
+  detail?: string;
+}
+
+type ActivityItem = DirectToolActivity | { kind: 'reasoning'; id: string; text: string; live?: boolean } | DirectActivityNotice;
 export type DirectTimelineBlock =
   | { kind: 'activity'; id: string; items: ActivityItem[]; waiting?: boolean }
   | { kind: 'message'; id: string; text: string; live?: boolean; justArrived?: boolean };
@@ -263,6 +272,58 @@ export function groupDirectMessages(sessionId: string, input: string, items: Ses
     if (typeof turnId !== 'string' || typeof callId !== 'string' || typeof exitCode !== 'number') continue;
     const row = tools.get(id('tool', turnKey(turnId), callId));
     if (row && row.exitCode === undefined) row.exitCode = exitCode;
+  }
+
+  // Render live mid-turn steering injections and hot-standby failover switches in the activity stream.
+  const seenNotices = new Set<string>();
+  for (const [idx, event] of events.entries()) {
+    if (event.type !== 'turn/steer_injected' && event.type !== 'turn/route_failover') continue;
+    const payload = event.payload ?? {};
+    const turnId = typeof payload.turnId === 'string' ? payload.turnId : undefined;
+    const exchange = (turnId ? byTurn.get(turnId) : undefined) ?? exchanges.findLast((ex) => !ex.command);
+    if (!exchange) continue;
+    const noticeId = id('notice', event.type, event.seq || idx, turnId ?? '');
+    if (seenNotices.has(noticeId)) continue;
+    seenNotices.add(noticeId);
+    if (event.type === 'turn/steer_injected') {
+      const step = typeof payload.step === 'number' ? payload.step : undefined;
+      const count = typeof payload.count === 'number' ? payload.count : undefined;
+      const texts = Array.isArray(payload.texts)
+        ? payload.texts.map((t) => String(t ?? '').trim()).filter(Boolean)
+        : typeof payload.text === 'string' && payload.text.trim()
+          ? [payload.text.trim()]
+          : [];
+      const detail = texts.length ? texts.join(' / ') : undefined;
+      phase(exchange).items.push({
+        kind: 'notice',
+        id: noticeId,
+        eventType: 'turn/steer_injected',
+        tone: 'steer',
+        title: `已实时注入插话引导${step !== undefined ? ` · 第 ${step} 步` : ''}${count && count > 1 ? ` (${count} 条)` : ''}`,
+        detail,
+      });
+    } else {
+      const statusCode = typeof payload.statusCode === 'number' || typeof payload.statusCode === 'string'
+        ? String(payload.statusCode)
+        : '';
+      const fromId = typeof payload.fromAccountId === 'string' ? payload.fromAccountId : '';
+      const toId = typeof payload.toAccountId === 'string' ? payload.toAccountId : '';
+      const attempt = typeof payload.attempt === 'number' ? payload.attempt : undefined;
+      const reason = typeof payload.reason === 'string' && payload.reason.trim() ? payload.reason.trim() : '';
+      const routeArrow = fromId || toId ? ` · ${fromId || '?'} → ${toId || '?'}` : '';
+      const detailParts = [
+        attempt !== undefined ? `第 ${attempt} 次容灾切换` : '',
+        reason,
+      ].filter(Boolean);
+      phase(exchange).items.push({
+        kind: 'notice',
+        id: noticeId,
+        eventType: 'turn/route_failover',
+        tone: 'failover',
+        title: `路由故障转移${statusCode ? ` (${statusCode})` : ''}${routeArrow}`,
+        detail: detailParts.length ? detailParts.join(' · ') : undefined,
+      });
+    }
   }
 
   if (active) {

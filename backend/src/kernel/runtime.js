@@ -43,6 +43,7 @@ export class AgentRuntimeKernel {
   constructor({
     store = null,
     adapter,
+    pool = null,
     judgment = null,
     verifier = null,
     checkpointStore = null,
@@ -55,9 +56,10 @@ export class AgentRuntimeKernel {
     getLivePolicy = null,
   }) {
     this.store = store;
+    this.pool = pool ?? adapter?.pool ?? null;
     this.eventRouter = eventRouter ?? new EventRouter(store);
     this.cancellation = cancellationManager ?? new CancellationManager();
-    this.inference = new InferenceEngine(adapter);
+    this.inference = new InferenceEngine(adapter, { pool: this.pool });
     this.checkpointStore = checkpointStore;
     this.reconciler = reconciler;
     this.toolPolicy = toolPolicy ?? new ToolPermissionPolicy({ permissionMode: 'approval' });
@@ -126,6 +128,7 @@ export class AgentRuntimeKernel {
     try {
       return await this.loop.run({
         ...params,
+        pool: params.pool ?? this.pool,
         profile,
         signal,
         toolDispatcher: params.toolDispatcher ?? this.toolDispatcher,

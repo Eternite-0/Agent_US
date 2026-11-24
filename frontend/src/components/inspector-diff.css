@@ -132,6 +132,14 @@
   padding-block: 4px;
 }
 .codex-ide-breadcrumb { flex: 1 1 110px; }
+.codex-ide-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  box-shadow: none;
+}
 
 .codex-diff-hunk-nav {
   display: inline-flex;
@@ -211,4 +219,224 @@
 [data-reduced-motion='true'] .codex-tree-chevron {
   transition: none;
   animation: none;
+}
+
+/* Git 暂存与提交工作台 (Codex flat 3.0 workbench) */
+.codex-git-workbench {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px 16px;
+  box-shadow: none;
+}
+
+.codex-git-wb-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.codex-git-wb-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-default);
+}
+
+.codex-git-wb-branch strong {
+  font-weight: var(--font-weight-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-git-wb-sha,
+.codex-git-wb-sync {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-surface-secondary);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  box-shadow: none;
+}
+
+.codex-git-sensitive-notice,
+.codex-git-error-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: none;
+}
+
+.codex-git-sensitive-notice {
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.codex-git-error-notice {
+  border: 1px solid color-mix(in srgb, var(--color-danger) 30%, transparent);
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+
+.codex-git-sensitive-notice code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  word-break: break-word;
+}
+
+.codex-git-empty,
+.codex-git-section-empty {
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-secondary);
+  color: var(--text-tertiary);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.codex-git-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.codex-git-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: var(--font-weight-strong);
+  color: var(--text-secondary);
+}
+
+.codex-git-file-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  overflow: hidden;
+  box-shadow: none;
+}
+
+.codex-git-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  box-shadow: none;
+}
+
+.codex-git-file-row:last-child {
+  border-bottom: none;
+}
+
+.codex-git-file-row:hover {
+  background: var(--bg-ghost-hover-soft);
+}
+
+.codex-git-status-badge {
+  flex: none;
+  min-width: 22px;
+  text-align: center;
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.codex-git-status-badge[data-status^='A'],
+.codex-git-status-badge[data-status='?'],
+.codex-git-status-badge[data-status='??'] {
+  color: var(--color-git-added);
+  background: var(--color-git-added-bg);
+}
+
+.codex-git-status-badge[data-status^='D'] {
+  color: var(--color-git-deleted);
+  background: var(--color-git-deleted-bg);
+}
+
+.codex-git-file-path {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--text-default);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.codex-git-file-path > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-git-commit-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  box-shadow: none;
+}
+
+.codex-git-commit-input {
+  width: 100%;
+  min-height: 68px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-default);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  line-height: 1.45;
+  resize: vertical;
+  box-shadow: none;
+}
+
+.codex-git-commit-input:focus {
+  outline: 1px solid var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+.codex-git-commit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.codex-git-commit-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
 }

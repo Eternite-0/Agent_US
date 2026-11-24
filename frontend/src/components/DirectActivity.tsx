@@ -1,14 +1,14 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import type { AciTurnTelemetry } from '../types/backend';
 import { sumAdmissionDecisions } from '../utils/aciTelemetry.ts';
-import { directToolOutput, reasoningHeadline, type DirectTimelineBlock, type DirectToolActivity, type DirectTurnTiming } from '../utils/directMessages';
+import { directToolOutput, reasoningHeadline, type DirectActivityNotice, type DirectTimelineBlock, type DirectToolActivity, type DirectTurnTiming } from '../utils/directMessages';
 import { fmtTokens } from '../utils/format';
 import {
   ActivityDisclosureScope, ActivityStatusText, ActivityToolRow, activityToolKind, activityToolLabels,
   toolActionLabel, toolDisclosureId, useActivityDisclosure, useAnyExplicitActivityOpen, type ActivityStatus,
 } from './ActivityPresentation';
 import { AnimatedDetails, Collapsible } from './Collapsible';
-import { IconChevronRight, IconSparkle } from './Icons';
+import { IconChevronRight, IconCompose, IconRefresh, IconSparkle } from './Icons';
 
 export { ActivityDisclosureScope } from './ActivityPresentation';
 
@@ -50,13 +50,42 @@ function presentTool(row: DirectToolActivity) {
   return { kind: classifiedKind, command, target, paths: [...paths] };
 }
 
+function DirectNoticeRows({ notices }: { notices: readonly DirectActivityNotice[] }) {
+  if (!notices.length) return null;
+  return (
+    <>
+      {notices.map((notice) => {
+        const NoticeIcon = notice.tone === 'failover' ? IconRefresh : IconCompose;
+        return (
+          <div
+            key={notice.id}
+            className="codex-direct-activity-row codex-direct-notice-row"
+            data-notice-tone={notice.tone}
+            data-event-type={notice.eventType}
+          >
+            <NoticeIcon size={14} aria-hidden="true" />
+            <span
+              className="codex-direct-activity-label"
+              title={notice.detail ? `${notice.title} · ${notice.detail}` : notice.title}
+            >
+              {notice.title}
+              {notice.detail && <code className="codex-direct-notice-detail"> · {notice.detail}</code>}
+            </span>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 export function DirectActivityGroup({ block, onInspectFile, onCopy }: {
   block: Extract<DirectTimelineBlock, { kind: 'activity' }>;
   onInspectFile?: (path: string, line?: number) => void;
   onCopy?: (msg: string) => void;
 }) {
   const panelId = useId();
-  const tools = block.items.filter((item) => item.kind === 'tool');
+  const tools = block.items.filter((item): item is DirectToolActivity => item.kind === 'tool');
+  const notices = block.items.filter((item): item is DirectActivityNotice => item.kind === 'notice');
   const reasoning = block.items.findLast((item) => item.kind === 'reasoning');
   const current = tools.findLast((row) => row.status === 'waiting') ?? tools.findLast((row) => row.status === 'running');
   const failed = tools.filter((row) => row.status === 'failed').length;
@@ -83,23 +112,34 @@ export function DirectActivityGroup({ block, onInspectFile, onCopy }: {
     {interrupted > 0 && <span className="codex-direct-issue" data-status="interrupted">{interrupted} 项未完成</span>}
   </>;
   if (!tools.length) {
-    return <div className="codex-direct-activity-row" data-status={status} data-running={status === 'running'}>{heading}</div>;
+    if (notices.length > 0 && !reasoning && !block.waiting) {
+      return <DirectNoticeRows notices={notices} />;
+    }
+    return (
+      <>
+        <div className="codex-direct-activity-row" data-status={status} data-running={status === 'running'}>{heading}</div>
+        <DirectNoticeRows notices={notices} />
+      </>
+    );
   }
   return (
-    <AnimatedDetails className="codex-direct-activity codex-activity-disclosure" data-status={status} data-running={status === 'running'} open={open} panelId={panelId} summary={
-      <summary className="codex-direct-activity-row" aria-expanded={open} aria-controls={panelId} data-scroll-disclosure onClick={(event) => {
-        event.preventDefault();
-        setOpen(!open);
-      }}>
-        {heading}<IconChevronRight className="codex-direct-chevron" size={14} aria-hidden="true" />
-      </summary>
-    }>
-      <div className="codex-direct-tools">
-        {tools.map((row) => <ActivityToolRow key={row.id} id={row.id} name={row.name} {...presentTool(row)}
-          status={row.status} {...directToolOutput(row)} liveOutput={row.liveOutput} durationMs={row.durationMs}
-          defaultOpen={row.status === 'failed'} onInspectFile={onInspectFile} onCopy={onCopy} />)}
-      </div>
-    </AnimatedDetails>
+    <>
+      <AnimatedDetails className="codex-direct-activity codex-activity-disclosure" data-status={status} data-running={status === 'running'} open={open} panelId={panelId} summary={
+        <summary className="codex-direct-activity-row" aria-expanded={open} aria-controls={panelId} data-scroll-disclosure onClick={(event) => {
+          event.preventDefault();
+          setOpen(!open);
+        }}>
+          {heading}<IconChevronRight className="codex-direct-chevron" size={14} aria-hidden="true" />
+        </summary>
+      }>
+        <div className="codex-direct-tools">
+          {tools.map((row) => <ActivityToolRow key={row.id} id={row.id} name={row.name} {...presentTool(row)}
+            status={row.status} {...directToolOutput(row)} liveOutput={row.liveOutput} durationMs={row.durationMs}
+            defaultOpen={row.status === 'failed'} onInspectFile={onInspectFile} onCopy={onCopy} />)}
+        </div>
+      </AnimatedDetails>
+      <DirectNoticeRows notices={notices} />
+    </>
   );
 }
 

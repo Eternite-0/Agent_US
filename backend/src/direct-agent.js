@@ -1,5 +1,5 @@
 import { modelToolCatalog, selectionRecoveryHint } from './tools/selection.js';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Fault, id as uuid } from './store.js';
 import { excerpt } from './context.js';
@@ -28,8 +28,12 @@ import { logEvent } from './observability/logger.js';
 import { BUDGET_SCOPES } from './swarm/budget-ledger.js';
 import {
   discoverMemoryAndSkills,
+  discoverNativeCustomizations,
   discoverProjectInstructions,
+  expandNativeSlashCommand,
   HookRunner,
+  importExternalConfigItems,
+  scanExternalConfigs,
 } from './agent-context.js';
 import {
   BackgroundProcessManager,
@@ -87,6 +91,15 @@ import { ChildAgentManager } from './swarm/child-lifecycle.js';
 import { DynamicReplanner } from './swarm/replan.js';
 import { AdaptiveSwarmOrchestrator } from './swarm/orchestrator.js';
 import { SwarmArtifactManager } from './swarm/artifacts.js';
+
+const ONBOARDING_EXTERNAL_KEY = 'onboarding.external.v1';
+
+function normalizeOnboardingScopeKey(rawPath) {
+  const norm = resolve(String(rawPath || process.cwd())).replace(/\\/g, '/');
+  return process.platform === 'win32' || process.platform === 'darwin'
+    ? norm.toLowerCase()
+    : norm;
+}
 
 function todayDateStr() {
   const d = new Date();
@@ -170,6 +183,7 @@ export class DirectAgentRuntime {
     this.kernel = new AgentRuntimeKernel({
       store: this.store,
       adapter: this.adapter,
+      pool: this.pool,
       judgment: this.judgment,
       checkpointStore: this.checkpointStore,
     });
@@ -1066,18 +1080,227 @@ export class DirectAgentRuntime {
     return this.hookTrust.listApprovals(opts);
   }
 
+  // ---- Explicit External Config Onboarding & Native Customizations ----
+
+  #readOnboardingExternalState() {
+    const raw = this.store?.getSetting?.(ONBOARDING_EXTERNAL_KEY, null);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { version: 1, users: {}, workspaces: {} };
+    }
+    return {
+      version: 1,
+      users: raw.users && typeof raw.users === 'object' && !Array.isArray(raw.users) ? { ...raw.users } : {},
+      workspaces:
+        raw.workspaces && typeof raw.workspaces === 'object' && !Array.isArray(raw.workspaces)
+          ? { ...raw.workspaces }
+          : {},
+    };
+  }
+
+  #buildOnboardingStateSummary(state, userKey, wsKey, { hasUserItems = false, hasWorkspaceItems = false } = {}) {
+    const userEntry = state.users?.[userKey] ?? null;
+    const wsEntry = state.workspaces?.[wsKey] ?? null;
+    const userHandled = userEntry?.status === 'imported' || userEntry?.status === 'skipped';
+    const workspaceHandled = wsEntry?.status === 'imported' || wsEntry?.status === 'skipped';
+    const hasUnhandledScope = (hasUserItems && !userHandled) || (hasWorkspaceItems && !workspaceHandled);
+    return {
+      key: ONBOARDING_EXTERNAL_KEY,
+      userScopeKey: userKey,
+      workspaceKey: wsKey,
+      userStatus: userEntry?.status ?? null,
+      workspaceStatus: wsEntry?.status ?? null,
+      hasUnhandledScope,
+      updatedAt:
+        Math.max(Number(userEntry?.updatedAt ?? 0), Number(wsEntry?.updatedAt ?? 0)) || null,
+    };
+  }
+
+  async detectExternalConfigs({
+    workspaceRoot = null,
+    homeDir = null,
+    force = false,
+  } = {}) {
+    const resolvedWs = resolve(String(workspaceRoot || this.getWorkspaceRoot()));
+    const resolvedHome = resolve(
+      String(homeDir || process.env.AGENT_US_TEST_HOMEDIR || homedir()),
+    );
+    const scan = scanExternalConfigs({
+      workspaceRoot: resolvedWs,
+      homeDir: resolvedHome,
+    });
+    const state = this.#readOnboardingExternalState();
+    const userKey = normalizeOnboardingScopeKey(scan.homeDir);
+    const wsKey = normalizeOnboardingScopeKey(scan.workspaceRoot);
+    const hasUserItems = scan.publicItems.some((i) => i.scope === 'user');
+    const hasWorkspaceItems = scan.publicItems.some((i) => i.scope === 'workspace');
+    const onboardingState = this.#buildOnboardingStateSummary(state, userKey, wsKey, {
+      hasUserItems,
+      hasWorkspaceItems,
+    });
+    const promptNeeded =
+      scan.publicItems.length > 0 && (Boolean(force) || onboardingState.hasUnhandledScope);
+
+    return {
+      promptNeeded,
+      onboardingState,
+      counts: scan.counts,
+      providers: scan.providers,
+      items: scan.publicItems,
+    };
+  }
+
+  async importExternalConfigs({
+    workspaceRoot = null,
+    homeDir = null,
+    action = 'import',
+    itemIds = undefined,
+    targetScope = 'auto',
+    sessionId = null,
+  } = {}) {
+    const resolvedWs = resolve(String(workspaceRoot || this.getWorkspaceRoot()));
+    const resolvedHome = resolve(
+      String(homeDir || process.env.AGENT_US_TEST_HOMEDIR || homedir()),
+    );
+    const scan = scanExternalConfigs({
+      workspaceRoot: resolvedWs,
+      homeDir: resolvedHome,
+    });
+    const state = this.#readOnboardingExternalState();
+    const userKey = normalizeOnboardingScopeKey(scan.homeDir);
+    const wsKey = normalizeOnboardingScopeKey(scan.workspaceRoot);
+    const now = Date.now();
+
+    if (action === 'skip') {
+      if (state.users[userKey]?.status !== 'imported') {
+        state.users[userKey] = { status: 'skipped', updatedAt: now, importedIds: [] };
+      }
+      if (state.workspaces[wsKey]?.status !== 'imported') {
+        state.workspaces[wsKey] = { status: 'skipped', updatedAt: now, importedIds: [] };
+      }
+      this.store?.setSetting?.(ONBOARDING_EXTERNAL_KEY, state);
+      const onboardingState = this.#buildOnboardingStateSummary(state, userKey, wsKey, {
+        hasUserItems: scan.publicItems.some((i) => i.scope === 'user'),
+        hasWorkspaceItems: scan.publicItems.some((i) => i.scope === 'workspace'),
+      });
+      return {
+        ok: true,
+        action: 'skip',
+        importedCount: 0,
+        onboardingState,
+        promptNeeded: false,
+      };
+    }
+
+    const wantedSet = Array.isArray(itemIds) ? new Set(itemIds.map(String)) : null;
+    const selectedRaw = wantedSet
+      ? scan.rawItems.filter((item) => wantedSet.has(item.id))
+      : scan.rawItems;
+
+    const importedItems = importExternalConfigItems({
+      workspaceRoot: scan.workspaceRoot,
+      dataRoot: this.dataRoot,
+      rawItems: selectedRaw,
+      targetScope,
+    });
+
+    const userImportedIds = importedItems
+      .filter((i) => i.sourceScope === 'user')
+      .map((i) => i.id);
+    const wsImportedIds = importedItems
+      .filter((i) => i.sourceScope === 'workspace')
+      .map((i) => i.id);
+
+    state.users[userKey] = {
+      status:
+        userImportedIds.length > 0 || state.users[userKey]?.status === 'imported'
+          ? 'imported'
+          : 'skipped',
+      updatedAt: now,
+      importedIds: [...new Set([...(state.users[userKey]?.importedIds ?? []), ...userImportedIds])],
+    };
+    state.workspaces[wsKey] = {
+      status:
+        wsImportedIds.length > 0 || state.workspaces[wsKey]?.status === 'imported'
+          ? 'imported'
+          : 'skipped',
+      updatedAt: now,
+      importedIds: [...new Set([...(state.workspaces[wsKey]?.importedIds ?? []), ...wsImportedIds])],
+    };
+    this.store?.setSetting?.(ONBOARDING_EXTERNAL_KEY, state);
+
+    this.eventRouter?.emitPersisted?.({
+      sessionId: sessionId || '__onboarding__',
+      turnId: null,
+      type: RUNTIME_EVENTS.ONBOARDING_IMPORTED,
+      data: {
+        workspaceRoot: scan.workspaceRoot,
+        action: 'import',
+        importedCount: importedItems.length,
+        itemIds: importedItems.map((i) => i.id),
+        targetScope,
+      },
+      audit: true,
+    });
+
+    const customizations = await this.getWorkspaceCustomizations(scan.workspaceRoot);
+    const onboardingState = this.#buildOnboardingStateSummary(state, userKey, wsKey, {
+      hasUserItems: scan.publicItems.some((i) => i.scope === 'user'),
+      hasWorkspaceItems: scan.publicItems.some((i) => i.scope === 'workspace'),
+    });
+    return {
+      ok: true,
+      action: 'import',
+      importedCount: importedItems.length,
+      importedItems,
+      customizations,
+      onboardingState,
+      promptNeeded: false,
+    };
+  }
+
+  async getWorkspaceCustomizations(workspaceRoot = null) {
+    const resolvedWs = resolve(String(workspaceRoot || this.getWorkspaceRoot()));
+    return discoverNativeCustomizations(resolvedWs, {
+      dataRoot: this.dataRoot,
+      hookTrust: this.hookTrust,
+    });
+  }
+
   // ---- Mid-Turn Steering Queue ----
 
-  steerSession(sessionId, text) {
-    this.getSession(sessionId);
-    const clean = String(text ?? '').trim();
-    if (!clean) throw new Fault('EMPTY_INPUT', 400);
+  steerSession(sessionId, text, opts = {}) {
+    const session = this.getSession(sessionId);
+    const rawClean = String(text ?? '').trim();
+    const files =
+      opts?.files && typeof opts.files === 'object' && !Array.isArray(opts.files) && Object.keys(opts.files).length
+        ? opts.files
+        : null;
+    if (!rawClean && !files) throw new Fault('EMPTY_INPUT', 400);
+    const effectiveRaw = rawClean || '请结合附带文件继续处理。';
     const activeTurnId = this.activeSessionTurn.get(sessionId);
     if (!activeTurnId) {
-      return { steered: false, ...this.startTurn(sessionId, { input: clean }) };
+      return {
+        steered: false,
+        ...this.startTurn(sessionId, {
+          input: effectiveRaw,
+          ...(files ? { files } : {}),
+          ...(opts?.model ? { model: opts.model } : {}),
+          ...(opts?.permissionMode ? { permissionMode: opts.permissionMode } : {}),
+          ...(opts?.effort ? { effort: opts.effort } : {}),
+        }),
+      };
     }
+    const workspaceRoot = session.workspaceRoot || this.getWorkspaceRoot();
+    const expanded = expandNativeSlashCommand(workspaceRoot, effectiveRaw, {
+      dataRoot: this.dataRoot,
+    });
+    const finalText = expanded.expandedText || effectiveRaw;
     const queue = this.steeringQueues.get(sessionId) ?? [];
-    queue.push(clean);
+    queue.push({
+      text: finalText,
+      rawText: effectiveRaw,
+      ...(files ? { files } : {}),
+    });
     this.steeringQueues.set(sessionId, queue);
     this.store.tx(() => {
       this.store.db
@@ -1089,17 +1312,29 @@ export class DirectAgentRuntime {
         .run(
           sessionId,
           activeTurnId,
-          clean,
-          JSON.stringify({ steering: true }),
+          finalText,
+          JSON.stringify({
+            steering: true,
+            ...(files ? { files } : {}),
+            ...(expanded.commandMeta ? { expandedCommand: expanded.commandMeta } : {}),
+          }),
           Date.now(),
         );
     });
-    this.#emitPersisted(sessionId, activeTurnId, 'turn/steered', {
+    this.#emitPersisted(sessionId, activeTurnId, RUNTIME_EVENTS.TURN_STEERED, {
       sessionId,
       turnId: activeTurnId,
-      text: clean,
+      text: finalText,
+      ...(finalText !== effectiveRaw ? { rawText: effectiveRaw } : {}),
+      ...(files ? { fileCount: Object.keys(files).length } : {}),
     });
-    return { steered: true, sessionId, turnId: activeTurnId, queued: queue.length };
+    return {
+      steered: true,
+      sessionId,
+      turnId: activeTurnId,
+      queued: queue.length,
+      text: finalText,
+    };
   }
 
   // ---- Non-Destructive Context Compaction ----
@@ -1439,7 +1674,7 @@ export class DirectAgentRuntime {
     if (!trimmedInput) throw new Fault('EMPTY_INPUT', 400);
 
     if (this.activeSessionTurn.has(sessionId) && !clientTurnId) {
-      const steered = this.steerSession(sessionId, trimmedInput);
+      const steered = this.steerSession(sessionId, trimmedInput, { files });
       return {
         steered: true,
         turn: this.store.db.prepare('SELECT * FROM direct_turns WHERE id=?').get(steered.turnId),
@@ -1472,11 +1707,15 @@ export class DirectAgentRuntime {
     const resolvedPerm = permissionMode || session.permissionMode || 'auto-safe';
     const effectiveMode = trimmedInput.startsWith('/plan ') ? 'plan' : session.mode || 'direct';
     const resolvedWorkspace = session.workspaceRoot || this.getWorkspaceRoot();
+    const expandedCmd = expandNativeSlashCommand(resolvedWorkspace, trimmedInput, {
+      dataRoot: this.dataRoot,
+    });
+    const effectiveInput = expandedCmd.expandedText || trimmedInput;
     const resolvedMaxSteps = Math.min(40, Math.max(1, Number(maxSteps || 24)));
     const jobPayload = {
       sessionId,
       turnId,
-      input: trimmedInput,
+      input: effectiveInput,
       model: resolvedModel,
       mode: effectiveMode,
       permissionMode: resolvedPerm,
@@ -1562,8 +1801,13 @@ export class DirectAgentRuntime {
         .run(
           sessionId,
           turnId,
-          trimmedInput,
-          files && Object.keys(files).length ? JSON.stringify({ files }) : null,
+          effectiveInput,
+          (files && Object.keys(files).length) || expandedCmd.commandMeta
+            ? JSON.stringify({
+                ...(files && Object.keys(files).length ? { files } : {}),
+                ...(expandedCmd.commandMeta ? { expandedCommand: expandedCmd.commandMeta } : {}),
+              })
+            : null,
           now,
         );
       this.store.db
@@ -1975,7 +2219,9 @@ export class DirectAgentRuntime {
           .run('SessionStart', { sessionId, turnId, input }, { signal, permissionMode: effectivePermissionMode })
           .catch(() => ({ blocked: false, additionalContexts: [] })),
       ]);
-      const projectInstructions = discoverProjectInstructions(workspaceRoot);
+      const projectInstructions = discoverProjectInstructions(workspaceRoot, {
+        dataRoot: this.dataRoot,
+      });
       const { memoryText, skillsText } = discoverMemoryAndSkills(
         workspaceRoot,
         this.store,

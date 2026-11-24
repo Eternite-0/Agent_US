@@ -7,10 +7,11 @@ import { CancellationError, classifyError, InferenceError } from './errors.js';
  * finish reason detection, and safe transient retries (only prior to partial emission).
  */
 export class InferenceEngine {
-  constructor(adapter, { maxRetries = 1, retryDelayMs = 400 } = {}) {
+  constructor(adapter, { maxRetries = 3, retryDelayMs = 200, pool = null } = {}) {
     this.adapter = adapter;
-    this.maxRetries = Math.max(0, Number(maxRetries ?? 1));
-    this.retryDelayMs = Math.max(50, Number(retryDelayMs ?? 400));
+    this.pool = pool ?? adapter?.pool ?? null;
+    this.maxRetries = Math.max(0, Number(maxRetries ?? 3));
+    this.retryDelayMs = Math.max(25, Number(retryDelayMs ?? 200));
   }
 
   async streamStep({
@@ -22,10 +23,19 @@ export class InferenceEngine {
     tools = [],
     maxTokens = 4096,
     signal,
+    pool = null,
+    excludeAccountIds = null,
     onTextDelta = null,
     onReasoningDelta = null,
     onRetryBudget = null,
+    onRouteFailover = null,
   }) {
+    const activePool = pool ?? this.pool ?? this.adapter?.pool ?? null;
+    const excludedAccounts = new Set(
+      excludeAccountIds
+        ? [...excludeAccountIds].filter(Boolean).map(String)
+        : [],
+    );
     let attempt = 0;
     let activeMaxTokens = maxTokens;
     for (;;) {
@@ -43,6 +53,16 @@ export class InferenceEngine {
       const usageByRequest = new Map();
       let emittedAnything = false;
       let providerInvoked = false;
+      const resolvedProvider = provider && provider !== 'pool' ? provider : null;
+      const preCandidateRoutes =
+        activePool && typeof activePool.resolveRoutes === 'function'
+          ? activePool.resolveRoutes(model, {
+              provider: resolvedProvider,
+              sessionKey,
+              excludeAccountIds: excludedAccounts.size ? [...excludedAccounts] : null,
+            })
+          : [];
+      const prePrimaryAccountId = preCandidateRoutes[0]?.accountId ?? null;
 
       try {
         signal?.throwIfAborted?.();
@@ -56,9 +76,17 @@ export class InferenceEngine {
           tools,
           maxTokens: activeMaxTokens,
           signal,
+          ...(excludedAccounts.size
+            ? { excludeAccountIds: [...excludedAccounts] }
+            : {}),
         })) {
           if (chunk.type !== 'usage') signal?.throwIfAborted?.();
-          if (chunk.type === 'route' && chunk.route) {
+          if (chunk.type === 'route-failover' && chunk.failover) {
+            if (chunk.failover.fromAccountId) {
+              excludedAccounts.add(String(chunk.failover.fromAccountId));
+            }
+            onRouteFailover?.(chunk.failover);
+          } else if (chunk.type === 'route' && chunk.route) {
             route = chunk.route;
           } else if (chunk.type === 'usage' && chunk.usage) {
             const key = chunk.usageRequestId ?? '';
@@ -122,12 +150,77 @@ export class InferenceEngine {
           throw cancelled;
         }
         const classified = classifyError(err);
+        if (Array.isArray(err?.detail?.triedAccountIds)) {
+          for (const tid of err.detail.triedAccountIds) {
+            if (tid) excludedAccounts.add(String(tid));
+          }
+        }
+        const poolAlreadyExhausted =
+          err?.code === 'PROVIDER_UNAVAILABLE' &&
+          err?.detail?.exhausted === true &&
+          activePool &&
+          typeof activePool.resolveRoutes === 'function' &&
+          activePool.resolveRoutes(model, {
+            provider: resolvedProvider,
+            sessionKey,
+            excludeAccountIds: excludedAccounts.size ? [...excludedAccounts] : null,
+          }).length === 0;
         if (
           !emittedAnything &&
+          !poolAlreadyExhausted &&
           classified.retryable &&
           attempt < this.maxRetries
         ) {
           attempt++;
+          const rawStatus = Number(
+            err?.status ??
+              err?.statusCode ??
+              err?.cause?.status ??
+              err?.cause?.statusCode ??
+              err?.detail?.statusCode ??
+              0,
+          );
+          const statusCode =
+            rawStatus ||
+            (/\b(429|500|502|503|504)\b/.exec(String(err?.message ?? ''))
+              ? Number(RegExp.$1)
+              : null);
+          const fromAccountId =
+            route?.accountId ??
+            err?.accountId ??
+            err?.route?.accountId ??
+            err?.detail?.accountId ??
+            prePrimaryAccountId ??
+            null;
+          if (fromAccountId) {
+            excludedAccounts.add(String(fromAccountId));
+            if (activePool) {
+              if (typeof activePool.recordAccountFailure === 'function') {
+                activePool.recordAccountFailure(fromAccountId, err?.cause ?? err);
+              } else if (typeof activePool.markRouteFailure === 'function') {
+                activePool.markRouteFailure(
+                  { source: 'pool', accountId: String(fromAccountId) },
+                  err?.cause ?? err,
+                );
+              }
+            }
+          }
+          const nextCandidateRoutes =
+            activePool && typeof activePool.resolveRoutes === 'function'
+              ? activePool.resolveRoutes(model, {
+                  provider: resolvedProvider,
+                  sessionKey,
+                  excludeAccountIds: excludedAccounts.size ? [...excludedAccounts] : null,
+                })
+              : [];
+          const toAccountId = nextCandidateRoutes[0]?.accountId ?? null;
+          onRouteFailover?.({
+            attempt,
+            statusCode,
+            fromAccountId,
+            toAccountId,
+            reason: classified.message || String(err?.message ?? err),
+          });
           if (typeof onRetryBudget === 'function') {
             const nextCap = onRetryBudget({ attempt, usage, error: classified });
             if (typeof nextCap === 'number' && Number.isFinite(nextCap)) {
@@ -135,8 +228,14 @@ export class InferenceEngine {
             }
           }
           providerInvoked = false;
+          const hasDifferentStandby = Boolean(
+            toAccountId && fromAccountId && toAccountId !== fromAccountId,
+          );
+          const backoffMs = hasDifferentStandby
+            ? Math.min(25, this.retryDelayMs)
+            : this.retryDelayMs * attempt;
           try {
-            await delay(this.retryDelayMs * attempt, undefined, { signal });
+            await delay(backoffMs, undefined, { signal });
           } catch (delayErr) {
             const reason = signal?.reason;
             const reasonMsg =
