@@ -4,7 +4,7 @@
 
 # Agent_US
 
-**Local-First Autonomous Engineering Platform · Adaptive Context Intelligence · Fail-Closed Docker Sandbox**
+**Local-First Autonomous Engineering Platform · Instant Rewind & Live Steer · Adaptive Context Intelligence · Fail-Closed Sandbox**
 
 面向复杂软件工程任务的本地优先自主智能体框架
 
@@ -25,6 +25,7 @@
 
 | 维度 | 核心能力与阶段 | 实测基线 vs 演进结果 | 验证环境 |
 | --- | --- | --- | --- |
+| **3.0 · 零成本回滚与全栈工作流** | **Agent_US 3.0**（`<50ms` 零 Token 真回滚/Redo · 运行中无损插话 `Live Steer` · `429`/`5xx` 热备切换 · 显式外部配置一键导入 · `agent-us` 终端 CLI & GUI 同步 · 原生 Git 交付台） | 单文件/整轮快照还原与 Redo **`<50ms`**（零 Token、绝不误伤未触碰脏改动）<br/>运行中 `/steer` 零中断注入且 **100% 保持静态 System Prompt KV 前缀** · 首包前 `429`/`5xx` 号池自动容灾<br/>只读扫描 `~/.claude` / `~/.codex` 经确认一键导入（原外部文件 **SHA-256 零改写**，外部 MCP 默认 `untrusted`）<br/>全仓 **`576/576`** 后端单测（`110` 文件）· **`73/73`** 前端单测 · `visual.spec.mjs` **`26/26`** 零失败 | Node.js 24 + Fastify `/v1/*`<br/>Docker `29.6.1` 全链路 E2E |
 | **ACI 2.6 · 轨迹驱逐与原生体验** | **Agent_US 2.6**（`trajectory_eviction_v26` · 过期输出置换 · 局部哈希恢复 · 防死磕 · `query_symbol_graph` · Swarm 自动解冲突 · Codex 原生交互） | Arm D 通关率 **`57.1%`（`8/14`**, CI `[32.6%, 78.6%]`）领先 Arm A/C（`50.0%`, `7/14`），唯一攻克 `aci-06`<br/>成功归一化成本 **`304,125`** tok/pass（较 Arm C `370,548` 降 **`17.9%`**）· 同题配对节省 **`+11.3%`（`n=5`）** vs Arm C `+2.5%`<br/>Arm A `Sup Tok = 0` · Arm D **`21` Epochs / `45` 次过期驱逐（省 `20,972` tok，总 DTOC 省 `39,189` tok）** · **`15/15` (`100%`)** 哈希恢复（`13` 次局部）<br/>全仓 **`558/558`** 后端单测（`106` 文件）· **`69/69`** 前端单测 · `visual.spec.mjs` **`26/26`** 零失败 | `deepseek-v4.1-flash`<br/>Docker `strong`（`42` 试次 `aci26`） |
 | **ACI 2.5 · 工程闭环** | **Agent_US 2.5**（`phase_watermark_v25` · 完工宽限 · `8s` 熔断 · `apply_patch` · Swarm 三方合并） | Arm C / D 通关率 **`25.0% → 58.3%`（`+33.3 pp`** · CI `[31.9%, 80.7%]`）<br/>成功归一化成本 **`670,619 → 288,998–298,849` tok/pass（`−55.4% ~ −56.9%`）**<br/>同题双通配对节省 **`+5.22%`** · Arm D KV Hit **`81.57%`** · **`0/10`** 诱饵恢复 · 全仓 **`533/533`** 单测 | `deepseek-v4.1-flash`<br/>Docker `strong`（`36` 试次 `aci25`） |
 | **注入前上下文治理** | **Agent_US 2.4 Stage 4**（Pre-Injection Admission · Supervisor · SHA-256 恢复） | Arm C 通关率 **`33.3% → 75.0%`（`+41.7 pp`）**<br/>关键上下文召回 **`100%`** · FNR **`0`** · 注入前减负 **`54.8%–64.8%`**<br/>Arm D KV Hit **`84.78%`** · 短任务 KV 差 **`-0.64 pp`** · **`0/6`** 诱饵恢复 | `deepseek-v4.1-flash`<br/>Docker `strong`（`48 + 6` 试次） |
@@ -40,6 +41,7 @@ Agent_US 将 **Durable Agent Kernel**、**Pre-Injection ACI Governance**、**Con
 
 | 维度 | 普通 AI 编程助手 | Agent_US |
 | --- | --- | --- |
+| **人机协同与多端流转** | 运行中无法纠偏、回退靠手写命令、CLI 与桌面端会话割裂 | 运行中 `Live Steer` 无损插话纠偏、`<50ms` 零 Token 快照真回滚/Redo、`agent-us` 终端 CLI 与 Web/Desktop 实时双向同步、原生 Git 暂存提交与外部配置显式导入 |
 | **上下文供给** | 盲目全量读取文件、诱饵/旧档污染前缀 | 五级注入前准入（`DIRECT`/`SUPPORTING`/`DEFER`/`DUPLICATE`/`IRRELEVANT`）、五大关键域硬护栏、`[ACI-SKIP]` 噪点拦截与 SHA-256 `expand_context` 无损按需恢复 |
 | **推理与修改** | 凭直觉改代码、手算哈希/盲猜需求 | `extractTaskContract` 提取硬约束与排序规则、前置失败复现、根因消退验证与零 Shell 安全校验原语 `compute_file_digest` |
 | **多智能体协同** | 固定角色模板、手动复制上下文 | 显式 `/swarm` 驱动动态编排、共享渐进式代码索引、独立 Git Worktree 并行执行与只读 Independent Reviewer |
@@ -50,7 +52,14 @@ Agent_US 将 **Durable Agent Kernel**、**Pre-Injection ACI Governance**、**Con
 
 ## 核心创新与能力体系
 
-### 1. ACI 2.5–2.6 上下文准入、轨迹驱逐与局部恢复（2.4 S4 – 2.6）
+### 1. Agent_US 3.0 开发者高频工作流跃迁（3.0 Product Leap）
+
+- **毫秒级零 Token 真回滚与单文件还原（`True Instant Rewind & Redo`）**：[`checkpoint.js`](backend/src/durable/checkpoint.js)、[`session-fork.js`](backend/src/routes/session-fork.js) 与 [`v1-routes.js`](backend/src/v1-routes.js) 在每轮首次修改前记录精确快照与 `fileStats` 清单，支持“仅还原文件”、“文件 + 对话回退”、单文件 `POST /v1/sessions/:id/rewind/file` 与一键 Redo（`<50ms`，绝不误伤未触碰的用户脏改动）；前端 [ThreadView](frontend/src/components/ThreadView.tsx)、[FileChangeCard](frontend/src/components/FileChangeCard.tsx) 与 [InspectorDrawer](frontend/src/components/InspectorDrawer.tsx) 原生联动。
+- **运行中无损插话纠偏（`Live Mid-Turn Steering`）与号池热备切换**：[`direct-agent.js`](backend/src/direct-agent.js)、[`agent-loop.js`](backend/src/kernel/agent-loop.js) 与 [Composer](frontend/src/components/Composer.tsx) 支持运行中通过 `POST /v1/sessions/:id/steer`（`插话引导`）投递实时引导消息，在工具批次边界零中断注入且不破坏静态系统提示词 KV Cache 前缀；[`inference.js`](backend/src/kernel/inference.js) 与 [`pool.js`](backend/src/pool.js) 在流式首包前遭遇 `429`/`5xx` 时自动切换健康备用账号重试（`turn/route_failover`），[`shell-tools.js`](backend/src/tools/builtin/shell-tools.js) 实时推送 `tool/output` 增量流并拦截交互等待卡死。
+- **显式外部生态检测与一键原生导入向导（`Explicit Onboarding Wizard`）**：[`agent-context.js`](backend/src/agent-context.js) 与 [ExternalImportModal](frontend/src/components/ExternalImportModal.tsx) 提供只读扫描 `GET /v1/onboarding/detect-external`（检测 `~/.claude`、`~/.codex` 与工作区遗留规则/命令/技能/MCP，未经确认绝不自动混读或改写原文件），确认后经 `POST /v1/onboarding/import-external` 转换为 Agent_US 原生资产（外部 MCP 默认标记 `untrusted`）并动态刷新 `/` 斜杠命令与技能列表。
+- **全功能 `agent-us` 终端 CLI、GUI 双向同步与原生 Git 交付闭环**：[`agent-us.mjs`](backend/bin/agent-us.mjs) 与 [`cli.js`](backend/src/cli.js) 支持后台服务自启、单次执行、`<piped_stdin>` 管道注入、交互式 REPL（`/steer`、`/undo`、`/redo`、`/git`、`/import`、`/swarm`）、终端内审批及 `--resume` 跨 CLI/Web/Desktop 共享 SQLite+SSE 会话实时同步；[`workspace-git.js`](backend/src/routes/workspace-git.js) 与 [GitWorkbench](frontend/src/components/GitWorkbench.tsx) 提供按文件 Stage/Unstage、敏感文件拦截、Commit 与分支 Merge 闭环。
+
+### 2. ACI 2.5–2.6 上下文准入、轨迹驱逐与局部恢复（2.4 S4 – 2.6）
 
 > 从 2.4 Stage 4“注入前精筛 + 无损恢复”、2.5“双门控水位 + `8s` 熔断 + 完工保留金”演进为 **2.6 的轨迹预测双层驱逐（`trajectory_eviction_v26`）、按 Symbol/行号局部哈希恢复与防死磕自诊断闭环**，在保持 KV 前缀稳定下解决 `<28k` 场景 DTOC 零触发难题并持续压降冗余上下文。
 
@@ -59,23 +68,23 @@ Agent_US 将 **Durable Agent Kernel**、**Pre-Injection ACI Governance**、**Con
 - **只读 `ContextSupervisor`（`tools: []`）与 `8s` 连续超时熔断**：[`supervisor.js`](backend/src/context/supervisor.js) 将单次超时收敛至 **`8000` ms**（`maxOutputTokens = 2048` 避免长 JSON 截断，连续 `>= 2` 次超时开启 `60s` 熔断短路至确定性回退），并对纯确定性 `onlySuperseded` Tier 1 驱逐免于额外 Supervisor LLM 调用；可在 [AdaptiveContextPanel](frontend/src/components/AdaptiveContextPanel.tsx) 与会话流 `aciTelemetry` 实时观测五级准入分布、水位与熔断状态。
 - **局部 SHA-256 校验恢复、防死磕守卫与完工保留金**：[`aci-store.js`](backend/src/context/aci-store.js) 与 [`meta-tools.js`](backend/src/tools/builtin/meta-tools.js) 扩展 `expand_context` 支持 `symbol` / `symbols` / `startLine..endLine` 按块精准恢复（`extractBoundedSymbolSpans`），同步校验父 `sha256` 与切片 `sliceSha256` 并统计 `partialRecoveries` / `recoveryTokensSaved`；[`execution-reasoning.js`](backend/src/kernel/execution-reasoning.js) 对同一文件连续失败修改 `>= 2` 次触发 **Anti-Thrashing** 尾部根因与调用链引导；[`budget-estimator.js`](backend/src/planning/budget-estimator.js) 为过测交付预留 **`postTestReserveActive`** 与唯一纯文本宽限步（`tools: []`），[`lease-guard.js`](backend/src/durable/lease-guard.js) 每 `5000ms` 续租。
 
-### 2. 核心编码原语、符号图谱与增量诊断（2.5–2.6）
+### 3. 核心编码原语、符号图谱与增量诊断（2.5–2.6）
 
 - **双格式乐观锁精确补丁（`apply_patch`）**：[`patch-and-diagnostics.js`](backend/src/patch-and-diagnostics.js) 与 [`fs-tools.js`](backend/src/tools/builtin/fs-tools.js) 扩展 `apply_patch` 透明解析 Codex 补丁与标准 unified diff（`--- a/` / `+++ b/` / `@@`），写盘前执行 SHA-256 **原子乐观并发锁**与 `.js/.mjs/.cjs/.json` **原子语法预校验**，并将结构化 `hunks`、`+add`/`-del` 与 `sha256After` 透传至前端 [FileChangeCard](frontend/src/components/FileChangeCard.tsx) 与 [InspectorDrawer](frontend/src/components/InspectorDrawer.tsx)（支持 **`Alt+↑/↓`** hunk 快捷键跳转与 **`>6` 行无变更上下文按需折叠展开**）。
 - **增量 TypeScript 类型检查与结构化测试诊断（`run_diagnostics`）**：`run_diagnostics`（`syntax`/`typecheck`/`test`/`lint`/`auto`）自动定位最近 `tsconfig.json` 执行 `tsc --noEmit --pretty false` 提取 `source: 'tsc'` 报错，精准解析 `node --test` `AssertionError` 的 `expected` vs `actual` / `operator` / `file:line:column` 并压平千行噪声；前端 [DirectActivity](frontend/src/components/DirectActivity.tsx) 支持点击诊断条直达 `InspectorDrawer` 目标行高亮。
 - **增量符号缓存与直调符号图谱（`query_symbol_graph`）**：[`repo-intelligence.js`](backend/src/repo-intelligence.js) 与 [`repo-symbols.js`](backend/src/repo-symbols.js) 基于 `(size, mtimeMs, sha256)` 缓存未变文件符号解析；[`workspace-tools.js`](backend/src/workspace-tools.js) 新增只读工具 **`query_symbol_graph`**，单次调用即可联合返回符号定义、`findCrossFileReferences` 跨文件调用/导入方与 `findRelatedTests` 关联单测，并在 [`tools/selection.js`](backend/src/tools/selection.js) 联动优先推荐。
 
-### 3. 自主推理、根因台账与可信经验记忆（2.4 Stage 1–3）
+### 4. 自主推理、根因台账与可信经验记忆（2.4 Stage 1–3）
 
 - **契约感知推理（`Contract-Aware Reasoning`）**：[`contract-reasoning.js`](backend/src/kernel/contract-reasoning.js) 抽取 `SPEC.md` / `CONTRACT.json` / `CONSTRAINTS.md` 中的交付清单、禁用修改列表、`C1..Rn` 约束与优先级规则（过滤反引号语法示例避免误报），保持系统提示词逐字节静态以维护 KV Prompt Cache。
 - **根因验证与免 Shell 校验**：[`execution-reasoning.js`](backend/src/kernel/execution-reasoning.js) 核对修复前报错指纹消退、Anti-Thrashing 连续失败拦截与 `doc` 免重验；[`meta-tools.js`](backend/src/tools/builtin/meta-tools.js) 提供零 Shell 的 `compute_file_digest` 与局部 `expand_context`；[`ExperienceMemoryService`](backend/src/memory/service.js) 仅吸纳经 `trusted_server_verifier` 验证的经验。
 
-### 4. Swarm 协同硬化、自动冲突消解与三域强隔离沙箱（2.3.1 – 2.6）
+### 5. Swarm 协同硬化、自动冲突消解与三域强隔离沙箱（2.3.1 – 2.6）
 
 - **Swarm 协同硬化与自动冲突修复闭环（2.5–2.6）**：[`planner.js`](backend/src/swarm/planner.js) 实施同级写路径冲突预检；[`mailbox.js`](backend/src/swarm/mailbox.js) 跨 Worker 传递 `<=1600` 字符 `[Shared Swarm ACI Digest]`；[`artifacts.js`](backend/src/swarm/artifacts.js) 通过 `mergeFileThreeWay`（`git merge-file` 三方合并，保留 `100755` 权限）识别同行冲突并提取结构化 `conflictBlocks`，由 [`orchestrator.js`](backend/src/swarm/orchestrator.js) 自动派发至多 1 次受控 `conflict_resolution` 修复步（仅携带冲突 hunk 与双方节点目标）并经 [`reviewer.js`](backend/src/swarm/reviewer.js) `evaluateConflictResolutionGate` / `evaluateReviewerHardGate`（零冲突标记 + 真实 `git diff` + 测试 `exitCode === 0`）验真放行；[`node-state-machine.js`](backend/src/swarm/node-state-machine.js) 与 [`run-deadline.js`](backend/src/swarm/run-deadline.js) 落实 SQLite 终态 CAS 与超时优雅降级（[AutonomousRunPanel](frontend/src/components/AutonomousRunPanel.tsx) 展示 `reviewerVerification` 硬门禁状态）。
 - **OS 级强隔离与三域隐藏验收（2.3.1）**：[`benchmark-sandbox.js`](backend/src/tools/benchmark-sandbox.js) 与 [`Dockerfile.benchmark`](backend/sandbox/Dockerfile.benchmark) 提供 `--network=none`、非 root `65534:65534`、`--ipc=none` 的 Docker `STRONG` Fail-Closed 隔离（无 Docker 时显式走受限 `NODE_PERMISSION`）；[`hidden-acceptance.js`](backend/src/evaluation/hidden-acceptance.js) 与 [`hidden-acceptance-supervisor.mjs`](backend/src/tools/hidden-acceptance-supervisor.mjs) 配合 Stdin 单次 `hmacKey` 与 [`judge.js`](backend/src/evaluation/judge.js) Hard Veto 彻底阻断 `7/7` 绕过向量。
 
-### 5. 能力感知工具治理、评估器 2.6 与 Codex 原生工作台（2.3.7 – 2.6）
+### 6. 能力感知工具治理、评估器 2.6 与 Codex 原生工作台（2.3.7 – 2.6）
 
 - **工具治理与权限模式**：[`tools/selection.js`](backend/src/tools/selection.js)、[`tools/policy.js`](backend/src/tools/policy.js)、[`tools/auto-approval.js`](backend/src/tools/auto-approval.js) 与 [`dispatcher.js`](backend/src/tools/dispatcher.js) 约束工具目录对齐与 Composer 分级审批；[`prompt-cache.js`](backend/src/observability/prompt-cache.js) 监测缓存稳定性。
 - **论文评估器 2.6 与原生消融界面**：[`aci-governance-benchmark.js`](backend/src/evaluation/aci-governance-benchmark.js) 与 [`benchmark-aci-governance.mjs`](backend/scripts/benchmark-aci-governance.mjs) 修复 `isAciSupervisorWireRequest` 使 Arm A/B `Sup Tok` 严格归零，将 `aci-06` 校准为 `240k` 并新增 21 文件高压力跨模块演进题 `aci-07-cross-module-evolution`（`--suite aci26`），支持 `--resume`、请求隔离 `--concurrency 1..16` 与 `--archive-dir` 自动归档；[`intelligence-routes.js`](backend/src/routes/intelligence-routes.js) 提供只读 `GET /v1/evaluations/aci-ablation`，前端 [EvaluationView](frontend/src/components/EvaluationView.tsx) 原生展示 A/C/D 通过率置信区间、同题配对省 Token 率与一键复制 LaTeX 论文表（严守 [`NATIVE-VISUAL.md`](frontend/NATIVE-VISUAL.md) 扁平无阴影与 `reduced-motion` 规范）。
@@ -122,16 +131,16 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph L1["1 · Application & Client Host"]
-        CLIENT["React 19 Web Workbench · Electron 35 Windows Desktop\nInspectorDrawer (Alt+↑/↓ · 上下文折叠 · 诊断跳行) · AciTurnTelemetryStrip · EvaluationView"]
+        CLIENT["React 19 Web Workbench · Electron 35 Desktop · agent-us Terminal CLI\nInspectorDrawer · GitWorkbench · ExternalImportModal · EvaluationView"]
     end
 
     subgraph L2["2 · Control Plane & Model Infrastructure"]
-        API["Fastify /v1 API Gateway · Chat Command /swarm\nSession · Approvals · /v1/context/supervisor · /v1/evaluations/aci-ablation"]
+        API["Fastify /v1 API Gateway · Chat Command /swarm · Live Steer /steer\nRewind /rewind* · Git /v1/git/* · Onboarding /v1/onboarding/*"]
         POOL["AccountPool · 动态模型能力路由 · GatewayProxy\nOpenAI (/v1/chat/completions) & Anthropic (/v1/messages)"]
     end
 
     subgraph L3["3 · Runtime Kernel & ACI 2.6 Governance"]
-        KERNEL["DirectAgentRuntime · AgentLoop · Anti-Thrashing 自诊断守卫\npostTestReserveActive · 唯一交付宽限步 · Retry Ledger Merge"]
+        KERNEL["DirectAgentRuntime · AgentLoop · Live Mid-Turn Steering · 429/5xx Failover\nAnti-Thrashing 自诊断守卫 · postTestReserveActive · Retry Ledger Merge"]
         ACI["PreInjectionAdmission · trajectory_eviction_v26 ([0.78, 0.90])\nContextSupervisor (8s 熔断) · ContextEvidenceLedger · Verifier"]
     end
 
@@ -146,7 +155,7 @@ flowchart TB
     end
 
     subgraph L6["6 · Durable Persistence & Telemetry"]
-        STORE[("SQLite WAL · Durable Job Queue · 5s Lease Renewal & Checkpoints\nReversibleContextStore (sha256 + sliceSha256) · Prompt Cache Telemetry")]
+        STORE[("SQLite WAL · Durable Job Queue · <50ms WorkspaceRewindManager\nReversibleContextStore (sha256 + sliceSha256) · Prompt Cache Telemetry")]
     end
 
     CLIENT <-->|"REST / SSE"| API
@@ -294,6 +303,21 @@ flowchart TB
 | `/swarm stop` | 安全停止当前会话未结束的 Swarm Run（不会取消普通 Direct turn） |
 | `/swarm` | 显示内置 `/swarm` 命令用法说明 |
 
+### 终端 `agent-us` CLI 与实时同步（3.0）
+
+通过 [agent-us.mjs](backend/bin/agent-us.mjs)（`npm link` 后可直接使用 `agent-us`）在终端直连并共享 `/v1/*` 会话存储与审批队列（后端未启动时自动拉起守护进程）：
+
+```bash
+# 单次执行 / 管道上下文注入 / 续接 Web 与桌面端同会话 / Swarm 调度
+node backend/bin/agent-us.mjs "修复鉴权回归测试"
+git diff | node backend/bin/agent-us.mjs "审查改动"
+node backend/bin/agent-us.mjs --resume latest
+node backend/bin/agent-us.mjs --swarm "并行完成前后端改造并验收"
+node backend/bin/agent-us.mjs import            # 显式扫描 ~/.claude / ~/.codex 并交互确认导入
+```
+
+> 交互式 REPL 内置 `/steer`（运行中插话纠偏）、`/undo` · `/redo`（`<50ms` 真回滚与重做）、`/git`、`/import`、`/swarm`、`/status`、`/cancel` 与 `/exit`。
+
 ### 本地 REST / SSE 与模型兼容端点
 
 后端默认监听 `http://127.0.0.1:8787`，鉴权使用 `BACKEND_TOKEN`（`Authorization: Bearer ...` 或 `x-api-key`）：
@@ -301,8 +325,9 @@ flowchart TB
 | 接口面 | 代表路由 | 用途 |
 | --- | --- | --- |
 | **模型兼容网关** | `POST /v1/chat/completions` · `GET /v1/models` · `POST /v1/messages` | OpenAI 与 Anthropic 兼容端点（经 `GatewayProxy` 与 `AccountPool` 转发） |
-| **ACI 与自主运行时** | `/v1/sessions/*` · `/v1/stream` · `/v1/context/supervisor` · `/v1/approvals` | Direct 会话、SSE 事件流（含 `aciTelemetry`/`budgetWatermarks`）、ContextSupervisor 与 ACI 开关、工具审批 |
-| **Swarm 与自治 API** | `/v1/swarm/*` · `/v1/autonomous/*` · `/v1/evaluations/aci-ablation` · `/v1/accounts` · `/v1/auth/*` | 自主任务与冲突自动修复、多智能体状态、归档消融查询、多账号健康路由 *(旧 `/api/v1/*` 仅保留兼容)* |
+| **Direct · Steer · Rewind** | `/v1/sessions/*` · `/v1/sessions/:id/steer` · `/v1/sessions/:id/rewind*` · `/v1/stream` | Direct 多轮流、运行中 `Live Steer`、`<50ms` 轮次/单文件真回滚与 Redo、SSE 实时推送 |
+| **Git · 生态导入与审批** | `/v1/git/*` · `/v1/onboarding/*` · `/v1/workspace/customizations` · `/v1/approvals` | 原生 Stage/Unstage/Commit/Merge、`~/.claude` & `~/.codex` 显式检测导入、`/` 命令刷新与跨端审批 |
+| **Swarm · ACI 与评测** | `/v1/swarm/*` · `/v1/context/supervisor` · `/v1/evaluations/aci-ablation` · `/v1/accounts` · `/v1/auth/*` | 自主任务与冲突自动修复、ContextSupervisor、归档消融查询与多账号热备容灾路由 *(旧 `/api/v1/*` 仅保留兼容)* |
 
 ---
 
@@ -317,7 +342,9 @@ flowchart TB
 ### 快速启动
 
 ```powershell
-# 1. 启动后端 (默认 http://127.0.0.1:8787，数据目录可用 BACKEND_DATA 覆盖)
+# 0. 一键启动前后端开发服务 (Windows PowerShell: .\start-dev.ps1 | macOS/Linux: ./start-dev.sh)
+
+# 1. 手动启动后端 (默认 http://127.0.0.1:8787，数据目录可用 BACKEND_DATA 覆盖)
 Set-Location backend
 npm ci
 $env:BACKEND_TOKEN = node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
@@ -340,16 +367,17 @@ npm --prefix desktop run build    # 生成 Windows 安装包 / 便携版
 ### 验证命令
 
 ```powershell
-# 后端语法与类型检查 + 2.6 核心回归与 E2E 套件
+# 后端语法与类型检查 + 3.0 全栈工作流 & 2.6 核心回归套件
 Set-Location backend
 npm run check
+node --test --test-concurrency=4 --test-timeout=180000 test/workspace-rewind-git-30.test.js test/live-steer-ecosystem-30.test.js test/cli-30.test.js test/integration-30-product.test.js
 node --test --test-concurrency=1 test/context/aci-26.test.js test/tools/coding-diagnostics-26.test.js test/swarm/conflict-resolution-26.test.js test/evaluation/eval-26.test.js test/integration-26-e2e.test.js
 
 # 评测沙箱（本地具备 Docker 时用 strong；Docker-less CI 自动/显式走 node-permission）
 $env:AGENT_US_BENCHMARK_SANDBOX_MODE = 'strong'
 node --test --test-concurrency=1 --test-timeout=180000 test/evaluation/aci-governance-benchmark.test.js test/evaluation/docker-sandbox-acceptance.test.js
 
-# 前端与桌面端校验（含 2.6 UI 单测与 Playwright 视觉门禁）
+# 前端与桌面端校验（含 3.0 / 2.6 UI 单测与 Playwright 视觉门禁）
 Set-Location ..\frontend
 npx tsc --noEmit
 node --test test/*.test.js
@@ -371,11 +399,13 @@ Get-ChildItem desktop\*.mjs | ForEach-Object { node --check $_.FullName }
 ```text
 Agent_US/
 ├─ backend/
+│  ├─ bin/
+│  │  └─ agent-us.mjs            # 3.0 终端 CLI 可执行入口（100755 LF）
 │  ├─ src/
 │  │  ├─ context/                # aci-admission / aci-engine (trajectory_eviction_v26) / aci-store / supervisor / memory
-│  │  ├─ kernel/                 # agent-loop / contract-reasoning / execution-reasoning (Anti-Thrashing) / runtime
-│  │  ├─ tools/                  # selection / policy / auto-approval / dispatcher / benchmark-sandbox / builtin/
-│  │  ├─ durable/                # DurableJobQueue / CheckpointStore / Recovery / lease-guard (renewTurnLease)
+│  │  ├─ kernel/                 # agent-loop / contract-reasoning / execution-reasoning (Anti-Thrashing) / inference / runtime
+│  │  ├─ tools/                  # selection / policy / auto-approval / dispatcher / benchmark-sandbox / builtin/ (shell-tools)
+│  │  ├─ durable/                # DurableJobQueue / WorkspaceRewindManager (<50ms) / CheckpointStore / Recovery / lease-guard
 │  │  ├─ evaluation/             # aci-governance-benchmark (aci26 / aci-07) / external-benchmark / judge / service
 │  │  ├─ governance/             # EvidenceVerifier / Audit / Policy Control Plane
 │  │  ├─ planning/               # AdaptivePlanner / AdaptiveReplanner / budget-estimator / Validator
@@ -383,25 +413,27 @@ Agent_US/
 │  │  ├─ communication/          # Inter-Agent Communication Bus & Store Adapters
 │  │  ├─ memory/                 # Verified-only ExperienceMemoryService
 │  │  ├─ observability/          # Prompt Cache Telemetry / Metrics / Traces / Structured Logs
-│  │  ├─ routes/                 # chat-command (/swarm) / intelligence-routes (/v1/evaluations/aci-ablation) / workspace-git
-│  │  ├─ patch-and-diagnostics.js # 双格式 apply_patch & run_diagnostics (增量 tsc + node --test expected/actual)
-│  │  ├─ direct-agent.js         # DirectAgentRuntime 主编排引擎 (Static Prompt + ACI 2.6 + Durable)
+│  │  ├─ routes/                 # workspace-git / session-fork / chat-command (/swarm) / intelligence-routes
+│  │  ├─ patch-and-diagnostics.js # 双格式 apply_patch & run_diagnostics (增量 tsc + 跨平台 file:// 修复)
+│  │  ├─ direct-agent.js         # DirectAgentRuntime 主编排引擎 (Static Prompt + Live Steer + 429/5xx 容灾 + ACI 2.6)
+│  │  ├─ agent-context.js        # 原生规则/命令/技能 + 显式外部配置扫描与一键导入 (detectExternal / importExternal)
+│  │  ├─ cli.js                  # 终端 CLI REPL · SSE 渲染 · 审批联动与共享 /v1 会话同步
 │  │  ├─ workspace-tools.js      # query_symbol_graph 直调符号图谱 / inspect_repository
 │  │  ├─ repo-intelligence.js    # 增量符号缓存、跨文件引用与关联测试定位
-│  │  ├─ pool.js & gateway-proxy.js # AccountPool 多账号路由与 OpenAI/Anthropic 协议适配
+│  │  ├─ pool.js & gateway-proxy.js # AccountPool 多账号热备路由与 OpenAI/Anthropic 协议适配
 │  │  └─ v1-routes.js            # 主 REST / SSE API (/v1/*；legacy /api/v1/* 仅兼容)
 │  ├─ sandbox/                   # Dockerfile.benchmark (agent-us/benchmark:node24)
 │  ├─ scripts/                   # check.js · benchmark-aci-governance.mjs (--suite aci26 / --archive-dir / wireSup fix)
-│  ├─ test/                      # 106+ 串行单测、2.6 端到端集成、Docker 安全隔离与消融套件
+│  ├─ test/                      # 110 串行单测、3.0 全链路 E2E、2.6 端到端集成、Docker 安全隔离与消融套件
 │  └─ docs/                      # 2.3–2.6 全阶段技术与实证报告 + evidence/ 归档实验数据
 ├─ frontend/
 │  ├─ src/
-│  │  ├─ components/             # AdaptiveContextPanel · FileChangeCard · InspectorDrawer · EvaluationView · ThreadView
-│  │  ├─ utils/                  # aciTelemetry.ts · diagnostics.ts · diff.ts (折叠上下文/hunk)
-│  │  ├─ api/                    # REST / SSE Client (getAciAblationSummary) · Simulator
+│  │  ├─ components/             # ExternalImportModal · GitWorkbench · Composer (Live Steer) · ThreadView · InspectorDrawer · EvaluationView
+│  │  ├─ utils/                  # aciTelemetry.ts · diagnostics.ts · directMessages.ts · diff.ts
+│  │  ├─ api/                    # REST / SSE Client · Simulator
 │  │  └─ App.tsx
 │  ├─ NATIVE-VISUAL.md           # 前端视觉设计与交互规范
-│  └─ test/                      # UI 单测 (ux-26 / eval-25-ui 等) 与 Playwright visual.spec.mjs / browser-runtime
+│  └─ test/                      # UI 单测 (workbench-30 / ux-26 / eval-25-ui) 与 Playwright visual.spec.mjs / browser-runtime
 ├─ desktop/
 │  ├─ main.mjs                   # Electron Desktop Host
 │  ├─ extension-hub.mjs          # 桌面插件扩展宿主
@@ -409,6 +441,7 @@ Agent_US/
 │  ├─ pack-win.mjs               # Windows x64 安装包与便携版构建入口
 │  └─ preload.cjs
 ├─ docs/images/                  # 真实工作台截图资源
+├─ start-dev.ps1 & start-dev.sh  # Windows / macOS / Linux 一键启动前后端开发服务
 ├─ AGENTS.md
 └─ README.md
 ```
