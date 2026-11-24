@@ -145,8 +145,11 @@ export class ContextAssembler {
     for (const msg of rawHistory) {
       if (turnId && msg.turnId === turnId) {
         currentTurnMsgs.push(msg);
-      } else {
-        priorHistory.push(msg);
+      } else if (msg && typeof msg === 'object') {
+        // Completed historical turns must never carry .reasoning into future turns
+        const cleanMsg = { ...msg };
+        delete cleanMsg.reasoning;
+        priorHistory.push(cleanMsg);
       }
     }
 

@@ -93,6 +93,7 @@ import { AdaptiveSwarmOrchestrator } from './swarm/orchestrator.js';
 import { SwarmArtifactManager } from './swarm/artifacts.js';
 
 const ONBOARDING_EXTERNAL_KEY = 'onboarding.external.v1';
+const CACHE_AWARE_V31_DTOC_POLICY_NAME = 'cache_aware_v31';
 
 function normalizeOnboardingScopeKey(rawPath) {
   const norm = resolve(String(rawPath || process.cwd())).replace(/\\/g, '/');
@@ -811,6 +812,7 @@ export class DirectAgentRuntime {
       'full_aci',
       'aci_25',
       'aci_26',
+      'aci_31',
     ]);
     const sessionCfg = this.sessionAciConfigs.get(sessionId) ?? {};
     const rawProfile = turnAciProfile ?? sessionCfg.aciProfile ?? 'full_aci';
@@ -881,21 +883,41 @@ export class DirectAgentRuntime {
       mergedOptions.dtocPolicy === 'cumulative' ||
       mergedOptions.dtocPolicy === 'adaptive_single_step' ||
       mergedOptions.dtocPolicy === 'phase_watermark_v25' ||
-      mergedOptions.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
+      mergedOptions.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY ||
+      mergedOptions.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY_NAME
     ) {
       dtocPolicy = mergedOptions.dtocPolicy;
     } else if (aciProfile === 'aci_25') {
       dtocPolicy = PHASE_WATERMARK_V25_DTOC_POLICY;
-    } else if (aciProfile === 'full_aci' || aciProfile === 'aci_26') {
+    } else if (aciProfile === 'aci_26') {
       dtocPolicy = TRAJECTORY_EVICTION_V26_DTOC_POLICY;
+    } else if (aciProfile === 'full_aci' || aciProfile === 'aci_31') {
+      dtocPolicy = CACHE_AWARE_V31_DTOC_POLICY_NAME;
     } else {
       dtocPolicy = 'adaptive_single_step';
     }
-    const dtocMinPromptTokens =
+    const storedSupRaw =
+      this.store && typeof this.store.getSetting === 'function'
+        ? this.store.getSetting(ACI_CONFIG_KEY, null)
+        : null;
+    const explicitV31DtocMinPrompt =
       mergedOptions.dtocMinPromptTokens != null &&
       Number.isFinite(Number(mergedOptions.dtocMinPromptTokens))
         ? Math.max(1000, Math.trunc(Number(mergedOptions.dtocMinPromptTokens)))
-        : supCfg.dtocMinPromptTokens;
+        : mergedOptions.supervisorConfigOverride?.dtocMinPromptTokens != null &&
+            Number.isFinite(Number(mergedOptions.supervisorConfigOverride.dtocMinPromptTokens))
+          ? Math.max(1000, Math.trunc(Number(mergedOptions.supervisorConfigOverride.dtocMinPromptTokens)))
+          : storedSupRaw?.dtocMinPromptTokens != null &&
+              Number.isFinite(Number(storedSupRaw.dtocMinPromptTokens))
+            ? Math.max(1000, Math.trunc(Number(storedSupRaw.dtocMinPromptTokens)))
+            : undefined;
+    const dtocMinPromptTokens =
+      dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY_NAME
+        ? explicitV31DtocMinPrompt
+        : mergedOptions.dtocMinPromptTokens != null &&
+            Number.isFinite(Number(mergedOptions.dtocMinPromptTokens))
+          ? Math.max(1000, Math.trunc(Number(mergedOptions.dtocMinPromptTokens)))
+          : supCfg.dtocMinPromptTokens;
     const singleStepBudget =
       mergedOptions.singleStepBudget != null && Number.isFinite(Number(mergedOptions.singleStepBudget))
         ? Math.max(500, Math.trunc(Number(mergedOptions.singleStepBudget)))
@@ -910,13 +932,30 @@ export class DirectAgentRuntime {
       Number.isFinite(Number(mergedOptions.admissionMinChars))
         ? Math.max(200, Math.trunc(Number(mergedOptions.admissionMinChars)))
         : undefined;
-    const storedSupRaw =
-      this.store && typeof this.store.getSetting === 'function'
-        ? this.store.getSetting(ACI_CONFIG_KEY, null)
-        : null;
+    const rawWorkingSetReadMaxChars =
+      mergedOptions.workingSetReadMaxChars !== undefined && mergedOptions.workingSetReadMaxChars !== null
+        ? mergedOptions.workingSetReadMaxChars
+        : aciProfile === 'aci_26'
+          ? 0
+          : undefined;
+    const workingSetReadMaxChars =
+      rawWorkingSetReadMaxChars !== undefined && Number.isFinite(Number(rawWorkingSetReadMaxChars))
+        ? Math.max(0, Math.trunc(Number(rawWorkingSetReadMaxChars)))
+        : undefined;
+    const minNetSavingsTokens =
+      mergedOptions.minNetSavingsTokens != null &&
+      Number.isFinite(Number(mergedOptions.minNetSavingsTokens))
+        ? Math.max(0, Math.trunc(Number(mergedOptions.minNetSavingsTokens)))
+        : undefined;
+    const evictionCooldownSteps =
+      mergedOptions.evictionCooldownSteps != null &&
+      Number.isFinite(Number(mergedOptions.evictionCooldownSteps))
+        ? Math.max(0, Math.trunc(Number(mergedOptions.evictionCooldownSteps)))
+        : undefined;
     const hasCustomWatermarks =
       (dtocPolicy !== PHASE_WATERMARK_V25_DTOC_POLICY &&
-        dtocPolicy !== TRAJECTORY_EVICTION_V26_DTOC_POLICY) ||
+        dtocPolicy !== TRAJECTORY_EVICTION_V26_DTOC_POLICY &&
+        dtocPolicy !== CACHE_AWARE_V31_DTOC_POLICY_NAME) ||
       (Array.isArray(mergedOptions.watermarks) && mergedOptions.watermarks.length > 0) ||
       (Array.isArray(mergedOptions.epochWatermarks) && mergedOptions.epochWatermarks.length > 0) ||
       (Array.isArray(mergedOptions.supervisorConfigOverride?.epochWatermarks) &&
@@ -939,6 +978,9 @@ export class DirectAgentRuntime {
       singleStepBudget,
       maxSupervisorAdmissionCalls,
       admissionMinChars,
+      workingSetReadMaxChars,
+      minNetSavingsTokens,
+      evictionCooldownSteps,
       engineWatermarks,
       supervisorConfigOverride,
     };
@@ -1658,7 +1700,7 @@ export class DirectAgentRuntime {
       model = null,
       permissionMode = null,
       effort = null,
-      maxSteps = 24,
+      maxSteps = undefined,
       finalVerificationReserve = null,
       files = null,
       evidenceContract = null,
@@ -1711,7 +1753,18 @@ export class DirectAgentRuntime {
       dataRoot: this.dataRoot,
     });
     const effectiveInput = expandedCmd.expandedText || trimmedInput;
-    const resolvedMaxSteps = Math.min(40, Math.max(1, Number(maxSteps || 24)));
+    const sessionAciMaxSteps = this.sessionAciConfigs.get(sessionId)?.aciOptions?.maxSteps;
+    const rawMaxSteps =
+      maxSteps !== undefined && maxSteps !== null
+        ? maxSteps
+        : aciOptions?.maxSteps !== undefined && aciOptions?.maxSteps !== null
+          ? aciOptions.maxSteps
+          : sessionAciMaxSteps;
+    const parsedMaxSteps = Number(rawMaxSteps);
+    const resolvedMaxSteps =
+      Number.isFinite(parsedMaxSteps) && parsedMaxSteps > 0
+        ? Math.min(80, Math.max(1, Math.trunc(parsedMaxSteps)))
+        : 40;
     const jobPayload = {
       sessionId,
       turnId,
@@ -1962,7 +2015,12 @@ export class DirectAgentRuntime {
             permissionMode: payload.permissionMode ?? session.permissionMode ?? 'auto-safe',
             effort: payload.effort ?? null,
             workspaceRoot: payload.workspaceRoot ?? session.workspaceRoot ?? this.getWorkspaceRoot(),
-            maxSteps: Number(payload.maxSteps ?? 24),
+            maxSteps: (() => {
+              const rawSteps = Number(payload.maxSteps ?? 40);
+              return Number.isFinite(rawSteps) && rawSteps > 0
+                ? Math.min(80, Math.max(1, Math.trunc(rawSteps)))
+                : 40;
+            })(),
             finalVerificationReserve: payload.finalVerificationReserve ?? null,
             evidenceContract: payload.evidenceContract ?? null,
             aciProfile: payload.aciProfile,
@@ -2243,7 +2301,9 @@ export class DirectAgentRuntime {
         contextWindow: Math.min(200_000, contextWindow),
         watermarks: aciResolved.engineWatermarks,
         dtocPolicy: aciResolved.dtocPolicy,
-        dtocMinPromptTokens: aciResolved.dtocMinPromptTokens,
+        ...(aciResolved.dtocMinPromptTokens !== undefined
+          ? { dtocMinPromptTokens: aciResolved.dtocMinPromptTokens }
+          : {}),
         ...(aciResolved.singleStepBudget !== undefined
           ? { singleStepBudget: aciResolved.singleStepBudget }
           : {}),
@@ -2252,6 +2312,15 @@ export class DirectAgentRuntime {
           : {}),
         ...(aciResolved.maxSupervisorAdmissionCalls !== undefined
           ? { maxSupervisorAdmissionCalls: aciResolved.maxSupervisorAdmissionCalls }
+          : {}),
+        ...(aciResolved.workingSetReadMaxChars !== undefined
+          ? { workingSetReadMaxChars: aciResolved.workingSetReadMaxChars }
+          : {}),
+        ...(aciResolved.minNetSavingsTokens !== undefined
+          ? { minNetSavingsTokens: aciResolved.minNetSavingsTokens }
+          : {}),
+        ...(aciResolved.evictionCooldownSteps !== undefined
+          ? { evictionCooldownSteps: aciResolved.evictionCooldownSteps }
           : {}),
       });
       const resolveContextRef = (rawRef, opts = {}) => {
@@ -2453,7 +2522,8 @@ export class DirectAgentRuntime {
       if (explicitBudgetTokens !== null && Number.isFinite(Number(explicitBudgetTokens)) && Number(explicitBudgetTokens) > 0) {
         aciEngine.maxTotalTokens = Math.max(1024, Number(explicitBudgetTokens));
       } else {
-        aciEngine.maxTotalTokens = clampedWindow;
+        aciEngine.maxTotalTokens =
+          aciResolved.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY_NAME ? null : clampedWindow;
       }
       const defaultMaxOutputTokens = Math.min(
         16384,
@@ -2555,7 +2625,7 @@ export class DirectAgentRuntime {
               );
           });
         },
-        onToolResult: ({ tc, output, isError, durationMs }) => {
+        onToolResult: ({ tc, output, promptOutput, isError, durationMs }) => {
           if (!isError && (tc?.name === 'read_file' || tc?.name === 'read_blob')) {
             try {
               const parsed =
@@ -2583,7 +2653,7 @@ export class DirectAgentRuntime {
               .run(
                 sessionId,
                 turnId,
-                excerpt(output, 32000),
+                excerpt(String(promptOutput ?? output ?? ''), 32000),
                 tc.id,
                 tc.name,
                 JSON.stringify({ isError, durationMs }),

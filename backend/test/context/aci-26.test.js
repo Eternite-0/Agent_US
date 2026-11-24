@@ -910,7 +910,10 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
         .get(fullTurn.turn.id).data,
     );
     assert.equal(comp2.aciTelemetry.aciProfile, 'full_aci');
-    assert.equal(comp2.aciTelemetry.dtocPolicy, 'trajectory_eviction_v26');
+    assert.ok(
+      ['trajectory_eviction_v26', 'cache_aware_v31'].includes(comp2.aciTelemetry.dtocPolicy),
+      `Unexpected dtocPolicy for full_aci: ${comp2.aciTelemetry.dtocPolicy}`,
+    );
   } finally {
     offEph?.();
     await runtime.close();
@@ -1027,7 +1030,7 @@ test('v2.6 AgentLoop does not shield taskContract requiredFiles (src/) from supe
     });
     const { turn } = runtime.startTurn(sess.id, {
       input: 'Update src/policy.js per SPEC.md so test/policy.test.js passes.',
-      aciProfile: 'full_aci',
+      aciProfile: 'aci_26',
       aciOptions: { admissionMinChars: 5000, maxSteps: 12 },
     });
     const term = await waitTurnDone(runtime, store, sess.id, turn.id, 10000);

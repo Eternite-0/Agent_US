@@ -183,7 +183,7 @@ export function createFsTools({
     defineTool({
       name: 'edit_file',
       description:
-        '对已有文件做局部替换。先用 read_file 获取最新内容；若文件已变化或目标不匹配，重新读取再编辑。多文件修改可用 apply_patch；快速语法诊断不代替测试。',
+        '单文件局部修改首选工具：基于精确上下文块做局部替换（先用 read_file 获取最新内容，target 复制真实代码且不要带行号前缀；若文件已变化或目标不匹配，重新读取再编辑）。跨多文件或多处不连续 hunk 的原子修改可用 apply_patch；快速语法诊断不代替测试。',
       effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
       riskLevel: RISK_LEVELS.MEDIUM,
       replayable: true,
@@ -234,7 +234,7 @@ export function createFsTools({
 
     defineTool({
       name: 'write_file',
-      description: '新建文件或完整覆写工作区内指定文件，自动创建缺失父目录并执行快速语法诊断。',
+      description: '新建文件或完整覆写工作区内指定文件（修改已有文件优先使用 edit_file 或 apply_patch），自动创建缺失父目录并执行快速语法诊断。',
       effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
       riskLevel: RISK_LEVELS.MEDIUM,
       replayable: true,
@@ -280,7 +280,7 @@ export function createFsTools({
       name: 'apply_patch',
       serializeZodSchema: false,
       description:
-        '高精度多文件原子补丁工具（修改已有文件优先使用）：同时透明支持 Codex 补丁（`*** Begin Patch`...`*** End Patch`）与标准 unified diff（`--- a/...`/`+++ b/...`/`@@ ... @@`），支持 `expectedHashes` 乐观并发锁与提交前 JS/JSON 语法校验，并返回紧凑 diff 摘要与新 SHA-256。',
+        '高精度跨多文件/多 hunk 原子补丁工具（单文件局部修改首选 edit_file；多文件或大范围原子修改优先使用 apply_patch）：同时透明支持 Codex 补丁（`*** Begin Patch`...`*** End Patch`）与标准 unified diff（`--- a/...`/`+++ b/...`/`@@ ... @@`），支持 `expectedHashes` 乐观并发锁与提交前 JS/JSON/Python 语法校验，并返回紧凑 diff 摘要与新 SHA-256。',
       effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
       riskLevel: RISK_LEVELS.MEDIUM,
       replayable: true,
@@ -298,7 +298,7 @@ export function createFsTools({
         allowSyntaxError: z
           .boolean()
           .optional()
-          .describe('是否允许写入存在语法错误的 JS/JSON 文件（默认 false，提交前校验失败原子拒绝）'),
+          .describe('是否允许写入存在语法错误的 JS/JSON/Python 文件（默认 false，提交前校验失败原子拒绝）'),
       }),
       async execute(args, ctx) {
         const patch = String(args.patch ?? '');
@@ -348,7 +348,7 @@ export function createFsTools({
       name: 'run_diagnostics',
       serializeZodSchema: false,
       description:
-        '只读结构化诊断工具（受工作区沙箱约束）：快速执行语法检查（node --check / JSON.parse）、增量类型检查（tsc --noEmit --pretty false）或测试（node --test），并将冗长输出去重压缩为带 source（tsc/node-test/syntax）、行列定位及 AssertionError expected/actual/operator 详情的结构化 JSON（diagnostics、failingTests、compression）与精简摘要。',
+        '只读结构化诊断工具（受工作区沙箱约束）：快速执行语法检查（node --check / JSON.parse / python ast.parse）、增量类型检查（tsc --noEmit --pretty false）或测试（node --test / pytest / unittest），并将冗长输出去重压缩为带 source（tsc/node-test/pytest/unittest/syntax）、行列定位及断言详情的结构化 JSON（diagnostics、failingTests、compression）与精简摘要。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
       riskLevel: RISK_LEVELS.LOW,
       replayable: true,
@@ -367,7 +367,7 @@ export function createFsTools({
           .string()
           .max(240)
           .optional()
-          .describe('可选：传递给 node --test --test-name-pattern 的测试名过滤模式'),
+          .describe('可选：传递给 node --test --test-name-pattern 或 pytest/unittest -k 的测试名过滤模式'),
         maxDiagnostics: z
           .number()
           .int()

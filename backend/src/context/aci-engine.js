@@ -13,6 +13,7 @@ import {
 import {
   DEFAULT_ADMISSION_MIN_CHARS,
   DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
+  DEFAULT_WORKING_SET_READ_MAX_CHARS,
   PreInjectionAdmissionController,
 } from './aci-admission.js';
 
@@ -27,19 +28,25 @@ export const DEFAULT_ACI_WEIGHTS = Object.freeze({
 export const DEFAULT_EPOCH_WATERMARKS = Object.freeze([0.6, 0.82]);
 export const PHASE_WATERMARK_V25_EPOCH_WATERMARKS = Object.freeze([0.78, 0.9]);
 export const TRAJECTORY_EVICTION_V26_EPOCH_WATERMARKS = Object.freeze([0.78, 0.9]);
+export const CACHE_AWARE_V31_EPOCH_WATERMARKS = Object.freeze([0.78, 0.9]);
 export const DEFAULT_SINGLE_STEP_BUDGET = 8000;
 export const DEFAULT_DTOC_MIN_CHARS = 700;
 export const DEFAULT_DTOC_SUPERSEDED_MIN_CHARS = 600;
 export const DEFAULT_DTOC_POLICY = 'adaptive_single_step';
 export const PHASE_WATERMARK_V25_DTOC_POLICY = 'phase_watermark_v25';
 export const TRAJECTORY_EVICTION_V26_DTOC_POLICY = 'trajectory_eviction_v26';
+export const CACHE_AWARE_V31_DTOC_POLICY = 'cache_aware_v31';
 export const VALID_DTOC_POLICIES = Object.freeze([
   DEFAULT_DTOC_POLICY,
   'cumulative',
   PHASE_WATERMARK_V25_DTOC_POLICY,
   TRAJECTORY_EVICTION_V26_DTOC_POLICY,
+  CACHE_AWARE_V31_DTOC_POLICY,
 ]);
 export const DEFAULT_DTOC_MIN_PROMPT_TOKENS = 24000;
+export const DEFAULT_V31_MIN_PROMPT_TOKENS = 32000;
+export const DEFAULT_V31_MIN_NET_SAVINGS_TOKENS = 3500;
+export const DEFAULT_V31_EVICTION_COOLDOWN_STEPS = 6;
 export const DEFAULT_DTOC_PRESSURE_MIN_TOKENS = 28000;
 export const DEFAULT_DTOC_PRESSURE_RATIO = 0.65;
 export const DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS = 1200;
@@ -74,6 +81,7 @@ export function normalizeDtocPolicy(dtocPolicy) {
     dtocPolicy === 'cumulative' ||
     dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||
     dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY ||
+    dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY ||
     dtocPolicy === DEFAULT_DTOC_POLICY
   ) {
     return dtocPolicy;
@@ -89,6 +97,9 @@ export function resolveWatermarksForPolicy(dtocPolicy, explicitWatermarks = null
     if (cleaned.length > 0) return cleaned;
   }
   const normalized = normalizeDtocPolicy(dtocPolicy);
+  if (normalized === CACHE_AWARE_V31_DTOC_POLICY) {
+    return [...CACHE_AWARE_V31_EPOCH_WATERMARKS];
+  }
   if (normalized === TRAJECTORY_EVICTION_V26_DTOC_POLICY) {
     return [...TRAJECTORY_EVICTION_V26_EPOCH_WATERMARKS];
   }
@@ -1261,6 +1272,41 @@ function buildDtocCandidateContext(
   };
 }
 
+function buildDtocTrialStubMessage(msg, ev) {
+  const stubText = formatAciRefStub(
+    {
+      uri: `artifact://${sha256HexLocal(ev.rawText)}`,
+      path: ev.rawFilePath || ev.targetPath,
+      lineRange: extractLineRangeLabel(ev.args, ev.rawText),
+      symbolOutline: [],
+      originalTokens: ev.rawTokens,
+      decision: 'DEFER',
+    },
+    { decision: 'DEFER' },
+  );
+  const nonTextBlocks = (msg.content ?? []).filter((b) => b?.type !== 'text');
+  return { ...msg, content: [...nonTextBlocks, { type: 'text', text: stubText }] };
+}
+
+function computeEmergencyTriggerFlag({
+  epochState,
+  hasCumulative,
+  maxTotalTokens,
+  usedCumulative,
+  contextWindow,
+  tokensBefore,
+}) {
+  if (epochState?.emergencyUsed) return false;
+  const emergencyGate = Math.min(12000, Math.floor(contextWindow * 0.2));
+  if (hasCumulative && maxTotalTokens > 0 && tokensBefore >= emergencyGate) {
+    const remainingBudget = Math.max(0, maxTotalTokens - usedCumulative);
+    if (remainingBudget <= 2.5 * tokensBefore) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function computeEpochTriggerState(
   messages,
   {
@@ -1271,8 +1317,9 @@ function computeEpochTriggerState(
     watermarks = undefined,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
-    dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    dtocMinPromptTokens = undefined,
     minNetSavingsTokens = undefined,
+    evictionCooldownSteps = undefined,
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     epochState = { lastWatermark: -1, epochCount: 0 },
     singleStepTokens = undefined,
@@ -1297,24 +1344,43 @@ function computeEpochTriggerState(
   const srcMessages = Array.isArray(messages) ? messages : [];
   const policy = normalizeDtocPolicy(dtocPolicy);
   const isV26 = policy === TRAJECTORY_EVICTION_V26_DTOC_POLICY;
+  const isV31 = policy === CACHE_AWARE_V31_DTOC_POLICY;
+  const useV26ToolRules = isV26 || isV31;
   const effectiveCompressibleTools =
-    compressibleTools ?? (isV26 ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
-  const effectiveMinAgeSteps = minAgeSteps ?? (isV26 ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
-  const effectiveMinChars = minChars ?? (isV26 ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
-  const effectiveSupersededMinAgeSteps = supersededMinAgeSteps ?? (isV26 ? 0 : 2);
+    compressibleTools ?? (useV26ToolRules ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
+  const effectiveMinAgeSteps =
+    minAgeSteps ?? (useV26ToolRules ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
+  const effectiveMinChars =
+    minChars ?? (useV26ToolRules ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
+  const effectiveSupersededMinAgeSteps =
+    supersededMinAgeSteps ?? (useV26ToolRules ? 0 : 2);
   const effectiveSupersededMinChars =
-    supersededMinChars ?? (isV26 ? DEFAULT_V26_SUPERSEDED_MIN_CHARS : DEFAULT_DTOC_SUPERSEDED_MIN_CHARS);
+    supersededMinChars ??
+    (useV26ToolRules ? DEFAULT_V26_SUPERSEDED_MIN_CHARS : DEFAULT_DTOC_SUPERSEDED_MIN_CHARS);
+  const hasExplicitDtocMinPromptTokens =
+    dtocMinPromptTokens !== undefined &&
+    dtocMinPromptTokens !== null &&
+    dtocMinPromptTokens !== '' &&
+    Number.isFinite(Number(dtocMinPromptTokens));
   const minPromptTokens = Math.max(
     1000,
-    Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
+    Number(
+      hasExplicitDtocMinPromptTokens
+        ? dtocMinPromptTokens
+        : isV31
+          ? DEFAULT_V31_MIN_PROMPT_TOKENS
+          : DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    ),
   );
   const effectiveMinNetSavings = Math.max(
     0,
     Number(
       minNetSavingsTokens ??
-        (isV26
-          ? DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS
-          : DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS),
+        (isV31
+          ? DEFAULT_V31_MIN_NET_SAVINGS_TOKENS
+          : isV26
+            ? DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS
+            : DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS),
     ),
   );
   const effectiveShieldSteps = Math.max(
@@ -1369,6 +1435,231 @@ function computeEpochTriggerState(
 
   const prevWatermark = Number(epochState?.lastWatermark ?? -1);
   const prevEpochCount = Number(epochState?.epochCount ?? 0);
+
+  if (policy === CACHE_AWARE_V31_DTOC_POLICY) {
+    const candCtx = buildDtocCandidateContext(srcMessages, {
+      currentStep,
+      activeMutationTargets,
+      keepRefs,
+      compressRefs,
+      aciStore,
+    });
+    const v31MinPrompt = hasExplicitDtocMinPromptTokens
+      ? minPromptTokens
+      : DEFAULT_V31_MIN_PROMPT_TOKENS;
+    const v31MinSavings =
+      minNetSavingsTokens != null &&
+      minNetSavingsTokens !== '' &&
+      Number.isFinite(Number(minNetSavingsTokens))
+        ? Math.max(0, Number(minNetSavingsTokens))
+        : DEFAULT_V31_MIN_NET_SAVINGS_TOKENS;
+    const v31CooldownSteps =
+      evictionCooldownSteps != null &&
+      evictionCooldownSteps !== '' &&
+      Number.isFinite(Number(evictionCooldownSteps))
+        ? Math.max(0, Math.trunc(Number(evictionCooldownSteps)))
+        : DEFAULT_V31_EVICTION_COOLDOWN_STEPS;
+
+    const emergencyTriggered = computeEmergencyTriggerFlag({
+      epochState,
+      hasCumulative,
+      maxTotalTokens,
+      usedCumulative,
+      contextWindow,
+      tokensBefore,
+    });
+
+    const lastEvictionStep =
+      epochState?.lastEvictionStep != null && Number.isFinite(Number(epochState.lastEvictionStep))
+        ? Number(epochState.lastEvictionStep)
+        : null;
+    const stepsSinceLastEviction =
+      lastEvictionStep !== null
+        ? Math.max(0, candCtx.effectiveCurrentStep - lastEvictionStep)
+        : Infinity;
+    const cooldownPassed = stepsSinceLastEviction >= v31CooldownSteps;
+
+    if (tokensBefore < v31MinPrompt && !emergencyTriggered) {
+      return {
+        srcMessages,
+        dtocPolicy: policy,
+        dtocMinPromptTokens: v31MinPrompt,
+        minNetSavingsTokens: v31MinSavings,
+        evictionCooldownSteps: v31CooldownSteps,
+        recentEditShieldSteps: effectiveShieldSteps,
+        tokensBefore,
+        singleStepRatio,
+        cumulativeRatio,
+        ratio: singleStepRatio,
+        highestCrossedWatermark: -1,
+        measuredSingleStep,
+        prevWatermark,
+        prevEpochCount,
+        watermarkTriggered: false,
+        singleStepTriggered: false,
+        emergencyTriggered: false,
+        pressureTriggered: false,
+        netSavingsMet: false,
+        estimatedNetSavingsTokens: 0,
+        supersededNetSavingsTokens: 0,
+        combinedNetSavingsTokens: 0,
+        firstCandidateIndex: -1,
+        invalidatedSuffixTokens: 0,
+        cooldownPassed,
+        stepsSinceLastEviction,
+        supersededTriggered: false,
+        trajectoryTriggered: false,
+        currentStep: candCtx.effectiveCurrentStep,
+        reason: 'append_only_cache_floor_v31',
+        triggered: false,
+      };
+    }
+
+    let tier1Count = 0;
+    let tier2Count = 0;
+    let firstCandidateIndex = -1;
+    const tier1Messages = [];
+    const combinedMessages = [];
+
+    for (let idx = 0; idx < srcMessages.length; idx += 1) {
+      const m = srcMessages[idx];
+      if (m?.role !== 'tool') {
+        tier1Messages.push(m);
+        combinedMessages.push(m);
+        continue;
+      }
+      const ev = evaluateToolMessageEligibility(m, {
+        index: idx,
+        toolCallsById: candCtx.toolCallsById,
+        activeMutations: candCtx.activeMutations,
+        explicitActiveMutations: candCtx.explicitActiveMutations,
+        lastMutationStepByPath: candCtx.lastMutationStepByPath,
+        effectiveCurrentStep: candCtx.effectiveCurrentStep,
+        fallbackStep: candCtx.msgSteps[idx],
+        compressibleTools: effectiveCompressibleTools,
+        minAgeSteps: effectiveMinAgeSteps,
+        minChars: effectiveMinChars,
+        supersededMinAgeSteps: effectiveSupersededMinAgeSteps,
+        supersededMinChars: effectiveSupersededMinChars,
+        singleStepTriggered: false,
+        singleStepBudget,
+        keepSet: candCtx.keepSet,
+        preferCompressSet: candCtx.preferCompressSet,
+        dtocPolicy: policy,
+        recentEditShieldSteps: effectiveShieldSteps,
+        contractFiles,
+        latestErrorIndex: candCtx.latestErrorIndex,
+        supersededAnalysis: candCtx.supersededAnalysis,
+      });
+      if (!ev.eligible) {
+        tier1Messages.push(m);
+        combinedMessages.push(m);
+        continue;
+      }
+      if (firstCandidateIndex === -1) firstCandidateIndex = idx;
+      const stubMsg = buildDtocTrialStubMessage(m, ev);
+      if (ev.superseded) {
+        tier1Count += 1;
+        tier1Messages.push(stubMsg);
+      } else {
+        tier2Count += 1;
+        tier1Messages.push(m);
+      }
+      combinedMessages.push(stubMsg);
+    }
+
+    const invalidatedSuffixTokens =
+      firstCandidateIndex >= 0 && firstCandidateIndex + 1 < srcMessages.length
+        ? measureRequestComposition({
+            messages: srcMessages.slice(firstCandidateIndex + 1),
+          }).totalTokens
+        : 0;
+
+    const tier1NetSavings =
+      tier1Count > 0
+        ? Math.max(
+            0,
+            tokensBefore -
+              measureRequestComposition({
+                system: systemPrompt,
+                tools,
+                messages: tier1Messages,
+              }).totalTokens,
+          )
+        : 0;
+    const combinedNetSavings =
+      tier1Count + tier2Count > 0
+        ? Math.max(
+            0,
+            tokensBefore -
+              measureRequestComposition({
+                system: systemPrompt,
+                tools,
+                messages: combinedMessages,
+              }).totalTokens,
+          )
+        : 0;
+
+    const hasCandidates = tier1Count + tier2Count > 0;
+    const netSavingsMet = combinedNetSavings >= v31MinSavings;
+    const triggered = emergencyTriggered
+      ? hasCandidates && combinedNetSavings > 0
+      : hasCandidates && cooldownPassed && netSavingsMet;
+
+    let highestCrossedWatermark = -1;
+    if (triggered) {
+      for (const wm of sortedWatermarks) {
+        if (singleStepRatio >= wm) highestCrossedWatermark = wm;
+      }
+      if (highestCrossedWatermark < 0) {
+        highestCrossedWatermark = Number(Math.min(0.9999, Math.max(0, singleStepRatio)).toFixed(4));
+      }
+    }
+
+    const reason = emergencyTriggered
+      ? triggered
+        ? 'emergency_budget'
+        : 'insufficient_net_savings'
+      : !cooldownPassed
+        ? 'eviction_cooldown'
+        : triggered
+          ? CACHE_AWARE_V31_DTOC_POLICY
+          : 'insufficient_net_savings';
+
+    return {
+      srcMessages,
+      dtocPolicy: policy,
+      dtocMinPromptTokens: v31MinPrompt,
+      minNetSavingsTokens: v31MinSavings,
+      evictionCooldownSteps: v31CooldownSteps,
+      recentEditShieldSteps: effectiveShieldSteps,
+      tokensBefore,
+      singleStepRatio,
+      cumulativeRatio,
+      ratio: singleStepRatio,
+      highestCrossedWatermark,
+      measuredSingleStep,
+      prevWatermark,
+      prevEpochCount,
+      watermarkTriggered: triggered && highestCrossedWatermark > prevWatermark,
+      singleStepTriggered: false,
+      emergencyTriggered,
+      pressureTriggered: tokensBefore >= v31MinPrompt || emergencyTriggered,
+      netSavingsMet,
+      estimatedNetSavingsTokens: combinedNetSavings,
+      supersededNetSavingsTokens: tier1NetSavings,
+      combinedNetSavingsTokens: combinedNetSavings,
+      firstCandidateIndex,
+      invalidatedSuffixTokens,
+      cooldownPassed,
+      stepsSinceLastEviction,
+      supersededTriggered: triggered && tier1Count > 0,
+      trajectoryTriggered: triggered && tier2Count > 0,
+      currentStep: candCtx.effectiveCurrentStep,
+      reason,
+      triggered,
+    };
+  }
 
   if (policy === TRAJECTORY_EVICTION_V26_DTOC_POLICY) {
     const candCtx = buildDtocCandidateContext(srcMessages, {
@@ -1809,18 +2100,14 @@ function computeEpochTriggerState(
         if (singleStepRatio >= wm) highestCrossedWatermark = wm;
       }
     }
-    const emergencyGate = Math.min(12000, Math.floor(contextWindow * 0.2));
-    if (
-      !epochState?.emergencyUsed &&
-      hasCumulative &&
-      maxTotalTokens > 0 &&
-      tokensBefore >= emergencyGate
-    ) {
-      const remainingBudget = Math.max(0, maxTotalTokens - usedCumulative);
-      if (remainingBudget <= 2.5 * tokensBefore) {
-        emergencyTriggered = true;
-      }
-    }
+    emergencyTriggered = computeEmergencyTriggerFlag({
+      epochState,
+      hasCumulative,
+      maxTotalTokens,
+      usedCumulative,
+      contextWindow,
+      tokensBefore,
+    });
   }
 
   const watermarkTriggered = highestCrossedWatermark > prevWatermark;
@@ -1890,6 +2177,15 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
     ...(state.cooldownPassed !== undefined ? { cooldownPassed: state.cooldownPassed } : {}),
     ...(state.stepsSinceLastEviction !== undefined
       ? { stepsSinceLastEviction: state.stepsSinceLastEviction }
+      : {}),
+    ...(state.evictionCooldownSteps !== undefined
+      ? { evictionCooldownSteps: state.evictionCooldownSteps }
+      : {}),
+    ...(state.firstCandidateIndex !== undefined
+      ? { firstCandidateIndex: state.firstCandidateIndex }
+      : {}),
+    ...(state.invalidatedSuffixTokens !== undefined
+      ? { invalidatedSuffixTokens: state.invalidatedSuffixTokens }
       : {}),
     ...(state.supersededTriggered !== undefined
       ? { supersededTriggered: state.supersededTriggered }
@@ -1968,23 +2264,25 @@ export function evaluateToolMessageEligibility(
   const normalizedPolicy = normalizeDtocPolicy(dtocPolicy);
   const isPhaseV25 = normalizedPolicy === PHASE_WATERMARK_V25_DTOC_POLICY;
   const isTrajectoryV26 = normalizedPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY;
+  const isCacheAwareV31 = normalizedPolicy === CACHE_AWARE_V31_DTOC_POLICY;
+  const isV26OrV31 = isTrajectoryV26 || isCacheAwareV31;
 
   const effectiveCompressibleTools =
-    compressibleTools ?? (isTrajectoryV26 ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
+    compressibleTools ?? (isV26OrV31 ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
   const effectiveMinAgeSteps =
-    minAgeSteps ?? (isTrajectoryV26 ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
+    minAgeSteps ?? (isV26OrV31 ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
   const effectiveMinChars =
-    minChars ?? (isTrajectoryV26 ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
+    minChars ?? (isV26OrV31 ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
   const effectiveSupersededMinAgeSteps =
-    supersededMinAgeSteps ?? (isTrajectoryV26 ? 0 : 2);
+    supersededMinAgeSteps ?? (isV26OrV31 ? 0 : 2);
   const effectiveSupersededMinChars =
     supersededMinChars ??
-    (isTrajectoryV26 ? DEFAULT_V26_SUPERSEDED_MIN_CHARS : DEFAULT_DTOC_SUPERSEDED_MIN_CHARS);
+    (isV26OrV31 ? DEFAULT_V26_SUPERSEDED_MIN_CHARS : DEFAULT_DTOC_SUPERSEDED_MIN_CHARS);
 
   const isHeadPrefixProtected =
-    isTrajectoryV26 && index < DEFAULT_V26_HEAD_PREFIX_PROTECT_MESSAGES;
+    isV26OrV31 && index < DEFAULT_V26_HEAD_PREFIX_PROTECT_MESSAGES;
 
-  const effectiveLatestErrIdx = isTrajectoryV26
+  const effectiveLatestErrIdx = isV26OrV31
     ? (supersededAnalysis?.latestUnresolvedErrorIndex ?? latestErrorIndex)
     : latestErrorIndex;
 
@@ -1992,11 +2290,20 @@ export function evaluateToolMessageEligibility(
   let supersededReason = null;
   let isActiveMutation = false;
 
-  if (isTrajectoryV26) {
+  if (isV26OrV31) {
     const supInfo = supersededAnalysis?.supersededByIndex?.get(index) ?? null;
     if (supInfo?.superseded) {
       superseded = true;
       supersededReason = supInfo.reason || 'superseded';
+    } else if (isCacheAwareV31 && rawFilePath) {
+      const mutStep = findLastMutationStep(rawFilePath, lastMutationStepByPath);
+      const mutWithinShieldWindow =
+        mutStep >= 0 && effectiveCurrentStep - mutStep <= recentEditShieldSteps;
+      const inExplicitTargets =
+        explicitActiveMutations && pathMatchesAny(rawFilePath, explicitActiveMutations);
+      if (mutWithinShieldWindow || (mutStep < 0 && inExplicitTargets)) {
+        isActiveMutation = true;
+      }
     }
   } else if (rawFilePath) {
     const mutStep = findLastMutationStep(rawFilePath, lastMutationStepByPath);
@@ -2018,7 +2325,7 @@ export function evaluateToolMessageEligibility(
 
   const isLatestProtectedError =
     effectiveLatestErrIdx >= 0 && index === effectiveLatestErrIdx;
-  const isErr = isTrajectoryV26
+  const isErr = isV26OrV31
     ? isLatestProtectedError || (!superseded && isErrorToolMessage(msg, rawText))
     : isErrorToolMessage(msg, rawText) || (isPhaseV25 && latestErrorIndex >= 0 && index === latestErrorIndex);
 
@@ -2031,11 +2338,11 @@ export function evaluateToolMessageEligibility(
     (normTargetPath && keepSet.has(normTargetPath));
 
   const isContractShielded =
-    (isPhaseV25 || isTrajectoryV26) &&
+    (isPhaseV25 || isV26OrV31) &&
     ((rawFilePath && isStrictDtocContractPath(rawFilePath, contractFiles)) ||
       (targetPath && isStrictDtocContractPath(targetPath, contractFiles)));
 
-  const isRecentShielded = isTrajectoryV26
+  const isRecentShielded = isV26OrV31
     ? !superseded && age <= DEFAULT_V26_ACTIVE_READ_PROTECT_AGE
     : isPhaseV25 && age <= recentEditShieldSteps;
 
@@ -2058,9 +2365,9 @@ export function evaluateToolMessageEligibility(
   const meetsPreferred =
     isPreferred &&
     rawText.length >= thresholdChars &&
-    age >= (isPhaseV25 ? recentEditShieldSteps + 1 : isTrajectoryV26 && !superseded ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 1);
+    age >= (isPhaseV25 ? recentEditShieldSteps + 1 : isV26OrV31 && !superseded ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 1);
 
-  const blockedByTierFilter = Boolean(isTrajectoryV26 && onlySuperseded && !superseded);
+  const blockedByTierFilter = Boolean(isV26OrV31 && onlySuperseded && !superseded);
 
   const eligible =
     isCompressibleTool &&
@@ -2203,8 +2510,9 @@ export function compressMessagesEpoch(
     watermarks = undefined,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
-    dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    dtocMinPromptTokens = undefined,
     minNetSavingsTokens = undefined,
+    evictionCooldownSteps = undefined,
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
     epochState = { lastWatermark: -1, epochCount: 0, lastEvictionStep: null },
     minAgeSteps = undefined,
@@ -2236,6 +2544,7 @@ export function compressMessagesEpoch(
     dtocPolicy,
     dtocMinPromptTokens,
     minNetSavingsTokens,
+    evictionCooldownSteps,
     recentEditShieldSteps,
     epochState,
     singleStepTokens,
@@ -2288,6 +2597,12 @@ export function compressMessagesEpoch(
       supersededTriggered: Boolean(trigger.supersededTriggered),
       projectedTotalTokens: trigger.projectedTotalTokens ?? null,
       estRemainingSteps: trigger.estRemainingSteps ?? null,
+      ...(trigger.firstCandidateIndex !== undefined
+        ? { firstCandidateIndex: trigger.firstCandidateIndex }
+        : {}),
+      ...(trigger.invalidatedSuffixTokens !== undefined
+        ? { invalidatedSuffixTokens: trigger.invalidatedSuffixTokens }
+        : {}),
       compressedCount: 0,
       compressedRefs: [],
       messages: srcMessages,
@@ -2412,10 +2727,15 @@ export function compressMessagesEpoch(
   }).totalTokens;
   const netSavingsTokens = Math.max(0, tokensBefore - tokensAfterPreview);
 
+  const v31AbortedSavings =
+    trigger.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY &&
+    (stagedCompressions.length === 0 ||
+      (emergencyTriggered ? netSavingsTokens <= 0 : netSavingsTokens < trigger.minNetSavingsTokens));
   if (
-    (trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||
+    v31AbortedSavings ||
+    ((trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||
       trigger.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY) &&
-    (stagedCompressions.length === 0 || netSavingsTokens < trigger.minNetSavingsTokens)
+      (stagedCompressions.length === 0 || netSavingsTokens < trigger.minNetSavingsTokens))
   ) {
     return {
       triggered: false,
@@ -2435,6 +2755,12 @@ export function compressMessagesEpoch(
       supersededTriggered: Boolean(trigger.supersededTriggered),
       projectedTotalTokens: trigger.projectedTotalTokens ?? null,
       estRemainingSteps: trigger.estRemainingSteps ?? null,
+      ...(trigger.firstCandidateIndex !== undefined
+        ? { firstCandidateIndex: trigger.firstCandidateIndex }
+        : {}),
+      ...(trigger.invalidatedSuffixTokens !== undefined
+        ? { invalidatedSuffixTokens: trigger.invalidatedSuffixTokens }
+        : {}),
       compressedCount: 0,
       compressedRefs: [],
       messages: srcMessages,
@@ -2522,15 +2848,17 @@ export function compressMessagesEpoch(
 
   const effectiveEpochCount = compressedRefs.length > 0 ? nextEpoch : prevEpochCount;
   const reason =
-    trigger.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
-      ? trigger.reason || TRAJECTORY_EVICTION_V26_DTOC_POLICY
-      : trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY
-        ? PHASE_WATERMARK_V25_DTOC_POLICY
-        : watermarkTriggered
-          ? 'watermark_crossed'
-          : singleStepTriggered
-            ? 'single_step_budget'
-            : 'emergency_budget';
+    trigger.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY
+      ? trigger.reason || CACHE_AWARE_V31_DTOC_POLICY
+      : trigger.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
+        ? trigger.reason || TRAJECTORY_EVICTION_V26_DTOC_POLICY
+        : trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY
+          ? PHASE_WATERMARK_V25_DTOC_POLICY
+          : watermarkTriggered
+            ? 'watermark_crossed'
+            : singleStepTriggered
+              ? 'single_step_budget'
+              : 'emergency_budget';
 
   if (compressedRefs.length > 0) {
     ledger?.recordEpoch?.({
@@ -2576,6 +2904,12 @@ export function compressMessagesEpoch(
     supersededTriggered: Boolean(trigger.supersededTriggered),
     projectedTotalTokens: trigger.projectedTotalTokens ?? null,
     estRemainingSteps: trigger.estRemainingSteps ?? null,
+    ...(trigger.firstCandidateIndex !== undefined
+      ? { firstCandidateIndex: trigger.firstCandidateIndex }
+      : {}),
+    ...(trigger.invalidatedSuffixTokens !== undefined
+      ? { invalidatedSuffixTokens: trigger.invalidatedSuffixTokens }
+      : {}),
     compressedCount: compressedRefs.length,
     compressedRefs,
     messages: outMessages,
@@ -3184,10 +3518,12 @@ export class ACIEngine {
     watermarks = undefined,
     singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
     dtocPolicy = DEFAULT_DTOC_POLICY,
-    dtocMinPromptTokens = DEFAULT_DTOC_MIN_PROMPT_TOKENS,
+    dtocMinPromptTokens = undefined,
     minNetSavingsTokens = undefined,
+    evictionCooldownSteps = undefined,
     recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
-    admissionMinChars = DEFAULT_ADMISSION_MIN_CHARS,
+    admissionMinChars = undefined,
+    workingSetReadMaxChars = undefined,
     maxSupervisorAdmissionCalls = DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
     weights = DEFAULT_ACI_WEIGHTS,
   } = {}) {
@@ -3200,30 +3536,71 @@ export class ACIEngine {
     this.singleStepBudget = singleStepBudget;
     this.dtocPolicy = normalizeDtocPolicy(dtocPolicy);
     this.watermarks = resolveWatermarksForPolicy(this.dtocPolicy, watermarks);
-    this.dtocMinPromptTokens = Math.max(
-      1000,
-      Number(dtocMinPromptTokens ?? DEFAULT_DTOC_MIN_PROMPT_TOKENS),
-    );
+    const hasExplicitMinPrompt =
+      dtocMinPromptTokens !== undefined &&
+      dtocMinPromptTokens !== null &&
+      dtocMinPromptTokens !== '' &&
+      Number.isFinite(Number(dtocMinPromptTokens));
+    this._explicitDtocMinPromptTokens = hasExplicitMinPrompt
+      ? Math.max(1000, Number(dtocMinPromptTokens))
+      : undefined;
+    this.dtocMinPromptTokens =
+      this._explicitDtocMinPromptTokens ??
+      (this.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY
+        ? DEFAULT_V31_MIN_PROMPT_TOKENS
+        : DEFAULT_DTOC_MIN_PROMPT_TOKENS);
     const hasExplicitSavings =
       minNetSavingsTokens !== undefined &&
       minNetSavingsTokens !== null &&
+      minNetSavingsTokens !== '' &&
       Number.isFinite(Number(minNetSavingsTokens));
     this._explicitMinNetSavingsTokens = hasExplicitSavings
       ? Math.max(0, Number(minNetSavingsTokens))
       : undefined;
     this.minNetSavingsTokens =
       this._explicitMinNetSavingsTokens ??
-      (this.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
-        ? DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS
-        : DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS);
+      (this.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY
+        ? DEFAULT_V31_MIN_NET_SAVINGS_TOKENS
+        : this.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
+          ? DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS
+          : DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS);
+    const hasExplicitCooldown =
+      evictionCooldownSteps !== undefined &&
+      evictionCooldownSteps !== null &&
+      evictionCooldownSteps !== '' &&
+      Number.isFinite(Number(evictionCooldownSteps));
+    this._explicitEvictionCooldownSteps = hasExplicitCooldown
+      ? Math.max(0, Math.trunc(Number(evictionCooldownSteps)))
+      : undefined;
+    this.evictionCooldownSteps =
+      this._explicitEvictionCooldownSteps ??
+      (this.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY
+        ? DEFAULT_V31_EVICTION_COOLDOWN_STEPS
+        : DEFAULT_V26_EVICTION_COOLDOWN_STEPS);
     this.recentEditShieldSteps = Math.max(
       0,
       Number(recentEditShieldSteps ?? DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS),
     );
-    this.admissionMinChars = Math.max(
-      200,
-      Number(admissionMinChars ?? DEFAULT_ADMISSION_MIN_CHARS),
-    );
+    const hasExplicitAdmissionMinChars =
+      admissionMinChars !== undefined &&
+      admissionMinChars !== null &&
+      admissionMinChars !== '' &&
+      Number.isFinite(Number(admissionMinChars));
+    this._explicitAdmissionMinChars = hasExplicitAdmissionMinChars
+      ? Math.max(200, Number(admissionMinChars))
+      : undefined;
+    this.admissionMinChars = this._explicitAdmissionMinChars ?? DEFAULT_ADMISSION_MIN_CHARS;
+    const hasExplicitWorkingSetMax =
+      workingSetReadMaxChars !== undefined &&
+      workingSetReadMaxChars !== null &&
+      workingSetReadMaxChars !== '' &&
+      Number.isFinite(Number(workingSetReadMaxChars));
+    this._explicitWorkingSetReadMaxChars = hasExplicitWorkingSetMax
+      ? Math.max(0, Number(workingSetReadMaxChars))
+      : undefined;
+    this.workingSetReadMaxChars =
+      this._explicitWorkingSetReadMaxChars ??
+      (hasExplicitAdmissionMinChars ? 0 : DEFAULT_WORKING_SET_READ_MAX_CHARS);
     this.maxSupervisorAdmissionCalls = Math.max(
       0,
       Number(maxSupervisorAdmissionCalls ?? DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS),
@@ -3238,7 +3615,8 @@ export class ACIEngine {
     this.admissionController = new PreInjectionAdmissionController({
       aciStore: this.aciStore,
       ledger: this.ledger,
-      admissionMinChars: this.admissionMinChars,
+      admissionMinChars: this._explicitAdmissionMinChars,
+      workingSetReadMaxChars: this._explicitWorkingSetReadMaxChars,
       maxSupervisorAdmissionCalls: this.maxSupervisorAdmissionCalls,
     });
   }
@@ -3259,7 +3637,12 @@ export class ACIEngine {
     return this.admissionController.admitBatch(executedBatch, {
       supervisor: options.supervisor ?? this.supervisor,
       learnedGuidelines: options.learnedGuidelines ?? this.getGuidelines(),
-      admissionMinChars: options.admissionMinChars ?? this.admissionMinChars,
+      ...(this._explicitAdmissionMinChars !== undefined
+        ? { admissionMinChars: this._explicitAdmissionMinChars }
+        : {}),
+      ...(this._explicitWorkingSetReadMaxChars !== undefined
+        ? { workingSetReadMaxChars: this._explicitWorkingSetReadMaxChars }
+        : {}),
       maxSupervisorAdmissionCalls:
         options.maxSupervisorAdmissionCalls ?? this.maxSupervisorAdmissionCalls,
       ...options,
@@ -3274,8 +3657,9 @@ export class ACIEngine {
       watermarks: this.watermarks,
       singleStepBudget: this.singleStepBudget,
       dtocPolicy: this.dtocPolicy,
-      dtocMinPromptTokens: this.dtocMinPromptTokens,
+      dtocMinPromptTokens: this._explicitDtocMinPromptTokens,
       minNetSavingsTokens: this._explicitMinNetSavingsTokens,
+      evictionCooldownSteps: this._explicitEvictionCooldownSteps,
       recentEditShieldSteps: this.recentEditShieldSteps,
       epochState: this.epochState,
       ...options,
@@ -3291,8 +3675,9 @@ export class ACIEngine {
       watermarks: this.watermarks,
       singleStepBudget: this.singleStepBudget,
       dtocPolicy: this.dtocPolicy,
-      dtocMinPromptTokens: this.dtocMinPromptTokens,
+      dtocMinPromptTokens: this._explicitDtocMinPromptTokens,
       minNetSavingsTokens: this._explicitMinNetSavingsTokens,
+      evictionCooldownSteps: this._explicitEvictionCooldownSteps,
       recentEditShieldSteps: this.recentEditShieldSteps,
       epochState: this.epochState,
       ...options,

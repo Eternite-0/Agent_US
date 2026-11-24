@@ -670,19 +670,28 @@ test('CLI supports --swarm, import --yes/--skip, and interactive REPL (/steer, /
       },
     );
 
+    const waitUntil = async (pred, timeoutMs = 3000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (pred()) return;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    };
     await new Promise((r) => setTimeout(r, 40));
     replIn.write('start refactor\n');
-    await new Promise((r) => setTimeout(r, 35));
+    await waitUntil(() => calls.turns.length >= 2);
     replIn.write('/steer prioritize tests\n');
-    await new Promise((r) => setTimeout(r, 150));
+    await waitUntil(() => calls.steers.length >= 1);
+    await new Promise((r) => setTimeout(r, 140));
     replIn.write('/commands\n');
     replIn.write('/git\n');
-    await new Promise((r) => setTimeout(r, 30));
+    await waitUntil(() => calls.gitChanges >= 1);
     gitChangesMode = '404';
     replIn.write('/git\n');
+    await waitUntil(() => calls.gitStatus >= 1);
     replIn.write('/undo files\n');
     replIn.write('/import --yes\n');
-    await new Promise((r) => setTimeout(r, 60));
+    await waitUntil(() => calls.rewinds.length >= 1 && calls.imports.length >= 3);
     replIn.write('/exit\n');
     replIn.end();
 

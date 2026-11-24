@@ -171,7 +171,7 @@ export function resolveArmProfileConfig(
   }
   const cleanProfile = aciProfile ? String(aciProfile).trim() : null;
   const resolvedProfile =
-    key === 'D' && cleanProfile && ['full_aci', 'aci_25', 'aci_26'].includes(cleanProfile)
+    key === 'D' && cleanProfile && ['full_aci', 'aci_25', 'aci_26', 'aci_31'].includes(cleanProfile)
       ? normalizeAciProfileName(cleanProfile)
       : profile.aciProfile;
   const cleanSuite = String(suite || 'aci').trim().toLowerCase();
@@ -180,13 +180,15 @@ export function resolveArmProfileConfig(
   if (!effectiveDtocPolicy && key === 'D') {
     if (
       (cleanSuite === 'aci26' || cleanSuite === 'all' || resolvedProfile === 'aci_26') &&
-      resolvedProfile !== 'aci_25'
+      resolvedProfile !== 'aci_25' &&
+      resolvedProfile !== 'aci_31'
     ) {
       effectiveDtocPolicy = 'trajectory_eviction_v26';
     } else if (cleanSuite === 'aci25' || resolvedProfile === 'aci_25') {
       effectiveDtocPolicy = 'phase_watermark_v25';
     }
   }
+  const historicalSuite = ['aci', 'aci25', 'aci26', 'all'].includes(cleanSuite);
   return {
     arm: profile.arm,
     aciProfile: resolvedProfile,
@@ -194,6 +196,9 @@ export function resolveArmProfileConfig(
     aciOptions: {
       dtocMinPromptTokens: Number(dtocMinPromptTokens) || 24000,
       ...(effectiveDtocPolicy ? { dtocPolicy: effectiveDtocPolicy } : {}),
+      ...(historicalSuite && key !== 'A' && resolvedProfile !== 'aci_31'
+        ? { workingSetReadMaxChars: 0 }
+        : {}),
     },
   };
 }
@@ -1183,6 +1188,9 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       maxTotalTokens: resolveBenchmarkTaskMaxTokens(task, opts),
       dtocPolicy: armCfg.aciOptions?.dtocPolicy || opts.dtocPolicy || 'adaptive_single_step',
       dtocMinPromptTokens: opts.dtocMinPromptTokens,
+      ...(armCfg.aciOptions?.workingSetReadMaxChars !== undefined
+        ? { workingSetReadMaxChars: armCfg.aciOptions.workingSetReadMaxChars }
+        : {}),
     });
 
     const readPlan = buildProbeReadPlan(task, armName);

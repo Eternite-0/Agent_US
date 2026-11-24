@@ -1761,6 +1761,7 @@ test('Stage 4: DirectAgent supports all 4 aciProfiles, short-task DTOC KV preser
       workspaceRoot: workDir,
       permissionMode: 'full-access',
       aciProfile,
+      aciOptions: { workingSetReadMaxChars: 2600 },
       budget: { maxTokens: 160000, maxSteps: 10 },
     });
     const { turn } = direct.startTurn(sess.id, {
@@ -1811,12 +1812,12 @@ test('Stage 4: DirectAgent supports all 4 aciProfiles, short-task DTOC KV preser
   assert.ok(retRes.aciMetrics.admissionSavedTokens > 0);
   assert.ok(retRes.aciMetrics.hashVerifiedRestores >= 1);
 
-  // 4. full_aci: admission=true, dtoc=true (trajectory_eviction_v26 default in 2.6), short task cumulative ~104k SKIPS DTOC (epochTransitions === 0)!
+  // 4. full_aci: admission=true, dtoc=true (cache_aware_v31 default in 3.1), short task cumulative ~104k SKIPS DTOC (epochTransitions === 0)!
   const fullRes = await runProfile('full_aci');
   assert.equal(fullRes.aciMetrics.aciProfile, 'full_aci');
   assert.equal(fullRes.aciMetrics.admissionEnabled, true);
   assert.equal(fullRes.aciMetrics.dtocEnabled, true);
-  assert.equal(fullRes.aciMetrics.dtocPolicy, 'trajectory_eviction_v26');
+  assert.equal(fullRes.aciMetrics.dtocPolicy, 'cache_aware_v31');
   assert.equal(fullRes.aciMetrics.epochTransitions, 0, 'Short task (~5k prompt tokens) must skip DTOC even at 104k cumulative');
   assert.ok(fullRes.aciMetrics.admissionSavedTokens > 0);
   assert.ok(fullRes.aciMetrics.totalAciSavedTokens >= fullRes.aciMetrics.admissionSavedTokens);

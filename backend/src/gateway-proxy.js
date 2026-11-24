@@ -89,7 +89,7 @@ function parseDataUrl(url) {
   return { mediaType: m[1], data: m[2] };
 }
 
-function openaiContentToAnthropicBlocks(content) {
+function openaiContentToAnthropicBlocks(content, { allowThinking = false } = {}) {
   if (typeof content === 'string') {
     return content ? [{ type: 'text', text: content }] : [];
   }
@@ -97,7 +97,20 @@ function openaiContentToAnthropicBlocks(content) {
   const blocks = [];
   for (const part of content) {
     if (!part || typeof part !== 'object') continue;
-    if (part.type === 'text' && part.text) {
+    if (
+      allowThinking &&
+      part.type === 'thinking' &&
+      typeof part.thinking === 'string' &&
+      part.thinking.length > 0 &&
+      typeof part.signature === 'string' &&
+      part.signature.trim().length > 0
+    ) {
+      blocks.push({
+        type: 'thinking',
+        thinking: part.thinking,
+        signature: part.signature,
+      });
+    } else if (part.type === 'text' && part.text) {
       blocks.push({ type: 'text', text: String(part.text) });
     } else if (part.type === 'image_url' && part.image_url?.url) {
       const parsed = parseDataUrl(part.image_url.url);
@@ -156,7 +169,9 @@ export function openaiRequestToAnthropic(body, wireModel) {
       }
       continue;
     }
-    const blocks = openaiContentToAnthropicBlocks(m.content);
+    const blocks = openaiContentToAnthropicBlocks(m.content, {
+      allowThinking: m.role === 'assistant',
+    });
     if (Array.isArray(m.tool_calls)) {
       for (const tc of m.tool_calls) {
         let input = {};

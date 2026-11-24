@@ -470,8 +470,8 @@ export class AgentLoop {
     const explicitMaxSteps = normalizeBudgetLimit(budget.maxSteps);
     const maxSteps =
       explicitMaxSteps !== null
-        ? Math.min(60, explicitMaxSteps)
-        : Math.min(60, Math.max(1, Number(profile?.defaultMaxSteps ?? 24)));
+        ? Math.min(80, explicitMaxSteps)
+        : Math.min(80, Math.max(1, Number(profile?.defaultMaxSteps ?? 40)));
     const explicitMaxDuration = normalizeBudgetLimit(budget.maxDurationMs);
     const deadlineAt = explicitMaxDuration !== null ? Date.now() + explicitMaxDuration : null;
     const maxTotalTokens = normalizeBudgetLimit(budget.maxTokens);
@@ -1112,7 +1112,10 @@ export class AgentLoop {
             const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
             const epochContextWindow = aci.engine.contextWindow ?? 128000;
             const epochMaxTotalTokens =
-              effectiveWatermarkMaxTokens ?? aci.engine.maxTotalTokens ?? epochContextWindow;
+              effectiveWatermarkMaxTokens ??
+              (aci.engine.dtocPolicy === 'cache_aware_v31'
+                ? null
+                : (aci.engine.maxTotalTokens ?? epochContextWindow));
             // Only shield genuine spec/contract docs (SPEC.md, CONTRACT.json, etc.), never target src/ files to be edited.
             const strictContractDocRe =
               /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
@@ -1179,7 +1182,7 @@ export class AgentLoop {
                       query: input,
                       candidates: supervisorCandidates,
                       errorSummary: lastErrFp,
-                      budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
+                      budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens ?? 'unbounded'})`,
                       learnedGuidelines: aci.engine.getGuidelines?.() ?? [],
                       signal,
                       configOverride: aciSupervisorConfigOverride,
@@ -1656,6 +1659,9 @@ export class AgentLoop {
         ) {
           const assistantMsg = {
             role: 'assistant',
+            ...(typeof stepResult.reasoning === 'string' && stepResult.reasoning.length > 0
+              ? { reasoning: stepResult.reasoning }
+              : {}),
             content: [
               ...(stepResult.text ? [{ type: 'text', text: stepResult.text }] : []),
               ...stepResult.toolCalls,
@@ -1981,10 +1987,11 @@ export class AgentLoop {
         for (let batchIdx = 0; batchIdx < preparedBatch.length; batchIdx += 1) {
           const item = preparedBatch[batchIdx];
           const { tc, isError, durationMs, receipt, output } = item;
-          const promptOutput = admittedOutputs[batchIdx] ?? output;
+          const promptOutput = excerpt(String(admittedOutputs[batchIdx] ?? output ?? ''), 32000);
           await onToolResult?.({
             tc,
             output,
+            promptOutput,
             isError,
             durationMs,
             receipt,

@@ -596,8 +596,25 @@ function lineColFromOffset(text, offset) {
   return { line, column: safeOffset - lastNl };
 }
 
+const PY_AST_CHECK_SCRIPT = [
+  'import ast, json, sys',
+  'src = sys.stdin.buffer.read()',
+  'fn = sys.argv[1] if len(sys.argv) > 1 else "<string>"',
+  'try:',
+  '    ast.parse(src, filename=fn)',
+  'except (SyntaxError, ValueError) as e:',
+  '    print(json.dumps({"type": type(e).__name__, "line": getattr(e, "lineno", None) or 1, "column": getattr(e, "offset", None) or 1, "message": getattr(e, "msg", None) or str(e)}))',
+  '    sys.exit(1)',
+].join('\n');
+
+function pythonSyntaxErrorCode(errType) {
+  if (errType === 'IndentationError') return 'INDENTATION_ERROR';
+  if (errType === 'TabError') return 'TAB_ERROR';
+  return 'SYNTAX_ERROR';
+}
+
 /**
- * Validates JS/MJS/CJS/JSON syntax purely from in-memory content before touching disk.
+ * Validates JS/MJS/CJS/JSON/Python syntax purely from in-memory content before touching disk.
  */
 export function validateCodeSyntax(relPath, content, { workspaceRoot = null, fullPath = null } = {}) {
   const ext = extname(relPath).toLowerCase();
@@ -630,6 +647,55 @@ export function validateCodeSyntax(relPath, content, { workspaceRoot = null, ful
         message: msg,
       };
     }
+  }
+
+  if (ext === '.py') {
+    const py = resolvePythonRunner();
+    if (!py) return { ok: true };
+    const res = spawnSync(
+      py.command,
+      [...py.prefixArgs, '-I', '-c', PY_AST_CHECK_SCRIPT, relPath || '<string>'],
+      {
+        input: text,
+        encoding: 'utf8',
+        windowsHide: true,
+        shell: false,
+        timeout: 3000,
+        env: sanitizeChildEnv(process.env),
+      },
+    );
+    if (!res.error && res.status === 0) return { ok: true };
+    const stdoutTrim = String(res.stdout ?? '').trim();
+    if (stdoutTrim.startsWith('{')) {
+      try {
+        const info = JSON.parse(stdoutTrim);
+        const errType = String(info.type || 'SyntaxError');
+        return {
+          ok: false,
+          file: relPath,
+          line: Math.max(1, Math.trunc(Number(info.line) || 1)),
+          column: Math.max(1, Math.trunc(Number(info.column) || 1)),
+          code: pythonSyntaxErrorCode(errType),
+          message: `${errType}: ${String(info.message || 'invalid syntax')}`,
+        };
+      } catch {
+        // fall through to text parser
+      }
+    }
+    const combined = `${res.stderr ?? ''}\n${res.stdout ?? ''}`.trim();
+    const lineM = /line\s+(\d+)/i.exec(combined);
+    const errM = /((?:IndentationError|TabError|SyntaxError|ValueError):[^\n]+)/.exec(combined);
+    const errType = errM ? errM[1].split(':')[0].trim() : 'SyntaxError';
+    return {
+      ok: false,
+      file: relPath,
+      line: lineM ? Math.max(1, Math.trunc(Number(lineM[1]) || 1)) : 1,
+      column: 1,
+      code: pythonSyntaxErrorCode(errType),
+      message: errM
+        ? errM[1].trim()
+        : combined.slice(0, 320) || String(res.error?.message ?? 'SyntaxError: invalid syntax'),
+    };
   }
 
   if (ext === '.js' || ext === '.mjs' || ext === '.cjs') {
@@ -1400,13 +1466,13 @@ export function runQuickDiagnostics(fullPath, relPath) {
   const ext = extname(fullPath).toLowerCase();
 
   try {
-    if (ext === '.json' || ext === '.js' || ext === '.mjs' || ext === '.cjs') {
+    if (ext === '.json' || ext === '.js' || ext === '.mjs' || ext === '.cjs' || ext === '.py') {
       const content = readFileSync(fullPath, 'utf8');
       const res = validateCodeSyntax(relPath || fullPath, content, { fullPath });
       if (!res.ok) {
         return {
           ok: false,
-          summary: `\n[自动语法诊断 · ${relPath}]\n${res.file}:${res.line}: ${res.message}`.slice(0, 800),
+          summary: `\n[自动语法诊断 · ${relPath}]\n${res.file}:${res.line}:${res.column}: ${res.message}`.slice(0, 800),
         };
       }
       return { ok: true, summary: '' };
@@ -1535,13 +1601,40 @@ function normalizeParsedValue(raw, { yamlStyle = false } = {}) {
   return s.slice(0, 240);
 }
 
+function isPythonStdlibOrRunnerFrame(rawFile, workspaceRoot = null, baseDir = null) {
+  const raw = String(rawFile ?? '').trim();
+  if (!raw || /^<[^>]+>$/.test(raw)) return true;
+  const norm = raw.replace(/\\/g, '/');
+  if (
+    /(?:^|\/)(?:site-packages|dist-packages|_pytest|pluggy)(?:\/|$)/i.test(norm) ||
+    /(?:^|\/)(?:\.?venv|virtualenv)(?:\/|$)/i.test(norm) ||
+    /^[A-Za-z]:\/[^/]*Python[^/]*\/Lib\//i.test(norm) ||
+    /\/lib\/python\d+(?:\.\d+)?\//i.test(norm) ||
+    /(?:^|\/)Lib\/(?:unittest|importlib|ast\.py|runpy\.py)/i.test(norm)
+  ) {
+    return true;
+  }
+  if (workspaceRoot) {
+    try {
+      const root = resolve(workspaceRoot);
+      const anchor = baseDir ? resolve(baseDir) : root;
+      const abs = isAbsolute(raw) ? resolve(raw) : resolve(anchor, raw);
+      const rel = relative(root, abs);
+      if (rel.startsWith('..') || isAbsolute(rel)) return true;
+    } catch {
+      // keep heuristic
+    }
+  }
+  return false;
+}
+
 /**
  * Parses and deduplicates noisy compiler/linter/test-runner output (hundreds/thousands of lines)
  * into bounded structured diagnostics, failing tests, and compression statistics.
  */
 export function parseAndCompressDiagnosticsOutput(
   rawOutput,
-  { kind = 'auto', maxDiagnostics = 25, workspaceRoot = null, baseDir = null } = {},
+  { kind = 'auto', maxDiagnostics = 25, workspaceRoot = null, baseDir = null, sourceHint = null } = {},
 ) {
   const cap = Math.max(1, Math.min(100, Math.trunc(Number(maxDiagnostics) || 25)));
   const cleaned = String(rawOutput ?? '').replace(ANSI_RE, '').replace(/\r\n/g, '\n');
@@ -1560,7 +1653,9 @@ export function parseAndCompressDiagnosticsOutput(
   const diagMap = new Map();
   const testMap = new Map();
   const deferredTestDiagnostics = [];
+  const pytestFailLookup = new Map();
   let hasStructuredNodeTestEvidence = false;
+  let hasPytestSectionErrorDiag = false;
 
   const addDiag = (entry) => {
     const file = normalizeDiagnosticFile(entry.file || '.', workspaceRoot, baseDir);
@@ -1599,6 +1694,7 @@ export function parseAndCompressDiagnosticsOutput(
     const expected = entry.expected !== undefined ? entry.expected : undefined;
     const actual = entry.actual !== undefined ? entry.actual : undefined;
     const operator = entry.operator !== undefined ? entry.operator : undefined;
+    const diagSource = String(entry.source || 'node-test').trim();
     const key = `${testName.toLowerCase()}::${file}`;
     const existing = testMap.get(key) ?? testMap.get(testName.toLowerCase());
     if (existing) {
@@ -1619,7 +1715,7 @@ export function parseAndCompressDiagnosticsOutput(
       if (expected !== undefined && existing.expected === undefined) existing.expected = expected;
       if (actual !== undefined && existing.actual === undefined) existing.actual = actual;
       if (operator !== undefined && existing.operator === undefined) existing.operator = operator;
-      return;
+      return existing;
     }
     if (testMap.size < cap) {
       const record = {
@@ -1636,34 +1732,135 @@ export function parseAndCompressDiagnosticsOutput(
         _fromStack: Boolean(entry.fromStack),
       };
       testMap.set(key, record);
-      if (key !== testName.toLowerCase() && !testMap.has(testName.toLowerCase())) {
-        // index by name as well only when file was blank initially
-      }
+      let deferredDiag = null;
       if (entry.emitDiagnostic) {
-        deferredTestDiagnostics.push({
+        deferredDiag = {
           file: file || '.',
           line,
           column,
           severity: 'error',
           code: code || (operator ? 'ERR_ASSERTION' : 'ERR_TEST_FAILURE'),
           message: `[${testName}] ${assertion}`.slice(0, 320),
-          source: 'node-test',
+          source: diagSource,
           testName,
           ...(expected !== undefined ? { expected } : {}),
           ...(actual !== undefined ? { actual } : {}),
           ...(operator !== undefined ? { operator } : {}),
           _structured: Boolean(entry.hasStructuredEvidence),
-        });
+        };
+        deferredTestDiagnostics.push(deferredDiag);
       }
+      return { record, deferredDiag, mapKey: key };
     }
+    return null;
   };
 
   let inSpecFailuresSection = false;
   let pendingDeclLoc = null;
   let pendingTest = null;
   let pendingTap = null;
+  let pendingPytest = null;
+  let pendingUnittest = null;
+  let pytestSection = null;
   const summaryOnlyFails = [];
   let detailedFailureCount = 0;
+
+  const trackFailingTest = (entry) => {
+    const beforeSize = testMap.size;
+    const beforeDiagLen = deferredTestDiagnostics.length;
+    const res = addFailingTest(entry);
+    if (res && typeof res === 'object' && 'record' in res) return res;
+    if (testMap.size === beforeSize && entry.testName) {
+      const file = entry.file ? normalizeDiagnosticFile(entry.file, workspaceRoot, baseDir) : '';
+      const key = `${String(entry.testName).toLowerCase()}::${file}`;
+      const record = testMap.get(key) ?? testMap.get(String(entry.testName).toLowerCase());
+      const deferredDiag =
+        deferredTestDiagnostics.length > beforeDiagLen ? deferredTestDiagnostics.at(-1) : null;
+      return record ? { record, deferredDiag } : null;
+    }
+    return null;
+  };
+
+  const classifyPythonErrorCode = (headline, isErrorBlock = false) => {
+    const h = String(headline ?? '');
+    if (/^IndentationError(?::|$)/i.test(h)) return 'INDENTATION_ERROR';
+    if (/^TabError(?::|$)/i.test(h)) return 'TAB_ERROR';
+    if (/^SyntaxError(?::|$)/i.test(h)) return 'SYNTAX_ERROR';
+    if (/^(?:ModuleNotFoundError|ImportError)(?::|$)/i.test(h)) return 'IMPORT_ERROR';
+    if (/^(?:assert\b|AssertionError(?::|$))/i.test(h)) return 'ERR_ASSERTION';
+    return isErrorBlock ? 'COLLECTION_ERROR' : 'ERR_TEST_FAILURE';
+  };
+
+  const flushPendingPytest = () => {
+    if (!pendingPytest) return;
+    const pp = pendingPytest;
+    pendingPytest = null;
+    let loc = pp.userLoc ?? pp.fallbackLoc ?? { file: '', line: 1, column: 1 };
+    if (!loc.file && /^ERROR\s+collecting\s+(.+)$/i.test(pp.headerName)) {
+      const target = /^ERROR\s+collecting\s+(.+)$/i.exec(pp.headerName)?.[1]?.trim();
+      if (target && !/^test session$/i.test(target)) {
+        loc = { file: target, line: 1, column: 1 };
+      }
+    }
+    const normFile = loc.file ? normalizeDiagnosticFile(loc.file, workspaceRoot, baseDir) : '';
+    const headline = pp.errLine || pp.eLines.join(' | ') || pp.headerName || 'pytest failure';
+    const code = classifyPythonErrorCode(headline, pp.isErrorBlock);
+    const source = sourceHint || 'pytest';
+    if (pp.isErrorBlock) {
+      hasPytestSectionErrorDiag = true;
+      addDiag({
+        file: normFile || '.',
+        line: loc.line,
+        column: loc.column,
+        severity: 'error',
+        code,
+        message: headline,
+        source,
+      });
+      return;
+    }
+    detailedFailureCount++;
+    const initialName = normFile ? `${normFile}::${pp.headerName}` : pp.headerName;
+    const tracked = trackFailingTest({
+      testName: initialName,
+      file: normFile,
+      line: loc.line,
+      column: loc.column,
+      fromStack: true,
+      assertion: headline,
+      code,
+      source,
+      emitDiagnostic: true,
+      hasStructuredEvidence: true,
+    });
+    if (tracked?.record) {
+      const shortKey = pp.headerName.toLowerCase();
+      if (normFile) pytestFailLookup.set(`${normFile}::${shortKey}`, tracked);
+      if (!pytestFailLookup.has(shortKey)) pytestFailLookup.set(shortKey, tracked);
+    }
+  };
+
+  const flushPendingUnittest = () => {
+    if (!pendingUnittest) return;
+    const pu = pendingUnittest;
+    pendingUnittest = null;
+    const loc = pu.userLoc ?? pu.fallbackLoc ?? { file: '', line: 1, column: 1 };
+    const headline = pu.errLines.at(-1) || `${pu.kind}: ${pu.fullName}`;
+    const code = classifyPythonErrorCode(headline, false);
+    detailedFailureCount++;
+    addFailingTest({
+      testName: pu.fullName,
+      file: loc.file,
+      line: loc.line,
+      column: loc.column,
+      fromStack: Boolean(pu.userLoc || pu.fallbackLoc),
+      assertion: headline,
+      code,
+      source: sourceHint || 'unittest',
+      emitDiagnostic: true,
+      hasStructuredEvidence: true,
+    });
+  };
 
   const finalizeInspectProp = (pt) => {
     if (!pt || !pt.inspectProp) return;
@@ -1788,6 +1985,15 @@ export function parseAndCompressDiagnosticsOutput(
   const bareLocRe = /^((?:[A-Za-z]:)?[^:\r\n]+?):(\d+)(?::(\d+))?$/;
   const specFailRe = /^\s*(?:✖|×|FAIL)\s+(.+?)(?:\s+\(\d+(?:\.\d+)?m?s\))?$/;
   const tapFailRe = /^\s*not ok\s+\d+\s*-\s*(.+)$/;
+  const pytestBannerRe = /^={3,}\s*([A-Za-z ]+?)\s*={3,}$/;
+  const pytestBlockHeaderRe = /^_{3,}\s+(.+?)\s+_{3,}$/;
+  const pytestFrameRe = /^(.+?\.py):(\d+):\s*(?:in\s+(.+))?$/;
+  const pyFileLineRe = /^(?:E\s+)?File\s+"([^"]+)",\s+line\s+(\d+)(?:,\s+in\s+(.+))?$/;
+  const pytestFailedSummaryRe = /^FAILED\s+(?!\()(.+?)(?:\s+-\s+(.+))?$/;
+  const pytestErrorSummaryRe = /^ERROR(?:\s+(?!collecting\b)([^\s].*?))?(?:\s+-\s+(.+))?$/;
+  const unittestHeaderRe = /^(FAIL|ERROR):\s+([^\s(]+)\s+\(([^)]+)\)\s*$/;
+  const pyExceptionRe =
+    /^((?:SyntaxError|IndentationError|TabError|ModuleNotFoundError|ImportError|AssertionError|NameError|TypeError|ValueError|RuntimeError|KeyError|IndexError|AttributeError|ZeroDivisionError|OSError|FileNotFoundError|[A-Z][A-Za-z0-9]*(?:Error|Exception))(?::.*)?)$/;
   let pendingFileLoc = null;
 
   for (let i = 0; i < lines.length; i++) {
@@ -1846,6 +2052,234 @@ export function parseAndCompressDiagnosticsOutput(
     }
 
     if (!trimmed) continue;
+
+    // 0a. Pytest banners & section transitions
+    const bannerM = pytestBannerRe.exec(trimmed);
+    if (bannerM) {
+      flushPendingTest();
+      flushPendingPytest();
+      flushPendingUnittest();
+      const sec = bannerM[1].trim().toUpperCase();
+      pytestSection = sec.includes('SHORT TEST SUMMARY') ? 'SUMMARY' : sec;
+      continue;
+    }
+
+    if (/^={10,}$/.test(trimmed)) {
+      flushPendingTest();
+      flushPendingPytest();
+      flushPendingUnittest();
+      continue;
+    }
+
+    // 0b. Unittest block headers (`FAIL: test_x (pkg.Cls.test_x)` / `ERROR: ...`)
+    const utM = unittestHeaderRe.exec(trimmed);
+    if (utM) {
+      flushPendingTest();
+      flushPendingPytest();
+      flushPendingUnittest();
+      pendingUnittest = {
+        kind: utM[1],
+        methodName: utM[2],
+        fullName: utM[3].trim(),
+        userLoc: null,
+        fallbackLoc: null,
+        errLines: [],
+      };
+      continue;
+    }
+
+    // 0c. Pytest block headers (`___ test_name ___` / `___ ERROR collecting ... ___`)
+    const pyBlockM = pytestBlockHeaderRe.exec(trimmed);
+    if (pyBlockM) {
+      flushPendingTest();
+      flushPendingPytest();
+      flushPendingUnittest();
+      const headerName = pyBlockM[1].trim();
+      pendingPytest = {
+        section: pytestSection,
+        headerName,
+        isErrorBlock: pytestSection === 'ERRORS' || /^ERROR\b/i.test(headerName),
+        userLoc: null,
+        fallbackLoc: null,
+        eLines: [],
+        errLine: null,
+      };
+      continue;
+    }
+
+    if (pendingUnittest) {
+      if (/^-{5,}$/.test(trimmed)) {
+        if (pendingUnittest.errLines.length > 0 || pendingUnittest.userLoc || pendingUnittest.fallbackLoc) {
+          // Could be bottom divider before `Ran N tests`
+        }
+        continue;
+      }
+      if (/^Ran\s+\d+\s+tests?\s+in\s+/i.test(trimmed)) {
+        flushPendingUnittest();
+        continue;
+      }
+      if (/^Traceback\s+\(most recent call last\):$/i.test(trimmed)) {
+        continue;
+      }
+      const utFileM = pyFileLineRe.exec(trimmed);
+      if (utFileM) {
+        const rawFile = utFileM[1];
+        const lineNo = Math.max(1, Math.trunc(Number(utFileM[2]) || 1));
+        if (!isPythonStdlibOrRunnerFrame(rawFile, workspaceRoot, baseDir)) {
+          if (!pendingUnittest.userLoc) {
+            pendingUnittest.userLoc = { file: rawFile, line: lineNo, column: 1 };
+          }
+        } else if (!pendingUnittest.fallbackLoc) {
+          pendingUnittest.fallbackLoc = { file: rawFile, line: lineNo, column: 1 };
+        }
+        continue;
+      }
+      if (pyExceptionRe.test(trimmed)) {
+        pendingUnittest.errLines.push(trimmed);
+      }
+      continue;
+    }
+
+    if (pendingPytest) {
+      if (
+        /^!{3,}\s+Interrupted:/i.test(trimmed) ||
+        /^\d+\s+(?:failed|passed|skipped|error|errors|deselected|xfailed|xpassed|warnings?)\b.*in\s+[\d.]+s$/i.test(
+          trimmed,
+        )
+      ) {
+        flushPendingPytest();
+        continue;
+      }
+      if (/^Traceback:?$/i.test(trimmed) || /^Hint:\s+/i.test(trimmed)) {
+        continue;
+      }
+      const pyFileM = pyFileLineRe.exec(trimmed);
+      if (pyFileM) {
+        const rawFile = pyFileM[1];
+        const lineNo = Math.max(1, Math.trunc(Number(pyFileM[2]) || 1));
+        if (!isPythonStdlibOrRunnerFrame(rawFile, workspaceRoot, baseDir)) {
+          if (trimmed.startsWith('E') || !pendingPytest.userLoc) {
+            pendingPytest.userLoc = { file: rawFile, line: lineNo, column: 1 };
+          }
+        } else if (!pendingPytest.fallbackLoc) {
+          pendingPytest.fallbackLoc = { file: rawFile, line: lineNo, column: 1 };
+        }
+        continue;
+      }
+      const pyFrameM = pytestFrameRe.exec(trimmed);
+      if (pyFrameM) {
+        const rawFile = pyFrameM[1];
+        const lineNo = Math.max(1, Math.trunc(Number(pyFrameM[2]) || 1));
+        if (!isPythonStdlibOrRunnerFrame(rawFile, workspaceRoot, baseDir)) {
+          if (!pendingPytest.userLoc) {
+            pendingPytest.userLoc = { file: rawFile, line: lineNo, column: 1 };
+          }
+        } else if (!pendingPytest.fallbackLoc) {
+          pendingPytest.fallbackLoc = { file: rawFile, line: lineNo, column: 1 };
+        }
+        continue;
+      }
+      const eLineM = /^\s*E\s+(.+)$/.exec(line);
+      if (eLineM) {
+        const inner = eLineM[1].trim();
+        if (!inner || /^\^+$/.test(inner)) continue;
+        if (pyExceptionRe.test(inner) || /^assert\s+/i.test(inner)) {
+          pendingPytest.errLine = inner;
+        }
+        if (pendingPytest.eLines.length < 3 && !pendingPytest.eLines.includes(inner)) {
+          pendingPytest.eLines.push(inner);
+        }
+        continue;
+      }
+      if (pyExceptionRe.test(trimmed)) {
+        pendingPytest.errLine = trimmed;
+        if (pendingPytest.eLines.length < 3) pendingPytest.eLines.push(trimmed);
+      }
+      continue;
+    }
+
+    // 0d. Pytest / Unittest summary & noise lines (before node-test specFailRe & genericColonRe)
+    if (
+      /^(?:[.FsExX]+(?:\s+\[\s*\d+%\])?|-{5,}|Ran\s+\d+\s+tests?\s+in\s+[\d.]+s|OK|NO TESTS RAN|FAILED\s+\([^)]+\)|!{3,}\s+Interrupted:.*|no tests ran in [\d.]+s|\d+\s+(?:failed|passed|skipped|error|errors|deselected|xfailed|xpassed|warnings?)\b.*in\s+[\d.]+s)$/i.test(
+        trimmed,
+      )
+    ) {
+      flushPendingTest();
+      continue;
+    }
+
+    const ptFailedM = pytestFailedSummaryRe.exec(trimmed);
+    if (ptFailedM) {
+      flushPendingTest();
+      const rawNode = ptFailedM[1].trim();
+      const detail = (ptFailedM[2] ?? '').trim();
+      const sepIdx = rawNode.indexOf('::');
+      const rawFile = sepIdx >= 0 ? rawNode.slice(0, sepIdx) : '';
+      const nodePart = sepIdx >= 0 ? rawNode.slice(sepIdx + 2) : rawNode;
+      const normFile = rawFile ? normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir) : '';
+      const shortNorm = nodePart.replace(/::/g, '.').toLowerCase();
+      const hit =
+        (normFile ? pytestFailLookup.get(`${normFile}::${shortNorm}`) : null) ??
+        pytestFailLookup.get(shortNorm) ??
+        (normFile ? pytestFailLookup.get(`${normFile}::${nodePart.toLowerCase()}`) : null);
+      if (hit) {
+        const finalFile = hit.record.file || normFile;
+        const finalName = finalFile ? `${finalFile}::${nodePart}` : rawNode;
+        hit.record.name = finalName;
+        hit.record.testName = finalName;
+        if (!hit.record.file && normFile) hit.record.file = normFile;
+        if (detail && hit.record.assertion === 'test failed') {
+          hit.record.assertion = detail.slice(0, 320);
+        }
+        if (hit.deferredDiag) {
+          hit.deferredDiag.testName = finalName;
+          hit.deferredDiag.file = hit.record.file || '.';
+          hit.deferredDiag.message = `[${finalName}] ${hit.record.assertion}`.slice(0, 320);
+        }
+      } else {
+        const finalName = normFile ? `${normFile}::${nodePart}` : rawNode;
+        addFailingTest({
+          testName: finalName,
+          file: normFile,
+          line: 1,
+          column: 1,
+          assertion: detail || 'test failed',
+          code: classifyPythonErrorCode(detail, false),
+          source: sourceHint || 'pytest',
+          emitDiagnostic: true,
+          hasStructuredEvidence: true,
+        });
+      }
+      continue;
+    }
+
+    if (!trimmed.startsWith('ERROR:')) {
+      const ptErrM = pytestErrorSummaryRe.exec(trimmed);
+      if (
+        ptErrM &&
+        (pytestSection === 'SUMMARY' ||
+          pytestSection === 'ERRORS' ||
+          sourceHint === 'pytest' ||
+          /\.py(?:::\S+)?$/i.test((ptErrM[1] ?? '').trim()))
+      ) {
+        flushPendingTest();
+        if (!hasPytestSectionErrorDiag) {
+          const rawTarget = (ptErrM[1] ?? '').trim();
+          const detail = (ptErrM[2] ?? '').trim();
+          const filePart = rawTarget.includes('::') ? rawTarget.split('::')[0] : rawTarget;
+          addDiag({
+            file: filePart || '.',
+            line: 1,
+            column: 1,
+            severity: 'error',
+            code: classifyPythonErrorCode(detail, true),
+            message: detail || (rawTarget ? `Collection error in ${rawTarget}` : 'Pytest collection error'),
+            source: sourceHint || 'pytest',
+          });
+        }
+        continue;
+      }
+    }
 
     if (/^(?:✖|×)\s*failing tests:\s*$/i.test(trimmed)) {
       flushPendingTest();
@@ -2061,6 +2495,8 @@ export function parseAndCompressDiagnosticsOutput(
   }
   flushPendingTap();
   flushPendingTest();
+  flushPendingPytest();
+  flushPendingUnittest();
 
   if (testMap.size === 0 && summaryOnlyFails.length > 0) {
     for (const sf of summaryOnlyFails) {
@@ -2258,6 +2694,43 @@ export function resolveTscRunner(searchDirs = [], pathEnv = process.env.PATH) {
   return null;
 }
 
+const pythonRunnerCache = new Map();
+
+/**
+ * Resolves and caches a local Python 3 interpreter (`python3`, then `python`)
+ * via `--version` with `shell: false` and `windowsHide: true`.
+ */
+export function resolvePythonRunner(pathEnv = process.env.PATH) {
+  const cacheKey = String(pathEnv ?? '');
+  if (pythonRunnerCache.has(cacheKey)) {
+    return pythonRunnerCache.get(cacheKey);
+  }
+  const baseEnv = { ...process.env };
+  if (pathEnv !== process.env.PATH) {
+    delete baseEnv.Path;
+    delete baseEnv.PATH;
+    baseEnv.PATH = pathEnv ?? '';
+  }
+  const env = sanitizeChildEnv(baseEnv);
+  for (const cmd of ['python3', 'python']) {
+    const res = spawnSync(cmd, ['--version'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      shell: false,
+      timeout: 3000,
+      env,
+    });
+    const output = `${res.stdout ?? ''}\n${res.stderr ?? ''}`.trim();
+    if (!res.error && res.status === 0 && !/was not found/i.test(output)) {
+      const runner = { command: cmd, prefixArgs: [], version: output };
+      pythonRunnerCache.set(cacheKey, runner);
+      return runner;
+    }
+  }
+  pythonRunnerCache.set(cacheKey, null);
+  return null;
+}
+
 function walkAncestorsWithinRoot(startDir, root) {
   const dirs = [];
   let dir = resolve(startDir);
@@ -2375,8 +2848,20 @@ export function runDiagnostics(
     }
   };
 
+  const PYTHON_PROJECT_MARKERS = [
+    'pyproject.toml',
+    'pytest.ini',
+    'setup.cfg',
+    'setup.py',
+    'tox.ini',
+    'conftest.py',
+  ];
+  const isJsTestRel = (rel) => /\.(?:test|spec)\.[cm]?js$/i.test(rel);
+  const isPyTestRel = (rel) => /(?:^|\/)(?:test_[^/]+|[^/]+_test)\.py$/i.test(rel);
+  const isPyTestSupportRel = (rel) => /(?:^|\/)tests?\/(?:__init__|conftest)\.py$/i.test(rel);
+
   const runSyntax = () => {
-    const syntaxExts = new Set(['.js', '.mjs', '.cjs', '.json']);
+    const syntaxExts = new Set(['.js', '.mjs', '.cjs', '.json', '.py']);
     const { files, missing } = collectDiagnosticFiles(root, normPaths, syntaxExts);
     for (const m of missing) {
       totalRawLines++;
@@ -2489,79 +2974,235 @@ export function runDiagnostics(
   };
 
   const runTests = () => {
-    const testExts = new Set(
+    const jsTestExts = new Set(
       normPaths.length > 0 && requestedKind === 'test'
         ? ['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts']
         : ['.js', '.mjs', '.cjs'],
     );
-    const { files, missing } = collectDiagnosticFiles(root, normPaths, testExts);
-    for (const m of missing) {
-      totalRawLines++;
-      pushDiag({
-        file: m,
-        line: 1,
-        column: 1,
-        severity: 'error',
-        code: 'ENOENT',
-        message: 'Test file not found',
-        source: 'node-test',
-      });
+    const { files: jsFiles } = collectDiagnosticFiles(root, normPaths, jsTestExts);
+    const jsTargets = normPaths.length
+      ? jsFiles.map((f) => f.rel)
+      : jsFiles
+          .filter((f) => isJsTestRel(f.rel) || /(?:^|\/)tests?\//i.test(f.rel))
+          .map((f) => f.rel);
+
+    const pyCollected = collectDiagnosticFiles(root, normPaths, new Set(['.py']));
+    const hasPackageJson = existsSync(join(root, 'package.json'));
+    const hasPythonMarker = PYTHON_PROJECT_MARKERS.some((m) => existsSync(join(root, m)));
+
+    const missingChecked = new Set();
+    const pyCliTargets = [];
+    if (normPaths.length > 0) {
+      for (const raw of normPaths) {
+        const confined = resolveConfinedPath(root, raw);
+        if (!existsSync(confined.full)) {
+          const mKey = stateKeyFor(confined.rel);
+          if (!missingChecked.has(mKey)) {
+            missingChecked.add(mKey);
+            totalRawLines++;
+            hadFailureExit = true;
+            pushDiag({
+              file: confined.rel,
+              line: 1,
+              column: 1,
+              severity: 'error',
+              code: 'ENOENT',
+              message: 'Test file not found',
+              source: /\.py$/i.test(confined.rel) ? 'pytest' : 'node-test',
+            });
+          }
+          continue;
+        }
+        const st = statSync(confined.full);
+        if (st.isFile() && extname(confined.rel).toLowerCase() === '.py') {
+          pyCliTargets.push({ rel: confined.rel, isDir: false });
+        } else if (
+          st.isDirectory() &&
+          collectDiagnosticFiles(root, [confined.rel], new Set(['.py'])).files.length > 0
+        ) {
+          pyCliTargets.push({ rel: confined.rel, isDir: true });
+        }
+      }
     }
-    const testTargets = normPaths.length
-      ? files.map((f) => f.rel)
-      : files.filter((f) => /\.(?:test|spec)\.[cm]?js$/i.test(f.rel) || /(?:^|\/)tests?\//i.test(f.rel)).map((f) => f.rel);
-    if (!testTargets.length) {
-      notes.push('test:none');
+
+    const shouldRunPython =
+      normPaths.length > 0
+        ? pyCliTargets.length > 0
+        : hasPythonMarker ||
+          (!hasPackageJson && pyCollected.files.length > 0) ||
+          pyCollected.files.some((f) => isPyTestRel(f.rel) || /(?:^|\/)tests?\//i.test(f.rel));
+
+    if (!jsTargets.length && !shouldRunPython) {
+      if (missingChecked.size === 0) notes.push('test:none');
       return;
     }
-    const args = ['--test', '--test-reporter=spec'];
-    if (testPattern && String(testPattern).trim()) {
-      args.push('--test-name-pattern', String(testPattern).trim());
-    }
-    args.push(...testTargets);
-    const childTestEnv = sanitizeChildEnv(process.env);
-    delete childTestEnv.NODE_TEST_CONTEXT;
-    delete childTestEnv.NODE_TEST_WORKER_ID;
-    const res = spawnSync(process.execPath, args, {
-      cwd: root,
-      encoding: 'utf8',
-      windowsHide: true,
-      shell: false,
-      timeout: 30000,
-      env: childTestEnv,
-    });
-    const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
-    const parsed = parseAndCompressDiagnosticsOutput(combined, {
-      kind: 'test',
-      maxDiagnostics: cap,
-      workspaceRoot: root,
-      baseDir: root,
-    });
-    totalRawLines += parsed.compression.rawLines;
-    for (const d of parsed.diagnostics) pushDiag(d);
-    for (const t of parsed.failingTests) pushTest(t);
-    if (res.status !== 0 && parsed.failingTests.length === 0 && parsed.diagnostics.length === 0) {
-      hadFailureExit = true;
-      pushTest({
-        name: testTargets[0] || 'node --test',
-        testName: testTargets[0] || 'node --test',
-        file: testTargets[0] || '',
-        line: 1,
-        column: 1,
-        assertion: combined.trim().slice(0, 320) || `node --test exited with status ${res.status}`,
+
+    if (jsTargets.length > 0) {
+      const args = ['--test', '--test-reporter=spec'];
+      if (testPattern && String(testPattern).trim()) {
+        args.push('--test-name-pattern', String(testPattern).trim());
+      }
+      args.push(...jsTargets);
+      const childTestEnv = sanitizeChildEnv(process.env);
+      delete childTestEnv.NODE_TEST_CONTEXT;
+      delete childTestEnv.NODE_TEST_WORKER_ID;
+      const res = spawnSync(process.execPath, args, {
+        cwd: root,
+        encoding: 'utf8',
+        windowsHide: true,
+        shell: false,
+        timeout: 30000,
+        env: childTestEnv,
       });
-      pushDiag({
-        file: testTargets[0] || '.',
-        line: 1,
-        column: 1,
-        severity: 'error',
-        code: 'ERR_TEST_FAILURE',
-        message: combined.trim().slice(0, 320) || `node --test exited with status ${res.status}`,
-        source: 'node-test',
-        testName: testTargets[0] || 'node --test',
+      const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+      const parsed = parseAndCompressDiagnosticsOutput(combined, {
+        kind: 'test',
+        maxDiagnostics: cap,
+        workspaceRoot: root,
+        baseDir: root,
+        sourceHint: 'node-test',
       });
+      totalRawLines += parsed.compression.rawLines;
+      for (const d of parsed.diagnostics) pushDiag(d);
+      for (const t of parsed.failingTests) pushTest(t);
+      if (res.status !== 0 && parsed.failingTests.length === 0 && parsed.diagnostics.length === 0) {
+        hadFailureExit = true;
+        pushTest({
+          name: jsTargets[0] || 'node --test',
+          testName: jsTargets[0] || 'node --test',
+          file: jsTargets[0] || '',
+          line: 1,
+          column: 1,
+          assertion: combined.trim().slice(0, 320) || `node --test exited with status ${res.status}`,
+        });
+        pushDiag({
+          file: jsTargets[0] || '.',
+          line: 1,
+          column: 1,
+          severity: 'error',
+          code: 'ERR_TEST_FAILURE',
+          message: combined.trim().slice(0, 320) || `node --test exited with status ${res.status}`,
+          source: 'node-test',
+          testName: jsTargets[0] || 'node --test',
+        });
+      }
+      notes.push(`test:${jsTargets.length} files (${res.status === 0 ? 'pass' : 'fail'})`);
     }
-    notes.push(`test:${testTargets.length} files (${res.status === 0 ? 'pass' : 'fail'})`);
+
+    if (shouldRunPython) {
+      const py = resolvePythonRunner();
+      if (!py) {
+        hadFailureExit = true;
+        pushDiag({
+          file: pyCliTargets[0]?.rel || pyCollected.files[0]?.rel || '.',
+          line: 1,
+          column: 1,
+          severity: 'error',
+          code: 'PYTHON_UNAVAILABLE',
+          message: 'Python interpreter (python3/python) not found for Python test diagnostics',
+          source: 'pytest',
+        });
+        notes.push('py-test:skipped(python unavailable)');
+        return;
+      }
+
+      const trimmedPattern = testPattern && String(testPattern).trim() ? String(testPattern).trim() : '';
+      const pyRelArgs = pyCliTargets.map((t) => t.rel).filter((r) => r && r !== '.' && !r.startsWith('-'));
+      const pytestArgs = ['-m', 'pytest', '-q', '--tb=short'];
+      if (trimmedPattern) {
+        pytestArgs.push('-k', trimmedPattern);
+      }
+      pytestArgs.push(...pyRelArgs);
+
+      const pyEnv = sanitizeChildEnv(process.env);
+      let usedRunner = 'pytest';
+      let res = spawnSync(py.command, [...py.prefixArgs, ...pytestArgs], {
+        cwd: root,
+        encoding: 'utf8',
+        windowsHide: true,
+        shell: false,
+        timeout: 30000,
+        env: pyEnv,
+      });
+      let combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+
+      if (res.status !== 0 && /No module named ['"]?pytest['"]?/i.test(combined)) {
+        usedRunner = 'unittest';
+        const runUnittestArgs = (extraArgs) =>
+          spawnSync(py.command, [...py.prefixArgs, '-m', 'unittest', ...extraArgs], {
+            cwd: root,
+            encoding: 'utf8',
+            windowsHide: true,
+            shell: false,
+            timeout: 30000,
+            env: pyEnv,
+          });
+
+        if (pyCliTargets.length === 0) {
+          const utArgs = ['discover'];
+          if (trimmedPattern) utArgs.push('-k', trimmedPattern);
+          res = runUnittestArgs(utArgs);
+          combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+        } else if (pyCliTargets.every((t) => !t.isDir)) {
+          const utArgs = [...pyRelArgs];
+          if (trimmedPattern) utArgs.push('-k', trimmedPattern);
+          res = runUnittestArgs(utArgs);
+          combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+        } else if (pyCliTargets.length === 1 && pyCliTargets[0].isDir) {
+          const utArgs = ['discover', '-s', pyCliTargets[0].rel];
+          if (trimmedPattern) utArgs.push('-k', trimmedPattern);
+          res = runUnittestArgs(utArgs);
+          combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+        } else {
+          const expandedFiles = pyCollected.files.map((f) => f.rel).filter((r) => !r.startsWith('-'));
+          const utArgs = expandedFiles.length ? [...expandedFiles] : ['discover'];
+          if (trimmedPattern) utArgs.push('-k', trimmedPattern);
+          res = runUnittestArgs(utArgs);
+          combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+        }
+      }
+
+      const parsed = parseAndCompressDiagnosticsOutput(combined, {
+        kind: 'test',
+        maxDiagnostics: cap,
+        workspaceRoot: root,
+        baseDir: root,
+        sourceHint: usedRunner,
+      });
+      totalRawLines += parsed.compression.rawLines;
+      for (const d of parsed.diagnostics) pushDiag(d);
+      for (const t of parsed.failingTests) pushTest(t);
+      if (res.status !== 0 || res.error) {
+        hadFailureExit = true;
+        if (parsed.failingTests.length === 0 && parsed.diagnostics.length === 0) {
+          const fallbackFile = pyRelArgs[0] || pyCollected.files[0]?.rel || '';
+          const msg =
+            combined.trim().slice(0, 320) ||
+            res.error?.message ||
+            `${usedRunner} exited with status ${res.status}`;
+          pushTest({
+            name: fallbackFile || usedRunner,
+            testName: fallbackFile || usedRunner,
+            file: fallbackFile,
+            line: 1,
+            column: 1,
+            assertion: msg,
+          });
+          pushDiag({
+            file: fallbackFile || '.',
+            line: 1,
+            column: 1,
+            severity: 'error',
+            code: 'ERR_TEST_FAILURE',
+            message: msg,
+            source: usedRunner,
+            testName: fallbackFile || usedRunner,
+          });
+        }
+      }
+      const pyCount = pyRelArgs.length || pyCollected.files.length;
+      notes.push(`py-test(${usedRunner}):${pyCount} targets (${res.status === 0 && !res.error ? 'pass' : 'fail'})`);
+    }
   };
 
   const runLint = () => {
@@ -2621,7 +3262,8 @@ export function runDiagnostics(
     const onlyTestsTargeted =
       normPaths.length > 0 &&
       files.length > 0 &&
-      files.every((f) => /\.(?:test|spec)\.[cm]?js$/i.test(f.rel));
+      files.some((f) => isJsTestRel(f.rel) || isPyTestRel(f.rel)) &&
+      files.every((f) => isJsTestRel(f.rel) || isPyTestRel(f.rel) || isPyTestSupportRel(f.rel));
     if ((testPattern && String(testPattern).trim()) || onlyTestsTargeted) {
       runTests();
     }
