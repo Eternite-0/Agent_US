@@ -29,7 +29,7 @@ const providers = { models: [{ model, provider: 'test' }], list: () => [] };
 const store = new Store(join(root, 'engine.sqlite'));
 const metrics = new MetricsCollector({ store });
 const pool = new AccountPool(store, { root, legacyProviders: providers, metrics });
-const gates = [Promise.withResolvers(), Promise.withResolvers()];
+const gates = Array.from({ length: 5 }, () => Promise.withResolvers());
 let step = 0;
 const upstream = createHttpServer(async (req, res) => {
   if (req.method !== 'POST' || req.url !== '/v1/chat/completions') { req.resume(); return res.writeHead(404).end(); }
@@ -52,6 +52,17 @@ const upstream = createHttpServer(async (req, res) => {
     }] } : { content: 'PERMISSION CHECK COMPLETE' };
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     return res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: progress < 2 ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  }
+  if (messages.includes('Stream a continuous final answer')) {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const chunks = ['The real runtime streams one reply.', ' It stays visible across chunks.', ' Final output.'];
+    for (const [index, content] of chunks.entries()) {
+      if (index > 0) await gates[index + 1].promise;
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`);
+    }
+    await gates[4].promise;
+    res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+    return;
   }
   const index = step++;
   if (index < 2) await gates[index].promise;

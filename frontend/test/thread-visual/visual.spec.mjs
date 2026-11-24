@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { screenshot, transcript } from '../e2e/thread.mjs';
+import { composer, screenshot, transcript } from '../e2e/thread.mjs';
 import { join } from 'node:path';
 import { FIXED_TIME } from '../e2e/sse-server.mjs';
 
@@ -85,6 +85,7 @@ async function attachVisualFixtures(page) {
       }
       if (kind === 'receipts') value = { items: [] };
     }
+    if (path === '/v1/git/status') value = { available: true, branch: 'main', dirty: false, branches: ['main', 'release'] };
     if (path === '/v1/observability/metrics' && query.get('view') === 'prompt-cache') value = cache;
     if (path === '/v1/approvals' && query.get('sessionId') === 'approval-visual') value = { items: [{
       id: 'visual-approval', sessionId: 'approval-visual', turnId: 'approval-visual-turn', callId: 'visual-test',
@@ -171,7 +172,103 @@ test('Direct prose and five operations with short and long terminal output', asy
     expect(await output.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(200);
     await output.scrollIntoViewIfNeeded();
     await capture(page, info, 'terminal-long');
+    // The same conversation preserves disclosures across theme/navigation changes.
+    await long.locator(':scope > summary').click();
+    await expect(output).toBeHidden();
   }
+});
+
+test('home keeps a single sidebar without evaluations and preserves composer controls', async ({ page }, info) => {
+  test.skip(Boolean(process.env.E2E_FRONTEND_DIR), 'Native home controls');
+  const sessionsPosted = [];
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/v1/sessions') sessionsPosted.push(request.url());
+  });
+  await page.goto('/');
+  const sidebar = page.getByRole('complementary', { name: '对话历史' });
+  const rail = page.locator('.codex-rail');
+  const evaluationEntry = /能力评测|评测中心|evaluation/i;
+  if (info.project.use.viewport.width <= 820) {
+    await expect(rail).toBeVisible();
+    await page.getByRole('button', { name: '显示侧边栏', exact: true }).click();
+  }
+  await expect(rail).toHaveCount(0);
+  // The default light sidebar and its title-bar segment use the original neutral chrome.
+  const neutralChrome = 'rgb(241, 242, 243)';
+  await expect(page.locator('.codex-shell')).toHaveCSS('background-color', neutralChrome);
+  await expect.poll(() => page.locator('.codex-topbar').evaluate(el => getComputedStyle(el, '::before').backgroundColor)).toBe(neutralChrome);
+  await expect(sidebar.getByRole('button', { name: '已归档', exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('button', { name: '插件', exact: true })).toBeVisible();
+  await expect(sidebar.getByRole('button', { name: evaluationEntry })).toHaveCount(0);
+  await page.getByRole('button', { name: '隐藏侧边栏', exact: true }).click();
+  await expect(rail).toBeVisible();
+  await expect(rail.getByRole('button', { name: evaluationEntry })).toHaveCount(0);
+  if (info.project.use.viewport.width > 820) {
+    await page.getByRole('button', { name: '显示侧边栏', exact: true }).click();
+  }
+
+  const home = page.locator('.codex-home');
+  const tray = home.locator('.codex-composer-tray');
+  await expect(home.getByRole('heading', { level: 1 })).toContainText('workspace');
+  const starters = home.getByRole('group', { name: '开始开发' }).getByRole('button');
+  await expect(starters).toHaveCount(4);
+  await starters.getByText('探索并理解代码', { exact: true }).click();
+  await expect(composer(page)).toHaveValue(/代码结构/);
+  await expect(composer(page)).toBeFocused();
+  const firstPrompt = await composer(page).inputValue();
+  await home.locator('input[type="file"]').setInputFiles({
+    name: 'starter-notes.txt', mimeType: 'text/plain', buffer: Buffer.from('Keep my notes'),
+  });
+  const attachment = home.getByText('starter-notes.txt', { exact: true });
+  await expect(attachment).toBeVisible();
+  for (const [label, beginning] of [
+    ['构建新功能、应用或工具', /^我想在这个项目中构建一个新功能。/],
+    ['审查代码并提出修改建议', /^请审查当前代码，/],
+    ['修复问题和失败', /^请帮我定位并修复下面的问题。/],
+  ]) {
+    const previous = await composer(page).inputValue();
+    await starters.getByText(label, { exact: true }).click();
+    await expect(composer(page)).toHaveValue(beginning);
+    expect(await composer(page).inputValue()).not.toContain(previous);
+    await expect(attachment).toBeVisible();
+  }
+  await starters.getByText('探索并理解代码', { exact: true }).click();
+  await expect(composer(page)).toHaveValue(firstPrompt);
+  await starters.getByText('探索并理解代码', { exact: true }).click();
+  await expect(composer(page)).toHaveValue(firstPrompt);
+  await home.getByRole('button', { name: '移除 starter-notes.txt' }).click();
+  expect(sessionsPosted).toEqual([]);
+  await navigate(page, '/tasks');
+  await expect(home).toHaveCount(0);
+  await navigate(page, '/');
+  await expect(composer(page)).toHaveValue('');
+
+  await tray.getByRole('button', { name: /workspace/ }).click();
+  await expect(tray.getByPlaceholder('搜索项目')).toBeInViewport();
+  await page.keyboard.press('Escape');
+  await tray.getByRole('button', { name: '本地', exact: true }).click();
+  await expect(tray.getByText('Worker 隔离容器', { exact: true })).toBeInViewport();
+  await page.keyboard.press('Escape');
+  await tray.getByRole('button', { name: /当前 Git 分支：main/ }).click();
+  await expect(tray.getByRole('dialog', { name: '切换或创建 Git 分支' })).toBeInViewport();
+  await page.keyboard.press('Escape');
+
+  const model = home.getByRole('button', { name: '模型与推理强度' });
+  await expect(model).toContainText('fixture-model');
+  await expect(model.locator('svg')).toHaveCount(0);
+  await model.press('Enter');
+  const slider = home.getByRole('slider', { name: '推理强度' });
+  await slider.press('ArrowLeft');
+  await expect(slider).toHaveAttribute('aria-valuenow', '2');
+  await home.locator('.codex-effort-model-btn').click();
+  const option = home.getByRole('button', { name: /^fixture-model/ });
+  await option.click();
+  await slider.press('Escape');
+  await expect(model).toHaveAttribute('aria-expanded', 'false');
+  await expect(model).toBeFocused();
+  await expect(home.getByRole('button', { name: /Prompt Cache：缓存命中 75%/ })).toBeInViewport();
+  await expect(home.locator('.codex-composer-card')).toBeInViewport({ ratio: 1 });
+  expect(await home.evaluate(el => el.scrollWidth)).toBe(await home.evaluate(el => el.clientWidth));
 });
 
 test('home and Markdown hierarchy in light and dark themes; file diff in Inspector', async ({ page }, info) => {
@@ -179,6 +276,7 @@ test('home and Markdown hierarchy in light and dark themes; file diff in Inspect
   for (const theme of ['light', 'dark']) {
     await toggleTheme(page, theme);
     await expect(page.locator('.codex-home .codex-composer-card')).toBeVisible();
+    await expect(page.getByRole('button', { name: /当前 Git 分支：main/ })).toBeVisible();
     await capture(page, info, 'home');
     await navigate(page, '/t/markdown-visual');
     await expect(transcript(page).getByRole('heading', { name: 'Workspace audit' })).toBeVisible();
@@ -193,6 +291,10 @@ test('home and Markdown hierarchy in light and dark themes; file diff in Inspect
     }
     await files.locator('.codex-file-row-trigger').click();
     await expect(files.locator('.codex-inline-diff-body')).toBeVisible();
+    if (!process.env.E2E_FRONTEND_DIR) {
+      await expect(files.locator('.codex-diff-changed[data-change="del"]')).toHaveText('1');
+      await expect(files.locator('.codex-diff-changed[data-change="add"]')).toHaveText('2');
+    }
     await capture(page, info, 'file-inline-diff');
     await files.getByRole('button', { name: '在右侧分屏打开 src/config.ts', exact: true }).click();
     await expect(page.locator('.codex-drawer[data-open="true"]')).toBeVisible();
@@ -204,6 +306,17 @@ test('home and Markdown hierarchy in light and dark themes; file diff in Inspect
       expect((await editor.boundingBox()).width).toBeGreaterThan((await tree.boundingBox()).width * 1.5);
     }
     await capture(page, info, 'file-diff');
+    if (!process.env.E2E_FRONTEND_DIR) {
+      const drawer = page.locator('.codex-drawer[data-open="true"]');
+      await expect(drawer.getByRole('button', { name: '查看源码', exact: true })).toBeVisible();
+      const editor = drawer.getByRole('region', { name: '文件差异' });
+      for (const mode of ['双栏', '单栏']) {
+        await expect(editor.locator('.codex-diff-changed[data-change="del"]')).toHaveText('1');
+        await expect(editor.locator('.codex-diff-changed[data-change="add"]')).toHaveText('2');
+        await drawer.getByRole('button', { name: mode, exact: true }).click();
+      }
+      await drawer.getByRole('button', { name: '查看源码', exact: true }).click();
+    }
     await page.getByRole('button', { name: '关闭右侧面板', exact: true }).click();
     await navigate(page, '/');
   }
@@ -264,12 +377,16 @@ test('desktop shell, search, settings, capability navigation and scheduling surf
     await expect(page.getByRole('heading', { name: '外观', exact: true })).toBeVisible();
     await capture(page, info, 'settings-appearance');
     await navigate(page, '/capabilities');
-    await expect(page.locator('.codex-body[data-capabilities-view="true"] .codex-settings-body')).toBeVisible();
+    await expect(page.getByRole('heading', { name: '插件', exact: true })).toBeVisible();
     await capture(page, info, 'capabilities');
     await navigate(page, '/evaluations');
     await expect(page.getByRole('heading', { name: '能力评测', exact: true })).toBeVisible();
     await capture(page, info, 'evaluations');
     await navigate(page, '/tasks');
+    if (!process.env.E2E_FRONTEND_DIR) {
+      await expect(page.getByRole('heading', { name: '已安排的任务', exact: true })).toBeVisible();
+      await capture(page, info, 'scheduled');
+    }
     await page.getByRole('button', { name: '新建任务', exact: true }).first().click();
     await expect(page.getByRole('heading', { name: '新建定时任务', exact: true })).toBeVisible();
     await expectSingleFieldFocus(page.locator('.codex-modal-input-box'));
@@ -350,6 +467,129 @@ test('settings handle an older Supervisor endpoint, support retry and stay reada
   await expect.poll(() => content.evaluate(el => el.scrollTop)).toBe(0);
 });
 
+test('workspace destinations preserve the sidebar, with route-only motion and usable library controls', async ({ page }, info) => {
+  test.skip(Boolean(process.env.E2E_FRONTEND_DIR), 'New workspace destinations');
+  await page.route('**/api/extensions/catalog*', route => route.fulfill({ json: {} }));
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.addInitScript(() => {
+    window.workspaceNavigationAnimations = 0;
+    const animate = Element.prototype.animate;
+    Element.prototype.animate = function (...args) {
+      if (this.classList.contains('codex-workspace-column')) window.workspaceNavigationAnimations++;
+      return animate.apply(this, args);
+    };
+  });
+  await page.goto('/');
+  const sidebar = page.getByRole('complementary', { name: '对话历史' });
+  if (info.project.use.viewport.width <= 820) {
+    await page.getByRole('button', { name: '显示侧边栏', exact: true }).click();
+  }
+  const archiveButton = sidebar.getByRole('button', { name: '已归档', exact: true });
+  const pluginButton = sidebar.getByRole('button', { name: '插件', exact: true });
+  const scheduleButton = sidebar.getByRole('button', { name: '定时任务', exact: true });
+  await sidebar.evaluate((node) => { window.originalWorkspaceSidebar = node; });
+  const expectSidebar = async (active) => {
+    await expect(active).toHaveAttribute('aria-current', 'page');
+    expect(await sidebar.evaluate(node => window.originalWorkspaceSidebar === node)).toBe(true);
+    await expect(page.getByRole('button', { name: '隐藏侧边栏', exact: true })).toBeVisible();
+    await expect(page.locator('.codex-settings-nav')).toHaveCount(0);
+  };
+  const countAnimations = () => page.evaluate(() => window.workspaceNavigationAnimations);
+  await archiveButton.click();
+  await expect(page).toHaveURL(/#\/archived$/);
+  await expect(page.getByRole('heading', { name: '已归档的聊天' })).toBeVisible();
+  await expectSidebar(archiveButton);
+  expect(await countAnimations()).toBe(1);
+  await capture(page, info, 'archived');
+
+  await pluginButton.click();
+  await expectSidebar(pluginButton);
+  const tabs = page.getByRole('banner').getByRole('navigation', { name: '插件与技能' });
+  await expect(tabs.getByRole('button', { name: '插件', exact: true })).toHaveAttribute('aria-current', 'page');
+  const list = page.getByRole('region', { name: '插件', exact: true });
+  const groups = list.locator('.codex-library-group');
+  await expect(groups.first()).toHaveAttribute('aria-label', 'Productivity');
+  await expect(groups.nth(1)).toHaveAttribute('aria-label', 'Creativity');
+  const firstGrid = groups.first().locator('.codex-custom-grid');
+  const tracks = await firstGrid.evaluate(el => getComputedStyle(el).gridTemplateColumns.split(' ').length);
+  expect(tracks).toBe(info.project.use.viewport.width <= 820 ? 1 : 2);
+  await list.getByRole('combobox', { name: '筛选插件分类' }).selectOption('Creativity');
+  await expect(groups).toHaveCount(1);
+  await expect(groups.first()).toHaveAttribute('aria-label', 'Creativity');
+  await list.getByRole('button', { name: '个人', exact: true }).click();
+  await expect(list.getByRole('button', { name: '个人', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  expect(await countAnimations()).toBe(2);
+  await page.getByRole('button', { name: '创建', exact: true }).click();
+  await expect(page.getByRole('button', { name: '添加自定义 MCP 插件' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('button', { name: '创建', exact: true })).toHaveAttribute('aria-expanded', 'false');
+  await tabs.getByRole('button', { name: '技能', exact: true }).click();
+  await expect(page).toHaveURL(/#\/capabilities\/skills$/);
+  await expect(page.getByRole('heading', { name: '技能', exact: true })).toBeVisible();
+  await expectSidebar(pluginButton);
+  await capture(page, info, 'skills');
+  expect(await countAnimations()).toBe(3);
+  await page.getByRole('button', { name: '返回', exact: true }).click();
+  await expect(page).toHaveURL(/#\/capabilities$/);
+  await expect(tabs.getByRole('button', { name: '插件', exact: true })).toHaveAttribute('aria-current', 'page');
+  expect(await countAnimations()).toBe(4);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await scheduleButton.click();
+  await expectSidebar(scheduleButton);
+  await expect(page.getByRole('searchbox', { name: '搜索已安排任务' })).toBeVisible();
+  await page.getByRole('button', { name: /每日简报/ }).click();
+  const create = page.getByRole('dialog', { name: '新建定时任务' });
+  await expect(create.getByPlaceholder('任务名称（如：每日代码健康检查）')).toHaveValue('每日简报');
+  await expect(create.getByPlaceholder('0 9 * * 1-5')).toHaveValue('0 8 * * 1-5');
+  await expect(create.getByPlaceholder('描述每次触发时让 Agent 自动执行的任务…')).not.toHaveValue('');
+  await create.getByRole('button', { name: '取消', exact: true }).click();
+  expect(await countAnimations()).toBe(4);
+});
+
+test('plugin icons use the office artwork and pictograms instead of initials', async ({ page }, info) => {
+  test.skip(Boolean(process.env.E2E_FRONTEND_DIR), 'New office artwork');
+  await page.goto('/#/capabilities');
+  const officePlugins = ['Documents', 'PDF', 'Spreadsheets', 'Presentations'];
+  const tile = (name) => page.getByRole('button', { name: `查看 ${name} 插件详情`, exact: true })
+    .locator('.codex-custom-icon-tile');
+  const expectLoadedArtwork = async (iconTile) => {
+    const img = iconTile.locator('img');
+    await img.scrollIntoViewIfNeeded();
+    await expect(img).toHaveAttribute('src', /^(?:data:image\/svg\+xml[;,]|\/[^?#]*\.svg(?:[?#]|$))/);
+    await expect.poll(() => img.evaluate((el) => el.naturalWidth)).toBeGreaterThan(0);
+    await expect(iconTile).toHaveText('');
+    return img.getAttribute('src');
+  };
+
+  const install = page.getByRole('button', { name: '安装 Presentations', exact: true });
+  const installed = page.getByRole('button', { name: '已安装 Presentations', exact: true });
+  await expect(install).toBeEnabled();
+  for (const theme of ['light', 'dark']) {
+    await toggleTheme(page, theme);
+    const sources = [];
+    for (const name of officePlugins) sources.push(await expectLoadedArtwork(tile(name)));
+    expect(new Set(sources).size).toBe(officePlugins.length);
+    await capture(page, info, 'office-plugin-icons');
+    await page.getByRole('button', { name: '查看 Presentations 插件详情', exact: true }).click();
+    const detail = page.getByRole('dialog', { name: '配置插件 Presentations' });
+    expect(await expectLoadedArtwork(detail.locator('.codex-custom-icon-tile'))).toBe(sources.at(-1));
+    await detail.getByRole('button', { name: '关闭', exact: true }).click();
+  }
+
+  await install.click();
+  await expect(installed).toBeEnabled();
+  await installed.click();
+  await page.getByRole('dialog', { name: '配置插件 Presentations' })
+    .getByRole('button', { name: '卸载插件', exact: true }).click();
+  await expect(install).toBeEnabled();
+
+  await page.getByRole('combobox', { name: '筛选插件分类' }).selectOption('Creativity');
+  const withoutBrand = tile('Creative Claw');
+  await expect(withoutBrand.locator('svg[aria-hidden="true"] path')).toBeVisible();
+  await expect(withoutBrand).toHaveText('');
+});
+
 test('desktop focus and reduced motion do not alter transcript or inspector state', async ({ page }, info) => {
   test.skip(Boolean(process.env.E2E_FRONTEND_DIR), 'New keyboard and motion behavior');
   test.skip(info.project.name !== '1440x960', 'Keyboard and motion are viewport-independent');
@@ -413,4 +653,48 @@ test('desktop focus and reduced motion do not alter transcript or inspector stat
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.keyboard.press('Control+K');
   await expect(page.getByRole('dialog', { name: '搜索与快捷操作' })).toHaveCSS('animation-name', 'none');
+});
+
+
+test('terminal disclosure reverses from its live height and settles immediately under Reduce Motion', async ({ page }, info) => {
+  test.skip(Boolean(process.env.E2E_FRONTEND_DIR) || info.project.name !== '1440x960', 'New desktop motion contract');
+  await page.goto('/#/t/tools-visual');
+  await openActivity(page);
+  const tool = transcript(page).locator('details.codex-direct-tool').filter({ hasText: 'npm run test:auth' });
+  const summary = tool.locator(':scope > summary');
+  const panel = tool.locator(':scope > .codex-collapsible');
+  await summary.scrollIntoViewIfNeeded();
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  const frames = await tool.evaluate(async (details) => {
+    const trigger = details.querySelector('summary');
+    const panel = details.querySelector('.codex-collapsible');
+    trigger.click();
+    await new Promise(requestAnimationFrame);
+    const animation = panel.getAnimations().find(item => item.transitionProperty === 'height');
+    if (!animation) throw new Error('No height transition started');
+    animation.pause();
+    await animation.ready;
+    animation.currentTime = 35;
+    const height = panel.getBoundingClientRect().height;
+    const target = panel.firstElementChild.scrollHeight;
+    trigger.click();
+    await new Promise(requestAnimationFrame);
+    const closing = panel.getAnimations().find(item => item.transitionProperty === 'height');
+    const reversed = parseFloat(closing?.effect.getKeyframes()[0].height ?? 'NaN');
+    return { height, target, reversed, expanded: trigger.getAttribute('aria-expanded'), inert: panel.inert };
+  });
+  expect(frames.height).toBeGreaterThan(0);
+  expect(frames.height).toBeLessThan(frames.target);
+  expect(Math.abs(frames.reversed - frames.height)).toBeLessThan(4);
+  expect(frames.expanded).toBe('false');
+  expect(frames.inert).toBe(true);
+  await expect(panel).toBeHidden();
+  expect(await tool.getAttribute('open')).toBeNull();
+
+  await summary.click();
+  await expect(tool.locator('pre')).toBeVisible();
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await summary.click();
+  await expect(panel).toBeHidden();
+  expect(await panel.evaluate(node => node.getAnimations())).toHaveLength(0);
 });

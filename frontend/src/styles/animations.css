@@ -33,6 +33,22 @@
   }
 }
 
+@keyframes codex-exit-fade {
+  to { opacity: 0; }
+}
+
+@keyframes codex-exit-popover-up {
+  to { opacity: 0; transform: translateY(3px) scale(.995); }
+}
+
+@keyframes codex-exit-popover {
+  to { opacity: 0; transform: translateY(-3px) scale(.995); }
+}
+
+@keyframes codex-exit-dialog {
+  to { opacity: 0; transform: translateY(4px) scale(.995); }
+}
+
 @keyframes codex-fade-in {
   0% {
     opacity: 0;
@@ -85,9 +101,16 @@
 /* An active operation is indicated by opacity only, not a moving gradient. */
 .codex-shimmer-text { color: var(--text-secondary); animation: codex-activity-pulse 1.6s ease-in-out infinite; }
 
-@keyframes codex-detail-enter {
-  from { opacity: .8; }
+/* Newly arriving prose and output get one quiet reveal; no layout motion. */
+@keyframes codex-content-reveal {
+  from { opacity: .78; }
   to { opacity: 1; }
+}
+
+/* Secondary views can move on entry; never animate transcript geometry. */
+@keyframes codex-library-detail-enter {
+  from { opacity: .72; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 /* Edge fade for secondary panels only; the transcript keeps text and focus rings legible. */
@@ -113,13 +136,23 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Copy feedback swaps two painted layers, never layout or the accessible name. */
+.codex-copy-feedback { display: inline-grid; flex: none; place-items: center; }
+.codex-copy-feedback > svg {
+  grid-area: 1 / 1;
+  transition: opacity var(--duration-basic) var(--ease-enter-snappy), transform var(--duration-basic) var(--ease-enter-snappy);
+}
+.codex-copy-feedback > svg:last-child { opacity: 0; transform: scale(.8); color: var(--color-success); }
+.codex-copy-feedback[data-copied='true'] > svg:first-child { opacity: 0; transform: scale(.85); }
+.codex-copy-feedback[data-copied='true'] > svg:last-child { opacity: 1; transform: none; }
+
 /* Reduced motion support (both OS preference and in-app setting) */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after,
   *::backdrop {
-    transition-duration: 0.01ms !important;
+    transition: none !important;
     animation: none !important;
     scroll-behavior: auto !important;
   }
@@ -129,7 +162,7 @@
 [data-reduced-motion="true"] *::before,
 [data-reduced-motion="true"] *::after,
 [data-reduced-motion="true"] *::backdrop {
-  transition-duration: 0.01ms !important;
+  transition: none !important;
   animation: none !important;
   scroll-behavior: auto !important;
 }

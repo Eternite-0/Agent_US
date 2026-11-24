@@ -1,5 +1,5 @@
 import { useId, useMemo, useState } from 'react';
-import type { ComputedFileDiff } from '../utils/diff';
+import { buildDiffPresentation, type ComputedFileDiff, type DiffLine, type DiffSpan } from '../utils/diff';
 import { splitPath } from '../utils/format';
 import { ActivityCopyButton } from './ActivityPresentation';
 import { Collapsible } from './Collapsible';
@@ -18,6 +18,44 @@ function DiffCounts({ added, deleted }: { added: number; deleted: number }) {
   return <span className="codex-diff-counts tabular-nums"><span className="codex-git-add">+{added}</span><span className="codex-git-del">-{deleted}</span></span>;
 }
 
+/** Keep code as selectable text; additions and deletions share the same renderer. */
+export function DiffLineText({ line, spans }: { line: DiffLine | null; spans?: readonly DiffSpan[] }) {
+  const Tag = line?.kind === 'del' ? 'del' : 'ins';
+  return <span className="codex-diff-code">{spans ? spans.map((span, index) => span.changed
+    ? <Tag key={index} className="codex-diff-changed" data-change={line?.kind}>{span.text}</Tag>
+    : span.text) : line?.text}</span>;
+}
+
+export function DiffLineSign({ kind }: { kind?: DiffLine['kind'] }) {
+  return <span className="codex-diff-sign">{kind === 'add' ? '+' : kind === 'del' ? '-' : ''}</span>;
+}
+
+function InlineDiff({ lines }: { lines: readonly DiffLine[] }) {
+  const { spansByLine } = useMemo(() => buildDiffPresentation(lines), [lines]);
+  const visibleLines = useMemo(() => {
+    const keep = new Set<number>();
+    lines.forEach((line, index) => {
+      if (line.kind === 'context') return;
+      for (let i = Math.max(0, index - 2); i <= Math.min(lines.length - 1, index + 2); i++) keep.add(i);
+    });
+    return keep.size ? lines.filter((_, index) => keep.has(index)).slice(0, 120) : lines.slice(0, 60);
+  }, [lines]);
+
+  return (
+    <div className="codex-inline-diff-body" role="region" aria-label="内联文件差异" tabIndex={0}>
+      {visibleLines.length === 0 ? (
+        <div style={{ padding: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>无文本行差异</div>
+      ) : visibleLines.map((line) => (
+        <div key={`${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
+          <span className="codex-inline-diff-ln">{line.newLine ?? line.oldLine ?? ''}</span>
+          <DiffLineSign kind={line.kind} />
+          <DiffLineText line={line} spans={spansByLine.get(line)} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
   file: ComputedFileDiff;
   hidden: boolean;
@@ -27,17 +65,9 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
 }) {
   const [open, setOpen] = useState(false);
   const previewId = useId();
-  const { path, added, deleted, lines, afterText } = file;
+  const { path, added, deleted, afterText } = file;
   const { dir, name } = splitPath(path);
   const status = file.isNew ? { kind: 'add', label: '新增' } : file.isDeleted ? { kind: 'del', label: '删除' } : { kind: 'edit', label: '修改' };
-  const visibleLines = useMemo(() => {
-    const keep = new Set<number>();
-    lines.forEach((line, index) => {
-      if (line.kind === 'context') return;
-      for (let i = Math.max(0, index - 2); i <= Math.min(lines.length - 1, index + 2); i++) keep.add(i);
-    });
-    return keep.size ? lines.filter((_, index) => keep.has(index)).slice(0, 120) : lines.slice(0, 60);
-  }, [lines]);
 
   return (
     <div className="codex-file-row-wrap" hidden={hidden} data-scroll-anchor={`file:${listId}:${path}`}>
@@ -61,16 +91,7 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
             <button type="button" className="codex-inline-link-btn" onClick={() => onInspectFile(path)}><span>{path}</span></button>
             <ActivityCopyButton text={afterText} label="复制文件内容" onCopy={onCopy} />
           </div>
-          <div className="codex-inline-diff-body">
-            {visibleLines.length === 0 ? (
-              <div style={{ padding: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>无文本行差异</div>
-            ) : visibleLines.map((line) => (
-              <div key={`${line.kind}:${line.oldLine ?? ''}:${line.newLine ?? ''}`} className="codex-inline-diff-row" data-kind={line.kind}>
-                <span className="codex-inline-diff-ln">{line.newLine ?? line.oldLine ?? ''}</span>
-                <span>{line.text || ' '}</span>
-              </div>
-            ))}
-          </div>
+          <InlineDiff lines={file.lines} />
         </div>
       </Collapsible>
     </div>

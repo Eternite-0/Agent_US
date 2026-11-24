@@ -1,7 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { AgentBackendClient } from '../api/client';
 import type { ChatHistoryMatch, Project, Task } from '../types/backend';
 import { fmtRelative, taskTitle } from '../utils/format';
+import { PresenceDiv } from './PresenceDiv';
+import './search-palette-motion.css';
 import {
   IconArchive, IconCircleOutline, IconCompose, IconFileDoc, IconFolder, IconSearch, IconSettingsGear,
 } from './Icons';
@@ -63,7 +65,7 @@ export const SearchPalette: React.FC<SearchPaletteProps> = ({
   const currentHistory = history?.query === search && history.client === historyClient && history.revision === historyRevision
     ? history : null;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
     const trigger = document.activeElement;
     setQuery('');
@@ -166,11 +168,10 @@ export const SearchPalette: React.FC<SearchPaletteProps> = ({
   const highlighted = Math.min(highlight, entries.length - 1);
 
   useEffect(() => {
+    if (!open) return;
     const row = resultsRef.current?.querySelector('[data-highlighted="true"]');
     row?.scrollIntoView({ block: 'nearest' });
-  }, [highlighted, category, search]);
-
-  if (!open) return null;
+  }, [open, highlighted, category, search]);
 
   const run = (entry: SearchEntry) => {
     entry.run();
@@ -215,7 +216,9 @@ export const SearchPalette: React.FC<SearchPaletteProps> = ({
   let previousGroup = '';
 
   return (
-    <div className="codex-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }} onKeyDown={handleKeyDown}>
+    <PresenceDiv open={open} className="codex-modal-backdrop search-palette-backdrop"
+      onMouseDown={open ? (event) => { if (event.target === event.currentTarget) onClose(); } : undefined}
+      onKeyDown={open ? handleKeyDown : undefined}>
       <div className="codex-search-modal" ref={modalRef} role="dialog" aria-modal="true" aria-label="搜索与快捷操作">
         <div className="codex-search-top">
           <IconSearch size={19} />
@@ -259,6 +262,6 @@ export const SearchPalette: React.FC<SearchPaletteProps> = ({
         </div>
         <footer className="chat-search-footer"><span><kbd>↑</kbd> <kbd>↓</kbd> 选择</span><span><kbd>↵</kbd> 打开</span><span className="chat-search-count">{entries.length} 项结果</span></footer>
       </div>
-    </div>
+    </PresenceDiv>
   );
 };

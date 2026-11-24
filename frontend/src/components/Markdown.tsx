@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { IconCheck, IconCopy, IconFileDoc, IconImageInspect } from './Icons';
+import React, { useEffect, useRef, useState } from 'react';
+import { IconFileDoc, IconImageInspect } from './Icons';
+import { CopyFeedbackIcon } from './CopyFeedbackIcon';
 import { toImageDataUrl, type PreviewImageItem } from './ImageLightbox';
 
 interface MarkdownProps {
@@ -95,13 +96,16 @@ const CodeBlock: React.FC<{ lang: string; code: string; onCopy?: (msg: string) =
   onCopy,
 }) => {
   const [copied, setCopied] = useState(false);
+  const copyTimeout = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(copyTimeout.current), []);
 
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(code);
       setCopied(true);
       onCopy?.('已复制代码');
-      window.setTimeout(() => setCopied(false), 1200);
+      window.clearTimeout(copyTimeout.current);
+      copyTimeout.current = window.setTimeout(() => setCopied(false), 1200);
     } catch {
       // clipboard unavailable
     }
@@ -118,7 +122,7 @@ const CodeBlock: React.FC<{ lang: string; code: string; onCopy?: (msg: string) =
           onClick={handleCopy}
           aria-label="复制"
         >
-          {copied ? <IconCheck size={13} /> : <IconCopy size={13} />}
+          <CopyFeedbackIcon copied={copied} size={13} />
           <span>{copied ? '已复制' : '复制'}</span>
         </button>
       </div>

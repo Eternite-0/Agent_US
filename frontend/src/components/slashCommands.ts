@@ -47,7 +47,7 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
     { cmd: '/rewind', desc: '回退上一轮对话和文件变更', icon: IconUndo, threadOnly: true },
     { cmd: '/pin', desc: '置顶或取消置顶当前聊天', icon: IconPin, threadOnly: true },
     { cmd: '/restore', desc: '恢复当前归档聊天', icon: IconHistory, threadOnly: true },
-    { cmd: '/archive', desc: '查找和恢复已归档的聊天', icon: IconArchive, view: settings('archived') },
+    { cmd: '/archive', desc: '查找和恢复已归档的聊天', icon: IconArchive, view: { kind: 'archived' } },
     { cmd: '/copy-link', desc: '复制当前聊天链接', icon: IconCopy, threadOnly: true },
     { cmd: '/clear', desc: '清空输入与附件', icon: IconReset },
   ] },

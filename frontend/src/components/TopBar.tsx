@@ -3,6 +3,8 @@ import {
   IconArrowBack,
   IconCheck,
   IconClose,
+  IconDotsHorizontal,
+  IconRightPanelToggle,
   IconSidebarToggle,
   IconWinMaximize,
   IconWinMinimize,
@@ -10,6 +12,10 @@ import {
 } from './Icons';
 
 interface TopBarProps {
+  workspaceLayout: boolean;
+  libraryToolbarRef?: React.Ref<HTMLDivElement>;
+  showInspectorToggle: boolean;
+  inspectorOpen: boolean;
   canBack: boolean;
   canForward: boolean;
   sidebarCollapsed: boolean;
@@ -31,6 +37,10 @@ interface TopBarProps {
 type MenuKey = 'file' | 'edit' | 'view' | 'help';
 
 export const TopBar: React.FC<TopBarProps> = ({
+  workspaceLayout,
+  libraryToolbarRef,
+  showInspectorToggle,
+  inspectorOpen,
   canBack,
   canForward,
   sidebarCollapsed,
@@ -48,7 +58,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onToggleInspector,
   onRefresh,
 }) => {
-  const [openMenu, setOpenMenu] = useState<MenuKey | null>(null);
+  const [openMenu, setOpenMenu] = useState<MenuKey | 'app' | null>(null);
   const [maximized, setMaximized] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
   const desktop = typeof window !== 'undefined' ? window.codexDesktop : undefined;
@@ -117,9 +127,35 @@ export const TopBar: React.FC<TopBarProps> = ({
     },
   };
 
+  const renderMenuItems = (key: MenuKey) => menus[key].items.map((item, idx) => item.divider ? (
+    <div key={idx} className="codex-popover-divider" />
+  ) : (
+    <button key={idx} type="button" className="codex-popover-item" onClick={() => {
+      setOpenMenu(null);
+      item.action?.();
+    }}>
+      <span className="codex-menu-item-label">
+        {item.checked !== undefined && <span className="codex-menu-check" data-checked={item.checked}><IconCheck size={14} /></span>}
+        <span>{item.label}</span>
+      </span>
+      {item.shortcut && <span className="codex-menu-shortcut">{item.shortcut}</span>}
+    </button>
+  ));
+
   return (
-    <header className="codex-topbar" ref={barRef}>
+    <header className="codex-topbar" data-library-toolbar={Boolean(libraryToolbarRef) || undefined} ref={barRef}>
       <div className="codex-topbar-left">
+        <button
+          type="button"
+          className="codex-icon-btn"
+          aria-label={sidebarCollapsed ? '显示侧边栏' : '隐藏侧边栏'}
+          aria-expanded={!sidebarCollapsed}
+          onClick={onToggleSidebar}
+          title="切换侧边栏 (Ctrl+B)"
+        >
+          <IconSidebarToggle size={16} />
+        </button>
+
         <div className="codex-topbar-nav">
           <button
             type="button"
@@ -143,81 +179,64 @@ export const TopBar: React.FC<TopBarProps> = ({
           </button>
         </div>
 
-        <button
-          type="button"
-          className="codex-icon-btn"
-          aria-label={sidebarCollapsed ? '显示侧边栏' : '隐藏侧边栏'}
-          aria-expanded={!sidebarCollapsed}
-          onClick={onToggleSidebar}
-          title="切换侧边栏 (Ctrl+B)"
-        >
-          <IconSidebarToggle size={16} />
-        </button>
-
-        <nav className="codex-menubar" role="menubar" aria-label="应用程序菜单">
-          {(Object.keys(menus) as MenuKey[]).map((key) => (
-            <div key={key} style={{ position: 'relative' }}>
-              <button
-                type="button"
-                role="menuitem"
-                className="codex-menu-trigger"
-                data-open={openMenu === key ? 'true' : undefined}
-                onClick={() => setOpenMenu((cur) => (cur === key ? null : key))}
-                onMouseEnter={() => {
-                  if (openMenu && openMenu !== key) setOpenMenu(key);
-                }}
-              >
-                {menus[key].label}
-              </button>
-
-              {openMenu === key && (
-                <div className="codex-popover" data-side="bottom" style={{ left: 0, minWidth: 210 }}>
-                  {menus[key].items.map((item, idx) =>
-                    item.divider ? (
-                      <div key={idx} className="codex-popover-divider" />
-                    ) : (
-                      <button
-                        key={idx}
-                        type="button"
-                        className="codex-popover-item"
-                        onClick={() => {
-                          setOpenMenu(null);
-                          item.action?.();
-                        }}
-                      >
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-                          {item.checked !== undefined && (
-                            <span style={{ width: 14, display: 'inline-flex', opacity: item.checked ? 1 : 0 }}>
-                              <IconCheck size={14} />
-                            </span>
-                          )}
-                          <span>{item.label}</span>
-                        </span>
-                        {item.shortcut && (
-                          <span style={{ fontSize: 11.5, color: 'var(--text-tertiary)' }}>
-                            {item.shortcut}
-                          </span>
-                        )}
-                      </button>
-                    ),
-                  )}
-                </div>
-              )}
-            </div>
-          ))}
-        </nav>
+        {workspaceLayout ? (
+          <div className="codex-app-menu">
+            <button type="button" className="codex-icon-btn" aria-label="应用程序菜单"
+              aria-expanded={openMenu === 'app'} onClick={() => setOpenMenu((cur) => cur === 'app' ? null : 'app')}>
+              <IconDotsHorizontal size={16} />
+            </button>
+            {openMenu === 'app' && (
+              <div className="codex-popover codex-app-menu-panel" data-side="bottom" aria-label="应用程序菜单">
+                {(Object.keys(menus) as MenuKey[]).map((key) => (
+                  <div key={key} role="group" aria-label={menus[key].label}>
+                    <div className="codex-app-menu-section">{menus[key].label}</div>
+                    {renderMenuItems(key)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <nav className="codex-menubar" role="menubar" aria-label="应用程序菜单">
+            {(Object.keys(menus) as MenuKey[]).map((key) => (
+              <div key={key} style={{ position: 'relative' }}>
+                <button type="button" role="menuitem" className="codex-menu-trigger"
+                  data-open={openMenu === key ? 'true' : undefined}
+                  onClick={() => setOpenMenu((cur) => (cur === key ? null : key))}
+                  onMouseEnter={() => { if (openMenu && openMenu !== key) setOpenMenu(key); }}>
+                  {menus[key].label}
+                </button>
+                {openMenu === key && (
+                  <div className="codex-popover" data-side="bottom" style={{ left: 0, minWidth: 210 }}>
+                    {renderMenuItems(key)}
+                  </div>
+                )}
+              </div>
+            ))}
+          </nav>
+        )}
       </div>
+
+      {libraryToolbarRef && <div className="codex-topbar-library" ref={libraryToolbarRef} />}
 
       <div className="codex-topbar-right">
         <button
           type="button"
           className="codex-conn-pill"
           onClick={() => onOpenSettings('connection')}
-          title="点击配置后端连接或切换模拟模式"
+          aria-label={connectionLabel}
+          title={`${connectionLabel} · 点击配置连接`}
         >
           <span className="codex-status-dot" data-tone={connectionTone} />
           <span>{connectionLabel}</span>
         </button>
+
+        {showInspectorToggle && (
+          <button type="button" className="codex-icon-btn" data-active={inspectorOpen || undefined}
+            title="切换右侧面板" aria-label="切换右侧面板" aria-expanded={inspectorOpen} onClick={onToggleInspector}>
+            <IconRightPanelToggle size={16} />
+          </button>
+        )}
 
         {desktop && (
           <div className="codex-win-controls" aria-label="窗口控制">

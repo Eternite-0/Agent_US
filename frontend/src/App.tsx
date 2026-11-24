@@ -12,6 +12,7 @@ import {
   type MarketplacePlugin,
   type MarketplaceSkill,
 } from './components/CapabilitiesView';
+import { ArchivedChats } from './components/ArchivedChats';
 import { ComposerDialog } from './components/ComposerDialog';
 import { CreateProjectModal } from './components/CreateProjectModal';
 import { EvaluationView } from './components/EvaluationView';
@@ -72,13 +73,24 @@ import {
   threadRootFor,
   type BundleCache,
 } from './utils/sseRefresh';
-import { randomIdempotencyKey } from './utils/format';
+import { randomIdempotencyKey, taskTitle } from './utils/format';
+import { createComposerDraftStore, createThreadInteraction, createThreadInteractionCache } from './utils/threadInteraction';
 import { BUILTIN_PROVIDER_PRESETS, mergeProviderPresetCatalog } from './data/providerPresets';
+
+type DeleteTarget = { kind: 'project'; project: Project } | { kind: 'archived'; task: Task };
+
+function withoutTask<T>(items: Record<string, T>, taskId: string): Record<string, T> {
+  if (!Object.hasOwn(items, taskId)) return items;
+  const next = { ...items };
+  delete next[taskId];
+  return next;
+}
 
 function parseHash(): AppView {
   const hash = window.location.hash.replace(/^#/, '');
   const threadMatch = hash.match(/^\/t\/([^/?]+)/);
   if (threadMatch) return { kind: 'thread', taskId: decodeURIComponent(threadMatch[1]) };
+  if (hash === '/archived' || hash === '/settings/archived') return { kind: 'archived' };
   if (hash.startsWith('/tasks')) return { kind: 'tasks' };
   const pluginMatch = hash.match(/^\/capabilities\/plugins\/([a-zA-Z0-9_-]+)$/);
   if (pluginMatch) return { kind: 'capabilities', pluginId: pluginMatch[1] };
@@ -96,6 +108,8 @@ function viewToHash(v: AppView): string {
       return '#/';
     case 'thread':
       return `#/t/${encodeURIComponent(v.taskId)}`;
+    case 'archived':
+      return '#/archived';
     case 'tasks':
       return '#/tasks';
     case 'capabilities':
@@ -133,12 +147,16 @@ export const App: React.FC = () => {
   // A connection epoch is distinct even when returning to the singleton demo client.
   const refreshScope = useMemo(() => ({
     id: ++nextConnectionId,
+    homeComposer: createComposerDraftStore(),
+    threadInteractions: createThreadInteractionCache(),
     workspaceRequests: createLatestRequests<void>(),
     gitRequests: createLatestRequests<string>(),
     permissionUpdates: new Set<string>(),
     workspaceChanging: false,
     bundleRequests: createLatestRequests<string>(),
     archiveRequests: new Set<string>(),
+    deletingTasks: new Set<string>(),
+    deletedTasks: new Set<string>(),
     taskWrites: new Map<string, number>(),
     taskClock: 0,
   }), [client]);
@@ -156,6 +174,9 @@ export const App: React.FC = () => {
   const view = nav.stack[nav.index] ?? { kind: 'home' };
 
   const navigate = useCallback((next: AppView) => {
+    if (next.kind === 'thread' && currentRefreshScope.current?.deletedTasks.has(next.taskId)) {
+      next = { kind: 'archived' };
+    }
     setNav((prev) => {
       const cur = prev.stack[prev.index];
       if (JSON.stringify(cur) === JSON.stringify(next)) return prev;
@@ -221,7 +242,7 @@ export const App: React.FC = () => {
     media.addEventListener('change', sync);
     return () => media.removeEventListener('change', sync);
   }, []);
-  const [sidebarWidth, setSidebarWidth] = useState(248);
+  const [sidebarWidth, setSidebarWidth] = useState(275);
   const [drawerWidth, setDrawerWidth] = useState(DEFAULT_INSPECTOR_WIDTH);
   const [searchOpen, setSearchOpen] = useState(false);
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
@@ -239,6 +260,10 @@ export const App: React.FC = () => {
   const [pinnedIds, setPinnedIds] = useState<string[]>([]);
   const [archiveBusy, setArchiveBusy] = useState<ReadonlySet<string>>(() => new Set());
   const [archiveRevision, setArchiveRevision] = useState(0);
+  const [archiveDeleting, setArchiveDeleting] = useState<ReadonlySet<string>>(() => new Set());
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  const [deletePending, setDeletePending] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
   const [scheduledTasks, setScheduledTasks] = useState<ScheduledTaskItem[]>([]);
   // The simulator keeps the same tasks across mode toggles; keep their relationships as well.
   const threadChainOwner = connection.mode === 'demo' ? client : refreshScope;
@@ -274,6 +299,13 @@ export const App: React.FC = () => {
   const [liveToolOutputs, setLiveToolOutputs] = useState<Record<string, DirectLiveToolOutput[]>>({});
   const [gitState, setGitState] = useState<{ key: string; status?: GitStatus; error?: string } | null>(null);
   const activeRootTaskId = view.kind === 'thread' ? threadRootFor(view.taskId, threadChains) : null;
+  const threadInteraction = useMemo(() => activeRootTaskId
+    ? refreshScope.threadInteractions.get(activeRootTaskId) ?? createThreadInteraction()
+    : null, [activeRootTaskId, refreshScope]);
+  useLayoutEffect(() => {
+    if (!activeRootTaskId || !threadInteraction) return;
+    refreshScope.threadInteractions.visit(activeRootTaskId, threadInteraction);
+  }, [activeRootTaskId, refreshScope, threadInteraction]);
   const gitSessionId = activeRootTaskId ?? (view.kind === 'home' && sideProject?.startsWith('session:') ? sideProject.slice(8) : undefined);
   const gitKey = JSON.stringify([refreshScope.id, gitSessionId, gitSessionId ? null : workspaceRoot]);
   const currentGitKey = useRef(gitKey);
@@ -414,12 +446,16 @@ export const App: React.FC = () => {
     setBundleState({ scope: refreshScope, cache: EMPTY_BUNDLE_CACHE });
     setInspectorTaskId(null);
     setArchiveBusy(new Set());
+    setArchiveDeleting(new Set());
+    setDeleteTarget(null);
+    setDeletePending(false);
+    setDeleteError('');
   }, [refreshScope]);
 
   // Mark local task writes independently so a racing list snapshot cannot undo them or
   // suppress fresh data for other tasks. This includes archive removals and newly created tasks.
   const writeTask = useCallback((task: Task, mode: 'upsert' | 'update' | 'archive' = 'upsert') => {
-    if (currentRefreshScope.current !== refreshScope) return;
+    if (currentRefreshScope.current !== refreshScope || refreshScope.deletedTasks.has(task.id)) return;
     refreshScope.taskWrites.set(task.id, ++refreshScope.taskClock);
     setTasks((previous) => {
       const current = previous.find((entry) => entry.id === task.id);
@@ -447,7 +483,7 @@ export const App: React.FC = () => {
         const taskClock = refreshScope.taskClock;
         const [projList, taskList, apprList, modelList, pHealth, memList, usgList, evList, schedList] =
           await Promise.all([
-            client.listProjects(),
+            client.listProjects().catch(() => null),
             client.listTasks({ archived: false }),
             client.listApprovals(),
             client.listModels(),
@@ -461,10 +497,11 @@ export const App: React.FC = () => {
 
         setBackendHealthy(health.ok ?? health.status === 'ok');
         if (health.workspaceRoot && !refreshScope.workspaceChanging) setWorkspaceRoot(health.workspaceRoot);
-        setProjects((prev) => shareSnapshot(prev, projList));
+        if (projList) setProjects((prev) => shareSnapshot(prev, projList));
         const protectedIds = new Set([...refreshScope.taskWrites]
           .filter(([, clock]) => clock > taskClock).map(([id]) => id));
-        setTasks((prev) => mergeTaskList(prev, taskList, protectedIds));
+        setTasks((prev) => mergeTaskList(prev, refreshScope.deletedTasks.size
+          ? taskList.filter(({ id }) => !refreshScope.deletedTasks.has(id)) : taskList, protectedIds));
         setApprovals((prev) => shareSnapshot(prev, apprList));
         setModels((prev) => shareSnapshot(prev, modelList));
         setProvidersHealth((prev) => shareSnapshot(prev, pHealth));
@@ -476,11 +513,13 @@ export const App: React.FC = () => {
         }
         if (evList.length) setRecentEvents((prev) => mergeRecentEvents(prev, evList));
 
-        const outsideProject = workedOutsideProjectRef.current;
-        setSelectedProjectId((cur) => {
-          if (cur && projList.some((p) => p.id === cur)) return cur;
-          return outsideProject ? null : projList[0]?.id ?? null;
-        });
+        if (projList) {
+          const outsideProject = workedOutsideProjectRef.current;
+          setSelectedProjectId((cur) => {
+            if (cur && projList.some((p) => p.id === cur)) return cur;
+            return outsideProject ? null : projList[0]?.id ?? null;
+          });
+        }
       } catch (err) {
         if (currentRefreshScope.current !== refreshScope || !request.claim()) return;
         setBackendHealthy(false);
@@ -719,29 +758,30 @@ export const App: React.FC = () => {
     void loadExtensionCatalog(false);
   }, [loadExtensionCatalog]);
 
+  const remotePluginRequest = useRef<AbortController | null>(null);
   const handleSearchRemotePlugins = useCallback(async (query: string) => {
-    if (!query) {
-      setRemoteSearchPlugins(null);
-      setRemoteSearching(false);
-      return;
-    }
-    setRemoteSearching(true);
+    remotePluginRequest.current?.abort();
+    remotePluginRequest.current = null;
+    setRemoteSearchPlugins(null);
+    setRemoteSearching(Boolean(query));
+    if (!query) return;
+    const controller = new AbortController();
+    remotePluginRequest.current = controller;
     try {
-      const res = await fetch(`/api/extensions/catalog?q=${encodeURIComponent(query)}`);
-      if (!res.ok) {
-        setRemoteSearchPlugins(null);
-        return;
-      }
+      const res = await fetch(`/api/extensions/catalog?q=${encodeURIComponent(query)}`, { signal: controller.signal });
+      if (!res.ok) return;
       const data = (await res.json()) as { plugins?: MarketplacePlugin[] };
-      if (Array.isArray(data.plugins)) {
-        setRemoteSearchPlugins(data.plugins);
-      }
+      if (!controller.signal.aborted && Array.isArray(data.plugins)) setRemoteSearchPlugins(data.plugins);
     } catch {
-      setRemoteSearchPlugins(null);
+      // The locally available catalog remains usable when remote search fails.
     } finally {
-      setRemoteSearching(false);
+      if (remotePluginRequest.current === controller) {
+        remotePluginRequest.current = null;
+        setRemoteSearching(false);
+      }
     }
   }, []);
+  useEffect(() => () => remotePluginRequest.current?.abort(), []);
 
   // Resolve the true chain before rendering so navigating to a child keeps the same thread instance.
   const activeChainIds = useMemo(() => {
@@ -761,6 +801,7 @@ export const App: React.FC = () => {
     async (taskIds: readonly string[]) => {
       if (currentRefreshScope.current !== refreshScope) return;
       await Promise.all([...new Set(taskIds)].map(async (id) => {
+        if (refreshScope.deletedTasks.has(id)) return;
         const request = refreshScope.bundleRequests.start(id);
         const loaded = await client.loadTaskBundle(id).catch(() => null);
         if (currentRefreshScope.current !== refreshScope || !request.claim()) return;
@@ -856,6 +897,7 @@ export const App: React.FC = () => {
       (ev) => {
         if (!isCurrent()) return;
         const sid = ev.taskId || (typeof ev.payload?.sessionId === 'string' ? ev.payload.sessionId : '');
+        if (refreshScope.deletedTasks.has(sid)) return;
         const turnId = typeof ev.payload?.turnId === 'string' ? ev.payload.turnId : undefined;
         const callId = typeof ev.payload?.callId === 'string' ? ev.payload.callId : '';
         if (ev.type === 'tool/output') {
@@ -867,31 +909,31 @@ export const App: React.FC = () => {
               const outputs = prev[sid] ?? [];
               const cur = outputs.find((entry) => entry.callId === callId && entry.turnId === turnId);
               const output = { turnId, callId, name, text: ((cur?.text ?? '') + chunk).slice(-12000) };
-              return { ...prev, [sid]: [...outputs.filter((entry) => entry !== cur), output] };
+              return { ...prev, [sid]: [...outputs.filter((entry) => entry !== cur).slice(-31), output] };
             });
           }
           return;
         }
+        const afterAssistantCursor = typeof ev.payload?.afterAssistantCursor === 'number' ? ev.payload.afterAssistantCursor : undefined;
         if (ev.type === 'assistant/delta' || ev.type === 'reasoning/delta') {
           if (!sid) return;
           setLiveStreams((prev) => {
             const stream = prev[sid];
-            const cur = stream && stream.turnId === turnId ? stream : { text: '', reasoning: '' };
+            const continuing = stream && !stream.settled && stream.turnId === turnId && stream.afterAssistantCursor === afterAssistantCursor;
+            const cur = continuing ? stream : { text: '', reasoning: '' };
             const key = ev.type === 'assistant/delta' ? 'text' : 'reasoning';
             const next = String(ev.payload?.text ?? (cur[key] + String(ev.payload?.delta ?? '')));
-            if (stream && stream.turnId === turnId && stream[key] === next) return prev;
-            return { ...prev, [sid]: { ...cur, turnId, [key]: next } };
+            if (continuing && stream[key] === next) return prev;
+            return { ...prev, [sid]: { ...cur, turnId, afterAssistantCursor, [key]: next } };
           });
           return;
         }
         const turnEnded = isDirectTurnEnd(ev.type);
-        if (sid && (ev.type === 'tool/result' || turnEnded || ev.type === 'turn/started')) {
+        const rewound = ev.type === 'session/rewound' && Number(ev.payload?.removedMessages) > 0;
+        if (sid && (rewound || ev.type === 'turn/started')) {
           setLiveToolOutputs((prev) => {
             if (!prev[sid]) return prev;
-            const outputs = prev[sid].filter((entry) =>
-              ev.type === 'turn/started' ? entry.turnId === turnId
-                : (turnId && entry.turnId !== turnId) || (!turnEnded && entry.callId !== callId),
-            );
+            const outputs = rewound ? [] : prev[sid].filter((entry) => entry.turnId === turnId);
             if (outputs.length === prev[sid].length) return prev;
             const next = { ...prev };
             if (outputs.length) next[sid] = outputs;
@@ -899,11 +941,23 @@ export const App: React.FC = () => {
             return next;
           });
         }
-        // A reasoning-only model step can transition directly to tools without assistant/message.
-        if (sid && (turnEnded || ev.type === 'assistant/message' || ev.type === 'tool/call' || ev.type === 'turn/started')) {
+        if (sid && (rewound || turnEnded || ev.type === 'assistant/message' || ev.type === 'tool/call' || ev.type === 'turn/started')) {
           setLiveStreams((prev) => {
             const stream = prev[sid];
-            if (!stream || (ev.type === 'turn/started' ? turnId === stream.turnId : turnId && turnId !== stream.turnId)) return prev;
+            if (!stream || (!rewound && (ev.type === 'turn/started' ? turnId === stream.turnId : turnId && turnId !== stream.turnId))) return prev;
+            // Older backends don't send a message cursor. Hold their finalized
+            // preview in place until the matching history arrives, also on turn/end.
+            if (ev.type === 'assistant/message' && typeof ev.payload?.messageCursor !== 'number') {
+              const { text, reasoning } = ev.payload ?? {};
+              return { ...prev, [sid]: { ...stream, settled: true,
+                text: typeof text === 'string' ? text : stream.text,
+                reasoning: typeof reasoning === 'string' ? reasoning : stream.reasoning,
+              } };
+            }
+            if (ev.type === 'assistant/message' && typeof ev.payload?.messageCursor === 'number' &&
+                stream.afterAssistantCursor !== undefined && ev.payload.messageCursor <= stream.afterAssistantCursor) return prev;
+            if ((turnEnded || ev.type === 'tool/call') && stream.settled) return prev;
+            if (ev.type === 'turn/completed') return { ...prev, [sid]: { ...stream, settled: true } };
             const next = { ...prev };
             delete next[sid];
             return next;
@@ -939,17 +993,23 @@ export const App: React.FC = () => {
 
   const handleCreateProject = async (name: string, sourceFolders: string[] = []) => {
     if (sourceFolders.length > 0 && client.setWorkspace) await handleChangeWorkspaceRoot(sourceFolders[0]);
+    if (currentRefreshScope.current !== refreshScope) return;
     const project = await client.createProject(name);
-    setProjects((prev) => [...prev, project]);
-    setSelectedProjectId(project.id);
-    setWorkedOutsideProject(false);
+    if (currentRefreshScope.current !== refreshScope) return;
+    refreshScope.workspaceRequests.invalidate(undefined);
+    setProjects((prev) => shareSnapshot(prev, [...prev.filter(({ id }) => id !== project.id), project]));
+    handleSelectProject(project.id);
+    void refreshWorkspace(false);
     pushToast(`已创建项目 ${project.name}`, 'success');
   };
 
   const handleRenameProject = async (project: Project, newName: string) => {
     try {
-      const updated = await client.renameProject(project.id, newName, project.version);
+      const updated = await client.renameProject(project, newName);
+      if (currentRefreshScope.current !== refreshScope) return;
+      refreshScope.workspaceRequests.invalidate(undefined);
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      void refreshWorkspace(false);
       pushToast(`项目已重命名为 ${updated.name}`);
     } catch (e) {
       pushToast(`重命名失败：${e instanceof Error ? e.message : '版本冲突'}`, 'danger');
@@ -970,13 +1030,7 @@ export const App: React.FC = () => {
     setSubmitting(true);
     try {
       const sideSource = sideProject?.startsWith('session:') ? await client.getTask(sideProject.slice(8)) : null;
-      let projectId = sideSource?.projectId ?? selectedProjectId;
-      if (!projectId) {
-        const created = await client.createProject('Agent_US Workspace');
-        setProjects((prev) => [...prev, created]);
-        projectId = created.id;
-        setSelectedProjectId(created.id);
-      }
+      const projectId = sideSource ? sideSource.projectId : selectedProject?.id ?? null;
 
       const task = await client.submitTask({
         effort,
@@ -1015,7 +1069,6 @@ export const App: React.FC = () => {
       pushToast('请等待会话权限更新完成', 'warning');
       return false;
     }
-    setSubmitting(true);
     try {
       const currentRoot = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
       if (currentRoot?.status === 'running' && client.steerSession && !isSwarmCommand(text) && !text.startsWith('/plan ') && Object.keys(files).length === 0) {
@@ -1035,20 +1088,22 @@ export const App: React.FC = () => {
           effort,
           clientTurnId: randomIdempotencyKey(),
         });
-        if (currentRefreshScope.current !== refreshScope || activeChainRef.current[0] !== activeRootTaskId) return false;
-        if ('mode' in updated) showSwarmReceipt(updated);
-        else writeTask(updated, 'update');
-        await refreshActiveBundles([activeRootTaskId]);
+        if (currentRefreshScope.current !== refreshScope) return false;
+        const stillViewing = activeChainRef.current[0] === activeRootTaskId;
+        if ('mode' in updated) {
+          if (stillViewing) showSwarmReceipt(updated);
+          else void refreshWorkspace(false);
+        } else {
+          writeTask(updated, 'update');
+        }
+        // The server accepted this draft even if the user opened another thread
+        // while the request was in flight. Don't show it as unsent on return.
+        if (stillViewing) await refreshActiveBundles([activeRootTaskId]);
         return true;
       }
       const rootTask = tasks.find((t) => t.id === activeRootTaskId) ?? activeBundles[0]?.task;
-      let projectId = rootTask?.projectId ?? selectedProjectId;
-      if (!projectId) {
-        const created = await client.createProject('Agent_US Workspace');
-        setProjects((prev) => [...prev, created]);
-        projectId = created.id;
-        setSelectedProjectId(created.id);
-      }
+      const projectId = rootTask && projects.some(({ id }) => id === rootTask.projectId)
+        ? rootTask.projectId : selectedProject?.id ?? null;
 
       const nextTask = await client.submitTask({
         effort,
@@ -1063,8 +1118,10 @@ export const App: React.FC = () => {
 
       if (currentRefreshScope.current !== refreshScope) return false;
       if ('mode' in nextTask) {
-        showSwarmReceipt(nextTask);
-        navigate({ kind: 'thread', taskId: nextTask.id });
+        if (activeChainRef.current[0] === activeRootTaskId) {
+          showSwarmReceipt(nextTask);
+          navigate({ kind: 'thread', taskId: nextTask.id });
+        }
         void refreshWorkspace(false);
         return true;
       }
@@ -1075,13 +1132,11 @@ export const App: React.FC = () => {
         if (nextTask.id === activeRootTaskId || children.includes(nextTask.id)) return prev;
         return { owner: threadChainOwner, chains: { ...chains, [activeRootTaskId]: [...children, nextTask.id] } };
       });
-      setInspectorTaskId(nextTask.id);
+      if (activeChainRef.current[0] === activeRootTaskId) setInspectorTaskId(nextTask.id);
       return true;
     } catch (e) {
       pushToast(`发送追问失败：${e instanceof Error ? e.message : '未知错误'}`, 'danger');
       return false;
-    } finally {
-      setSubmitting(false);
     }
   };
 
@@ -1204,7 +1259,8 @@ export const App: React.FC = () => {
   };
 
   const updateArchive = async (taskId: string, archived: boolean): Promise<boolean> => {
-    if (currentRefreshScope.current !== refreshScope || refreshScope.archiveRequests.has(taskId)) return false;
+    if (currentRefreshScope.current !== refreshScope || refreshScope.archiveRequests.has(taskId)
+      || refreshScope.deletingTasks.has(taskId) || refreshScope.deletedTasks.has(taskId)) return false;
     refreshScope.archiveRequests.add(taskId);
     setArchiveBusy(new Set(refreshScope.archiveRequests));
     try {
@@ -1243,6 +1299,79 @@ export const App: React.FC = () => {
   const handleArchiveTask = async (taskId: string) => {
     if (await updateArchive(taskId, true)) {
       pushToast('已归档聊天', 'success', { label: '撤销', onClick: () => void handleRestoreArchived(taskId) });
+    }
+  };
+
+  const requestDeletion = (target: DeleteTarget) => {
+    setDeleteError('');
+    setDeleteTarget(target);
+  };
+
+  const confirmDeletion = async () => {
+    if (!client.supportsSafeDeletion || !deleteTarget || deletePending || currentRefreshScope.current !== refreshScope) return;
+    const taskId = deleteTarget.kind === 'archived' ? deleteTarget.task.id : null;
+    if (taskId && (refreshScope.archiveRequests.has(taskId) || refreshScope.deletingTasks.has(taskId))) return;
+    setDeletePending(true);
+    setDeleteError('');
+    if (taskId) {
+      refreshScope.deletingTasks.add(taskId);
+      setArchiveDeleting(new Set(refreshScope.deletingTasks));
+    }
+    try {
+      if (deleteTarget.kind === 'project') {
+        const { project } = deleteTarget;
+        await client.deleteProject(project);
+        if (currentRefreshScope.current !== refreshScope) return;
+        // Invalidate a list snapshot that started before the shortcut was removed.
+        refreshScope.workspaceRequests.invalidate(undefined);
+        setProjects((previous) => previous.filter((entry) => entry.id !== project.id || entry.workspaceRoot !== project.workspaceRoot));
+        setSelectedProjectId((current) => current === project.id ? null : current);
+        void refreshWorkspace(false);
+        pushToast('已移除项目，文件和聊天均已保留', 'success');
+      } else if (taskId) {
+        await client.deleteArchivedTask(taskId);
+        if (currentRefreshScope.current !== refreshScope) return;
+        refreshScope.deletedTasks.add(taskId);
+        refreshScope.threadInteractions.delete(taskId);
+        refreshScope.bundleRequests.invalidate(taskId);
+        setTasks((previous) => previous.filter(({ id }) => id !== taskId));
+        setPinnedIds((previous) => previous.filter((id) => id !== taskId));
+        setLiveStreams((previous) => withoutTask(previous, taskId));
+        setLiveToolOutputs((previous) => withoutTask(previous, taskId));
+        setBundleState((previous) => {
+          if (previous.scope !== refreshScope || !previous.cache.has(taskId)) return previous;
+          const cache = new Map(previous.cache);
+          cache.delete(taskId);
+          return { scope: refreshScope, cache };
+        });
+        setInspectorTaskId((current) => current === taskId ? null : current);
+        setPreferredSwarmRun((current) => current?.sessionId === taskId ? null : current);
+        const archiveView = { kind: 'archived' } as const;
+        const shown = parseHash();
+        if (shown.kind === 'thread' && shown.taskId === taskId) window.history.replaceState(null, '', viewToHash(archiveView));
+        setNav((previous) => ({ ...previous, stack: previous.stack.map((entry) =>
+          entry.kind === 'thread' && entry.taskId === taskId ? archiveView : entry) }));
+        setThreadChainState((previous) => {
+          if (previous.owner !== threadChainOwner) return previous;
+          const chains = Object.fromEntries(Object.entries(previous.chains)
+            .filter(([root]) => root !== taskId)
+            .map(([root, children]) => [root, children.filter((child) => child !== taskId)]));
+          return { owner: threadChainOwner, chains };
+        });
+        setArchiveRevision((revision) => revision + 1);
+        pushToast('聊天已永久删除', 'success');
+      }
+      setDeleteTarget(null);
+    } catch (error) {
+      if (currentRefreshScope.current === refreshScope) {
+        setDeleteError(`${deleteTarget.kind === 'project' ? '移除' : '删除'}失败：${error instanceof Error ? error.message : '连接异常'}`);
+      }
+    } finally {
+      if (taskId) refreshScope.deletingTasks.delete(taskId);
+      if (currentRefreshScope.current === refreshScope) {
+        if (taskId) setArchiveDeleting(new Set(refreshScope.deletingTasks));
+        setDeletePending(false);
+      }
     }
   };
 
@@ -1574,12 +1703,38 @@ export const App: React.FC = () => {
           : 'SSE 重连中'
         : '未连接后端';
 
+  const workspaceLayout = ['home', 'thread', 'archived', 'tasks', 'capabilities'].includes(view.kind);
+  const [libraryToolbarHost, setLibraryToolbarHost] = useState<HTMLDivElement | null>(null);
+  const hasLibraryToolbar = view.kind === 'tasks' || (view.kind === 'capabilities' && view.section !== 'mcp');
+  const workspaceColumn = useRef<HTMLDivElement>(null);
+  const route = viewToHash(view);
+  const previousRoute = useRef(route);
+  useLayoutEffect(() => {
+    if (route === '#/archived' && window.location.hash === '#/settings/archived') {
+      window.history.replaceState(null, '', route);
+    }
+    if (route === previousRoute.current) return;
+    previousRoute.current = route;
+    if (reducedMotion || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    // Animate only the active content plane, without keying the shell or transcript on data changes.
+    const animation = workspaceColumn.current?.animate(
+      [{ opacity: 0.65 }, { opacity: 1 }],
+      { duration: 190, easing: 'cubic-bezier(.2,.65,.3,1)' },
+    );
+    return () => animation?.cancel();
+  }, [route, reducedMotion]);
   const lastCacheEvent = recentEvents.findLast(event => cacheRefreshEvent(event.type));
   const cacheRevision = lastCacheEvent ? `${lastCacheEvent.seq}:${lastCacheEvent.type}` : '';
   return (
     <PromptCacheProvider client={client} revision={cacheRevision}>
-    <div className="codex-shell">
+    <div className="codex-shell" data-workspace-layout={workspaceLayout || undefined}
+      data-sidebar-open={workspaceLayout && !sidebarCollapsed || undefined}
+      style={{ '--app-sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}>
       <TopBar
+        workspaceLayout={workspaceLayout}
+        libraryToolbarRef={hasLibraryToolbar ? setLibraryToolbarHost : undefined}
+        showInspectorToggle={view.kind === 'home'}
+        inspectorOpen={inspectorOpen}
         canBack={nav.index > 0}
         canForward={nav.index < nav.stack.length - 1}
         sidebarCollapsed={sidebarCollapsed}
@@ -1613,7 +1768,7 @@ export const App: React.FC = () => {
           view={view}
           collapsed={sidebarCollapsed}
           hidePanel={
-            view.kind === 'settings' || view.kind === 'tasks' || view.kind === 'capabilities' || view.kind === 'evaluations'
+            !workspaceLayout
           }
           width={sidebarWidth}
           codexMode={codexMode}
@@ -1630,7 +1785,7 @@ export const App: React.FC = () => {
             pushToast(`已切换工作模式：${m}`);
           }}
           onSelectHome={(projId) => {
-            if (projId) setSelectedProjectId(projId);
+            if (projId) handleSelectProject(projId);
             navigate({ kind: 'home' });
           }}
           onSelectTask={(taskId, focusWorkerId) => {
@@ -1644,13 +1799,14 @@ export const App: React.FC = () => {
               setInspectorOpen(true);
             }
           }}
+          onSelectArchived={() => navigate({ kind: 'archived' })}
           onSelectTasksView={() => navigate({ kind: 'tasks' })}
           onSelectCapabilities={() => navigate({ kind: 'capabilities' })}
-          onSelectEvaluations={() => navigate({ kind: 'evaluations' })}
           onOpenSettings={(sec) => navigate({ kind: 'settings', section: sec || 'general' })}
           onOpenSearch={() => setSearchOpen(true)}
           onOpenCreateProject={() => setCreateProjectOpen(true)}
           onRenameProject={handleRenameProject}
+          onDeleteProject={client.supportsSafeDeletion ? (project) => requestDeletion({ kind: 'project', project }) : undefined}
           onTogglePin={handleTogglePin}
           onArchiveTask={handleArchiveTask}
           onDecideApproval={handleDecideApproval}
@@ -1660,14 +1816,16 @@ export const App: React.FC = () => {
         <main
           className="codex-main-surface"
           data-frameless={
-            view.kind === 'settings' || view.kind === 'tasks' || view.kind === 'capabilities' || view.kind === 'evaluations'
+            !workspaceLayout
               ? 'true'
               : undefined
           }
         >
-          <div className="codex-workspace-column">
+          <div className="codex-workspace-column" ref={workspaceColumn}>
             {view.kind === 'home' && (
               <HomeView
+                key={refreshScope.id}
+                draftStore={refreshScope.homeComposer}
                 codexMode={codexMode}
                 projects={projects}
                 selectedProject={selectedProject}
@@ -1681,7 +1839,6 @@ export const App: React.FC = () => {
                 mentionSkills={mentionSkills}
                 draftInjection={homeDraft}
                 submitting={submitting}
-                inspectorOpen={inspectorOpen}
                 routerReady={routerReady}
                 isLiveBackend={connection.mode === 'live' && backendHealthy === true}
                 onSelectProject={handleSelectProject}
@@ -1698,23 +1855,46 @@ export const App: React.FC = () => {
                 searchMentionFiles={searchMentionFiles}
                 onSubmitGoal={handleSubmitGoal}
                 onSubmitTask={handleSubmitNewTask}
-                onToggleInspector={() => setInspectorOpen((v) => !v)}
                 onOpenSettings={(sec) => navigate({ kind: 'settings', section: sec || 'general' })}
               />
+            )}
+
+            {view.kind === 'archived' && (
+              <div className="codex-library-scroll codex-archive-page">
+                <ArchivedChats
+                  client={client}
+                  busy={archiveBusy}
+                  deleting={archiveDeleting}
+                  removedTaskIds={refreshScope.deletedTasks}
+                  revision={archiveRevision}
+                  onOpen={(taskId) => navigate({ kind: 'thread', taskId })}
+                  onRestore={handleRestoreArchived}
+                  onDelete={client.supportsSafeDeletion ? (task) => requestDeletion({ kind: 'archived', task }) : undefined}
+                />
+              </div>
             )}
 
             {archivedThread && (
               <div className="chat-archive-notice">
                 <span>此聊天已归档</span>
-                <button type="button" className="chat-archive-link" disabled={archiveBusy.has(archivedThread.task.id)}
+                <button type="button" className="chat-archive-link"
+                  disabled={archiveBusy.has(archivedThread.task.id) || archiveDeleting.has(archivedThread.task.id)}
                   onClick={() => void handleRestoreArchived(archivedThread.task.id)}>
                   {archiveBusy.has(archivedThread.task.id) ? '正在恢复…' : '恢复到列表'}
                 </button>
+                {client.supportsSafeDeletion && (
+                  <button type="button" className="chat-archive-link"
+                    disabled={archiveBusy.has(archivedThread.task.id) || archiveDeleting.has(archivedThread.task.id)}
+                    onClick={() => requestDeletion({ kind: 'archived', task: archivedThread.task })}>
+                    删除聊天
+                  </button>
+                )}
               </div>
             )}
-            {view.kind === 'thread' && (
+            {view.kind === 'thread' && threadInteraction && (
               <ThreadView
                 key={`${refreshScope.id}:${activeRootTaskId}`}
+                interaction={threadInteraction}
                 onOpenSwarmRun={(sessionId, runId) => {
                   setPreferredSwarmRun({ client, sessionId, runId });
                   setInspectorTaskId(sessionId);
@@ -1728,6 +1908,7 @@ export const App: React.FC = () => {
                 focusWorkerId={view.focusWorkerId}
                 liveStreams={liveStreams}
                 liveToolOutputs={liveToolOutputs}
+                recentRuntimeEvents={recentEvents}
                 onRewindSession={handleRewindSession}
                 onCompactSession={handleCompactSession}
                 codexMode={codexMode}
@@ -1794,6 +1975,7 @@ export const App: React.FC = () => {
 
             {view.kind === 'tasks' && (
               <TasksView
+                toolbarHost={libraryToolbarHost}
                 scheduledTasks={scheduledTasks}
                 tasks={tasks}
                 projects={projects}
@@ -1890,13 +2072,8 @@ export const App: React.FC = () => {
                     }
                     return;
                   }
-                  let projectId = item.projectId ?? selectedProject?.id ?? null;
-                  if (!projectId) {
-                    const created = await client.createProject('Agent_US Workspace');
-                    setProjects((prev) => [...prev, created]);
-                    projectId = created.id;
-                    setSelectedProjectId(created.id);
-                  }
+                  const projectId = projects.some(({ id }) => id === item.projectId)
+                    ? item.projectId : selectedProject?.id ?? null;
                   const task = await client.submitTask({
                     effort,
                     projectId,
@@ -1931,8 +2108,9 @@ export const App: React.FC = () => {
             )}
             {view.kind === 'capabilities' && view.section !== 'mcp' && (
               <CapabilitiesView
-                key={view.section ?? 'plugins'}
-                initialTab={view.section === 'skills' ? 'skills' : 'plugins'}
+                toolbarHost={libraryToolbarHost}
+                activeTab={view.section === 'skills' ? 'skills' : 'plugins'}
+                onChangeTab={(tab) => navigate({ kind: 'capabilities', section: tab === 'skills' ? 'skills' : undefined })}
                 initialPluginId={view.pluginId}
                 theme={resolvedTheme}
                 catalogSource={catalogSource}
@@ -1942,7 +2120,7 @@ export const App: React.FC = () => {
                 installedPluginIds={installedPluginIds}
                 pluginTokens={pluginTokens}
                 skills={skills}
-                onSearchRemotePlugins={(q) => void handleSearchRemotePlugins(q)}
+                onSearchRemotePlugins={handleSearchRemotePlugins}
                 onRefreshCatalog={(sync) => loadExtensionCatalog(Boolean(sync))}
                 onToggleInstallPlugin={async (plugin) => {
                   const installed = installedPluginIds.includes(plugin.id);
@@ -2145,9 +2323,6 @@ export const App: React.FC = () => {
                 approvals={approvals}
                 memory={memory}
                 usage={usage}
-                archiveClient={client}
-                archiveBusy={archiveBusy}
-                archiveRevision={archiveRevision}
                 recentEvents={recentEvents}
                 onChangeSection={(sec) => navigate({ kind: 'settings', section: sec })}
                 onChangeThemeMode={setThemeMode}
@@ -2186,7 +2361,6 @@ export const App: React.FC = () => {
                   await refreshWorkspace(true);
                 }}
                 onDecideApproval={handleDecideApproval}
-                onRestoreArchived={handleRestoreArchived}
                 onOpenTask={(taskId) => navigate({ kind: 'thread', taskId })}
                 onSearchMemory={handleSearchMemory}
                 onDeleteMemory={handleDeleteMemory}
@@ -2238,7 +2412,7 @@ export const App: React.FC = () => {
           setInspectorOpen(true);
         }}
         onSelectProject={(projectId) => {
-          setSelectedProjectId(projectId);
+          handleSelectProject(projectId);
           navigate({ kind: 'home' });
         }}
         onNewChat={() => navigate({ kind: 'home' })}
@@ -2252,24 +2426,45 @@ export const App: React.FC = () => {
         onCreate={handleCreateProject}
       />
 
-      {forkSource && <ComposerDialog title="创建聊天分支" onClose={() => { if (!forkPending) setForkSource(null); }}>
+      <ComposerDialog
+        open={deleteTarget !== null}
+        title={deleteTarget?.kind === 'project' ? '移除项目？' : '永久删除聊天？'}
+        onClose={() => { if (!deletePending) setDeleteTarget(null); }}
+      >
+        {deleteTarget && <p className="composer-dialog-note">
+          {deleteTarget.kind === 'project'
+            ? `从此应用的项目列表移除「${deleteTarget.project.name}」。本地文件和聊天均会保留。`
+            : `将永久删除「${taskTitle(deleteTarget.task.input)}」及其关联的子会话。此操作无法撤销，不会回退已写入工作区的文件。`}
+        </p>}
+        {deleteError && <p className="codex-inline-error" role="alert">{deleteError}</p>}
+        <div className="composer-dialog-actions">
+          <button type="button" className="codex-toolbar-btn" autoFocus disabled={deletePending} onClick={() => setDeleteTarget(null)}>取消</button>
+          <button type="button" className="codex-toolbar-btn" data-variant="danger" disabled={deletePending}
+            onClick={() => void confirmDeletion()}>
+            {deleteTarget?.kind === 'project'
+              ? (deletePending ? '正在移除…' : '移除项目')
+              : (deletePending ? '正在删除…' : '永久删除')}
+          </button>
+        </div>
+      </ComposerDialog>
+      <ComposerDialog open={Boolean(forkSource)} title="创建聊天分支" onClose={() => { if (!forkPending) setForkSource(null); }}>
         <p className="composer-dialog-note">继承近期对话文本。已有工具执行、附件和文件变更记录留在原聊天。</p>
         <button type="button" className="composer-dialog-option" disabled={forkPending}
           onClick={() => void createChatFork('same-workspace')}>在当前工作区创建</button>
         <button type="button" className="composer-dialog-option" disabled={forkPending || !gitStatus?.available}
           onClick={() => void createChatFork('new-worktree')}>从已提交版本创建 Git 工作树</button>
         {forkPending && <p className="composer-dialog-note" role="status">正在创建聊天分支…</p>}
-      </ComposerDialog>}
-      {feedbackDraft !== null && <ComposerDialog title="聊天反馈" onClose={() => setFeedbackDraft(null)}>
+      </ComposerDialog>
+      <ComposerDialog open={feedbackDraft !== null} title="聊天反馈" onClose={() => setFeedbackDraft(null)}>
         <p className="composer-dialog-note">导出本地 Markdown。仅包含你填写的反馈。</p>
         <label className="composer-dialog-field">反馈内容
-          <textarea value={feedbackDraft} maxLength={4000} onChange={(event) => setFeedbackDraft(event.currentTarget.value)} />
+          <textarea value={feedbackDraft ?? ''} maxLength={4000} onChange={(event) => setFeedbackDraft(event.currentTarget.value)} />
         </label>
         <div className="composer-dialog-actions">
-          <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={!feedbackDraft.trim()}
+          <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={!feedbackDraft?.trim()}
             onClick={exportFeedback}>导出反馈</button>
         </div>
-      </ComposerDialog>}
+      </ComposerDialog>
       <ToastHost toasts={toasts} />
     </div>
     </PromptCacheProvider>

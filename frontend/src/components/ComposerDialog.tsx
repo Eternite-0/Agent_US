@@ -1,33 +1,59 @@
-import React, { useEffect, useId, useRef, useState } from 'react';
+import React, { useId, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { usePresence, usePresenceSnapshot } from '../hooks/usePresence';
 import { IconClose } from './Icons';
+import './composer-dialog-motion.css';
 
-export function ComposerDialog({ title, onClose, children, className = '' }: React.PropsWithChildren<{
+export function ComposerDialog({ open = true, title, onClose, children, className = '' }: React.PropsWithChildren<{
+  open?: boolean;
   title: string;
   onClose: () => void;
   className?: string;
 }>) {
   const heading = useId();
   const dialog = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const node = dialog.current;
-    node?.showModal();
-    return () => node?.close();
-  }, []);
-  return (
+    if (!open || !node) return;
+    node.showModal();
+    // Release the native top layer, modal focus trap, and restore focus at logical close.
+    return () => node.close();
+  }, [open]);
+  const present = usePresence(open, dialog);
+  const content = usePresenceSnapshot(open, { title, children });
+  if (!present) return null;
+  return createPortal(<>
+    {!open && <div className="composer-dialog-exit-scrim" aria-hidden="true" inert />}
     <dialog ref={dialog} className={`composer-dialog ${className}`} aria-labelledby={heading}
-      onCancel={(event) => { event.preventDefault(); onClose(); }}>
+      data-presence={open ? 'open' : 'exiting'} inert={!open} aria-hidden={!open || undefined}
+      onCancel={(event) => { event.preventDefault(); if (open) onClose(); }}>
       <header className="composer-dialog-header">
-        <h2 id={heading}>{title}</h2>
-        <button type="button" className="codex-icon-btn" aria-label="关闭" onClick={onClose}><IconClose /></button>
+        <h2 id={heading}>{content.title}</h2>
+        <button type="button" className="codex-icon-btn" aria-label="关闭" onClick={open ? onClose : undefined}><IconClose /></button>
       </header>
-      {children}
+      {content.children}
     </dialog>
-  );
+  </>, document.body);
 }
 
 const SKETCH_COLORS = ['#1e293b', '#2563eb', '#0f766e', '#c2410c'];
 
-export function SketchDialog({ onClose, onAttach }: { onClose: () => void; onAttach: (image: Blob) => void }) {
+export function SketchDialog({ open, onClose, onAttach }: { open: boolean; onClose: () => void; onAttach: (image: Blob) => void }) {
+  const [wasOpen, setWasOpen] = useState(open);
+  const [revision, setRevision] = useState(0);
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    // A rapid reopen starts a fresh sketch without clearing the exiting one early.
+    if (open) setRevision((value) => value + 1);
+  }
+  return (
+    <ComposerDialog open={open} title="绘图" className="composer-sketch-dialog" onClose={onClose}>
+      <SketchPad key={revision} onAttach={onAttach} />
+    </ComposerDialog>
+  );
+}
+
+function SketchPad({ onAttach }: { onAttach: (image: Blob) => void }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const pointer = useRef<number | null>(null);
   const [color, setColor] = useState(SKETCH_COLORS[0]);
@@ -77,11 +103,11 @@ export function SketchDialog({ onClose, onAttach }: { onClose: () => void; onAtt
     context.fillStyle = '#ffffff';
     context.fillRect(0, 0, image.width, image.height);
     context.drawImage(board, 0, 0);
-    image.toBlob((blob) => { if (blob) onAttach(blob); }, 'image/png');
+    image.toBlob((blob) => { if (blob && board.closest('dialog')?.open) onAttach(blob); }, 'image/png');
   }
 
   return (
-    <ComposerDialog title="绘图" className="composer-sketch-dialog" onClose={onClose}>
+    <>
       <canvas ref={canvas} className="composer-sketch-canvas" width={1000} height={520} aria-label="草图画布"
         onPointerDown={(event) => draw(event, true)} onPointerMove={(event) => draw(event, false)}
         onPointerUp={finish} onPointerCancel={finish} onLostPointerCapture={finish} />
@@ -99,6 +125,6 @@ export function SketchDialog({ onClose, onAttach }: { onClose: () => void; onAtt
         }}>清空</button>
         <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={!hasInk} onClick={attachSketch}>添加草图</button>
       </footer>
-    </ComposerDialog>
+    </>
   );
 }

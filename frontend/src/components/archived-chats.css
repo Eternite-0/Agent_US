@@ -1,0 +1,30 @@
+.chat-archive-actions {
+  display: flex;
+  flex: none;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.chat-archive-actions .chat-archive-delete {
+  color: var(--text-secondary);
+}
+
+.chat-archive-actions .chat-archive-delete:is(:hover, :focus-visible):not(:disabled) {
+  color: var(--color-danger);
+  background: var(--color-danger-soft);
+}
+
+.chat-archive-refresh-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.chat-archive-refresh-error p {
+  margin: 0;
+}

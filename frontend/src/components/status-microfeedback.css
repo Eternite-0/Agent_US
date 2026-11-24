@@ -1,0 +1,104 @@
+/* Swap only the glyph. The transcript row, labels, and disclosure stay in normal layout. */
+.worker-status-stack {
+  display: grid;
+  place-items: center;
+  flex: none;
+  inline-size: var(--activity-icon-size);
+  block-size: var(--activity-icon-size);
+}
+
+.subagent-progress .worker-status-stack {
+  inline-size: 15px;
+  block-size: 15px;
+}
+
+.worker-status-layer {
+  grid-area: 1 / 1;
+  display: grid;
+  opacity: 0;
+  transition: opacity var(--duration-basic) var(--ease-in-out);
+}
+
+.worker-status-layer[data-current='true'] { opacity: 1; }
+
+/* Pulse on the inner glyph so it can't override the outer crossfade. Pause at its
+   current opacity when it leaves rather than snapping the departing glyph to 1. */
+.worker-status-stack .worker-status-mark:is([data-state='running'], [data-state='reconciling']) {
+  animation: codex-activity-pulse 1.4s ease-in-out infinite paused;
+}
+
+.worker-status-layer[data-current='true'] > .worker-status-mark {
+  animation-play-state: running;
+}
+
+.toast-stack-announcements {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.codex-toast-host.toast-stack {
+  gap: 0;
+  max-inline-size: calc(100% - 36px);
+}
+
+.toast-stack-slot {
+  --toast-stack-duration: var(--duration-basic);
+  display: grid;
+  grid-template-rows: 1fr;
+  margin-block-end: 8px;
+  max-inline-size: 100%;
+  transition: grid-template-rows var(--toast-stack-duration) var(--ease-out),
+              margin-block-end var(--toast-stack-duration) var(--ease-out);
+}
+
+.toast-stack-content {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  min-block-size: 0;
+  min-inline-size: 0;
+}
+
+.toast-stack .codex-toast {
+  animation: none;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity var(--toast-stack-duration) var(--ease-out),
+              transform var(--toast-stack-duration) var(--ease-out);
+}
+
+.toast-stack-message { overflow-wrap: anywhere; }
+.toast-stack .codex-toast-action { flex: none; }
+
+@starting-style {
+  .toast-stack .codex-toast {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+.toast-stack-slot[data-toast-exiting='true'] {
+  --toast-stack-duration: var(--duration-exit, 110ms);
+  grid-template-rows: 0fr;
+  margin-block-end: 0;
+}
+
+.toast-stack-slot[data-toast-exiting='true'] .toast-stack-content { overflow: clip; }
+
+.toast-stack-slot[data-toast-exiting='true'] .codex-toast {
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+}
+
+:root[data-reduced-motion='true'] :is(.worker-status-layer, .toast-stack-slot, .toast-stack .codex-toast) {
+  transition-property: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :is(.worker-status-layer, .toast-stack-slot, .toast-stack .codex-toast) { transition-property: none; }
+}

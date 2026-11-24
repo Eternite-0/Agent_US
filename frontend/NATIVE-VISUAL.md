@@ -10,7 +10,7 @@ The transcript is the content surface. Assistant prose, the work log, and file c
 | File changes | Flat list shown below the final response only after successful delivery; file names open Inspector; a separate disclosure opens the inline diff |
 | Inputs | 8 px control / 10 px composer radius; borders imply editing, not elevation |
 | Overlays | 8 px popover / 10 px dialog radius; only true overlays use `--shadow-popover` or `--shadow-dialog` |
-| Motion | 150 ms opacity transition on detail reveal; progress uses a quiet opacity pulse; reduced-motion disables both |
+| Motion | 150 ms interruptible height/opacity on explicit disclosure; progress uses a quiet opacity pulse; reduced-motion disables both |
 
 Use the semantic colors in `src/styles/tokens.css` so equivalent surfaces look consistent in light, dark, and customized themes. Shared work-log and file-list styles belong to `src/components/activity-presentation.css`; workspace layout to `src/styles/codex.css`; keyframes to `src/styles/animations.css`. Keep presentation separate from stable operation IDs and disclosure state. Successful verification stays in receipts or Reviewer, not in a transcript badge; only actionable failures or reconciliation need an inline notice.
 
@@ -40,8 +40,8 @@ This is a desktop design reference, not a phone layout. Use Apple's [Motion](htt
 | --- | --- |
 | Navigation / selected values | Low-intensity accent fill and readable text for workspace navigation, settings, Inspector, capability filters, and menu selection. |
 | Press / focus | 90 ms button feedback; 0.96 scale only for small command buttons, with color-only feedback under Reduce Motion. Keyboard focus gets a high-contrast outline. |
-| Popover / dialog | 150 ms anchored entry or 200 ms dialog entry; theme-aware opaque surfaces. No blur or heavy shadow. |
-| Content / live work | Markdown prose stays unboxed. Streamed transcript position, tool disclosure IDs, and scroll geometry are not animated. OS and in-app reduced-motion settings stop decoration and the expandable sidebar transition. |
-| Inspector | Arrow keys, Home/End, and Delete operate tabs; opening a tab from the plus menu no longer requires scrolling the tab strip. |
+| Popover / dialog | 150 ms anchored entry or 200 ms dialog entry; 110 ms quiet exit. A closing overlay stops receiving input immediately. Theme-aware opaque surfaces, no blur or heavy shadow. |
+| Content / live work | Markdown prose stays unboxed. Only user-facing disclosure bodies interpolate their height. The transcript resolves its anchor immediately at each layout change; streamed output never starts a scroll animation or a new disclosure animation. OS and in-app reduced-motion settings stop decoration and the expandable sidebar transition. |
+| Inspector | 200 ms width/opacity on drawer open and close, bypassed during resize. The active indicator follows tab selection; Arrow keys, Home/End, and Delete operate tabs. The tab menu restores focus on Escape. Unified, split and inline diffs emphasize changed text spans without modifying the line contents. |
 
 Visual regression runs the same desktop routes in both themes, including the settings, search, scheduling dialog, capability and evaluation surfaces. Fixture screenshots establish layout, not completeness of real provider data. Browser tests also cover focus restoration from model selection and reduced-motion behavior independently of the operating system.

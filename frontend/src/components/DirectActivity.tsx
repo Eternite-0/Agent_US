@@ -1,9 +1,10 @@
-import { useEffect, useId, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { directToolOutput, reasoningHeadline, type DirectTimelineBlock, type DirectToolActivity, type DirectTurnTiming } from '../utils/directMessages';
 import {
   ActivityDisclosureScope, ActivityStatusText, ActivityToolRow, activityToolKind, activityToolLabels,
   toolActionLabel, toolDisclosureId, useActivityDisclosure, useAnyExplicitActivityOpen, type ActivityStatus,
 } from './ActivityPresentation';
+import { AnimatedDetails, Collapsible } from './Collapsible';
 import { IconChevronRight, IconSparkle } from './Icons';
 
 export { ActivityDisclosureScope } from './ActivityPresentation';
@@ -77,19 +78,20 @@ export function DirectActivityGroup({ block, onInspectFile, onCopy }: {
     return <div className="codex-direct-activity-row" data-status={status} data-running={status === 'running'}>{heading}</div>;
   }
   return (
-    <details className="codex-direct-activity codex-activity-disclosure" data-status={status} data-running={status === 'running'} open={open}>
-      <summary className="codex-direct-activity-row" aria-controls={panelId} data-scroll-disclosure onClick={(event) => {
+    <AnimatedDetails className="codex-direct-activity codex-activity-disclosure" data-status={status} data-running={status === 'running'} open={open} panelId={panelId} summary={
+      <summary className="codex-direct-activity-row" aria-expanded={open} aria-controls={panelId} data-scroll-disclosure onClick={(event) => {
         event.preventDefault();
         setOpen(!open);
       }}>
         {heading}<IconChevronRight className="codex-direct-chevron" size={14} aria-hidden="true" />
       </summary>
-      <div id={panelId} className="codex-direct-tools">
+    }>
+      <div className="codex-direct-tools">
         {tools.map((row) => <ActivityToolRow key={row.id} id={row.id} name={row.name} {...presentTool(row)}
           status={row.status} {...directToolOutput(row)} liveOutput={row.liveOutput} durationMs={row.durationMs}
           defaultOpen={row.status === 'failed'} onInspectFile={onInspectFile} onCopy={onCopy} />)}
       </div>
-    </details>
+    </AnimatedDetails>
   );
 }
 
@@ -109,6 +111,8 @@ export function DirectTurnProcess(props: DirectTurnProcessProps) {
 
 function DirectProcessPanel({ activityId, active, timing, children, blocks, finalBlockId, renderBlock }: DirectTurnProcessProps) {
   const [now, setNow] = useState(Date.now);
+  const wasRunning = useRef(false);
+  useEffect(() => { if (active) wasRunning.current = true; }, [active]);
   const processId = useId();
   const hasOpenChild = useAnyExplicitActivityOpen((blocks ?? []).flatMap((block) => {
     if (block.kind !== 'activity') return [];
@@ -116,9 +120,9 @@ function DirectProcessPanel({ activityId, active, timing, children, blocks, fina
     if (!tools.length) return [];
     return [phaseDisclosureId(block.id), ...tools.flatMap(({ id }) => [phaseMemberDisclosureId(id), toolDisclosureId(id)])];
   }));
-  // Finishing a turn can change the default, but must not hide details the user opened.
-  // An explicit choice on the process itself always wins (including an explicit close).
-  const [open, setOpen] = useActivityDisclosure(`process:${activityId ?? processId}`, Boolean(active) || hasOpenChild);
+  // Do not collapse content out from under the reader on completion. History
+  // still starts compact; a user-selected open/closed state always wins.
+  const [open, setOpen] = useActivityDisclosure(`process:${activityId ?? processId}`, Boolean(active) || wasRunning.current || hasOpenChild);
   const startedAt = timing?.startedAt;
   useEffect(() => {
     if (!active || startedAt === undefined) return;
@@ -134,11 +138,10 @@ function DirectProcessPanel({ activityId, active, timing, children, blocks, fina
     : !active && !timing?.end ? '处理过程' : undefined;
   const title = <ActivityStatusText status={status} title={label} durationMs={duration} />;
   const hasProcess = blocks ? blocks.some((block) => block.id !== finalBlockId) : Boolean(children);
-  const finalVisible = blocks?.some((block) => block.id === finalBlockId);
   return (
     <>
       {(active || hasProcess || timing?.end) && (
-        <div className="codex-direct-status" data-status={status}>
+        <div className="codex-direct-status" data-status={status} data-settled={wasRunning.current && !active && !!timing?.end || undefined}>
           {hasProcess ? (
             <button className="codex-activity-disclosure" type="button" aria-expanded={open} aria-controls={processId} data-scroll-disclosure onClick={() => setOpen(!open)}>
               {title}<IconChevronRight className="codex-direct-chevron" size={14} aria-hidden="true" />
@@ -146,12 +149,12 @@ function DirectProcessPanel({ activityId, active, timing, children, blocks, fina
           ) : title}
         </div>
       )}
-      <div id={processId} className="codex-direct-process" hidden={!finalVisible && (!open || !hasProcess)}>
+      <div id={processId} className="codex-direct-process">
         {blocks ? blocks.map((block) => (
-          <div key={block.id} data-scroll-anchor={block.id} hidden={!open && block.id !== finalBlockId}>
+          <Collapsible key={block.id} anchor={block.id} open={open || block.id === finalBlockId} keepMounted>
             {renderBlock?.(block)}
-          </div>
-        )) : children}
+          </Collapsible>
+        )) : <Collapsible open={open && hasProcess} keepMounted>{children}</Collapsible>}
       </div>
     </>
   );

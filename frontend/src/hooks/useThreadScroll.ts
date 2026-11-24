@@ -1,5 +1,6 @@
 import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent } from 'react';
+import type { SavedThreadPosition } from '../utils/threadInteraction';
 
 const FOLLOW_DISTANCE = 96;
 const TAIL_EPSILON = 4;
@@ -31,11 +32,18 @@ function anchorFor(node: Element, view: HTMLElement): Anchor {
   const stableNode = node.closest('[data-scroll-anchor], [data-anchor-key]');
   const attribute = stableNode?.hasAttribute('data-scroll-anchor') ? 'data-scroll-anchor' : 'data-anchor-key';
   const key = stableNode?.getAttribute(attribute);
-  const relative = node === stableNode ? '' : node.matches('summary') ? ' > summary' : null;
+  // For prose inside a stable message, retain the paragraph offset as well as
+  // the turn ID. Never retain DOM nodes beyond the mounted transcript.
+  const path: string[] = [];
+  for (let child: Element | null = node; child && child !== stableNode && key; child = child.parentElement) {
+    const parent = child.parentElement;
+    if (!parent) break;
+    path.unshift(` > ${child.localName}:nth-child(${Array.prototype.indexOf.call(parent.children, child) + 1})`);
+  }
   return {
     node,
     offset: node.getBoundingClientRect().top - upperEdge(view),
-    selector: key && relative !== null ? `[${attribute}="${CSS.escape(key)}"]${relative}` : undefined,
+    selector: key ? `[${attribute}="${CSS.escape(key)}"]${path.join('')}` : undefined,
   };
 }
 
@@ -76,7 +84,7 @@ function readAnchor(view: HTMLElement, content: HTMLElement, turns: NodeListOf<H
  * commits or a late resize (image, font, disclosure, or composer height change).
  * No wheel/key cancellation and no animated programmatic scroll to fight input.
  */
-export function useThreadScroll(threadId: string | undefined, contentVersion: unknown) {
+export function useThreadScroll(threadId: string | undefined, contentVersion: unknown, saved: { current?: SavedThreadPosition }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const turnsRef = useRef<NodeListOf<HTMLElement> | null>(null);
@@ -90,21 +98,35 @@ export function useThreadScroll(threadId: string | undefined, contentVersion: un
     const turns = turnsRef.current;
     if (!view || !content || !turns) return;
     const position = metrics(view);
+    const anchor = following ? undefined : readAnchor(view, content, turns);
     positionRef.current = {
       top: position.top, following, disclosure,
-      anchor: following ? undefined : readAnchor(view, content, turns),
+      anchor,
+    };
+    saved.current = {
+      top: position.top, following,
+      anchor: anchor?.selector ? { selector: anchor.selector, offset: anchor.offset } : undefined,
     };
     setShowLatest(position.extent - position.top > (following ? FOLLOW_DISTANCE : TAIL_EPSILON));
     setActiveTurnIdx(turnAt(turns, upperEdge(view) + 100));
-  }, []);
+  }, [saved]);
 
   const reconcile = useCallback(() => {
     const view = viewportRef.current;
-    if (!view) return;
+    if (!view || !turnsRef.current) return;
     const before = positionRef.current;
     if (!before) {
-      view.scrollTop = view.scrollHeight;
-      record(true);
+      const remembered = saved.current;
+      const savedAnchor = remembered?.anchor;
+      const anchor = savedAnchor && view.querySelector(savedAnchor.selector);
+      if (!remembered || remembered.following) {
+        view.scrollTop = view.scrollHeight;
+      } else if (savedAnchor && anchor?.getClientRects().length) {
+        view.scrollTop += anchor.getBoundingClientRect().top - upperEdge(view) - savedAnchor.offset;
+      } else {
+        view.scrollTop = remembered.top;
+      }
+      record(remembered?.following ?? true);
       return;
     }
     const now = metrics(view);
@@ -135,7 +157,7 @@ export function useThreadScroll(threadId: string | undefined, contentVersion: un
     const after = metrics(view);
     const resumeDistance = tailTrigger ? TAIL_EPSILON : FOLLOW_DISTANCE;
     record(before.following || Boolean(before.disclosure && after.extent - after.top <= resumeDistance));
-  }, [record]);
+  }, [record, saved]);
 
   useLayoutEffect(() => {
     const view = viewportRef.current;
@@ -157,6 +179,11 @@ export function useThreadScroll(threadId: string | undefined, contentVersion: un
     };
     view.addEventListener('scroll', onScroll, { passive: true });
     return () => {
+      // A navigation click can happen before the scroll listener's RAF runs.
+      const { top, extent } = metrics(view);
+      if (positionRef.current && Math.abs(top - positionRef.current.top) > 1 && view.isConnected) {
+        record(extent - top <= FOLLOW_DISTANCE);
+      }
       view.removeEventListener('scroll', onScroll);
       observer.disconnect();
       cancelAnimationFrame(frame);

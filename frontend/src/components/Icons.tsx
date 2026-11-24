@@ -202,6 +202,22 @@ export const IconFolder: React.FC<IconProps> = ({ size = 16, ...props }) => (
   </svg>
 );
 
+export const IconSidebarFolder: React.FC<IconProps> = ({ size = 16, ...props }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor"
+    strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>
+    <path d="M2.3 12.7 1.3 4.3A1.6 1.6 0 0 1 2.9 2.5h2.6c.4 0 .7.1 1 .3l1.3 1c.3.2.6.3 1 .3h3.1c.9 0 1.7.7 1.8 1.6l.1 1" />
+    <path d="M3.2 13.5h9.1c.6 0 1.1-.4 1.3-.9l1.3-4.3c.2-.7-.3-1.6-1.1-1.6H5.4c-.6 0-1.1.4-1.3 1l-1.6 4.7c-.2.5.2 1.1.7 1.1Z" />
+  </svg>
+);
+
+export const IconHelpCircle: React.FC<IconProps> = ({ size = 16, ...props }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor"
+    strokeWidth="1.25" strokeLinecap="round" aria-hidden="true" {...props}>
+    <circle cx="8" cy="8" r="6.5" />
+    <path d="M6.45 6.35a1.55 1.55 0 1 1 2.6 1.16C8.42 8.07 8 8.32 8 9.1m0 2.15v.03" />
+  </svg>
+);
+
 export const IconLaptop: React.FC<IconProps> = ({ size = 16, ...props }) => (
   <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true" {...props}>
     <path

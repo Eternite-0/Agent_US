@@ -130,6 +130,131 @@ async function revealTool(exchange) {
   return tool;
 }
 
+test('desktop navigation restores drafts, reading anchors and disclosures during SSE', async ({ page, request }) => {
+  test.skip(baseline, 'Conversation state restoration was not present on the capture baseline');
+  await resetHistory(request, 24, true);
+  await openHistory(page, request, 24);
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.evaluate(() => {
+    const animate = Element.prototype.animate;
+    window.workspaceTransitions = 0;
+    Element.prototype.animate = function (...args) {
+      if (this.classList.contains('codex-workspace-column')) window.workspaceTransitions++;
+      return animate.apply(this, args);
+    };
+  });
+  const motionCount = () => page.evaluate(() => window.workspaceTransitions);
+  const sidebar = page.getByRole('complementary', { name: '对话历史' });
+  const reference = sidebar.getByText('Reference notes', { exact: true });
+  const prompt = 'Keep reviewing the workspace in the background';
+  await sendMessage(page, prompt);
+  const exchange = turn(page, prompt);
+  await expect(exchange).toBeVisible();
+  await advance(request, 'assistant/delta', { text: 'Background review started.' });
+  await expect(exchange.getByText('Background review started.', { exact: true })).toHaveCount(1);
+  const history = turn(page, 'Review checkpoint 22');
+  const tool = await revealTool(history);
+  await tool.click();
+  const row = history.locator('details.codex-direct-tool').first();
+  await expect(row).toHaveAttribute('open', '');
+  const diagnostic = row.getByText('Historical diagnostic 1', { exact: false });
+  await expect(diagnostic).toBeVisible();
+  await composer(page).fill('Unsaved transcript follow-up');
+  await page.locator('.codex-composer-card input[type="file"]').setInputFiles({
+    name: 'review-notes.txt', mimeType: 'text/plain', buffer: Buffer.from('private draft attachment'),
+  });
+  const attachment = page.locator('.codex-composer-attachments').getByText('review-notes.txt', { exact: true });
+  await expect(attachment).toBeVisible();
+  const anchor = history.locator('details.codex-direct-tool > summary').first();
+  await transcript(page).evaluate((view) => {
+    const tool = view.querySelector('details.codex-direct-tool[open] > summary');
+    view.scrollTop += tool.getBoundingClientRect().top - view.getBoundingClientRect().top - 28;
+  });
+  await expect.poll(async () => (await geometry(page)).gap).toBeGreaterThan(300);
+  const offset = await offsetInViewport(anchor);
+
+  await reference.click();
+  await expect(page).toHaveURL(/#\/t\/reference$/);
+  await expect(composer(page)).toHaveValue('');
+  await expect(attachment).toHaveCount(0);
+  await composer(page).fill('Separate reference draft');
+  expect(await motionCount()).toBe(1);
+  const referenceTranscript = await transcript(page).elementHandle();
+  await advance(request, 'assistant/delta', { text: '\n\n' + longDelta('Background review') });
+  await expect(composer(page)).toHaveValue('Separate reference draft');
+  expect(await referenceTranscript.evaluate((node) => node.isConnected)).toBe(true);
+  expect(await motionCount()).toBe(1);
+
+  await page.getByRole('button', { name: '返回', exact: true }).click();
+  await expect(page).toHaveURL(/#\/t\/transcript$/);
+  await expect(composer(page)).toHaveValue('Unsaved transcript follow-up');
+  await expect(attachment).toBeVisible();
+  await expect(row).toHaveAttribute('open', '');
+  await expect(exchange.getByText('Background review 20.', { exact: true })).toHaveCount(1);
+  await stableAnchor(anchor, offset, 8);
+  expect(await motionCount()).toBe(2);
+
+  const settledTranscript = await transcript(page).elementHandle();
+  const openCommand = await row.elementHandle();
+  await advance(request, 'finish', { text: finalText });
+  await expect(exchange.getByText(finalText, { exact: true })).toHaveCount(1);
+  await expect(exchange.locator('.codex-direct-status')).toHaveAttribute('data-status', 'completed');
+  await stableAnchor(anchor, offset, 8);
+  expect(await settledTranscript.evaluate((node) => node.isConnected)).toBe(true);
+  expect(await openCommand.evaluate((node) => node.isConnected && node.open)).toBe(true);
+  expect(await motionCount()).toBe(2);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.getByRole('button', { name: '前进', exact: true }).click();
+  await expect(composer(page)).toHaveValue('Separate reference draft');
+  expect(await motionCount()).toBe(2);
+  await page.getByRole('button', { name: '返回', exact: true }).click();
+  await expect(composer(page)).toHaveValue('Unsaved transcript follow-up');
+  await stableAnchor(anchor, offset, 8);
+});
+
+test('a follow-up accepted after switching threads clears only the sent draft', async ({ page, request }) => {
+  test.skip(baseline, 'Conversation state restoration was not present on the capture baseline');
+  await openHistory(page, request);
+  const accepted = Promise.withResolvers();
+  const releaseResponse = Promise.withResolvers();
+  let submissions = 0;
+  await page.route('**/v1/sessions/transcript/turns', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    submissions++;
+    const response = await route.fetch();
+    accepted.resolve(response.ok());
+    await releaseResponse.promise;
+    await route.fulfill({ response });
+  });
+  const sidebar = page.getByRole('complementary', { name: '对话历史' });
+  const send = page.getByRole('button', { name: '发送消息', exact: true });
+  const prompt = 'Accept this follow-up without keeping a duplicate draft';
+  try {
+    await composer(page).fill(prompt);
+    await send.click();
+    expect(await accepted.promise).toBe(true);
+    await sidebar.getByText('Reference notes', { exact: true }).click();
+    await expect(composer(page)).toHaveValue('');
+    await composer(page).fill('A draft in the other thread');
+    await expect(send).toBeEnabled();
+    const response = page.waitForResponse((r) => r.request().method() === 'POST'
+      && new URL(r.url()).pathname === '/v1/sessions/transcript/turns');
+    releaseResponse.resolve();
+    expect((await response).ok()).toBe(true);
+    await expect(composer(page)).toHaveValue('A draft in the other thread');
+
+    await page.getByRole('button', { name: '返回', exact: true }).click();
+    await expect(turn(page, prompt)).toHaveCount(1);
+    await expect(composer(page)).toHaveValue('');
+    expect(submissions).toBe(1);
+    await page.getByRole('button', { name: '前进', exact: true }).click();
+    await expect(composer(page)).toHaveValue('A draft in the other thread');
+  } finally {
+    releaseResponse.resolve();
+  }
+});
+
 test('B — keyboard navigation and disclosure anchoring in 24 historical turns', async ({ page, request }) => {
   await resetHistory(request, 24, true);
   await openHistory(page, request, 24);
@@ -222,6 +347,52 @@ async function held(request, label) {
 }
 async function release(request, label) {
   expect((await request.post('/__e2e/release', { data: { label } })).ok()).toBe(true);
+}
+
+for (const legacy of [false, true]) {
+  test(`D — final reply stays mounted while history is delayed (${legacy ? 'older backend' : 'cursor handoff'})`, async ({ page, request }) => {
+    test.skip(baseline, 'Completion handoff is a new regression assertion');
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    const prompt = 'Keep the transcript mounted as the response finishes';
+    await begin(page, request, prompt);
+    const exchange = turn(page, prompt);
+    const reply = exchange.locator('.codex-direct-prose');
+    const streamed = 'The streamed answer never leaves the transcript.';
+    await advance(request, 'assistant/delta', { text: streamed });
+    await expect(reply).toHaveText(streamed);
+    await expect(reply).toHaveCSS('animation-name', 'codex-content-reveal');
+    await composer(page).focus();
+    await composer(page).fill('Draft to keep while the response finishes');
+    const original = await reply.elementHandle();
+    const transcriptNode = await transcript(page).elementHandle();
+    const composerNode = await composer(page).elementHandle();
+    let navigations = 0;
+    page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) navigations++; });
+
+    // Force the end event, including finalized text that differs from the
+    // last delta, to reach the browser before the history request can return.
+    const label = 'completion-history';
+    await gate(request, label, 200);
+    await advance(request, 'finish', { text: finalText, legacy });
+    await held(request, label);
+    await expect(reply).toHaveText(finalText);
+    await expect(reply.locator('.a2a-stream-cursor')).toHaveCount(0);
+    await expect(exchange.locator('.codex-direct-status')).toHaveAttribute('data-status', 'completed');
+    expect(await original.evaluate((node) => node.isConnected && !node.closest('[hidden]'))).toBe(true);
+    expect(await transcriptNode.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await composerNode.evaluate((node) => node === document.activeElement)).toBe(true);
+    await expect(composer(page)).toHaveValue('Draft to keep while the response finishes');
+
+    const response = page.waitForResponse((res) => messagesPath(res, 200));
+    await release(request, label);
+    await (await response).finished();
+    await expect(reply).toHaveCount(1);
+    await expect(reply).toHaveText(finalText);
+    expect(await original.evaluate((node) => node.isConnected)).toBe(true);
+    expect(navigations).toBe(0);
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await expect(reply).toHaveCSS('animation-name', 'none');
+  });
 }
 
 test('D — SSE bursts cannot let delayed or failed old REST overwrite a fresh session', async ({ page, request }) => {

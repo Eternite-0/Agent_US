@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   IconCheck,
   IconChevronDown,
@@ -8,7 +9,6 @@ import {
   IconRefresh,
   IconSearch,
   IconSettingsGear,
-  IconSkillsNode,
 } from './Icons';
 
 export type PluginCategoryId =
@@ -618,24 +618,6 @@ export const INITIAL_SKILLS: MarketplaceSkill[] = [
 ];
 
 /** Subtle small workspace/directory outline badge shown right next to plugin names (Screenshots 2 & 3) */
-const PluginMetaIcon: React.FC = () => (
-  <svg
-    width="12"
-    height="12"
-    viewBox="0 0 16 16"
-    fill="none"
-    aria-hidden="true"
-    style={{ color: 'var(--text-tertiary)', opacity: 0.72, flex: 'none' }}
-  >
-    <path
-      d="M2.4 4.2c0-.7.6-1.3 1.3-1.3h2.6l1.2 1.3h4.8c.7 0 1.3.6 1.3 1.3v6.2c0 .7-.6 1.3-1.3 1.3H3.7c-.7 0-1.3-.6-1.3-1.3V4.2z"
-      stroke="currentColor"
-      strokeWidth="1.25"
-      strokeLinejoin="round"
-    />
-  </svg>
-);
-
 /** Crisp colorful 3D cube skill badge matching Screenshot 1 */
 const SkillCubeIcon: React.FC<{ hue: [string, string, string]; size?: number }> = ({
   hue,
@@ -648,7 +630,19 @@ const SkillCubeIcon: React.FC<{ hue: [string, string, string]; size?: number }> 
   </svg>
 );
 
-/** Bespoke brand glyphs for every plugin in User Screenshots 2 & 3 */
+const PLUGIN_CATEGORY_GLYPHS: Record<PluginCategoryId, string> = {
+  Communication: 'M6 19.5v-3H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-8l-5 3ZM7.5 11h9',
+  Creativity: 'M19 5a2.1 2.1 0 0 1 0 3l-7 7-3-3 7-7a2.1 2.1 0 0 1 3 0ZM9 12c-2.3 0-3.5 1.4-3.5 3.5 0 1.5-.6 2.5-1.5 3 4.4 1.5 8-1 8-3.5',
+  'Data & Analytics': 'M4.5 5v13.5h15M8.5 14v-3m4 3V8m4 6V5.5',
+  'Developer Tools': 'M7.5 8 3.5 12l4 4m9-8 4 4-4 4m-3-10-3 12',
+  'Education & Research': 'M12 6.5C9.5 4.5 6 4.5 3.5 5.5v12c2.5-1 6-1 8.5 1 2.5-2 6-2 8.5-1v-12c-2.5-1-6-1-8.5 1ZM12 6.5v12',
+  Finance: 'M4 9h16M5 6h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Zm2 8h4',
+  Productivity: 'M9 6H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-3M9 4h6v4H9zM8.5 14l2 2 4.5-4.5',
+  'Scientific Research': 'M9.5 4.5h5m-4 0v5l-4.7 7.8a1.3 1.3 0 0 0 1.1 2h10.2a1.3 1.3 0 0 0 1.1-2l-4.7-7.8v-5M8.2 14.5h7.6',
+  Security: 'M12 3.5 19 6v5.5c0 4-2.8 7.2-7 8.8-4.2-1.6-7-4.8-7-8.8V6l7-2.5ZM9.3 12l1.8 1.8 3.6-3.6',
+};
+
+/** Vector marks used when bundled or official artwork cannot be loaded. */
 const PluginBrandIcon: React.FC<{ plugin: MarketplacePlugin; size?: number }> = ({
   plugin,
   size = 20,
@@ -685,12 +679,6 @@ const PluginBrandIcon: React.FC<{ plugin: MarketplacePlugin; size?: number }> = 
           <path d="M9.5 14.5H12v2.75a2.75 2.75 0 11-2.5-2.75z" fill="#0ACF83" />
         </svg>
       );
-    case 'canva':
-      return (
-        <span style={{ fontSize: Math.round(size * 0.78), fontWeight: 700, fontStyle: 'italic', fontFamily: 'Georgia, serif' }}>
-          C
-        </span>
-      );
     case 'product-design':
       return (
         <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -698,18 +686,6 @@ const PluginBrandIcon: React.FC<{ plugin: MarketplacePlugin; size?: number }> = 
           <circle cx="16" cy="8" r="2.2" stroke="currentColor" strokeWidth="1.7" />
           <circle cx="12" cy="16.2" r="2.2" stroke="currentColor" strokeWidth="1.7" />
           <path d="M10.2 8h3.6M9.2 10l1.8 4.2M14.8 10L13 14.2" stroke="currentColor" strokeWidth="1.5" />
-        </svg>
-      );
-    case 'higgsfield':
-      return (
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M6.5 5.5v13M17.5 5.5v13M6.5 12h11" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
-        </svg>
-      );
-    case 'mixpanel':
-      return (
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M6.5 6.5l11 11M17.5 6.5l-11 11" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
         </svg>
       );
     case 'posthog':
@@ -774,24 +750,12 @@ const PluginBrandIcon: React.FC<{ plugin: MarketplacePlugin; size?: number }> = 
           <path d="M9.2 14.6c1 .9 4.6.9 5.6 0" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
         </svg>
       );
-    case 'latex':
-      return (
-        <span style={{ fontSize: Math.round(size * 0.48), fontWeight: 700, fontFamily: 'Georgia, serif', letterSpacing: '-0.04em' }}>
-          LaTeX
-        </span>
-      );
     case 'life-science':
       return (
         <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M9.5 4.5h5M10.5 4.5v4.8L5.8 17c-.6 1 .1 2.2 1.2 2.2h10c1.1 0 1.8-1.2 1.2-2.2l-4.7-7.7V4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
           <path d="M7.6 14.5h8.8" stroke="currentColor" strokeWidth="1.5" />
         </svg>
-      );
-    case 'zotero':
-      return (
-        <span style={{ fontSize: Math.round(size * 0.8), fontWeight: 800, fontFamily: 'Georgia, serif' }}>
-          Z
-        </span>
       );
     case 'life-science-ngs':
       return (
@@ -804,12 +768,6 @@ const PluginBrandIcon: React.FC<{ plugin: MarketplacePlugin; size?: number }> = 
         <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M12 4.2l2.3 5.2 5.6.5-4.3 3.7 1.3 5.5L12 16.2l-4.9 2.9 1.3-5.5-4.3-3.7 5.6-.5L12 4.2z" />
         </svg>
-      );
-    case 'stripe':
-      return (
-        <span style={{ fontSize: Math.round(size * 0.82), fontWeight: 800, letterSpacing: '-0.03em' }}>
-          S
-        </span>
       );
     case 'linear':
       return (
@@ -856,12 +814,6 @@ const PluginBrandIcon: React.FC<{ plugin: MarketplacePlugin; size?: number }> = 
           <circle cx="17.6" cy="15.2" r="2.1" fill="#00ca72" />
         </svg>
       );
-    case 'boltz':
-      return (
-        <span style={{ fontSize: Math.round(size * 0.8), fontWeight: 800, letterSpacing: '-0.04em' }}>
-          B
-        </span>
-      );
     case 'codex-security':
       return (
         <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -869,13 +821,14 @@ const PluginBrandIcon: React.FC<{ plugin: MarketplacePlugin; size?: number }> = 
           <path d="M9.2 12.2l1.9 1.9 3.8-4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       );
-    default:
-      return (
-        <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: '-0.02em' }}>
-          {plugin.name.slice(0, 2).toUpperCase()}
-        </span>
-      );
   }
+
+  const glyph = PLUGIN_CATEGORY_GLYPHS[plugin.category];
+  return glyph ? (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d={glyph} stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ) : <IconPuzzle size={size} />;
 };
 
 interface LocalPluginLogoSpec {
@@ -908,6 +861,7 @@ const PLUGIN_LOGO_SPECS: Record<string, LocalPluginLogoSpec> = {
   'office-documents': { light: '/plugin-logos/office-documents.svg', fit: 'contain' },
   'office-pdf': { light: '/plugin-logos/office-pdf.svg', fit: 'contain' },
   'office-spreadsheets': { light: '/plugin-logos/office-spreadsheets.svg', fit: 'contain' },
+  'office-presentations': { light: '/plugin-logos/office-presentations.svg', fit: 'contain' },
   slack: { light: '/plugin-logos/slack.png', fit: 'contain', bgLight: '#1c1c20', bgDark: '#1c1c20' },
   gmail: { light: '/plugin-logos/gmail.png', fit: 'contain', bgLight: '#ffffff', bgDark: '#1c1c20' },
   remotion: {
@@ -1193,7 +1147,9 @@ const PluginTileGraphic: React.FC<{
 };
 
 interface CapabilitiesViewProps {
-  initialTab?: 'plugins' | 'skills';
+  toolbarHost: HTMLElement | null;
+  activeTab: 'plugins' | 'skills';
+  onChangeTab: (tab: 'plugins' | 'skills') => void;
   initialPluginId?: string;
   theme: 'light' | 'dark';
   catalogSource: LocalCatalogSourceInfo | null;
@@ -1219,7 +1175,9 @@ interface CapabilitiesViewProps {
 }
 
 export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
-  initialTab = 'plugins',
+  toolbarHost,
+  activeTab,
+  onChangeTab,
   initialPluginId,
   theme,
   catalogSource,
@@ -1243,10 +1201,9 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
   onOpenSettings,
   onToast,
 }) => {
-  const [activeTab, setActiveTab] = useState<'plugins' | 'skills'>(initialTab);
   const [search, setSearch] = useState('');
-  const [navSearchOpen, setNavSearchOpen] = useState(false);
-  const [pluginScope, setPluginScope] = useState<'public' | 'creativity' | 'installed'>('public');
+  const [pluginScope, setPluginScope] = useState<'public' | 'installed'>('public');
+  const [category, setCategory] = useState<PluginCategoryId | ''>('');
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>({});
   const [skillScope, setSkillScope] = useState<'personal' | 'system' | 'recommended'>('personal');
   const [showAllInstalledSkills, setShowAllInstalledSkills] = useState(false);
@@ -1259,7 +1216,8 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
   const [selectedPlugin, setSelectedPlugin] = useState<MarketplacePlugin | null>(null);
   const openedPlugin = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (!initialPluginId || openedPlugin.current === initialPluginId) return;
+    if (!initialPluginId) { openedPlugin.current = undefined; return; }
+    if (openedPlugin.current === initialPluginId) return;
     const plugin = plugins.find(({ id }) => id === initialPluginId);
     if (!plugin) return;
     openedPlugin.current = initialPluginId;
@@ -1291,6 +1249,7 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
   const [newSkillInstructions, setNewSkillInstructions] = useState('');
 
   const addMenuRef = useRef<HTMLDivElement>(null);
+  const createTrigger = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!addMenuOpen) return;
@@ -1299,35 +1258,38 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
         setAddMenuOpen(false);
       }
     };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setAddMenuOpen(false);
+      if (addMenuRef.current?.contains(document.activeElement)) createTrigger.current?.focus();
+    };
     document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
   }, [addMenuOpen]);
 
   useEffect(() => {
     if (activeTab !== 'plugins') return;
-    const t = window.setTimeout(() => {
-      onSearchRemotePlugins(search.trim());
-    }, 180);
-    return () => window.clearTimeout(t);
-  }, [activeTab, search, onSearchRemotePlugins]);
+    const query = pluginScope === 'public' ? search.trim() : '';
+    if (!query) return;
+    const timer = window.setTimeout(() => onSearchRemotePlugins(query), 180);
+    return () => {
+      window.clearTimeout(timer);
+      onSearchRemotePlugins('');
+    };
+  }, [activeTab, search, pluginScope, onSearchRemotePlugins]);
 
   const installedPluginSet = useMemo(() => new Set(installedPluginIds), [installedPluginIds]);
-  const installedPlugins = useMemo(
-    () => plugins.filter((p) => installedPluginSet.has(p.id)),
-    [plugins, installedPluginSet],
-  );
-
-  const creativityCount = useMemo(
-    () => plugins.filter((p) => p.category === 'Creativity').length,
-    [plugins],
-  );
 
   const groupedPlugins = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const sourcePool = q && remoteSearchResults ? remoteSearchResults : plugins;
+    const sourcePool = q && pluginScope === 'public' && remoteSearchResults ? remoteSearchResults : plugins;
     const pool = sourcePool.filter((p) => {
       if (pluginScope === 'installed' && !installedPluginSet.has(p.id)) return false;
-      if (pluginScope === 'creativity' && p.category !== 'Creativity') return false;
+      if (category && p.category !== category) return false;
       if (!q) return true;
       return (
         p.name.toLowerCase().includes(q) ||
@@ -1338,12 +1300,12 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
     });
 
     const groups: Array<{ category: PluginCategoryId; items: MarketplacePlugin[] }> = [];
-    for (const cat of PLUGIN_CATEGORY_ORDER) {
+    for (const cat of ['Productivity', 'Creativity', ...PLUGIN_CATEGORY_ORDER.filter((id) => id !== 'Productivity' && id !== 'Creativity')] as const) {
       const items = pool.filter((p) => p.category === cat);
       if (items.length > 0) groups.push({ category: cat, items });
     }
     return groups;
-  }, [plugins, remoteSearchResults, pluginScope, installedPluginSet, search]);
+  }, [plugins, remoteSearchResults, pluginScope, installedPluginSet, search, category]);
 
   const installedSkills = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -1494,240 +1456,47 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
   };
 
   return (
-    <div className="codex-settings">
-      {/* Left 252px Chrome Navigation (Exact Screenshots 1, 2, 3) */}
-      <aside className="codex-settings-nav" aria-label="自定义导航">
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '4px 8px 10px',
-          }}
-        >
-          <span style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-default)' }}>自定义</span>
-          <button
-            type="button"
-            className="codex-icon-btn"
-            style={{ width: 26, height: 26 }}
-            title="搜索插件或技能"
-            aria-label="搜索插件或技能"
-            onClick={() => setNavSearchOpen((v) => !v)}
-          >
-            <IconSearch size={15} />
-          </button>
-        </div>
-
-        {navSearchOpen && (
-          <div className="codex-settings-search" style={{ marginBottom: 8 }}>
-            <IconSearch size={13} />
-            <input
-              autoFocus
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={activeTab === 'plugins' ? '筛选插件…' : '筛选技能…'}
-            />
-          </div>
-        )}
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          <button
-            type="button"
-            className="codex-sidebar-row"
-            data-selected={activeTab === 'plugins' ? 'true' : undefined}
-            onClick={() => setActiveTab('plugins')}
-          >
-            <IconPuzzle size={15} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
-            <span className="codex-sidebar-row-text">插件</span>
-          </button>
-
-          <button
-            type="button"
-            className="codex-sidebar-row"
-            data-selected={activeTab === 'skills' ? 'true' : undefined}
-            onClick={() => setActiveTab('skills')}
-          >
-            <IconSkillsNode size={15} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
-            <span className="codex-sidebar-row-text">技能</span>
-          </button>
-        </div>
-
-        <div className="codex-section-header" style={{ paddingTop: 18 }}>
-          <span className="codex-section-toggle" style={{ cursor: 'default' }}>
-            已安装
-          </span>
-          {installedPlugins.length > 0 && (
-            <span className="tabular-nums" style={{ fontSize: 11.5, color: 'var(--text-tertiary)' }}>
-              {installedPlugins.length}
-            </span>
-          )}
-        </div>
-
-        <div className="codex-sidebar-scroll" style={{ paddingTop: 2 }}>
-          {installedPlugins.length === 0 ? (
-            <div style={{ padding: '4px 10px', fontSize: 12.5, color: 'var(--text-tertiary)' }}>
-              未安装任何插件
-            </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-              {installedPlugins.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  className="codex-sidebar-row"
-                  onClick={() => openPluginModal(p)}
-                >
-                  <span
-                    style={getPluginTileStyle(p, theme, {
-                      width: 18,
-                      height: 18,
-                      borderRadius: resolvePluginLogoSpec(p)?.circular ? 9999 : 5,
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      flex: 'none',
-                    })}
-                  >
-                    <PluginTileGraphic plugin={p} theme={theme} size={11} />
-                  </span>
-                  <span className="codex-sidebar-row-text">{p.name}</span>
-                  <span className="codex-status-dot" data-tone="live" title="已启用" />
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      </aside>
-
-      {/* Right Rounded Surface Card */}
-      <section className="codex-settings-body">
-        <div className="codex-custom-inner">
-          {/* Header Row (Exact Screenshots 1 & 2) */}
-          <div className="codex-custom-topbar">
-            <div>
-              <h1 className="codex-custom-title">
-                {activeTab === 'plugins' ? '插件' : '技能'}
-              </h1>
-              <p className="codex-custom-sub">
-                {activeTab === 'plugins'
-                  ? '连接插件，让 Codex 在你的各类工具中协同工作'
-                  : '通过任务专用技能扩展 Codex'}
-              </p>
-            </div>
-
-            <div className="codex-custom-actions">
-              <div className="codex-custom-search">
-                <IconSearch size={14} style={{ flex: 'none' }} />
-                <input
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder={activeTab === 'plugins' ? '搜索插件' : '搜索技能'}
-                />
-                {search && (
-                  <button
-                    type="button"
-                    className="codex-icon-btn"
-                    style={{ width: 18, height: 18 }}
-                    onClick={() => setSearch('')}
-                  >
-                    <IconClose size={11} />
-                  </button>
-                )}
-              </div>
-
-              <button
-                type="button"
-                className="codex-icon-btn"
-                title="刷新目录"
-                aria-label="刷新"
-                onClick={handleRefresh}
-              >
-                <IconRefresh
-                  size={15}
-                  style={{
-                    transition: 'transform 0.35s ease',
-                    transform: refreshing ? 'rotate(360deg)' : 'none',
-                  }}
-                />
+    <div className="codex-library-page">
+      {toolbarHost && createPortal(
+        <div className="codex-library-toolbar">
+          <nav className="codex-custom-pill-tabs" aria-label="插件与技能">
+            {(['plugins', 'skills'] as const).map((tab) => (
+              <button key={tab} type="button" className="codex-custom-pill"
+                data-active={activeTab === tab || undefined} aria-current={activeTab === tab ? 'page' : undefined}
+                onClick={() => { if (activeTab !== tab) { setSearch(''); setAddMenuOpen(false); onChangeTab(tab); } }}>
+                {tab === 'plugins' ? '插件' : '技能'}
               </button>
+            ))}
+          </nav>
+          <div className="codex-library-actions">
+            <button
+              type="button"
+              className="codex-icon-btn"
+              title="刷新目录"
+              aria-label="刷新"
+              onClick={handleRefresh}
+            >
+              <IconRefresh
+                size={15}
+                style={{
+                  transition: 'transform 0.35s ease',
+                  transform: refreshing ? 'rotate(360deg)' : 'none',
+                }}
+              />
+            </button>
 
-              <button
-                type="button"
-                className="codex-icon-btn"
-                title="模型与连接设置"
-                aria-label="打开设置"
-                onClick={() => onOpenSettings('providers')}
-              >
-                <IconSettingsGear size={15} />
-              </button>
+            <button
+              type="button"
+              className="codex-icon-btn"
+              title="模型与连接设置"
+              aria-label="打开设置"
+              onClick={() => onOpenSettings('providers')}
+            >
+              <IconSettingsGear size={15} />
+            </button>
 
-              {activeTab === 'plugins' ? (
-                <div style={{ position: 'relative' }} ref={addMenuRef}>
-                  <button
-                    type="button"
-                    className="codex-toolbar-btn"
-                    data-variant="primary"
-                    style={{
-                      borderRadius: 9999,
-                      height: 30,
-                      padding: '0 12px 0 14px',
-                      fontSize: 12.5,
-                      fontWeight: 500,
-                      gap: 4,
-                    }}
-                    onClick={() => setAddMenuOpen((v) => !v)}
-                  >
-                    <span>添加</span>
-                    <IconChevronDown size={13} />
-                  </button>
-                  {addMenuOpen && (
-                    <div className="codex-popover" data-side="bottom" style={{ right: 0, width: 224 }}>
-                      <button
-                        type="button"
-                        className="codex-popover-item"
-                        onClick={() => {
-                          setAddMenuOpen(false);
-                          setAddModalMode('github');
-                        }}
-                      >
-                        <span>从 GitHub 仓库安装插件</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="codex-popover-item"
-                        onClick={() => {
-                          setAddMenuOpen(false);
-                          setAddModalMode('plugin');
-                        }}
-                      >
-                        <span>添加自定义 MCP 插件</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="codex-popover-item"
-                        onClick={() => {
-                          setAddMenuOpen(false);
-                          setAddModalMode('json');
-                        }}
-                      >
-                        <span>从 mcpServers JSON 导入</span>
-                      </button>
-                      <div className="codex-popover-divider" />
-                      <button
-                        type="button"
-                        className="codex-popover-item"
-                        onClick={() => {
-                          setAddMenuOpen(false);
-                          setActiveTab('skills');
-                          setAddModalMode('skill');
-                        }}
-                      >
-                        <span>创建新技能 (SKILL.md)</span>
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ) : (
+            {activeTab === 'plugins' ? (
+              <div style={{ position: 'relative' }} ref={addMenuRef}>
                 <button
                   type="button"
                   className="codex-toolbar-btn"
@@ -1735,160 +1504,160 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
                   style={{
                     borderRadius: 9999,
                     height: 30,
-                    padding: '0 14px',
+                    padding: '0 12px 0 14px',
                     fontSize: 12.5,
                     fontWeight: 500,
+                    gap: 4,
                   }}
-                  onClick={() => setAddModalMode('skill')}
+                  ref={createTrigger}
+                  aria-expanded={addMenuOpen}
+                  onClick={() => setAddMenuOpen((v) => !v)}
                 >
-                  添加
+                  <span>创建</span>
+                  <IconChevronDown size={13} />
                 </button>
-              )}
-            </div>
+                {addMenuOpen && (
+                  <div className="codex-popover" data-side="bottom" style={{ right: 0, width: 224 }}>
+                    <button
+                      type="button"
+                      className="codex-popover-item"
+                      onClick={() => {
+                        setAddMenuOpen(false);
+                        setAddModalMode('github');
+                      }}
+                    >
+                      <span>从 GitHub 仓库安装插件</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="codex-popover-item"
+                      onClick={() => {
+                        setAddMenuOpen(false);
+                        setAddModalMode('plugin');
+                      }}
+                    >
+                      <span>添加自定义 MCP 插件</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="codex-popover-item"
+                      onClick={() => {
+                        setAddMenuOpen(false);
+                        setAddModalMode('json');
+                      }}
+                    >
+                      <span>从 mcpServers JSON 导入</span>
+                    </button>
+                    <div className="codex-popover-divider" />
+                    <button
+                      type="button"
+                      className="codex-popover-item"
+                      onClick={() => {
+                        setAddMenuOpen(false);
+                        onChangeTab('skills');
+                        setAddModalMode('skill');
+                      }}
+                    >
+                      <span>创建新技能 (SKILL.md)</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="codex-toolbar-btn"
+                data-variant="primary"
+                style={{
+                  borderRadius: 9999,
+                  height: 30,
+                  padding: '0 14px',
+                  fontSize: 12.5,
+                  fontWeight: 500,
+                }}
+                onClick={() => setAddModalMode('skill')}
+              >
+                创建
+              </button>
+            )}
           </div>
+        </div>, toolbarHost)}
+      <section className="codex-library-scroll" aria-labelledby="capabilities-heading">
+        <div className="codex-custom-inner">
+          <header key={activeTab} className="codex-library-heading codex-library-detail-enter">
+            <h1 id="capabilities-heading">{activeTab === 'plugins' ? '插件' : '技能'}</h1>
+            <p>{activeTab === 'plugins' ? '在你常用的工具中与 Agent_US 协作' : '通过任务专用技能扩展 Agent_US'}</p>
+          </header>
+          <label className="codex-library-search">
+            <IconSearch size={16} />
+            <input type="search" aria-label={activeTab === 'plugins' ? '搜索插件' : '搜索技能'}
+              value={search} onChange={(e) => setSearch(e.target.value)}
+              placeholder={activeTab === 'plugins' ? '搜索插件' : '搜索技能'} />
+          </label>
 
           {activeTab === 'plugins' ? (
             /* ============================================================
              * PLUGINS MARKETPLACE TAB (Real Codex Catalog + Creativity!)
              * ========================================================== */
             <>
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                  flexWrap: 'wrap',
-                }}
-              >
-                <div className="codex-custom-pill-tabs">
-                  <button
-                    type="button"
-                    className="codex-custom-pill"
-                    data-active={pluginScope === 'public' ? 'true' : undefined}
-                    onClick={() => setPluginScope('public')}
-                  >
-                    公开
-                  </button>
-                  <button
-                    type="button"
-                    className="codex-custom-pill"
-                    data-active={pluginScope === 'creativity' ? 'true' : undefined}
-                    onClick={() => setPluginScope('creativity')}
-                  >
-                    Creativity ({creativityCount})
-                  </button>
-                  {installedPlugins.length > 0 && (
-                    <button
-                      type="button"
-                      className="codex-custom-pill"
-                      data-active={pluginScope === 'installed' ? 'true' : undefined}
-                      onClick={() => setPluginScope('installed')}
-                    >
-                      已安装 ({installedPlugins.length})
-                    </button>
-                  )}
+              <div className="codex-library-filters">
+                <div className="codex-custom-pill-tabs" role="group" aria-label="插件范围">
+                  <button type="button" className="codex-custom-pill" aria-pressed={pluginScope === 'public'}
+                    data-active={pluginScope === 'public' || undefined} onClick={() => setPluginScope('public')}>公开</button>
+                  <button type="button" className="codex-custom-pill" aria-pressed={pluginScope === 'installed'}
+                    data-active={pluginScope === 'installed' || undefined} onClick={() => setPluginScope('installed')}>个人</button>
                 </div>
-
-                {catalogSource?.available && (
-                  <span style={{ fontSize: 11.5, color: 'var(--text-tertiary)' }} className="tabular-nums">
-                    独立插件与技能中心 · GitHub / MCP 开放源（无需本机安装 Codex）
-                  </span>
-                )}
+                <select className="codex-library-category" aria-label="筛选插件分类" value={category}
+                  onChange={(e) => setCategory(e.target.value as PluginCategoryId | '')}>
+                  <option value="">所有分类</option>
+                  {PLUGIN_CATEGORY_ORDER.map((item) => <option key={item} value={item}>{item}</option>)}
+                </select>
               </div>
 
-              {remoteSearching && search.trim() ? (
+              {pluginScope === 'public' && remoteSearching && search.trim() ? (
                 <div style={{ padding: '18px 0', fontSize: 12.5, color: 'var(--text-tertiary)' }}>
                   正在检索 Codex 插件目录…
                 </div>
               ) : groupedPlugins.length === 0 ? (
                 <div style={{ padding: '28px 0', textAlign: 'center', fontSize: 13, color: 'var(--text-tertiary)' }}>
-                  没有匹配的插件，点击右上角「添加 ⌄」可接入自定义 MCP 服务。
+                  {pluginScope === 'installed' && !search && !category ? '尚未安装插件。可在「公开」中浏览，或通过「创建」添加。' : '没有匹配的插件。'}
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
                   {groupedPlugins.map((group) => {
                     const isExpanded =
                       Boolean(expandedCategories[group.category]) ||
-                      pluginScope === 'creativity' ||
+                      Boolean(category) ||
                       Boolean(search.trim());
-                    const limit = group.category === 'Creativity' ? 6 : 8;
+                    const limit = 6;
                     const visibleItems = isExpanded ? group.items : group.items.slice(0, limit);
                     const moreCount = Math.max(0, group.items.length - visibleItems.length);
                     return (
-                      <div key={group.category} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                        <div
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            gap: 8,
-                          }}
-                        >
-                          <div className="codex-custom-cat-heading">{group.category}</div>
-                          {moreCount > 0 && (
-                            <button
-                              type="button"
-                              style={{ fontSize: 12, color: 'var(--text-tertiary)' }}
-                              onClick={() =>
-                                setExpandedCategories((prev) => ({
-                                  ...prev,
-                                  [group.category]: true,
-                                }))
-                              }
-                            >
-                              查看全部 {group.items.length} 项 →
-                            </button>
-                          )}
-                        </div>
+                      <section key={group.category} className="codex-library-group" aria-label={group.category}>
+                        <h2 className="codex-custom-cat-heading">{group.category}</h2>
                         <div className="codex-custom-grid">
                           {visibleItems.map((p) => {
                             const isInstalled = installedPluginSet.has(p.id);
                             const isBusy = installingId === p.id;
                             return (
-                              <div
-                                key={p.id}
-                                role="button"
-                                tabIndex={0}
-                                className="codex-custom-card"
-                                onClick={() => openPluginModal(p)}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') openPluginModal(p);
-                                }}
-                              >
-                                <div className="codex-custom-card-left">
-                                  <span
-                                    className="codex-custom-icon-tile"
-                                    style={getPluginTileStyle(p, theme)}
-                                  >
-                                    <PluginTileGraphic plugin={p} theme={theme} size={19} />
+                              <div key={p.id} className="codex-custom-card codex-plugin-row">
+                                <button type="button" className="codex-custom-card-left codex-plugin-detail"
+                                  aria-label={`查看 ${p.name} 插件详情`} onClick={() => openPluginModal(p)}>
+                                  <span className="codex-custom-icon-tile" style={getPluginTileStyle(p, theme)}>
+                                    <PluginTileGraphic plugin={p} theme={theme} size={25} />
                                   </span>
-                                  <div className="codex-custom-card-meta">
+                                  <span className="codex-custom-card-meta">
                                     <span className="codex-custom-card-name">
-                                      <span>{p.name}</span>
-                                      <PluginMetaIcon />
-                                      {p.transport === 'GitHub · Open Source' && (
-                                        <span
-                                          style={{
-                                            fontSize: 10,
-                                            padding: '0 5px',
-                                            borderRadius: 999,
-                                            background: 'var(--color-accent-soft)',
-                                            color: 'var(--color-text-accent)',
-                                            fontWeight: 500,
-                                          }}
-                                        >
-                                          GitHub
-                                        </span>
-                                      )}
+                                      <span className="codex-plugin-name" title={p.name}>{p.name}</span>
+                                      <span className="codex-plugin-author" title={p.author}>{p.author}</span>
                                     </span>
                                     <span className="codex-custom-card-desc">{p.description}</span>
-                                  </div>
-                                </div>
+                                  </span>
+                                </button>
 
                                 <button
                                   type="button"
-                                  className="codex-custom-plus-btn"
+                                  className="codex-custom-install-btn"
                                   data-installed={isInstalled ? 'true' : undefined}
                                   disabled={isBusy}
                                   title={isInstalled ? `已安装 ${p.name}（点击配置）` : `安装 ${p.name}`}
@@ -1897,20 +1666,22 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
                                 >
                                   {isBusy ? (
                                     <span className="codex-sidebar-spinner" />
-                                  ) : isInstalled ? (
-                                    <IconCheck size={15} />
-                                  ) : (
-                                    <IconPlus size={15} />
-                                  )}
+                                  ) : isInstalled ? '已安装' : '安装'}
                                 </button>
                               </div>
                             );
                           })}
                         </div>
-                        {isExpanded && group.items.length > limit && !search.trim() && pluginScope === 'public' && (
+                        {moreCount > 0 && (
+                          <button type="button" className="codex-library-more"
+                            onClick={() => setExpandedCategories((prev) => ({ ...prev, [group.category]: true }))}>
+                            查看全部 {group.items.length} 项
+                          </button>
+                        )}
+                        {Boolean(expandedCategories[group.category]) && !category && group.items.length > limit && !search.trim() && (
                           <button
                             type="button"
-                            style={{ alignSelf: 'flex-start', fontSize: 12, color: 'var(--text-tertiary)' }}
+                            className="codex-library-more"
                             onClick={() =>
                               setExpandedCategories((prev) => ({
                                 ...prev,
@@ -1921,7 +1692,7 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
                             收起 {group.category}
                           </button>
                         )}
-                      </div>
+                      </section>
                     );
                   })}
                 </div>
@@ -2109,6 +1880,9 @@ export const CapabilitiesView: React.FC<CapabilitiesViewProps> = ({
                 )}
               </div>
             </>
+          )}
+          {activeTab === 'plugins' && catalogSource?.available && (
+            <p className="codex-library-source">独立插件目录 · GitHub / MCP 开放源（无需本机安装 Codex）</p>
           )}
         </div>
       </section>

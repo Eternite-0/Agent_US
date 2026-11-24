@@ -1,6 +1,6 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Approval, InspectorTab, Task, TaskBundle, Worker, SwarmCommandReceipt } from '../types/backend';
-import { aggregateFileChanges, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
+import { aggregateFileChanges, buildDiffPresentation, decodeBase64Utf8, type ComputedFileDiff } from '../utils/diff';
 import { fmtClock, fmtStatusLabel, fmtTokens, fmtUSD } from '../utils/format';
 import {
   eventMatchesWorker,
@@ -17,7 +17,6 @@ import {
   IconAgentTeam,
   IconArrowBack,
   IconBranch,
-  IconCheck,
   IconChevronDown,
   IconChevronRight,
   IconClose,
@@ -38,9 +37,16 @@ import { Markdown } from './Markdown';
 import type { AgentBackendClient } from '../api/client';
 import { AutonomousRunPanel } from './AutonomousRunPanel';
 import type { SwarmSection } from './slashCommands';
+import { DiffLineSign, DiffLineText } from './FileChangeCard';
+import { CopyFeedbackIcon } from './CopyFeedbackIcon';
+import { PresenceDiv } from './PresenceDiv';
+import './inspector-diff.css';
 
 export const DEFAULT_INSPECTOR_WIDTH = 400;
 const TASK_PREVIEW_LIMIT = 10;
+const MIN_INSPECTOR_WIDTH = 380;
+const MAX_INSPECTOR_WIDTH = 980;
+const clampInspectorWidth = (value: number) => Math.max(MIN_INSPECTOR_WIDTH, Math.min(MAX_INSPECTOR_WIDTH, value));
 interface InspectorDrawerProps {
   open: boolean;
   width: number;
@@ -178,6 +184,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   onToast,
 }) => {
   const [resizing, setResizing] = useState(false);
+  const resizeDrag = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const [openTabs, setOpenTabs] = useState<OpenPaneTab[]>([
     { id: 'subagents', kind: 'subagents', label: '子智能体' },
   ]);
@@ -199,10 +206,14 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
   const [loadingVersion, setLoadingVersion] = useState(false);
 
   const panelBodyId = useId();
+  const drawerContentId = `${panelBodyId}-drawer-content`;
   const tabDomId = (id: string) => `${panelBodyId}-tab-${encodeURIComponent(id)}`;
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
   const pendingTabFocus = useRef<string | null>(null);
   const plusMenuRef = useRef<HTMLDivElement>(null);
+  const plusTriggerRef = useRef<HTMLButtonElement>(null);
+  const tabListRef = useRef<HTMLDivElement>(null);
+  const tabIndicatorRef = useRef<HTMLSpanElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const closePanelRef = useRef<HTMLButtonElement>(null);
@@ -211,13 +222,20 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
   useEffect(() => {
     if (!open) {
-      if (openerRef.current?.isConnected) openerRef.current.focus({ preventScroll: true });
+      const focused = document.activeElement;
+      if (openerRef.current?.isConnected && (focused === document.body || panelRef.current?.contains(focused))) {
+        openerRef.current.focus({ preventScroll: true });
+      }
       openerRef.current = null;
+      setPlusMenuOpen(false);
+      setLightbox(null);
+      resizeDrag.current = null;
+      setResizing(false);
       return;
     }
     const opener = document.activeElement;
-    if (opener instanceof HTMLElement && opener !== document.body && !panelRef.current?.contains(opener)) {
-      openerRef.current = opener;
+    if (!panelRef.current?.contains(opener)) {
+      if (opener instanceof HTMLElement && opener !== document.body) openerRef.current = opener;
       closePanelRef.current?.focus({ preventScroll: true });
     }
   }, [open, tabRequest]);
@@ -297,6 +315,32 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
   const activePaneTab = openTabs.find((t) => t.id === activeTabId) ?? openTabs[0] ?? null;
 
+  const activePaneTabId = activePaneTab?.id;
+  useLayoutEffect(() => {
+    const list = tabListRef.current;
+    const indicator = tabIndicatorRef.current;
+    const active = activePaneTabId && tabRefs.current.get(activePaneTabId)?.parentElement;
+    if (!list || !indicator || !active) return;
+
+    const update = () => {
+      indicator.style.setProperty('--inspector-tab-offset', `${active.offsetLeft}px`);
+      indicator.style.setProperty('--inspector-tab-width', `${active.offsetWidth}px`);
+    };
+    update();
+
+    // Previous tabs can resize independently (labels, fonts, active font weight).
+    const observer = new ResizeObserver(update);
+    for (const tab of tabRefs.current.values()) {
+      if (tab.parentElement) observer.observe(tab.parentElement);
+    }
+    return () => observer.disconnect();
+  }, [activePaneTabId, openTabs]);
+
+  const closePlusMenu = () => {
+    setPlusMenuOpen(false);
+    plusTriggerRef.current?.focus({ preventScroll: true });
+  };
+
   useEffect(() => {
     const previousWorker = previousWorkerRef.current;
     previousWorkerRef.current = selectedSubagentId;
@@ -332,61 +376,42 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
     return s;
   }, [activeFileDiff]);
 
-  const splitRows = useMemo(() => {
-    if (!activeFileDiff) return [];
-    const pairs: Array<{
-      left: { ln: number | null; kind: 'context' | 'del' | 'empty'; text: string };
-      right: { ln: number | null; kind: 'context' | 'add' | 'empty'; text: string };
-    }> = [];
-    const lines = activeFileDiff.lines;
-    let i = 0;
-    while (i < lines.length) {
-      if (lines[i].kind === 'context') {
-        pairs.push({
-          left: { ln: lines[i].oldLine, kind: 'context', text: lines[i].text },
-          right: { ln: lines[i].newLine, kind: 'context', text: lines[i].text },
-        });
-        i++;
-      } else {
-        const dels: typeof lines = [];
-        const adds: typeof lines = [];
-        while (i < lines.length && lines[i].kind !== 'context') {
-          if (lines[i].kind === 'del') dels.push(lines[i]);
-          else adds.push(lines[i]);
-          i++;
-        }
-        const maxLen = Math.max(dels.length, adds.length);
-        for (let j = 0; j < maxLen; j++) {
-          pairs.push({
-            left: dels[j]
-              ? { ln: dels[j].oldLine, kind: 'del', text: dels[j].text }
-              : { ln: null, kind: 'empty', text: '' },
-            right: adds[j]
-              ? { ln: adds[j].newLine, kind: 'add', text: adds[j].text }
-              : { ln: null, kind: 'empty', text: '' },
-          });
-        }
-      }
-    }
-    return pairs;
-  }, [activeFileDiff]);
+  const { splitRows, spansByLine } = useMemo(
+    () => buildDiffPresentation(activeFileDiff?.lines ?? []),
+    [activeFileDiff?.lines],
+  );
 
-  const startResize = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = width;
+  const stopResize = (pointerId: number) => {
+    if (resizeDrag.current?.pointerId !== pointerId) return;
+    resizeDrag.current = null;
+    setResizing(false);
+  };
+
+  const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    event.currentTarget.focus({ preventScroll: true });
+    event.currentTarget.setPointerCapture(event.pointerId);
+    resizeDrag.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: panelRef.current?.getBoundingClientRect().width ?? width,
+    };
     setResizing(true);
-    const onMove = (ev: MouseEvent) => {
-      const next = Math.max(380, Math.min(980, startW - (ev.clientX - startX)));
-      onResize(next);
-    };
-    const onUp = () => {
-      setResizing(false);
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+  };
+
+  const moveResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = resizeDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    onResize(clampInspectorWidth(drag.startWidth + drag.startX - event.clientX));
+  };
+
+  const resizeWithKeys = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const next = event.key === 'Home' ? MIN_INSPECTOR_WIDTH : event.key === 'End' ? MAX_INSPECTOR_WIDTH
+      : event.key === 'ArrowLeft' ? width + 24 : event.key === 'ArrowRight' ? width - 24 : null;
+    if (next === null || resizeDrag.current) return;
+    event.preventDefault();
+    setResizing(true);
+    onResize(clampInspectorWidth(next));
   };
 
   const selectTab = (next: OpenPaneTab) => {
@@ -465,13 +490,14 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
             <button
               type="button"
               className="codex-tree-node"
+              aria-expanded={!collapsed}
               style={{ paddingLeft: 8 + depth * 12 }}
               onClick={() =>
                 setCollapsedDirs((prev) => ({ ...prev, [node.fullPath]: !prev[node.fullPath] }))
               }
             >
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
-                {collapsed ? <IconChevronRight size={12} /> : <IconChevronDown size={12} />}
+                <IconChevronRight size={12} className="codex-tree-chevron" />
                 <IconFolder size={13} style={{ color: 'var(--text-tertiary)', flex: 'none' }} />
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {node.name}
@@ -549,26 +575,32 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
       onKeyDown={(event) => {
         if (event.key === 'Escape' && !event.defaultPrevented && !lightbox) {
           event.stopPropagation();
-          if (plusMenuOpen) {
-            setPlusMenuOpen(false);
-            plusMenuRef.current?.querySelector('button')?.focus({ preventScroll: true });
-          } else onClose();
+          if (plusMenuOpen) closePlusMenu();
+          else onClose();
         }
       }}
-      className="codex-drawer"
-      data-open={open ? 'true' : undefined}
-      data-resizing={resizing ? 'true' : undefined}
-      style={{ width: open ? width : 0 }}
+      className="codex-drawer codex-inspector-drawer"
+      data-open={open}
+      data-resizing={open && resizing}
+      style={{ '--inspector-width': `${width}px` } as React.CSSProperties}
       aria-label="右侧工作区面板"
       inert={!open}
     >
-      {open && <div className="codex-drawer-resizer" onMouseDown={startResize} title="拖拽调整右侧工作区宽度" />}
+      {open && <div className="codex-drawer-resizer" role="separator" tabIndex={0}
+        aria-label="调整右侧工作区宽度" aria-orientation="vertical" aria-controls={drawerContentId}
+        aria-valuemin={MIN_INSPECTOR_WIDTH} aria-valuemax={MAX_INSPECTOR_WIDTH} aria-valuenow={width}
+        aria-valuetext={`首选宽度 ${width} 像素`} title="调整右侧工作区宽度"
+        onPointerDown={startResize} onPointerMove={moveResize}
+        onPointerUp={(event) => stopResize(event.pointerId)} onPointerCancel={(event) => stopResize(event.pointerId)}
+        onLostPointerCapture={(event) => stopResize(event.pointerId)}
+        onKeyDown={resizeWithKeys} onKeyUp={() => { if (!resizeDrag.current) setResizing(false); }}
+        onBlur={() => { if (!resizeDrag.current) setResizing(false); }} />}
 
-      <div className="codex-drawer-inner" style={{ width }}>
-        {/* Multi-Tab Bar (1:1 with User Screenshots 3, 4, 5!) */}
+      <div className="codex-drawer-inner" id={drawerContentId}>
         <div className="codex-split-tabbar">
           <div className="codex-split-tabs">
-            <div className="codex-split-tablist" role="tablist" aria-label="工作区标签页">
+            <div className="codex-split-tablist" ref={tabListRef} role="tablist" aria-label="工作区标签页">
+              <span className="codex-split-tab-indicator" ref={tabIndicatorRef} aria-hidden="true" />
               {openTabs.map((t, index) => {
                 const active = activePaneTab?.id === t.id;
                 return (
@@ -608,60 +640,60 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                 className="codex-icon-btn"
                 style={{ width: 26, height: 26 }}
                 aria-label="打开面板标签页"
+                ref={plusTriggerRef}
                 aria-expanded={plusMenuOpen}
                 title="打开面板标签页"
                 onClick={() => setPlusMenuOpen((v) => !v)}
               >
                 <IconPlus size={14} />
               </button>
-              {plusMenuOpen && (
-                <div className="codex-popover" data-side="bottom">
-                  <button
-                    type="button"
-                    className="codex-popover-item"
-                    onClick={() => {
-                      setPlusMenuOpen(false);
-                      onChangeTab('subagents');
-                      ensureTab({ id: 'subagents', kind: 'subagents', label: '子智能体' });
-                    }}
-                  >
-                    <span>子智能体</span>
-                  </button>
-                  <button type="button" className="codex-popover-item" onClick={() => {
-                    setPlusMenuOpen(false);
-                    onChangeTab('autonomous');
-                    ensureTab({ id: 'autonomous', kind: 'autonomous', label: '自主任务' });
-                  }}>
-                    <span><IconDagNodes size={14} /> 自主任务</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="codex-popover-item"
-                    onClick={() => {
-                      setPlusMenuOpen(false);
-                      const firstPath = diffs[0]?.path;
-                      if (firstPath) openFileInPane(firstPath);
-                      else {
-                        onChangeTab('diff');
-                        ensureTab({ id: 'file:__all__', kind: 'file', path: '__all__', label: '变更' });
-                      }
-                    }}
-                  >
-                    <span>文件与变更 Diff</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="codex-popover-item"
-                    onClick={() => {
-                      setPlusMenuOpen(false);
-                      onChangeTab('events');
-                      ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
-                    }}
-                  >
-                    <span>SSE 事件与版本</span>
-                  </button>
-                </div>
-              )}
+              <PresenceDiv open={open && plusMenuOpen} className="codex-popover" data-side="bottom"
+                focusOnOpen="button">
+                <button
+                  type="button"
+                  className="codex-popover-item"
+                  onClick={() => {
+                    closePlusMenu();
+                    onChangeTab('subagents');
+                    ensureTab({ id: 'subagents', kind: 'subagents', label: '子智能体' });
+                  }}
+                >
+                  <span>子智能体</span>
+                </button>
+                <button type="button" className="codex-popover-item" onClick={() => {
+                  closePlusMenu();
+                  onChangeTab('autonomous');
+                  ensureTab({ id: 'autonomous', kind: 'autonomous', label: '自主任务' });
+                }}>
+                  <span><IconDagNodes size={14} /> 自主任务</span>
+                </button>
+                <button
+                  type="button"
+                  className="codex-popover-item"
+                  onClick={() => {
+                    closePlusMenu();
+                    const firstPath = diffs[0]?.path;
+                    if (firstPath) openFileInPane(firstPath);
+                    else {
+                      onChangeTab('diff');
+                      ensureTab({ id: 'file:__all__', kind: 'file', path: '__all__', label: '变更' });
+                    }
+                  }}
+                >
+                  <span>文件与变更 Diff</span>
+                </button>
+                <button
+                  type="button"
+                  className="codex-popover-item"
+                  onClick={() => {
+                    closePlusMenu();
+                    onChangeTab('events');
+                    ensureTab({ id: 'events', kind: 'events', label: '事件与版本' });
+                  }}
+                >
+                  <span>SSE 事件与版本</span>
+                </button>
+              </PresenceDiv>
             </div>
             <button
               type="button"
@@ -943,9 +975,10 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                       className="codex-icon-btn"
                       style={{ width: 26, height: 26 }}
                       title="复制文件内容"
+                      aria-label="复制文件内容"
                       onClick={() => void copyActiveFile()}
                     >
-                      {copiedFile ? <IconCheck size={13} /> : <IconCopy size={13} />}
+                      <CopyFeedbackIcon copied={copiedFile} size={13} />
                     </button>
                     <button
                       type="button"
@@ -963,7 +996,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
             {/* Split Body: Left Code/Diff Viewer + Right Changed Files Tree */}
             <div className="codex-ide-body">
-              <div className="codex-ide-editor">
+              <div className="codex-ide-editor" role="region" aria-label={showChanges ? '文件差异' : '文件预览'} tabIndex={0}>
                 {!activeFileDiff ? (
                   <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-tertiary)', fontFamily: 'var(--font-sans)' }}>
                     当前任务暂无文件变更或产物。
@@ -1034,10 +1067,8 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                       <div key={idx} className="codex-diff-line" data-kind={line.kind}>
                         <span className="codex-diff-ln">{line.oldLine ?? ''}</span>
                         <span className="codex-diff-ln">{line.newLine ?? ''}</span>
-                        <span className="codex-diff-sign">
-                          {line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ' '}
-                        </span>
-                        <span className="codex-diff-code">{line.text}</span>
+                        <DiffLineSign kind={line.kind} />
+                        <DiffLineText line={line} spans={spansByLine.get(line)} />
                       </div>
                     ))}
                   </div>
@@ -1045,20 +1076,13 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
                   <div className="codex-diff-split">
                     {splitRows.map((row, idx) => (
                       <React.Fragment key={idx}>
-                        <div className="codex-diff-split-cell" data-kind={row.left.kind}>
-                          <span className="codex-diff-ln">{row.left.ln ?? ''}</span>
-                          <span className="codex-diff-sign">
-                            {row.left.kind === 'del' ? '-' : ' '}
-                          </span>
-                          <span>{row.left.text}</span>
-                        </div>
-                        <div className="codex-diff-split-cell" data-kind={row.right.kind}>
-                          <span className="codex-diff-ln">{row.right.ln ?? ''}</span>
-                          <span className="codex-diff-sign">
-                            {row.right.kind === 'add' ? '+' : ' '}
-                          </span>
-                          <span>{row.right.text}</span>
-                        </div>
+                        {[row.left, row.right].map((line, side) => (
+                          <div key={side} className="codex-diff-split-cell" data-kind={line?.kind ?? 'empty'} aria-hidden={!line}>
+                            <span className="codex-diff-ln">{(side === 0 ? line?.oldLine : line?.newLine) ?? ''}</span>
+                            <DiffLineSign kind={line?.kind} />
+                            <DiffLineText line={line} spans={line ? spansByLine.get(line) : undefined} />
+                          </div>
+                        ))}
                       </React.Fragment>
                     ))}
                   </div>
@@ -1285,7 +1309,7 @@ export const InspectorDrawer: React.FC<InspectorDrawerProps> = ({
 
       <ImageLightbox
         images={lightbox?.images ?? []}
-        index={lightbox?.index ?? null}
+        index={open ? lightbox?.index ?? null : null}
         onChangeIndex={(next) =>
           setLightbox((cur) => (next === null || !cur ? null : { ...cur, index: next }))
         }

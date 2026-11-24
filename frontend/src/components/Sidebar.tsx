@@ -7,19 +7,18 @@ import {
   IconArchive,
   IconBell,
   IconCheck,
-  IconChevronDown,
   IconChevronRight,
   IconDotsHorizontal,
   IconCompose,
-  IconFolder,
+  IconHelpCircle,
   IconPin,
   IconPlus,
   IconRailClock,
   IconRailHome,
   IconRailPlugins,
-  IconDagNodes,
   IconSearch,
   IconSettingsGear,
+  IconSidebarFolder,
 } from './Icons';
 
 interface SidebarProps {
@@ -39,13 +38,14 @@ interface SidebarProps {
   onChangeCodexMode: (mode: CodexMode) => void;
   onSelectHome: (projectId?: string) => void;
   onSelectTask: (taskId: string, focusWorkerId?: string) => void;
+  onSelectArchived: () => void;
   onSelectTasksView: () => void;
   onSelectCapabilities: () => void;
-  onSelectEvaluations: () => void;
   onOpenSettings: (section?: string) => void;
   onOpenSearch: () => void;
   onOpenCreateProject: () => void;
   onRenameProject: (project: Project, newName: string) => Promise<void>;
+  onDeleteProject?: (project: Project) => void;
   onTogglePin: (taskId: string) => void;
   onArchiveTask: (taskId: string) => void;
   onDecideApproval: (approval: Approval, decision: 'approve' | 'deny') => Promise<void>;
@@ -73,13 +73,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onChangeCodexMode,
   onSelectHome,
   onSelectTask,
+  onSelectArchived,
   onSelectTasksView,
   onSelectCapabilities,
-  onSelectEvaluations,
   onOpenSettings,
   onOpenSearch,
   onOpenCreateProject,
   onRenameProject,
+  onDeleteProject,
   onTogglePin,
   onArchiveTask,
   onDecideApproval,
@@ -88,7 +89,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [resizing, setResizing] = useState(false);
   const [peeking, setPeeking] = useState(false);
   const [projectsOpen, setProjectsOpen] = useState(true);
-  const [recentsOpen, setRecentsOpen] = useState(false);
+  const [recentsExpanded, setRecentsExpanded] = useState<boolean | null>(null);
+  const recentsOpen = recentsExpanded ?? projects.length === 0;
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
   const [bellOpen, setBellOpen] = useState(false);
   const [modeOpen, setModeOpen] = useState(false);
@@ -163,6 +165,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const activeTaskId = view.kind === 'thread' ? view.taskId : null;
   const isHomeRail = view.kind === 'home' || view.kind === 'thread';
+  const showRail = hidePanel || collapsed;
   const pinnedSet = new Set(pinnedIds);
 
   const visibleTasks = tasks.filter((t) => t.archivedAt == null);
@@ -272,7 +275,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   return (
     <div style={{ display: 'flex', flex: 'none', minHeight: 0 }} ref={popoverRef}>
       {/* Far-left Codex navigation rail */}
-      <nav className="codex-rail" aria-label="主导航">
+      {showRail && <nav className="codex-rail" aria-label="主导航">
         <div className="codex-rail-group">
           <button
             type="button"
@@ -283,6 +286,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onClick={() => onSelectHome()}
           >
             <IconRailHome size={20} active={isHomeRail} />
+          </button>
+          <button type="button" className="codex-rail-btn" aria-label="已归档" title="已归档"
+            data-active={view.kind === 'archived' || undefined} aria-current={view.kind === 'archived' ? 'page' : undefined}
+            onClick={onSelectArchived}>
+            <IconArchive size={18} />
           </button>
           <button
             type="button"
@@ -304,16 +312,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             <IconRailPlugins size={20} />
           </button>
-          <button
-            type="button"
-            className="codex-rail-btn"
-            data-active={view.kind === 'evaluations' ? 'true' : undefined}
-            aria-label="评测中心"
-            title="Evaluation Center"
-            onClick={onSelectEvaluations}
-          >
-            <IconDagNodes size={20} />
-          </button>
         </div>
         <div className="codex-rail-group">
           <button
@@ -327,7 +325,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <IconSettingsGear size={20} />
           </button>
         </div>
-      </nav>
+      </nav>}
       {/* Left-edge Hover Peek Trigger when sidebar is collapsed */}
       {collapsed && !hidePanel && !peeking && (
         <div
@@ -336,7 +334,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         />
       )}
 
-      {/* Resizable 288px Conversation & Project Sidebar */}
+      {/* Resizable conversation and project sidebar */}
       {!hidePanel && (
         <aside
           className="codex-sidebar-wrap"
@@ -349,7 +347,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           onMouseLeave={leavePeek}
         >
           <div className="codex-sidebar">
-            {/* Header: Codex wordmark + Bell + Search */}
+            {/* Header: Codex wordmark + Search + Bell */}
             <div className="codex-sidebar-head">
               <div style={{ position: 'relative' }}>
                 <button
@@ -359,11 +357,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   onClick={() => setModeOpen((v) => !v)}
                 >
                   {codexMode === 'Codex' ? (
-                    <CodexWordmark style={{ height: 15, width: 'auto' }} />
+                    <CodexWordmark className="codex-sidebar-wordmark" />
                   ) : (
                     <span style={{ fontSize: 15, fontWeight: 600 }}>{codexMode}</span>
                   )}
-                  <IconChevronDown size={14} style={{ color: 'var(--text-tertiary)' }} />
+                  <svg className="codex-brand-disclosure" width="16" height="16" viewBox="0 0 16 16"
+                    fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"
+                    strokeLinejoin="round" aria-hidden="true">
+                    <path d="m4 6.25 4 4 4-4" />
+                  </svg>
                 </button>
 
                 {modeOpen && (
@@ -397,6 +399,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
 
               <div className="codex-sidebar-head-actions">
+                <button
+                  type="button"
+                  className="codex-icon-btn"
+                  aria-label="搜索"
+                  title="搜索 (Ctrl+K)"
+                  onClick={onOpenSearch}
+                >
+                  <IconSearch size={16} />
+                </button>
                 <div className="codex-bell-wrap" style={{ position: 'relative' }}>
                   <button
                     type="button"
@@ -513,43 +524,36 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     </div>
                   )}
                 </div>
-
-                <button
-                  type="button"
-                  className="codex-icon-btn"
-                  aria-label="搜索"
-                  title="搜索 (Ctrl+K)"
-                  onClick={onOpenSearch}
-                >
-                  <IconSearch size={16} />
-                </button>
               </div>
             </div>
 
-            {/* Primary Action: 新聊天 */}
-            <button
-              type="button"
-              className="codex-sidebar-row"
-              onClick={() => {
-                setPeeking(false);
-                onSelectHome();
-              }}
-              style={{ marginBottom: 4 }}
-            >
-              <IconCompose size={16} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
-              <span className="codex-sidebar-row-text">新聊天</span>
-            </button>
-            <button
-              type="button"
-              className="codex-sidebar-row chat-archive-shortcut"
-              onClick={() => {
-                setPeeking(false);
-                onOpenSettings('archived');
-              }}
-            >
-              <IconArchive size={16} />
-              <span className="codex-sidebar-row-text">已归档</span>
-            </button>
+            <nav className="codex-sidebar-nav" aria-label={showRail ? '会话操作' : '主导航'}>
+              <button type="button" className="codex-sidebar-row" onClick={() => { setPeeking(false); onSelectHome(); }}>
+                <IconCompose size={16} />
+                <span className="codex-sidebar-row-text">新聊天</span>
+              </button>
+              <button type="button" className="codex-sidebar-row"
+                aria-current={view.kind === 'archived' ? 'page' : undefined}
+                data-selected={view.kind === 'archived' || undefined}
+                onClick={() => { setPeeking(false); onSelectArchived(); }}>
+                <IconArchive size={16} />
+                <span className="codex-sidebar-row-text">已归档</span>
+              </button>
+              <button type="button" className="codex-sidebar-row" aria-label="定时任务"
+                aria-current={view.kind === 'tasks' ? 'page' : undefined}
+                data-selected={view.kind === 'tasks' || undefined}
+                onClick={() => { setPeeking(false); onSelectTasksView(); }}>
+                <IconRailClock size={16} />
+                <span className="codex-sidebar-row-text">已安排</span>
+              </button>
+              <button type="button" className="codex-sidebar-row"
+                aria-current={view.kind === 'capabilities' ? 'page' : undefined}
+                data-selected={view.kind === 'capabilities' || undefined}
+                onClick={() => { setPeeking(false); onSelectCapabilities(); }}>
+                <IconRailPlugins size={16} />
+                <span className="codex-sidebar-row-text">插件</span>
+              </button>
+            </nav>
 
             {/* Scrollable Sections */}
             <div className="codex-sidebar-scroll vertical-scroll-fade-mask">
@@ -648,10 +652,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                               }
                             }}
                           >
-                            <IconFolder
-                              size={15}
-                              style={{ color: 'var(--text-secondary)', flex: 'none' }}
-                            />
+                            <IconSidebarFolder className="codex-sidebar-project-icon" />
                             <span className="codex-sidebar-row-text">{p.name}</span>
                             <div
                               className="codex-sidebar-row-actions"
@@ -719,7 +720,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   type="button"
                   className="codex-section-toggle"
                   aria-expanded={recentsOpen}
-                  onClick={() => setRecentsOpen((v) => !v)}
+                  onClick={() => setRecentsExpanded(!recentsOpen)}
                 >
                   <span>最近</span>
                   <span className="codex-section-chevron">
@@ -745,6 +746,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   )}
                 </div>
               </Collapsible>
+            </div>
+            <div className="codex-sidebar-footer">
+              <button type="button" className="codex-sidebar-row" onClick={() => onOpenSettings('general')}>
+                <IconSettingsGear size={16} />
+                <span>设置</span>
+              </button>
+              <button type="button" className="codex-icon-btn" aria-label="快捷键与帮助" title="快捷键与帮助"
+                onClick={() => onOpenSettings('shortcuts')}>
+                <IconHelpCircle />
+              </button>
             </div>
           </div>
 
@@ -846,6 +857,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
               >
                 <span>复制项目 ID</span>
               </button>
+              {onDeleteProject && (
+                <>
+                  <div className="codex-popover-divider" />
+                  <button
+                    type="button"
+                    className="codex-popover-item"
+                    data-tone="danger"
+                    onClick={() => {
+                      onDeleteProject(contextMenu.project);
+                      setContextMenu(null);
+                    }}
+                  >
+                    <span>移除项目</span>
+                  </button>
+                </>
+              )}
             </>
           )}
         </div>

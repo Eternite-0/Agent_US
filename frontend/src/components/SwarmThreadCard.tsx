@@ -1,6 +1,18 @@
 import type { SwarmRunRecord } from '../types/backend';
-import { IconAgentTeam, IconChevronRight } from './Icons';
+import { IconChevronRight } from './Icons';
 import { summarizeSwarmRun } from '../utils/swarmCommand';
+import { swarmWorkerStatus } from '../utils/subagentProgress';
+import { LayeredWorkerStatusMark } from './SubagentProgress';
+
+function runMark(status?: string) {
+  switch (status) {
+    case undefined: return 'waiting';
+    case 'planning':
+    case 'verifying':
+    case 'aggregating': return 'running';
+    default: return swarmWorkerStatus(status);
+  }
+}
 
 export function SwarmThreadCard({ run, onOpen }: { run?: SwarmRunRecord; onOpen?: () => void }) {
   const progress = run && summarizeSwarmRun(run);
@@ -8,7 +20,7 @@ export function SwarmThreadCard({ run, onOpen }: { run?: SwarmRunRecord; onOpen?
   const nodes = progress && progress.total > 0 ? ` · ${progress.completed}/${progress.total} 个节点完成` : '';
   const heading = (
     <>
-      <IconAgentTeam size={14} aria-hidden="true" />
+      <LayeredWorkerStatusMark status={runMark(run?.status)} />
       <span className="codex-direct-activity-label">
         <span className="swarm-thread-title">Swarm 协作</span>
         <span className="swarm-thread-status tabular-nums" data-tone={progress?.tone}> · {status}{nodes}</span>

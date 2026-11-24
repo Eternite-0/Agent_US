@@ -141,6 +141,7 @@ const SAMPLE_ROUTER_AFTER = `export function pickModel(models, role, complexity 
 
 export class SimulatorClient implements AgentBackendClient {
   readonly isDemo = true;
+  readonly supportsSafeDeletion = true;
   private seq = 100;
   private listeners = new Set<(ev: EventEnvelope) => void>();
 
@@ -810,7 +811,7 @@ export class SimulatorClient implements AgentBackendClient {
     return p;
   }
 
-  async renameProject(id: string, name: string, version: number): Promise<Project> {
+  async renameProject({ id, version }: Project, name: string): Promise<Project> {
     const idx = this.projects.findIndex((p) => p.id === id);
     if (idx < 0) throw new ApiError(404, 'NOT_FOUND');
     const cur = this.projects[idx];
@@ -819,6 +820,14 @@ export class SimulatorClient implements AgentBackendClient {
     this.projects[idx] = next;
     this.emit('projects.updated', next.id, null, { id: next.id, version: next.version });
     return next;
+  }
+
+  async deleteProject(project: Project): Promise<void> {
+    this.projects = this.projects.filter(({ id }) => id !== project.id);
+    for (const [id, task] of this.tasks) {
+      if (task.projectId === project.id) this.tasks.set(id, { ...task, projectId: null });
+    }
+    this.emit('projects.deleted', project.id, null, { id: project.id });
   }
 
   async listTasks(params?: ListTasksOptions): Promise<Task[]> {
@@ -841,6 +850,22 @@ export class SimulatorClient implements AgentBackendClient {
     const next = { ...task, archivedAt: archived ? (task.archivedAt ?? Date.now()) : null };
     this.tasks.set(id, next);
     return next;
+  }
+
+  async deleteArchivedTask(id: string): Promise<void> {
+    const task = this.tasks.get(id);
+    if (!task) return;
+    if (task.archivedAt == null) throw new ApiError(409, 'SESSION_NOT_ARCHIVED', '此聊天已不在归档列表中。');
+    this.tasks.delete(id);
+    for (const approval of this.approvals.get(id) ?? []) {
+      this.pendingResolvers.get(approval.id)?.('deny');
+      this.pendingResolvers.delete(approval.id);
+    }
+    for (const session of this.sessions.get(id) ?? []) this.histories.delete(session.id);
+    for (const collection of [this.assignments, this.workers, this.sessions, this.approvals, this.evidence, this.artifacts]) {
+      collection.delete(id);
+    }
+    this.emit('tasks.deleted', task.projectId, id, { id });
   }
 
   async getTask(id: string): Promise<Task> {

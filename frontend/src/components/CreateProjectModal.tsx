@@ -18,7 +18,7 @@ type SourceMode = 'local' | 'manual' | 'blank';
 const SOURCE_MODES: Array<{ id: SourceMode; label: string; desc: string }> = [
   { id: 'local', label: '在此电脑上添加文件夹', desc: '从本机选择项目目录作为源文件夹' },
   { id: 'manual', label: '输入本地文件夹路径', desc: '直接粘贴目录路径，如 D:\\MyProject' },
-  { id: 'blank', label: '创建空白工作区项目', desc: '仅在后端注册项目，不绑定本地目录' },
+  { id: 'blank', label: '从当前工作区创建', desc: '使用当前工作区，不新建目录' },
 ];
 
 export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({

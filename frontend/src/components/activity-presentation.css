@@ -32,8 +32,8 @@ summary:is(.codex-direct-activity-row, .codex-direct-tool-row):focus-visible { o
 
 .codex-tool-target { font: 400 .96em var(--font-mono); }
 .codex-tool-time { flex: none; font-size: var(--text-caption); color: var(--text-tertiary); }
-.codex-direct-chevron { flex: none; color: var(--text-tertiary); transition: transform var(--duration-basic) var(--ease-out); }
-:is(.codex-direct-activity, .codex-direct-tool)[open] > summary > .codex-direct-chevron,
+.codex-direct-chevron { flex: none; color: var(--text-tertiary); transition: transform var(--duration-basic) var(--ease-enter-snappy); }
+:is(.codex-direct-activity, .codex-direct-tool) > summary[aria-expanded="true"] > .codex-direct-chevron,
 .codex-file-row-trigger[aria-expanded='true'] .codex-direct-chevron { transform: rotate(90deg); }
 .codex-file-more-btn[aria-expanded='true'] .codex-direct-chevron { transform: rotate(180deg); }
 
@@ -59,7 +59,6 @@ summary:is(.codex-direct-activity-row, .codex-direct-tool-row):focus-visible { o
   font-size: var(--text-small);
   overflow-wrap: anywhere;
 }
-.codex-direct-tool-detail:not([hidden]) { animation: codex-detail-enter var(--duration-basic) var(--ease-out); }
 
 .codex-terminal-inset { min-width: 0; border-radius: var(--thread-radius-detail); background: var(--thread-detail-surface); }
 .codex-command-header { padding: 5px 9px 0; color: var(--text-tertiary); font-size: var(--text-caption); line-height: 15px; }
@@ -90,6 +89,7 @@ summary:is(.codex-direct-activity-row, .codex-direct-tool-row):focus-visible { o
 }
 .codex-terminal-inset > .codex-command-output:not(:first-child) { border-top: 1px solid var(--border-subtle); }
 .codex-command-output:focus-visible { outline-offset: -2px; }
+.codex-activity-output[data-enter='true'] { animation: codex-content-reveal var(--duration-basic) var(--ease-out); }
 .codex-command-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; min-height: 24px; padding: 0 5px 0 9px; font-size: var(--text-caption); color: var(--text-tertiary); }
 .codex-command-footer > .codex-activity-copy { margin-inline-start: auto; }
 .codex-direct-tool[data-status="failed"] .codex-command-output { color: var(--color-danger); }

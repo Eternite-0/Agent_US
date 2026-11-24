@@ -22,13 +22,11 @@ import {
   fmtTokens,
   fmtUSD,
 } from '../utils/format';
-import { ArchivedChats } from './ArchivedChats';
 import { AdaptiveContextPanel } from './AdaptiveContextPanel';
 import { CheckinCenterPanel } from './CheckinCenterPanel';
 import { ExperienceMemoryPanel } from './ExperienceMemoryPanel';
 import {
   IconActivity,
-  IconArchive,
   IconCheck,
   IconClose,
   IconCpu,
@@ -82,9 +80,6 @@ interface SettingsViewProps {
   approvals: Approval[];
   memory: MemoryItem[];
   usage: UsageItem[];
-  archiveClient: AgentBackendClient;
-  archiveBusy: ReadonlySet<string>;
-  archiveRevision: number;
   recentEvents: EventEnvelope[];
   onChangeSection: (section: string) => void;
   onChangeThemeMode: (mode: ThemeMode) => void;
@@ -95,7 +90,6 @@ interface SettingsViewProps {
   onUpdateConnection: (conn: ConnectionSettings) => void;
   onTestConnection: (next?: ConnectionSettings) => Promise<void>;
   onDecideApproval: (approval: Approval, decision: 'approve' | 'deny') => Promise<void>;
-  onRestoreArchived: (taskId: string) => void;
   onOpenTask: (taskId: string) => void;
   onSearchMemory?: (query: string, scope: 'global' | 'workspace' | 'session') => Promise<void>;
   onDeleteMemory?: (item: MemoryItem) => Promise<void>;
@@ -129,7 +123,6 @@ const NAV_GROUPS: Array<{
     items: [
       { id: 'general', label: '常规', icon: <IconSettingsGear size={15} /> },
       { id: 'appearance', label: '外观', icon: <IconSun size={15} /> },
-      { id: 'archived', label: '已归档的聊天', icon: <IconArchive size={15} /> },
       { id: 'shortcuts', label: '键盘快捷键', icon: <IconKeyboard size={15} /> },
       { id: 'environment', label: '安全护栏', icon: <IconShieldCheck size={15} /> },
       { id: 'events', label: '事件流诊断', icon: <IconActivity size={15} /> },
@@ -200,9 +193,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   approvals,
   memory,
   usage,
-  archiveClient,
-  archiveBusy,
-  archiveRevision,
   recentEvents,
   onChangeSection,
   onChangeThemeMode,
@@ -213,7 +203,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onUpdateConnection,
   onTestConnection,
   onDecideApproval,
-  onRestoreArchived,
   onOpenTask,
   onSearchMemory,
   onDeleteMemory,
@@ -602,16 +591,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               </div>
             </>
-          )}
-
-          {activeSection === 'archived' && (
-            <ArchivedChats
-              client={archiveClient}
-              busy={archiveBusy}
-              revision={archiveRevision}
-              onOpen={onOpenTask}
-              onRestore={onRestoreArchived}
-            />
           )}
 
           {activeSection === 'shortcuts' && (

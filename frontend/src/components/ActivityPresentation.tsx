@@ -1,9 +1,11 @@
 import { createContext, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { fmtDuration } from '../utils/format';
 import {
-  IconArrowUpRight, IconCheck, IconChevronRight, IconCopy, IconFileDoc, IconFileEdit,
+  IconArrowUpRight, IconCheck, IconChevronRight, IconFileDoc, IconFileEdit,
   IconActivity, IconGlobe, IconPuzzle, IconSearch, IconTerminal, IconTool,
 } from './Icons';
+import { AnimatedDetails } from './Collapsible';
+import { CopyFeedbackIcon } from './CopyFeedbackIcon';
 import './activity-presentation.css';
 
 export type ActivityStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'interrupted';
@@ -19,16 +21,17 @@ type Disclosure = {
 const DisclosureContext = createContext<Disclosure | undefined>(undefined);
 
 /** Keep explicit disclosure choices above any rows that can move between groups. */
-export function ActivityDisclosureScope({ children }: { children: ReactNode }) {
+export function ActivityDisclosureScope({ children, remembered }: { children: ReactNode; remembered?: Map<string, boolean> }) {
   const parent = useContext(DisclosureContext);
-  const [values, setValues] = useState<ReadonlyMap<string, boolean>>(() => new Map());
+  const [values, setValues] = useState<ReadonlyMap<string, boolean>>(() => new Map(remembered));
   const value = useMemo<Disclosure>(() => ({ values, set: (ids, open) => {
+    if (remembered) for (const id of ids) remembered.set(id, open);
     setValues((previous) => {
       const next = new Map(previous);
       for (const id of ids) next.set(id, open);
       return next;
     });
-  } }), [values]);
+  } }), [values, remembered]);
   return parent ? <>{children}</> : <DisclosureContext.Provider value={value}>{children}</DisclosureContext.Provider>;
 }
 
@@ -68,7 +71,7 @@ export function ActivityCopyButton({ text, label, onCopy }: { text: string; labe
       window.clearTimeout(timeout.current);
       timeout.current = window.setTimeout(() => setCopied(false), 1200);
     }}>
-      {copied ? <IconCheck size={13} aria-hidden="true" /> : <IconCopy size={13} aria-hidden="true" />}
+      <CopyFeedbackIcon copied={copied} size={13} />
     </button>
   );
 }
@@ -111,6 +114,11 @@ export function toolActionLabel(kind: ToolKind, status: ActivityStatus) {
   return activityStatusLabel[status];
 }
 
+function ActivityOutput({ text, label, animate }: { text: string; label: string; animate: boolean }) {
+  const [entering] = useState(animate);
+  return <pre className="codex-command-output codex-activity-output" data-enter={entering || undefined} aria-label={label} tabIndex={0}>{text}</pre>;
+}
+
 export function ActivityToolRow({ id, name, kind, target, command, output, liveOutput, error, exitCode, durationMs, status,
   paths = [], meta, eventType, defaultOpen = false, onInspectFile, onCopy }: {
   id: string;
@@ -142,8 +150,8 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
   const summary = target.replace(/\s+/g, ' ');
   const useMono = isShell || ['read', 'edit', 'search'].includes(kind);
   return (
-    <details className="codex-direct-tool codex-activity-disclosure" data-status={status} data-tool-kind={kind} data-event-type={eventType} data-scroll-anchor={`tool:${id}`} open={open}>
-      <summary className="codex-direct-tool-row" aria-controls={panelId} data-scroll-disclosure title={summary} onClick={(event) => {
+    <AnimatedDetails className="codex-direct-tool codex-activity-disclosure" data-status={status} data-tool-kind={kind} data-event-type={eventType} data-scroll-anchor={`tool:${id}`} open={open} panelId={panelId} summary={
+      <summary className="codex-direct-tool-row" aria-expanded={open} aria-controls={panelId} data-scroll-disclosure title={summary} onClick={(event) => {
         event.preventDefault();
         setOpen(!open);
       }}>
@@ -152,7 +160,8 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
         <IconChevronRight className="codex-direct-chevron" size={13} aria-hidden="true" />
         {!open && elapsed && <small className="codex-tool-time tabular-nums">{elapsed}</small>}
       </summary>
-      <div id={panelId} hidden={!open} className="codex-direct-tool-detail">
+    }>
+      <div className="codex-direct-tool-detail">
         <div className={command !== undefined || displayOutput ? 'codex-terminal-inset' : undefined}>
           {showHeader && <div className="codex-command-header">{meta ? `${meta} · ${name}` : name}</div>}
           {command !== undefined && <div className="codex-activity-raw-line">
@@ -167,7 +176,7 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
                 </button>
               : <code key={path}>{path}</code>)}
           </div>}
-          {displayOutput && <pre className="codex-command-output codex-activity-output" aria-label={outputLabel} tabIndex={0}>{displayOutput}</pre>}
+          {displayOutput && <ActivityOutput text={displayOutput} label={outputLabel} animate={open && output === undefined} />}
           <div className="codex-command-footer" data-failed={status === 'failed' || undefined}>
             {status === 'completed' && <IconCheck size={12} aria-hidden="true" />}
             <ActivityStatusText status={status} />
@@ -178,6 +187,6 @@ export function ActivityToolRow({ id, name, kind, target, command, output, liveO
         </div>
         {error && error !== displayOutput && <div className="codex-event-error">{error}</div>}
       </div>
-    </details>
+    </AnimatedDetails>
   );
 }

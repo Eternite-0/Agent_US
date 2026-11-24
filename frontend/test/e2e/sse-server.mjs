@@ -57,7 +57,9 @@ export async function startFixture(workspaceRoot, token) {
     }
   }
   function message(session, turnId, fields) {
-    session.messages.push({ seq: session.messages.length + 1, turnId, ...fields });
+    const messageCursor = session.messages.length + 1;
+    session.messages.push({ seq: messageCursor, turnId, ...fields });
+    return messageCursor;
   }
   function begin(session, input) {
     const id = `${session.record.id}-turn-${session.turns.length + 1}`;
@@ -68,10 +70,10 @@ export async function startFixture(workspaceRoot, token) {
     event(session, 'turn/started', { turnId: id });
     return turn;
   }
-  function finish(session, turn, { text = '', reason = 'completed', reasoning = '' }) {
+  function finish(session, turn, { text = '', reason = 'completed', reasoning = '', legacy = false }) {
     if (text || reasoning) {
-      message(session, turn.id, { role: 'assistant', content: text, reasoning });
-      event(session, 'assistant/message', { turnId: turn.id, text });
+      const messageCursor = message(session, turn.id, { role: 'assistant', content: text, reasoning });
+      event(session, 'assistant/message', { turnId: turn.id, text, ...(legacy ? {} : { messageCursor }) });
     }
     turn.state = session.record.state = reason;
     event(session, `turn/${reason}`, { turnId: turn.id, durationMs: 12_000 });
@@ -130,7 +132,7 @@ export async function startFixture(workspaceRoot, token) {
         return send(res, 200, { ok: true });
       }
       if (req.method === 'POST' && path === '/__e2e/advance') {
-        const { id = 'transcript', action, text, name = 'bash', callId = 'fixture-tool', reason, args, change } = await body(req);
+        const { id = 'transcript', action, text, name = 'bash', callId = 'fixture-tool', reason, args, change, legacy } = await body(req);
         const session = sessions.get(id);
         const turn = session?.turns[0];
         if (!turn || turn.state !== 'running') return send(res, 409, { error: 'No running fixture turn' });
@@ -152,7 +154,7 @@ export async function startFixture(workspaceRoot, token) {
           case 'burst':
             for (let step = 0; step < 30; step++) event(session, 'turn/phase_changed', { turnId, phase: 'running', step });
             break;
-          case 'finish': finish(session, turn, { text, reason }); break;
+          case 'finish': finish(session, turn, { text, reason, legacy }); break;
           default: return send(res, 400, { error: 'Unknown fixture action' });
         }
         return send(res, 200, { ok: true });

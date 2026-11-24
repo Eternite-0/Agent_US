@@ -2,6 +2,8 @@ import type { EventEnvelope, SessionHistoryItem } from '../types/backend';
 
 export interface DirectLiveStream {
   turnId?: string;
+  afterAssistantCursor?: number;
+  settled?: boolean;
   text: string;
   reasoning: string;
 }
@@ -29,7 +31,7 @@ export interface DirectToolActivity {
 type ActivityItem = DirectToolActivity | { kind: 'reasoning'; id: string; text: string; live?: boolean };
 export type DirectTimelineBlock =
   | { kind: 'activity'; id: string; items: ActivityItem[]; waiting?: boolean }
-  | { kind: 'message'; id: string; text: string; live?: boolean };
+  | { kind: 'message'; id: string; text: string; live?: boolean; justArrived?: boolean };
 
 type TurnEnd = 'turn/completed' | 'turn/failed' | 'turn/cancelled' | 'turn/parked';
 export const isDirectTurnEnd = (type: string): type is TurnEnd =>
@@ -59,16 +61,43 @@ interface TimelineOptions {
   liveToolOutputs?: DirectLiveToolOutput[];
   pendingCallIds?: Set<string>;
   awaitingApproval?: boolean;
+  recentEvents?: readonly EventEnvelope[];
 }
 
 export function groupDirectMessages(sessionId: string, input: string, items: SessionHistoryItem[], options: TimelineOptions = {}): Exchange[] {
+  const historyTail = items.at(-1)?.cursor ?? 0;
+  const snapshotSeq = options.events?.at(-1)?.seq ?? 0;
+  const events = options.recentEvents?.some((ev) => ev.seq > snapshotSeq)
+    ? [...(options.events ?? []), ...options.recentEvents.filter((ev) => ev.seq > snapshotSeq)]
+    : options.events ?? [];
+  // The final SSE carries the persisted message cursor. Treat it as a history
+  // row until REST catches up, preserving the same step key and React subtree.
+  // Never resurrect messages that were deliberately removed by a rewind.
+  const rewoundAt = events.findLast((ev) => ev.type === 'session/rewound' && Number(ev.payload?.removedMessages) > 0)?.seq ?? 0;
+  const pendingMessages: SessionHistoryItem[] = [];
+  const justArrived = new Set<number>();
+  const snapshotCursors = new Set(items.map((item) => item.cursor));
+  for (const event of events) {
+    if (event.type !== 'assistant/message' || event.seq <= rewoundAt) continue;
+    const { turnId, messageCursor, text, reasoning, toolCalls } = event.payload ?? {};
+    if (typeof turnId !== 'string' || typeof messageCursor !== 'number' || !Number.isSafeInteger(messageCursor) || messageCursor <= historyTail) continue;
+    if (snapshotCursors.has(messageCursor)) continue;
+    snapshotCursors.add(messageCursor);
+    if (event.seq > snapshotSeq) justArrived.add(messageCursor);
+    pendingMessages.push({
+      cursor: messageCursor, sequence: messageCursor, sessionId, turnId, type: 'assistant/message',
+      text: typeof text === 'string' ? text : '', reasoning: typeof reasoning === 'string' ? reasoning : undefined,
+      toolCalls: Array.isArray(toolCalls) ? toolCalls : undefined,
+    });
+  }
+  if (pendingMessages.length) items = [...items, ...pendingMessages.sort((a, b) => a.cursor - b.cursor)];
   const exchanges: Exchange[] = [];
   const byTurn = new Map<string, Exchange>();
   const tools = new Map<string, DirectToolActivity>();
   const timing = new Map<string, DirectTurnTiming>();
   let latestStartedTurn: string | undefined;
   let latestStartedAt = -Infinity;
-  const turnEvents = (options.events ?? []).filter((event) => event.type === 'turn/started' || isDirectTurnEnd(event.type))
+  const turnEvents = events.filter((event) => event.type === 'turn/started' || isDirectTurnEnd(event.type))
     .sort((a, b) => a.timestamp - b.timestamp || (a.seq ?? 0) - (b.seq ?? 0));
   for (const event of turnEvents) {
     const { turnId, durationMs } = event.payload ?? {};
@@ -164,7 +193,7 @@ export function groupDirectMessages(sessionId: string, input: string, items: Ses
       const key = stepId(exchange);
       lastAssistant.set(turnScope(exchange), item);
       if (item.reasoning?.trim()) phase(exchange).items.push({ kind: 'reasoning', id: id('reasoning', key), text: item.reasoning });
-      if (item.text?.trim()) exchange.blocks.push({ kind: 'message', id: key, text: item.text });
+      if (item.text?.trim()) exchange.blocks.push({ kind: 'message', id: key, text: item.text, justArrived: justArrived.has(item.cursor) });
       for (const call of item.toolCalls ?? []) tool(exchange, call.id, call.name, call.arguments);
     } else {
       const row = tool(exchange, item.callId || id('history-call', item.cursor), item.name);
@@ -190,37 +219,45 @@ export function groupDirectMessages(sessionId: string, input: string, items: Ses
     if (active) {
       active.active = true;
       active.timing ??= timing.get(active.turnId ?? '');
-      const live = options.liveStream;
-      const persisted = lastAssistant.get(turnScope(active));
-      const alreadySaved = persisted && (persisted.text ?? '') === live?.text && (persisted.reasoning ?? '') === live.reasoning;
-      if (live && (!live.turnId || live.turnId === active.turnId) && !alreadySaved) {
-        const key = stepId(active);
-        if (live.reasoning.trim()) phase(active).items.push({ kind: 'reasoning', id: id('reasoning', key), text: live.reasoning, live: true });
-        if (live.text.trim()) active.blocks.push({ kind: 'message', id: key, text: live.text, live: true });
-      }
+    }
+  }
+
+  const live = options.liveStream;
+  const streamedExchange = live?.settled && live.turnId ? byTurn.get(live.turnId) : active;
+  if (live && streamedExchange && (!live.turnId || live.turnId === streamedExchange.turnId)) {
+    const persisted = lastAssistant.get(turnScope(streamedExchange));
+    const alreadySaved = persisted && (live.afterAssistantCursor !== undefined
+      ? persisted.cursor > live.afterAssistantCursor
+      : (persisted.text ?? '') === live.text && (persisted.reasoning ?? '') === live.reasoning);
+    if (!alreadySaved) {
+      const key = stepId(streamedExchange);
+      if (live.reasoning.trim()) phase(streamedExchange).items.push({ kind: 'reasoning', id: id('reasoning', key), text: live.reasoning, live: !live.settled });
+      if (live.text.trim()) streamedExchange.blocks.push({ kind: 'message', id: key, text: live.text, live: !live.settled });
     }
   }
 
   // Runtime events can reach the UI before the next REST history fetch. Enrich an existing
   // call in place, or use the same call identity for a temporary row until its history lands.
-  for (const event of options.events ?? []) {
+  for (const event of events) {
     if (event.type !== 'tool/call' && event.type !== 'tool/result') continue;
     const { turnId, callId, name, arguments: args, output, isError, durationMs } = event.payload ?? {};
     if (typeof turnId !== 'string' || typeof callId !== 'string' || !callId) continue;
     const exchange = byTurn.get(turnId);
     if (!exchange) continue;
-    if (exchange !== active && !tools.has(id('tool', turnKey(turnId), callId))) continue;
+    if (exchange !== active && !tools.has(id('tool', turnKey(turnId), callId)) && !(event.seq > Math.max(snapshotSeq, rewoundAt))) continue;
     const row = tool(exchange, callId, typeof name === 'string' ? name : undefined,
       typeof args === 'string' || (args && typeof args === 'object' && !Array.isArray(args)) ? args as DirectToolActivity['args'] : undefined);
     if (event.type === 'tool/result' && row.status === 'interrupted') {
       row.status = isError ? 'failed' : 'completed';
-      if (typeof output === 'string') row.output = output;
+      const buffered = options.liveToolOutputs?.find((entry) => entry.turnId === turnId && entry.callId === callId)?.text;
+      if (typeof output === 'string') row.output = buffered && output.length < buffered.length ? buffered : output;
+      else if (buffered) row.output = buffered;
       if (typeof durationMs === 'number') row.durationMs = durationMs;
     }
   }
 
   // Receipt facts take priority over the shell output's display-only exit prefix.
-  for (const event of options.events ?? []) {
+  for (const event of events) {
     if (event.type !== 'tool/receipt') continue;
     const { turnId, callId, exitCode } = event.payload ?? {};
     if (typeof turnId !== 'string' || typeof callId !== 'string' || typeof exitCode !== 'number') continue;

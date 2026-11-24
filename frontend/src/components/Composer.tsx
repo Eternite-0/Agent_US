@@ -1,7 +1,8 @@
 import { resolveComposerDraft, type ComposerMode } from '../utils/composerMode';
 import { PromptCacheStatus } from './PromptCacheStatus';
 import { isSwarmCommand, swarmAttachmentError } from '../utils/swarmCommand';
-import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
+import type { ComposerDraft, ComposerDraftStore } from '../utils/threadInteraction';
+import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type {
   GitStatus,
   CodexMode,
@@ -13,7 +14,10 @@ import type {
   Project,
 } from '../types/backend';
 import { commandGroups, findSlashCommand, matchesSlashCommand, type CommandAvailability, type MentionExtension, type SlashCommand } from './slashCommands';
+import { usePresence, usePresenceSnapshot } from '../hooks/usePresence';
 import { ComposerDialog, SketchDialog } from './ComposerDialog';
+import { PresenceDiv } from './PresenceDiv';
+import './composer-motion.css';
 import { encodeUtf8Base64 } from '../utils/diff';
 import { isImagePath, toImageDataUrl } from './ImageLightbox';
 import {
@@ -21,7 +25,6 @@ import {
   IconArrowUp,
   IconBranch,
   IconCheck,
-  IconChevronDown,
   IconChevronRight,
   IconCircleClose,
   IconAgentTeam,
@@ -46,6 +49,7 @@ import {
 
 interface ComposerProps {
   variant: 'home' | 'thread';
+  draftStore: ComposerDraftStore;
   codexMode: CodexMode;
   projects: Project[];
   selectedProject: Project | null;
@@ -89,8 +93,57 @@ const EFFORT_STOPS: Array<{ id: EffortLevel; label: string }> = [
 
 type PopoverKind = null | 'project' | 'env' | 'branch' | 'permission' | 'effort' | 'models';
 
+function updateComposerHeight(input: HTMLTextAreaElement, probe: HTMLTextAreaElement) {
+  const { minHeight, maxHeight } = getComputedStyle(input);
+  const next = `${Math.max(parseFloat(minHeight), Math.min(probe.scrollHeight, parseFloat(maxHeight)))}px`;
+  if (input.style.height !== next) input.style.height = next;
+}
+
+function AttachmentChip({ name, data, onRemove, onExited }: {
+  name: string;
+  data: string | undefined;
+  onRemove: () => void;
+  onExited: () => void;
+}) {
+  const open = data !== undefined;
+  const ref = useRef<HTMLSpanElement>(null);
+  const present = usePresence(open, ref, onExited);
+  const visibleData = usePresenceSnapshot(open, data);
+  if (!present) return null;
+  const imgUrl = visibleData && isImagePath(name) ? toImageDataUrl(name, visibleData) : null;
+  return (
+    <span ref={ref} className="codex-attach-chip" data-image={imgUrl ? 'true' : undefined}
+      data-presence={open ? 'open' : 'exiting'} inert={!open} aria-hidden={!open || undefined}>
+      {imgUrl ? <img src={imgUrl} alt={name} className="composer-image-preview" />
+        : <IconFileDoc size={13} style={{ color: 'var(--text-tertiary)' }} />}
+      <span>{name}</span>
+      <button type="button" aria-label={`移除 ${name}`} onClick={open ? onRemove : undefined}><IconClose size={12} /></button>
+    </span>
+  );
+}
+
+function ComposerAttachments({ files, onRemove }: {
+  files: ComposerDraft['files'];
+  onRemove: (name: string) => void;
+}) {
+  const [tracked, setTracked] = useState(() => ({ files, keys: Object.keys(files) }));
+  if (tracked.files !== files) {
+    // Keep removed keys in their existing positions just long enough to paint the exit.
+    setTracked({ files, keys: [...new Set([...tracked.keys, ...Object.keys(files)])] });
+  }
+  if (!tracked.keys.length) return null;
+  return (
+    <div className="codex-composer-attachments">
+      {tracked.keys.map((name) => <AttachmentChip key={name} name={name} data={Object.hasOwn(files, name) ? files[name] : undefined}
+        onRemove={() => onRemove(name)} onExited={() => setTracked((before) => Object.hasOwn(before.files, name)
+          ? before : { ...before, keys: before.keys.filter((key) => key !== name) })} />)}
+    </div>
+  );
+}
+
 export const Composer: React.FC<ComposerProps> = ({
   variant,
+  draftStore,
   codexMode,
   projects,
   selectedProject,
@@ -106,7 +159,7 @@ export const Composer: React.FC<ComposerProps> = ({
   mentionSkills = [],
   draftInjection = null,
   isRunning = false,
-  submitting = false,
+  submitting: externalSubmitPending = false,
   onSelectProject,
   onOpenCreateProject,
   onSelectModel,
@@ -123,11 +176,14 @@ export const Composer: React.FC<ComposerProps> = ({
   onSubmit,
   onStop,
 }) => {
-  const [text, setText] = useState('');
-  const [draftMode, setDraftMode] = useState<'swarm' | 'goal' | null>(null);
+  const snapshot = useSyncExternalStore(draftStore.subscribe, draftStore.read);
+  const sendingDraft = useSyncExternalStore(draftStore.subscribe, draftStore.isSending);
+  const submitting = externalSubmitPending || sendingDraft;
+  const { text, files, mode: draftMode } = snapshot;
+  const setText = (next: React.SetStateAction<ComposerDraft['text']>) => draftStore.update('text', next);
+  const setFiles = (next: React.SetStateAction<ComposerDraft['files']>) => draftStore.update('files', next);
+  const setDraftMode = (next: ComposerDraft['mode']) => draftStore.update('mode', next);
   const activeMode = draftMode ?? (codexMode === 'Work' ? 'plan' : null);
-  const sendingRef = useRef(false);
-  const [files, setFiles] = useState<Record<string, string>>({});
   const [popover, setPopover] = useState<PopoverKind>(null);
   const [dragging, setDragging] = useState(false);
   const [projectSearch, setProjectSearch] = useState('');
@@ -151,16 +207,20 @@ export const Composer: React.FC<ComposerProps> = ({
   const menuId = useId();
   const modelTrigger = useRef<HTMLButtonElement>(null);
   const permissionTrigger = useRef<HTMLButtonElement>(null);
+  const projectTrigger = useRef<HTMLDivElement>(null);
+  const branchTrigger = useRef<HTMLButtonElement>(null);
+  const envTrigger = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const heightProbe = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!draftInjection) return;
-    setText((prev) =>
+    if (!draftInjection || !draftStore.consumeInjection(draftInjection)) return;
+    draftStore.update('text', (prev) =>
       draftInjection.mode === 'replace'
         ? draftInjection.text
         : prev.trim()
@@ -169,21 +229,34 @@ export const Composer: React.FC<ComposerProps> = ({
 ${draftInjection.text}`
           : draftInjection.text,
     );
-    window.setTimeout(() => {
+    const timer = window.setTimeout(() => {
       const el = textareaRef.current;
       if (el) {
         el.focus();
         el.setSelectionRange(el.value.length, el.value.length);
       }
     }, 10);
-  }, [draftInjection]);
+    return () => window.clearTimeout(timer);
+  }, [draftInjection, draftStore]);
 
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, window.innerHeight * 0.25)}px`;
+  useLayoutEffect(() => {
+    if (textareaRef.current && heightProbe.current) updateComposerHeight(textareaRef.current, heightProbe.current);
   }, [text]);
+
+  useLayoutEffect(() => {
+    const input = textareaRef.current;
+    const probe = heightProbe.current;
+    if (!input || !probe) return;
+    const measure = () => updateComposerHeight(input, probe);
+    // The probe's width changes with wrapping space; its height never changes during the transition.
+    const observer = new ResizeObserver(measure);
+    observer.observe(probe);
+    window.addEventListener('resize', measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, []);
 
   const slashQuery = !menuDismissed && !addContextOpen && onSlashCommand && /^\/[\p{L}\p{N}_?-]*$/u.test(text.trimStart())
     ? text.trimStart().toLowerCase() : null;
@@ -294,6 +367,7 @@ ${draftInjection.text}`
   const menuIsOpen = slashQuery !== null || Boolean(mentionToken);
   useEffect(() => { setMenuHighlight(null); }, [text, mentionQuery, workspaceResults]);
   useEffect(() => {
+    if (!menuIsOpen) return;
     const row = menuRef.current?.querySelector<HTMLElement>('[data-selected="true"]');
     const options = menuRef.current?.querySelector('.composer-picker-options');
     if (!row || !options) return;
@@ -301,7 +375,7 @@ ${draftInjection.text}`
     const bounds = options.getBoundingClientRect();
     if (rowBounds.top < bounds.top) options.scrollTop += rowBounds.top - bounds.top;
     if (rowBounds.bottom > bounds.bottom) options.scrollTop += rowBounds.bottom - bounds.bottom;
-  }, [selectedIndex, slashQuery, menuCount]);
+  }, [menuIsOpen, selectedIndex, slashQuery, menuCount]);
 
   useEffect(() => {
     if (!popover && !menuIsOpen) return;
@@ -313,11 +387,19 @@ ${draftInjection.text}`
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || e.defaultPrevented || !popover) return;
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (menuIsOpen) {
+        setAddContextOpen(false);
+        setMenuDismissed(true);
+      }
+      if (!popover) return;
       // Preserve Escape dismissal even when a pointer-opened menu did not take focus.
       if (rootRef.current?.contains(document.activeElement)) {
         if (popover === 'effort' || popover === 'models') modelTrigger.current?.focus({ preventScroll: true });
         if (popover === 'permission') permissionTrigger.current?.focus({ preventScroll: true });
+        if (popover === 'project') projectTrigger.current?.focus({ preventScroll: true });
+        if (popover === 'branch') branchTrigger.current?.focus({ preventScroll: true });
+        if (popover === 'env') envTrigger.current?.focus({ preventScroll: true });
       }
       setPopover(null);
     };
@@ -329,11 +411,10 @@ ${draftInjection.text}`
     };
   }, [popover, menuIsOpen]);
 
-  const pendingFileReads = useRef(0);
   const attachFileList = async (list: FileList | File[]) => {
     const arr = Array.from(list).slice(0, 12);
     if (!arr.length) return;
-    pendingFileReads.current++;
+    const finishRead = draftStore.startFileRead();
     const next: Record<string, string> = {};
     for (const f of arr) {
       try {
@@ -360,7 +441,7 @@ ${draftInjection.text}`
         setCommandError(`无法读取附件 ${f.name}`);
       }
     }
-    pendingFileReads.current--;
+    finishRead();
     setFiles((previous) => ({ ...previous, ...next }));
   };
 
@@ -513,15 +594,13 @@ ${draftInjection.text}`
   };
 
   const clearDraft = () => {
-    setText('');
+    if (!draftStore.clearIfUnchanged(snapshot)) return;
     setCaret(0);
-    setFiles({});
-    setDraftMode(null);
     setMenuDismissed(true);
   };
 
   const handleSend = async () => {
-    if (submitting || permissionPending || sendingRef.current) return;
+    if (submitting || permissionPending || draftStore.isSending()) return;
     const draft = resolveComposerDraft(text, activeMode);
     if (draft.kind === 'empty') return;
     if (slashQuery !== null && slashMatches.length > 0 && !exactSlash) {
@@ -543,13 +622,13 @@ ${draftInjection.text}`
     const blocked = (swarm && (swarmAttachmentError(draft.body, files) || commandAvailability?.['/swarm']))
       || (draft.kind === 'goal' && ((!onSubmitGoal ? '当前连接未提供自主任务' : undefined) || commandAvailability?.['/goal']
         || (isRunning ? '请等待当前对话执行结束' : undefined)));
-    if (blocked || pendingFileReads.current > 0) {
+    if (blocked || draftStore.hasPendingFileReads()) {
       setCommandError(blocked || '请等待附件读取完成。');
       return;
     }
     setCommandError('');
     const attached = { ...files };
-    sendingRef.current = true;
+    draftStore.setSending(true);
     try {
       if (draft.kind === 'goal') {
         if (await onSubmitGoal?.(draft.body, attached)) clearDraft();
@@ -557,7 +636,7 @@ ${draftInjection.text}`
         clearDraft();
       }
     } finally {
-      sendingRef.current = false;
+      draftStore.setSending(false);
     }
   };
 
@@ -620,7 +699,6 @@ ${draftInjection.text}`
     : activeMode === 'goal' ? '提交目标' : activeMode === 'plan' ? '提交计划请求'
       : isRunning ? '实时注入纠偏指令' : '发送消息';
   const displayModel = selectedModel || models[0]?.model || 'Auto Router';
-  const attachedKeys = Object.keys(files);
   const filteredProjects = projects.filter((p) =>
     p.name.toLowerCase().includes(projectSearch.trim().toLowerCase()),
   );
@@ -750,6 +828,7 @@ ${draftInjection.text}`
           aria-label={branchTitle}
           aria-expanded={popover === 'branch'}
           aria-haspopup="dialog"
+          ref={branchTrigger}
           onClick={() => openBranchPopover()}
         >
           <IconBranch size={14} style={{ flex: 'none' }} />
@@ -763,225 +842,198 @@ ${draftInjection.text}`
           )}
         </button>
 
-        {popover === 'branch' && (
-          <div
+        <PresenceDiv open={popover === 'branch'} focusOnOpen="[data-composer-autofocus]"
             className="codex-popover codex-branch-popover"
             data-side="top"
             style={{ left: 0 }}
             role="dialog"
             aria-label="切换或创建 Git 分支"
           >
-            <div className="codex-project-popover-search">
-              <IconSearch size={14} style={{ flex: 'none' }} />
-              <input
-                autoFocus={!creatingBranch}
-                placeholder={selectedProject ? `搜索${selectedProject.name}分支` : '搜索分支'}
-                value={branchSearch}
-                onChange={(e) => {
-                  setBranchSearch(e.target.value);
-                  setBranchError('');
-                }}
-              />
-            </div>
+          <div className="codex-project-popover-search">
+            <IconSearch size={14} style={{ flex: 'none' }} />
+            <input
+              data-composer-autofocus={!creatingBranch || undefined}
+              placeholder={selectedProject ? `搜索${selectedProject.name}分支` : '搜索分支'}
+              value={branchSearch}
+              onChange={(e) => {
+                setBranchSearch(e.target.value);
+                setBranchError('');
+              }}
+            />
+          </div>
 
-            <div className="codex-branch-section-label">分支</div>
+          <div className="codex-branch-section-label">分支</div>
 
-            <div className="codex-branch-list">
-              {filteredBranches.map((b) => {
-                const isCurrent = b === branchText;
-                return (
-                  <button
-                    key={b}
-                    type="button"
-                    className="codex-branch-item"
-                    data-selected={isCurrent ? 'true' : undefined}
-                    disabled={branchBusy}
-                    onClick={() => void handleBranchCheckout(b, false)}
-                  >
-                    <span className="codex-branch-item-left">
-                      <IconBranch size={14} style={{ flex: 'none', marginTop: 2, color: 'var(--text-secondary)' }} />
-                      <span className="codex-branch-item-copy">
-                        <span className="codex-branch-item-name">{b}</span>
-                        {isCurrent && isDirty && (
-                          <span className="codex-branch-item-sub">
-                            {uncommittedCount !== undefined
-                              ? `未提交: ${uncommittedCount} 个文件`
-                              : '工作区有未提交修改'}
-                          </span>
-                        )}
-                      </span>
-                    </span>
-                    {isCurrent && <IconCheck size={14} style={{ flex: 'none', color: 'var(--text-default)' }} />}
-                  </button>
-                );
-              })}
-
-              {!filteredBranches.length && (
-                <div className="codex-branch-empty">未找到匹配分支</div>
-              )}
-            </div>
-
-            {branchError && (
-              <div className="codex-branch-error" role="alert">
-                {branchError}
-              </div>
-            )}
-
-            <div className="codex-project-popover-footer">
-              {creatingBranch ? (
-                <form
-                  className="codex-branch-create-form"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    void handleBranchCheckout(newBranchName, true);
-                  }}
+          <div className="codex-branch-list">
+            {filteredBranches.map((b) => {
+              const isCurrent = b === branchText;
+              return (
+                <button
+                  key={b}
+                  type="button"
+                  className="codex-branch-item"
+                  data-selected={isCurrent ? 'true' : undefined}
+                  disabled={branchBusy}
+                  onClick={() => void handleBranchCheckout(b, false)}
                 >
-                  <input
-                    autoFocus
-                    className="codex-branch-create-input"
-                    placeholder="输入新分支名称，如 feat/new-ui"
-                    value={newBranchName}
+                  <span className="codex-branch-item-left">
+                    <IconBranch size={14} style={{ flex: 'none', marginTop: 2, color: 'var(--text-secondary)' }} />
+                    <span className="codex-branch-item-copy">
+                      <span className="codex-branch-item-name">{b}</span>
+                      {isCurrent && isDirty && (
+                        <span className="codex-branch-item-sub">
+                          {uncommittedCount !== undefined
+                            ? `未提交: ${uncommittedCount} 个文件`
+                            : '工作区有未提交修改'}
+                        </span>
+                      )}
+                    </span>
+                  </span>
+                  {isCurrent && <IconCheck size={14} style={{ flex: 'none', color: 'var(--text-default)' }} />}
+                </button>
+              );
+            })}
+
+            {!filteredBranches.length && (
+              <div className="codex-branch-empty">未找到匹配分支</div>
+            )}
+          </div>
+
+          {branchError && (
+            <div className="codex-branch-error" role="alert">
+              {branchError}
+            </div>
+          )}
+
+          <div className="codex-project-popover-footer">
+            {creatingBranch ? (
+              <form
+                className="codex-branch-create-form"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void handleBranchCheckout(newBranchName, true);
+                }}
+              >
+                <input
+                  autoFocus
+                  className="codex-branch-create-input"
+                  placeholder="输入新分支名称，如 feat/new-ui"
+                  value={newBranchName}
+                  disabled={branchBusy}
+                  onChange={(e) => {
+                    setNewBranchName(e.target.value);
+                    setBranchError('');
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      e.stopPropagation();
+                      setCreatingBranch(false);
+                      setBranchError('');
+                    }
+                  }}
+                />
+                <div className="codex-branch-create-actions">
+                  <button
+                    type="button"
+                    className="codex-branch-cancel-btn"
                     disabled={branchBusy}
-                    onChange={(e) => {
-                      setNewBranchName(e.target.value);
+                    onClick={() => {
+                      setCreatingBranch(false);
                       setBranchError('');
                     }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Escape') {
-                        e.stopPropagation();
-                        setCreatingBranch(false);
-                        setBranchError('');
-                      }
-                    }}
-                  />
-                  <div className="codex-branch-create-actions">
-                    <button
-                      type="button"
-                      className="codex-branch-cancel-btn"
-                      disabled={branchBusy}
-                      onClick={() => {
-                        setCreatingBranch(false);
-                        setBranchError('');
-                      }}
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="submit"
-                      className="codex-branch-submit-btn"
-                      disabled={!newBranchName.trim() || branchBusy}
-                    >
-                      {branchBusy ? '创建中...' : '创建并检出'}
-                    </button>
-                  </div>
-                </form>
-              ) : (
-                <button
-                  type="button"
-                  className="codex-popover-item"
-                  disabled={branchBusy}
-                  onClick={() => {
-                    setCreatingBranch(true);
-                    setBranchError('');
-                    setNewBranchName(branchSearch.trim());
-                  }}
-                >
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                    <IconPlus size={14} />
-                    <span>创建并检出新分支...</span>
-                  </span>
-                </button>
-              )}
-            </div>
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    className="codex-branch-submit-btn"
+                    disabled={!newBranchName.trim() || branchBusy}
+                  >
+                    {branchBusy ? '创建中...' : '创建并检出'}
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <button
+                type="button"
+                className="codex-popover-item"
+                disabled={branchBusy}
+                onClick={() => {
+                  setCreatingBranch(true);
+                  setBranchError('');
+                  setNewBranchName(branchSearch.trim());
+                }}
+              >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                  <IconPlus size={14} />
+                  <span>创建并检出新分支...</span>
+                </span>
+              </button>
+            )}
           </div>
-        )}
+        </PresenceDiv>
       </div>
     );
   };
 
   return (
-    <div className="codex-composer-wrap" ref={rootRef}>
+    <div className="codex-composer-wrap" data-variant={variant} data-context-tray={showHomeTray || undefined} ref={rootRef}>
       {commandError && <p className="composer-command-error" role="status">{commandError}</p>}
       {/* Slash Command Popover */}
-      {menuIsOpen && (
-        <div className="codex-slash-menu" ref={menuRef}>
-          <div className="composer-picker-heading" aria-hidden="true">
-            {slashQuery !== null ? '快捷命令' : '添加上下文'}
-            <span className="composer-picker-keys"><kbd>↑</kbd><kbd>↓</kbd><kbd>↵</kbd><kbd>Esc</kbd></span>
-          </div>
-          <div id={menuId} className="composer-picker-options" role="listbox" aria-label={slashQuery !== null ? '快捷命令' : '添加上下文'}>
-            {slashGroups.map(({ label, commands }) => (
-              <div key={label} role="group" aria-label={label || '常用命令'} className="composer-command-group">
-                {label && <div className="composer-command-label" aria-hidden="true">{label}</div>}
-                {commands.map((item) => {
-                  const index = slashMatches.indexOf(item);
-                  const blocked = commandBlock(item);
-                  return <button key={item.cmd} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
-                    aria-label={`${item.cmd} ${item.title ?? ''} ${blocked || item.desc}`} aria-disabled={Boolean(blocked)} aria-selected={index === selectedIndex}
-                    data-selected={index === selectedIndex ? 'true' : undefined}
-                    className="codex-popover-item composer-picker-row composer-command-row"
-                    onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
-                    onClick={() => executeSlash(item)}>
-                    <item.icon size={15} aria-hidden="true" />
-                    <span className="composer-command-text">
-                      <strong>{item.title ?? item.cmd}</strong>
-                      <small>{blocked || (item.cmd === '/effort' ? effortMeta.label : item.cmd === '/model' ? displayModel : item.desc)}</small>
-                    </span>
-                    {item.title && <small className="composer-command-alias" aria-hidden="true">{item.cmd}</small>}
-                    {(item.opensOptions || item.popover) && <IconChevronRight size={13} aria-hidden="true" />}
-                  </button>;
-                })}
-              </div>
-            ))}
-            {mentionGroups.map(({ label, items }) => (
-              <div key={label} role="group" aria-label={label} className="composer-command-group">
-                {label !== '添加' && <div className="composer-command-label" aria-hidden="true">{label}</div>}
-                {items.map((item) => {
-                  const index = mentionItems.indexOf(item);
-                  return <button key={item.id} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
-                    aria-label={item.description ? `${item.label} ${item.description}` : item.label}
-                    aria-disabled={item.disabled || undefined} aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
-                    className="codex-popover-item composer-picker-row composer-command-row"
-                    onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
-                    onClick={() => insertMention(item)}>
-                    {item.iconUrl ? <img className="composer-plugin-icon" src={item.iconUrl} alt="" /> : <item.icon size={15} aria-hidden="true" style={item.color ? { color: item.color } : undefined} />}
-                    <span className="composer-command-text"><strong title={item.label}>{item.label}</strong>{item.description && <small title={item.description}>{item.description}</small>}</span>
-                    {item.action === 'files' && <IconChevronRight size={13} aria-hidden="true" />}
-                  </button>;
-                })}
-              </div>
-            ))}
-          </div>
-          {slashQuery !== null && !slashMatches.length && <div className="composer-picker-state">没有匹配的命令。按 Esc 可继续输入正文。</div>}
-          {canSearchFiles && searchMentionFiles && !workspaceResults && <div className="composer-picker-state" role="status">正在查找工作区文件…</div>}
-          {canSearchFiles && workspaceResults?.failed && <div className="composer-picker-state" role="status">工作区文件搜索失败。</div>}
-          {mentionToken && !mentionItems.length && (!canSearchFiles || !searchMentionFiles || workspaceResults && !workspaceResults.failed) &&
-            <div className="composer-picker-state">没有匹配的{mentionToken.scope === 'file' ? '文件' : '引用'}。</div>}
+      <PresenceDiv open={menuIsOpen} className="codex-slash-menu" elementRef={menuRef}>
+        <div className="composer-picker-heading" aria-hidden="true">
+          {slashQuery !== null ? '快捷命令' : '添加上下文'}
+          <span className="composer-picker-keys"><kbd>↑</kbd><kbd>↓</kbd><kbd>↵</kbd><kbd>Esc</kbd></span>
         </div>
-      )}
-
-      {/* Main Rounded Composer Surface with Drag & Drop */}
-      <div
-        className="codex-composer-card"
-        data-dragging={dragging ? 'true' : undefined}
-        onDragOver={(e) => {
-          e.preventDefault();
-          if (!dragging) setDragging(true);
-        }}
-        onDragLeave={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-            setDragging(false);
-          }
-        }}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDragging(false);
-          if (e.dataTransfer.files?.length) {
-            void attachFileList(e.dataTransfer.files);
-          }
-        }}
-      >
-        {dragging && <div className="codex-drop-overlay">松开即可附加文件到工作区</div>}
+        <div id={menuId} className="composer-picker-options" role="listbox" aria-label={slashQuery !== null ? '快捷命令' : '添加上下文'}>
+          {slashGroups.map(({ label, commands }) => (
+            <div key={label} role="group" aria-label={label || '常用命令'} className="composer-command-group">
+              {label && <div className="composer-command-label" aria-hidden="true">{label}</div>}
+              {commands.map((item) => {
+                const index = slashMatches.indexOf(item);
+                const blocked = commandBlock(item);
+                return <button key={item.cmd} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
+                  aria-label={`${item.cmd} ${item.title ?? ''} ${blocked || item.desc}`} aria-disabled={Boolean(blocked)} aria-selected={index === selectedIndex}
+                  data-selected={index === selectedIndex ? 'true' : undefined}
+                  className="codex-popover-item composer-picker-row composer-command-row"
+                  onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
+                  onClick={() => executeSlash(item)}>
+                  <item.icon size={15} aria-hidden="true" />
+                  <span className="composer-command-text">
+                    <strong>{item.title ?? item.cmd}</strong>
+                    <small>{blocked || (item.cmd === '/effort' ? effortMeta.label : item.cmd === '/model' ? displayModel : item.desc)}</small>
+                  </span>
+                  {item.title && <small className="composer-command-alias" aria-hidden="true">{item.cmd}</small>}
+                  {(item.opensOptions || item.popover) && <IconChevronRight size={13} aria-hidden="true" />}
+                </button>;
+              })}
+            </div>
+          ))}
+          {mentionGroups.map(({ label, items }) => (
+            <div key={label} role="group" aria-label={label} className="composer-command-group">
+              {label !== '添加' && <div className="composer-command-label" aria-hidden="true">{label}</div>}
+              {items.map((item) => {
+                const index = mentionItems.indexOf(item);
+                return <button key={item.id} id={`${menuId}-${index}`} type="button" role="option" tabIndex={-1}
+                  aria-label={item.description ? `${item.label} ${item.description}` : item.label}
+                  aria-disabled={item.disabled || undefined} aria-selected={index === selectedIndex} data-selected={index === selectedIndex ? 'true' : undefined}
+                  className="codex-popover-item composer-picker-row composer-command-row"
+                  onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setMenuHighlight(index)}
+                  onClick={() => insertMention(item)}>
+                  {item.iconUrl ? <img className="composer-plugin-icon" src={item.iconUrl} alt="" /> : <item.icon size={15} aria-hidden="true" style={item.color ? { color: item.color } : undefined} />}
+                  <span className="composer-command-text"><strong title={item.label}>{item.label}</strong>{item.description && <small title={item.description}>{item.description}</small>}</span>
+                  {item.action === 'files' && <IconChevronRight size={13} aria-hidden="true" />}
+                </button>;
+              })}
+            </div>
+          ))}
+        </div>
+        {slashQuery !== null && !slashMatches.length && <div className="composer-picker-state">没有匹配的命令。按 Esc 可继续输入正文。</div>}
+        {canSearchFiles && searchMentionFiles && !workspaceResults && <div className="composer-picker-state" role="status">正在查找工作区文件…</div>}
+        {canSearchFiles && workspaceResults?.failed && <div className="composer-picker-state" role="status">工作区文件搜索失败。</div>}
+        {mentionToken && !mentionItems.length && (!canSearchFiles || !searchMentionFiles || workspaceResults && !workspaceResults.failed) &&
+          <div className="composer-picker-state">没有匹配的{mentionToken.scope === 'file' ? '文件' : '引用'}。</div>}
+      </PresenceDiv>
 
         {/* Workspace context controls */}
         {showHomeTray && (
@@ -995,6 +1047,8 @@ ${draftInjection.text}`
                 role="button"
                 tabIndex={0}
                 className="codex-project-pill"
+                ref={projectTrigger}
+                aria-expanded={popover === 'project'}
                 data-open={popover === 'project' ? 'true' : undefined}
                 data-has-project={selectedProject ? 'true' : undefined}
                 onClick={() => {
@@ -1032,88 +1086,86 @@ ${draftInjection.text}`
                 <span>{selectedProject?.name || '选择项目'}</span>
               </div>
 
-              {popover === 'project' && (
-                <div
+              <PresenceDiv open={popover === 'project'} focusOnOpen="[data-composer-autofocus]"
                   className="codex-popover codex-project-popover"
                   data-side="top"
                   style={{ left: 0 }}
                 >
-                  <div className="codex-project-popover-search">
-                    <IconSearch size={14} style={{ flex: 'none' }} />
-                    <input
-                      autoFocus
-                      placeholder="搜索项目"
-                      value={projectSearch}
-                      onChange={(e) => setProjectSearch(e.target.value)}
-                    />
-                  </div>
-                  <div className="codex-project-popover-list">
-                    {filteredProjects.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        className="codex-popover-item"
-                        data-selected={selectedProject?.id === p.id ? 'true' : undefined}
-                        onClick={() => {
-                          onSelectProject(p.id);
-                          setPopover(null);
-                        }}
-                      >
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                          <IconFolder size={14} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
-                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {p.name}
-                          </span>
-                        </span>
-                        {selectedProject?.id === p.id && <IconCheck size={14} />}
-                      </button>
-                    ))}
-                    {!filteredProjects.length && (
-                      <div
-                        style={{
-                          padding: '10px 10px',
-                          fontSize: 12.5,
-                          color: 'var(--text-tertiary)',
-                          textAlign: 'center',
-                        }}
-                      >
-                        未找到匹配项目
-                      </div>
-                    )}
-                  </div>
-                  <div className="codex-project-popover-footer">
-                    {onOpenCreateProject && (
-                      <button
-                        type="button"
-                        className="codex-popover-item"
-                        onClick={() => {
-                          setPopover(null);
-                          onOpenCreateProject();
-                        }}
-                      >
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                          <IconPlus size={14} />
-                          <span>新建项目</span>
-                        </span>
-                      </button>
-                    )}
+                <div className="codex-project-popover-search">
+                  <IconSearch size={14} style={{ flex: 'none' }} />
+                  <input
+                    data-composer-autofocus
+                    placeholder="搜索项目"
+                    value={projectSearch}
+                    onChange={(e) => setProjectSearch(e.target.value)}
+                  />
+                </div>
+                <div className="codex-project-popover-list">
+                  {filteredProjects.map((p) => (
                     <button
+                      key={p.id}
                       type="button"
                       className="codex-popover-item"
-                      style={{ color: 'var(--text-secondary)' }}
+                      data-selected={selectedProject?.id === p.id ? 'true' : undefined}
                       onClick={() => {
-                        onSelectProject(null);
+                        onSelectProject(p.id);
                         setPopover(null);
                       }}
                     >
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                        <IconFolder size={14} style={{ color: 'var(--text-secondary)', flex: 'none' }} />
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {p.name}
+                        </span>
+                      </span>
+                      {selectedProject?.id === p.id && <IconCheck size={14} />}
+                    </button>
+                  ))}
+                  {!filteredProjects.length && (
+                    <div
+                      style={{
+                        padding: '10px 10px',
+                        fontSize: 12.5,
+                        color: 'var(--text-tertiary)',
+                        textAlign: 'center',
+                      }}
+                    >
+                      未找到匹配项目
+                    </div>
+                  )}
+                </div>
+                <div className="codex-project-popover-footer">
+                  {onOpenCreateProject && (
+                    <button
+                      type="button"
+                      className="codex-popover-item"
+                      onClick={() => {
+                        setPopover(null);
+                        onOpenCreateProject();
+                      }}
+                    >
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                        <IconClose size={14} />
-                        <span>不在项目中工作</span>
+                        <IconPlus size={14} />
+                        <span>新建项目</span>
                       </span>
                     </button>
-                  </div>
+                  )}
+                  <button
+                    type="button"
+                    className="codex-popover-item"
+                    style={{ color: 'var(--text-secondary)' }}
+                    onClick={() => {
+                      onSelectProject(null);
+                      setPopover(null);
+                    }}
+                  >
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                      <IconClose size={14} />
+                      <span>不在项目中工作</span>
+                    </span>
+                  </button>
                 </div>
-              )}
+              </PresenceDiv>
             </div>
 
             {hasGitRepo && (
@@ -1121,28 +1173,51 @@ ${draftInjection.text}`
                 <button
                   type="button"
                   className="codex-tray-item"
+                  ref={envTrigger}
+                  aria-expanded={popover === 'env'}
                   onClick={() => setPopover((p) => (p === 'env' ? null : 'env'))}
                 >
                   <IconLaptop size={14} />
                   <span>本地</span>
                 </button>
 
-                {popover === 'env' && (
-                  <div className="codex-popover" data-side="top" style={{ left: 0, width: 268, padding: 10 }}>
-                    <div style={{ fontSize: 12.5, fontWeight: 500, marginBottom: 6 }}>
-                      Worker 隔离容器
-                    </div>
-                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: '18px' }}>
-                      每次写入/命令调用均在独立无网络 Docker 容器（<code>--network=none</code>、非 root、私有 tmpfs）中执行，并记录不可变退出码与 Diff 证据。
-                    </div>
+                <PresenceDiv open={popover === 'env'} className="codex-popover" data-side="top" style={{ left: 0, width: 268, padding: 10 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 500, marginBottom: 6 }}>
+                    Worker 隔离容器
                   </div>
-                )}
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: '18px' }}>
+                    每次写入/命令调用均在独立无网络 Docker 容器（<code>--network=none</code>、非 root、私有 tmpfs）中执行，并记录不可变退出码与 Diff 证据。
+                  </div>
+                </PresenceDiv>
               </div>
             )}
 
             {renderBranchBadge(false)}
           </div>
         )}
+
+      {/* Main Rounded Composer Surface with Drag & Drop */}
+      <div
+        className="codex-composer-card"
+        data-dragging={dragging ? 'true' : undefined}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (!dragging) setDragging(true);
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setDragging(false);
+          }
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          if (e.dataTransfer.files?.length) {
+            void attachFileList(e.dataTransfer.files);
+          }
+        }}
+      >
+        {dragging && <div className="codex-drop-overlay">松开即可附加文件到工作区</div>}
 
         <input
           ref={fileInputRef}
@@ -1155,65 +1230,45 @@ ${draftInjection.text}`
           }}
         />
 
-        {attachedKeys.length > 0 && (
-          <div className="codex-composer-attachments">
-            {attachedKeys.map((name) => {
-              const imgUrl = isImagePath(name) ? toImageDataUrl(name, files[name]) : null;
-              return (
-                <span key={name} className="codex-attach-chip" data-image={imgUrl ? 'true' : undefined}>
-                  {imgUrl ? (
-                    <img
-                      src={imgUrl}
-                      alt={name}
-                      className="composer-image-preview"
-                    />
-                  ) : (
-                    <IconFileDoc size={13} style={{ color: 'var(--text-tertiary)' }} />
-                  )}
-                  <span>{name}</span>
-                  <button
-                    type="button"
-                    aria-label={`移除 ${name}`}
-                    onClick={() => {
-                      const copy = { ...files };
-                      delete copy[name];
-                      setFiles(copy);
-                      setCommandError('');
-                    }}
-                  >
-                    <IconClose size={12} />
-                  </button>
-                </span>
-              );
-            })}
-          </div>
-        )}
+        <ComposerAttachments files={files} onRemove={(name) => {
+          textareaRef.current?.focus({ preventScroll: true });
+          setFiles((previous) => {
+            const next = { ...previous };
+            delete next[name];
+            return next;
+          });
+          setCommandError('');
+        }} />
 
-        <textarea
-          ref={textareaRef}
-          className="codex-composer-textarea"
-          rows={1}
-          aria-label="消息内容"
-          placeholder={modeControl?.placeholder ?? "输入消息"}
-          value={text}
-          aria-controls={menuIsOpen ? menuId : undefined}
-          aria-activedescendant={menuCount ? `${menuId}-${selectedIndex}` : undefined}
-          onChange={(event) => {
-            setText(event.target.value);
-            setCommandError('');
-            setAddContextOpen(false);
-            setCaret(event.target.selectionStart);
-            setMenuDismissed(false);
-          }}
-          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
-          onKeyDown={handleKeyDown}
-          onPaste={(e) => {
-            if (e.clipboardData.files?.length) {
-              e.preventDefault();
-              void attachFileList(e.clipboardData.files);
-            }
-          }}
-        />
+        <div className="composer-textarea-size">
+          <textarea ref={heightProbe} className="composer-height-probe" rows={1}
+            value={text} readOnly inert aria-hidden="true" tabIndex={-1} />
+          <textarea
+            ref={textareaRef}
+            className="codex-composer-textarea"
+            rows={1}
+            aria-label="消息内容"
+            placeholder={modeControl?.placeholder ?? (variant === 'home' ? '随心输入' : '输入消息')}
+            value={text}
+            aria-controls={menuIsOpen ? menuId : undefined}
+            aria-activedescendant={menuIsOpen && menuCount ? `${menuId}-${selectedIndex}` : undefined}
+            onChange={(event) => {
+              setText(event.target.value);
+              setCommandError('');
+              setAddContextOpen(false);
+              setCaret(event.target.selectionStart);
+              setMenuDismissed(false);
+            }}
+            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            onKeyDown={handleKeyDown}
+            onPaste={(e) => {
+              if (e.clipboardData.files?.length) {
+                e.preventDefault();
+                void attachFileList(e.clipboardData.files);
+              }
+            }}
+          />
+        </div>
 
         <div className="codex-composer-footer">
           <div className="codex-composer-controls">
@@ -1262,270 +1317,253 @@ ${draftInjection.text}`
                 </span>
               </button>
 
-              {popover === 'permission' && (
-                <div className="codex-popover codex-perm-popover" data-side="top" style={{ left: 0 }}>
-                  <div className="codex-perm-header">
-                    <span>工具操作如何审批？</span>
-                    <button
-                      type="button"
-                      className="codex-perm-learn-link"
-                      onClick={() => {
-                        setPopover(null);
-                        onSlashCommand?.(findSlashCommand('/settings')!);
-                      }}
-                    >
-                      了解更多
-                    </button>
-                  </div>
-
+              <PresenceDiv open={popover === 'permission'} className="codex-popover codex-perm-popover" data-side="top" style={{ left: 0 }}>
+                <div className="codex-perm-header">
+                  <span>工具操作如何审批？</span>
                   <button
                     type="button"
-                    className="codex-perm-option"
+                    className="codex-perm-learn-link"
                     onClick={() => {
-                      onChangePermission('approval');
                       setPopover(null);
+                      onSlashCommand?.(findSlashCommand('/settings')!);
                     }}
                   >
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                      <IconHand size={16} style={{ marginTop: 2, flex: 'none', color: 'var(--text-secondary)' }} />
-                      <div>
-                        <div className="codex-perm-option-title">请我批准</div>
-                        <div className="codex-perm-option-desc">
-                          修改文件或执行命令前需要批准
-                        </div>
-                      </div>
-                    </div>
-                    {permissionMode === 'approval' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="codex-perm-option"
-                    onClick={() => {
-                      onChangePermission('auto-review');
-                      setPopover(null);
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                      <IconShieldTerminal size={16} style={{ marginTop: 2, flex: 'none', color: 'var(--text-secondary)' }} />
-                      <div>
-                        <div className="codex-perm-option-title">替我审查</div>
-                        <div className="codex-perm-option-desc">
-                          自动审查低风险的只读命令；修改文件、运行脚本及其他需人工确认的操作仍会询问
-                        </div>
-                      </div>
-                    </div>
-                    {permissionMode === 'auto-review' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="codex-perm-option"
-                    data-danger="true"
-                    onClick={() => {
-                      onChangePermission('full-access');
-                      setPopover(null);
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                      <IconShieldAlert size={16} style={{ marginTop: 2, flex: 'none' }} />
-                      <div>
-                        <div className="codex-perm-option-title">完全访问权限</div>
-                        <div className="codex-perm-option-desc">
-                          工作区内常规工具自动批准；系统权限、安全规则及外部工具审批仍有效
-                        </div>
-                      </div>
-                    </div>
-                    {permissionMode === 'full-access' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
+                    了解更多
                   </button>
                 </div>
-              )}
+
+                <button
+                  type="button"
+                  className="codex-perm-option"
+                  onClick={() => {
+                    onChangePermission('approval');
+                    setPopover(null);
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                    <IconHand size={16} style={{ marginTop: 2, flex: 'none', color: 'var(--text-secondary)' }} />
+                    <div>
+                      <div className="codex-perm-option-title">请我批准</div>
+                      <div className="codex-perm-option-desc">
+                        修改文件或执行命令前需要批准
+                      </div>
+                    </div>
+                  </div>
+                  {permissionMode === 'approval' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
+                </button>
+
+                <button
+                  type="button"
+                  className="codex-perm-option"
+                  onClick={() => {
+                    onChangePermission('auto-review');
+                    setPopover(null);
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                    <IconShieldTerminal size={16} style={{ marginTop: 2, flex: 'none', color: 'var(--text-secondary)' }} />
+                    <div>
+                      <div className="codex-perm-option-title">替我审查</div>
+                      <div className="codex-perm-option-desc">
+                        自动审查低风险的只读命令；修改文件、运行脚本及其他需人工确认的操作仍会询问
+                      </div>
+                    </div>
+                  </div>
+                  {permissionMode === 'auto-review' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
+                </button>
+
+                <button
+                  type="button"
+                  className="codex-perm-option"
+                  data-danger="true"
+                  onClick={() => {
+                    onChangePermission('full-access');
+                    setPopover(null);
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+                    <IconShieldAlert size={16} style={{ marginTop: 2, flex: 'none' }} />
+                    <div>
+                      <div className="codex-perm-option-title">完全访问权限</div>
+                      <div className="codex-perm-option-desc">
+                        工作区内常规工具自动批准；系统权限、安全规则及外部工具审批仍有效
+                      </div>
+                    </div>
+                  </div>
+                  {permissionMode === 'full-access' && <IconCheck size={15} style={{ flex: 'none', marginTop: 2 }} />}
+                </button>
+              </PresenceDiv>
             </div>
 
-            {modeControl && (
-              <div className="composer-mode-slot">
-                <button type="button" className="codex-composer-pill composer-mode-toggle" data-mode={activeMode}
-                  aria-label={`关闭${modeControl.label}模式`} aria-pressed="true" title={`退出${modeControl.label}模式`} onClick={clearMode}>
-                  <modeControl.icon size={16} aria-hidden="true" /><span>{modeControl.label}</span>
-                </button>
-              </div>
-            )}
+            <PresenceDiv open={Boolean(modeControl)} className="composer-mode-slot">
+              {modeControl && <button type="button" className="codex-composer-pill composer-mode-toggle" data-mode={activeMode}
+                aria-label={`关闭${modeControl.label}模式`} aria-pressed="true" title={`退出${modeControl.label}模式`} onClick={clearMode}>
+                <modeControl.icon size={16} aria-hidden="true" /><span>{modeControl.label}</span>
+              </button>}
+            </PresenceDiv>
             {!showHomeTray && renderBranchBadge(true)}
           </div>
 
           <div className="codex-composer-controls">
-            {/* Exact Codex Model & Effort Slider Trigger */}
-            <div style={{ position: 'relative' }}>
+            <div className="codex-model-control">
               <button
                 type="button"
-                className="codex-composer-pill"
+                className="codex-composer-pill codex-model-trigger"
                 data-open={popover === 'effort' || popover === 'models' ? 'true' : undefined}
                 ref={modelTrigger}
                 aria-label="模型与推理强度"
                 aria-expanded={popover === 'effort' || popover === 'models'}
+                title={`${displayModel} · ${effortMeta.label}`}
                 onClick={() =>
                   setPopover((p) => (p === 'effort' || p === 'models' ? null : 'effort'))
                 }
               >
-                {popover === 'effort' ? (
-                  <span>选择推理强度</span>
-                ) : (
-                  <>
-                    <span className="codex-composer-model-name">{displayModel}</span>
-                    <span className="codex-effort-label-viewport">
-                      <span key={effortMeta.id} className="codex-effort-label-val">
-                        {effortMeta.label}
-                      </span>
-                    </span>
-                  </>
-                )}
-                <IconChevronDown size={14} />
+                <span className="codex-composer-model-name">{displayModel}</span>
+                <span className="codex-effort-label-viewport">
+                  <span key={effortMeta.id} className="codex-effort-label-val">{effortMeta.label}</span>
+                </span>
               </button>
 
               {/* Floating Blue Effort Slider Popover (1:1 with live/model_picker.png) */}
-              {popover === 'effort' && (
-                <div
+              <PresenceDiv open={popover === 'effort'}
                   className="codex-popover codex-effort-popover"
                   data-side="top"
                   style={{ right: 0 }}
                 >
-                  <div className="codex-effort-header">
-                    <span key={effortMeta.id} className="codex-effort-level codex-effort-label-val">
-                      {effortMeta.label}
-                    </span>
-                    <button
-                      type="button"
-                      className="codex-effort-model-btn"
-                      onClick={() => setPopover('models')}
-                    >
-                      <span>{displayModel}</span>
-                      <IconChevronRight size={13} />
-                    </button>
-                    <button
-                      type="button"
-                      className="codex-effort-reset"
-                      title="重置默认推理强度"
-                      onClick={() => {
-                        onChangeEffort('xhigh');
-                      }}
-                    >
-                      <IconReset size={14} />
-                    </button>
-                  </div>
-
-                  <div
-                    ref={trackRef}
-                    className="codex-effort-track"
-                    role="slider"
-                    aria-label="推理强度"
-                    aria-valuemin={0}
-                    aria-valuemax={EFFORT_STOPS.length - 1}
-                    aria-valuenow={effortIdx}
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === 'ArrowLeft') {
-                        e.preventDefault();
-                        setEffortByIndex(effortIdx - 1);
-                      } else if (e.key === 'ArrowRight') {
-                        e.preventDefault();
-                        setEffortByIndex(effortIdx + 1);
-                      }
-                    }}
-                    onMouseDown={(e) => {
-                      updateEffortFromPointer(e.clientX);
-                      const onMove = (ev: MouseEvent) => updateEffortFromPointer(ev.clientX);
-                      const onUp = () => {
-                        window.removeEventListener('mousemove', onMove);
-                        window.removeEventListener('mouseup', onUp);
-                      };
-                      window.addEventListener('mousemove', onMove);
-                      window.addEventListener('mouseup', onUp);
-                    }}
-                  >
-                    <div
-                      className="codex-effort-fill"
-                      style={{ width: `calc(${thumbPercent}% + 10px)` }}
-                    />
-                    <div className="codex-effort-stops">
-                      {EFFORT_STOPS.map((stop, idx) => (
-                        <span
-                          key={stop.id}
-                          className="codex-effort-pip"
-                          data-beyond={idx > effortIdx ? 'true' : undefined}
-                        />
-                      ))}
-                    </div>
-                    <div className="codex-effort-thumb" style={{ left: `${thumbPercent}%` }} />
-                  </div>
-                </div>
-              )}
-
-              {/* Drill-down Model Selector Popover with Back header */}
-              {popover === 'models' && (
-                <div className="codex-popover" data-side="top" style={{ right: 0, width: 256 }}>
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      padding: '4px 6px 6px',
-                      fontSize: 12.5,
-                      fontWeight: 500,
-                      color: 'var(--text-secondary)',
-                    }}
-                  >
-                    <button
-                      type="button"
-                      className="codex-icon-btn"
-                      style={{ width: 22, height: 22 }}
-                      onClick={() => setPopover('effort')}
-                      aria-label="返回推理强度"
-                    >
-                      <IconArrowBack size={13} />
-                    </button>
-                    <span>选择模型</span>
-                  </div>
-                  <div className="codex-popover-divider" />
+                <div className="codex-effort-header">
+                  <span key={effortMeta.id} className="codex-effort-level codex-effort-label-val">
+                    {effortMeta.label}
+                  </span>
                   <button
                     type="button"
-                    className="codex-popover-item"
-                    data-selected={selectedModel === '' ? 'true' : undefined}
+                    className="codex-effort-model-btn"
+                    onClick={() => setPopover('models')}
+                  >
+                    <span>{displayModel}</span>
+                    <IconChevronRight size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    className="codex-effort-reset"
+                    title="重置默认推理强度"
                     onClick={() => {
-                      onSelectModel('');
-                      setPopover('effort');
+                      onChangeEffort('xhigh');
                     }}
                   >
-                    <span>自动路由（Router 按角色最优）</span>
-                    {selectedModel === '' && <IconCheck size={14} />}
+                    <IconReset size={14} />
                   </button>
-                  {models.length === 0 ? (
-                    <div style={{ padding: '8px 10px', fontSize: 12, color: 'var(--text-tertiary)' }}>
-                      后端尚未配置模型目录，可在「设置 → 模型与网关」查看配置指引。
-                    </div>
-                  ) : (
-                    models.map((m) => (
-                      <button
-                        key={`${m.provider}/${m.model}`}
-                        type="button"
-                        className="codex-popover-item"
-                        data-selected={selectedModel === m.model ? 'true' : undefined}
-                        onClick={() => {
-                          onSelectModel(m.model);
-                          setPopover('effort');
-                        }}
-                      >
-                        <span style={{ display: 'flex', flexDirection: 'column' }}>
-                          <span>{m.model}</span>
-                          <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-                            {m.provider} · {Math.round(m.context / 1000)}k ctx
-                          </span>
-                        </span>
-                        {selectedModel === m.model && <IconCheck size={14} />}
-                      </button>
-                    ))
-                  )}
                 </div>
-              )}
+
+                <div
+                  ref={trackRef}
+                  className="codex-effort-track"
+                  role="slider"
+                  aria-label="推理强度"
+                  aria-valuemin={0}
+                  aria-valuemax={EFFORT_STOPS.length - 1}
+                  aria-valuenow={effortIdx}
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'ArrowLeft') {
+                      e.preventDefault();
+                      setEffortByIndex(effortIdx - 1);
+                    } else if (e.key === 'ArrowRight') {
+                      e.preventDefault();
+                      setEffortByIndex(effortIdx + 1);
+                    }
+                  }}
+                  onMouseDown={(e) => {
+                    updateEffortFromPointer(e.clientX);
+                    const onMove = (ev: MouseEvent) => updateEffortFromPointer(ev.clientX);
+                    const onUp = () => {
+                      window.removeEventListener('mousemove', onMove);
+                      window.removeEventListener('mouseup', onUp);
+                    };
+                    window.addEventListener('mousemove', onMove);
+                    window.addEventListener('mouseup', onUp);
+                  }}
+                >
+                  <div
+                    className="codex-effort-fill"
+                    style={{ width: `calc(${thumbPercent}% + 10px)` }}
+                  />
+                  <div className="codex-effort-stops">
+                    {EFFORT_STOPS.map((stop, idx) => (
+                      <span
+                        key={stop.id}
+                        className="codex-effort-pip"
+                        data-beyond={idx > effortIdx ? 'true' : undefined}
+                      />
+                    ))}
+                  </div>
+                  <div className="codex-effort-thumb" style={{ left: `${thumbPercent}%` }} />
+                </div>
+              </PresenceDiv>
+
+              {/* Drill-down Model Selector Popover with Back header */}
+              <PresenceDiv open={popover === 'models'} className="codex-popover" data-side="top" style={{ right: 0, width: 256 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '4px 6px 6px',
+                    fontSize: 12.5,
+                    fontWeight: 500,
+                    color: 'var(--text-secondary)',
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="codex-icon-btn"
+                    style={{ width: 22, height: 22 }}
+                    onClick={() => setPopover('effort')}
+                    aria-label="返回推理强度"
+                  >
+                    <IconArrowBack size={13} />
+                  </button>
+                  <span>选择模型</span>
+                </div>
+                <div className="codex-popover-divider" />
+                <button
+                  type="button"
+                  className="codex-popover-item"
+                  data-selected={selectedModel === '' ? 'true' : undefined}
+                  onClick={() => {
+                    onSelectModel('');
+                    setPopover('effort');
+                  }}
+                >
+                  <span>自动路由（Router 按角色最优）</span>
+                  {selectedModel === '' && <IconCheck size={14} />}
+                </button>
+                {models.length === 0 ? (
+                  <div style={{ padding: '8px 10px', fontSize: 12, color: 'var(--text-tertiary)' }}>
+                    后端尚未配置模型目录，可在「设置 → 模型与网关」查看配置指引。
+                  </div>
+                ) : (
+                  models.map((m) => (
+                    <button
+                      key={`${m.provider}/${m.model}`}
+                      type="button"
+                      className="codex-popover-item"
+                      data-selected={selectedModel === m.model ? 'true' : undefined}
+                      onClick={() => {
+                        onSelectModel(m.model);
+                        setPopover('effort');
+                      }}
+                    >
+                      <span style={{ display: 'flex', flexDirection: 'column' }}>
+                        <span>{m.model}</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                          {m.provider} · {Math.round(m.context / 1000)}k ctx
+                        </span>
+                      </span>
+                      {selectedModel === m.model && <IconCheck size={14} />}
+                    </button>
+                  ))
+                )}
+              </PresenceDiv>
             </div>
 
             {isRunning && onStop && !text.trim() && !activeMode ? (
@@ -1554,11 +1592,11 @@ ${draftInjection.text}`
         </div>
       </div>
       <PromptCacheStatus />
-      {dialog === 'sketch' && <SketchDialog onClose={closeDialog} onAttach={(image) => {
+      <SketchDialog open={dialog === 'sketch'} onClose={closeDialog} onAttach={(image) => {
         void attachFileList([new File([image], `sketch-${Date.now()}.png`, { type: 'image/png' })]);
         closeDialog();
-      }} />}
-      {dialog === 'files' && <ComposerDialog title="文件和文件夹" onClose={closeDialog}>
+      }} />
+      <ComposerDialog open={dialog === 'files'} title="文件和文件夹" onClose={closeDialog}>
         <button type="button" className="composer-dialog-option" onClick={() => {
           closeDialog();
           fileInputRef.current?.click();
@@ -1567,8 +1605,8 @@ ${draftInjection.text}`
           onClick={() => openWorkspacePicker('file')}><IconFileDoc />引用工作区文件</button>
         <button type="button" className="composer-dialog-option" disabled={!searchMentionFiles}
           onClick={() => openWorkspacePicker('folder')}><IconFolder />引用工作区文件夹</button>
-      </ComposerDialog>}
-      {dialog === 'review' && <ComposerDialog title="代码审查" onClose={() => { if (!reviewBusy) closeDialog(); }}>
+      </ComposerDialog>
+      <ComposerDialog open={dialog === 'review'} title="代码审查" onClose={() => { if (!reviewBusy) closeDialog(); }}>
         <label className="composer-dialog-field">审查范围
           <select className="codex-select" disabled={reviewBusy} value={reviewBranch} onChange={(event) => setReviewBranch(event.currentTarget.value)}>
             <option value="">未提交的变更</option>
@@ -1582,7 +1620,7 @@ ${draftInjection.text}`
         <div className="composer-dialog-actions">
           <button type="button" className="codex-toolbar-btn" data-variant="primary" disabled={reviewBusy} onClick={() => void applyReview()}>{reviewBusy ? '正在启动…' : '开始代码审查'}</button>
         </div>
-      </ComposerDialog>}
+      </ComposerDialog>
     </div>
   );
 };

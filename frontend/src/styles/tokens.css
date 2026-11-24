@@ -83,7 +83,14 @@
   /* Workspace geometry */
   --topbar-height: 36px;
   --rail-width: 48px;
-  --sidebar-width: 248px;
+  --sidebar-width: 275px;
+  --workspace-chrome: var(--bg-chrome);
+  --workspace-canvas: var(--bg-surface);
+  --home-content-width: 740px;
+  --home-composer-radius: 20px;
+  --home-starter-radius: 16px;
+  --home-composer-shadow: 0 3px 12px rgb(0 0 0 / 5%);
+  --home-starter-shadow: 0 2px 4px rgb(0 0 0 / 4%);
   --thread-header-height: 44px;
   --thread-content-max-width: 720px;
   --thread-gutter: clamp(16px, 3.1cqi, 28px);
@@ -116,6 +123,7 @@
 
   /* Motion */
   --duration-feedback: 90ms;
+  --duration-exit: 110ms;
   --duration-popover: 150ms;
   --duration-dialog: 200ms;
   --duration-basic: 150ms;
@@ -133,9 +141,15 @@
   color-scheme: light;
 }
 
+[data-theme="light"][data-appearance-preset="codex"] {
+  --workspace-canvas: #fdfdfd;
+}
+
 /* Dark workspace and overlay colors */
 [data-theme="dark"] {
   --overlay-scrim: rgb(0 0 0 / 48%);
+  --home-composer-shadow: none;
+  --home-starter-shadow: none;
   --bg-chrome: #1f2022;
   --bg-surface: #191a1c;
   --bg-surface-secondary: rgba(252, 252, 252, 0.041);

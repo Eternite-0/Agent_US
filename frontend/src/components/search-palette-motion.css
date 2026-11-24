@@ -1,0 +1,8 @@
+.search-palette-backdrop[data-presence='exiting'] {
+  pointer-events: none;
+  animation: codex-exit-fade var(--duration-exit) var(--ease-out) both;
+}
+
+.search-palette-backdrop[data-presence='exiting'] .codex-search-modal {
+  animation: codex-exit-dialog var(--duration-exit) var(--ease-out) both;
+}

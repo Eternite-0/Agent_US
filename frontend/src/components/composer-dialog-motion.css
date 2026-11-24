@@ -1,0 +1,20 @@
+/* A closed native dialog is no longer modal. Paint it briefly as a non-interactive ghost. */
+.composer-dialog[data-presence='exiting'] {
+  display: block;
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  height: fit-content;
+  z-index: 159;
+  pointer-events: none;
+  animation: codex-exit-dialog var(--duration-exit) var(--ease-out) both;
+}
+
+.composer-dialog-exit-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 158;
+  background: var(--overlay-scrim);
+  pointer-events: none;
+  animation: codex-exit-fade var(--duration-exit) var(--ease-out) both;
+}

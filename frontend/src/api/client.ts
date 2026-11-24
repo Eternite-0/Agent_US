@@ -180,10 +180,13 @@ export interface AgentBackendClient {
   setWorkspace?: (workspaceRoot: string) => Promise<{ workspaceRoot: string }>;
   listProjects(): Promise<Project[]>;
   createProject(name: string): Promise<Project>;
-  renameProject(id: string, name: string, version: number): Promise<Project>;
+  renameProject(project: Project, name: string): Promise<Project>;
+  readonly supportsSafeDeletion: boolean;
+  deleteProject(project: Project): Promise<void>;
   listTasks(params?: ListTasksOptions): Promise<Task[]>;
   forkTask?: (id: string, workspaceMode: 'same-workspace' | 'new-worktree') => Promise<Task>;
   setTaskArchived(id: string, archived: boolean): Promise<Task>;
+  deleteArchivedTask(id: string): Promise<void>;
   getTask(id: string): Promise<Task>;
   submitTask(submission: Submission): Promise<SubmittedTurn>;
   submitFollowupTurn?: (
@@ -676,6 +679,9 @@ export class LiveBackendClient implements AgentBackendClient {
   private defaultModel = '';
   private workspaceRoot = '';
   private workspaceRevision = 0;
+  private workspaceProjectApi: 'unknown' | 'legacy' | 'current' = 'unknown';
+  // The workspace project API and archive-only deletion guard were introduced together.
+  get supportsSafeDeletion() { return this.workspaceProjectApi === 'current'; }
   private readonly rt = createRuntimeClient((m, p, o) => this.req(m, p, o));
 
   constructor(settings: ConnectionSettings) {
@@ -792,35 +798,51 @@ export class LiveBackendClient implements AgentBackendClient {
     return data;
   }
 
-  async listProjects(): Promise<Project[]> {
-    const wsName = this.workspaceRoot
-      ? this.workspaceRoot.split(/[\\/]/).filter(Boolean).pop() || 'Workspace'
-      : 'Agent_US Workspace';
-    return [
-      {
-        id: 'workspace',
-        version: 1,
-        projectId: null,
-        taskId: null,
-        name: wsName,
-        workspaceRoot: this.workspaceRoot || undefined,
-      },
-    ];
-  }
-
-  async createProject(name: string): Promise<Project> {
+  // The Direct API persists sidebar shortcuts independently from the directory and chats.
+  // Preserve the original projection for older servers without a project endpoint.
+  private defaultWorkspaceProject(): Project {
+    const workspaceRoot = this.workspaceRoot || undefined;
     return {
-      id: 'workspace',
-      version: 1,
-      projectId: null,
-      taskId: null,
-      name: name || 'Agent_US Workspace',
-      workspaceRoot: this.workspaceRoot || undefined,
+      id: 'workspace', version: 1, projectId: null, taskId: null, workspaceRoot,
+      name: workspaceRoot?.split(/[\\/]/).filter(Boolean).pop() || 'Agent_US Workspace',
     };
   }
 
-  async renameProject(_id: string, name: string, version: number): Promise<Project> {
-    return { id: 'workspace', version: version + 1, projectId: null, taskId: null, name };
+  async listProjects(): Promise<Project[]> {
+    if (this.workspaceProjectApi !== 'legacy') {
+      try {
+        const { project } = await this.req<{ project: Project | null }>('GET', '/v1/workspace/project');
+        this.workspaceProjectApi = 'current';
+        return project ? [project] : [];
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 404) throw error;
+        this.workspaceProjectApi = 'legacy';
+      }
+    }
+    return [this.defaultWorkspaceProject()];
+  }
+
+  async createProject(name: string): Promise<Project> {
+    if (this.workspaceProjectApi === 'legacy') return { ...this.defaultWorkspaceProject(), name };
+    const { project } = await this.req<{ project: Project }>('PUT', '/v1/workspace/project', {
+      body: { name, workspaceRoot: this.workspaceRoot || undefined },
+    });
+    return project;
+  }
+
+  async renameProject(project: Project, name: string): Promise<Project> {
+    if (this.workspaceProjectApi === 'legacy') return { ...project, name, version: project.version + 1 };
+    const { project: updated } = await this.req<{ project: Project }>('PUT', '/v1/workspace/project', {
+      body: { name, workspaceRoot: project.workspaceRoot, version: project.version },
+    });
+    return updated;
+  }
+
+  async deleteProject(project: Project): Promise<void> {
+    if (!this.supportsSafeDeletion) throw new Error('当前后端版本不支持移除项目，请更新后端。');
+    await this.req('DELETE', '/v1/workspace/project', {
+      body: { workspaceRoot: project.workspaceRoot, version: project.version },
+    });
   }
 
   private taskFromSession(
@@ -904,6 +926,16 @@ export class LiveBackendClient implements AgentBackendClient {
       throw new Error('后端未保存归档状态，请确认已更新后端。');
     }
     return this.taskFromSession(session, null);
+  }
+
+  async deleteArchivedTask(id: string): Promise<void> {
+    if (!this.supportsSafeDeletion) throw new Error('当前后端版本不支持安全删除归档的聊天，请更新后端。');
+    try {
+      await this.req('DELETE', `/v1/sessions/${encodeURIComponent(id)}`, { query: { archived: 'true' } });
+    } catch (error) {
+      // The delete may have succeeded before a previous request lost its response.
+      if (!(error instanceof ApiError) || error.code !== 'SESSION_NOT_FOUND') throw error;
+    }
   }
 
   async forkTask(id: string, workspaceMode: 'same-workspace' | 'new-worktree'): Promise<Task> {

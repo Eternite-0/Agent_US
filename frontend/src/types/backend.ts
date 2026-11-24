@@ -39,7 +39,7 @@ export interface GitStatus {
 }
 
 export interface Submission {
-  projectId: string;
+  projectId: string | null;
   input: string;
   idempotencyKey: string;
   files?: Record<string, string>;
@@ -666,6 +666,7 @@ export type GitReviewInput = { sessionId?: string; expectedWorkspaceRoot?: strin
 export type AppView =
   | { kind: 'home' }
   | { kind: 'thread'; taskId: string; focusWorkerId?: string }
+  | { kind: 'archived' }
   | { kind: 'tasks' }
   | { kind: 'capabilities'; section?: 'skills' | 'mcp'; sessionId?: string; pluginId?: string }
   | { kind: 'evaluations' }

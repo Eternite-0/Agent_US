@@ -1,3 +1,4 @@
+import { CopyFeedbackIcon } from './CopyFeedbackIcon';
 import { SwarmThreadCard } from './SwarmThreadCard';
 import { groupDirectMessages, isDirectTurnEnd, type DirectLiveStream, type DirectLiveToolOutput, type DirectTimelineBlock } from '../utils/directMessages';
 import { ActivityDisclosureScope, DirectActivityGroup, DirectTurnProcess } from './DirectActivity';
@@ -8,6 +9,7 @@ import type {
   GitStatus,
   CodexMode,
   EffortLevel,
+  EventEnvelope,
   InspectorTab,
   ModelSpec,
   PermissionMode,
@@ -44,7 +46,6 @@ import {
   IconArchive,
   IconArrowDown,
   IconBookmark,
-  IconCheck,
   IconChevronDown,
   IconClose,
   IconCompose,
@@ -71,6 +72,7 @@ import {
 } from './ImageLightbox';
 import { Markdown } from './Markdown';
 import { useThreadScroll } from '../hooks/useThreadScroll';
+import type { ThreadInteraction } from '../utils/threadInteraction';
 
 /**
  * Keeps the closing assistant reply crisp & concise (like Codex Desktop),
@@ -129,12 +131,14 @@ function extractConciseClosing(raw: string): { shortText: string; isTruncated: b
 }
 
 interface ThreadViewProps {
+  interaction: ThreadInteraction;
   bundles: TaskBundle[];
   onOpenSwarmRun?: (sessionId: string, runId: string) => void;
   loading: boolean;
   focusWorkerId?: string;
   liveStreams?: Record<string, DirectLiveStream>;
   liveToolOutputs?: Record<string, DirectLiveToolOutput[]>;
+  recentRuntimeEvents?: readonly EventEnvelope[];
   onRewindSession?: (sessionId: string, scope: 'code' | 'conversation' | 'both', turnId?: string) => Promise<void>;
   onCompactSession?: (sessionId: string) => Promise<void>;
   codexMode: CodexMode;
@@ -189,9 +193,10 @@ interface ThreadViewProps {
   onToast: (msg: string) => void;
 }
 
-const DirectProse = React.memo(function DirectProse({ text, live, taskId, imageFiles, onInspect, onOpenImage, onCopy }: {
+const DirectProse = React.memo(function DirectProse({ text, live, animate, taskId, imageFiles, onInspect, onOpenImage, onCopy }: {
   text: string;
   live: boolean;
+  animate: boolean;
   taskId: string;
   imageFiles: Record<string, string>;
   onInspect: ThreadViewProps['onOpenInspector'];
@@ -199,7 +204,9 @@ const DirectProse = React.memo(function DirectProse({ text, live, taskId, imageF
   onCopy: ThreadViewProps['onToast'];
 }) {
   const openFile = useCallback((path: string) => onInspect('diff', path, taskId), [onInspect, taskId]);
-  return <div className="codex-assistant-turn codex-direct-prose">
+  // Set on mount only; do not replay a reply entrance for each token or on commit.
+  const [entering] = useState(animate);
+  return <div className="codex-assistant-turn codex-direct-prose" data-enter={entering || undefined}>
     <Markdown text={text} imageFiles={imageFiles} onOpenFile={openFile} onOpenImage={onOpenImage} onCopy={onCopy} />
     {live && <span className="a2a-stream-cursor" aria-hidden="true" />}
   </div>;
@@ -219,12 +226,14 @@ interface SelectionOverlay {
 }
 
 export const ThreadView: React.FC<ThreadViewProps> = ({
+  interaction,
   bundles,
   onOpenSwarmRun,
   loading,
   focusWorkerId,
   liveStreams = {},
   liveToolOutputs = {},
+  recentRuntimeEvents,
   onRewindSession,
   onCompactSession,
   codexMode,
@@ -358,7 +367,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
 
   // Cache historical view models by immutable bundle identity, not by the
   // outer list (which changes on each batch for the active task).
-  const buildTurnModel = useCallback((b: TaskBundle, liveStream?: DirectLiveStream, liveOutput?: DirectLiveToolOutput[]) => {
+  const buildTurnModel = useCallback((b: TaskBundle, liveStream?: DirectLiveStream, liveOutput?: DirectLiveToolOutput[], recentEvents?: readonly EventEnvelope[]) => {
     const { task, workers, sessions, histories, approvals, evidence, artifacts, usage, events } =
       b;
     const isLive =
@@ -394,6 +403,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
       isLive,
       events,
       liveStream,
+      recentEvents,
       liveToolOutputs: liveOutput,
       pendingCallIds: new Set(pendingApprovals.flatMap((approval) => approval.callId ? [approval.callId] : [])),
       awaitingApproval: pendingApprovals.length > 0,
@@ -532,26 +542,33 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
   const turnModelCache = useMemo(() => new WeakMap<TaskBundle, {
     stream?: DirectLiveStream;
     output?: DirectLiveToolOutput[];
+    recent: EventEnvelope[];
     model: ReturnType<typeof buildTurnModel>;
   }>(), [buildTurnModel]);
   const turnModels = useMemo(() => bundles.map((bundle) => {
     const stream = liveStreams[bundle.task.id];
     const output = liveToolOutputs[bundle.task.id];
+    const snapshotSeq = bundle.events.at(-1)?.seq ?? 0;
+    const recent = recentRuntimeEvents?.filter((event) => event.seq > snapshotSeq &&
+      (event.taskId === bundle.task.id || event.payload?.sessionId === bundle.task.id) &&
+      (event.type === 'assistant/message' || event.type === 'tool/call' || event.type === 'tool/result' ||
+        event.type === 'tool/receipt' || event.type === 'turn/started' || isDirectTurnEnd(event.type) || event.type === 'session/rewound')) ?? [];
     const cached = turnModelCache.get(bundle);
-    if (cached && cached.stream === stream && cached.output === output) return cached.model;
-    const model = buildTurnModel(bundle, stream, output);
+    if (cached && cached.stream === stream && cached.output === output &&
+        cached.recent.length === recent.length && cached.recent.every((event, index) => event === recent[index])) return cached.model;
+    const model = buildTurnModel(bundle, stream, output, recent);
     if (cached && Object.keys(model.imageFiles).length === Object.keys(cached.model.imageFiles).length
         && Object.entries(model.imageFiles).every(([path, content]) => cached.model.imageFiles[path] === content)) {
       model.imageFiles = cached.model.imageFiles;
     }
-    turnModelCache.set(bundle, { stream, output, model });
+    turnModelCache.set(bundle, { stream, output, recent, model });
     return model;
-  }), [bundles, liveStreams, liveToolOutputs, buildTurnModel, turnModelCache]);
+  }), [bundles, liveStreams, liveToolOutputs, recentRuntimeEvents, buildTurnModel, turnModelCache]);
 
   const {
     viewportRef: scrollRef, contentRef, showLatest: showScrollBottom, activeTurnIdx,
     jumpToLatest: scrollToBottom, jumpTo, holdDisclosure, onViewportKeyDown,
-  } = useThreadScroll(primaryBundle?.task.id, turnModels);
+  } = useThreadScroll(primaryBundle?.task.id, turnModels, interaction.reading);
 
   // Exact Codex Turn Minimap: 1 tick per User Turn (prompt title + 3-line assistant snippet)
   const minimapEntries = useMemo<MinimapEntry[]>(() => {
@@ -1246,7 +1263,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
             </div>
           )}
 
-          <ActivityDisclosureScope>
+          <ActivityDisclosureScope remembered={interaction.disclosures}>
           {turnModels.map((tm) => {
             const { bundle, isLive, visibleEvidence, visibleApprovals, visibleEvents, assistantBlocks, computedFiles, showFileSummary, isDirectSession, directExchanges } =
               tm;
@@ -1321,7 +1338,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                       const renderBlock = (block: DirectTimelineBlock) => block.kind === 'activity'
                         ? <DirectActivityGroup block={block} onInspectFile={(path) => onOpenInspector('diff', path, tid)} onCopy={onToast} />
                         : <DirectProse
-                          text={block.text} live={Boolean(block.live)} taskId={tid} imageFiles={tm.imageFiles}
+                          text={block.text} live={Boolean(block.live)} animate={Boolean(block.live || block.justArrived)} taskId={tid} imageFiles={tm.imageFiles}
                           onInspect={onOpenInspector} onOpenImage={openThreadImage} onCopy={onToast}
                         />;
                       return (
@@ -1339,7 +1356,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                                 </button>}
                                 <button type="button" className="codex-icon-btn codex-direct-prompt-copy" aria-label="复制消息" title="复制消息"
                                   onClick={() => void copyText(copyKey, ex.userText, '已复制提示词')}>
-                                  {copiedKey === copyKey ? <IconCheck size={14} /> : <IconCopy size={14} />}
+                                  <CopyFeedbackIcon copied={copiedKey === copyKey} />
                                 </button>
                               </div>
                             </div>
@@ -1575,7 +1592,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                         title="复制消息"
                         onClick={() => void copyText(`u-${tid}`, task.input, '已复制提示词')}
                       >
-                        {copiedKey === `u-${tid}` ? <IconCheck size={14} /> : <IconCopy size={14} />}
+                        <CopyFeedbackIcon copied={copiedKey === `u-${tid}`} />
                       </button>
                     </div>
                   </div>
@@ -1864,7 +1881,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
                           )
                         }
                       >
-                        {copiedKey === `a-${tid}` ? <IconCheck size={14} /> : <IconCopy size={14} />}
+                        <CopyFeedbackIcon copied={copiedKey === `a-${tid}`} />
                       </button>
 
                       <div
@@ -1981,6 +1998,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
           className="codex-scroll-bottom-btn"
           data-visible={showScrollBottom ? 'true' : undefined}
           tabIndex={showScrollBottom ? 0 : -1}
+          inert={!showScrollBottom}
           aria-hidden={!showScrollBottom}
           aria-label="滚动到底部"
           title="最新一条回复"
@@ -1990,6 +2008,7 @@ export const ThreadView: React.FC<ThreadViewProps> = ({
         </button>
         <Composer
           variant="thread"
+          draftStore={interaction.draft}
           codexMode={codexMode}
           projects={projects}
           selectedProject={selectedProject}

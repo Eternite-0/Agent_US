@@ -1,0 +1,126 @@
+/* The shell animates; content keeps its final width and is clipped as it enters/exits. */
+.codex-drawer.codex-inspector-drawer {
+  --inspector-pane-width: clamp(0px, calc(100cqw - 420px), var(--inspector-width));
+  width: 0;
+  max-width: none;
+  overflow: clip;
+  border: 0;
+  opacity: 0;
+  transition:
+    width var(--duration-dialog) var(--ease-enter-snappy),
+    opacity var(--duration-dialog) var(--ease-out);
+}
+
+.codex-drawer.codex-inspector-drawer[data-open='true'] {
+  width: var(--inspector-pane-width);
+  border: 0;
+  opacity: 1;
+}
+
+.codex-drawer.codex-inspector-drawer[data-resizing='true'],
+[data-reduced-motion='true'] .codex-drawer.codex-inspector-drawer {
+  transition: none;
+}
+
+.codex-drawer.codex-inspector-drawer[data-open] > .codex-drawer-inner {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  width: var(--inspector-pane-width);
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  border-inline-start: 1px solid var(--border-subtle);
+}
+
+@container workspace (max-width: 720px) {
+  /* The closed shell must remain out of flow while animating away on narrow workspaces. */
+  .codex-drawer.codex-inspector-drawer[data-open] {
+    --inspector-pane-width: min(var(--inspector-width), 100cqw);
+    position: absolute;
+    inset: 0 0 0 auto;
+    z-index: 85;
+    box-shadow: var(--shadow-popover);
+  }
+  .codex-inspector-drawer > .codex-drawer-resizer { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .codex-drawer.codex-inspector-drawer { transition: none; }
+}
+
+.codex-inspector-drawer .codex-drawer-resizer { touch-action: none; }
+.codex-inspector-drawer .codex-drawer-resizer:focus-visible,
+.codex-inspector-drawer .codex-ide-editor:focus-visible,
+.codex-file-inline-diff .codex-inline-diff-body:focus-visible {
+  outline: 2px solid var(--thread-focus-ring);
+  outline-offset: -2px;
+}
+
+.codex-inspector-drawer .codex-diff-table {
+  display: grid;
+  width: max-content;
+  min-width: 100%;
+}
+
+.codex-inspector-drawer .codex-diff-line { width: auto; }
+.codex-inspector-drawer .codex-diff-split { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.codex-inspector-drawer .codex-diff-split-cell {
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.codex-file-inline-diff .codex-inline-diff-body {
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr);
+}
+
+.codex-file-inline-diff .codex-inline-diff-row { grid-template-columns: 34px 16px minmax(0, 1fr); }
+
+.codex-inspector-drawer .codex-diff-ln { font-variant-numeric: tabular-nums; }
+.codex-inspector-drawer [data-kind='add'] > .codex-diff-sign,
+.codex-file-inline-diff [data-kind='add'] > .codex-diff-sign { color: var(--color-git-added); }
+.codex-inspector-drawer [data-kind='del'] > .codex-diff-sign,
+.codex-file-inline-diff [data-kind='del'] > .codex-diff-sign { color: var(--color-git-deleted); }
+
+.codex-diff-changed {
+  background: color-mix(in srgb, var(--diff-ink) 24%, transparent);
+  color: inherit;
+  text-decoration: underline dotted var(--diff-ink);
+  text-underline-offset: 0.16em;
+}
+
+.codex-diff-changed[data-change='add'] { --diff-ink: var(--color-git-added); }
+.codex-diff-changed[data-change='del'] { --diff-ink: var(--color-git-deleted); }
+
+/* The indicator is painted behind the existing tab buttons without taking layout space. */
+.codex-split-tab-indicator {
+  position: absolute;
+  z-index: -1;
+  inset: 0 auto 0 0;
+  width: var(--inspector-tab-width, 0px);
+  border-radius: var(--radius-control);
+  background: var(--workspace-selection);
+  transform: translateX(var(--inspector-tab-offset, 0px));
+  pointer-events: none;
+  transition:
+    width var(--duration-basic) var(--ease-enter-snappy),
+    transform var(--duration-basic) var(--ease-enter-snappy);
+}
+
+.codex-split-tab[data-active='true']:hover { background: transparent; }
+.codex-split-add > button[aria-expanded='true'] { background: var(--bg-ghost-hover); }
+.codex-split-add > .codex-popover[data-presence='exiting'] {
+  animation: codex-exit-popover var(--duration-exit) var(--ease-out) both;
+  pointer-events: none;
+}
+
+.codex-tree-chevron {
+  flex: none;
+  transition: transform var(--duration-basic) var(--ease-enter-snappy);
+}
+.codex-tree-node[aria-expanded='true'] .codex-tree-chevron { transform: rotate(90deg); }
+
+.codex-inspector-drawer :is(.codex-diff-table, .codex-diff-split) {
+  animation: codex-content-reveal var(--duration-basic) var(--ease-out);
+}
