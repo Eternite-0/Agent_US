@@ -151,11 +151,24 @@ function collectRequestedSymbols(prompt, requiredFiles) {
     );
     for (const m of line.matchAll(SYMBOL_SIGNATURE_RE)) {
       const name = m[1];
+      const argsHint = (m[2] || '').trim();
       if (!name || ignoreNames.has(name) || name.length < 2) continue;
-      if (line.slice(Math.max(0, m.index - 1), m.index) === '.') continue;
+      const prevChar = m.index > 0 ? line[m.index - 1] : '';
+      if (prevChar === '.' || prevChar === ':') continue;
+      if (argsHint.startsWith(':')) continue;
       let fileHint = null;
       const before = line.slice(0, m.index);
       const after = line.slice(m.index + m[0].length, m.index + m[0].length + 120);
+      // Skip format/grammar examples inside backticks such as `file(line,col): severity code: msg`
+      const backticksBefore = (before.match(/`/g) || []).length;
+      const insideBackticks = backticksBefore % 2 === 1 || (m[0].startsWith('`') && !m[0].endsWith('`'));
+      if (insideBackticks) {
+        const closeTickIdx = after.indexOf('`');
+        const tailInTick = closeTickIdx >= 0 ? after.slice(0, closeTickIdx) : after;
+        if (/^:\s*\S+\s+\S+/.test(tailInTick) || /^:\s*[^`]*:/.test(tailInTick)) {
+          continue;
+        }
+      }
       const beforePaths = collectPromptPaths(before).filter((p) => /\.[cm]?[jt]sx?$/i.test(p));
       const inAfterMatch = /^\s*(?:in|from|on|inside|of)\s+`?([^\s`,;)]+)/i.exec(after);
       const afterPaths = inAfterMatch ? collectPromptPaths(inAfterMatch[1]).filter((p) => /\.[cm]?[jt]sx?$/i.test(p)) : [];

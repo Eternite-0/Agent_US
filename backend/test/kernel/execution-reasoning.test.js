@@ -988,7 +988,7 @@ test('AgentLoop steers varied POLICY_BLOCK_LOOP without fatal break, injects tok
           return;
         }
         if (policyStep === 4) {
-          // Steps >= 4 and remaining tokens (50k - 21k = 29k <= 38k, > 2.15 * 11.2k + 1.5k) injects Tier 1 [预算收尾提醒]
+          // Steps >= 4 and remaining tokens (54k - 21k = 33k <= 38k, > tier2Threshold ~29.7k) injects Tier 1 [预算收尾提醒]
           assert.match(userText, /\[预算收尾提醒\]/);
           sawTokenWrapUp = true;
           yield {
@@ -1021,7 +1021,7 @@ test('AgentLoop steers varied POLICY_BLOCK_LOOP without fatal break, injects tok
     workspaceRoot: workDir,
     permissionMode: 'auto-safe',
     requestApproval: async () => ({ allowed: false }),
-    budget: { maxSteps: 10, maxTokens: 50_000 },
+    budget: { maxSteps: 10, maxTokens: 54_000 },
     messages: [
       { role: 'system', content: [{ type: 'text', text: staticSysPrompt }] },
       { role: 'user', content: [{ type: 'text', text: 'Inspect calc.js safely' }] },

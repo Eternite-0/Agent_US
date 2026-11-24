@@ -870,8 +870,8 @@ test('Post-test completion reserve gates non-essential tools, runs Stage-1 stale
           arguments: JSON.stringify({ command: 'node --test test/app.test.js' }),
         },
       };
-      // Consume enough tokens that remaining (~5000) <= completionReserveTokens (~9000) while unpruned prompt > 5000!
-      yield { type: 'usage', usage: { inputTokens: 10600, outputTokens: 1000 } };
+      // Consume enough tokens that remaining (~5500) <= completionReserveTokens (~9000) while unpruned prompt > 5500!
+      yield { type: 'usage', usage: { inputTokens: 10100, outputTokens: 1000 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }

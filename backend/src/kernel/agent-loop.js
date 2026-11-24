@@ -1053,16 +1053,24 @@ export class AgentLoop {
           if (aciDtocEnabled) {
             const cumulativeUsedTokens = tm.totalIn + tm.totalOut;
             const epochContextWindow = aci.engine.contextWindow ?? 128000;
+            const epochMaxTotalTokens =
+              effectiveWatermarkMaxTokens ?? aci.engine.maxTotalTokens ?? epochContextWindow;
+            // Only shield genuine spec/contract docs (SPEC.md, CONTRACT.json, etc.), never target src/ files to be edited.
+            const strictContractDocRe =
+              /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
             const contractFiles = [
-              ...(execution?.evidenceContract?.requiredChangedFiles ?? []),
-              ...(taskContract?.requiredFiles ?? []),
-            ];
+              ...(taskContract?.contractFilesOnDisk ?? []),
+            ].filter((filePath) =>
+              strictContractDocRe.test(String(filePath || '').replace(/\\/g, '/')),
+            );
             const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
               currentStep: steps,
               maxSteps,
               tools: requestOptions.tools,
               cumulativeUsedTokens,
               contextWindow: epochContextWindow,
+              maxTotalTokens: epochMaxTotalTokens,
+              contractFiles,
               verificationCount: reasoningTracker.verificationCount,
               unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
             });
@@ -1084,14 +1092,20 @@ export class AgentLoop {
               if (eligibleCandidates.length > 0) {
                 let keepRefs = [];
                 let compressRefs = [];
-                const totalEligibleChars = eligibleCandidates.reduce(
+                const isTrajectoryOnlyV26 = aci.engine.dtocPolicy === 'trajectory_eviction_v26';
+                const supervisorCandidates = isTrajectoryOnlyV26
+                  ? epochProbe.trajectoryTriggered
+                    ? eligibleCandidates.filter((c) => !c.superseded)
+                    : []
+                  : eligibleCandidates;
+                const totalEligibleChars = supervisorCandidates.reduce(
                   (sum, c) => sum + (Number(c.chars) || 0),
                   0,
                 );
                 if (
                   aciSupervisorEnabled &&
                   aci.supervisor &&
-                  eligibleCandidates.length >= 2 &&
+                  supervisorCandidates.length >= 2 &&
                   totalEligibleChars >= 2400 &&
                   dtocSupervisorCalls < 2
                 ) {
@@ -1105,7 +1119,7 @@ export class AgentLoop {
                   const supRes = await aci.supervisor
                     .supervise({
                       query: input,
-                      candidates: eligibleCandidates,
+                      candidates: supervisorCandidates,
                       errorSummary: lastErrFp,
                       budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens})`,
                       learnedGuidelines: aci.engine.getGuidelines?.() ?? [],
@@ -1122,7 +1136,7 @@ export class AgentLoop {
                     aci.ledger?.recordSupervisorCall?.({
                       stage: 'dtoc',
                       model: supRes.model ?? aciSupervisorModel,
-                      candidateCount: eligibleCandidates.length,
+                      candidateCount: supervisorCandidates.length,
                       decisions: {
                         keepRefs: supRes.keepRefs ?? [],
                         compressRefs: supRes.compressRefs ?? [],
@@ -1145,6 +1159,7 @@ export class AgentLoop {
                   tools: requestOptions.tools,
                   cumulativeUsedTokens,
                   contextWindow: epochContextWindow,
+                  maxTotalTokens: epochMaxTotalTokens,
                   keepRefs,
                   compressRefs,
                   activeMutationTargets,

@@ -321,6 +321,23 @@ test('v2.6 Budget Trajectory Prediction triggers at >= 0.78 * maxTotalTokens aft
       ...makeToolStep('t6', 'read_file', { path: 'src/fresh.js' }, freshC), // active recent (age <= 2)
     ];
 
+    // Pre-edit exploration guard: verificationCount=0 & zero mutations below 72% budget must NOT prematurely evict Tier 2 aged reads
+    const preEditEngine = new ACIEngine({
+      dtocPolicy: TRAJECTORY_EVICTION_V26_DTOC_POLICY,
+      maxTotalTokens: 100000,
+      contextWindow: 128000,
+    });
+    const preEditProbe = preEditEngine.inspectEpoch(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'Optimize large codebase' }] },
+        ...makeToolStep('p0', 'read_file', { path: 'README.md' }, 'Intro\n'.repeat(20)),
+        ...makeToolStep('p1', 'read_file', { path: 'src/aged1.js' }, agedA),
+        ...makeToolStep('p2', 'read_file', { path: 'src/aged2.js' }, agedB),
+      ],
+      { currentStep: 7, estRemainingSteps: 5, cumulativeUsedTokens: 55000, verificationCount: 0, unverifiedSrcMutations: 0 },
+    );
+    assert.equal(preEditProbe.trajectoryTriggered, false, 'Tier 2 must wait until edits/tests or >=72% cumulative');
+
     // tokensBefore is ~11k–15k (>= 10k). With cumulative=45000 & estRemainingSteps=5 -> projected > 100k >= 78k!
     const res = engine.compress(messages, {
       currentStep: 6,
@@ -896,6 +913,142 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
     assert.equal(comp2.aciTelemetry.dtocPolicy, 'trajectory_eviction_v26');
   } finally {
     offEph?.();
+    await runtime.close();
+    store.close?.();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  }
+});
+
+test('v2.6 AgentLoop does not shield taskContract requiredFiles (src/) from superseded eviction while keeping SPEC.md protected', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-v26-reqfiles-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-v26-reqfiles-ws-'));
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.setDefaultModel('mock-v26');
+
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+  mkdirSync(join(workDir, 'test'), { recursive: true });
+  const distinctTerms = [
+    'tenantIsolationBoundary', 'immutableLedgerSequence', 'auditSignatureCheck', 'quotaGraceWindow',
+    'tokenBudgetGuard', 'workspaceCanonicalRoot', 'symlinkEscapeBlocker', 'atomicTempSwapWrite',
+    'monotonicEpochCounter', 'supersededReadPruner', 'hashVerifiedSliceExpand', 'contractReadinessGate',
+    'antiThrashingDiagnosis', 'symbolCallerGraphIndex', 'threeWayPatchMerger', 'reviewerHardGate',
+    'deterministicVerdictRun', 'sandboxNetworkFirewall', 'sessionTurnLeaseFence', 'providerUsageTracker',
+    'promptCacheStaticPrefix', 'runtimeContextTailMsg', 'preInjectionAdmission', 'postTestCompletionGrace',
+  ];
+  const makeDiverseJs = (tag) =>
+    distinctTerms
+      .map(
+        (term, idx) =>
+          `export function ${tag}_${term}(ctx, payload) {\n  const note = '${tag}:${term}:' + String(ctx?.mode ?? '${idx}');\n  return { ok: Boolean(payload), note, key: '${term}' };\n}`,
+      )
+      .join('\n');
+  writeFileSync(join(workDir, 'SPEC.md'), `# Contract\n\ncontractConstraintHelper1: enforce strict tenant policy.\n${distinctTerms.map((t) => `- Rule ${t}: preserve deterministic verification before closing turn.`).join('\n')}\n`);
+  writeFileSync(join(workDir, 'src', 'helper.js'), `export const helper = true;\n`);
+  writeFileSync(join(workDir, 'src', 'policy.js'), `export function checkPolicy(x) { return x > 0; }\n${makeDiverseJs('legacyPolicy')}\n`);
+  writeFileSync(
+    join(workDir, 'test', 'policy.test.js'),
+    'import test from "node:test"; import assert from "node:assert/strict"; import { checkPolicy } from "../src/policy.js"; test("policy", () => assert.equal(checkPolicy(2), true));\n',
+  );
+
+  let step5Messages = null;
+  const adapter = new ScriptedAdapter([
+    // Step 1: read SPEC.md and src/helper.js so later tool msg sits at index >= 3
+    async function* () {
+      yield {
+        type: 'block-end',
+        index: 0,
+        block: { type: 'tool-call', id: 'tc_spec', name: 'read_file', arguments: JSON.stringify({ path: 'SPEC.md' }) },
+      };
+      yield {
+        type: 'block-end',
+        index: 1,
+        block: { type: 'tool-call', id: 'tc_helper', name: 'read_file', arguments: JSON.stringify({ path: 'src/helper.js' }) },
+      };
+      yield { type: 'usage', usage: { inputTokens: 800, outputTokens: 30 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+    },
+    // Step 2: read target implementation file src/policy.js (also in taskContract.requiredFiles!)
+    async function* () {
+      yield {
+        type: 'block-end',
+        index: 0,
+        block: { type: 'tool-call', id: 'tc_policy_read', name: 'read_file', arguments: JSON.stringify({ path: 'src/policy.js' }) },
+      };
+      yield { type: 'usage', usage: { inputTokens: 1500, outputTokens: 30 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+    },
+    // Step 3: mutate src/policy.js -> supersedes tc_policy_read
+    async function* () {
+      yield {
+        type: 'block-end',
+        index: 0,
+        block: {
+          type: 'tool-call',
+          id: 'tc_policy_write',
+          name: 'write_file',
+          arguments: JSON.stringify({ path: 'src/policy.js', content: 'export function checkPolicy(x) { return Number.isFinite(x) && x > 0; }\n' }),
+        },
+      };
+      yield { type: 'usage', usage: { inputTokens: 1600, outputTokens: 30 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+    },
+    // Step 4: verify via node --test -> step advances to 4 (DEFAULT_V26_MIN_SUPERSEDED_STEP)
+    async function* () {
+      yield {
+        type: 'block-end',
+        index: 0,
+        block: { type: 'tool-call', id: 'tc_test_pass', name: 'bash', arguments: JSON.stringify({ command: 'node --test test/policy.test.js' }) },
+      };
+      yield { type: 'usage', usage: { inputTokens: 1700, outputTokens: 30 } };
+      yield { type: 'finish', reason: { kind: 'tool-calls' } };
+    },
+    // Step 5: before model call 5, AgentLoop DTOC should have evicted tc_policy_read while keeping SPEC.md
+    async function* (opts) {
+      step5Messages = opts.messages;
+      yield { type: 'text-delta', index: 0, text: 'Updated src/policy.js per SPEC.md and verified test/policy.test.js.' };
+      yield { type: 'usage', usage: { inputTokens: 1200, outputTokens: 25 } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  ]);
+
+  const runtime = new DirectAgentRuntime(store, pool, {
+    adapter,
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+  });
+
+  try {
+    const sess = runtime.createSession({
+      model: 'mock-v26',
+      workspaceRoot: workDir,
+      permissionMode: 'full-access',
+    });
+    const { turn } = runtime.startTurn(sess.id, {
+      input: 'Update src/policy.js per SPEC.md so test/policy.test.js passes.',
+      aciProfile: 'full_aci',
+      aciOptions: { admissionMinChars: 5000, maxSteps: 12 },
+    });
+    const term = await waitTurnDone(runtime, store, sess.id, turn.id, 10000);
+    assert.equal(term.state, 'completed');
+
+    const compEv = store.db
+      .prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed' ORDER BY seq DESC LIMIT 1")
+      .get(turn.id);
+    assert.ok(compEv);
+    const data = JSON.parse(compEv.data);
+    assert.ok(
+      data.aciTelemetry.supersededEvictions >= 1,
+      `Expected src/policy.js stale read to evict (>=1), got ${data.aciTelemetry.supersededEvictions}`,
+    );
+    assert.ok(data.aciTelemetry.epochTransitions >= 1);
+
+    const findText = (tcId) =>
+      step5Messages?.find((m) => m.role === 'tool' && m.toolCallId === tcId)?.content?.[0]?.text ?? '';
+    assert.ok(findText('tc_policy_read').startsWith('[ACI-REF '), 'stale src/policy.js read must be evicted');
+    assert.ok(findText('tc_spec').includes('contractConstraintHelper1'), 'SPEC.md contract must stay verbatim');
+  } finally {
     await runtime.close();
     store.close?.();
     rmDirSafe(dataDir);

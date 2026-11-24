@@ -44,9 +44,10 @@ export const DEFAULT_DTOC_PRESSURE_MIN_TOKENS = 28000;
 export const DEFAULT_DTOC_PRESSURE_RATIO = 0.65;
 export const DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS = 1200;
 export const DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS = 4;
-export const DEFAULT_V26_SUPERSEDED_MIN_NET_SAVINGS_TOKENS = 700;
-export const DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS = 900;
+export const DEFAULT_V26_SUPERSEDED_MIN_NET_SAVINGS_TOKENS = 450;
+export const DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS = 750;
 export const DEFAULT_V26_TRAJECTORY_PRESSURE_MIN_TOKENS = 10000;
+export const DEFAULT_V26_TRAJECTORY_HIGH_CUMULATIVE_MIN_TOKENS = 6500;
 export const DEFAULT_V26_TRAJECTORY_PROJECTED_RATIO = 0.78;
 export const DEFAULT_V26_EVICTION_COOLDOWN_STEPS = 3;
 export const DEFAULT_V26_MIN_SUPERSEDED_STEP = 4;
@@ -139,7 +140,22 @@ export function detectLanguageFromPath(filePath) {
 }
 
 function isAciStubText(text) {
-  return typeof text === 'string' && (text.startsWith('[ACI-REF ') || text.startsWith('[ACI-SKIP '));
+  if (typeof text !== 'string') return false;
+  if (text.startsWith('[ACI-SKIP ')) return true;
+  if (!text.startsWith('[ACI-REF ')) return false;
+  // SUPPORTING payloads carry an extracted slice after the [ACI-REF ...] header line;
+  // only single-line pointer stubs count as already-offloaded stubs.
+  const newlineIdx = text.indexOf('\n');
+  if (newlineIdx !== -1 && text.slice(newlineIdx + 1).trim().length > 0) {
+    return false;
+  }
+  return true;
+}
+
+function extractSupportingUriFromText(text) {
+  if (typeof text !== 'string' || !text.startsWith('[ACI-REF ')) return null;
+  const m = text.match(/^\[ACI-REF\s+(artifact:\/\/[a-f0-9]{64})\s*\|\s*SUPPORTING\b/);
+  return m?.[1] ?? null;
 }
 
 function tokenizeIdentifiers(text) {
@@ -895,6 +911,12 @@ function parseReadOrExpandMetadata(lowerTool, args = {}, rawText = '', uriToPath
   if (!filePath && outlineHeader?.[1]) {
     filePath = outlineHeader[1].trim();
   }
+  const supportingHeader = inner.match(
+    /^\[ACI-REF\s+(artifact:\/\/[a-f0-9]{64})\s*\|\s*SUPPORTING\s*\|\s*([^|\r\n]+?)\s*\|\s*L(\d+)-(\d+|EOF)/m,
+  );
+  if (!filePath && supportingHeader?.[2]) {
+    filePath = supportingHeader[2].trim();
+  }
   const expandRangeHeader = inner.match(
     /^\[expand_context\s+sha256:[a-f0-9]{12}[^\]]*\blines\s+(\d+)-(\d+)\/(\d+)/im,
   );
@@ -914,7 +936,12 @@ function parseReadOrExpandMetadata(lowerTool, args = {}, rawText = '', uriToPath
   let isOutline = false;
 
   if (lowerTool === 'read_file') {
-    if (rfHeader) {
+    if (supportingHeader) {
+      start = Math.max(1, Number(supportingHeader[3]));
+      end = supportingHeader[4] === 'EOF' ? Infinity : Math.max(start, Number(supportingHeader[4]));
+      isOutline = true;
+      isFull = false;
+    } else if (rfHeader) {
       start = Math.max(1, Number(rfHeader[2]));
       end = Math.max(start, Number(rfHeader[3]));
       const total = Math.max(end, Number(rfHeader[4]));
@@ -1367,9 +1394,17 @@ function computeEpochTriggerState(
         ? Math.max(0, Math.trunc(Number(unverifiedSrcMutations)))
         : derivedPhase.unverifiedSrcMutations;
 
+    const hasAnyMutations =
+      candCtx.lastMutationStepByPath.size > 0 ||
+      (candCtx.activeMutations?.length ?? 0) > 0;
+    const highCumulativeTrajectoryBypass =
+      maxTotalTokens > 0 &&
+      usedCumulative >= 0.72 * maxTotalTokens &&
+      candCtx.effectiveCurrentStep >= 6;
     const phasePassed =
       effectiveVerificationCount >= 1 ||
-      (candCtx.effectiveCurrentStep >= 6 && effectiveUnverifiedSrc === 0);
+      highCumulativeTrajectoryBypass ||
+      (candCtx.effectiveCurrentStep >= 6 && hasAnyMutations && effectiveUnverifiedSrc === 0);
 
     const hasExplicitEstRemaining =
       estRemainingSteps != null &&
@@ -1526,7 +1561,10 @@ function computeEpochTriggerState(
       (maxTotalTokens > 0 &&
         projectedTotalTokens >= DEFAULT_V26_TRAJECTORY_PROJECTED_RATIO * maxTotalTokens) ||
       singleStepRatio >= 0.9;
-    const v26MinPrompt = DEFAULT_V26_TRAJECTORY_PRESSURE_MIN_TOKENS;
+    const v26MinPrompt =
+      maxTotalTokens > 0 && usedCumulative >= 0.45 * maxTotalTokens
+        ? DEFAULT_V26_TRAJECTORY_HIGH_CUMULATIVE_MIN_TOKENS
+        : DEFAULT_V26_TRAJECTORY_PRESSURE_MIN_TOKENS;
     const pressureTriggered = trajectoryPressureMet && tokensBefore >= v26MinPrompt;
     const trajectoryTriggered =
       pressureTriggered &&
@@ -2349,16 +2387,17 @@ export function compressMessagesEpoch(
       supersededReason: ev.supersededReason ?? null,
       evictionTier: ev.evictionTier || 'aged',
     };
+    const supportingUri = extractSupportingUriFromText(ev.rawText);
     const previewStub = formatAciRefStub(
       {
-        uri: `artifact://${sha256HexLocal(ev.rawText)}`,
+        uri: supportingUri || `artifact://${sha256HexLocal(ev.rawText)}`,
         ...putMeta,
       },
       putMeta,
     );
     const nonTextBlocks = (m.content ?? []).filter((b) => b?.type !== 'text');
     m.content = [...nonTextBlocks, { type: 'text', text: previewStub }];
-    const stagedItem = { msg: m, ev, putMeta, nonTextBlocks };
+    const stagedItem = { msg: m, ev, putMeta, nonTextBlocks, supportingUri };
     if (ev.superseded) stagedSuperseded.push(stagedItem);
     else stagedAged.push(stagedItem);
   }
@@ -2414,12 +2453,42 @@ export function compressMessagesEpoch(
   let supersededTokensSaved = 0;
 
   for (const item of stagedCompressions) {
-    const ref = aciStore.put(item.ev.rawText, item.putMeta);
+    const existingRef = item.supportingUri ? aciStore.getRef?.(item.supportingUri) : null;
+    const ref = existingRef
+      ? (() => {
+          const stubText = formatAciRefStub(
+            {
+              ...existingRef,
+              lineRange: item.putMeta.lineRange || existingRef.lineRange,
+              symbolOutline: item.putMeta.symbolOutline?.length
+                ? item.putMeta.symbolOutline
+                : existingRef.symbolOutline,
+              originalTokens: existingRef.originalTokens || item.ev.rawTokens,
+              decision: 'DEFER',
+            },
+            {
+              decision: 'DEFER',
+              superseded: item.putMeta.superseded,
+              supersededReason: item.putMeta.supersededReason,
+              evictionTier: item.putMeta.evictionTier,
+            },
+          );
+          return {
+            ...existingRef,
+            decision: 'DEFER',
+            superseded: Boolean(item.putMeta.superseded),
+            supersededReason: item.putMeta.supersededReason ?? null,
+            evictionTier: item.putMeta.evictionTier ?? null,
+            stubText,
+            stubTokens: estimateTokens(stubText),
+          };
+        })()
+      : aciStore.put(item.ev.rawText, item.putMeta);
     item.msg.content = [...item.nonTextBlocks, { type: 'text', text: ref.stubText }];
     compressedRefs.push(ref);
     const savedForRef = Math.max(
       0,
-      Number(ref.originalTokens ?? item.ev.rawTokens ?? 0) -
+      Number(item.ev.rawTokens ?? ref.originalTokens ?? 0) -
         Number(ref.stubTokens ?? estimateTokens(ref.stubText)),
     );
     if (item.ev.superseded) {
