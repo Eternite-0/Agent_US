@@ -348,7 +348,7 @@ export function createFsTools({
       name: 'run_diagnostics',
       serializeZodSchema: false,
       description:
-        '只读结构化诊断工具（受工作区沙箱约束）：快速执行语法检查（node --check / JSON.parse）、类型检查（tsc --noEmit）或测试（node --test），并将冗长输出去重压缩为结构化 JSON（diagnostics、failingTests、compression）与精简摘要。',
+        '只读结构化诊断工具（受工作区沙箱约束）：快速执行语法检查（node --check / JSON.parse）、增量类型检查（tsc --noEmit --pretty false）或测试（node --test），并将冗长输出去重压缩为带 source（tsc/node-test/syntax）、行列定位及 AssertionError expected/actual/operator 详情的结构化 JSON（diagnostics、failingTests、compression）与精简摘要。',
       effectClass: EFFECT_CLASSES.READ_ONLY,
       riskLevel: RISK_LEVELS.LOW,
       replayable: true,

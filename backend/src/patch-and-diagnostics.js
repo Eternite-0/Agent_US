@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import {
+  accessSync,
+  constants,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -8,7 +10,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, extname, join, relative, resolve } from 'node:path';
+import { delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { sha256Hex } from './integrity.js';
 import {
   isProtectedPathSegment,
@@ -1434,17 +1436,23 @@ const DIAG_SKIP_DIRS = new Set([
   'var',
 ]);
 
-function normalizeDiagnosticFile(rawFile, workspaceRoot) {
-  let s = String(rawFile ?? '').trim().replace(/^file:\/\/\/?/i, '');
+function normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir = null) {
+  let s = String(rawFile ?? '')
+    .trim()
+    .replace(/^file:\/\/\/?/i, '');
+  if (!/^\\\\[^\\]/.test(s)) {
+    s = s.replace(/\\\\/g, '\\');
+  }
   if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(s)) {
     s = s.slice(1);
   }
   if (workspaceRoot && s) {
     try {
       const root = resolve(workspaceRoot);
-      const abs = resolve(root, s);
+      const anchor = baseDir ? resolve(baseDir) : root;
+      const abs = isAbsolute(s) ? resolve(s) : resolve(anchor, s);
       const rel = relative(root, abs).replace(/\\/g, '/');
-      if (rel && !rel.startsWith('..')) return rel;
+      if (rel && !rel.startsWith('..') && !isAbsolute(rel)) return rel;
     } catch {
       // keep cleaned string
     }
@@ -1478,13 +1486,62 @@ function isBlockedDiagnosticsRel(relPath) {
   });
 }
 
+function extractStackLocation(line) {
+  const s = String(line ?? '');
+  const patterns = [
+    /\(((?:file:\/\/\/)?[^()\r\n]+?\.[cm]?[jt]sx?):(\d+)(?::(\d+))?\)/i,
+    /((?:file:\/\/\/|[A-Za-z]:[\\/]|[\w./\\-]+)[^():\s\r\n]*?\.[cm]?[jt]sx?):(\d+)(?::(\d+))?/i,
+  ];
+  for (const rx of patterns) {
+    const m = rx.exec(s);
+    if (!m) continue;
+    const raw = m[1];
+    if (
+      !raw ||
+      raw.startsWith('node:') ||
+      /(?:^|[\\/])node_modules(?:[\\/]|$)/i.test(raw)
+    ) {
+      continue;
+    }
+    return {
+      file: raw,
+      line: Math.max(1, Math.trunc(Number(m[2]) || 1)),
+      column: Math.max(1, Math.trunc(Number(m[3]) || 1)),
+    };
+  }
+  return null;
+}
+
+function normalizeParsedValue(raw, { yamlStyle = false } = {}) {
+  if (raw === undefined || raw === null) return undefined;
+  let s = String(raw).trim();
+  if (!yamlStyle) {
+    s = s.replace(/,\s*$/, '').trim();
+  }
+  s = s.replace(/\s*\r?\n\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  if (s.length >= 2 && s.startsWith("'") && s.endsWith("'")) {
+    const inner = s.slice(1, -1);
+    s = yamlStyle
+      ? inner.replace(/''/g, "'")
+      : inner.replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+  } else if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(s);
+      if (typeof parsed === 'string') s = parsed;
+    } catch {
+      s = s.slice(1, -1);
+    }
+  }
+  return s.slice(0, 240);
+}
+
 /**
  * Parses and deduplicates noisy compiler/linter/test-runner output (hundreds/thousands of lines)
  * into bounded structured diagnostics, failing tests, and compression statistics.
  */
 export function parseAndCompressDiagnosticsOutput(
   rawOutput,
-  { kind = 'auto', maxDiagnostics = 25, workspaceRoot = null } = {},
+  { kind = 'auto', maxDiagnostics = 25, workspaceRoot = null, baseDir = null } = {},
 ) {
   const cap = Math.max(1, Math.min(100, Math.trunc(Number(maxDiagnostics) || 25)));
   const cleaned = String(rawOutput ?? '').replace(ANSI_RE, '').replace(/\r\n/g, '\n');
@@ -1502,48 +1559,227 @@ export function parseAndCompressDiagnosticsOutput(
   const rawLines = lines.length;
   const diagMap = new Map();
   const testMap = new Map();
+  const deferredTestDiagnostics = [];
+  let hasStructuredNodeTestEvidence = false;
 
   const addDiag = (entry) => {
-    const file = normalizeDiagnosticFile(entry.file || '.', workspaceRoot);
+    const file = normalizeDiagnosticFile(entry.file || '.', workspaceRoot, baseDir);
     const line = Math.max(1, Math.trunc(Number(entry.line) || 1));
     const column = Math.max(1, Math.trunc(Number(entry.column) || 1));
     const severity = entry.severity || 'error';
     const code = String(entry.code || 'DIAGNOSTIC').trim();
     const message = String(entry.message || '').trim().slice(0, 320);
+    const source = String(entry.source || 'diagnostic').trim();
     if (!message) return;
     const key = `${file}:${line}:${column}:${severity}:${code}:${message}`;
     if (!diagMap.has(key) && diagMap.size < cap) {
-      diagMap.set(key, { file, line, column, severity, code, message });
+      diagMap.set(key, {
+        file,
+        line,
+        column,
+        severity,
+        code,
+        message,
+        source,
+        ...(entry.testName ? { testName: entry.testName } : {}),
+        ...(entry.expected !== undefined ? { expected: entry.expected } : {}),
+        ...(entry.actual !== undefined ? { actual: entry.actual } : {}),
+        ...(entry.operator !== undefined ? { operator: entry.operator } : {}),
+      });
     }
   };
 
   const addFailingTest = (entry) => {
-    const name = String(entry.name || 'unnamed test').trim().slice(0, 200);
-    const file = entry.file ? normalizeDiagnosticFile(entry.file, workspaceRoot) : '';
+    const testName = String(entry.testName || entry.name || 'unnamed test').trim().slice(0, 200);
+    const file = entry.file ? normalizeDiagnosticFile(entry.file, workspaceRoot, baseDir) : '';
+    const line = Math.max(1, Math.trunc(Number(entry.line) || 1));
+    const column = Math.max(1, Math.trunc(Number(entry.column) || 1));
     const assertion = String(entry.assertion || 'test failed').trim().slice(0, 320);
-    const key = name.toLowerCase();
-    const existing = testMap.get(key);
+    const code = entry.code ? String(entry.code).trim() : null;
+    const expected = entry.expected !== undefined ? entry.expected : undefined;
+    const actual = entry.actual !== undefined ? entry.actual : undefined;
+    const operator = entry.operator !== undefined ? entry.operator : undefined;
+    const key = `${testName.toLowerCase()}::${file}`;
+    const existing = testMap.get(key) ?? testMap.get(testName.toLowerCase());
     if (existing) {
-      if (!existing.file && file) existing.file = file;
+      if (!existing.file && file) {
+        existing.file = file;
+        existing.line = line;
+        existing.column = column;
+      } else if (entry.fromStack && !existing._fromStack && file) {
+        existing.file = file;
+        existing.line = line;
+        existing.column = column;
+        existing._fromStack = true;
+      }
       if (existing.assertion === 'test failed' && assertion && assertion !== 'test failed') {
         existing.assertion = assertion;
       }
+      if (code && !existing.code) existing.code = code;
+      if (expected !== undefined && existing.expected === undefined) existing.expected = expected;
+      if (actual !== undefined && existing.actual === undefined) existing.actual = actual;
+      if (operator !== undefined && existing.operator === undefined) existing.operator = operator;
       return;
     }
     if (testMap.size < cap) {
-      testMap.set(key, { name, file, assertion });
+      const record = {
+        name: testName,
+        testName,
+        file,
+        line,
+        column,
+        assertion,
+        ...(code ? { code } : {}),
+        ...(expected !== undefined ? { expected } : {}),
+        ...(actual !== undefined ? { actual } : {}),
+        ...(operator !== undefined ? { operator } : {}),
+        _fromStack: Boolean(entry.fromStack),
+      };
+      testMap.set(key, record);
+      if (key !== testName.toLowerCase() && !testMap.has(testName.toLowerCase())) {
+        // index by name as well only when file was blank initially
+      }
+      if (entry.emitDiagnostic) {
+        deferredTestDiagnostics.push({
+          file: file || '.',
+          line,
+          column,
+          severity: 'error',
+          code: code || (operator ? 'ERR_ASSERTION' : 'ERR_TEST_FAILURE'),
+          message: `[${testName}] ${assertion}`.slice(0, 320),
+          source: 'node-test',
+          testName,
+          ...(expected !== undefined ? { expected } : {}),
+          ...(actual !== undefined ? { actual } : {}),
+          ...(operator !== undefined ? { operator } : {}),
+          _structured: Boolean(entry.hasStructuredEvidence),
+        });
+      }
     }
   };
 
+  let inSpecFailuresSection = false;
+  let pendingDeclLoc = null;
   let pendingTest = null;
+  let pendingTap = null;
+  const summaryOnlyFails = [];
+  let detailedFailureCount = 0;
+
+  const finalizeInspectProp = (pt) => {
+    if (!pt || !pt.inspectProp) return;
+    const raw = pt.inspectBuf.join('\n');
+    const val = normalizeParsedValue(raw, { yamlStyle: false });
+    if (pt.inspectProp === 'code' && val) pt.code = val;
+    else if (pt.inspectProp === 'operator' && val !== undefined) {
+      pt.operator = val;
+      pt.hasStructuredEvidence = true;
+    } else if (pt.inspectProp === 'actual' && val !== undefined) {
+      pt.actual = val;
+      pt.hasStructuredEvidence = true;
+    } else if (pt.inspectProp === 'expected' && val !== undefined) {
+      pt.expected = val;
+      pt.hasStructuredEvidence = true;
+    }
+    pt.inspectProp = null;
+    pt.inspectBuf = [];
+  };
+
   const flushPendingTest = () => {
     if (!pendingTest) return;
-    addFailingTest({
-      name: pendingTest.name,
-      file: pendingTest.file,
-      assertion: pendingTest.assertions.join(' | ') || 'test failed',
-    });
+    finalizeInspectProp(pendingTest);
+    const pt = pendingTest;
     pendingTest = null;
+
+    if (!pt.isDetailed) {
+      summaryOnlyFails.push({ testName: pt.testName });
+      return;
+    }
+
+    // Fallback inference for single-line `Expected values to be strictly equal: A !== B`
+    const combinedAssertions = pt.assertions.join(' | ');
+    if (
+      pt.actual === undefined &&
+      pt.expected === undefined &&
+      /Expected values to be strictly equal/i.test(combinedAssertions)
+    ) {
+      const cmpM = /(\S+)\s*!==\s*(\S+)/.exec(combinedAssertions);
+      if (cmpM) {
+        pt.actual = normalizeParsedValue(cmpM[1], { yamlStyle: false });
+        pt.expected = normalizeParsedValue(cmpM[2], { yamlStyle: false });
+        if (!pt.operator) pt.operator = 'strictEqual';
+      }
+    }
+
+    detailedFailureCount++;
+    const loc = pt.stackLoc ?? pt.declLoc ?? { file: '', line: 1, column: 1 };
+    addFailingTest({
+      testName: pt.testName,
+      file: loc.file,
+      line: loc.line,
+      column: loc.column,
+      fromStack: Boolean(pt.stackLoc),
+      assertion: combinedAssertions || 'test failed',
+      code: pt.code,
+      expected: pt.expected,
+      actual: pt.actual,
+      operator: pt.operator,
+      emitDiagnostic: true,
+      hasStructuredEvidence: pt.hasStructuredEvidence || hasStructuredNodeTestEvidence,
+    });
+  };
+
+  const finalizeTapBlockProp = (tp) => {
+    if (!tp || !tp.activeKey) return;
+    const raw = tp.blockBuf.join('\n');
+    if (tp.activeKey === 'error') {
+      const firstLine = tp.blockBuf.map((l) => l.trim()).filter(Boolean).slice(0, 3);
+      tp.errorLines.push(...firstLine);
+    } else if (tp.activeKey === 'stack') {
+      for (const sl of tp.blockBuf) {
+        const loc = extractStackLocation(sl);
+        if (loc && !tp.stackLoc) {
+          tp.stackLoc = loc;
+          break;
+        }
+      }
+    } else if (tp.activeKey === 'expected') {
+      tp.expected = normalizeParsedValue(raw, { yamlStyle: true });
+    } else if (tp.activeKey === 'actual') {
+      tp.actual = normalizeParsedValue(raw, { yamlStyle: true });
+    }
+    tp.activeKey = null;
+    tp.blockBuf = [];
+    tp.blockIndent = 0;
+  };
+
+  const flushPendingTap = () => {
+    if (!pendingTap) return;
+    finalizeTapBlockProp(pendingTap);
+    const tp = pendingTap;
+    pendingTap = null;
+    if (tp.failureType === 'subtestsFailed' && detailedFailureCount > 0) {
+      return;
+    }
+    detailedFailureCount++;
+    const loc = tp.stackLoc ?? tp.declLoc ?? { file: '', line: 1, column: 1 };
+    const headline =
+      tp.name && tp.errorLines.length
+        ? `${tp.name}${tp.code ? ` [${tp.code}]` : ''}: ${tp.errorLines.join(' | ')}`
+        : tp.errorLines.join(' | ') || 'test failed';
+    addFailingTest({
+      testName: tp.testName,
+      file: loc.file,
+      line: loc.line,
+      column: loc.column,
+      fromStack: Boolean(tp.stackLoc),
+      assertion: headline,
+      code: tp.code,
+      expected: tp.expected,
+      actual: tp.actual,
+      operator: tp.operator,
+      emitDiagnostic: true,
+      hasStructuredEvidence: true,
+    });
   };
 
   const tscParenRe = /^(.+?)\((\d+),(\d+)\):\s*(error|warning|info)\s+(TS\d+):\s*(.+)$/i;
@@ -1552,35 +1788,136 @@ export function parseAndCompressDiagnosticsOutput(
   const bareLocRe = /^((?:[A-Za-z]:)?[^:\r\n]+?):(\d+)(?::(\d+))?$/;
   const specFailRe = /^\s*(?:✖|×|FAIL)\s+(.+?)(?:\s+\(\d+(?:\.\d+)?m?s\))?$/;
   const tapFailRe = /^\s*not ok\s+\d+\s*-\s*(.+)$/;
-  const stackLocRe = /\(?((?:file:\/\/\/|[A-Za-z]:[\\/]|[\w./\\-]+)[^():\s]+\.[cm]?[jt]sx?):(\d+)(?::(\d+))?\)?/;
   let pendingFileLoc = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
+
+    if (pendingTap) {
+      if (!pendingTap.inYaml) {
+        if (trimmed === '---') {
+          pendingTap.inYaml = true;
+          continue;
+        }
+        flushPendingTap();
+      } else {
+        if (trimmed === '...') {
+          flushPendingTap();
+          continue;
+        }
+        const indent = line.length - line.trimStart().length;
+        if (pendingTap.activeKey && (indent > pendingTap.blockIndent || !trimmed)) {
+          if (trimmed) pendingTap.blockBuf.push(line);
+          continue;
+        }
+        finalizeTapBlockProp(pendingTap);
+        const kvM = /^([A-Za-z_][\w]*)\s*:\s*(.*)$/.exec(trimmed);
+        if (kvM) {
+          const [, k, v] = kvM;
+          if (v === '|-' || v === '|' || v === '') {
+            pendingTap.activeKey = k;
+            pendingTap.blockIndent = indent;
+            pendingTap.blockBuf = [];
+          } else {
+            const val = normalizeParsedValue(v, { yamlStyle: true });
+            if (k === 'location') {
+              const loc = extractStackLocation(val);
+              if (loc) pendingTap.declLoc = loc;
+            } else if (k === 'failureType') {
+              pendingTap.failureType = val;
+            } else if (k === 'code') {
+              pendingTap.code = val;
+            } else if (k === 'name') {
+              pendingTap.name = val;
+            } else if (k === 'operator') {
+              pendingTap.operator = val;
+            } else if (k === 'expected') {
+              pendingTap.expected = val;
+            } else if (k === 'actual') {
+              pendingTap.actual = val;
+            } else if (k === 'error' && val) {
+              pendingTap.errorLines.push(val);
+            }
+          }
+        }
+        continue;
+      }
+    }
+
     if (!trimmed) continue;
+
+    if (/^(?:✖|×)\s*failing tests:\s*$/i.test(trimmed)) {
+      flushPendingTest();
+      inSpecFailuresSection = true;
+      hasStructuredNodeTestEvidence = true;
+      continue;
+    }
 
     // Ignore passing noise, summary headings & TAP boilerplate
     if (
-      /^(?:✔|✓|ok\s+\d+|#\s*(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms|Subtest)|TAP version|1\.\.\d+|---|(?:\.\.\.)$|(?:✖|×)\s*failing tests:\s*$)/i.test(
+      /^(?:✔|✓|▶|ok\s+\d+|#\s*(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms|Subtest)|ℹ\s+(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b|TAP version|1\.\.\d+)$/i.test(
         trimmed,
       )
     ) {
-      if (pendingTest && /^(?:✔|✓|ok\s+\d+|not ok|✖|×|#\s*(?:tests|fail)|\.\.\.$)/i.test(trimmed)) {
-        flushPendingTest();
+      if (pendingTest) flushPendingTest();
+      if (/^ℹ\s+(?:tests|fail)\b/i.test(trimmed) || /^TAP version/i.test(trimmed)) {
+        hasStructuredNodeTestEvidence = true;
       }
+      continue;
+    }
+
+    if (/^test at\s+/i.test(trimmed)) {
+      flushPendingTest();
+      hasStructuredNodeTestEvidence = true;
+      const loc = extractStackLocation(trimmed);
+      if (loc) pendingDeclLoc = loc;
       continue;
     }
 
     // 1. Failing test markers
     const specM = specFailRe.exec(line);
     const tapM = !specM ? tapFailRe.exec(line) : null;
-    if (specM || tapM) {
+    if (tapM) {
       flushPendingTest();
+      hasStructuredNodeTestEvidence = true;
+      pendingTap = {
+        testName: tapM[1].trim(),
+        declLoc: null,
+        stackLoc: null,
+        failureType: '',
+        errorLines: [],
+        code: null,
+        name: null,
+        expected: undefined,
+        actual: undefined,
+        operator: undefined,
+        inYaml: false,
+        activeKey: null,
+        blockIndent: 0,
+        blockBuf: [],
+      };
+      continue;
+    }
+    if (specM) {
+      flushPendingTest();
+      const declLoc = pendingDeclLoc;
+      pendingDeclLoc = null;
       pendingTest = {
-        name: (specM ? specM[1] : tapM[1]).trim(),
-        file: '',
+        testName: specM[1].trim(),
+        declLoc,
+        stackLoc: null,
         assertions: [],
+        code: null,
+        expected: undefined,
+        actual: undefined,
+        operator: undefined,
+        isDetailed: Boolean(inSpecFailuresSection || declLoc),
+        hasStructuredEvidence: Boolean(inSpecFailuresSection || declLoc),
+        inInspectObj: false,
+        inspectBraceDepth: 0,
+        inspectProp: null,
+        inspectBuf: [],
       };
       continue;
     }
@@ -1592,35 +1929,68 @@ export function parseAndCompressDiagnosticsOutput(
         tscColonRe.test(trimmed);
       if (isCompilerOrSummary) {
         flushPendingTest();
-      } else {
-        const locM = stackLocRe.exec(trimmed);
-        if (locM && !locM[1].startsWith('node:') && !locM[1].includes('node_modules')) {
-          if (!pendingTest.file) pendingTest.file = locM[1];
+      } else if (pendingTest.inInspectObj) {
+        if (trimmed === '}' && pendingTest.inspectBraceDepth <= 1) {
+          finalizeInspectProp(pendingTest);
+          pendingTest.inInspectObj = false;
+          pendingTest.inspectBraceDepth = 0;
+          flushPendingTest();
+          continue;
         }
-        if (/^(?:AssertionError|Error|TypeError|ReferenceError|SyntaxError|Expected|Actual|values|failed|err_|code:|error:)/i.test(trimmed) || trimmed.startsWith("'")) {
-          if (pendingTest.assertions.length < 3) {
-            pendingTest.assertions.push(trimmed);
+        if (/^\},?$/.test(trimmed) && pendingTest.inspectBraceDepth > 1) {
+          pendingTest.inspectBraceDepth--;
+          if (pendingTest.inspectProp) {
+            pendingTest.inspectBuf.push(trimmed);
+          }
+          continue;
+        }
+        const propM =
+          pendingTest.inspectBraceDepth === 1
+            ? /^(generatedMessage|code|actual|expected|operator|diff|showDiff)\s*:\s*(.*)$/.exec(trimmed)
+            : null;
+        if (propM) {
+          finalizeInspectProp(pendingTest);
+          pendingTest.inspectProp = propM[1];
+          const propValTrim = propM[2].trim();
+          pendingTest.inspectBuf = propValTrim ? [propValTrim] : [];
+          if (/^(?:.*[:=,\[])?\s*\{$/.test(propValTrim)) {
+            pendingTest.inspectBraceDepth++;
+          }
+        } else {
+          if (/(?:^|[:=,\[])\s*\{$/.test(trimmed)) {
+            pendingTest.inspectBraceDepth++;
+          }
+          if (pendingTest.inspectProp) {
+            pendingTest.inspectBuf.push(trimmed);
           }
         }
-        if (/^at\s+test\s+at\s+/i.test(trimmed) || /^test at\s+/i.test(trimmed)) {
-          const tLoc = stackLocRe.exec(trimmed);
-          if (tLoc && !pendingTest.file) pendingTest.file = tLoc[1];
-        }
         continue;
-      }
-    }
-
-    if (/^test at\s+/i.test(trimmed)) {
-      const locM = stackLocRe.exec(trimmed);
-      const nextLine = (lines[i + 1] ?? '').trim();
-      const nameM = /^(?:✖|×)\s*(.+?)(?:\s+\(\d+(?:\.\d+)?m?s\))?$/.exec(nextLine);
-      if (locM && nameM) {
-        pendingTest = {
-          name: nameM[1].trim(),
-          file: locM[1],
-          assertions: [],
-        };
-        i++;
+      } else {
+        const isErrLine =
+          /^(?:AssertionError|Error|TypeError|ReferenceError|SyntaxError|RangeError|Expected|Actual|values|failed|err_|code:|error:|The input did not match|[+-]\s+actual)/i.test(
+            trimmed,
+          ) ||
+          /^[+-]\s+/.test(trimmed) ||
+          trimmed.startsWith("'") ||
+          /\s!==\s/.test(trimmed);
+        const loc = extractStackLocation(trimmed);
+        if (loc || isErrLine || /^at\s+/.test(trimmed)) {
+          pendingTest.isDetailed = true;
+        }
+        if (loc && !pendingTest.stackLoc) {
+          pendingTest.stackLoc = loc;
+        }
+        const errCodeM = /\[([A-Z][A-Z0-9_]+)\]/.exec(trimmed);
+        if (errCodeM && !pendingTest.code) {
+          pendingTest.code = errCodeM[1];
+        }
+        if (isErrLine && pendingTest.assertions.length < 3) {
+          pendingTest.assertions.push(trimmed);
+        }
+        if (/^at\s+.+\{\s*$/.test(trimmed) || (trimmed === '{' && Boolean(pendingTest.stackLoc))) {
+          pendingTest.inInspectObj = true;
+          pendingTest.inspectBraceDepth = 1;
+        }
         continue;
       }
     }
@@ -1635,6 +2005,7 @@ export function parseAndCompressDiagnosticsOutput(
         severity: tsM[4].toLowerCase(),
         code: tsM[5],
         message: tsM[6],
+        source: 'tsc',
       });
       continue;
     }
@@ -1658,6 +2029,7 @@ export function parseAndCompressDiagnosticsOutput(
         severity: (genM[4] || 'error').toLowerCase(),
         code: genM[5] || (synNext ? 'SYNTAX_ERROR' : 'DIAGNOSTIC'),
         message: synNext ? synNext[1] : genM[6],
+        source: synNext ? 'syntax' : kind === 'lint' ? 'eslint' : 'diagnostic',
       });
       continue;
     }
@@ -1673,24 +2045,7 @@ export function parseAndCompressDiagnosticsOutput(
       continue;
     }
 
-    // 4. Standalone `test at path:line:col` summary blocks
-    if (trimmed.startsWith('test at ')) {
-      const locM = stackLocRe.exec(trimmed);
-      if (locM) {
-        const nextLine = (lines[i + 1] ?? '').trim();
-        const nameM = /^(?:✖|×)\s*(.+?)(?:\s+\(\d+(?:\.\d+)?m?s\))?$/.exec(nextLine);
-        if (nameM) {
-          addFailingTest({
-            name: nameM[1],
-            file: locM[1],
-            assertion: (lines[i + 2] ?? '').trim() || 'test failed',
-          });
-        }
-      }
-      continue;
-    }
-
-    // 5. Fallback for explicit error lines when nothing else matched
+    // 4. Fallback for explicit error lines when nothing else matched
     if (/^(?:SyntaxError|TypeError|ReferenceError|Error|ERR_[A-Z0-9_]+)\b/i.test(trimmed) && diagMap.size < cap) {
       addDiag({
         file: pendingFileLoc?.file || '.',
@@ -1699,14 +2054,36 @@ export function parseAndCompressDiagnosticsOutput(
         severity: 'error',
         code: /^SyntaxError:/i.test(trimmed) ? 'SYNTAX_ERROR' : 'ERROR',
         message: trimmed,
+        source: /^SyntaxError:/i.test(trimmed) ? 'syntax' : 'diagnostic',
       });
       pendingFileLoc = null;
     }
   }
+  flushPendingTap();
   flushPendingTest();
 
+  if (testMap.size === 0 && summaryOnlyFails.length > 0) {
+    for (const sf of summaryOnlyFails) {
+      addFailingTest({
+        testName: sf.testName,
+        file: '',
+        line: 1,
+        column: 1,
+        assertion: 'test failed',
+        emitDiagnostic: true,
+        hasStructuredEvidence: hasStructuredNodeTestEvidence,
+      });
+    }
+  }
+
+  for (const d of deferredTestDiagnostics) {
+    if (kind === 'test' || diagMap.size === 0 || d._structured) {
+      addDiag(d);
+    }
+  }
+
   const diagnostics = [...diagMap.values()];
-  const failingTests = [...testMap.values()];
+  const failingTests = [...testMap.values()].map(({ _fromStack, ...rest }) => rest);
   const keptLines = diagnostics.length + failingTests.length;
   const truncatedCount = Math.max(0, rawLines - keptLines);
 
@@ -1784,30 +2161,174 @@ function collectDiagnosticFiles(workspaceRoot, rawPaths, extFilterSet) {
   return { files, missing: [] };
 }
 
-function findTsconfigAndTsc(workspaceRoot, targetFiles) {
+const TS_EXTS = new Set(['.ts', '.tsx', '.mts', '.cts']);
+const SAFE_CLI_ARG_RE = /^[^\r\n\0&|;<>^%!"]+$/;
+
+function isNodeShebangScript(filePath) {
+  try {
+    const head = readFileSync(filePath, 'utf8').slice(0, 160);
+    return /^#![^\n]*\bnode\b/i.test(head);
+  } catch {
+    return false;
+  }
+}
+
+function isExecutableFile(filePath) {
+  try {
+    if (!existsSync(filePath) || statSync(filePath).isDirectory()) return false;
+    if (process.platform === 'win32') return true;
+    accessSync(filePath, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function makeRunnerFromBinPath(binPath) {
+  if (!binPath || !existsSync(binPath)) return null;
+  if (isNodeShebangScript(binPath)) {
+    return { command: process.execPath, prefixArgs: [binPath], path: binPath };
+  }
+  if (process.platform === 'win32') {
+    const lower = binPath.toLowerCase();
+    if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
+      const siblingJs = [
+        join(dirname(binPath), 'node_modules', 'typescript', 'bin', 'tsc'),
+        join(dirname(binPath), '..', 'typescript', 'bin', 'tsc'),
+      ].find((p) => existsSync(p));
+      if (siblingJs) {
+        return { command: process.execPath, prefixArgs: [siblingJs], path: siblingJs };
+      }
+      if (!SAFE_CLI_ARG_RE.test(binPath)) return null;
+      return {
+        command: process.env.ComSpec || 'cmd.exe',
+        prefixArgs: ['/d', '/c', binPath],
+        path: binPath,
+        requiresSafeArgs: true,
+      };
+    }
+    if (lower.endsWith('.exe')) {
+      return { command: binPath, prefixArgs: [], path: binPath };
+    }
+    return null;
+  }
+  return isExecutableFile(binPath) ? { command: binPath, prefixArgs: [], path: binPath } : null;
+}
+
+export function resolveTscRunner(searchDirs = [], pathEnv = process.env.PATH) {
+  const checkedDirs = new Set();
+  for (const rawDir of searchDirs) {
+    if (!rawDir) continue;
+    const dir = resolve(rawDir);
+    if (checkedDirs.has(dir)) continue;
+    checkedDirs.add(dir);
+
+    const directJs = join(dir, 'node_modules', 'typescript', 'bin', 'tsc');
+    if (existsSync(directJs)) {
+      return { command: process.execPath, prefixArgs: [directJs], path: directJs };
+    }
+    const localBinCandidates =
+      process.platform === 'win32'
+        ? [
+            join(dir, 'node_modules', '.bin', 'tsc.exe'),
+            join(dir, 'node_modules', '.bin', 'tsc'),
+            join(dir, 'node_modules', '.bin', 'tsc.cmd'),
+          ]
+        : [join(dir, 'node_modules', '.bin', 'tsc')];
+    for (const cand of localBinCandidates) {
+      const runner = makeRunnerFromBinPath(cand);
+      if (runner) return runner;
+    }
+  }
+
+  const pathDirs = String(pathEnv ?? '')
+    .split(delimiter)
+    .map((d) => d.trim())
+    .filter(Boolean);
+  for (const binDir of pathDirs) {
+    const candidates =
+      process.platform === 'win32'
+        ? [join(binDir, 'tsc.exe'), join(binDir, 'tsc'), join(binDir, 'tsc.cmd')]
+        : [join(binDir, 'tsc')];
+    for (const cand of candidates) {
+      const runner = makeRunnerFromBinPath(cand);
+      if (runner) return runner;
+    }
+  }
+  return null;
+}
+
+function walkAncestorsWithinRoot(startDir, root) {
+  const dirs = [];
+  let dir = resolve(startDir);
+  const absRoot = resolve(root);
+  while (true) {
+    const rel = relative(absRoot, dir);
+    if (rel.startsWith('..') || isAbsolute(rel)) break;
+    dirs.push(dir);
+    if (dir === absRoot) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return dirs;
+}
+
+function findNearestTsconfigProjects(workspaceRoot, targetFiles, normPaths = []) {
   const root = resolve(workspaceRoot);
-  const candidates = new Set([root]);
+  const seenTsconfigs = new Set();
+  const projects = [];
+
+  const addForStartDir = (startDir) => {
+    const ancestors = walkAncestorsWithinRoot(startDir, root);
+    for (const dir of ancestors) {
+      const tsconfig = join(dir, 'tsconfig.json');
+      if (existsSync(tsconfig)) {
+        const key = stateKeyFor(tsconfig);
+        if (!seenTsconfigs.has(key)) {
+          seenTsconfigs.add(key);
+          const runnerSearchDirs = walkAncestorsWithinRoot(dir, root);
+          projects.push({
+            tsconfig,
+            projectDir: dir,
+            tscRunner: resolveTscRunner(runnerSearchDirs),
+          });
+        }
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (normPaths.length > 0) {
+    for (const raw of normPaths) {
+      try {
+        const confined = resolveConfinedPath(root, raw);
+        const startDir =
+          existsSync(confined.full) && statSync(confined.full).isDirectory()
+            ? confined.full
+            : dirname(confined.full);
+        addForStartDir(startDir);
+      } catch {
+        // skip invalid path
+      }
+    }
+    for (const f of targetFiles) {
+      addForStartDir(dirname(f.full));
+    }
+    return projects;
+  }
+
+  // Whole-workspace scan: check root tsconfig.json first, then any subdir TS target's nearest tsconfig.json
+  if (existsSync(join(root, 'tsconfig.json'))) {
+    addForStartDir(root);
+  }
   for (const f of targetFiles) {
-    let dir = dirname(f.full);
-    while (dir.startsWith(root)) {
-      candidates.add(dir);
-      if (dir === root) break;
-      const parent = dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
+    if (TS_EXTS.has(extname(f.rel).toLowerCase())) {
+      addForStartDir(dirname(f.full));
     }
   }
-  for (const dir of candidates) {
-    const tsconfig = join(dir, 'tsconfig.json');
-    const tscBin =
-      [join(dir, 'node_modules', 'typescript', 'bin', 'tsc'), join(root, 'node_modules', 'typescript', 'bin', 'tsc')].find(
-        (p) => existsSync(p),
-      ) ?? null;
-    if (existsSync(tsconfig)) {
-      return { tsconfig, tscBin, projectDir: dir };
-    }
-  }
-  return { tsconfig: null, tscBin: null, projectDir: root };
+  return projects;
 }
 
 export function runDiagnostics(
@@ -1836,14 +2357,18 @@ export function runDiagnostics(
   const notes = [];
 
   const pushDiag = (d) => {
-    const key = `${d.file}:${d.line}:${d.column}:${d.severity}:${d.code}:${d.message}`;
+    const entry = {
+      ...d,
+      source: d.source || 'diagnostic',
+    };
+    const key = `${entry.file}:${entry.line}:${entry.column}:${entry.severity}:${entry.code}:${entry.message}`;
     if (!diagKeys.has(key) && allDiagnostics.length < cap) {
       diagKeys.add(key);
-      allDiagnostics.push(d);
+      allDiagnostics.push(entry);
     }
   };
   const pushTest = (t) => {
-    const key = `${t.name}|${t.file}|${t.assertion}`;
+    const key = `${t.testName || t.name}|${t.file}|${t.line || 1}|${t.assertion}`;
     if (!testKeys.has(key) && allFailingTests.length < cap) {
       testKeys.add(key);
       allFailingTests.push(t);
@@ -1855,7 +2380,15 @@ export function runDiagnostics(
     const { files, missing } = collectDiagnosticFiles(root, normPaths, syntaxExts);
     for (const m of missing) {
       totalRawLines++;
-      pushDiag({ file: m, line: 1, column: 1, severity: 'error', code: 'ENOENT', message: 'File not found' });
+      pushDiag({
+        file: m,
+        line: 1,
+        column: 1,
+        severity: 'error',
+        code: 'ENOENT',
+        message: 'File not found',
+        source: 'syntax',
+      });
     }
     for (const f of files) {
       totalRawLines++;
@@ -1872,54 +2405,107 @@ export function runDiagnostics(
           severity: 'error',
           code: res.code,
           message: res.message,
+          source: 'syntax',
         });
       }
     }
     notes.push(`syntax:${files.length} files`);
   };
 
-  const runTypecheck = () => {
-    const { files } = collectDiagnosticFiles(root, normPaths, null);
-    const { tsconfig, tscBin, projectDir } = findTsconfigAndTsc(root, files);
-    if (!tsconfig || !tscBin) {
-      notes.push(`typecheck:skipped(${!tsconfig ? 'no tsconfig.json' : 'tsc unavailable'})`);
+  const runTypecheck = (precomputedProjects = null) => {
+    const projects =
+      precomputedProjects ??
+      findNearestTsconfigProjects(
+        root,
+        collectDiagnosticFiles(root, normPaths, null).files,
+        normPaths,
+      );
+    if (!projects.length) {
+      notes.push('typecheck:skipped(no tsconfig.json)');
       return;
     }
-    const res = spawnSync(process.execPath, [tscBin, '--noEmit', '--pretty', 'false', '-p', tsconfig], {
-      cwd: projectDir,
-      encoding: 'utf8',
-      windowsHide: true,
-      timeout: 25000,
-      env: sanitizeChildEnv(process.env),
-    });
-    const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
-    const parsed = parseAndCompressDiagnosticsOutput(combined, {
-      kind: 'typecheck',
-      maxDiagnostics: cap,
-      workspaceRoot: root,
-    });
-    totalRawLines += parsed.compression.rawLines;
-    for (const d of parsed.diagnostics) pushDiag(d);
-    if (res.status !== 0 && parsed.diagnostics.length === 0) {
-      hadFailureExit = true;
-      pushDiag({
-        file: relative(root, tsconfig).replace(/\\/g, '/') || 'tsconfig.json',
-        line: 1,
-        column: 1,
-        severity: 'error',
-        code: 'TYPECHECK_ERROR',
-        message: combined.trim().slice(0, 320) || `tsc exited with status ${res.status}`,
-      });
+    const runnable = projects.filter((p) => Boolean(p.tscRunner));
+    if (!runnable.length) {
+      notes.push('typecheck:skipped(tsc unavailable)');
+      return;
     }
-    notes.push(`typecheck:${res.status === 0 ? 'ok' : 'failed'}`);
+    let anyFailed = false;
+    for (const { tsconfig, projectDir, tscRunner } of runnable) {
+      if (tscRunner.requiresSafeArgs && !SAFE_CLI_ARG_RE.test(tsconfig)) {
+        hadFailureExit = true;
+        anyFailed = true;
+        pushDiag({
+          file: relative(root, tsconfig).replace(/\\/g, '/') || 'tsconfig.json',
+          line: 1,
+          column: 1,
+          severity: 'error',
+          code: 'UNSAFE_TSCONFIG_PATH',
+          message: 'Unsafe characters in tsconfig path blocked before invoking tsc',
+          source: 'tsc',
+        });
+        continue;
+      }
+      const res = spawnSync(
+        tscRunner.command,
+        [...tscRunner.prefixArgs, '--noEmit', '--pretty', 'false', '-p', tsconfig],
+        {
+          cwd: projectDir,
+          encoding: 'utf8',
+          windowsHide: true,
+          shell: false,
+          timeout: 25000,
+          env: sanitizeChildEnv(process.env),
+        },
+      );
+      const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+      const parsed = parseAndCompressDiagnosticsOutput(combined, {
+        kind: 'typecheck',
+        maxDiagnostics: cap,
+        workspaceRoot: root,
+        baseDir: projectDir,
+      });
+      totalRawLines += parsed.compression.rawLines;
+      for (const d of parsed.diagnostics) pushDiag({ ...d, source: d.source || 'tsc' });
+      if (res.status !== 0 && parsed.diagnostics.length === 0) {
+        hadFailureExit = true;
+        anyFailed = true;
+        pushDiag({
+          file: relative(root, tsconfig).replace(/\\/g, '/') || 'tsconfig.json',
+          line: 1,
+          column: 1,
+          severity: 'error',
+          code: 'TYPECHECK_ERROR',
+          message:
+            combined.trim().slice(0, 320) ||
+            res.error?.message ||
+            `tsc exited with status ${res.status}`,
+          source: 'tsc',
+        });
+      } else if (res.status !== 0) {
+        anyFailed = true;
+      }
+    }
+    notes.push(`typecheck:${anyFailed ? 'failed' : 'ok'}`);
   };
 
   const runTests = () => {
-    const testExts = new Set(['.js', '.mjs', '.cjs']);
+    const testExts = new Set(
+      normPaths.length > 0 && requestedKind === 'test'
+        ? ['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts']
+        : ['.js', '.mjs', '.cjs'],
+    );
     const { files, missing } = collectDiagnosticFiles(root, normPaths, testExts);
     for (const m of missing) {
       totalRawLines++;
-      pushDiag({ file: m, line: 1, column: 1, severity: 'error', code: 'ENOENT', message: 'Test file not found' });
+      pushDiag({
+        file: m,
+        line: 1,
+        column: 1,
+        severity: 'error',
+        code: 'ENOENT',
+        message: 'Test file not found',
+        source: 'node-test',
+      });
     }
     const testTargets = normPaths.length
       ? files.map((f) => f.rel)
@@ -1940,6 +2526,7 @@ export function runDiagnostics(
       cwd: root,
       encoding: 'utf8',
       windowsHide: true,
+      shell: false,
       timeout: 30000,
       env: childTestEnv,
     });
@@ -1948,6 +2535,7 @@ export function runDiagnostics(
       kind: 'test',
       maxDiagnostics: cap,
       workspaceRoot: root,
+      baseDir: root,
     });
     totalRawLines += parsed.compression.rawLines;
     for (const d of parsed.diagnostics) pushDiag(d);
@@ -1956,8 +2544,21 @@ export function runDiagnostics(
       hadFailureExit = true;
       pushTest({
         name: testTargets[0] || 'node --test',
+        testName: testTargets[0] || 'node --test',
         file: testTargets[0] || '',
+        line: 1,
+        column: 1,
         assertion: combined.trim().slice(0, 320) || `node --test exited with status ${res.status}`,
+      });
+      pushDiag({
+        file: testTargets[0] || '.',
+        line: 1,
+        column: 1,
+        severity: 'error',
+        code: 'ERR_TEST_FAILURE',
+        message: combined.trim().slice(0, 320) || `node --test exited with status ${res.status}`,
+        source: 'node-test',
+        testName: testTargets[0] || 'node --test',
       });
     }
     notes.push(`test:${testTargets.length} files (${res.status === 0 ? 'pass' : 'fail'})`);
@@ -1974,6 +2575,7 @@ export function runDiagnostics(
           cwd: root,
           encoding: 'utf8',
           windowsHide: true,
+          shell: false,
           timeout: 25000,
           env: sanitizeChildEnv(process.env),
         });
@@ -1982,6 +2584,7 @@ export function runDiagnostics(
           kind: 'lint',
           maxDiagnostics: cap,
           workspaceRoot: root,
+          baseDir: root,
         });
         totalRawLines += parsed.compression.rawLines;
         for (const d of parsed.diagnostics) pushDiag(d);
@@ -2006,9 +2609,14 @@ export function runDiagnostics(
   } else {
     runSyntax();
     const { files } = collectDiagnosticFiles(root, normPaths, null);
-    const { tsconfig, tscBin } = findTsconfigAndTsc(root, files);
-    if (tsconfig && tscBin) {
-      runTypecheck();
+    const hasTsTargets =
+      files.some((f) => TS_EXTS.has(extname(f.rel).toLowerCase())) ||
+      normPaths.some((p) => /\.[cm]?tsx?$/i.test(p.trim()));
+    const projects = findNearestTsconfigProjects(root, files, normPaths);
+    if (projects.some((p) => Boolean(p.tscRunner))) {
+      runTypecheck(projects);
+    } else if (hasTsTargets) {
+      notes.push(`typecheck:skipped(${projects.length ? 'tsc unavailable' : 'no tsconfig.json'})`);
     }
     const onlyTestsTargeted =
       normPaths.length > 0 &&
@@ -2030,10 +2638,15 @@ export function runDiagnostics(
     `[run_diagnostics kind=${requestedKind} ok=${ok}] ${notes.join(', ') || 'checked'} | diagnostics=${allDiagnostics.length} failingTests=${allFailingTests.length} (rawLines=${totalRawLines} -> keptLines=${keptLines}, truncated=${truncatedCount})`,
   ];
   for (const d of allDiagnostics.slice(0, 8)) {
-    summaryParts.push(`- ${d.file}:${d.line}:${d.column} [${d.severity} ${d.code}] ${d.message}`);
+    summaryParts.push(`- ${d.file}:${d.line}:${d.column} [${d.severity} ${d.code}${d.source ? ` ${d.source}` : ''}] ${d.message}`);
   }
   for (const t of allFailingTests.slice(0, 5)) {
-    summaryParts.push(`- FAIL ${t.name}${t.file ? ` (${t.file})` : ''}: ${t.assertion}`);
+    const loc = t.file ? ` (${t.file}:${t.line || 1}:${t.column || 1})` : '';
+    const cmp =
+      t.expected !== undefined || t.actual !== undefined
+        ? ` [expected=${t.expected}, actual=${t.actual}${t.operator ? `, op=${t.operator}` : ''}]`
+        : '';
+    summaryParts.push(`- FAIL ${t.testName || t.name}${loc}${cmp}: ${t.assertion}`);
   }
 
   return {

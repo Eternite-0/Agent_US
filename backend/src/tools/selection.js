@@ -1,6 +1,7 @@
 // Advisory wire catalog, never a permit. Do not infer capabilities from provider/MCP text.
 const lookup = [
   ['inspect_repository', '仓库入口/测试命令'],
+  ['query_symbol_graph', '符号定义/跨文件调用与关联测试'],
   ['run_diagnostics', '结构化语法/类型/测试诊断'],
   ['glob', '找文件/列目录'],
   ['grep', '搜索内容'],
@@ -21,14 +22,16 @@ export function modelToolCatalog(tools, policy, live) {
     if (decision !== 'deny') entries.push({ tool, decision });
   }
   const names = new Set(entries.map(({ tool }) => tool.name));
-  // Promote `apply_patch` before `write_file`/`edit_file` and `run_diagnostics` before `bash` deterministically.
+  // Promote `apply_patch` before `write_file`/`edit_file`, `run_diagnostics` before `bash`,
+  // and `query_symbol_graph` alongside `inspect_repository` deterministically.
   const priority = (name) => {
     if (name === 'apply_patch') return 0;
     if (name === 'run_diagnostics') return 1;
-    if (name === 'edit_file') return 2;
-    if (name === 'write_file') return 3;
-    if (name === 'bash') return 4;
-    return 2;
+    if (name === 'inspect_repository' || name === 'query_symbol_graph') return 2;
+    if (name === 'edit_file') return 3;
+    if (name === 'write_file') return 4;
+    if (name === 'bash') return 5;
+    return 3;
   };
   const indexed = entries.map((entry, idx) => ({ entry, idx }));
   indexed.sort((a, b) => priority(a.entry.tool.name) - priority(b.entry.tool.name) || a.idx - b.idx);
@@ -41,6 +44,8 @@ export function modelToolCatalog(tools, policy, live) {
       description += ' 修改已有文件优先使用 apply_patch；write_file 仅用于新建文件或整文件覆写。';
     } else if (tool.name === 'run_diagnostics') {
       description += ' 优先用于快速结构化语法/类型/测试检查。';
+    } else if (tool.name === 'query_symbol_graph') {
+      description += ' 优先用于直接查询符号定义范围、跨文件调用方/导入方及关联测试。';
     }
     if (decision === 'conditional') {
       const routes = tool.name === 'bash' && alternatives(names);

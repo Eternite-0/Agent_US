@@ -49,6 +49,57 @@ function importBindings(text, masked) {
   return bindings;
 }
 
+function compactSignature(text, startOffset, endOffset) {
+  const raw = text.slice(Math.max(0, startOffset), Math.max(startOffset, endOffset));
+  return raw
+    .replace(/\s*\r?\n\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/[\s{:=]+$/, '')
+    .trim()
+    .slice(0, 160);
+}
+
+function lineStartOffset(text, offset) {
+  const idx = text.lastIndexOf('\n', Math.max(0, offset - 1));
+  return idx === -1 ? 0 : idx + 1;
+}
+
+function findNonJsBlockEndLine(text, headerOffset, language, locate) {
+  const lines = text.split(/\r?\n/);
+  const startLine = locate(headerOffset).line;
+  if (language === 'python') {
+    const baseLine = lines[startLine - 1] ?? '';
+    const baseIndent = baseLine.length - baseLine.trimStart().length;
+    let lastLine = startLine;
+    for (let idx = startLine; idx < lines.length; idx++) {
+      const l = lines[idx];
+      if (!l.trim()) continue;
+      const indent = l.length - l.trimStart().length;
+      if (indent <= baseIndent) break;
+      lastLine = idx + 1;
+    }
+    return lastLine;
+  }
+  let braceDepth = 0;
+  let seenOpen = false;
+  for (let i = headerOffset; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '{') {
+      braceDepth++;
+      seenOpen = true;
+    } else if (ch === '}') {
+      if (braceDepth > 0) braceDepth--;
+      if (seenOpen && braceDepth === 0) {
+        return locate(i).line;
+      }
+    } else if (!seenOpen && (ch === '\n' || ch === '\r')) {
+      // Wait up to next line for opening brace, else single-line decl
+      if (locate(i).line > startLine + 1) break;
+    }
+  }
+  return startLine;
+}
+
 export function extractRepositorySymbols(path, language, text) {
   const definitions = [],
     calls = [];
@@ -57,9 +108,18 @@ export function extractRepositorySymbols(path, language, text) {
   const masked = js ? text.replace(jsTrivia, (token) => token.replace(/[^\r\n]/g, ' ')) : text;
   const pattern = js ? declarations : otherDeclarations[language];
   if (!pattern) return { definitions, calls };
-  const add = (name, kind, offset) => {
+  const add = (name, kind, offset, endLine = null, signature = null) => {
     const { line, column } = locate(offset);
-    const symbol = { id: `${path}#${line}:${column}`, path, line, column, name, kind };
+    const symbol = {
+      id: `${path}#${line}:${column}`,
+      path,
+      line,
+      endLine: Math.max(line, Number(endLine) || line),
+      column,
+      name,
+      kind,
+      signature: signature ?? compactSignature(text, lineStartOffset(text, offset), text.indexOf('\n', offset) === -1 ? text.length : text.indexOf('\n', offset)),
+    };
     definitions.push(symbol);
     return symbol;
   };
@@ -76,15 +136,30 @@ export function extractRepositorySymbols(path, language, text) {
   for (const m of masked.matchAll(pattern)) {
     const [, kind, name] = m;
     const offset = m.index + m[0].lastIndexOf(name);
+    const sigStart = lineStartOffset(text, m.index);
     const symbol = add(name, kind.trim(), offset);
-    if (!js) continue;
+    if (!js) {
+      symbol.endLine = findNonJsBlockEndLine(text, offset, language, locate);
+      const lineEnd = text.indexOf('\n', offset);
+      symbol.signature = compactSignature(
+        text,
+        sigStart,
+        lineEnd === -1 ? text.length : lineEnd,
+      );
+      continue;
+    }
     const end = offset + name.length;
     const rest = masked.slice(end, end + 512);
     let start;
     if (kind === 'class') {
       const head = /^[^;{}]*\{/.exec(rest);
       const open = head && end + head[0].length - 1;
-      if (open != null && closing.has(open)) classes.push({ name, open, end: closing.get(open) });
+      if (open != null && closing.has(open)) {
+        const clsEnd = closing.get(open);
+        symbol.endLine = Math.max(symbol.line, locate(clsEnd).line);
+        symbol.signature = compactSignature(text, sigStart, open);
+        classes.push({ name, open, end: clsEnd });
+      }
       continue;
     }
     if (kind.startsWith('function')) {
@@ -92,19 +167,70 @@ export function extractRepositorySymbols(path, language, text) {
       const close = params && closing.get(end + params[0].length - 1);
       if (close == null) continue;
       const body = /^\s*(?::[^;{}=]*?)?\{/.exec(masked.slice(close + 1, close + 513));
-      if (!body) continue;
+      if (!body) {
+        // Overload signature or declare function without body
+        const semi = masked.indexOf(';', close + 1);
+        const endOff = semi !== -1 && semi - close < 256 ? semi : close;
+        symbol.endLine = Math.max(symbol.line, locate(endOff).line);
+        symbol.signature = compactSignature(text, sigStart, endOff + 1);
+        continue;
+      }
       start = close + body[0].length;
-    } else if (['const', 'let', 'var'].includes(kind)) {
-      const arrow = /^\s*=\s*(?:async\s+)?(?:\([^;{}]*?\)|[\w$]+)\s*(?::[^;{}=]*?)?=>\s*/.exec(
-        rest,
-      );
-      if (!arrow) continue;
+      symbol.signature = compactSignature(text, sigStart, start - 1);
+    } else if (kind === 'interface' || kind === 'enum') {
+      const head = /^[^;{}]*\{/.exec(rest);
+      const open = head && end + head[0].length - 1;
+      if (open != null && closing.has(open)) {
+        symbol.endLine = Math.max(symbol.line, locate(closing.get(open)).line);
+        symbol.signature = compactSignature(text, sigStart, open);
+      }
+      continue;
+    } else if (['const', 'let', 'var', 'type'].includes(kind)) {
+      const arrow =
+        kind !== 'type'
+          ? /^\s*=\s*(?:async\s+)?(?:\([^;{}]*?\)|[\w$]+)\s*(?::[^;{}=]*?)?=>\s*/.exec(rest)
+          : null;
+      if (!arrow) {
+        // Track multi-line const object/array/type statement span
+        let scanEnd = end;
+        for (let i = end; i < masked.length; i++) {
+          if (closing.has(i)) {
+            i = closing.get(i);
+            scanEnd = i;
+            continue;
+          }
+          if (masked[i] === ';') {
+            scanEnd = i;
+            break;
+          }
+          if (masked[i] === '\n' && i > end) {
+            const nextTrim = masked.slice(i + 1, i + 40).trimStart();
+            if (!/^[|&?:.=]/.test(nextTrim)) {
+              scanEnd = i;
+              break;
+            }
+          }
+          scanEnd = i;
+        }
+        symbol.endLine = Math.max(symbol.line, locate(scanEnd).line);
+        const firstLineEnd = text.indexOf('\n', offset);
+        symbol.signature = compactSignature(
+          text,
+          sigStart,
+          firstLineEnd === -1 ? text.length : Math.min(firstLineEnd, scanEnd + 1),
+        );
+        continue;
+      }
       start = end + arrow[0].length;
       symbol.kind = 'arrow';
+      symbol.signature = compactSignature(text, sigStart, start);
     } else continue;
     const finish =
       masked[start] === '{' ? closing.get(start) : start + masked.slice(start).search(/[;\r\n]|$/);
-    if (finish != null) bodies.push({ start, finish, symbol });
+    if (finish != null) {
+      symbol.endLine = Math.max(symbol.line, locate(finish).line);
+      bodies.push({ start, finish, symbol });
+    }
     if (
       /\bexport\s+default\s+(?:async\s+)?$/.test(masked.slice(Math.max(0, m.index - 50), m.index))
     )
@@ -124,7 +250,14 @@ export function extractRepositorySymbols(path, language, text) {
           const start = close + body[0].length;
           const finish = closing.get(start);
           if (finish != null) {
-            const symbol = add(member[1], 'method', i - member[0].length);
+            const memberOffset = i - member[0].length;
+            const symbol = add(
+              member[1],
+              'method',
+              memberOffset,
+              locate(finish).line,
+              compactSignature(text, lineStartOffset(text, memberOffset), start - 1),
+            );
             symbol.owner = cls.name;
             bodies.push({ start, finish, symbol });
             i = finish;
@@ -296,7 +429,9 @@ export function findCrossFileReferencesFromAnalysis(analysis, symbolName, { path
       kind: s.kind,
       path: s.path,
       line: s.line,
+      endLine: Math.max(s.line, Number(s.endLine) || s.line),
       column: s.column,
+      signature: s.signature ?? '',
       ...(s.owner ? { owner: s.owner } : {}),
     }));
 
@@ -519,6 +654,226 @@ export function findRelatedTestsFromAnalysis(analysis, filePaths, { maxDepth = 5
     targetFiles,
     tests: details.map((d) => d.path),
     details,
+  };
+}
+
+export function querySymbolGraphFromAnalysis(
+  analysis,
+  {
+    symbol = '',
+    path = null,
+    includeCallers = true,
+    includeTests = true,
+    maxResults = 25,
+  } = {},
+) {
+  const limit = Math.max(1, Math.min(100, Math.trunc(Number(maxResults) || 25)));
+  const cleanSymbol = String(symbol ?? '').trim();
+  const rawPath = path ? String(path).replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').trim() : '';
+
+  if (!analysis?.callGraph) {
+    return {
+      ok: true,
+      query: {
+        symbol: cleanSymbol || null,
+        path: rawPath || null,
+        includeCallers: includeCallers !== false,
+        includeTests: includeTests !== false,
+        maxResults: limit,
+      },
+      definitions: [],
+      callers: [],
+      importers: [],
+      relatedTests: [],
+      relatedTestDetails: [],
+      files: [],
+    };
+  }
+
+  const modules = analysis.callGraph.modules ?? [];
+  const edges = analysis.callGraph.edges ?? [];
+  const allSymbols = analysis.callGraph.symbols ?? [];
+  const allPaths = [
+    ...new Set([
+      ...modules.map((m) => m.path),
+      ...(analysis.structure?.sourceFiles ?? []),
+      ...(analysis.structure?.testFiles ?? []),
+    ]),
+  ];
+
+  let scopedPaths = null;
+  let resolvedPath = rawPath || null;
+  if (rawPath) {
+    const lower = rawPath.toLowerCase();
+    const exactFile =
+      allPaths.find((p) => p === rawPath) ??
+      allPaths.find((p) => p.toLowerCase() === lower) ??
+      null;
+    if (exactFile) {
+      resolvedPath = exactFile;
+      scopedPaths = new Set([exactFile]);
+    } else {
+      const dirMatches = allPaths.filter(
+        (p) => p.toLowerCase().startsWith(`${lower}/`),
+      );
+      if (dirMatches.length > 0) {
+        scopedPaths = new Set(dirMatches);
+      } else {
+        const suffixMatches = allPaths.filter((p) => p.toLowerCase().endsWith(`/${lower}`));
+        if (suffixMatches.length > 0) {
+          const picked = suffixMatches.sort((a, b) => a.localeCompare(b))[0];
+          resolvedPath = picked;
+          scopedPaths = new Set([picked]);
+        } else {
+          scopedPaths = new Set([rawPath]);
+        }
+      }
+    }
+  }
+
+  const defMap = new Map();
+  const callerMap = new Map();
+  const importerMap = new Map();
+
+  const addRefsResult = (refs) => {
+    for (const d of refs.definitions ?? []) {
+      if (scopedPaths && !scopedPaths.has(d.path)) continue;
+      if (!defMap.has(d.id)) defMap.set(d.id, d);
+    }
+    if (includeCallers !== false) {
+      for (const c of refs.callers ?? []) {
+        const key = `${c.from}->${c.to}@${c.line}`;
+        if (!callerMap.has(key)) callerMap.set(key, c);
+      }
+      for (const im of refs.importers ?? []) {
+        const key = `${im.from}->${im.to}`;
+        if (!importerMap.has(key)) importerMap.set(key, im);
+      }
+    }
+  };
+
+  if (cleanSymbol) {
+    const exactRefs = findCrossFileReferencesFromAnalysis(analysis, cleanSymbol, {
+      path: scopedPaths?.size === 1 ? [...scopedPaths][0] : null,
+    });
+    addRefsResult(exactRefs);
+    if (defMap.size === 0) {
+      const partialMatches = findRepositorySymbols(analysis, cleanSymbol, {
+        path: scopedPaths?.size === 1 ? [...scopedPaths][0] : undefined,
+        limit: Math.min(limit, 12),
+      }).filter((s) => !scopedPaths || scopedPaths.has(s.path));
+      const seenNames = new Set();
+      for (const sym of partialMatches) {
+        if (seenNames.has(sym.name)) continue;
+        seenNames.add(sym.name);
+        const refs = findCrossFileReferencesFromAnalysis(analysis, sym.name, {
+          path: sym.path,
+        });
+        addRefsResult(refs);
+        if (seenNames.size >= 6) break;
+      }
+    }
+  } else if (scopedPaths) {
+    const matchingSymbols = allSymbols
+      .filter((s) => scopedPaths.has(s.path))
+      .sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line || a.column - b.column);
+    for (const s of matchingSymbols.slice(0, limit)) {
+      defMap.set(s.id, {
+        id: s.id,
+        name: s.name,
+        kind: s.kind,
+        path: s.path,
+        line: s.line,
+        endLine: Math.max(s.line, Number(s.endLine) || s.line),
+        column: s.column,
+        signature: s.signature ?? '',
+        ...(s.owner ? { owner: s.owner } : {}),
+      });
+    }
+    if (includeCallers !== false) {
+      const modMap = new Map(modules.map((m) => [m.path, m]));
+      const seedSymbols = [];
+      for (const p of scopedPaths) {
+        for (const exp of modMap.get(p)?.exports ?? []) {
+          if (exp !== 'default' && !seedSymbols.includes(exp) && seedSymbols.length < 8) {
+            seedSymbols.push(exp);
+          }
+        }
+      }
+      for (const s of matchingSymbols) {
+        if (seedSymbols.length >= 8) break;
+        if (!seedSymbols.includes(s.name)) seedSymbols.push(s.name);
+      }
+      for (const symName of seedSymbols) {
+        addRefsResult(
+          findCrossFileReferencesFromAnalysis(analysis, symName, {
+            path: scopedPaths.size === 1 ? [...scopedPaths][0] : null,
+          }),
+        );
+      }
+      for (const e of edges) {
+        if (scopedPaths.has(e.to)) {
+          const key = `${e.from}->${e.to}`;
+          if (!importerMap.has(key)) {
+            importerMap.set(key, {
+              from: e.from,
+              to: e.to,
+              specifier: e.specifier,
+              kind: e.kind,
+              symbols: [...(e.symbols ?? [])],
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const definitions = [...defMap.values()].slice(0, limit);
+  const callers = includeCallers !== false ? [...callerMap.values()].slice(0, limit) : [];
+  const importers = includeCallers !== false ? [...importerMap.values()].slice(0, limit) : [];
+
+  let relatedTests = [];
+  let relatedTestDetails = [];
+  if (includeTests !== false) {
+    const seedFiles = [
+      ...new Set([
+        ...(scopedPaths ? [...scopedPaths] : []),
+        ...definitions.map((d) => d.path),
+      ]),
+    ].filter(Boolean);
+    if (seedFiles.length > 0) {
+      const rel = findRelatedTestsFromAnalysis(analysis, seedFiles);
+      relatedTests = rel.tests.slice(0, limit);
+      relatedTestDetails = rel.details.slice(0, limit);
+    }
+  }
+
+  const files = [
+    ...new Set([
+      ...definitions.map((d) => d.path),
+      ...callers.map((c) => c.path),
+      ...importers.map((im) => im.from),
+      ...relatedTests,
+    ]),
+  ]
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, Math.max(limit * 2, 50));
+
+  return {
+    ok: true,
+    query: {
+      symbol: cleanSymbol || null,
+      path: resolvedPath,
+      includeCallers: includeCallers !== false,
+      includeTests: includeTests !== false,
+      maxResults: limit,
+    },
+    definitions,
+    callers,
+    importers,
+    relatedTests,
+    relatedTestDetails,
+    files,
   };
 }
 

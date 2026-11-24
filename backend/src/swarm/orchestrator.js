@@ -58,6 +58,7 @@ import {
   MAX_REVIEWER_FORMAT_RETRIES,
   buildReviewerFormatRepairPrompt,
   buildReviewerPromptConstraints,
+  evaluateConflictResolutionGate,
   evaluateReviewerHardGate,
   parseReviewerOutput,
   validateReviewerExecution,
@@ -1744,6 +1745,28 @@ export class AdaptiveSwarmOrchestrator {
           }
         }
 
+        // Pre-spawn check for non-worktree review nodes whose upstream sibling artifacts collide
+        if (
+          node.taskType === 'review' &&
+          predecessorArtifacts.length >= 2 &&
+          this.artifactManager &&
+          !run.strategy?.conflictResolution?.triggered
+        ) {
+          const preConflictAnalysis = this.artifactManager.analyzeRunArtifacts(predecessorArtifacts, {
+            dependenciesByNodeKey,
+            workspaceRoot: run.workspaceRoot,
+          });
+          if ((preConflictAnalysis.mergeConflicts?.length ?? 0) > 0) {
+            const crOutcome = this.#scheduleOrFailConflictResolution({
+              run,
+              mergeConflicts: preConflictAnalysis.mergeConflicts,
+              blockedNode: node,
+              leaseGuard,
+            });
+            if (crOutcome.handled) return;
+          }
+        }
+
         // P0-9: Peek mailbox without consuming; ack atomically inside child turn-start tx!
         const peekedInbox =
           typeof this.mailbox?.peekInbox === 'function'
@@ -1950,7 +1973,12 @@ export class AdaptiveSwarmOrchestrator {
           trafficSource: run.trafficSource || 'production',
           isSynthetic: run.isSynthetic ? 1 : 0,
         });
-        const effectiveNodeBudget = computeEffectiveNodeBudget(node.budget, treeSnap, { ...run.budget, maxDurationMs: remainingRunMs(run) });
+        const isConflictResolutionStep =
+          parsedNodeMetaBudget?.conflictResolutionStep === true || node.taskType === 'conflict_resolution';
+        const effectiveNodeBudget = {
+          ...computeEffectiveNodeBudget(node.budget, treeSnap, { ...run.budget, maxDurationMs: remainingRunMs(run) }),
+          ...(isConflictResolutionStep ? { conflictResolutionStep: true } : {}),
+        };
         const budgetScope = ['review', 'verification'].includes(node.taskType)
           ? BUDGET_SCOPES.REVIEW_VERIFICATION
           : BUDGET_SCOPES.NODE_EXECUTION;
@@ -2040,6 +2068,52 @@ export class AdaptiveSwarmOrchestrator {
 
         let finalChildResult = childRes;
         const parsedNodeBudget = parseJsonSafe(node.budgetJson, {});
+        const isConflictResolutionNode =
+          node.taskType === 'conflict_resolution' ||
+          parsedNodeBudget?.conflictResolutionStep === true;
+
+        let verifiedConflictResolution = null;
+        if (isConflictResolutionNode) {
+          const conflictFiles = Array.isArray(parsedNodeBudget?.conflictFiles)
+            ? parsedNodeBudget.conflictFiles
+            : [];
+          const { receipts, verificationResults } = this.#inspectChildVerificationEvidence(
+            childRes.childSessionId,
+            childRes.childTurnId,
+          );
+          const crGate = evaluateConflictResolutionGate({
+            conflictFiles,
+            artifact: childRes.artifact ?? null,
+            artifactManager: this.artifactManager,
+            reviewerEvidence: {
+              artifacts: childRes.artifact ? [childRes.artifact] : [],
+              sourceNodes: [node],
+              receipts,
+              verificationResults,
+            },
+            gitDiff: childRes.gitDiff ?? null,
+            precomputedRemainingMarkers: childRes.remainingConflictMarkers ?? null,
+          });
+          verifiedConflictResolution = {
+            triggered: true,
+            resolved: Boolean(crGate.resolved),
+            files: conflictFiles,
+            hardGatePassed: Boolean(crGate.hardGatePassed),
+            testExitCode: crGate.testExitCode ?? null,
+          };
+          this.#persistConflictResolutionTelemetry(runId, verifiedConflictResolution, { leaseGuard: nodeGuard });
+          if (!crGate.resolved || !crGate.hardGatePassed) {
+            throw new RuntimeError('CONFLICT_RESOLUTION_FAILED', {
+              message: `Conflict resolution failed hard verification gate for [${conflictFiles.join(', ')}]: ${(crGate.reasons || []).join('; ') || 'unresolved'}`,
+              usage: childRes.usage,
+              steps: childRes.steps,
+              detail: {
+                conflictResolution: verifiedConflictResolution,
+                reasons: crGate.reasons,
+              },
+            });
+          }
+        }
 
         // Inspect real shell/test command outcome for verification nodes before committing completion
         let latestVerifySummary = null;
@@ -2484,6 +2558,7 @@ export class AdaptiveSwarmOrchestrator {
               childSessionId: committedRow.childSessionId || undefined,
               artifactUris: uris,
               ...(committedHardGateVerdict ? { reviewerVerification: committedHardGateVerdict } : {}),
+              ...(verifiedConflictResolution ? { conflictResolution: verifiedConflictResolution } : {}),
             },
             audit: false,
           });
@@ -2704,6 +2779,101 @@ export class AdaptiveSwarmOrchestrator {
           });
         });
 
+        const isConflictResolutionFailure =
+          freshNode.taskType === 'conflict_resolution' ||
+          parseJsonSafe(freshNode.budgetJson, {})?.conflictResolutionStep === true;
+
+        if (
+          errorCode === 'WORKTREE_ARTIFACT_CONFLICT' &&
+          (err?.detail?.mergeConflicts?.length ?? 0) > 0 &&
+          !isConflictResolutionFailure
+        ) {
+          const crRes = this.#scheduleOrFailConflictResolution({
+            run: freshRun,
+            mergeConflicts: err.detail.mergeConflicts,
+            blockedNode: freshNode,
+            leaseGuard,
+          });
+          if (crRes.handled) return;
+        }
+
+        if (isConflictResolutionFailure) {
+          const parsedNodeBudgetFail = parseJsonSafe(freshNode.budgetJson, {});
+          const conflictFiles = Array.isArray(parsedNodeBudgetFail?.conflictFiles)
+            ? parsedNodeBudgetFail.conflictFiles
+            : freshRun.strategy?.conflictResolution?.files ?? [];
+          const { receipts } = this.#inspectChildVerificationEvidence(
+            freshNode.childSessionId,
+            freshNode.childTurnId,
+          );
+          const failedTestReceipt = receipts
+            .filter((r) => ['bash', 'start_process', 'run_command', 'run_tests', 'test'].includes(String(r?.toolName ?? '')))
+            .at(-1);
+          const inferredTestExitCode =
+            err?.detail?.conflictResolution?.testExitCode !== undefined
+              ? err.detail.conflictResolution.testExitCode
+              : failedTestReceipt?.exitCode !== undefined && failedTestReceipt?.exitCode !== null
+                ? Number(failedTestReceipt.exitCode)
+                : null;
+          const failedCrTelemetry = {
+            triggered: true,
+            resolved: false,
+            files: conflictFiles,
+            hardGatePassed: false,
+            testExitCode: inferredTestExitCode,
+          };
+          this.#persistConflictResolutionTelemetry(runId, failedCrTelemetry, { leaseGuard: nodeGuard });
+          const failedNode = transitionNodeTerminalCas(
+            this.store,
+            null,
+            freshNode.id,
+            SWARM_NODE_STATES.FAILED,
+            {
+              emitEvent: false,
+              leaseGuard: nodeGuard,
+              patch: {
+                activeFence: null,
+                activeJobId: null,
+                errorCode,
+                errorMessage,
+              },
+            },
+          );
+          if (failedNode.changed) {
+            try {
+              this.eventRouter?.emitPersisted({
+                sessionId: freshRun.sessionId,
+                turnId: freshRun.rootTurnId,
+                type: RUNTIME_EVENTS.SWARM_NODE_UPDATED,
+                data: {
+                  runId: freshRun.id,
+                  nodeId: freshNode.id,
+                  nodeKey: freshNode.nodeKey,
+                  status: SWARM_NODE_STATES.FAILED,
+                  childSessionId: freshNode.childSessionId || undefined,
+                  errorCode,
+                  conflictResolution: failedCrTelemetry,
+                },
+                audit: false,
+              });
+            } catch {
+              // non-fatal event emit
+            }
+          }
+          enqueueSwarmJob(
+            this.jobQueue,
+            SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
+            {
+              runId,
+              sessionId: freshRun.sessionId,
+              planVersion: freshRun.planVersion || 1,
+              epoch: Date.now(),
+            },
+            { idempotencyKey: `swarm:resolve:${runId}:${freshNode.nodeKey}:crfail:${uuid().slice(0, 8)}` },
+          );
+          return;
+        }
+
         let replanOut = { replanned: false };
         if (this.replanner && !errorCode.startsWith('REVIEWER_')) {
           try {
@@ -2797,6 +2967,31 @@ export class AdaptiveSwarmOrchestrator {
       if (run.status !== SWARM_RUN_STATES.AGGREGATING) return;
       if (jobPlanVersion !== undefined && Number(jobPlanVersion) < Number(run.planVersion || 1)) {
         return;
+      }
+      if (this.artifactManager && typeof this.artifactManager.analyzeRunArtifacts === 'function') {
+        const replacedKeys = this.#getReplacedNodeKeys(runId);
+        const allArtifacts = this.artifactManager.listRunArtifacts(runId) ?? [];
+        const activeArtifacts = allArtifacts.filter(
+          (a) => a && a.status !== 'superseded' && !replacedKeys.has(a.nodeKey),
+        );
+        if (activeArtifacts.length > 0) {
+          const dependenciesByNodeKey = Object.fromEntries(
+            (run.nodes ?? []).map((n) => [n.nodeKey, Array.isArray(n.dependencies) ? n.dependencies : []]),
+          );
+          const analysis = this.artifactManager.analyzeRunArtifacts(activeArtifacts, {
+            dependenciesByNodeKey,
+            workspaceRoot: run.workspaceRoot,
+          });
+          if ((analysis.mergeConflicts?.length ?? 0) > 0) {
+            const crRes = this.#scheduleOrFailConflictResolution({
+              run,
+              mergeConflicts: analysis.mergeConflicts,
+              blockedNode: null,
+              leaseGuard,
+            });
+            if (crRes.handled) return;
+          }
+        }
       }
       const updated = transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.VERIFYING, {
         leaseGuard,
@@ -2908,6 +3103,31 @@ export class AdaptiveSwarmOrchestrator {
         hasPendingReconciliation: verdict?.verdict === 'block_reconciliation',
       });
 
+      const rawCrState = run.strategy?.conflictResolution ?? null;
+      if (rawCrState?.triggered) {
+        const crTelemetry = {
+          triggered: true,
+          resolved: Boolean(rawCrState.resolved),
+          files: Array.isArray(rawCrState.files) ? rawCrState.files : [],
+          hardGatePassed: Boolean(rawCrState.hardGatePassed),
+          testExitCode: rawCrState.testExitCode ?? null,
+        };
+        outcome.verdict = outcome.verdict || { verdict: 'pass', accepted: true, reasons: [] };
+        outcome.verdict.conflictResolution = crTelemetry;
+        if (!crTelemetry.resolved || !crTelemetry.hardGatePassed) {
+          outcome.status = SWARM_RUN_STATES.FAILED;
+          outcome.verdict.accepted = false;
+          outcome.verdict.verdict = 'fail';
+          outcome.verdict.reasons = [
+            ...new Set([...(Array.isArray(outcome.verdict.reasons) ? outcome.verdict.reasons : []), 'merge_conflict_unresolved']),
+          ];
+          if (!outcome.errorCode) outcome.errorCode = 'MERGE_CONFLICT_UNRESOLVED';
+          if (!outcome.errorMessage) {
+            outcome.errorMessage = `Merge conflict resolution failed for [${crTelemetry.files.join(', ')}]`;
+          }
+        }
+      }
+
       if (outcome.status === SWARM_RUN_STATES.RECONCILING) {
         transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.RECONCILING, {
           leaseGuard,
@@ -2978,6 +3198,9 @@ export class AdaptiveSwarmOrchestrator {
               ...(outcome.verdict?.reviewerVerification
                 ? { reviewerVerification: outcome.verdict.reviewerVerification }
                 : {}),
+              ...(outcome.verdict?.conflictResolution
+                ? { conflictResolution: outcome.verdict.conflictResolution }
+                : {}),
               ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
               ...(outcome.errorMessage ? { errorMessage: outcome.errorMessage } : {}),
             },
@@ -2999,7 +3222,12 @@ export class AdaptiveSwarmOrchestrator {
     const sourceNodeKeys = [...new Set(picked.map((node) => String(node.nodeKey)).filter(Boolean))].sort();
     if (
       sourceNodeKeys.length === 0 ||
-      picked.some((node) => parseJsonSafe(node.budgetJson, {})?.reviewerMetadata?.autoMaterialized === true)
+      picked.some(
+        (node) =>
+          node.taskType === 'conflict_resolution' ||
+          parseJsonSafe(node.budgetJson, {})?.conflictResolutionStep === true ||
+          parseJsonSafe(node.budgetJson, {})?.reviewerMetadata?.autoMaterialized === true,
+      )
     ) {
       return null;
     }
@@ -3613,6 +3841,9 @@ export class AdaptiveSwarmOrchestrator {
       ...(run.strategy?.writeConflictResolution
         ? { writeConflictResolution: run.strategy.writeConflictResolution }
         : {}),
+      ...(run.verdict?.conflictResolution ?? run.strategy?.conflictResolution
+        ? { conflictResolution: run.verdict?.conflictResolution ?? run.strategy?.conflictResolution }
+        : {}),
       ...(run.verdict?.reviewerVerification
         ? { reviewerVerification: run.verdict.reviewerVerification }
         : {}),
@@ -3633,6 +3864,510 @@ export class AdaptiveSwarmOrchestrator {
     const set = this.waiters.get(run.id);
     if (!set) return;
     for (const fn of [...set]) fn(run);
+  }
+
+  #inspectChildVerificationEvidence(childSessionId, childTurnId) {
+    if (!childSessionId || !this.store?.db?.isOpen) {
+      return { receipts: [], verificationResults: [] };
+    }
+    const receipts = this.store.db
+      .prepare(
+        `SELECT id AS receiptId, id, sessionId, turnId, callId, toolName, status, exitCode, outputDigest, errorCode, createdAt, updatedAt
+         FROM tool_receipts
+         WHERE sessionId=? AND (? IS NULL OR turnId=?)
+         ORDER BY createdAt ASC`,
+      )
+      .all(childSessionId, childTurnId ?? null, childTurnId ?? null);
+
+    const diagReceipts = receipts.filter((r) => r.toolName === 'run_diagnostics');
+    const verificationResults = [];
+    if (diagReceipts.length > 0) {
+      const toolMsgs = this.store.db
+        .prepare(
+          `SELECT toolCallId, content
+           FROM direct_messages
+           WHERE sessionId=? AND (? IS NULL OR turnId=?) AND role='tool' AND toolName='run_diagnostics'
+           ORDER BY seq ASC`,
+        )
+        .all(childSessionId, childTurnId ?? null, childTurnId ?? null);
+      const msgByCall = new Map(toolMsgs.map((m) => [m.toolCallId, m.content]));
+      for (const r of diagReceipts) {
+        const raw = String(msgByCall.get(r.callId) ?? '')
+          .replace(/^<untrusted\b[^>]*>/, '')
+          .replace(/<\/untrusted>\s*$/, '');
+        const jsonStart = raw.indexOf('{"ok":');
+        const parsed = jsonStart !== -1 ? parseJsonSafe(raw.slice(jsonStart, raw.lastIndexOf('}') + 1), null) : null;
+        const ranTests = Boolean(
+          parsed &&
+            (parsed.kind === 'test' ||
+              (/test:\d+\s+files\s*\(/i.test(raw) && !/test:none/i.test(raw))),
+        );
+        if (ranTests) {
+          verificationResults.push({
+            status: parsed.ok === true ? 'passed' : 'failed',
+            exitCode: parsed.ok === true ? 0 : 1,
+          });
+        }
+      }
+    }
+    return { receipts, verificationResults };
+  }
+
+  #persistConflictResolutionTelemetry(runId, telemetry, { leaseGuard = null } = {}) {
+    if (!this.#dbOpen() || !runId || !telemetry) return;
+    const runLevelGuard =
+      leaseGuard?.withContext?.({ runId, nodeId: null, nodeAttempt: null }) ?? leaseGuard;
+    this.store.tx(() => {
+      assertLeaseInTx(runLevelGuard, { runId });
+      const liveRun = this.store.db.prepare('SELECT status, strategyJson FROM swarm_runs WHERE id=?').get(runId);
+      if (!liveRun || isTerminalRunState(liveRun.status)) return;
+      const nextStrategy = {
+        ...parseJsonSafe(liveRun.strategyJson, {}),
+        conflictResolution: telemetry,
+      };
+      this.store.db
+        .prepare('UPDATE swarm_runs SET strategyJson=?, updatedAt=? WHERE id=?')
+        .run(JSON.stringify(nextStrategy), Date.now(), runId);
+    });
+  }
+
+  #scheduleOrFailConflictResolution({
+    run,
+    mergeConflicts = [],
+    blockedNode = null,
+    leaseGuard = null,
+  } = {}) {
+    if (!this.#dbOpen() || !run || !Array.isArray(mergeConflicts) || mergeConflicts.length === 0) {
+      return { handled: false };
+    }
+    const runId = run.id;
+    const conflictFiles = [...new Set(mergeConflicts.map((c) => String(c.path || '').trim()).filter(Boolean))];
+    const runLevelGuard =
+      leaseGuard?.withContext?.({ runId, nodeId: null, nodeAttempt: null }) ?? leaseGuard;
+
+    const txOut = this.store.tx(() => {
+      assertLeaseInTx(runLevelGuard, { runId });
+      const liveRun = this.store.db.prepare('SELECT * FROM swarm_runs WHERE id=?').get(runId);
+      if (!liveRun || isTerminalRunState(liveRun.status)) {
+        return { handled: false };
+      }
+
+      const liveStrategy = parseJsonSafe(liveRun.strategyJson, {});
+      const liveBudget = parseJsonSafe(liveRun.budgetJson, {});
+      const prevCr = liveStrategy.conflictResolution ?? null;
+      const existingNodes = this.store.db
+        .prepare('SELECT * FROM swarm_nodes WHERE runId=? ORDER BY createdAt ASC')
+        .all(runId)
+        .map((r) => ({
+          ...r,
+          dependencies: parseJsonSafe(r.dependenciesJson, []),
+          toolAllow: parseJsonSafe(r.toolAllowJson, []),
+          budget: parseJsonSafe(r.budgetJson, {}),
+        }));
+      const byKey = new Map(existingNodes.map((n) => [n.nodeKey, n]));
+
+      const failClosed = (reason, existingTelemetry = null) => {
+        const mergedFiles = [
+          ...new Set([...(existingTelemetry?.files ?? []), ...conflictFiles]),
+        ];
+        const crTelemetry = {
+          triggered: true,
+          resolved: false,
+          files: mergedFiles,
+          hardGatePassed: false,
+          testExitCode: existingTelemetry?.testExitCode ?? null,
+        };
+        const nextStrategy = { ...liveStrategy, conflictResolution: crTelemetry };
+        const verdict = {
+          verdict: 'fail',
+          accepted: false,
+          reasons: ['merge_conflict_unresolved', reason].filter(Boolean),
+          conflictResolution: crTelemetry,
+        };
+        const errMessage = `Merge conflict unresolved (${reason}) for [${mergedFiles.join(', ')}]`;
+        const updated = transitionRunTerminalCas(this.store, runId, SWARM_RUN_STATES.FAILED, {
+          leaseGuard: runLevelGuard,
+          patch: {
+            currentPhase: SWARM_RUN_STATES.FAILED,
+            strategyJson: JSON.stringify(nextStrategy),
+            verdictJson: JSON.stringify(verdict),
+            errorCode: 'MERGE_CONFLICT_UNRESOLVED',
+            errorMessage: errMessage,
+          },
+        });
+        return {
+          handled: true,
+          action: 'failed_closed',
+          changed: Boolean(updated.changed),
+          conflictResolution: crTelemetry,
+          verdict,
+          errorCode: 'MERGE_CONFLICT_UNRESOLVED',
+          errorMessage: errMessage,
+        };
+      };
+
+      // Respect explicit opt-out when replanning is disabled (maxReplans <= 0)
+      const explicitMaxReplans = liveStrategy.maxReplans ?? liveBudget.maxReplans;
+      if (
+        explicitMaxReplans !== undefined &&
+        explicitMaxReplans !== null &&
+        Number.isFinite(Number(explicitMaxReplans)) &&
+        Number(explicitMaxReplans) <= 0
+      ) {
+        return blockedNode ? { handled: false } : failClosed('MAX_REPLANS_ZERO');
+      }
+
+      // Bound: dispatch at most 1 conflict_resolution repair step per run
+      if (prevCr?.triggered) {
+        return failClosed('CONFLICT_RESOLUTION_LIMIT_REACHED', prevCr);
+      }
+      const hasTextConflict = mergeConflicts.some(
+        (mc) =>
+          !mc.binaryConflict &&
+          ((Array.isArray(mc.conflictBlocks) && mc.conflictBlocks.length > 0) ||
+            Boolean(mc.conflictMarkers)),
+      );
+      if (!hasTextConflict) {
+        return failClosed('NON_TEXT_OR_BINARY_CONFLICT');
+      }
+      if (liveRun.permissionMode === 'read-only') {
+        return failClosed('READ_ONLY_PERMISSION_MODE');
+      }
+
+      const snap = this.budgetLedger?.getSnapshot?.(runId) ?? null;
+      if (
+        snap &&
+        (snap.isStepExhausted ||
+          snap.isPermanentlyExhausted ||
+          (snap.remainingSteps !== null && snap.remainingSteps < 1))
+      ) {
+        return failClosed('BUDGET_EXCEEDED');
+      }
+
+      const conflictingNodeKeys = [
+        ...new Set(
+          mergeConflicts
+            .flatMap((mc) => (Array.isArray(mc.nodeKeys) ? mc.nodeKeys : []))
+            .filter((k) => k && byKey.has(k)),
+        ),
+      ];
+      if (conflictingNodeKeys.length === 0) {
+        return failClosed('MISSING_CONFLICTING_NODES');
+      }
+
+      const existingKeys = new Set(byKey.keys());
+      let crKey = 'conflict_resolution';
+      let suffix = 2;
+      while (existingKeys.has(crKey)) {
+        crKey = `conflict_resolution__v${suffix++}`;
+      }
+
+      const siblingGoals = conflictingNodeKeys.map((nk) => {
+        const sn = byKey.get(nk);
+        return {
+          nodeKey: nk,
+          goal: String(sn?.objective || '').slice(0, 600),
+          summary: String(sn?.resultText || '').slice(0, 600),
+        };
+      });
+
+      const conflictHunks = mergeConflicts.map((mc) => ({
+        path: mc.path,
+        nodeKeys: Array.isArray(mc.nodeKeys) ? mc.nodeKeys : [],
+        blocks: (Array.isArray(mc.conflictBlocks) ? mc.conflictBlocks : []).slice(0, 8).map((b) => ({
+          startLine: b.startLine,
+          endLine: b.endLine,
+          ours: String(b.ours ?? '').slice(0, 1200),
+          base: String(b.base ?? '').slice(0, 1200),
+          theirs: String(b.theirs ?? '').slice(0, 1200),
+          rawConflictSlice: String(b.rawConflictSlice ?? '').slice(0, 2400),
+        })),
+      }));
+
+      const hunkPromptLines = [
+        '[Bounded Merge-Conflict Resolution Step]',
+        `Resolve overlapping same-line merge conflicts in an isolated staging workspace for file(s): ${conflictFiles.join(', ')}.`,
+        'Preserve the intent of ALL sibling nodes without leaving any `<<<<<<<`, `=======`, or `>>>>>>>` markers, and verify tests pass (via `bash` or `run_diagnostics` kind="test") before completing.',
+        '',
+        '[Sibling Node Goals & Summaries]',
+        ...siblingGoals.map(
+          (sg) =>
+            `- ${sg.nodeKey}:\n  Goal: ${sg.goal || '(none)'}\n  Summary: ${sg.summary || '(none)'}`,
+        ),
+        '',
+        '[Conflicted Hunk(s)]',
+      ];
+      for (const ch of conflictHunks) {
+        hunkPromptLines.push(`File: ${ch.path} (between ${ch.nodeKeys.join(' vs ') || 'siblings'})`);
+        if (ch.blocks.length > 0) {
+          for (const b of ch.blocks) {
+            hunkPromptLines.push(
+              `Lines ${b.startLine}-${b.endLine}:\n${b.rawConflictSlice}`,
+            );
+          }
+        } else {
+          const fallbackPreview = mergeConflicts.find((m) => m.path === ch.path)?.conflictMarkers ?? '';
+          if (fallbackPreview) hunkPromptLines.push(String(fallbackPreview).slice(0, 2400));
+        }
+      }
+      const repoTestCmds = liveStrategy.repoContext?.testCommands ?? [];
+      if (repoTestCmds.length > 0) {
+        hunkPromptLines.push('', `Suggested test command(s): ${repoTestCmds.join(' ; ')}`);
+      }
+      const crObjective = hunkPromptLines.join('\n');
+
+      const implSibling = conflictingNodeKeys
+        .map((k) => byKey.get(k))
+        .find((n) => n && n.permissionMode && n.permissionMode !== 'read-only');
+      const crPermissionMode =
+        implSibling?.permissionMode ||
+        (liveRun.permissionMode && liveRun.permissionMode !== 'read-only'
+          ? liveRun.permissionMode
+          : 'auto-safe');
+      const sel = this.router?.select?.({
+        taskType: 'implementation',
+        objective: crObjective,
+        budget: parseJsonSafe(liveRun.budgetJson, {}),
+      });
+      const crModel = sel?.model || implSibling?.model || 'default';
+      const crProvider = sel?.provider || implSibling?.provider || 'pool';
+      const crProfileId = sel?.profile?.id || 'dynamic:implementation';
+
+      const nextVersion = Number(liveRun.planVersion || 1) + 1;
+      const nextReplanCount = Number(liveRun.replanCount || 0) + 1;
+      const maxSteps =
+        snap?.remainingSteps !== null && snap?.remainingSteps !== undefined
+          ? Math.min(8, Math.max(1, snap.remainingSteps))
+          : 8;
+      const now = Date.now();
+      const crToolAllow = [
+        'read_file',
+        'edit_file',
+        'write_file',
+        'apply_patch',
+        'glob',
+        'grep',
+        'read_blob',
+        'query_symbol_graph',
+        'run_diagnostics',
+        'bash',
+        'read_process_output',
+        'read_swarm_artifact',
+      ];
+      const crBudget = {
+        maxSteps,
+        conflictResolutionStep: true,
+        conflictFiles,
+        conflictHunks,
+        siblingGoals,
+        roleMetadata: {
+          roleTitle: 'Merge Conflict Resolver',
+          focus: `Resolve merge conflicts in ${conflictFiles.join(', ')}`,
+          ownedPaths: conflictFiles,
+        },
+      };
+
+      this.store.db
+        .prepare(
+          `INSERT INTO swarm_nodes(
+            id, runId, nodeKey, agentProfileId, model, provider, objective, acceptance,
+            dependenciesJson, toolAllowJson, permissionMode, taskType, isolationMode,
+            allowIsolationFallback, planVersion, status, priority, budgetJson, createdAt, updatedAt
+          ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)`,
+        )
+        .run(
+          uuid(),
+          runId,
+          crKey,
+          crProfileId,
+          crModel,
+          crProvider,
+          crObjective,
+          'Zero remaining <<<<<<< / ======= / >>>>>>> markers and passing test verification (exitCode === 0)',
+          JSON.stringify(conflictingNodeKeys),
+          JSON.stringify(crToolAllow),
+          crPermissionMode,
+          'conflict_resolution',
+          'worktree',
+          0,
+          nextVersion,
+          10,
+          JSON.stringify(crBudget),
+          now,
+          now,
+        );
+
+      const conflictingKeySet = new Set(conflictingNodeKeys);
+      const resetNodeToPending = (targetNode) => {
+        if (!targetNode) return;
+        const nextDeps = [...new Set([...(targetNode.dependencies ?? []), crKey])];
+        const patch = {
+          dependenciesJson: JSON.stringify(nextDeps),
+          planVersion: nextVersion,
+          activeFence: null,
+          activeJobId: null,
+          errorCode: null,
+          errorMessage: null,
+        };
+        if (targetNode.status === SWARM_NODE_STATES.RUNNING) {
+          transitionSwarmNode(this.store, null, targetNode.id, SWARM_NODE_STATES.READY, {
+            emitEvent: false,
+            leaseGuard: runLevelGuard,
+          });
+          transitionSwarmNode(this.store, null, targetNode.id, SWARM_NODE_STATES.PENDING, {
+            emitEvent: false,
+            leaseGuard: runLevelGuard,
+            patch,
+          });
+        } else if (targetNode.status === SWARM_NODE_STATES.READY) {
+          transitionSwarmNode(this.store, null, targetNode.id, SWARM_NODE_STATES.PENDING, {
+            emitEvent: false,
+            leaseGuard: runLevelGuard,
+            patch,
+          });
+        } else if (targetNode.status === SWARM_NODE_STATES.FAILED) {
+          transitionSwarmNode(this.store, null, targetNode.id, SWARM_NODE_STATES.PENDING, {
+            emitEvent: false,
+            allowReplanReset: true,
+            leaseGuard: runLevelGuard,
+            patch,
+          });
+        } else if (targetNode.status === SWARM_NODE_STATES.PENDING) {
+          this.store.db
+            .prepare('UPDATE swarm_nodes SET dependenciesJson=?, planVersion=?, updatedAt=? WHERE id=?')
+            .run(JSON.stringify(nextDeps), nextVersion, now, targetNode.id);
+        }
+      };
+
+      const blockedLive = blockedNode ? byKey.get(blockedNode.nodeKey) : null;
+      if (blockedLive) {
+        resetNodeToPending(blockedLive);
+      }
+      for (const n of existingNodes) {
+        if (blockedLive && n.nodeKey === blockedLive.nodeKey) continue;
+        if (!['pending', 'ready'].includes(n.status)) continue;
+        if (n.dependencies.some((d) => conflictingKeySet.has(d))) {
+          resetNodeToPending(n);
+        }
+      }
+
+      const crTelemetry = {
+        triggered: true,
+        resolved: false,
+        files: conflictFiles,
+        hardGatePassed: false,
+        testExitCode: null,
+      };
+      const nextStrategy = {
+        ...liveStrategy,
+        conflictResolution: crTelemetry,
+      };
+      if (liveRun.status === SWARM_RUN_STATES.AGGREGATING) {
+        transitionSwarmRun(this.store, runId, SWARM_RUN_STATES.RUNNING, {
+          leaseGuard: runLevelGuard,
+          patch: {
+            currentPhase: 'running',
+            planVersion: nextVersion,
+            replanCount: nextReplanCount,
+            strategyJson: JSON.stringify(nextStrategy),
+          },
+        });
+      } else {
+        this.store.db
+          .prepare('UPDATE swarm_runs SET planVersion=?, replanCount=?, strategyJson=?, updatedAt=? WHERE id=?')
+          .run(nextVersion, nextReplanCount, JSON.stringify(nextStrategy), now, runId);
+      }
+
+      this.store.db
+        .prepare(
+          'INSERT INTO swarm_replans(id, runId, version, failedNodeKey, strategy, reason, diffJson, createdAt) VALUES(?,?,?,?,?,?,?,?)',
+        )
+        .run(
+          uuid(),
+          runId,
+          nextVersion,
+          blockedNode?.nodeKey || conflictingNodeKeys.join(','),
+          'conflict_resolution',
+          `Bounded merge-conflict resolution for [${conflictFiles.join(', ')}]`,
+          JSON.stringify({
+            conflictResolutionNodeKey: crKey,
+            conflictingNodeKeys,
+            conflictFiles,
+            addedNodes: [crKey],
+          }),
+          now,
+        );
+
+      return {
+        handled: true,
+        action: 'scheduled',
+        planVersion: nextVersion,
+        crKey,
+        conflictingNodeKeys,
+        conflictResolution: crTelemetry,
+      };
+    });
+
+    if (!txOut.handled) return { handled: false };
+
+    if (txOut.action === 'failed_closed') {
+      const settled = this.getRun(runId);
+      if (txOut.changed) {
+        try {
+          this.eventRouter?.emitPersisted({
+            sessionId: run.sessionId,
+            turnId: run.rootTurnId,
+            type: RUNTIME_EVENTS.SWARM_RUN_COMPLETED,
+            data: {
+              runId,
+              status: SWARM_RUN_STATES.FAILED,
+              usage: settled?.usage,
+              verdict: txOut.verdict,
+              conflictResolution: txOut.conflictResolution,
+              errorCode: txOut.errorCode,
+              errorMessage: txOut.errorMessage,
+            },
+            audit: true,
+          });
+        } catch {
+          // non-fatal event emit
+        }
+      }
+      this.#notifyWaiters(settled);
+      return { handled: true, action: 'failed_closed' };
+    }
+
+    try {
+      this.eventRouter?.emitPersisted({
+        sessionId: run.sessionId,
+        turnId: run.rootTurnId,
+        type: RUNTIME_EVENTS.SWARM_REPLANNED,
+        data: {
+          runId,
+          version: txOut.planVersion,
+          strategy: 'conflict_resolution',
+          addedNodes: [txOut.crKey],
+          conflictingNodeKeys: txOut.conflictingNodeKeys,
+          conflictResolution: txOut.conflictResolution,
+        },
+        audit: true,
+      });
+    } catch {
+      // non-fatal event emit
+    }
+
+    enqueueSwarmJob(
+      this.jobQueue,
+      SWARM_JOB_KINDS.DEPENDENCY_RESOLVE,
+      {
+        runId,
+        sessionId: run.sessionId,
+        planVersion: txOut.planVersion,
+        epoch: Date.now(),
+      },
+      { idempotencyKey: `swarm:resolve:${runId}:cr:${txOut.crKey}:${uuid().slice(0, 8)}` },
+    );
+    return { handled: true, action: 'scheduled', crKey: txOut.crKey };
   }
 
   #inspectVerificationShellOutcome(
@@ -3850,6 +4585,11 @@ export class AdaptiveSwarmOrchestrator {
       reviewerVerdicts.find((rv) => rv.reviewerVerification)?.reviewerVerification ??
       null;
 
+    const packageConflictResolution =
+      run.verdict?.conflictResolution ??
+      run.strategy?.conflictResolution ??
+      null;
+
     return {
       runId: run.id,
       status: run.status,
@@ -3857,6 +4597,7 @@ export class AdaptiveSwarmOrchestrator {
       planVersion: Number(run.planVersion || 1),
       repoContext: run.strategy?.repoContext ?? null,
       writeConflictResolution: run.strategy?.writeConflictResolution ?? null,
+      conflictResolution: packageConflictResolution,
       changedFiles: (analysis.changedFiles || []).map((f) => ({
         path: f.path,
         changeType: f.changeType,
