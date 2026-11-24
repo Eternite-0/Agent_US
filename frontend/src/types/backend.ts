@@ -758,7 +758,7 @@ export type AppView =
 
 export type CodexMode = 'Codex' | 'Work' | 'Chat';
 
-export type InspectorTab = 'subagents' | 'diff' | 'artifacts' | 'events' | 'autonomous';
+export type InspectorTab = 'subagents' | 'diff' | 'artifacts' | 'events' | 'autonomous' | 'git';
 
 export interface ToastItem {
   id: string;
@@ -1276,4 +1276,148 @@ export interface AciAblationSummary {
   latexTable?: string;
   markdownTable?: string;
   sourceFile?: string;
+}
+
+export type RewindScope = 'files' | 'code' | 'conversation' | 'both';
+
+export interface SessionSnapshotsResponse {
+  items: Array<Record<string, unknown>>;
+  turns?: Array<Record<string, unknown>>;
+  canRedo?: boolean;
+  latestRedoId?: string | null;
+}
+
+export interface RewindSessionResult {
+  ok: boolean;
+  sessionId?: string;
+  turnId?: string | null;
+  scope: string;
+  restoredFiles: string[];
+  deletedFiles?: string[];
+  removedMessages: number;
+  redoId?: string | null;
+  durationMs?: number;
+}
+
+export interface RewindFileResult {
+  ok: boolean;
+  sessionId?: string;
+  turnId?: string | null;
+  path: string;
+  action: 'restored' | 'deleted' | string;
+  redoId?: string | null;
+  durationMs?: number;
+}
+
+export interface RedoRewindResult {
+  ok: boolean;
+  sessionId?: string;
+  restoredFiles: string[];
+  deletedFiles?: string[];
+  removedMessages?: number;
+  redoId?: string | null;
+  durationMs?: number;
+}
+
+export interface GitChangeEntry {
+  path: string;
+  status: string;
+  oldPath?: string;
+}
+
+export interface GitChangesResponse {
+  available: boolean;
+  branch: string | null;
+  ahead?: number;
+  behind?: number;
+  headSha?: string | null;
+  clean?: boolean;
+  staged: GitChangeEntry[];
+  unstaged: GitChangeEntry[];
+  untracked: GitChangeEntry[];
+  blockedSensitive?: string[];
+  workspaceRoot?: string;
+}
+
+export interface GitCommitResult {
+  ok: boolean;
+  commitSha: string;
+  shortSha: string;
+  branch: string | null;
+  subject: string;
+  filesCommitted?: number;
+  changes?: GitChangesResponse;
+}
+
+export interface GitMergeResult {
+  ok: boolean;
+  merged?: boolean;
+  branch?: string | null;
+  sourceBranch?: string | null;
+  commitSha?: string | null;
+  conflicts?: string[];
+  changes?: GitChangesResponse;
+}
+
+export interface ExternalConfigItem {
+  id: string;
+  provider: string;
+  scope: 'user' | 'workspace' | string;
+  kind: 'rule' | 'command' | 'skill' | 'agent' | 'mcp' | string;
+  name: string;
+  displayPath: string;
+  summary?: string;
+  bytes?: number;
+}
+
+export interface ExternalConfigCounts {
+  rules: number;
+  commands: number;
+  skills: number;
+  agents: number;
+  mcp: number;
+  total: number;
+}
+
+export interface ExternalConfigDetectResult {
+  promptNeeded: boolean;
+  onboardingState?: Record<string, unknown>;
+  counts: ExternalConfigCounts;
+  providers: string[];
+  items: ExternalConfigItem[];
+}
+
+export interface WorkspaceCustomizationEntry {
+  id?: string;
+  name: string;
+  command?: string;
+  description?: string;
+  argumentHint?: string;
+  summary?: string;
+  scope?: string;
+  source?: string;
+  path?: string;
+  displayPath?: string;
+  enabled?: boolean;
+  disabled?: boolean;
+  trusted?: boolean;
+  transport?: string;
+}
+
+export interface WorkspaceCustomizations {
+  workspaceRoot?: string;
+  commands: WorkspaceCustomizationEntry[];
+  agents: WorkspaceCustomizationEntry[];
+  skills: WorkspaceCustomizationEntry[];
+  rules: WorkspaceCustomizationEntry[];
+  mcpServers: WorkspaceCustomizationEntry[];
+}
+
+export interface ExternalImportResult {
+  ok: boolean;
+  action: 'import' | 'skip' | string;
+  importedCount: number;
+  importedItems?: Array<Record<string, unknown>>;
+  customizations?: WorkspaceCustomizations;
+  promptNeeded: boolean;
 }

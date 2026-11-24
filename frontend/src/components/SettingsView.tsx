@@ -14,6 +14,7 @@ import type {
   ProvidersHealth,
   ThemeMode,
   UsageItem,
+  WorkspaceCustomizations,
 } from '../types/backend';
 import {
   fmtActionCommand,
@@ -31,6 +32,7 @@ import {
   IconClose,
   IconCpu,
   IconDatabase,
+  IconDownload,
   IconGlobe,
   IconKeyboard,
   IconSearch,
@@ -93,6 +95,8 @@ interface SettingsViewProps {
   onOpenTask: (taskId: string) => void;
   onSearchMemory?: (query: string, scope: 'global' | 'workspace' | 'session') => Promise<void>;
   onDeleteMemory?: (item: MemoryItem) => Promise<void>;
+  customizations?: WorkspaceCustomizations | null;
+  onOpenExternalImport?: () => void;
   onToast: (msg: string, tone?: 'default' | 'success' | 'warning' | 'danger') => void;
 }
 
@@ -206,6 +210,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onOpenTask,
   onSearchMemory,
   onDeleteMemory,
+  customizations,
+  onOpenExternalImport,
   onToast,
 }) => {
   const [navSearch, setNavSearch] = useState('');
@@ -515,6 +521,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       onClick={() => onUpdateConnection({ ...connection, mode: 'demo' })}
                     >
                       本地演示
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="codex-settings-section-title">外部配置与扩展</div>
+              <div className="codex-settings-card">
+                <div className="codex-settings-row">
+                  <div className="codex-settings-row-info">
+                    <span className="codex-settings-row-label">显式导入外部配置</span>
+                    <span className="codex-settings-row-desc">
+                      扫描 `~/.claude`（CLAUDE.md、commands、agents、MCP）与 `~/.codex`（AGENTS.md、skills），由你确认后再迁移为 Agent_US 原生项目命令、规则与技能。
+                      {customizations && (
+                        <> 当前已激活 {customizations.commands.length} 个命令、{customizations.skills.length} 项技能、{customizations.rules.length} 条规则。</>
+                      )}
+                    </span>
+                  </div>
+                  <div className="codex-settings-actions">
+                    <button
+                      type="button"
+                      className="codex-toolbar-btn"
+                      data-variant="primary"
+                      disabled={!onOpenExternalImport}
+                      onClick={() => onOpenExternalImport?.()}
+                    >
+                      <IconDownload size={13} />
+                      <span>外部配置导入</span>
                     </button>
                   </div>
                 </div>

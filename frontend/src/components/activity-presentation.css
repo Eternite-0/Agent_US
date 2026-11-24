@@ -224,3 +224,38 @@ button.codex-diag-row:hover .codex-diag-loc { color: var(--color-link); }
 }
 .codex-aci-pill[data-level='DIRECT'] { color: var(--color-success); }
 .codex-aci-pill[data-level='IRRELEVANT'] { color: var(--text-tertiary); }
+
+.codex-direct-notice-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 9px;
+  margin: 2px 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+  box-shadow: none;
+}
+
+.codex-direct-notice-row[data-notice-tone='steer'] {
+  border-color: color-mix(in srgb, var(--color-accent) 26%, transparent);
+  background: var(--color-accent-soft);
+  color: var(--color-text-accent);
+}
+
+.codex-direct-notice-row[data-notice-tone='failover'] {
+  border-color: color-mix(in srgb, var(--color-warning) 28%, transparent);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.codex-direct-notice-detail {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: inherit;
+  opacity: 0.88;
+  word-break: break-word;
+}

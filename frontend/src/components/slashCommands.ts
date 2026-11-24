@@ -1,9 +1,9 @@
-import type { AppView, InspectorTab } from '../types/backend';
+import type { AppView, InspectorTab, WorkspaceCustomizations } from '../types/backend';
 import {
   IconActivity, IconAgent, IconAgentTeam, IconArchive, IconBranch, IconColumns, IconCompose, IconCopy, IconCpu,
-  IconDagNodes, IconLightbulb, IconTarget, IconDatabase, IconDiffBox, IconFileDoc, IconFileEdit, IconFolder, IconFolderPlus,
+  IconDagNodes, IconDownload, IconLightbulb, IconTarget, IconDatabase, IconDiffBox, IconFileDoc, IconFileEdit, IconFolder, IconFolderPlus,
   IconGlobe, IconHistory, IconKeyboard, IconPin, IconPlay, IconPlus, IconPuzzle,
-  IconRailClock, IconReset, IconSearch, IconSettingsGear, IconShieldCheck,
+  IconRailClock, IconReset, IconSearch, IconSettingsGear, IconShieldCheck, IconSkillsNode,
   IconStopSquare, IconSun, IconTerminal, IconUndo,
 } from './Icons';
 
@@ -24,6 +24,10 @@ export interface SlashCommand {
   swarmSection?: SwarmSection;
   popover?: CommandPopover;
   threadOnly?: boolean;
+  customCommand?: boolean;
+  kind?: 'command' | 'skill';
+  scope?: string;
+  submitText?: string;
 }
 
 const settings = (section: string): AppView => ({ kind: 'settings', section });
@@ -70,7 +74,9 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
     { cmd: '/project', desc: '选择工作区项目', icon: IconFolder, popover: 'project' },
     { cmd: '/new-project', desc: '新建工作区项目', icon: IconFolderPlus },
     { cmd: '/diff', desc: '查看当前会话的文件变更', icon: IconDiffBox, inspector: 'diff', threadOnly: true },
+    { cmd: '/commit', title: 'Git 暂存与提交', desc: '打开 Git 暂存、取消暂存与提交工作台', icon: IconBranch, inspector: 'git', aliases: ['stage', 'git-commit'] },
     { cmd: '/branch', desc: '查看和切换 Git 分支', icon: IconBranch, popover: 'branch', aliases: ['git'] },
+    { cmd: '/import', title: '导入外部配置', desc: '检测并导入 ~/.claude / ~/.codex 规则、命令、技能与 MCP', icon: IconDownload, aliases: ['onboarding', 'import-external', '导入'] },
     { cmd: '/sketch', title: '绘图', desc: '绘制草图并附加到消息', icon: IconFileEdit, aliases: ['draw', '绘图'] },
     { cmd: '/attach', desc: '打开本地文件选择器', icon: IconPlus, aliases: ['upload'] },
     { cmd: '/folder', desc: '搜索并引用工作区文件夹', icon: IconFolder },
@@ -97,11 +103,77 @@ export const commandGroups: Array<{ label: string; commands: SlashCommand[] }> =
 ];
 
 const commands = commandGroups.flatMap((group) => group.commands);
+const builtinCmdSet = new Set(commands.map((c) => c.cmd.toLowerCase()));
 
-export function findSlashCommand(input: string) {
+function normalizeSlashToken(raw: string): string {
+  const cleaned = raw.trim().replace(/^\/+/, '').replace(/\s+/g, '-').toLowerCase();
+  return `/${cleaned}`;
+}
+
+export function buildDynamicCommandGroup(
+  customizations?: WorkspaceCustomizations | null,
+): { label: string; commands: SlashCommand[] } | null {
+  if (!customizations) return null;
+  const dynamic: SlashCommand[] = [];
+  const seen = new Set<string>(builtinCmdSet);
+
+  for (const entry of customizations.commands ?? []) {
+    if (entry.disabled || entry.enabled === false) continue;
+    const rawName = (entry.command || entry.name || '').trim().replace(/^\/+/, '');
+    if (!rawName) continue;
+    let cmd = normalizeSlashToken(rawName);
+    if (seen.has(cmd)) cmd = `/cmd:${rawName.replace(/\s+/g, '-').toLowerCase()}`;
+    if (seen.has(cmd)) continue;
+    seen.add(cmd);
+    dynamic.push({
+      cmd,
+      title: `/${rawName}${entry.argumentHint ? ` ${entry.argumentHint}` : ''}`,
+      desc: entry.description || entry.summary || `项目自定义命令${entry.scope ? ` (${entry.scope})` : ''}`,
+      icon: IconTerminal,
+      customCommand: true,
+      kind: 'command',
+      scope: entry.scope,
+      submitText: `/${rawName}`,
+      aliases: [rawName.toLowerCase()],
+    });
+  }
+
+  for (const entry of customizations.skills ?? []) {
+    if (entry.disabled || entry.enabled === false) continue;
+    const rawName = (entry.name || '').trim().replace(/^\/+/, '');
+    if (!rawName) continue;
+    let cmd = normalizeSlashToken(rawName);
+    if (seen.has(cmd)) cmd = `/skill:${rawName.replace(/\s+/g, '-').toLowerCase()}`;
+    if (seen.has(cmd)) continue;
+    seen.add(cmd);
+    dynamic.push({
+      cmd,
+      title: `${rawName} · 技能`,
+      desc: entry.description || entry.summary || `原生技能${entry.scope ? ` (${entry.scope})` : ''}`,
+      icon: IconSkillsNode,
+      customCommand: true,
+      kind: 'skill',
+      scope: entry.scope,
+      submitText: `/${rawName}`,
+      aliases: [`skill:${rawName.toLowerCase()}`, rawName.toLowerCase()],
+    });
+  }
+
+  return dynamic.length > 0 ? { label: '项目命令与技能', commands: dynamic } : null;
+}
+
+export function mergeSlashCommandGroups(
+  customizations?: WorkspaceCustomizations | null,
+): Array<{ label: string; commands: SlashCommand[] }> {
+  const dynamicGroup = buildDynamicCommandGroup(customizations);
+  return dynamicGroup ? [...commandGroups, dynamicGroup] : commandGroups;
+}
+
+export function findSlashCommand(input: string, extraCommands: readonly SlashCommand[] = []) {
   if (!input.startsWith('/')) return undefined;
   const query = input.toLowerCase();
-  return commands.find(({ cmd, aliases }) => cmd === query || aliases?.includes(query.slice(1)));
+  const all = extraCommands.length ? [...commands, ...extraCommands] : commands;
+  return all.find(({ cmd, aliases }) => cmd === query || aliases?.includes(query.slice(1)));
 }
 
 export function matchesSlashCommand(command: SlashCommand, query: string) {

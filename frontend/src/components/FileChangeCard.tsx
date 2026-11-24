@@ -15,6 +15,8 @@ interface FileChangeCardProps {
   files: ComputedFileDiff[];
   onInspectFile: (path?: string) => void;
   onUndo?: () => void;
+  onRewind?: (scope: 'files' | 'both') => Promise<void> | void;
+  rewinding?: boolean;
   onCopy?: (msg: string) => void;
 }
 
@@ -204,8 +206,10 @@ function FileChangeRow({ file, hidden, listId, onInspectFile, onCopy }: {
   );
 }
 
-export function FileChangeCard({ files, onInspectFile, onUndo, onCopy }: FileChangeCardProps) {
+export function FileChangeCard({ files, onInspectFile, onUndo, onRewind, rewinding = false, onCopy }: FileChangeCardProps) {
   const [expandedList, setExpandedList] = useState(false);
+  const [rewindOpen, setRewindOpen] = useState(false);
+  const [localRewinding, setLocalRewinding] = useState(false);
   const listId = useId();
   const uniqueFiles = useMemo(() => [...new Map(files.map((file) => [file.path, file])).values()], [files]);
   if (!uniqueFiles.length) return null;
@@ -214,6 +218,17 @@ export function FileChangeCard({ files, onInspectFile, onUndo, onCopy }: FileCha
   const totalDel = uniqueFiles.reduce((sum, file) => sum + file.deleted, 0);
   const moreCount = uniqueFiles.length - INITIAL_VISIBLE;
   const inspectFirst = () => onInspectFile(uniqueFiles[0].path);
+  const rewindBusy = rewinding || localRewinding;
+  const triggerRewind = async (scope: 'files' | 'both') => {
+    if (!onRewind || rewindBusy) return;
+    setLocalRewinding(true);
+    try {
+      await onRewind(scope);
+      setRewindOpen(false);
+    } finally {
+      setLocalRewinding(false);
+    }
+  };
   return (
     <div className="codex-file-card" data-status="completed">
       <div className="codex-file-card-head">
@@ -223,10 +238,56 @@ export function FileChangeCard({ files, onInspectFile, onUndo, onCopy }: FileCha
           <DiffCounts added={totalAdd} deleted={totalDel} />
         </button>
         <div className="codex-file-card-actions">
-          {onUndo && <button type="button" className="codex-toolbar-btn" onClick={onUndo}><span>撤销</span><IconUndo size={13} aria-hidden="true" /></button>}
+          {(onRewind || onUndo) && (
+            <button
+              type="button"
+              className="codex-toolbar-btn"
+              aria-expanded={onRewind ? rewindOpen : undefined}
+              disabled={rewindBusy}
+              onClick={() => {
+                if (onRewind) setRewindOpen((cur) => !cur);
+                else onUndo?.();
+              }}
+            >
+              <span>撤销</span>
+              <IconUndo size={13} aria-hidden="true" />
+            </button>
+          )}
           <button type="button" className="codex-toolbar-btn" onClick={inspectFirst}>查看变更<IconArrowUpRight size={12} aria-hidden="true" /></button>
         </div>
       </div>
+
+      {onRewind && rewindOpen && (
+        <div className="codex-rewind-choice-bar" role="group" aria-label="选择回退范围">
+          <span className="codex-rewind-choice-label">回退范围：</span>
+          <button
+            type="button"
+            className="codex-toolbar-btn"
+            data-variant="outline"
+            disabled={rewindBusy}
+            onClick={() => void triggerRewind('files')}
+          >
+            仅还原文件
+          </button>
+          <button
+            type="button"
+            className="codex-toolbar-btn"
+            data-variant="primary"
+            disabled={rewindBusy}
+            onClick={() => void triggerRewind('both')}
+          >
+            文件 + 对话回退
+          </button>
+          <button
+            type="button"
+            className="codex-toolbar-btn"
+            disabled={rewindBusy}
+            onClick={() => setRewindOpen(false)}
+          >
+            取消
+          </button>
+        </div>
+      )}
 
       <div id={listId}>
         {uniqueFiles.map((file, index) => <FileChangeRow key={file.path} file={file} listId={listId}

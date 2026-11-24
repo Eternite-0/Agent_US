@@ -7,6 +7,7 @@ import type {
   ModelSpec,
   PermissionMode,
   SessionPermissionMode,
+  WorkspaceCustomizations,
   WorkspaceEntryKind,
   Project,
 } from '../types/backend';
@@ -51,6 +52,7 @@ interface HomeViewProps {
   onStartReview?: (baseBranch?: string) => Promise<void>;
   onSlashCommand: (command: SlashCommand) => void;
   commandAvailability?: CommandAvailability;
+  customizations?: WorkspaceCustomizations | null;
   searchMentionFiles?: (query: string, signal: AbortSignal, kind: WorkspaceEntryKind) => Promise<string[]>;
   onSubmitGoal: (goal: string, files: Record<string, string>) => Promise<boolean>;
   onSubmitTask: (text: string, files: Record<string, string>) => Promise<boolean | void>;
@@ -110,6 +112,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onStartReview,
   onSlashCommand,
   commandAvailability,
+  customizations,
   searchMentionFiles,
   onSubmitGoal,
   onSubmitTask,
@@ -314,6 +317,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
           onStartReview={onStartReview}
           onSlashCommand={onSlashCommand}
           commandAvailability={commandAvailability}
+          customizations={customizations}
           searchMentionFiles={searchMentionFiles}
           onSubmitGoal={onSubmitGoal}
           onSubmit={onSubmitTask}
