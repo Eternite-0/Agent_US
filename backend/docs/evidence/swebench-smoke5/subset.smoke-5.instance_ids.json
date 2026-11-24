@@ -1,0 +1,17 @@
+{
+  "preset": "smoke-5",
+  "seed": 42,
+  "count": 5,
+  "repoDistribution": {
+    "django/django": 3,
+    "sphinx-doc/sphinx": 2
+  },
+  "instanceIds": [
+    "django__django-12209",
+    "sphinx-doc__sphinx-8035",
+    "django__django-12155",
+    "sphinx-doc__sphinx-8721",
+    "django__django-12050"
+  ],
+  "createdAt": "2026-11-24T22:36:51.636Z"
+}

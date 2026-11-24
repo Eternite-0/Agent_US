@@ -2235,6 +2235,12 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     const summaryPath = join(outputDir, 'summary.md');
     let evalByArm = {};
     let pairedByArm = {};
+    const resolveBenchmarkSummaryModel = () =>
+      opts.model ||
+      providerConfig?.model ||
+      telemetryByArm[opts.arms[0]]?.find((r) => r?.status !== 'env_error' && r?.model)?.model ||
+      telemetryByArm[opts.arms[0]]?.[0]?.model ||
+      (opts.dryRun ? 'swebench-dry-run-sim' : 'default');
     const writeIncrementalSummary = () => {
       const metricsByArm = {};
       for (const arm of opts.arms) {
@@ -2245,6 +2251,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         );
       }
       pairedByArm = computePairedResolutionMetrics(opts.arms, telemetryByArm, opts.arms[0]);
+      const summaryModel = resolveBenchmarkSummaryModel();
       const md = renderSummaryMarkdown({
         arms: opts.arms,
         metricsByArm,
@@ -2252,12 +2259,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         pairedByArm,
         meta: {
           dryRun: opts.dryRun,
-          model:
-            opts.model ||
-            providerConfig?.model ||
-            telemetryByArm[opts.arms[0]]?.find((r) => r?.status !== 'env_error' && r?.model)?.model ||
-            telemetryByArm[opts.arms[0]]?.[0]?.model ||
-            (opts.dryRun ? 'swebench-dry-run-sim' : 'default'),
+          model: summaryModel,
           maxSteps: opts.maxSteps,
           resumed: opts.resume,
           updatedAt: new Date().toISOString(),
@@ -2546,7 +2548,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         meta: {
           dryRun: opts.dryRun,
           subset: opts.subset ?? null,
-          model: opts.model || providerConfig?.model || (opts.dryRun ? 'swebench-dry-run-sim' : 'default'),
+          model: resolveBenchmarkSummaryModel(),
         },
       });
       writeFileSync(latexPath, tex, { encoding: 'utf8', mode: 0o600 });

@@ -434,6 +434,24 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     });
     assert.equal(sympyFallback.framework, 'sympy');
     assert.match(sympyFallback.commands[0], /sympy\/solvers\/tests\/test_solveset\.py/);
+
+    const djangoDocstringFallback = buildSweBenchEvalCommands({
+      repo: 'django/django',
+      FAIL_TO_PASS: ['partial(func, *args, **keywords) - new function with partial application'],
+      PASS_TO_PASS: [],
+      test_patch: [
+        'diff --git a/tests/serializers/models/data.py b/tests/serializers/models/data.py',
+        '--- a/tests/serializers/models/data.py',
+        '+++ b/tests/serializers/models/data.py',
+        'diff --git a/tests/serializers/test_data.py b/tests/serializers/test_data.py',
+        '--- a/tests/serializers/test_data.py',
+        '+++ b/tests/serializers/test_data.py',
+      ].join('\n'),
+    });
+    assert.equal(djangoDocstringFallback.framework, 'django');
+    assert.deepEqual(djangoDocstringFallback.commands, [
+      "./tests/runtests.py --verbosity 2 --parallel 1 'serializers'",
+    ]);
   });
 
   test('parseEvalTestResults parses pytest -rA, Django/unittest verbose, and SymPy bin/test outputs accurately', () => {
@@ -507,6 +525,56 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     assert.equal(sympyParsed.passToPassPassed, 1);
     assert.equal(sympyParsed.passToPassFailed, 1);
     assert.equal(sympyParsed.resolved, false);
+
+    // 4. Django/unittest docstring targets (partial(...) and prose docstrings)
+    const partialDoc = 'partial(func, *args, **keywords) - new function with partial application';
+    const djangoDocPassOut = [
+      'test_json_793 (serializers.test_data.JsonSerializerTestCase)',
+      `${partialDoc} ... ok`,
+      'test_xml_793 (serializers.test_data.XmlSerializerTestCase)',
+      `${partialDoc} ... ok`,
+      'Ran 2 tests in 0.015s',
+      'OK',
+    ].join('\n');
+    const djangoDocPassed = parseEvalTestResults(djangoDocPassOut, {
+      repo: 'django/django',
+      failToPass: [partialDoc],
+      passToPass: [],
+      exitCode: 0,
+    });
+    assert.equal(djangoDocPassed.failToPassPassed, 1);
+    assert.equal(djangoDocPassed.resolved, true);
+
+    const djangoDocMixedFailOut = [
+      'test_json_793 (serializers.test_data.JsonSerializerTestCase)',
+      `${partialDoc} ... ok`,
+      'test_yaml_793 (serializers.test_data.YamlSerializerTestCase)',
+      `${partialDoc} ... FAIL`,
+      'Ran 2 tests in 0.016s',
+      'FAILED (failures=1)',
+    ].join('\n');
+    const djangoDocFailed = parseEvalTestResults(djangoDocMixedFailOut, {
+      repo: 'django/django',
+      failToPass: [partialDoc],
+      passToPass: [],
+      exitCode: 1,
+    });
+    assert.equal(djangoDocFailed.failToPassPassed, 0);
+    assert.equal(djangoDocFailed.resolved, false);
+
+    const djangoStandaloneDocOut = [
+      'BoundField without any choices (subwidgets) evaluates to True. ... ok',
+      'Ran 1 test in 0.005s',
+      'OK',
+    ].join('\n');
+    const djangoStandaloneParsed = parseEvalTestResults(djangoStandaloneDocOut, {
+      repo: 'django/django',
+      failToPass: ['BoundField without any choices (subwidgets) evaluates to True.'],
+      passToPass: [],
+      exitCode: 0,
+    });
+    assert.equal(djangoStandaloneParsed.failToPassPassed, 1);
+    assert.equal(djangoStandaloneParsed.resolved, true);
   });
 
   test('evaluateSweBenchPredictions grades resolved, empty_patch, patch_apply_failed, test_patch_apply_failed, FAIL_TO_PASS fail, and PASS_TO_PASS regression while always destroying sessions', async () => {

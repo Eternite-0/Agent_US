@@ -31,6 +31,7 @@ const MAX_TARGETS_PER_SYMPY_CMD = 60;
 const MAX_CMD_LENGTH_CHARS = 16_000;
 const ANSI_ESCAPE_RE = /\x1B\[[0-9;]*[A-Za-z]/g;
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const VALID_DJANGO_LABEL_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
 function compareStringsAsc(a, b) {
   const sa = String(a ?? '');
@@ -697,6 +698,24 @@ function extractSympyTestFile(target) {
   return '';
 }
 
+function extractDjangoLabelsFromTestPatch(testPatch) {
+  const touched = parseDiffTouchedFiles(testPatch);
+  const allFiles = dedupePreserveOrder([...touched.existing, ...touched.added]);
+  const labels = [];
+  for (const filePath of allFiles) {
+    const norm = normalizeMatchPath(filePath);
+    if (!norm.endsWith('.py') || !norm.startsWith('tests/')) continue;
+    const rel = norm.slice('tests/'.length);
+    const segments = rel.split('/').filter(Boolean);
+    if (segments.length === 0) continue;
+    const label = segments.length === 1 ? segments[0].replace(/\.py$/, '') : segments[0];
+    if (VALID_DJANGO_LABEL_RE.test(label)) {
+      labels.push(label);
+    }
+  }
+  return dedupePreserveOrder(labels);
+}
+
 function parseDiffTouchedFiles(diffText) {
   const existing = [];
   const added = [];
@@ -803,7 +822,23 @@ export function buildSweBenchEvalCommands(instance) {
   const allTargets = dedupePreserveOrder([...failToPassTargets, ...passToPassTargets]);
 
   if (repo === 'django/django') {
-    const labels = dedupePreserveOrder(allTargets.map(djangoTestNodeToLabel).filter(Boolean));
+    const mappedLabels = allTargets.map(djangoTestNodeToLabel).filter(Boolean);
+    const validLabels = dedupePreserveOrder(
+      mappedLabels.filter((lbl) => VALID_DJANGO_LABEL_RE.test(lbl)),
+    );
+    const hasInvalidLabels = mappedLabels.some((lbl) => !VALID_DJANGO_LABEL_RE.test(lbl));
+    let labels = validLabels;
+    if ((hasInvalidLabels || validLabels.length === 0) && instance?.test_patch) {
+      const patchLabels = extractDjangoLabelsFromTestPatch(instance.test_patch);
+      if (patchLabels.length > 0) {
+        const patchRoots = new Set(patchLabels.map((lbl) => lbl.split('.')[0]));
+        const extraValid = validLabels.filter((lbl) => !patchRoots.has(lbl.split('.')[0]));
+        labels = dedupePreserveOrder([...patchLabels, ...extraValid]);
+      }
+    }
+    if (labels.length === 0) {
+      labels = dedupePreserveOrder(mappedLabels);
+    }
     const commands = chunkCommands(
       './tests/runtests.py --verbosity 2 --parallel 1',
       labels,
@@ -903,6 +938,15 @@ export function parseEvalTestResults(
     passedNames.delete(n);
     failedNames.add(n);
   };
+  const recordUnittestOutcome = (outcomeRaw, ...names) => {
+    const outcome = String(outcomeRaw ?? '').toLowerCase();
+    const targets = names.map((n) => String(n ?? '').trim()).filter(Boolean);
+    if (outcome === 'ok' || outcome === 'expected failure') {
+      for (const t of targets) markPassed(t);
+    } else if (outcome === 'fail' || outcome === 'error' || outcome === 'unexpected success') {
+      for (const t of targets) markFailed(t);
+    }
+  };
 
   let currentSympyFile = null;
   let pendingUnittestNode = null;
@@ -965,39 +1009,42 @@ export function parseEvalTestResults(
       continue;
     }
 
+    // Multiline unittest docstring output (`test_foo (pkg.mod.Cls)` followed by `<doc> ... ok`)
+    if (pendingUnittestNode) {
+      const docOutcome = line.match(
+        /^(.*?)\s*\.\.\.\s+(ok|FAIL|ERROR|expected failure|unexpected success|skipped(?:\s+.*)?)$/i,
+      );
+      if (docOutcome) {
+        recordUnittestOutcome(docOutcome[2], pendingUnittestNode, docOutcome[1]);
+        pendingUnittestNode = null;
+        continue;
+      }
+      pendingUnittestNode = null;
+    }
+
     // Unittest / Django single-line verbose output (`test_foo (pkg.mod.Cls) ... ok|FAIL|ERROR`)
     const unittestLine = line.match(
       /^(.+?)\s+\(([^)]+)\)\s+\.\.\.\s+(ok|FAIL|ERROR|expected failure|unexpected success|skipped(?:\s+.*)?)$/i,
     );
     if (unittestLine) {
       const testLabel = `${unittestLine[1].trim()} (${unittestLine[2].trim()})`;
-      const outcome = unittestLine[3].toLowerCase();
-      if (outcome === 'ok' || outcome === 'expected failure') {
-        markPassed(testLabel);
-      } else if (outcome === 'fail' || outcome === 'error' || outcome === 'unexpected success') {
-        markFailed(testLabel);
-      }
+      recordUnittestOutcome(unittestLine[3], testLabel);
       pendingUnittestNode = null;
       continue;
     }
 
-    // Multiline unittest docstring output (`test_foo (pkg.mod.Cls)` followed by `<doc> ... ok`)
-    if (pendingUnittestNode) {
-      const docOutcome = line.match(
-        /\.\.\.\s+(ok|FAIL|ERROR|expected failure|unexpected success|skipped(?:\s+.*)?)$/i,
+    // Standalone Django/unittest docstring status line (`<docstring> ... ok|FAIL|ERROR`)
+    if (repo === 'django/django') {
+      const djangoDocLine = line.match(
+        /^(.+?)\s+\.\.\.\s+(ok|FAIL|ERROR|expected failure|unexpected success|skipped(?:\s+.*)?)$/i,
       );
-      if (docOutcome) {
-        const outcome = docOutcome[1].toLowerCase();
-        if (outcome === 'ok' || outcome === 'expected failure') {
-          markPassed(pendingUnittestNode);
-        } else if (outcome === 'fail' || outcome === 'error' || outcome === 'unexpected success') {
-          markFailed(pendingUnittestNode);
-        }
+      if (djangoDocLine) {
+        recordUnittestOutcome(djangoDocLine[2], djangoDocLine[1]);
         pendingUnittestNode = null;
         continue;
       }
-      pendingUnittestNode = null;
     }
+
     const unittestHeader = line.match(/^([^\s(]+)\s+\(([^)]+)\)$/);
     if (unittestHeader) {
       pendingUnittestNode = `${unittestHeader[1]} (${unittestHeader[2].trim()})`;
