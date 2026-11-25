@@ -45,6 +45,13 @@ import {
   scrubAntiCheatGitRefs,
 } from '../src/evaluation/swebench-docker.js';
 import {
+  EXTERNAL_SWEBENCH_ARMS,
+  SweBenchMeteringProxy,
+  createTestbedShimBinDir,
+  isExternalSweBenchArm,
+  runExternalSweBenchArm,
+} from '../src/evaluation/swebench-external-agents.js';
+import {
   hasExplicitEnvProviderKey,
   isThinkingOrReasoningModel,
   loadAppPoolReadOnly,
@@ -62,6 +69,11 @@ import {
 } from '../src/tools/benchmark-sandbox.js';
 
 export {
+  EXTERNAL_SWEBENCH_ARMS,
+  SweBenchMeteringProxy,
+  createTestbedShimBinDir,
+  isExternalSweBenchArm,
+  runExternalSweBenchArm,
   resolveAppDataDir,
   loadAppPoolReadOnly,
   hasExplicitEnvProviderKey,
@@ -82,6 +94,9 @@ export const VALID_SWEBENCH_ARMS = Object.freeze(
     'full_aci',
     'aci_25',
     'aci_26',
+    'claude_code',
+    'codex_cli',
+    'mini_swe_agent',
   ]),
 );
 export const DEFAULT_MAX_STEPS = 60;
@@ -172,7 +187,7 @@ function printSweBenchUsage() {
       '  --shard <index>/<total>        Run 1-based interleaved shard (e.g. 1/5) after --subset/--limit',
       '  --merge-shards <dir1,dir2,...> Merge sharded JSONL outputs into summary.md / .tex without running inference',
       '  --dry-run                      Run deterministic offline Python bug trajectory with 64-tok KV sim',
-      '  --arms <csv>                   Comma-separated ACI arms (default: raw_full,full_aci)',
+      '  --arms <csv>                   Comma-separated arms: raw_full,full_aci,claude_code,codex_cli,mini_swe_agent',
       '  --model <model>                Model alias / name for predictions & inference',
       '  --supervisor-model <model|off> Explicit ACI supervisor model or "off"/"deterministic"',
       '  --deterministic-admission      Disable supervisor LLM calls and use deterministic admission',
@@ -1909,11 +1924,13 @@ export async function runSweBenchInstanceArm({
   const pool = new AccountPool(store, { root: stateDir, metrics });
 
   const containerMode = Boolean(!opts.dryRun && (opts.dockerImage || opts.dockerPreset));
+  const isExternalArm = isExternalSweBenchArm(arm);
   let resolvedModel = opts.model || null;
   let modelNameForPrediction = opts.model || null;
   let availableModels = [];
+  let externalLiveConfig = null;
 
-  if (adapter || opts.dryRun) {
+  if (!isExternalArm && (adapter || opts.dryRun)) {
     resolvedModel = opts.model || providerConfig?.model || 'swebench-dry-run-sim';
     modelNameForPrediction = opts.model
       ? opts.model
@@ -1956,6 +1973,25 @@ export async function runSweBenchInstanceArm({
     pool.setDefaultModel(resolvedModel);
     availableModels = Array.isArray(cloned.availableModels) ? cloned.availableModels : [resolvedModel];
     modelNameForPrediction = opts.model || resolvedModel || `agent-us-${arm}`;
+
+    if (isExternalArm) {
+      const route = pool.resolveRoutes(resolvedModel)?.[0] ?? null;
+      if (!route?.endpoint) {
+        const fatal = new Error(
+          `No healthy App Pool route found for external SWE-bench arm "${arm}" (model="${resolvedModel}").`,
+        );
+        fatal.isFatalConfigError = true;
+        throw fatal;
+      }
+      externalLiveConfig = {
+        apiKey: route.apiKey ?? '',
+        endpoint: route.endpoint,
+        protocol: route.protocol || 'openai',
+        model: route.wireModel || resolvedModel,
+        customHeaders: route.customHeaders ?? null,
+        fetchImpl: route.fetch ?? fetch,
+      };
+    }
   } else {
     const liveCfg = providerConfig ?? resolveLiveProviderConfig(opts, runtimeDeps.env ?? process.env);
     if (!liveCfg?.apiKey) {
@@ -1964,24 +2000,177 @@ export async function runSweBenchInstanceArm({
       );
     }
     resolvedModel = opts.model || liveCfg.model || 'deepseek-chat';
-    const supExplicit =
-      typeof opts.supervisorModel === 'string' &&
-      opts.supervisorModel.trim() &&
-      !['off', 'deterministic', 'auto'].includes(opts.supervisorModel.trim().toLowerCase())
-        ? opts.supervisorModel.trim()
-        : null;
-    const accountModels = [...new Set([resolvedModel, ...(supExplicit ? [supExplicit] : [])])];
-    pool.createAccount({
-      preset: liveCfg.preset || (liveCfg.protocol === 'anthropic' ? 'custom-anthropic' : 'custom-openai'),
-      label: 'swebench-live',
-      credential: liveCfg.apiKey,
-      protocol: liveCfg.protocol || 'openai',
-      endpoint: liveCfg.endpoint,
-      models: accountModels,
-    });
-    pool.setDefaultModel(resolvedModel);
-    availableModels = accountModels;
     modelNameForPrediction = opts.model || resolvedModel || `agent-us-${arm}`;
+    if (isExternalArm) {
+      externalLiveConfig = {
+        apiKey: liveCfg.apiKey,
+        endpoint: liveCfg.endpoint,
+        protocol: liveCfg.protocol || 'openai',
+        model: resolvedModel,
+      };
+    } else {
+      const supExplicit =
+        typeof opts.supervisorModel === 'string' &&
+        opts.supervisorModel.trim() &&
+        !['off', 'deterministic', 'auto'].includes(opts.supervisorModel.trim().toLowerCase())
+          ? opts.supervisorModel.trim()
+          : null;
+      const accountModels = [...new Set([resolvedModel, ...(supExplicit ? [supExplicit] : [])])];
+      pool.createAccount({
+        preset: liveCfg.preset || (liveCfg.protocol === 'anthropic' ? 'custom-anthropic' : 'custom-openai'),
+        label: 'swebench-live',
+        credential: liveCfg.apiKey,
+        protocol: liveCfg.protocol || 'openai',
+        endpoint: liveCfg.endpoint,
+        models: accountModels,
+      });
+      pool.setDefaultModel(resolvedModel);
+      availableModels = accountModels;
+    }
+  }
+
+  const prepareWorkspaceAndSandbox = async () => {
+    let localBaseCommit = instance.base_commit;
+    if (!opts.dryRun) {
+      const scrubFn = runtimeDeps.scrubAntiCheatGitRefs ?? scrubAntiCheatGitRefs;
+      await scrubFn(workspaceRoot, instance.base_commit);
+      if (extractedFromImage) {
+        localBaseCommit = await commitContainerBaselineChanges(
+          workspaceRoot,
+          instance.base_commit,
+        );
+      }
+    }
+
+    let sandbox = null;
+    if (containerMode) {
+      const dockerImage = resolveSweBenchDockerImage({
+        dockerImage: opts.dockerImage,
+        dockerPreset: opts.dockerPreset,
+        instance,
+      });
+      const adapterPull =
+        extractedFromImage && opts.pull === 'always' ? 'missing' : (opts.pull ?? 'missing');
+      const containerMemory = opts.containerMemory ?? '2g';
+      const containerMemorySwap = computeMemorySwap(containerMemory);
+      sandbox =
+        typeof runtimeDeps.createDockerAdapter === 'function'
+          ? runtimeDeps.createDockerAdapter({
+              image: dockerImage,
+              workspaceRoot,
+              pull: adapterPull,
+              memory: containerMemory,
+              ...(containerMemorySwap ? { memorySwap: containerMemorySwap } : {}),
+              timeoutMs: 120_000,
+              instance,
+            })
+          : new SweBenchDockerAdapter({
+              image: dockerImage,
+              workspaceRoot,
+              pull: adapterPull,
+              memory: containerMemory,
+              ...(containerMemorySwap ? { memorySwap: containerMemorySwap } : {}),
+              timeoutMs: 120_000,
+            });
+      await sandbox?.start?.();
+      if (typeof sandbox?.exec === 'function') {
+        // Warm Linux 9P/drvfs stat cache for `.git/index` before agent runs so `git diff` / `git status` won't timeout on large repos like Django.
+        await sandbox
+          .exec('git -c core.preloadIndex=true update-index -q --refresh || true', {
+            skipAntiCheatGuard: true,
+            timeoutMs: 90_000,
+          })
+          .catch(() => {});
+      }
+    }
+    return { effectiveBaseCommit: localBaseCommit, sessionSandbox: sandbox };
+  };
+
+  if (isExternalArm) {
+    let sessionSandbox = null;
+    try {
+      const prep = await prepareWorkspaceAndSandbox();
+      sessionSandbox = prep.sessionSandbox;
+      const runExtFn = runtimeDeps.runExternalSweBenchArm ?? runExternalSweBenchArm;
+      const extRes = await runExtFn({
+        arm,
+        instance,
+        workspaceRoot,
+        opts,
+        liveConfig: externalLiveConfig,
+        sessionSandbox,
+        containerMode,
+        modelNameForPrediction,
+        runtimeDeps,
+      });
+
+      const wallClockMs = Math.max(
+        1,
+        Math.round(performance.now() - started),
+        Number(extRes?.wallClockMs ?? 0) || 0,
+      );
+      await sessionSandbox?.repairHostWorkspacePermissions?.().catch(() => {});
+      const extractDiffFn = runtimeDeps.extractInstanceGitDiff ?? extractInstanceGitDiff;
+      const { patch } = await extractDiffFn(workspaceRoot, prep.effectiveBaseCommit);
+
+      const m = extRes?.metrics ?? {};
+      const inputTokens = Number(m.inputTokens ?? 0) || 0;
+      const outputTokens = Number(m.outputTokens ?? 0) || 0;
+      const cacheReadTokens = Number(m.cacheReadTokens ?? 0) || 0;
+      const cacheWriteTokens = Number(m.cacheWriteTokens ?? 0) || 0;
+      const rawEligible = m.cacheEligibleInputTokens;
+      const cacheEligibleInputTokens =
+        rawEligible != null && Number.isFinite(Number(rawEligible)) && Number(rawEligible) > 0
+          ? Number(rawEligible)
+          : null;
+      const cacheStatus = cacheEligibleInputTokens != null ? 'available' : 'missing';
+      const cacheHitRate =
+        cacheEligibleInputTokens != null && cacheEligibleInputTokens > 0
+          ? round4(Math.min(1, cacheReadTokens / cacheEligibleInputTokens))
+          : null;
+
+      const prediction = formatPredictionRecord({
+        instanceId: instance.instance_id,
+        modelName: modelNameForPrediction,
+        modelPatch: patch,
+      });
+      const telemetry = {
+        instance_id: instance.instance_id,
+        arm,
+        model: modelNameForPrediction,
+        status: String(extRes?.status || 'completed'),
+        wallClockMs,
+        steps: Number(m.steps ?? 0) || 0,
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        cacheReadTokens,
+        cacheWriteTokens,
+        cacheEligibleInputTokens,
+        cacheStatus,
+        cacheHitRate,
+        nonEmptyPatch: String(patch ?? '').trim().length > 0,
+        patchBytes: Buffer.byteLength(String(patch ?? ''), 'utf8'),
+        admissionOriginalTokens: 0,
+        admissionInjectedTokens: 0,
+        admissionSavedTokens: 0,
+        admissionTokenReductionRate: 0,
+        epochTransitions: 0,
+        aciProfile: arm,
+        dtocPolicy: null,
+        admissionDecisions: null,
+        supervisorCost: null,
+        toolCallsCount: Number(extRes?.toolCallsCount ?? 0) || 0,
+        error: extRes?.error ? redactSecrets(String(extRes.error)) : null,
+        timestamp: new Date().toISOString(),
+      };
+
+      return { prediction, telemetry };
+    } finally {
+      await sessionSandbox?.destroy?.().catch(() => {});
+      store.close();
+      safeRmRf(stateDir);
+    }
   }
 
   const supExec = resolveSupervisorExecutionConfig({
@@ -2011,58 +2200,10 @@ export async function runSweBenchInstanceArm({
 
   let unsub = null;
   let sessionSandbox = null;
-  let effectiveBaseCommit = instance.base_commit;
   try {
-    if (!opts.dryRun) {
-      const scrubFn = runtimeDeps.scrubAntiCheatGitRefs ?? scrubAntiCheatGitRefs;
-      await scrubFn(workspaceRoot, instance.base_commit);
-      if (extractedFromImage) {
-        effectiveBaseCommit = await commitContainerBaselineChanges(
-          workspaceRoot,
-          instance.base_commit,
-        );
-      }
-    }
-
-    if (containerMode) {
-      const dockerImage = resolveSweBenchDockerImage({
-        dockerImage: opts.dockerImage,
-        dockerPreset: opts.dockerPreset,
-        instance,
-      });
-      const adapterPull =
-        extractedFromImage && opts.pull === 'always' ? 'missing' : (opts.pull ?? 'missing');
-      const containerMemory = opts.containerMemory ?? '2g';
-      const containerMemorySwap = computeMemorySwap(containerMemory);
-      sessionSandbox =
-        typeof runtimeDeps.createDockerAdapter === 'function'
-          ? runtimeDeps.createDockerAdapter({
-              image: dockerImage,
-              workspaceRoot,
-              pull: adapterPull,
-              memory: containerMemory,
-              ...(containerMemorySwap ? { memorySwap: containerMemorySwap } : {}),
-              timeoutMs: 120_000,
-              instance,
-            })
-          : new SweBenchDockerAdapter({
-              image: dockerImage,
-              workspaceRoot,
-              pull: adapterPull,
-              memory: containerMemory,
-              ...(containerMemorySwap ? { memorySwap: containerMemorySwap } : {}),
-              timeoutMs: 120_000,
-            });
-      if (typeof sessionSandbox?.exec === 'function') {
-        // Warm Linux 9P/drvfs stat cache for `.git/index` before agent runs so `git diff` / `git status` won't timeout on large repos like Django.
-        await sessionSandbox
-          .exec('git -c core.preloadIndex=true update-index -q --refresh || true', {
-            skipAntiCheatGuard: true,
-            timeoutMs: 90_000,
-          })
-          .catch(() => {});
-      }
-    }
+    const prep = await prepareWorkspaceAndSandbox();
+    const effectiveBaseCommit = prep.effectiveBaseCommit;
+    sessionSandbox = prep.sessionSandbox;
 
     const session = direct.createSession({
       title: `SWE-bench · ${instance.instance_id} (${arm})`,

@@ -19,7 +19,7 @@ export const DEFAULT_TESTBED_PATH =
 
 const VALID_PULL_POLICIES = new Set(['missing', 'always', 'never']);
 
-const ANTI_CHEAT_GIT_SUBCOMMANDS = new Set([
+export const ANTI_CHEAT_GIT_SUBCOMMANDS = new Set([
   'commit',
   'reset',
   'checkout',
@@ -77,7 +77,7 @@ const SAFE_CONTAINER_GIT_SUBCOMMANDS = new Set([
 
 const SAFE_HOST_GIT_SUBCOMMANDS = new Set(['diff', 'status', 'show', 'log']);
 
-const BLOCKED_GIT_FLAGS = new Set([
+export const BLOCKED_GIT_FLAGS = new Set([
   '-c',
   '-C',
   '--config-env',
@@ -281,7 +281,7 @@ const DANGEROUS_ENV_ASSIGN_KEYS = new Set([
   'NODE_PATH',
 ]);
 
-const SAFE_PIP_SUBCOMMANDS = new Set(['list', 'show', 'freeze', 'check', '--version', '-V', 'help', '--help']);
+export const SAFE_PIP_SUBCOMMANDS = new Set(['list', 'show', 'freeze', 'check', '--version', '-V', 'help', '--help']);
 const SAFE_HOST_PYTHON_MODULES = new Set([
   'pytest',
   'unittest',
@@ -297,7 +297,7 @@ const DIRECT_GIT_INTERNALS_RE =
 const DIRECT_GIT_DIR_TOKEN_RE = /(?:^|[\s;|&(/\\])\.git(?:[\\/\s;|&)]|$)/i;
 const GIT_CHEAT_FLAGS_RE =
   /^(?:--all|--branches(?:=.*)?|--tags(?:=.*)?|--remotes(?:=.*)?|--glob(?:=.*)?|--reflog|--indexed-objects)$/i;
-const PY_CHEAT_GIT_CALL_RE =
+export const PY_CHEAT_GIT_CALL_RE =
   /(?:\.git[\\/]|--all|--branches|--tags|--remotes|--glob|\bgit\s+(?:commit|reset|checkout|switch|restore|revert|rebase|cherry-pick|merge|am|fetch|pull|push|remote|clone|tag|branch|reflog|for-each-ref|show-ref|cat-file|update-ref|fsck)\b|['"]git['"]\s*,\s*['"](?:commit|reset|checkout|switch|restore|revert|rebase|cherry-pick|merge|am|fetch|pull|push|remote|clone|tag|branch|reflog|for-each-ref|show-ref|cat-file|update-ref|fsck)['"])/i;
 
 function stripWinExtendedPrefix(p) {

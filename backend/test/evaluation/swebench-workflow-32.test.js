@@ -341,6 +341,30 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
       assert.ok(mergeBlock.includes(flag), `merge-and-publish missing CLI flag: ${flag}`);
     }
 
+    const parsedMixed = parseSweBenchCliArgs([
+      '--dataset',
+      'hf:verified-mini',
+      '--arms',
+      'raw_full,full_aci,claude_code,codex_cli,mini_swe_agent',
+      '--model',
+      'deepseek-v4.1-flash',
+    ]);
+    assert.deepEqual(parsedMixed.arms, [
+      'raw_full',
+      'full_aci',
+      'claude_code',
+      'codex_cli',
+      'mini_swe_agent',
+    ]);
+
+    assert.match(workflowText, /claude_code/);
+    assert.match(workflowText, /codex_cli/);
+    assert.match(workflowText, /mini_swe_agent/);
+    assert.ok(shardBlock.includes('Install external benchmark agent CLIs (on-demand)'));
+    assert.ok(shardBlock.includes('@anthropic-ai/claude-code'));
+    assert.ok(shardBlock.includes('@openai/codex'));
+    assert.ok(shardBlock.includes('mini-swe-agent'));
+
     // Verify all non-shard flags parse cleanly against parseSweBenchCliArgs in benchmark-swebench.mjs
     const parsedShardNonShardFlags = parseSweBenchCliArgs([
       '--dataset',

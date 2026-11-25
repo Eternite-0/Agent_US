@@ -16,7 +16,7 @@ on:
         required: true
         default: deepseek-v4.1-flash
       arms:
-        description: 'Comma-separated arms, e.g. raw_full,full_aci or deterministic_progressive,aci_26'
+        description: 'Comma-separated arms, e.g. raw_full,full_aci or claude_code,codex_cli,mini_swe_agent or raw_full,full_aci,claude_code,codex_cli'
         type: string
         required: true
         default: raw_full,full_aci
@@ -186,6 +186,41 @@ jobs:
         run: |
           set -euo pipefail
           npm --prefix backend ci
+
+      - name: Install external benchmark agent CLIs (on-demand)
+        shell: bash
+        env:
+          INPUT_ARMS: ${{ inputs.arms }}
+        run: |
+          set -euo pipefail
+          NORM_ARMS=",$(echo "$INPUT_ARMS" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'),"
+          NPM_PKGS=()
+          case "$NORM_ARMS" in
+            *,claude_code,*)
+              NPM_PKGS+=(@anthropic-ai/claude-code)
+              ;;
+          esac
+          case "$NORM_ARMS" in
+            *,codex_cli,*)
+              NPM_PKGS+=(@openai/codex)
+              ;;
+          esac
+          if [ "${#NPM_PKGS[@]}" -gt 0 ]; then
+            echo "Installing npm external agent CLI(s): ${NPM_PKGS[*]}"
+            npm install -g "${NPM_PKGS[@]}"
+          fi
+          case "$NORM_ARMS" in
+            *,mini_swe_agent,*)
+              echo "Installing Python mini-swe-agent CLI"
+              python3 -m pip install --user --break-system-packages mini-swe-agent || python3 -m pip install --user mini-swe-agent
+              if [ -d "${HOME}/.local/bin" ]; then
+                echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+              fi
+              ;;
+          esac
+          if [ "${#NPM_PKGS[@]}" -eq 0 ] && [[ "$NORM_ARMS" != *",mini_swe_agent,"* ]]; then
+            echo "No external agent arms requested (${INPUT_ARMS}); skipping external CLI installation."
+          fi
 
       - name: Seed shard output directory
         id: seed-shard
