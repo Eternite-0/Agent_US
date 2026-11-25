@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { posix as posixPath, resolve } from 'node:path';
 import { verifyTurn } from '../verifier.js';
 import { resolveConfinedPath } from '../tools/sandbox.js';
 import { RUNTIME_EVENTS } from '../kernel/events.js';
@@ -41,7 +42,7 @@ function findUnresolvedVerification(receipts, events, workspaceRoot, callsById =
     if (!isVerificationCommand(args?.command)) continue;
     let cwd = args.cwd || '.';
     if (workspaceRoot) {
-      try { cwd = resolveConfinedPath(workspaceRoot, cwd).rel; } catch { /* keep raw cwd */ }
+      try { cwd = resolveWorkspacePath(workspaceRoot, cwd).rel; } catch { /* keep raw cwd */ }
     }
     const key = JSON.stringify([receipt.sessionId ?? null, cwd, args.command.trim()]);
     // Rejections are unsuccessful attempts; they must not turn a failing check green.
@@ -53,11 +54,65 @@ function findUnresolvedVerification(receipts, events, workspaceRoot, callsById =
   return failed ?? null;
 }
 
+const CONTAINER_MOUNT_PREFIXES = ['/testbed', '/work'];
+
+function stripContainerOrWorkspacePrefix(rawPath, workspaceRoot = null) {
+  const input = String(rawPath ?? '').trim();
+  if (!input) return '';
+  const posixInput = input.replace(/\\/g, '/');
+  const rootPosix = workspaceRoot
+    ? resolve(String(workspaceRoot)).replace(/\\/g, '/').replace(/\/+$/, '')
+    : '';
+
+  if (rootPosix) {
+    const isWinRoot = /^[A-Za-z]:/.test(rootPosix);
+    const cmpInput = isWinRoot ? posixInput.toLowerCase() : posixInput;
+    const cmpRoot = isWinRoot ? rootPosix.toLowerCase() : rootPosix;
+    if (cmpInput === cmpRoot) return '.';
+    if (cmpInput.startsWith(`${cmpRoot}/`)) {
+      return posixInput.slice(rootPosix.length + 1).replace(/^\.\//, '') || '.';
+    }
+  }
+
+  // Normalize POSIX dot segments before matching container prefixes so `/testbed/../outside` never strips `/testbed/`.
+  const normPosix = posixPath.normalize(posixInput);
+  if (!CONTAINER_MOUNT_PREFIXES.includes(rootPosix)) {
+    for (const prefix of CONTAINER_MOUNT_PREFIXES) {
+      if (normPosix === prefix) return '.';
+      if (normPosix.startsWith(`${prefix}/`)) {
+        return normPosix.slice(prefix.length + 1) || '.';
+      }
+    }
+  }
+
+  return input;
+}
+
+function resolveWorkspacePath(workspaceRoot, rawPath) {
+  const input = String(rawPath ?? '').trim();
+  if (!input) throw new Error('路径不能为空');
+  try {
+    return resolveConfinedPath(workspaceRoot, input);
+  } catch (err) {
+    const stripped = stripContainerOrWorkspacePrefix(input, workspaceRoot);
+    if (stripped !== input) {
+      return resolveConfinedPath(workspaceRoot, stripped);
+    }
+    throw err;
+  }
+}
+
+const SEGMENT_WRAPPER_PREFIX_RE =
+  /^\s*(?:sudo\s+|cmd(?:\.exe)?\s+\/[cq]\s+|powershell(?:\.exe)?\s+(?:-\w+\s+)*)?/i;
+
 const DELETE_SEGMENT_RE =
-  /^\s*(?:sudo\s+|cmd(?:\.exe)?\s+\/[cq]\s+|powershell(?:\.exe)?\s+(?:-\w+\s+)*)?(?:rm|rmdir|unlink|del|erase|remove-item|ri|git\s+rm)\b/i;
+  /^\s*(?:sudo\s+|cmd(?:\.exe)?\s+\/[cq]\s+|powershell(?:\.exe)?\s+(?:-\w+\s+)*)?(?:rm|rmdir|rd|unlink|del|erase|remove-item|ri|git\s+(?:rm|(?:-C\s+\S+\s+)?clean))\b/i;
 
 const PROGRAMMATIC_DELETE_RE =
-  /\b(?:fs\.(?:promises\.)?)?(?:unlink|rm)(?:Sync)?\s*\(|\bos\.(?:remove|unlink)\s*\(/;
+  /\b(?:fs\.(?:promises\.)?)?(?:unlink|rm)(?:Sync)?\s*\(|\bos\.(?:remove|unlink|rmdir)\s*\(|\b(?:pathlib\.)?Path\s*\(.*?\)\s*\.unlink\s*\(|\bshutil\.rmtree\s*\(/;
+
+const RECURSIVE_DELETE_RE =
+  /\bshutil\.rmtree\s*\(|\bfs\.(?:promises\.)?rm(?:Sync)?\s*\([^)]*recursive\s*:\s*true|^\s*(?:sudo\s+|cmd(?:\.exe)?\s+\/[cq]\s+)?rm\s+.*(?:^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$)|^\s*(?:powershell(?:\.exe)?\s+(?:-\w+\s+)*)?(?:remove-item|ri)\b.*-recurse\b|^\s*(?:cmd(?:\.exe)?\s+\/[cq]\s+)?(?:rmdir|rd)\b.*\s\/s\b/i;
 
 function safeToolArgs(rawArgs) {
   if (!rawArgs) return {};
@@ -73,39 +128,253 @@ function safeToolArgs(rawArgs) {
   return {};
 }
 
-function commandMentionsPath(text, rel) {
-  const posix = String(rel || '').replace(/\\/g, '/').replace(/^\.\//, '');
-  if (!posix) return false;
-  const win = posix.replace(/\//g, '\\');
-  const escaped = [...new Set([posix, win])].map((p) =>
-    p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-  );
+function tokenizeShellArgs(text) {
+  const tokens = [];
+  let cur = '';
+  let quote = null;
+  let hasToken = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\' && quote === '"' && (text[i + 1] === '"' || text[i + 1] === '\\')) {
+        cur += text[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === '\'' || ch === '"') {
+      quote = ch;
+      hasToken = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (hasToken) {
+        tokens.push(cur);
+        cur = '';
+        hasToken = false;
+      }
+      continue;
+    }
+    cur += ch;
+    hasToken = true;
+  }
+  if (hasToken) tokens.push(cur);
+  return tokens;
+}
+
+function parseGitCleanSegment(trimmed) {
+  const unwrapped = trimmed.replace(SEGMENT_WRAPPER_PREFIX_RE, '');
+  const tokens = tokenizeShellArgs(unwrapped);
+  if (!tokens.length) return { isGitClean: false };
+  const bin = tokens[0].split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase();
+  if (bin !== 'git') return { isGitClean: false };
+
+  let i = 1;
+  let chdir = null;
+  while (i < tokens.length && tokens[i].startsWith('-')) {
+    const tok = tokens[i];
+    if (tok === '-C' && i + 1 < tokens.length) {
+      chdir = tokens[i + 1];
+      i += 2;
+      continue;
+    }
+    if (tok.startsWith('-C') && tok.length > 2) {
+      chdir = tok.slice(2);
+      i += 1;
+      continue;
+    }
+    if (
+      ['-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'].includes(
+        tok,
+      ) &&
+      i + 1 < tokens.length
+    ) {
+      i += 2;
+      continue;
+    }
+    i += 1;
+  }
+
+  if (tokens[i]?.toLowerCase() !== 'clean') return { isGitClean: false };
+
+  let hasForce = false;
+  let hasDryRun = false;
+  let afterDoubleDash = false;
+  const pathspecs = [];
+  for (let j = i + 1; j < tokens.length; j += 1) {
+    const tok = tokens[j];
+    if (!afterDoubleDash) {
+      if (tok === '--') {
+        afterDoubleDash = true;
+        continue;
+      }
+      if (tok === '--force') {
+        hasForce = true;
+        continue;
+      }
+      if (tok === '--dry-run') {
+        hasDryRun = true;
+        continue;
+      }
+      if ((tok === '-e' || tok === '--exclude') && j + 1 < tokens.length) {
+        j += 1;
+        continue;
+      }
+      if (tok.startsWith('--exclude=')) continue;
+      if (tok.startsWith('--')) continue;
+      if (tok.startsWith('-') && tok.length > 1) {
+        const flags = tok.slice(1);
+        if (flags.includes('f')) hasForce = true;
+        if (flags.includes('n')) hasDryRun = true;
+        continue;
+      }
+    }
+    pathspecs.push(tok);
+  }
+
+  return { isGitClean: true, hasForce, hasDryRun, chdir, pathspecs };
+}
+
+function matchesGitCleanSegment(parsed, rel, workspaceRoot = null) {
+  if (!parsed.hasForce || parsed.hasDryRun) return false;
+  const relPosix = String(rel || '').replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!relPosix) return false;
+
+  let baseDir = '.';
+  if (parsed.chdir) {
+    const strippedDir = stripContainerOrWorkspacePrefix(parsed.chdir, workspaceRoot)
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/\/+$/, '');
+    if (
+      !strippedDir ||
+      strippedDir === '..' ||
+      strippedDir.startsWith('../') ||
+      strippedDir.startsWith('/') ||
+      /^[A-Za-z]:/.test(strippedDir)
+    ) {
+      return false;
+    }
+    baseDir = strippedDir;
+  }
+
+  if (parsed.pathspecs.length === 0) {
+    return baseDir === '.' || relPosix === baseDir || relPosix.startsWith(`${baseDir}/`);
+  }
+
+  for (const rawSpec of parsed.pathspecs) {
+    const rawTrimmed = String(rawSpec ?? '').trim();
+    if (!rawTrimmed) continue;
+    const stripped = stripContainerOrWorkspacePrefix(rawTrimmed, workspaceRoot);
+    let spec = stripped.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    const hadContainerOrWorkspacePrefix = stripped !== rawTrimmed;
+    if (
+      baseDir !== '.' &&
+      !hadContainerOrWorkspacePrefix &&
+      !rawTrimmed.startsWith('/') &&
+      !/^[A-Za-z]:/.test(rawTrimmed)
+    ) {
+      spec = spec === '.' || spec === '' ? baseDir : `${baseDir}/${spec}`;
+    }
+    if (spec === '' || spec === '.') return true;
+    if (
+      spec === '..' ||
+      spec.startsWith('../') ||
+      spec.startsWith('/') ||
+      /^[A-Za-z]:/.test(spec)
+    ) {
+      continue;
+    }
+    if (relPosix === spec || relPosix.startsWith(`${spec}/`)) return true;
+  }
+
+  return false;
+}
+
+function buildTargetPathVariants(targetPosix, workspaceRoot = null) {
+  const win = targetPosix.replace(/\//g, '\\');
+  const variants = [
+    targetPosix,
+    win,
+    `/testbed/${targetPosix}`,
+    `/work/${targetPosix}`,
+  ];
+  if (workspaceRoot) {
+    const rawRootPosix = String(workspaceRoot).replace(/\\/g, '/').replace(/\/+$/, '');
+    const resolvedRootPosix = resolve(String(workspaceRoot)).replace(/\\/g, '/').replace(/\/+$/, '');
+    const resolvedRootWin = resolve(String(workspaceRoot)).replace(/\//g, '\\').replace(/\\+$/, '');
+    if (rawRootPosix) variants.push(`${rawRootPosix}/${targetPosix}`);
+    if (resolvedRootPosix) variants.push(`${resolvedRootPosix}/${targetPosix}`);
+    if (resolvedRootWin) variants.push(`${resolvedRootWin}\\${win}`);
+  }
+  return [...new Set(variants)];
+}
+
+function commandMentionsExactTarget(text, targetPosix, { workspaceRoot = null } = {}) {
+  const variants = buildTargetPathVariants(targetPosix, workspaceRoot);
   const prefix = '(?:^|[\\s"\'`=(,;]|\\.[\\\\/])';
   const suffix = '(?=$|[\\s"\'`),;])';
-  const exactRe = new RegExp(`${prefix}(?:${escaped.join('|')})${suffix}`);
-  if (exactRe.test(text)) return true;
+  for (const candidate of variants) {
+    const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const flags = /^[A-Za-z]:/.test(candidate) ? 'i' : '';
+    const re = new RegExp(`${prefix}${escaped}${suffix}`, flags);
+    if (re.test(text)) return true;
+  }
+  return false;
+}
+
+function commandMentionsPath(
+  text,
+  rel,
+  { workspaceRoot = null, allowAncestorDir = false } = {},
+) {
+  const posix = String(rel || '').replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!posix) return false;
+  if (commandMentionsExactTarget(text, posix, { workspaceRoot })) return true;
+
+  const prefix = '(?:^|[\\s"\'`=(,;]|\\.[\\\\/])';
+  const suffix = '(?=$|[\\s"\'`),;])';
   const slashIdx = posix.lastIndexOf('/');
   if (slashIdx > 0) {
     const dir = posix.slice(0, slashIdx);
     const base = posix.slice(slashIdx + 1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const dirMentioned = text.includes(dir) || text.includes(dir.replace(/\//g, '\\'));
     const baseRe = new RegExp(`${prefix}${base}${suffix}`);
-    return dirMentioned && baseRe.test(text);
+    if (dirMentioned && baseRe.test(text)) return true;
+
+    if (allowAncestorDir) {
+      const parts = posix.split('/');
+      for (let len = parts.length - 1; len >= 1; len -= 1) {
+        const ancestor = parts.slice(0, len).join('/');
+        if (commandMentionsExactTarget(text, ancestor, { workspaceRoot })) return true;
+      }
+    }
   }
   return false;
 }
 
-function isExplicitFileDeleteCommand(command, rel) {
+export function isExplicitFileDeleteCommand(command, rel, { workspaceRoot = null } = {}) {
   if (typeof command !== 'string' || !command.trim()) return false;
   const segments = command.split(/(?:&&|\|\||[;\n|{}])+/);
   for (const seg of segments) {
     const trimmed = seg.trim();
     if (!trimmed) continue;
-    if (
-      (DELETE_SEGMENT_RE.test(trimmed) || PROGRAMMATIC_DELETE_RE.test(trimmed)) &&
-      commandMentionsPath(trimmed, rel)
-    ) {
-      return true;
+    const gitClean = parseGitCleanSegment(trimmed);
+    if (gitClean.isGitClean) {
+      if (matchesGitCleanSegment(gitClean, rel, workspaceRoot)) return true;
+      continue;
+    }
+    if (DELETE_SEGMENT_RE.test(trimmed) || PROGRAMMATIC_DELETE_RE.test(trimmed)) {
+      const allowAncestorDir = RECURSIVE_DELETE_RE.test(trimmed);
+      if (commandMentionsPath(trimmed, rel, { workspaceRoot, allowAncestorDir })) {
+        return true;
+      }
     }
   }
   return false;
@@ -573,7 +842,7 @@ export class EvidenceVerifier {
           const args = safeToolArgs(ev.data?.arguments);
           if (!args.path) continue;
           try {
-            const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+            const { full, rel } = resolveWorkspacePath(workspaceRoot, args.path);
             resolvedPaths.set(rel, full);
             latestWriteIndex.set(rel, Math.max(latestWriteIndex.get(rel) ?? -1, idx));
           } catch {
@@ -588,7 +857,7 @@ export class EvidenceVerifier {
         ...(Array.isArray(contract?.requiredChangedFiles) ? contract.requiredChangedFiles : []),
       ]) {
         try {
-          const { rel } = resolveConfinedPath(workspaceRoot, reqPath);
+          const { rel } = resolveWorkspacePath(workspaceRoot, reqPath);
           requiredPaths.add(rel);
         } catch {
           // ignore unresolvable requirement path here
@@ -605,7 +874,7 @@ export class EvidenceVerifier {
             if (delEv.callIndex <= lastWriteIdx) continue;
             if (delEv.name === 'delete_file' && delEv.args?.path) {
               try {
-                if (resolveConfinedPath(workspaceRoot, delEv.args.path).rel === rel) {
+                if (resolveWorkspacePath(workspaceRoot, delEv.args.path).rel === rel) {
                   explicitlyDeleted = true;
                   break;
                 }
@@ -614,7 +883,7 @@ export class EvidenceVerifier {
               }
             } else if (
               delEv.name === 'bash' &&
-              isExplicitFileDeleteCommand(delEv.args?.command, rel)
+              isExplicitFileDeleteCommand(delEv.args?.command, rel, { workspaceRoot })
             ) {
               explicitlyDeleted = true;
               break;
