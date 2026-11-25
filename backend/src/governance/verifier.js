@@ -20,18 +20,500 @@ const PASS_CLAIM_RE =
 
 const POST_EDIT_FILE_MUTATION_TOOLS = new Set(['write_file', 'edit_file', 'apply_patch']);
 
-function findUnresolvedVerification(receipts, events, workspaceRoot, callsById = new Map()) {
+const GENERIC_TARGET_DIRS = new Set([
+  '.',
+  'test',
+  'tests',
+  '__tests__',
+  'spec',
+  'specs',
+  'src',
+  'lib',
+  'pkg',
+  'packages',
+  'app',
+  'apps',
+]);
+
+const GENERIC_TARGET_STEMS = new Set([
+  'test',
+  'tests',
+  'spec',
+  'specs',
+  'index',
+  'main',
+  '__init__',
+  'conftest',
+  'setup',
+  'mod',
+  'lib',
+]);
+
+const GENERIC_APP_LABELS = new Set([
+  '.',
+  'test',
+  'tests',
+  '__tests__',
+  'spec',
+  'specs',
+  'src',
+  'lib',
+  'pkg',
+  'packages',
+  'app',
+  'apps',
+  'django',
+  'contrib',
+]);
+
+const VALUE_TAKING_TEST_FLAGS = new Set([
+  '-k',
+  '-m',
+  '-c',
+  '-o',
+  '-n',
+  '-w',
+  '-p',
+  '-t',
+  '-s',
+  '--tb',
+  '--maxfail',
+  '--rootdir',
+  '--confcutdir',
+  '--junitxml',
+  '--cov',
+  '--cov-report',
+  '--durations',
+  '--ignore',
+  '--deselect',
+  '--test-name-pattern',
+  '--test-reporter',
+  '--test-reporter-destination',
+  '--test-shard',
+  '--test-concurrency',
+  '--test-timeout',
+  '--testnamepattern',
+  '--testpathpattern',
+  '--config',
+  '--reporter',
+  '--env',
+  '--package',
+  '--test',
+  '--bin',
+  '--example',
+  '--features',
+  '--manifest-path',
+  '--pattern',
+  '--start-directory',
+  '--top-level-directory',
+  '--project',
+  '--outdir',
+  '--rootdir',
+  '--target',
+  '--module',
+  '--filter',
+  '-run',
+]);
+
+const FILTER_TEST_FLAGS = new Set([
+  '-k',
+  '-t',
+  '--test-name-pattern',
+  '--testnamepattern',
+  '--testpathpattern',
+  '--filter',
+  '-run',
+]);
+
+const TEST_SUBJECT_EXT_RE = /\.(?:[cm]?[jt]sx?|py|go|rs)$/i;
+
+function stripTestAffixes(stem) {
+  let s = String(stem ?? '');
+  if (!s) return '';
+  s = s.replace(/\.(?:test|spec)$/i, '');
+  s = s.replace(/^test_+/i, '');
+  s = s.replace(/_+test$/i, '');
+  return s;
+}
+
+function addTargetTokens(targetStr, { targets, dirs, stems, appLabels }) {
+  const clean = String(targetStr ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!clean || clean === '.' || clean === './...') return;
+  targets.add(clean);
+
+  const isFileLike = TEST_SUBJECT_EXT_RE.test(clean);
+  const parts = clean.split('/').filter(Boolean);
+  if (parts.length === 0) return;
+
+  if (isFileLike) {
+    if (parts.length > 1) {
+      const parentDir = parts.slice(0, -1).join('/');
+      if (parentDir && !GENERIC_TARGET_DIRS.has(parentDir)) {
+        dirs.add(parentDir);
+      }
+      // Also record nested sub-dirs under tests/ (e.g. tests/queries/sub -> tests/queries)
+      if (parts.length >= 3 && ['test', 'tests', '__tests__', 'spec', 'specs'].includes(parts[0])) {
+        dirs.add(`${parts[0]}/${parts[1]}`);
+      }
+    }
+    const base = parts[parts.length - 1];
+    const noExt = base.replace(TEST_SUBJECT_EXT_RE, '');
+    const subject = stripTestAffixes(noExt);
+    if (noExt && !GENERIC_TARGET_STEMS.has(noExt.toLowerCase())) stems.add(noExt);
+    if (subject && !GENERIC_TARGET_STEMS.has(subject.toLowerCase())) stems.add(subject);
+  } else {
+    if (!GENERIC_TARGET_DIRS.has(clean)) {
+      dirs.add(clean);
+    }
+    const last = parts[parts.length - 1];
+    const subject = stripTestAffixes(last);
+    if (last && !GENERIC_TARGET_STEMS.has(last.toLowerCase())) stems.add(last);
+    if (subject && !GENERIC_TARGET_STEMS.has(subject.toLowerCase())) stems.add(subject);
+  }
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const seg = parts[i];
+    const prev = i > 0 ? parts[i - 1] : null;
+    if (i === parts.length - 1 && isFileLike) continue;
+    if (['test', 'tests', '__tests__', 'spec', 'specs'].includes(seg)) {
+      if (prev && !GENERIC_APP_LABELS.has(prev.toLowerCase())) appLabels.add(prev);
+      continue;
+    }
+    if (!GENERIC_APP_LABELS.has(seg.toLowerCase())) {
+      appLabels.add(seg);
+    }
+  }
+}
+
+export function extractVerificationTargets(command, cwd = '.', workspaceRoot = null) {
+  const empty = {
+    runner: null,
+    isBroadSuite: false,
+    targets: [],
+    dirs: [],
+    stems: [],
+    appLabels: [],
+    filters: [],
+  };
+  if (typeof command !== 'string' || !command.trim()) return empty;
+
+  const rawTokens = tokenizeShellArgs(command);
+  let idx = 0;
+  while (idx < rawTokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rawTokens[idx])) {
+    idx += 1;
+  }
+  const tokens = rawTokens.slice(idx);
+  if (!tokens.length) return empty;
+
+  const prog = tokens[0].split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase() ?? '';
+  let runner = prog;
+  let argStart = 1;
+
+  if (['npm', 'pnpm', 'yarn', 'bun'].includes(prog)) {
+    const sub = tokens[1]?.toLowerCase() ?? '';
+    argStart = sub === 'run' ? 3 : 2;
+    runner = prog;
+  } else if (prog === 'npx') {
+    const sub = tokens[1]?.toLowerCase() ?? '';
+    runner = sub || 'npx';
+    argStart = 2;
+  } else if (prog === 'node') {
+    const sub = tokens[1]?.toLowerCase() ?? '';
+    runner = sub === '--check' ? 'node_check' : 'node_test';
+    argStart = 2;
+  } else if (prog === 'python' || prog === 'python3') {
+    if (tokens[1] === '-m' && tokens[2]) {
+      runner = tokens[2].toLowerCase();
+      argStart = 3;
+    }
+  } else if (prog === 'cargo' || prog === 'go') {
+    runner = prog;
+    argStart = 2;
+  }
+
+  let cwdPrefix = stripContainerOrWorkspacePrefix(cwd || '.', workspaceRoot)
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '');
+  if (
+    !cwdPrefix ||
+    cwdPrefix === '.' ||
+    cwdPrefix === '..' ||
+    cwdPrefix.startsWith('../') ||
+    cwdPrefix.startsWith('/') ||
+    /^[A-Za-z]:/.test(cwdPrefix)
+  ) {
+    cwdPrefix = '';
+  }
+
+  const targets = new Set();
+  const dirs = new Set();
+  const stems = new Set();
+  const appLabels = new Set();
+  const filters = new Set();
+  let sawDoubleDash = false;
+  let sawRootMarker = false;
+
+  const rest = tokens.slice(argStart);
+  for (let i = 0; i < rest.length; i += 1) {
+    const tok = rest[i];
+    if (!sawDoubleDash) {
+      if (tok === '--') {
+        sawDoubleDash = true;
+        continue;
+      }
+      if (i === 0 && (runner === 'vitest' || runner === 'jest') && tok === 'run') {
+        continue;
+      }
+      if (tok.startsWith('-')) {
+        const eqIdx = tok.indexOf('=');
+        const flagName = (eqIdx >= 0 ? tok.slice(0, eqIdx) : tok).toLowerCase();
+        const flagVal = eqIdx >= 0 ? tok.slice(eqIdx + 1) : null;
+
+        if (flagVal !== null) {
+          if (FILTER_TEST_FLAGS.has(flagName)) filters.add(flagVal);
+          if (['--test', '-p', '--package', '--testpathpattern'].includes(flagName)) {
+            addTargetTokens(flagVal, { targets, dirs, stems, appLabels });
+          }
+          continue;
+        }
+        if (VALUE_TAKING_TEST_FLAGS.has(flagName)) {
+          const nextVal = i + 1 < rest.length ? rest[i + 1] : null;
+          if (nextVal !== null) {
+            if (FILTER_TEST_FLAGS.has(flagName)) filters.add(nextVal);
+            if (['--test', '-p', '--package', '--testpathpattern'].includes(flagName)) {
+              addTargetTokens(nextVal, { targets, dirs, stems, appLabels });
+            }
+            i += 1;
+          }
+          continue;
+        }
+        continue;
+      }
+    }
+
+    const beforeNodeId = tok.split('::')[0].trim();
+    if (!beforeNodeId) continue;
+    if (beforeNodeId === '.' || beforeNodeId === './' || beforeNodeId === './...') {
+      if (cwdPrefix) {
+        addTargetTokens(cwdPrefix, { targets, dirs, stems, appLabels });
+      } else {
+        sawRootMarker = true;
+      }
+      continue;
+    }
+
+    // Dotted python module / unittest target (e.g. auth_tests.tests.LoginTest)
+    const looksLikeDottedPython =
+      !beforeNodeId.includes('/') &&
+      !beforeNodeId.includes('\\') &&
+      beforeNodeId.includes('.') &&
+      !TEST_SUBJECT_EXT_RE.test(beforeNodeId) &&
+      !/^\d+(?:\.\d+)*$/.test(beforeNodeId) &&
+      !beforeNodeId.startsWith('.');
+
+    if (looksLikeDottedPython) {
+      const dottedParts = beforeNodeId.split('.').filter(Boolean);
+      const asPath = dottedParts.join('/');
+      const joined = cwdPrefix ? posixPath.normalize(`${cwdPrefix}/${asPath}`) : asPath;
+      addTargetTokens(joined, { targets, dirs, stems, appLabels });
+      if (dottedParts[0] && !GENERIC_APP_LABELS.has(dottedParts[0].toLowerCase())) {
+        appLabels.add(dottedParts[0]);
+      }
+      continue;
+    }
+
+    const stripped = stripContainerOrWorkspacePrefix(beforeNodeId, workspaceRoot);
+    let norm = stripped.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    const hadPrefix = stripped !== beforeNodeId;
+    if (
+      cwdPrefix &&
+      !hadPrefix &&
+      !beforeNodeId.startsWith('/') &&
+      !/^[A-Za-z]:/.test(beforeNodeId)
+    ) {
+      norm = posixPath.normalize(`${cwdPrefix}/${norm}`);
+    } else {
+      norm = posixPath.normalize(norm);
+    }
+    if (norm === '.' || norm === './...') {
+      sawRootMarker = true;
+      continue;
+    }
+    if (norm === '..' || norm.startsWith('../')) continue;
+    norm = norm.replace(/^\.\//, '').replace(/\/...$/, '');
+    addTargetTokens(norm, { targets, dirs, stems, appLabels });
+  }
+
+  const isBroadSuite =
+    (targets.size === 0 && filters.size === 0) ||
+    (sawRootMarker && targets.size === 0 && filters.size === 0);
+
+  return {
+    runner,
+    isBroadSuite,
+    targets: [...targets],
+    dirs: [...dirs],
+    stems: [...stems],
+    appLabels: [...appLabels],
+    filters: [...filters],
+  };
+}
+
+function extractMutatedTargetSignals(allMutatedFiles, workspaceRoot = null) {
+  const stems = new Set();
+  const packages = new Set();
+  for (const rawFile of allMutatedFiles ?? []) {
+    const stripped = stripContainerOrWorkspacePrefix(rawFile, workspaceRoot)
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '');
+    if (!stripped) continue;
+    const parts = stripped.split('/').filter(Boolean);
+    const base = parts[parts.length - 1] ?? '';
+    const noExt = base.replace(TEST_SUBJECT_EXT_RE, '');
+    const subject = stripTestAffixes(noExt);
+    if (noExt && !GENERIC_TARGET_STEMS.has(noExt.toLowerCase())) stems.add(noExt);
+    if (subject && !GENERIC_TARGET_STEMS.has(subject.toLowerCase())) stems.add(subject);
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const seg = parts[i];
+      if (seg && !GENERIC_APP_LABELS.has(seg.toLowerCase())) {
+        packages.add(seg);
+      }
+    }
+  }
+  return { stems, packages };
+}
+
+const CLI_OR_PATH_ERROR_RE =
+  /command not found|no such file or directory|unrecognized arguments|invalid choice|error:\s*argument|超出当前工作区边界|chdir to cwd|Blocked unauthorized/i;
+
+const OFFLINE_NETWORK_ERROR_RE =
+  /HTTPSConnectionPool|HTTPConnectionPool|NewConnectionError|MaxRetryError|Temporary failure in name resolution|Network is unreachable|Name or service not known|URLError:\s*<urlopen error|socket\.gaierror/i;
+
+const SYNTAX_OR_LINT_ONLY_RUNNERS = new Set(['node_check', 'tsc', 'eslint']);
+const TEST_EXECUTION_RUNNERS = new Set([
+  'pytest',
+  'unittest',
+  'node_test',
+  'vitest',
+  'jest',
+  'cargo',
+  'go',
+]);
+
+function setsOverlap(a, b) {
+  if (!a?.length || !b?.length) return false;
+  const bSet = new Set(b);
+  return a.some((item) => bSet.has(item));
+}
+
+export function isFailedVerificationSuperseded(
+  failRun,
+  passRun,
+  { lastCodeMutationIndex = -1, allMutatedFiles = [], workspaceRoot = null } = {},
+) {
+  if (!failRun || !passRun) return false;
+  if (typeof failRun.index === 'number' && typeof passRun.index === 'number') {
+    if (failRun.index >= passRun.index) return false;
+  } else {
+    return false;
+  }
+  if (lastCodeMutationIndex >= 0 && passRun.index <= lastCodeMutationIndex) {
+    return false;
+  }
+
+  // a) Pre-edit reproduction superseded by post-edit passing verification
+  if (
+    lastCodeMutationIndex >= 0 &&
+    failRun.index < lastCodeMutationIndex &&
+    passRun.index > lastCodeMutationIndex
+  ) {
+    return true;
+  }
+
+  // b) CLI / path / syntax invocation error
+  const failOut = String(failRun.output ?? '');
+  if (
+    (typeof failRun.exitCode === 'number' && [2, 4, 126, 127].includes(failRun.exitCode)) ||
+    CLI_OR_PATH_ERROR_RE.test(failOut)
+  ) {
+    return true;
+  }
+
+  // c) Offline container network failure
+  if (OFFLINE_NETWORK_ERROR_RE.test(failOut)) {
+    return true;
+  }
+
+  // d) Target overlap (broad suite, shared path/stem/dir/appLabel, or mutated package/stem)
+  const failTargets = extractVerificationTargets(
+    failRun.command,
+    failRun.cwd ?? '.',
+    workspaceRoot,
+  );
+  const passTargets = extractVerificationTargets(
+    passRun.command,
+    passRun.cwd ?? '.',
+    workspaceRoot,
+  );
+
+  // A syntax-only/lint-only command (e.g. `node --check`) must not supersede a failing test suite.
+  if (
+    SYNTAX_OR_LINT_ONLY_RUNNERS.has(passTargets.runner) &&
+    TEST_EXECUTION_RUNNERS.has(failTargets.runner)
+  ) {
+    return false;
+  }
+
+  if (passTargets.isBroadSuite) return true;
+  if (setsOverlap(passTargets.targets, failTargets.targets)) return true;
+  for (const pTarget of passTargets.targets) {
+    for (const fTarget of failTargets.targets) {
+      if (fTarget.startsWith(`${pTarget}/`)) return true;
+    }
+  }
+  if (setsOverlap(passTargets.dirs, failTargets.dirs)) return true;
+  if (setsOverlap(passTargets.stems, failTargets.stems)) return true;
+  if (setsOverlap(passTargets.appLabels, failTargets.appLabels)) return true;
+
+  const mutatedSignals = extractMutatedTargetSignals(allMutatedFiles, workspaceRoot);
+  if (
+    passTargets.stems.some((s) => mutatedSignals.stems.has(s)) ||
+    passTargets.appLabels.some((a) => mutatedSignals.packages.has(a))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function findUnresolvedVerification(
+  receipts,
+  events,
+  workspaceRoot,
+  callsById = new Map(),
+  supersession = null,
+) {
   const resultsByKey = new Map();
+  const outputByKey = new Map();
   for (const ev of events) {
-    const { receipt, effectiveArgs, callId } = ev.data ?? {};
-    if (ev.type === 'tool/result' && effectiveArgs) {
-      if (receipt?.id) resultsByKey.set(`id:${receipt.id}`, effectiveArgs);
-      const cid = receipt?.callId ?? callId;
-      if (cid) resultsByKey.set(`call:${cid}`, effectiveArgs);
+    const { receipt, effectiveArgs, callId, content } = ev.data ?? {};
+    if (ev.type === 'tool/result') {
+      if (effectiveArgs) {
+        if (receipt?.id) resultsByKey.set(`id:${receipt.id}`, effectiveArgs);
+        const cid = receipt?.callId ?? callId;
+        if (cid) resultsByKey.set(`call:${cid}`, effectiveArgs);
+      }
+      if (typeof content === 'string' && content) {
+        if (receipt?.id) outputByKey.set(`id:${receipt.id}`, content);
+        const cid = receipt?.callId ?? callId;
+        if (cid) outputByKey.set(`call:${cid}`, content);
+      }
     }
   }
   const latestByCommand = new Map();
-  for (const receipt of receipts) {
+  for (let idx = 0; idx < receipts.length; idx += 1) {
+    const receipt = receipts[idx];
     if (receipt.toolName !== 'bash') continue;
     const args =
       (receipt.id ? resultsByKey.get(`id:${receipt.id}`) : null) ??
@@ -44,10 +526,50 @@ function findUnresolvedVerification(receipts, events, workspaceRoot, callsById =
     if (workspaceRoot) {
       try { cwd = resolveWorkspacePath(workspaceRoot, cwd).rel; } catch { /* keep raw cwd */ }
     }
-    const key = JSON.stringify([receipt.sessionId ?? null, cwd, args.command.trim()]);
+    const command = args.command.trim();
+    const output =
+      receipt.output ??
+      (receipt.id ? outputByKey.get(`id:${receipt.id}`) : null) ??
+      (receipt.callId ? outputByKey.get(`call:${receipt.callId}`) : null) ??
+      '';
+    const key = JSON.stringify([receipt.sessionId ?? null, cwd, command]);
     // Rejections are unsuccessful attempts; they must not turn a failing check green.
-    latestByCommand.set(key, { receipt, command: args.command.trim(), cwd });
+    latestByCommand.set(key, {
+      receipt,
+      command,
+      cwd,
+      index: typeof receipt.orderedIndex === 'number' ? receipt.orderedIndex : idx,
+      exitCode: receipt.exitCode,
+      status: receipt.status,
+      output,
+      callId: receipt.callId ?? null,
+    });
   }
+
+  const passRun = supersession?.lastPassingVerification ?? null;
+  const canSupersede = Boolean(
+    passRun &&
+      !supersession?.staleAfterEdit &&
+      ((supersession?.lastCodeMutationIndex ?? -1) < 0 ||
+        passRun.index > supersession.lastCodeMutationIndex),
+  );
+  if (canSupersede) {
+    for (const [key, entry] of [...latestByCommand.entries()]) {
+      const isFailed = entry.receipt.status !== 'finished' || entry.receipt.exitCode !== 0;
+      if (!isFailed) continue;
+      if (
+        entry.index < passRun.index &&
+        isFailedVerificationSuperseded(entry, passRun, {
+          lastCodeMutationIndex: supersession.lastCodeMutationIndex ?? -1,
+          allMutatedFiles: supersession.allMutatedFiles ?? [],
+          workspaceRoot,
+        })
+      ) {
+        latestByCommand.delete(key);
+      }
+    }
+  }
+
   const failed = [...latestByCommand.values()].findLast(
     ({ receipt }) => receipt.status !== 'finished' || receipt.exitCode !== 0,
   );
@@ -168,13 +690,154 @@ function tokenizeShellArgs(text) {
   return tokens;
 }
 
-function parseGitCleanSegment(trimmed) {
-  const unwrapped = trimmed.replace(SEGMENT_WRAPPER_PREFIX_RE, '');
-  const tokens = tokenizeShellArgs(unwrapped);
-  if (!tokens.length) return { isGitClean: false };
-  const bin = tokens[0].split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase();
-  if (bin !== 'git') return { isGitClean: false };
+function splitShellSegments(command) {
+  const segments = [];
+  let cur = '';
+  let quote = null;
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < command.length) {
+        cur += ch + command[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      cur += ch;
+      continue;
+    }
+    if (ch === '\'' || ch === '"') {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === '&' && command[i + 1] === '&') {
+      segments.push(cur);
+      cur = '';
+      i += 1;
+      continue;
+    }
+    if (ch === '|' && command[i + 1] === '|') {
+      segments.push(cur);
+      cur = '';
+      i += 1;
+      continue;
+    }
+    if (ch === ';' || ch === '\n' || ch === '\r' || ch === '|' || ch === '{' || ch === '}') {
+      segments.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) segments.push(cur);
+  return segments;
+}
 
+function normalizeWorkspaceRelativeCandidate(
+  rawPath,
+  { workspaceRoot = null, activeCwd = '.', activeCwdInvalid = false } = {},
+) {
+  const rawTrimmed = String(rawPath ?? '').trim();
+  if (!rawTrimmed) return null;
+  const stripped = stripContainerOrWorkspacePrefix(rawTrimmed, workspaceRoot);
+  const hadPrefix = stripped !== rawTrimmed;
+  const posix = stripped.replace(/\\/g, '/');
+
+  if (!hadPrefix) {
+    if (posix.startsWith('/') || /^[A-Za-z]:/.test(posix)) return null;
+    if (activeCwdInvalid) return null;
+    const base = activeCwd && activeCwd !== '.' ? activeCwd : '';
+    const joined = base ? `${base}/${posix}` : posix;
+    const norm = posixPath.normalize(joined).replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!norm) return '.';
+    if (norm === '..' || norm.startsWith('../') || norm.startsWith('/')) return null;
+    if (norm.split('/').includes('..')) return null;
+    return norm;
+  }
+
+  const norm = posixPath.normalize(posix).replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!norm) return '.';
+  if (norm === '..' || norm.startsWith('../') || norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) {
+    return null;
+  }
+  if (norm.split('/').includes('..')) return null;
+  return norm;
+}
+
+function globPatternToRegExp(globPosix) {
+  let reStr = '^';
+  for (let i = 0; i < globPosix.length; i += 1) {
+    const ch = globPosix[i];
+    if (ch === '*') {
+      if (globPosix[i + 1] === '*') {
+        reStr += '.*';
+        i += 1;
+      } else {
+        reStr += '[^/]*';
+      }
+      continue;
+    }
+    if (ch === '?') {
+      reStr += '[^/]';
+      continue;
+    }
+    if (/[.+^${}()|[\]\\]/.test(ch)) {
+      reStr += `\\${ch}`;
+    } else {
+      reStr += ch;
+    }
+  }
+  reStr += '$';
+  return new RegExp(reStr);
+}
+
+function tokenizeUnwrappedSegment(trimmed) {
+  let unwrapped = trimmed.replace(SEGMENT_WRAPPER_PREFIX_RE, '').trim();
+  if (
+    unwrapped.length >= 2 &&
+    ((unwrapped.startsWith('"') && unwrapped.endsWith('"')) ||
+      (unwrapped.startsWith("'") && unwrapped.endsWith("'")))
+  ) {
+    const inner = unwrapped.slice(1, -1).trim();
+    if (inner) unwrapped = inner;
+  }
+  return tokenizeShellArgs(unwrapped);
+}
+
+function parseCdSegment(trimmed, { workspaceRoot = null, activeCwd = '.', activeCwdInvalid = false } = {}) {
+  const tokens = tokenizeUnwrappedSegment(trimmed);
+  if (!tokens.length) return null;
+  const bin = tokens[0].split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase();
+  if (bin !== 'cd') return null;
+
+  let dirArg = null;
+  for (let i = 1; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    if (tok === '--') {
+      dirArg = tokens[i + 1] ?? null;
+      break;
+    }
+    if (tok.startsWith('-') && tok.length > 1) continue;
+    dirArg = tok;
+    break;
+  }
+
+  if (!dirArg) {
+    return { activeCwd: '.', activeCwdInvalid: true };
+  }
+  const resolved = normalizeWorkspaceRelativeCandidate(dirArg, {
+    workspaceRoot,
+    activeCwd,
+    activeCwdInvalid,
+  });
+  if (!resolved) {
+    return { activeCwd: '.', activeCwdInvalid: true };
+  }
+  return { activeCwd: resolved, activeCwdInvalid: false };
+}
+
+function consumeGitGlobalFlags(tokens) {
   let i = 1;
   let chdir = null;
   while (i < tokens.length && tokens[i].startsWith('-')) {
@@ -200,7 +863,16 @@ function parseGitCleanSegment(trimmed) {
     }
     i += 1;
   }
+  return { subIdx: i, chdir };
+}
 
+function parseGitCleanSegment(trimmed) {
+  const tokens = tokenizeUnwrappedSegment(trimmed);
+  if (!tokens.length) return { isGitClean: false };
+  const bin = tokens[0].split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase();
+  if (bin !== 'git') return { isGitClean: false };
+
+  const { subIdx: i, chdir } = consumeGitGlobalFlags(tokens);
   if (tokens[i]?.toLowerCase() !== 'clean') return { isGitClean: false };
 
   let hasForce = false;
@@ -241,59 +913,356 @@ function parseGitCleanSegment(trimmed) {
   return { isGitClean: true, hasForce, hasDryRun, chdir, pathspecs };
 }
 
-function matchesGitCleanSegment(parsed, rel, workspaceRoot = null) {
+function matchesGitCleanSegment(
+  parsed,
+  rel,
+  workspaceRoot = null,
+  { activeCwd = '.', activeCwdInvalid = false } = {},
+) {
   if (!parsed.hasForce || parsed.hasDryRun) return false;
   const relPosix = String(rel || '').replace(/\\/g, '/').replace(/^\.\//, '');
   if (!relPosix) return false;
 
-  let baseDir = '.';
+  let baseDir = activeCwd || '.';
+  let baseInvalid = activeCwdInvalid;
   if (parsed.chdir) {
-    const strippedDir = stripContainerOrWorkspacePrefix(parsed.chdir, workspaceRoot)
-      .replace(/\\/g, '/')
-      .replace(/^\.\//, '')
-      .replace(/\/+$/, '');
-    if (
-      !strippedDir ||
-      strippedDir === '..' ||
-      strippedDir.startsWith('../') ||
-      strippedDir.startsWith('/') ||
-      /^[A-Za-z]:/.test(strippedDir)
-    ) {
-      return false;
-    }
-    baseDir = strippedDir;
+    const resolvedChdir = normalizeWorkspaceRelativeCandidate(parsed.chdir, {
+      workspaceRoot,
+      activeCwd,
+      activeCwdInvalid,
+    });
+    if (!resolvedChdir) return false;
+    baseDir = resolvedChdir;
+    baseInvalid = false;
   }
 
   if (parsed.pathspecs.length === 0) {
+    if (baseInvalid) return false;
     return baseDir === '.' || relPosix === baseDir || relPosix.startsWith(`${baseDir}/`);
   }
 
-  for (const rawSpec of parsed.pathspecs) {
-    const rawTrimmed = String(rawSpec ?? '').trim();
-    if (!rawTrimmed) continue;
-    const stripped = stripContainerOrWorkspacePrefix(rawTrimmed, workspaceRoot);
-    let spec = stripped.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
-    const hadContainerOrWorkspacePrefix = stripped !== rawTrimmed;
-    if (
-      baseDir !== '.' &&
-      !hadContainerOrWorkspacePrefix &&
-      !rawTrimmed.startsWith('/') &&
-      !/^[A-Za-z]:/.test(rawTrimmed)
-    ) {
-      spec = spec === '.' || spec === '' ? baseDir : `${baseDir}/${spec}`;
+  return matchesDeleteOperands(parsed.pathspecs, relPosix, {
+    workspaceRoot,
+    activeCwd: baseDir,
+    activeCwdInvalid: baseInvalid,
+    allowAncestorDir: true,
+    allowDot: true,
+    allowDirPrefix: true,
+  });
+}
+
+function parseShellDeleteSegment(trimmed) {
+  const tokens = tokenizeUnwrappedSegment(trimmed);
+  if (!tokens.length) return { isShellDelete: false };
+  const bin = tokens[0].split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase();
+
+  if (bin === 'git') {
+    const { subIdx, chdir } = consumeGitGlobalFlags(tokens);
+    if (tokens[subIdx]?.toLowerCase() !== 'rm') return { isShellDelete: false };
+    let hasDryRun = false;
+    let hasCached = false;
+    let recursive = false;
+    let afterDoubleDash = false;
+    const operands = [];
+    for (let j = subIdx + 1; j < tokens.length; j += 1) {
+      const tok = tokens[j];
+      if (!afterDoubleDash) {
+        if (tok === '--') {
+          afterDoubleDash = true;
+          continue;
+        }
+        if (tok === '--dry-run') {
+          hasDryRun = true;
+          continue;
+        }
+        if (tok === '--cached') {
+          hasCached = true;
+          continue;
+        }
+        if (tok === '--recursive') {
+          recursive = true;
+          continue;
+        }
+        if (tok.startsWith('--')) continue;
+        if (tok.startsWith('-') && tok.length > 1) {
+          const flags = tok.slice(1);
+          if (flags.includes('n')) hasDryRun = true;
+          if (flags.includes('r') || flags.includes('R')) recursive = true;
+          continue;
+        }
+      }
+      operands.push(tok);
     }
-    if (spec === '' || spec === '.') return true;
-    if (
-      spec === '..' ||
-      spec.startsWith('../') ||
-      spec.startsWith('/') ||
-      /^[A-Za-z]:/.test(spec)
-    ) {
-      continue;
-    }
-    if (relPosix === spec || relPosix.startsWith(`${spec}/`)) return true;
+    return {
+      isShellDelete: true,
+      skip: hasDryRun || hasCached,
+      chdir,
+      operands,
+      allowAncestorDir: recursive,
+    };
   }
 
+  const shellDeleteBins = new Set([
+    'rm',
+    'unlink',
+    'del',
+    'erase',
+    'remove-item',
+    'ri',
+    'rmdir',
+    'rd',
+  ]);
+  if (!shellDeleteBins.has(bin)) return { isShellDelete: false };
+
+  let recursive = RECURSIVE_DELETE_RE.test(trimmed);
+  let hasDryRun = false;
+  let afterDoubleDash = false;
+  const operands = [];
+  const isWinCmd = bin === 'del' || bin === 'erase' || bin === 'rmdir' || bin === 'rd';
+  const isPs = bin === 'remove-item' || bin === 'ri';
+
+  for (let j = 1; j < tokens.length; j += 1) {
+    const tok = tokens[j];
+    if (!afterDoubleDash) {
+      if (tok === '--') {
+        afterDoubleDash = true;
+        continue;
+      }
+      if (isWinCmd && /^\/[a-zA-Z](?::\S+)?$/.test(tok)) {
+        if (tok.toLowerCase() === '/s') recursive = true;
+        continue;
+      }
+      if (isPs && tok.startsWith('-')) {
+        const lower = tok.toLowerCase();
+        if (lower === '-whatif') {
+          hasDryRun = true;
+          continue;
+        }
+        if (lower === '-recurse' || lower === '-r') {
+          recursive = true;
+          continue;
+        }
+        if ((lower === '-path' || lower === '-literalpath') && j + 1 < tokens.length) {
+          operands.push(tokens[j + 1]);
+          j += 1;
+          continue;
+        }
+        if (
+          ['-filter', '-include', '-exclude', '-erroraction', '-ea', '-warningaction', '-confirm'].includes(
+            lower,
+          ) &&
+          j + 1 < tokens.length
+        ) {
+          j += 1;
+          continue;
+        }
+        continue;
+      }
+      if (!isWinCmd && !isPs && tok.startsWith('-') && tok.length > 1) {
+        if (tok === '--recursive' || (!tok.startsWith('--') && /[rR]/.test(tok.slice(1)))) {
+          recursive = true;
+        }
+        continue;
+      }
+    }
+    operands.push(tok);
+  }
+
+  return {
+    isShellDelete: true,
+    skip: hasDryRun,
+    chdir: null,
+    operands,
+    allowAncestorDir: recursive,
+  };
+}
+
+function parseGitRevertSegment(trimmed) {
+  const tokens = tokenizeUnwrappedSegment(trimmed);
+  if (!tokens.length) return { isGitRevert: false };
+  const bin = tokens[0].split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase();
+  if (bin !== 'git') return { isGitRevert: false };
+
+  const { subIdx, chdir } = consumeGitGlobalFlags(tokens);
+  const sub = tokens[subIdx]?.toLowerCase();
+
+  if (sub === 'checkout') {
+    let sawDoubleDash = false;
+    let invalidBranchSwitch = false;
+    const preDashArgs = [];
+    const postDashArgs = [];
+
+    for (let j = subIdx + 1; j < tokens.length; j += 1) {
+      const tok = tokens[j];
+      if (sawDoubleDash) {
+        postDashArgs.push(tok);
+        continue;
+      }
+      if (tok === '--') {
+        sawDoubleDash = true;
+        continue;
+      }
+      if (tok === '-b' || tok === '-B' || tok === '--orphan') {
+        invalidBranchSwitch = true;
+        break;
+      }
+      if ((tok === '--conflict' || tok === '--pathspec-from-file') && j + 1 < tokens.length) {
+        j += 1;
+        continue;
+      }
+      if (tok.startsWith('--')) continue;
+      if (tok.startsWith('-') && tok.length > 1) {
+        if (/[bB]/.test(tok.slice(1))) {
+          invalidBranchSwitch = true;
+          break;
+        }
+        continue;
+      }
+      preDashArgs.push(tok);
+    }
+
+    if (invalidBranchSwitch) return { isGitRevert: false };
+    let pathspecs = [];
+    if (sawDoubleDash) {
+      pathspecs = postDashArgs;
+    } else if (preDashArgs.length === 1 || preDashArgs.length === 2) {
+      const candidate = preDashArgs[preDashArgs.length - 1];
+      const isUnambiguous =
+        candidate === '.' ||
+        candidate.includes('/') ||
+        candidate.includes('\\') ||
+        candidate.startsWith('./') ||
+        /\.[A-Za-z][A-Za-z0-9]*$/.test(candidate) ||
+        candidate.includes('*') ||
+        candidate.includes('?');
+      if (isUnambiguous) pathspecs = [candidate];
+    }
+
+    return {
+      isGitRevert: pathspecs.length > 0,
+      chdir,
+      pathspecs,
+      allowDot: true,
+      allowDirPrefix: true,
+    };
+  }
+
+  if (sub === 'restore') {
+    let sawDoubleDash = false;
+    let hasStaged = false;
+    let hasWorktree = false;
+    let hasDryRun = false;
+    const pathspecs = [];
+
+    for (let j = subIdx + 1; j < tokens.length; j += 1) {
+      const tok = tokens[j];
+      if (sawDoubleDash) {
+        pathspecs.push(tok);
+        continue;
+      }
+      if (tok === '--') {
+        sawDoubleDash = true;
+        continue;
+      }
+      if (tok === '--staged') {
+        hasStaged = true;
+        continue;
+      }
+      if (tok === '--worktree') {
+        hasWorktree = true;
+        continue;
+      }
+      if (tok === '--dry-run' || tok === '-n') {
+        hasDryRun = true;
+        continue;
+      }
+      if (
+        ['-s', '--source', '--conflict', '--pathspec-from-file'].includes(tok) &&
+        j + 1 < tokens.length
+      ) {
+        j += 1;
+        continue;
+      }
+      if (
+        tok.startsWith('--source=') ||
+        tok.startsWith('--conflict=') ||
+        tok.startsWith('--pathspec-from-file=')
+      ) {
+        continue;
+      }
+      if (tok.startsWith('--')) continue;
+      if (tok.startsWith('-') && tok.length > 1) {
+        const flags = tok.slice(1);
+        if (flags.includes('S')) hasStaged = true;
+        if (flags.includes('W')) hasWorktree = true;
+        continue;
+      }
+      pathspecs.push(tok);
+    }
+
+    if (hasDryRun || (hasStaged && !hasWorktree) || pathspecs.length === 0) {
+      return { isGitRevert: false };
+    }
+
+    return {
+      isGitRevert: true,
+      chdir,
+      pathspecs,
+      allowDot: true,
+      allowDirPrefix: true,
+    };
+  }
+
+  return { isGitRevert: false };
+}
+
+function matchesDeleteOperands(
+  operands,
+  rel,
+  {
+    workspaceRoot = null,
+    activeCwd = '.',
+    activeCwdInvalid = false,
+    allowAncestorDir = false,
+    allowDot = false,
+    allowDirPrefix = false,
+  } = {},
+) {
+  const relPosix = String(rel || '').replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!relPosix) return false;
+  const relParts = relPosix.split('/');
+
+  for (const rawOp of operands) {
+    const spec = normalizeWorkspaceRelativeCandidate(rawOp, {
+      workspaceRoot,
+      activeCwd,
+      activeCwdInvalid,
+    });
+    if (!spec) continue;
+
+    if (spec === '.') {
+      if (allowDot || allowAncestorDir) return true;
+      continue;
+    }
+
+    const hasGlob = spec.includes('*') || spec.includes('?');
+    if (!hasGlob) {
+      if (relPosix === spec) return true;
+      if ((allowAncestorDir || allowDirPrefix) && relPosix.startsWith(`${spec}/`)) {
+        return true;
+      }
+      continue;
+    }
+
+    const globRe = globPatternToRegExp(spec);
+    if (globRe.test(relPosix)) return true;
+    if (allowAncestorDir || allowDirPrefix) {
+      for (let len = 1; len < relParts.length; len += 1) {
+        const ancestor = relParts.slice(0, len).join('/');
+        if (globRe.test(ancestor)) return true;
+      }
+    }
+  }
   return false;
 }
 
@@ -332,11 +1301,16 @@ function commandMentionsExactTarget(text, targetPosix, { workspaceRoot = null } 
 function commandMentionsPath(
   text,
   rel,
-  { workspaceRoot = null, allowAncestorDir = false } = {},
+  { workspaceRoot = null, allowAncestorDir = false, activeCwd = '.', activeCwdInvalid = false } = {},
 ) {
   const posix = String(rel || '').replace(/\\/g, '/').replace(/^\.\//, '');
   if (!posix) return false;
   if (commandMentionsExactTarget(text, posix, { workspaceRoot })) return true;
+
+  if (!activeCwdInvalid && activeCwd && activeCwd !== '.' && posix.startsWith(`${activeCwd}/`)) {
+    const cwdRel = posix.slice(activeCwd.length + 1);
+    if (commandMentionsExactTarget(text, cwdRel, { workspaceRoot })) return true;
+  }
 
   const prefix = '(?:^|[\\s"\'`=(,;]|\\.[\\\\/])';
   const suffix = '(?=$|[\\s"\'`),;])';
@@ -359,20 +1333,119 @@ function commandMentionsPath(
   return false;
 }
 
-export function isExplicitFileDeleteCommand(command, rel, { workspaceRoot = null } = {}) {
+export function isExplicitFileDeleteCommand(
+  command,
+  rel,
+  { workspaceRoot = null, cwd = null } = {},
+) {
   if (typeof command !== 'string' || !command.trim()) return false;
-  const segments = command.split(/(?:&&|\|\||[;\n|{}])+/);
+
+  let activeCwd = '.';
+  let activeCwdInvalid = false;
+  if (cwd) {
+    const normalizedCwd = normalizeWorkspaceRelativeCandidate(cwd, {
+      workspaceRoot,
+      activeCwd: '.',
+      activeCwdInvalid: false,
+    });
+    if (!normalizedCwd) {
+      activeCwdInvalid = true;
+    } else {
+      activeCwd = normalizedCwd;
+    }
+  }
+
+  const segments = splitShellSegments(command);
   for (const seg of segments) {
     const trimmed = seg.trim();
     if (!trimmed) continue;
-    const gitClean = parseGitCleanSegment(trimmed);
-    if (gitClean.isGitClean) {
-      if (matchesGitCleanSegment(gitClean, rel, workspaceRoot)) return true;
+
+    const cdUpdate = parseCdSegment(trimmed, { workspaceRoot, activeCwd, activeCwdInvalid });
+    if (cdUpdate) {
+      activeCwd = cdUpdate.activeCwd;
+      activeCwdInvalid = cdUpdate.activeCwdInvalid;
       continue;
     }
-    if (DELETE_SEGMENT_RE.test(trimmed) || PROGRAMMATIC_DELETE_RE.test(trimmed)) {
+
+    const gitClean = parseGitCleanSegment(trimmed);
+    if (gitClean.isGitClean) {
+      if (
+        matchesGitCleanSegment(gitClean, rel, workspaceRoot, {
+          activeCwd,
+          activeCwdInvalid,
+        })
+      ) {
+        return true;
+      }
+      continue;
+    }
+
+    const gitRevert = parseGitRevertSegment(trimmed);
+    if (gitRevert.isGitRevert) {
+      let baseDir = activeCwd;
+      let baseInvalid = activeCwdInvalid;
+      if (gitRevert.chdir) {
+        const resolvedChdir = normalizeWorkspaceRelativeCandidate(gitRevert.chdir, {
+          workspaceRoot,
+          activeCwd,
+          activeCwdInvalid,
+        });
+        if (!resolvedChdir) continue;
+        baseDir = resolvedChdir;
+        baseInvalid = false;
+      }
+      if (
+        matchesDeleteOperands(gitRevert.pathspecs, rel, {
+          workspaceRoot,
+          activeCwd: baseDir,
+          activeCwdInvalid: baseInvalid,
+          allowDot: gitRevert.allowDot,
+          allowDirPrefix: gitRevert.allowDirPrefix,
+        })
+      ) {
+        return true;
+      }
+      continue;
+    }
+
+    const shellDel = parseShellDeleteSegment(trimmed);
+    if (shellDel.isShellDelete) {
+      if (shellDel.skip) continue;
+      let baseDir = activeCwd;
+      let baseInvalid = activeCwdInvalid;
+      if (shellDel.chdir) {
+        const resolvedChdir = normalizeWorkspaceRelativeCandidate(shellDel.chdir, {
+          workspaceRoot,
+          activeCwd,
+          activeCwdInvalid,
+        });
+        if (!resolvedChdir) continue;
+        baseDir = resolvedChdir;
+        baseInvalid = false;
+      }
+      if (
+        matchesDeleteOperands(shellDel.operands, rel, {
+          workspaceRoot,
+          activeCwd: baseDir,
+          activeCwdInvalid: baseInvalid,
+          allowAncestorDir: shellDel.allowAncestorDir,
+        })
+      ) {
+        return true;
+      }
+      continue;
+    }
+
+    if (PROGRAMMATIC_DELETE_RE.test(trimmed)) {
       const allowAncestorDir = RECURSIVE_DELETE_RE.test(trimmed);
-      if (commandMentionsPath(trimmed, rel, { workspaceRoot, allowAncestorDir })) {
+      if (
+        commandMentionsPath(trimmed, rel, {
+          workspaceRoot,
+          allowAncestorDir,
+          activeCwd,
+          activeCwdInvalid,
+        })
+      ) {
         return true;
       }
     }
@@ -553,15 +1626,23 @@ export class EvidenceVerifier {
 
     const receiptById = new Map();
     const receiptByCallId = new Map();
-    for (const r of turnReceipts) {
+    const receiptDbIndex = new Map();
+    let maxTurnReceiptTs = 0;
+    for (let i = 0; i < turnReceipts.length; i += 1) {
+      const r = turnReceipts[i];
       if (r.id) receiptById.set(r.id, r);
       if (r.callId) receiptByCallId.set(r.callId, r);
+      receiptDbIndex.set(r, i);
+      if (typeof r.createdAt === 'number' && r.createdAt > maxTurnReceiptTs) {
+        maxTurnReceiptTs = r.createdAt;
+      }
     }
 
     const seenReceiptIds = new Set();
     const seenCallIds = new Set();
-    const orderedToolRuns = [];
-    for (const ev of events) {
+    const rawEventRuns = [];
+    for (let evIdx = 0; evIdx < events.length; evIdx += 1) {
+      const ev = events[evIdx];
       if (ev.type !== 'tool/result') continue;
       const cid = ev.data?.receipt?.callId ?? ev.data?.callId ?? null;
       const callInfo = cid ? callsById.get(cid) : null;
@@ -587,65 +1668,151 @@ export class EvidenceVerifier {
         status === 'rejected_before_effect' ||
         (typeof exitCode === 'number' && exitCode !== 0);
       const output = typeof ev.data?.content === 'string' ? ev.data.content : '';
-      orderedToolRuns.push({
-        toolName,
-        args,
-        status,
-        exitCode,
-        isError,
-        receipt,
-        callId: cid ?? receipt?.callId ?? null,
-        output,
+      const explicitTs =
+        (typeof dbReceipt?.createdAt === 'number' ? dbReceipt.createdAt : null) ??
+        (typeof ev.data?.receipt?.createdAt === 'number' ? ev.data.receipt.createdAt : null) ??
+        (typeof ev.ts === 'number' ? ev.ts : null) ??
+        (typeof ev.createdAt === 'number' ? ev.createdAt : null);
+      const dbIdx = dbReceipt ? receiptDbIndex.get(dbReceipt) ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+      rawEventRuns.push({
+        run: {
+          toolName,
+          args,
+          status,
+          exitCode,
+          isError,
+          receipt,
+          callId: cid ?? receipt?.callId ?? null,
+          output,
+          sessionId: receipt?.sessionId ?? sessionId ?? null,
+        },
+        evIdx,
+        explicitTs,
+        dbIdx,
       });
     }
-    for (const r of turnReceipts) {
+
+    const sortableRuns = [];
+    for (let i = 0; i < rawEventRuns.length; i += 1) {
+      const item = rawEventRuns[i];
+      let ts = item.explicitTs;
+      let dbIdx = item.dbIdx;
+      let sub = 0;
+      if (ts === null) {
+        let prevAnchor = null;
+        for (let p = i - 1; p >= 0; p -= 1) {
+          if (rawEventRuns[p].explicitTs !== null) {
+            prevAnchor = rawEventRuns[p];
+            break;
+          }
+        }
+        if (prevAnchor) {
+          ts = prevAnchor.explicitTs;
+          dbIdx = prevAnchor.dbIdx;
+          sub = item.evIdx + 1;
+        } else {
+          let nextAnchor = null;
+          for (let n = i + 1; n < rawEventRuns.length; n += 1) {
+            if (rawEventRuns[n].explicitTs !== null) {
+              nextAnchor = rawEventRuns[n];
+              break;
+            }
+          }
+          if (nextAnchor) {
+            ts = nextAnchor.explicitTs;
+            dbIdx = nextAnchor.dbIdx;
+            sub = -100000 + item.evIdx;
+          } else {
+            ts = maxTurnReceiptTs + 1;
+            dbIdx = 0;
+            sub = item.evIdx;
+          }
+        }
+      }
+      sortableRuns.push({
+        run: item.run,
+        ts,
+        dbIdx,
+        sub,
+        evIdx: item.evIdx,
+      });
+    }
+
+    for (let dbIdx = 0; dbIdx < turnReceipts.length; dbIdx += 1) {
+      const r = turnReceipts[dbIdx];
       if ((r.id && seenReceiptIds.has(r.id)) || (r.callId && seenCallIds.has(r.callId))) {
         continue;
       }
       const callInfo = r.callId ? callsById.get(r.callId) : null;
-      const isError = r.status === 'failed' || (typeof r.exitCode === 'number' && r.exitCode !== 0);
-      orderedToolRuns.push({
-        toolName: r.toolName,
-        args: callInfo?.args ?? {},
-        status: r.status,
-        exitCode: r.exitCode,
-        isError,
-        receipt: r,
-        callId: r.callId ?? null,
-        output: '',
+      const isError =
+        r.status === 'failed' ||
+        r.status === 'rejected_before_effect' ||
+        (typeof r.exitCode === 'number' && r.exitCode !== 0);
+      sortableRuns.push({
+        run: {
+          toolName: r.toolName,
+          args: callInfo?.args ?? {},
+          status: r.status,
+          exitCode: r.exitCode,
+          isError,
+          receipt: r,
+          callId: r.callId ?? null,
+          output: '',
+          sessionId: r.sessionId ?? sessionId ?? null,
+        },
+        ts: typeof r.createdAt === 'number' ? r.createdAt : 0,
+        dbIdx,
+        sub: 0,
+        evIdx: -1,
       });
     }
 
-    // 2. Cross-check pass/success claims and post-edit verification against real receipts/timeline
-    const shellReceipts = turnReceipts.filter((r) =>
-      ['bash', 'start_process'].includes(r.toolName),
+    sortableRuns.sort(
+      (a, b) =>
+        a.ts - b.ts ||
+        a.dbIdx - b.dbIdx ||
+        a.sub - b.sub ||
+        a.evIdx - b.evIdx,
     );
-    const effectiveShellReceipts =
-      shellReceipts.length > 0
-        ? shellReceipts
-        : orderedToolRuns
-            .filter((run) => ['bash', 'start_process'].includes(run.toolName))
-            .map((run, idx) => ({
-              id: run.receipt?.id ?? run.callId ?? `event-shell-${idx}`,
-              callId: run.callId ?? run.receipt?.callId ?? `event-shell-${idx}`,
-              sessionId: sessionId ?? 'event-session',
-              toolName: run.toolName,
-              status: run.status,
-              exitCode: run.exitCode,
-              args: run.args,
-            }));
+    const orderedToolRuns = sortableRuns.map((s) => s.run);
+
+    // 2. Cross-check pass/success claims and post-edit verification against real receipts/timeline
+    const effectiveShellReceipts = [];
+    for (let idx = 0; idx < orderedToolRuns.length; idx += 1) {
+      const run = orderedToolRuns[idx];
+      if (!['bash', 'start_process'].includes(run.toolName)) continue;
+      effectiveShellReceipts.push({
+        id: run.receipt?.id ?? run.callId ?? `event-shell-${effectiveShellReceipts.length}`,
+        callId: run.callId ?? run.receipt?.callId ?? `event-shell-${effectiveShellReceipts.length}`,
+        sessionId: run.sessionId ?? sessionId ?? 'event-session',
+        toolName: run.toolName,
+        status: run.status,
+        exitCode: run.exitCode,
+        args: run.args,
+        output: run.output ?? '',
+        orderedIndex: idx,
+      });
+    }
 
     const failedShells = effectiveShellReceipts.filter(
-      (r) => r.status === 'failed' || (typeof r.exitCode === 'number' && r.exitCode !== 0),
+      (r) =>
+        r.status === 'failed' ||
+        r.status === 'rejected_before_effect' ||
+        (typeof r.exitCode === 'number' && r.exitCode !== 0),
     );
     const latestShell = effectiveShellReceipts.at(-1);
     const unresolvedShellFailure =
       failedShells.length > 0 &&
-      (!latestShell || latestShell.status === 'failed' || (latestShell.exitCode ?? 0) !== 0);
+      (!latestShell ||
+        latestShell.status === 'failed' ||
+        latestShell.status === 'rejected_before_effect' ||
+        (latestShell.exitCode ?? 0) !== 0);
     checks.failedShellReceipts = failedShells.length;
 
     const allMutatedFiles = [];
     const allMutatedSet = new Set();
+    let lastCodeMutationIndex = -1;
+    const verificationRuns = [];
     let lastPassingVerification = null;
     let mutatedAfterLastPass = [];
     let mutatedAfterLastPassSet = new Set();
@@ -666,16 +1833,18 @@ export class EvidenceVerifier {
         run.status !== 'outcome_unknown'
       ) {
         const files = extractMutatedFilesFromToolCall(run.toolName, run.args, workspaceRoot);
+        let touchedNonDoc = false;
         for (const f of files) {
           if (!allMutatedSet.has(f)) {
             allMutatedSet.add(f);
             allMutatedFiles.push(f);
           }
+          const mutKind = classifyMutationPath(f, {
+            workspaceRoot,
+            baselineTestFiles,
+          });
+          if (mutKind !== 'doc') touchedNonDoc = true;
           if (lastPassingVerification) {
-            const mutKind = classifyMutationPath(f, {
-              workspaceRoot,
-              baselineTestFiles,
-            });
             if (mutKind === 'doc') {
               if (!mutatedDocAfterLastPassSet.has(f)) {
                 mutatedDocAfterLastPassSet.add(f);
@@ -687,24 +1856,22 @@ export class EvidenceVerifier {
             }
           }
         }
+        if (touchedNonDoc) {
+          lastCodeMutationIndex = idx;
+        }
       } else if (run.toolName === 'bash' && isVerificationCommand(run.args?.command)) {
         verificationRunsCount += 1;
+        let cwd = run.args?.cwd || '.';
+        if (workspaceRoot) {
+          try { cwd = resolveWorkspacePath(workspaceRoot, cwd).rel; } catch { /* keep raw cwd */ }
+        }
+        const command = run.args.command.trim();
         const passed =
           run.status === 'finished' &&
           !run.isError &&
           (run.exitCode === 0 || run.exitCode === null || run.exitCode === undefined);
-        if (passed) {
-          lastPassingVerification = {
-            index: idx,
-            command: run.args.command.trim(),
-            callId: run.callId,
-          };
-          mutatedAfterLastPass = [];
-          mutatedAfterLastPassSet = new Set();
-          mutatedDocAfterLastPass = [];
-          mutatedDocAfterLastPassSet = new Set();
-        } else {
-          const fp = run.output
+        const fingerprint =
+          !passed && run.output
             ? extractFailureFingerprint({
                 toolName: run.toolName,
                 args: run.args,
@@ -713,24 +1880,45 @@ export class EvidenceVerifier {
                 workspaceRoot,
               })
             : null;
-          const failInfo = {
-            command: run.args.command.trim(),
-            exitCode: run.exitCode,
-            output: run.output,
-            callId: run.callId,
-            fingerprint: fp,
-          };
-          latestFailureRun = failInfo;
-          if (run.callId) failureRunByCallId.set(run.callId, failInfo);
+        const vRun = {
+          index: idx,
+          command,
+          cwd,
+          passed,
+          exitCode: run.exitCode,
+          status: run.status,
+          output: run.output,
+          callId: run.callId,
+          receipt: run.receipt,
+          fingerprint,
+        };
+        verificationRuns.push(vRun);
+        if (passed) {
+          lastPassingVerification = vRun;
+          mutatedAfterLastPass = [];
+          mutatedAfterLastPassSet = new Set();
+          mutatedDocAfterLastPass = [];
+          mutatedDocAfterLastPassSet = new Set();
+        } else {
+          latestFailureRun = vRun;
+          if (run.callId) failureRunByCallId.set(run.callId, vRun);
         }
       }
     }
 
+    const staleAfterEdit = Boolean(lastPassingVerification && mutatedAfterLastPass.length > 0);
     const unresolvedEntry = findUnresolvedVerification(
       effectiveShellReceipts,
       events,
       workspaceRoot,
       callsById,
+      {
+        lastPassingVerification,
+        staleAfterEdit,
+        lastCodeMutationIndex,
+        allMutatedFiles,
+        verificationRuns,
+      },
     );
     const unresolvedCheck = unresolvedEntry?.receipt ?? null;
     const unresolvedCommand = unresolvedEntry?.command ?? null;
@@ -751,7 +1939,6 @@ export class EvidenceVerifier {
     const requirePostEditVerification = Boolean(execution?.requirePostEditVerification);
     checks.mutatedFiles = [...allMutatedFiles];
 
-    const staleAfterEdit = Boolean(lastPassingVerification && mutatedAfterLastPass.length > 0);
     checks.staleVerificationAfterEdit = staleAfterEdit;
     checks.mutatedFilesAfterVerification = [...mutatedAfterLastPass];
     checks.mutatedDocFilesAfterVerification = [...mutatedDocAfterLastPass];
@@ -795,59 +1982,45 @@ export class EvidenceVerifier {
     }
 
     // 3. Verify claimed file mutations exist on disk when workspaceRoot is supplied
-    if (workspaceRoot && events.length) {
-      const okWritePaths = new Set();
-      const succeededWriteCallIds = new Set();
-      const callsById = new Map();
-      const latestWriteIndex = new Map();
+    if (workspaceRoot && (events.length || turnReceipts.length)) {
+      const latestWriteInfo = new Map();
       const resolvedPaths = new Map();
       const deletionEvents = [];
 
-      for (let idx = 0; idx < events.length; idx += 1) {
-        const ev = events[idx];
-        if (ev.type === 'tool/call' && ev.data?.callId) {
-          callsById.set(ev.data.callId, {
-            index: idx,
-            name: ev.data?.name,
-            args: safeToolArgs(ev.data?.arguments),
-          });
-        }
-        if (ev.type === 'tool/result' && !ev.data?.isError) {
-          const cid = ev.data?.receipt?.callId ?? ev.data?.callId ?? null;
-          if (['write_file', 'edit_file'].includes(ev.data?.name)) {
-            if (cid) succeededWriteCallIds.add(cid);
-            else okWritePaths.add('*');
-          } else if (['bash', 'delete_file'].includes(ev.data?.name)) {
-            const exitCode = ev.data?.receipt?.exitCode ?? ev.data?.exitCode;
-            if (typeof exitCode === 'number' && exitCode !== 0) continue;
-            const call = cid ? callsById.get(cid) : null;
-            const args = call?.args ?? safeToolArgs(ev.data?.arguments);
-            deletionEvents.push({
-              index: idx,
-              callIndex: call?.index ?? idx,
-              name: ev.data?.name,
-              args,
-            });
-          }
-        }
-      }
-
-      for (let idx = 0; idx < events.length; idx += 1) {
-        const ev = events[idx];
+      for (let runIdx = 0; runIdx < orderedToolRuns.length; runIdx += 1) {
+        const run = orderedToolRuns[runIdx];
         if (
-          ev.type === 'tool/call' &&
-          ['write_file', 'edit_file'].includes(ev.data?.name) &&
-          (succeededWriteCallIds.has(ev.data?.callId) || okWritePaths.has('*'))
+          run.isError ||
+          run.status === 'rejected_before_effect' ||
+          run.status === 'outcome_unknown'
         ) {
-          const args = safeToolArgs(ev.data?.arguments);
-          if (!args.path) continue;
+          continue;
+        }
+        const call = run.callId ? callsById.get(run.callId) : null;
+        const evCallIdx = call && typeof call.index === 'number' && call.index >= 0 ? call.index : -1;
+
+        if (['write_file', 'edit_file'].includes(run.toolName)) {
+          const pathArg = run.args?.path;
+          if (!pathArg) continue;
           try {
-            const { full, rel } = resolveWorkspacePath(workspaceRoot, args.path);
+            const { full, rel } = resolveWorkspacePath(workspaceRoot, pathArg);
             resolvedPaths.set(rel, full);
-            latestWriteIndex.set(rel, Math.max(latestWriteIndex.get(rel) ?? -1, idx));
+            const prev = latestWriteInfo.get(rel);
+            latestWriteInfo.set(rel, {
+              runIdx: Math.max(prev?.runIdx ?? -1, runIdx),
+              evCallIdx: Math.max(prev?.evCallIdx ?? -1, evCallIdx),
+            });
           } catch {
             // Path outside workspace was already blocked before execution
           }
+        } else if (['bash', 'delete_file'].includes(run.toolName)) {
+          if (typeof run.exitCode === 'number' && run.exitCode !== 0) continue;
+          deletionEvents.push({
+            runIdx,
+            evCallIdx,
+            name: run.toolName,
+            args: run.args,
+          });
         }
       }
 
@@ -867,11 +2040,15 @@ export class EvidenceVerifier {
       const cleanedUpFiles = [];
       for (const [rel, full] of resolvedPaths.entries()) {
         if (existsSync(full)) continue;
-        const lastWriteIdx = latestWriteIndex.get(rel) ?? -1;
+        const lastWrite = latestWriteInfo.get(rel) ?? { runIdx: -1, evCallIdx: -1 };
         let explicitlyDeleted = false;
         if (!requiredPaths.has(rel)) {
           for (const delEv of deletionEvents) {
-            if (delEv.callIndex <= lastWriteIdx) continue;
+            const isAfterWrite =
+              delEv.evCallIdx >= 0 && lastWrite.evCallIdx >= 0
+                ? delEv.evCallIdx > lastWrite.evCallIdx
+                : delEv.runIdx > lastWrite.runIdx;
+            if (!isAfterWrite) continue;
             if (delEv.name === 'delete_file' && delEv.args?.path) {
               try {
                 if (resolveWorkspacePath(workspaceRoot, delEv.args.path).rel === rel) {
@@ -883,7 +2060,10 @@ export class EvidenceVerifier {
               }
             } else if (
               delEv.name === 'bash' &&
-              isExplicitFileDeleteCommand(delEv.args?.command, rel, { workspaceRoot })
+              isExplicitFileDeleteCommand(delEv.args?.command, rel, {
+                workspaceRoot,
+                cwd: delEv.args?.cwd,
+              })
             ) {
               explicitlyDeleted = true;
               break;
