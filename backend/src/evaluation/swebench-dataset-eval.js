@@ -1575,17 +1575,28 @@ export function computePairedResolutionMetrics(
       const rowTok = getRowTotalTokens(row);
       const inTok = Number(row?.inputTokens ?? 0) || 0;
       const crTok = Number(row?.cacheReadTokens ?? 0) || 0;
+      const cwTok = Number(row?.cacheWriteTokens ?? 0) || 0;
       const rawEligible = row?.cacheEligibleInputTokens;
+      const hasExplicitEligible =
+        rawEligible != null && Number.isFinite(Number(rawEligible)) && Number(rawEligible) > 0;
+      const hasLegacyCacheFallback =
+        rawEligible == null && (crTok > 0 || cwTok > 0) && inTok > 0;
       const eligibleTok =
-        rawEligible != null && Number.isFinite(Number(rawEligible)) && Number(rawEligible) > 0
-          ? Number(rawEligible)
-          : inTok;
+        row?.cacheStatus === 'missing'
+          ? 0
+          : hasExplicitEligible
+            ? Number(rawEligible)
+            : hasLegacyCacheFallback
+              ? inTok
+              : 0;
 
       totalTokens += rowTok;
       totalSteps += Number(row?.steps ?? 0) || 0;
       totalWallClockMs += Number(row?.wallClockMs ?? 0) || 0;
-      totalCacheReadTokens += crTok;
-      totalCacheEligibleInputTokens += eligibleTok;
+      if (eligibleTok > 0) {
+        totalCacheReadTokens += crTok;
+        totalCacheEligibleInputTokens += eligibleTok;
+      }
 
       if (row?.resolved === true) {
         resolvedCount += 1;

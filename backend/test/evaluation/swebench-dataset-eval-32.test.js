@@ -960,5 +960,64 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     assert.match(tex, /1\/2 & 50\.00\\%/);
     assert.match(tex, /2\/2 & 100\.00\\%/);
     assert.match(tex, /40\.00\\% \(n=1\)/);
+
+    // cacheStatus: 'missing' (and legacy null eligible with 0 cache tokens) must be excluded from cacheHitRate denominator
+    const missingCacheByArm = {
+      raw_full: [
+        {
+          instance_id: 'inst-1',
+          arm: 'raw_full',
+          resolved: true,
+          steps: 10,
+          wallClockMs: 1000,
+          inputTokens: 10000,
+          outputTokens: 500,
+          totalTokens: 10500,
+          cacheReadTokens: 9500,
+          cacheWriteTokens: 0,
+          cacheEligibleInputTokens: 10000,
+          cacheStatus: 'available',
+        },
+      ],
+      full_aci: [
+        {
+          instance_id: 'inst-1',
+          arm: 'full_aci',
+          resolved: true,
+          steps: 8,
+          wallClockMs: 800,
+          inputTokens: 6000,
+          outputTokens: 400,
+          totalTokens: 6400,
+          cacheReadTokens: 5715,
+          cacheWriteTokens: 0,
+          cacheEligibleInputTokens: 6000,
+          cacheStatus: 'available',
+        },
+        {
+          instance_id: 'inst-2',
+          arm: 'full_aci',
+          resolved: false,
+          steps: 12,
+          wallClockMs: 900,
+          inputTokens: 4000,
+          outputTokens: 300,
+          totalTokens: 4300,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          cacheEligibleInputTokens: null,
+          cacheStatus: 'missing',
+        },
+      ],
+    };
+    const pairedMissing = computePairedResolutionMetrics(['raw_full', 'full_aci'], missingCacheByArm, 'raw_full');
+    assert.equal(pairedMissing.full_aci.cacheHitRate, 0.9525);
+    const texMissing = renderPaperLatexTable({
+      arms: ['raw_full', 'full_aci'],
+      metricsByArm: pairedMissing,
+      pairedByArm: pairedMissing,
+      meta: { model: 'deepseek-v4.1-flash' },
+    });
+    assert.match(texMissing, /95\.25\\%/);
   });
 });

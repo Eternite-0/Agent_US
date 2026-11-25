@@ -117,6 +117,7 @@ function printSweBenchUsage() {
       '  --use-app-pool                 Clone enabled accounts read-only from App engine.sqlite',
       '  --no-use-app-pool              Require explicit API key env var instead of App Pool',
       '  --app-data-dir <dir>           Explicit App data directory containing engine.sqlite',
+      '  --exclude-accounts <csv>       Comma-separated case-insensitive account ID/preset/label/endpoint filters',
       '  --max-steps <n>                Max agent steps per instance (default: 60, max: 80)',
       '  --turn-timeout-ms <ms>         Per-turn timeout in ms (default: 900000 live, 60000 dry-run)',
       '  --output-dir <dir>             Directory for predictions, telemetry, eval, summary.md, .tex',
@@ -174,6 +175,7 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     cleanupImages: true,
     useAppPool: null,
     appDataDir: null,
+    excludeAccounts: [],
     supervisorModel: null,
     deterministicAdmission: false,
     fetchDataset: false,
@@ -252,6 +254,17 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--supervisor-model=')) opts.supervisorModel = splitEq('--supervisor-model').trim();
     else if (arg === '--app-data-dir') opts.appDataDir = String(nextVal()).trim();
     else if (arg.startsWith('--app-data-dir=')) opts.appDataDir = splitEq('--app-data-dir').trim();
+    else if (arg === '--exclude-accounts') {
+      opts.excludeAccounts = String(nextVal())
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else if (arg.startsWith('--exclude-accounts=')) {
+      opts.excludeAccounts = splitEq('--exclude-accounts')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
     else if (arg === '--max-steps') opts.maxSteps = Number(nextVal());
     else if (arg.startsWith('--max-steps=')) opts.maxSteps = Number(splitEq('--max-steps'));
     else if (arg === '--turn-timeout-ms') opts.turnTimeoutMs = Number(nextVal());
@@ -1816,6 +1829,7 @@ async function runSweBenchInstanceArm({
       targetPool: pool,
       model: opts.model ?? null,
       supervisorModel: opts.supervisorModel ?? null,
+      excludeAccounts: opts.excludeAccounts ?? [],
       env: runtimeDeps.env ?? process.env,
     });
     if (!cloned || cloned.accountsCloned <= 0) {
@@ -2552,6 +2566,16 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
                 runtimeDeps,
                 extractedFromImage: !hasLocalWorkspace && hasContainer,
               });
+              if (
+                !opts.dryRun &&
+                result.telemetry?.cacheStatus === 'missing' &&
+                Number(result.telemetry?.inputTokens ?? 0) > 0
+              ) {
+                const warnFn = runtimeDeps.warn ?? console.warn;
+                warnFn(
+                  `[CACHE-WARN] instance=${instance.instance_id} arm=${arm} model=${result.telemetry?.model ?? 'unknown'} inputTokens=${result.telemetry.inputTokens} returned cacheStatus=missing (0 cache telemetry; inspect upstream provider/route or exclude via --exclude-accounts)`,
+                );
+              }
               persistResult(arm, result);
             } catch (err) {
               if (isEnvironmentOrDockerError(err, { containerMode: hasContainer })) {

@@ -407,6 +407,7 @@ export function loadAppPoolReadOnly({
   targetPool,
   model = null,
   supervisorModel = null,
+  excludeAccounts = [],
   cwd = process.cwd(),
   repoRoot = DEFAULT_REPO_ROOT,
   env = process.env,
@@ -414,6 +415,14 @@ export function loadAppPoolReadOnly({
   if (!targetStore || !targetPool) {
     throw new Error('loadAppPoolReadOnly requires targetStore and targetPool');
   }
+
+  const excludeTokens = (
+    Array.isArray(excludeAccounts)
+      ? excludeAccounts
+      : String(excludeAccounts ?? '').split(',')
+  )
+    .map((token) => String(token ?? '').trim().toLowerCase())
+    .filter(Boolean);
 
   const requestedDir = explicitDir ?? appDataDir ?? null;
   const sourceDataDir = resolveAppDataDir(requestedDir, { cwd, repoRoot, env });
@@ -430,6 +439,7 @@ export function loadAppPoolReadOnly({
   }
 
   let accountsCloned = 0;
+  let excludedAccountsCount = 0;
   let modelsCloned = 0;
   let sourceDefaultModel = null;
   const clonedAccountIds = new Set();
@@ -457,6 +467,15 @@ export function loadAppPoolReadOnly({
         : null;
 
       for (const acc of enabledRows) {
+        if (excludeTokens.length > 0) {
+          const haystack = [acc.id, acc.preset, acc.label, acc.endpoint].map((v) =>
+            String(v ?? '').toLowerCase(),
+          );
+          if (excludeTokens.some((tok) => haystack.some((field) => field.includes(tok)))) {
+            excludedAccountsCount += 1;
+            continue;
+          }
+        }
         const headers = parseJsonSafe(acc.headers, {});
         const models = parseJsonSafe(acc.models, []);
         const meta = parseJsonSafe(acc.meta, {});
@@ -508,6 +527,12 @@ export function loadAppPoolReadOnly({
         clonedAccountIds.add(created.id);
         clonedAccounts.push(created);
         accountsCloned += 1;
+      }
+
+      if (enabledRows.length > 0 && accountsCloned === 0 && excludedAccountsCount > 0) {
+        throw new Error(
+          `All ${excludedAccountsCount} enabled App Pool account(s) matched --exclude-accounts (${excludeTokens.join(', ')}). Remove an exclusion or enable another provider account.`,
+        );
       }
 
       if (tables.has('provider_priorities')) {
@@ -692,6 +717,7 @@ export function loadAppPoolReadOnly({
   return {
     sourceDataDir,
     accountsCloned,
+    excludedAccountsCount,
     modelsCloned,
     defaultModel,
     availableModels,

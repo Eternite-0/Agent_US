@@ -9,6 +9,7 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { DirectAgentRuntime } from '../../src/direct-agent.js';
 import {
   isThinkingOrReasoningModel,
+  loadAppPoolReadOnly,
   resolveSupervisorExecutionConfig,
 } from '../../src/evaluation/swebench-pool.js';
 import { MetricsCollector } from '../../src/observability/metrics.js';
@@ -727,5 +728,179 @@ describe('SWE-bench Telemetry 3.2.1 (T1, T2, T3, --turn-timeout-ms, Supervisor D
         reason: 'auto_fast_model',
       },
     );
+  });
+
+  test('--exclude-accounts CLI flag, loadAppPoolReadOnly exclusion + all-excluded error, and live [CACHE-WARN]', async () => {
+    const parsedA = parseSweBenchCliArgs([
+      '--dataset',
+      'hf:verified-mini',
+      '--exclude-accounts',
+      'catpaw, Mirror-1 ',
+    ]);
+    assert.deepEqual(parsedA.excludeAccounts, ['catpaw', 'Mirror-1']);
+    const parsedB = parseSweBenchCliArgs([
+      '--dry-run',
+      '--exclude-accounts=alpha,beta',
+    ]);
+    assert.deepEqual(parsedB.excludeAccounts, ['alpha', 'beta']);
+
+    const srcDir = makeTmp('swe-excl-src-');
+    const dstDir = makeTmp('swe-excl-dst-');
+    const srcStore = new Store(join(srcDir, 'engine.sqlite'));
+    const srcPool = new AccountPool(srcStore, { root: srcDir });
+    const catAcc = srcPool.createAccount({
+      preset: 'catpaw',
+      label: 'CatPaw Relay',
+      priority: 1,
+      endpoint: 'https://catpaw.example.invalid/v1',
+      credential: 'sk-catpaw-excl',
+      models: ['deepseek-v4.1-flash'],
+    });
+    const dsAcc = srcPool.createAccount({
+      preset: 'deepseek',
+      label: 'DeepSeek Direct',
+      priority: 2,
+      endpoint: 'https://api.deepseek.com/v1',
+      credential: 'sk-deepseek-keep',
+      models: ['deepseek-v4.1-flash'],
+    });
+    srcPool.addManualModel({ accountId: catAcc.id, upstreamModel: 'deepseek-v4.1-flash' });
+    srcPool.addManualModel({ accountId: dsAcc.id, upstreamModel: 'deepseek-v4.1-flash' });
+    srcPool.setDefaultModel('deepseek-v4.1-flash');
+    srcStore.close();
+
+    const dstStore = new Store(join(dstDir, 'swebench.sqlite'));
+    const dstPool = new AccountPool(dstStore, { root: dstDir });
+    try {
+      const cloned = loadAppPoolReadOnly({
+        explicitDir: srcDir,
+        targetStore: dstStore,
+        targetPool: dstPool,
+        excludeAccounts: ['catpaw'],
+      });
+      assert.equal(cloned.accountsCloned, 1);
+      assert.equal(cloned.excludedAccountsCount, 1);
+      assert.deepEqual(
+        dstPool.listAccounts().map((a) => a.preset),
+        ['deepseek'],
+      );
+    } finally {
+      dstStore.close();
+    }
+
+    const allExclDir = makeTmp('swe-excl-all-');
+    const allExclStore = new Store(join(allExclDir, 'swebench.sqlite'));
+    const allExclPool = new AccountPool(allExclStore, { root: allExclDir });
+    try {
+      assert.throws(
+        () =>
+          loadAppPoolReadOnly({
+            explicitDir: srcDir,
+            targetStore: allExclStore,
+            targetPool: allExclPool,
+            excludeAccounts: ['catpaw', 'deepseek'],
+          }),
+        /matched --exclude-accounts/i,
+      );
+    } finally {
+      allExclStore.close();
+    }
+
+    // Live runSweBenchBenchmark should forward --exclude-accounts to App Pool and emit [CACHE-WARN] when cacheStatus=missing
+    const repoDir = makeTmp('swe-cache-warn-repo-');
+    const baseCommit = seedSimpleRepo(repoDir);
+    const dsPath = join(makeTmp('swe-cache-warn-ds-'), 'mini.jsonl');
+    writeFileSync(
+      dsPath,
+      JSON.stringify({
+        instance_id: 'inst-cache-warn-1',
+        repo: 'demo/app',
+        base_commit: baseCommit,
+        problem_statement: 'Fix add() in src/app.py',
+        FAIL_TO_PASS: ['tests/test_app.py::test_add'],
+        PASS_TO_PASS: [],
+      }) + '\n',
+      'utf8',
+    );
+    const outDir = makeTmp('swe-cache-warn-out-');
+    const seenEndpoints = [];
+    const mockHttp = await startMockOpenAiSseServer(async (body, req, res) => {
+      seenEndpoints.push(req.url);
+      res.write(
+        `data: ${JSON.stringify({
+          id: 'cw-1',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: body?.model ?? 'deepseek-v4.1-flash',
+          choices: [{ index: 0, delta: { content: 'Done.' }, finish_reason: null }],
+        })}\n\n`,
+      );
+      res.write(
+        `data: ${JSON.stringify({
+          id: 'cw-1',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: body?.model ?? 'deepseek-v4.1-flash',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: 180,
+            completion_tokens: 12,
+            total_tokens: 192,
+          },
+        })}\n\n`,
+      );
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+
+    const appPoolLiveDir = makeTmp('swe-live-excl-pool-');
+    const liveSrcStore = new Store(join(appPoolLiveDir, 'engine.sqlite'));
+    const liveSrcPool = new AccountPool(liveSrcStore, { root: appPoolLiveDir });
+    liveSrcPool.createAccount({
+      preset: 'catpaw',
+      label: 'CatPaw ZeroCache',
+      priority: 1,
+      endpoint: 'http://127.0.0.1:9/catpaw/v1',
+      credential: 'sk-catpaw-blocked',
+      models: ['deepseek-v4.1-flash'],
+    });
+    liveSrcPool.createAccount({
+      preset: 'custom-openai',
+      label: 'Mock Live',
+      priority: 2,
+      endpoint: `${mockHttp.baseUrl}`,
+      credential: 'sk-mock-live',
+      models: ['deepseek-v4.1-flash'],
+    });
+    liveSrcPool.setDefaultModel('deepseek-v4.1-flash');
+    liveSrcStore.close();
+
+    const warnings = [];
+    const origWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
+    try {
+      const res = await runSweBenchBenchmark(
+        {
+          dataset: dsPath,
+          arms: ['raw_full'],
+          workspaceRoot: repoDir,
+          useAppPool: true,
+          appDataDir: appPoolLiveDir,
+          excludeAccounts: ['catpaw'],
+          model: 'deepseek-v4.1-flash',
+          outputDir: outDir,
+        },
+        {},
+      );
+      assert.equal(res.telemetryByArm.raw_full[0].cacheStatus, 'missing');
+      assert.ok(seenEndpoints.length >= 1, 'non-excluded Mock Live endpoint should handle the request');
+      assert.ok(
+        warnings.some((w) => w.includes('[CACHE-WARN]') && w.includes('inst-cache-warn-1') && w.includes('cacheStatus=missing')),
+        `expected [CACHE-WARN] on console.warn, got: ${JSON.stringify(warnings)}`,
+      );
+    } finally {
+      console.warn = origWarn;
+      await mockHttp.close();
+    }
   });
 });
