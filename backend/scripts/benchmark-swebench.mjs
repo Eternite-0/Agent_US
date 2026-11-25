@@ -51,6 +51,7 @@ import {
   resolveLiveProviderConfig,
   resolveSupervisorExecutionConfig,
 } from '../src/evaluation/swebench-pool.js';
+import { MetricsCollector } from '../src/observability/metrics.js';
 import { stableTools } from '../src/observability/prompt-cache.js';
 import { AccountPool } from '../src/pool.js';
 import { Store } from '../src/store.js';
@@ -84,6 +85,8 @@ export const VALID_SWEBENCH_ARMS = Object.freeze(
 export const DEFAULT_MAX_STEPS = 60;
 export const MAX_ALLOWED_STEPS = 80;
 export const CACHE_BLOCK_TOKENS = 64;
+export const DEFAULT_LIVE_TURN_TIMEOUT_MS = 900_000;
+export const DEFAULT_DRY_RUN_TURN_TIMEOUT_MS = 60_000;
 
 const SUPERVISOR_WIRE_MARKER = 'Supervisor for Adaptive Context Intelligence (ACI)';
 const TEMP_CACHE_DIR_NAMES = new Set([
@@ -115,6 +118,7 @@ function printSweBenchUsage() {
       '  --no-use-app-pool              Require explicit API key env var instead of App Pool',
       '  --app-data-dir <dir>           Explicit App data directory containing engine.sqlite',
       '  --max-steps <n>                Max agent steps per instance (default: 60, max: 80)',
+      '  --turn-timeout-ms <ms>         Per-turn timeout in ms (default: 900000 live, 60000 dry-run)',
       '  --output-dir <dir>             Directory for predictions, telemetry, eval, summary.md, .tex',
       '  --workspace-root <dir>         Base directory containing checked-out target repositories',
       '  --docker-preset <epoch|official> Official or Epoch SWE-bench container image preset',
@@ -160,6 +164,7 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     arms: [...DEFAULT_ARMS],
     model: null,
     maxSteps: DEFAULT_MAX_STEPS,
+    turnTimeoutMs: null,
     outputDir: null,
     workspaceRoot: null,
     dockerImage: null,
@@ -249,6 +254,8 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--app-data-dir=')) opts.appDataDir = splitEq('--app-data-dir').trim();
     else if (arg === '--max-steps') opts.maxSteps = Number(nextVal());
     else if (arg.startsWith('--max-steps=')) opts.maxSteps = Number(splitEq('--max-steps'));
+    else if (arg === '--turn-timeout-ms') opts.turnTimeoutMs = Number(nextVal());
+    else if (arg.startsWith('--turn-timeout-ms=')) opts.turnTimeoutMs = Number(splitEq('--turn-timeout-ms'));
     else if (arg === '--output-dir') opts.outputDir = String(nextVal());
     else if (arg.startsWith('--output-dir=')) opts.outputDir = splitEq('--output-dir');
     else if (arg === '--workspace-root') opts.workspaceRoot = String(nextVal());
@@ -295,6 +302,15 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     throw new Error('--max-steps must be a positive integer');
   }
   opts.maxSteps = Math.min(MAX_ALLOWED_STEPS, opts.maxSteps);
+
+  if (opts.turnTimeoutMs !== null) {
+    if (!Number.isFinite(opts.turnTimeoutMs) || opts.turnTimeoutMs < 1) {
+      throw new Error('--turn-timeout-ms must be a positive integer');
+    }
+    opts.turnTimeoutMs = Math.trunc(opts.turnTimeoutMs);
+  } else {
+    opts.turnTimeoutMs = opts.dryRun ? DEFAULT_DRY_RUN_TURN_TIMEOUT_MS : DEFAULT_LIVE_TURN_TIMEOUT_MS;
+  }
 
   if (opts.limit !== null && (!Number.isInteger(opts.limit) || opts.limit < 1)) {
     throw new Error('--limit must be a positive integer');
@@ -1092,6 +1108,7 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
   let totalOutputTokens = 0;
   let totalCacheReadTokens = 0;
   let totalCacheEligibleInputTokens = 0;
+  let cacheReportedInstances = 0;
   let totalSteps = 0;
   let totalWallClockMs = 0;
   let nonEmptyPatches = 0;
@@ -1102,6 +1119,9 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
   let admissionInjectedTokens = 0;
   let admissionSavedTokens = 0;
   let epochTransitions = 0;
+  let supervisorCalls = 0;
+  let supervisorDurationMs = 0;
+  let supervisorTokens = 0;
   const seenIds = new Set();
 
   for (const row of rows) {
@@ -1110,16 +1130,25 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
     const inTok = Number(row?.inputTokens ?? 0) || 0;
     const outTok = Number(row?.outputTokens ?? 0) || 0;
     const crTok = Number(row?.cacheReadTokens ?? 0) || 0;
+    const cwTok = Number(row?.cacheWriteTokens ?? 0) || 0;
     const rawEligible = row?.cacheEligibleInputTokens;
-    const eligibleTok =
-      rawEligible != null && Number.isFinite(Number(rawEligible)) && Number(rawEligible) > 0
-        ? Number(rawEligible)
-        : inTok;
+    const hasExplicitEligible =
+      rawEligible != null && Number.isFinite(Number(rawEligible)) && Number(rawEligible) > 0;
+    const hasLegacyCacheFallback =
+      rawEligible == null && (crTok > 0 || cwTok > 0) && inTok > 0;
+    const eligibleTok = hasExplicitEligible
+      ? Number(rawEligible)
+      : hasLegacyCacheFallback
+        ? inTok
+        : null;
 
     totalInputTokens += inTok;
     totalOutputTokens += outTok;
-    totalCacheReadTokens += crTok;
-    totalCacheEligibleInputTokens += eligibleTok;
+    if (eligibleTok != null && eligibleTok > 0) {
+      cacheReportedInstances += 1;
+      totalCacheReadTokens += crTok;
+      totalCacheEligibleInputTokens += eligibleTok;
+    }
     totalSteps += Number(row?.steps ?? 0) || 0;
     totalWallClockMs += Number(row?.wallClockMs ?? 0) || 0;
 
@@ -1142,6 +1171,14 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
     admissionInjectedTokens += admInj;
     admissionSavedTokens += admSaved;
     epochTransitions += Number(row?.epochTransitions ?? 0) || 0;
+
+    const supCost =
+      row?.supervisorCost && typeof row.supervisorCost === 'object' ? row.supervisorCost : null;
+    if (supCost) {
+      supervisorCalls += Number(supCost.calls ?? 0) || 0;
+      supervisorDurationMs += Number(supCost.durationMs ?? 0) || 0;
+      supervisorTokens += Number(supCost.totalTokens ?? supCost.tokens ?? 0) || 0;
+    }
   }
 
   let predOnlyCount = 0;
@@ -1183,6 +1220,7 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
     totalTokens,
     totalCacheReadTokens,
     totalCacheEligibleInputTokens,
+    cacheReportedInstances,
     cacheHitRate,
     totalSteps,
     meanSteps: count > 0 ? round4(totalSteps / count) : 0,
@@ -1195,6 +1233,9 @@ export function computeArmAggregateMetrics(arm, telemetryRows = [], predictionRo
     admissionSavedTokens,
     admissionTokenReductionRate,
     epochTransitions,
+    supervisorCalls,
+    supervisorDurationMs,
+    supervisorTokens,
   };
 }
 
@@ -1230,8 +1271,8 @@ export function renderSummaryMarkdown({
     '',
     '## Per-Arm Metrics',
     '',
-    '| Arm | Instances | Resolved Rate (%) | Tokens / Resolved | Paired Resolved Token Reduction | Total Input Tokens | Total Output Tokens | Real Provider Cache Hit Rate | Steps (Mean) | Wall-Clock Time (ms) | Non-Empty Patch Rate | ACI Admission Token Reduction Rate | DTOC Epoch Transitions |',
-    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| Arm | Instances | Resolved Rate (%) | Tokens / Resolved | Paired Resolved Token Reduction | Total Input Tokens | Total Output Tokens | Real Provider Cache Hit Rate | Steps (Mean) | Wall-Clock Time (ms) | Non-Empty Patch Rate | ACI Admission Token Reduction Rate | DTOC Epoch Transitions | Supervisor Cost |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
 
   for (const arm of arms) {
@@ -1251,8 +1292,14 @@ export function renderSummaryMarkdown({
       p?.pairedResolvedTokenReduction != null && (p?.pairedResolvedCount ?? 0) > 0
         ? `${formatPct(p.pairedResolvedTokenReduction)} (n=${p.pairedResolvedCount})`
         : 'N/A';
+    const cacheReportedCount = m.cacheReportedInstances ?? 0;
+    const cacheCell =
+      m.totalCacheEligibleInputTokens > 0
+        ? `${formatPct(m.cacheHitRate)} (${m.totalCacheReadTokens}/${m.totalCacheEligibleInputTokens}, n=${cacheReportedCount})`
+        : `N/A (0/0, n=${cacheReportedCount})`;
+    const supervisorCell = `${m.supervisorCalls ?? 0} calls / ${m.supervisorTokens ?? 0} tok / ${m.supervisorDurationMs ?? 0} ms`;
     lines.push(
-      `| \`${arm}\` | ${m.completedInstances}/${m.totalInstances} | ${resolvedCell} | ${tokPerResCell} | ${pairedCell} | ${m.totalInputTokens} | ${m.totalOutputTokens} | ${formatPct(m.cacheHitRate)} (${m.totalCacheReadTokens}/${m.totalCacheEligibleInputTokens}) | ${m.totalSteps} (${m.meanSteps}) | ${m.totalWallClockMs} | ${formatPct(m.nonEmptyPatchRate)} (${m.nonEmptyPatches}/${m.totalInstances}) | ${formatPct(m.admissionTokenReductionRate)} (${m.admissionSavedTokens}/${m.admissionOriginalTokens}) | ${m.epochTransitions} |`,
+      `| \`${arm}\` | ${m.completedInstances}/${m.totalInstances} | ${resolvedCell} | ${tokPerResCell} | ${pairedCell} | ${m.totalInputTokens} | ${m.totalOutputTokens} | ${cacheCell} | ${m.totalSteps} (${m.meanSteps}) | ${m.totalWallClockMs} | ${formatPct(m.nonEmptyPatchRate)} (${m.nonEmptyPatches}/${m.totalInstances}) | ${formatPct(m.admissionTokenReductionRate)} (${m.admissionSavedTokens}/${m.admissionOriginalTokens}) | ${m.epochTransitions} | ${supervisorCell} |`,
     );
   }
 
@@ -1268,8 +1315,12 @@ export function renderSummaryMarkdown({
     for (const row of telemetryByArm[arm] ?? []) {
       const resolvedLabel =
         row.resolved === true ? 'yes' : row.resolved === false ? 'no' : '-';
+      const rowCacheCell =
+        row.cacheHitRate == null || row.cacheStatus === 'missing'
+          ? 'N/A'
+          : formatPct(row.cacheHitRate);
       lines.push(
-        `| \`${arm}\` | \`${row.instance_id}\` | ${row.status} | ${resolvedLabel} | ${row.steps} | ${row.inputTokens} | ${row.outputTokens} | ${formatPct(row.cacheHitRate)} | ${row.wallClockMs} | ${row.nonEmptyPatch ? 'yes' : 'no'} | ${formatPct(row.admissionTokenReductionRate)} | ${row.epochTransitions} |`,
+        `| \`${arm}\` | \`${row.instance_id}\` | ${row.status} | ${resolvedLabel} | ${row.steps} | ${row.inputTokens} | ${row.outputTokens} | ${rowCacheCell} | ${row.wallClockMs} | ${row.nonEmptyPatch ? 'yes' : 'no'} | ${formatPct(row.admissionTokenReductionRate)} | ${row.epochTransitions} |`,
       );
     }
   }
@@ -1356,7 +1407,7 @@ async function createIsolatedTrialWorkspace(sourceRepo, baseCommit) {
   return trialWs;
 }
 
-function extractTurnTelemetryRow({
+export function extractTurnTelemetryRow({
   store,
   turnId,
   sessionId,
@@ -1383,19 +1434,73 @@ function extractTurnTelemetryRow({
 
   const aciMetrics = evData?.reasoningMetrics?.aciMetrics ?? {};
   const aciTelemetry = evData?.aciTelemetry ?? aciMetrics?.aciTelemetry ?? {};
-  const inputTokens = Number(evData?.inputTokens ?? turnRow?.inputTokens ?? 0) || 0;
-  const outputTokens = Number(evData?.outputTokens ?? turnRow?.outputTokens ?? 0) || 0;
-  const cacheReadTokens = Number(evData?.cacheReadTokens ?? 0) || 0;
-  const cacheWriteTokens = Number(evData?.cacheWriteTokens ?? 0) || 0;
-  const rawEligible = evData?.cacheEligibleInputTokens;
-  const cacheEligibleInputTokens =
-    rawEligible != null && Number.isFinite(Number(rawEligible)) && Number(rawEligible) > 0
-      ? Number(rawEligible)
-      : inputTokens;
+  let inputTokens = Math.max(
+    Number(evData?.inputTokens ?? 0) || 0,
+    Number(turnRow?.inputTokens ?? 0) || 0,
+  );
+  let outputTokens = Math.max(
+    Number(evData?.outputTokens ?? 0) || 0,
+    Number(turnRow?.outputTokens ?? 0) || 0,
+  );
+  let cacheReadTokens = Number(evData?.cacheReadTokens ?? 0) || 0;
+  let cacheWriteTokens = Number(evData?.cacheWriteTokens ?? 0) || 0;
+  let rawEligible = evData?.cacheEligibleInputTokens;
+
+  if (inputTokens === 0) {
+    const usageRows = store.db
+      .prepare(
+        "SELECT detailJson FROM runtime_metrics_events WHERE turnId=? AND kind='provider_usage'",
+      )
+      .all(turnId);
+    if (usageRows.length > 0) {
+      let aggIn = 0;
+      let aggOut = 0;
+      let aggRead = 0;
+      let aggWrite = 0;
+      let aggEligible = 0;
+      let hasEligible = false;
+      for (const uRow of usageRows) {
+        let detail = null;
+        try {
+          detail = uRow?.detailJson ? JSON.parse(uRow.detailJson) : null;
+        } catch {
+          detail = null;
+        }
+        if (!detail || typeof detail !== 'object') continue;
+        aggIn += Number(detail.inputTokens ?? 0) || 0;
+        aggOut += Number(detail.outputTokens ?? 0) || 0;
+        aggRead += Number(detail.cacheReadTokens ?? 0) || 0;
+        aggWrite += Number(detail.cacheWriteTokens ?? 0) || 0;
+        if (
+          detail.cacheEligibleInputTokens != null &&
+          Number.isFinite(Number(detail.cacheEligibleInputTokens))
+        ) {
+          aggEligible += Number(detail.cacheEligibleInputTokens);
+          hasEligible = true;
+        }
+      }
+      if (aggIn > 0) inputTokens = aggIn;
+      if (aggOut > 0 && outputTokens === 0) outputTokens = aggOut;
+      if (aggRead > 0 && cacheReadTokens === 0) cacheReadTokens = aggRead;
+      if (aggWrite > 0 && cacheWriteTokens === 0) cacheWriteTokens = aggWrite;
+      if (hasEligible && rawEligible == null) rawEligible = aggEligible;
+    }
+  }
+
+  const hasExplicitEligible =
+    rawEligible != null && Number.isFinite(Number(rawEligible)) && Number(rawEligible) > 0;
+  const hasLegacyFallback =
+    rawEligible == null && (cacheReadTokens > 0 || cacheWriteTokens > 0) && inputTokens > 0;
+  const cacheEligibleInputTokens = hasExplicitEligible
+    ? Number(rawEligible)
+    : hasLegacyFallback
+      ? inputTokens
+      : null;
+  const cacheStatus = cacheEligibleInputTokens != null ? 'available' : 'missing';
   const cacheHitRate =
-    cacheEligibleInputTokens > 0
+    cacheEligibleInputTokens != null && cacheEligibleInputTokens > 0
       ? round4(Math.min(1, cacheReadTokens / cacheEligibleInputTokens))
-      : 0;
+      : null;
 
   const admissionOriginalTokens = Number(aciMetrics?.admissionOriginalTokens ?? 0) || 0;
   const admissionInjectedTokens = Number(aciMetrics?.admissionInjectedTokens ?? 0) || 0;
@@ -1415,6 +1520,10 @@ function extractTurnTelemetryRow({
     store.db
       .prepare('SELECT COUNT(*) AS n FROM tool_receipts WHERE sessionId=? AND turnId=?')
       .get(sessionId, turnId)?.n ?? 0;
+  let steps = Math.max(Number(evData?.steps ?? 0) || 0, Number(turnRow?.step ?? 0) || 0);
+  if (steps === 0 && Number(receiptCount) > 0) {
+    steps = Number(receiptCount) || 0;
+  }
 
   const nonEmptyPatch = String(modelPatch ?? '').trim().length > 0;
   const status = String(turnRow?.state ?? (evRow?.type === 'turn/completed' ? 'completed' : 'failed'));
@@ -1425,13 +1534,14 @@ function extractTurnTelemetryRow({
     model: modelName,
     status,
     wallClockMs,
-    steps: Number(evData?.steps ?? turnRow?.step ?? 0) || 0,
+    steps,
     inputTokens,
     outputTokens,
     totalTokens: inputTokens + outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
     cacheEligibleInputTokens,
+    cacheStatus,
     cacheHitRate,
     nonEmptyPatch,
     patchBytes: Buffer.byteLength(String(modelPatch ?? ''), 'utf8'),
@@ -1506,8 +1616,9 @@ function buildEnvErrorTelemetryRow({ instance, arm, modelName, wallClockMs = 1, 
     totalTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
-    cacheEligibleInputTokens: 0,
-    cacheHitRate: 0,
+    cacheEligibleInputTokens: null,
+    cacheStatus: 'missing',
+    cacheHitRate: null,
     nonEmptyPatch: false,
     patchBytes: 0,
     admissionOriginalTokens: 0,
@@ -1671,7 +1782,8 @@ async function runSweBenchInstanceArm({
   const started = performance.now();
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-swe-state-${arm}-`));
   const store = new Store(join(stateDir, 'swebench.sqlite'));
-  const pool = new AccountPool(store, { root: stateDir });
+  const metrics = new MetricsCollector({ store });
+  const pool = new AccountPool(store, { root: stateDir, metrics });
 
   const containerMode = Boolean(!opts.dryRun && (opts.dockerImage || opts.dockerPreset));
   let resolvedModel = opts.model || null;
@@ -1769,6 +1881,7 @@ async function runSweBenchInstanceArm({
   const direct = new DirectAgentRuntime(store, pool, {
     defaultWorkspace: workspaceRoot,
     dataRoot: stateDir,
+    metrics,
     ...(effectiveAdapter ? { adapter: effectiveAdapter } : {}),
   });
 
@@ -1873,7 +1986,12 @@ async function runSweBenchInstanceArm({
       isSynthetic: Boolean(opts.dryRun),
     });
 
-    const timeoutMs = opts.dryRun ? 60_000 : 600_000;
+    const timeoutMs =
+      opts.turnTimeoutMs != null && Number.isFinite(Number(opts.turnTimeoutMs)) && Number(opts.turnTimeoutMs) > 0
+        ? Math.trunc(Number(opts.turnTimeoutMs))
+        : opts.dryRun
+          ? DEFAULT_DRY_RUN_TURN_TIMEOUT_MS
+          : DEFAULT_LIVE_TURN_TIMEOUT_MS;
     const deadline = performance.now() + timeoutMs;
     let turnRow = null;
     while (performance.now() < deadline) {
@@ -1949,6 +2067,12 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     arms: Array.isArray(rawOpts.arms) && rawOpts.arms.length ? [...rawOpts.arms] : [...DEFAULT_ARMS],
     model: rawOpts.model ?? null,
     maxSteps: Math.min(MAX_ALLOWED_STEPS, Math.max(1, Number(rawOpts.maxSteps ?? DEFAULT_MAX_STEPS))),
+    turnTimeoutMs:
+      rawOpts.turnTimeoutMs != null && Number.isFinite(Number(rawOpts.turnTimeoutMs)) && Number(rawOpts.turnTimeoutMs) > 0
+        ? Math.trunc(Number(rawOpts.turnTimeoutMs))
+        : Boolean(rawOpts.dryRun)
+          ? DEFAULT_DRY_RUN_TURN_TIMEOUT_MS
+          : DEFAULT_LIVE_TURN_TIMEOUT_MS,
     outputDir: rawOpts.outputDir ?? null,
     workspaceRoot: rawOpts.workspaceRoot ?? null,
     dockerImage: rawOpts.dockerImage ?? null,
@@ -2071,8 +2195,9 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         totalTokens: 0,
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
-        cacheEligibleInputTokens: 0,
-        cacheHitRate: 0,
+        cacheEligibleInputTokens: null,
+        cacheStatus: 'missing',
+        cacheHitRate: null,
         nonEmptyPatch: Boolean(predById.get(er.instance_id)?.model_patch?.trim()),
         admissionOriginalTokens: 0,
         admissionInjectedTokens: 0,

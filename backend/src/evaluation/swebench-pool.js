@@ -782,33 +782,39 @@ export function resolveLiveProviderConfig(opts = {}, env = process.env) {
 }
 
 /**
- * Returns true for thinking/reasoning models (e.g. deepseek-reasoner, r1, o1, o3, o4, thinking, qwq)
+ * Returns true for thinking/reasoning models (e.g. deepseek-reasoner, deepseek-v4, r1, o1, o3, o4, thinking, qwq)
  * that must be decoupled from synchronous ACI admission supervisor calls.
  */
-export function isThinkingOrReasoningModel(modelId) {
+export function isThinkingOrReasoningModel(modelId, capabilities = null) {
+  if (capabilities && typeof capabilities === 'object' && capabilities.reasoning === true) {
+    return true;
+  }
   const id = String(modelId ?? '').trim().toLowerCase();
   if (!id) return false;
   return (
     REASONING_MODEL_TOKEN_RE.test(id) ||
     REASONING_MODEL_PREFIX_RE.test(id) ||
-    /deepseek-(?:r1|reasoner)/i.test(id)
+    /deepseek-(?:r1|reasoner)/i.test(id) ||
+    /\bdeepseek-v4\b/i.test(id)
   );
 }
 
 function collectFastSupervisorCandidateModels({ mainModel, availableModels = [], targetPool = null }) {
   const mainFamily = inferModelFamily(mainModel);
+  const mainNorm = String(mainModel ?? '').trim().toLowerCase();
   const now = Date.now();
   const candidates = new Map();
 
-  const register = (rawName, healthyHint = true) => {
+  const register = (rawName, healthyHint = true, capabilities = null) => {
     const name = String(rawName ?? '').trim();
     if (!name) return;
     const prev = candidates.get(name);
     if (prev) {
       prev.healthy = prev.healthy && healthyHint;
+      if (!prev.capabilities && capabilities) prev.capabilities = capabilities;
       return;
     }
-    candidates.set(name, { model: name, healthy: healthyHint });
+    candidates.set(name, { model: name, healthy: healthyHint, capabilities });
   };
 
   if (Array.isArray(availableModels)) {
@@ -818,7 +824,7 @@ function collectFastSupervisorCandidateModels({ mainModel, availableModels = [],
       } else if (item && typeof item === 'object') {
         const name = item.alias ?? item.id ?? item.upstreamModel ?? item.model;
         const healthyHint = item.healthy !== false && item.enabled !== false;
-        register(name, healthyHint);
+        register(name, healthyHint, item.capabilities ?? null);
       }
     }
   }
@@ -830,7 +836,8 @@ function collectFastSupervisorCandidateModels({ mainModel, availableModels = [],
       if (!alias) continue;
       const routes = typeof targetPool.resolveRoutes === 'function' ? targetPool.resolveRoutes(alias) : [];
       const healthy = typeof targetPool.resolveRoutes === 'function' ? isHealthyRouteList(routes, now) : true;
-      register(alias, healthy);
+      const caps = catalog?.profiles?.[alias]?.capabilities ?? item?.capabilities ?? null;
+      register(alias, healthy, caps);
     }
   }
 
@@ -838,9 +845,11 @@ function collectFastSupervisorCandidateModels({ mainModel, availableModels = [],
   for (const entry of candidates.values()) {
     const name = entry.model;
     if (!entry.healthy) continue;
-    if (isThinkingOrReasoningModel(name)) continue;
+    if (mainNorm && name.toLowerCase() === mainNorm) continue;
+    if (isThinkingOrReasoningModel(name, entry.capabilities)) continue;
     if (UTILITY_MODEL_RE.test(name)) continue;
     if (HEAVY_NON_REASONING_RE.test(name)) continue;
+    if (!FAST_TIER_MODEL_RE.test(name) && !/^deepseek-chat$/i.test(name)) continue;
 
     if (targetPool && typeof targetPool.resolveRoutes === 'function') {
       const routes = targetPool.resolveRoutes(name);
@@ -862,7 +871,7 @@ function collectFastSupervisorCandidateModels({ mainModel, availableModels = [],
 /**
  * Computes the ACI ContextSupervisor configuration for a benchmark `(arm, mainModel)` run,
  * enforcing deterministic admission fallback whenever `mainModel` is a slow reasoning/thinking
- * model and no fast healthy non-reasoning side model is bound.
+ * model or no distinct lightweight non-reasoning side model exists in the pool.
  */
 export function resolveSupervisorExecutionConfig({
   arm,
@@ -911,35 +920,28 @@ export function resolveSupervisorExecutionConfig({
     };
   }
 
-  if (isThinkingOrReasoningModel(mainModel)) {
-    const fastModel = collectFastSupervisorCandidateModels({
-      mainModel,
-      availableModels,
-      targetPool,
-    });
-    if (fastModel) {
-      return {
-        enabled: true,
-        mode: 'custom',
-        model: fastModel,
-        admissionEnabled: true,
-        reason: 'auto_fast_model',
-      };
-    }
+  const fastModel = collectFastSupervisorCandidateModels({
+    mainModel,
+    availableModels,
+    targetPool,
+  });
+  if (fastModel) {
     return {
-      enabled: false,
-      mode: 'off',
-      model: null,
+      enabled: true,
+      mode: 'custom',
+      model: fastModel,
       admissionEnabled: true,
-      reason: 'reasoning_main_deterministic_fallback',
+      reason: 'auto_fast_model',
     };
   }
 
   return {
-    enabled: true,
-    mode: 'auto',
+    enabled: false,
+    mode: 'off',
     model: null,
     admissionEnabled: true,
-    reason: 'auto',
+    reason: isThinkingOrReasoningModel(mainModel)
+      ? 'reasoning_main_deterministic_fallback'
+      : 'no_distinct_fast_model_deterministic_fallback',
   };
 }

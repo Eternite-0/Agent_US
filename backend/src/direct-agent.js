@@ -222,6 +222,7 @@ export class DirectAgentRuntime {
     );
 
     this.activeTurns = new Map(); // turnId -> { controller, sessionId }
+    this.activeTurnPromises = new Map(); // turnId -> Promise
     this.activeSessionTurn = new Map(); // sessionId -> turnId
     this.steeringQueues = new Map(); // sessionId -> string[]
     this.readFileStates = new Map(); // sessionId -> Map(relPath -> { sha256, at })
@@ -655,8 +656,12 @@ export class DirectAgentRuntime {
       if (!row) throw new Fault('TURN_NOT_FOUND', 404);
       if (['completed', 'failed', 'cancelled'].includes(row.state)) {
         const pendingDones = [];
+        const activeTurnPromise = this.activeTurnPromises?.get?.(id);
+        if (activeTurnPromise) {
+          pendingDones.push(activeTurnPromise);
+        }
         for (const entry of this.recoveryWorker?.active?.values?.() ?? []) {
-          if (entry?.turnId === id && entry?.done) {
+          if (entry?.turnId === id && entry?.done && !pendingDones.includes(entry.done)) {
             pendingDones.push(entry.done);
           }
         }
@@ -2005,42 +2010,48 @@ export class DirectAgentRuntime {
           this.turnAciStates.set(turnId, turnAciState);
         }
 
+        const turnPromise = this.#runTurnLoop({
+          sessionId,
+          turnId,
+          input: payload.input ?? '',
+          model: resolvedModel,
+          mode: payload.mode ?? session.mode ?? 'direct',
+          permissionMode: payload.permissionMode ?? session.permissionMode ?? 'auto-safe',
+          effort: payload.effort ?? null,
+          workspaceRoot: payload.workspaceRoot ?? session.workspaceRoot ?? this.getWorkspaceRoot(),
+          maxSteps: (() => {
+            const rawSteps = Number(payload.maxSteps ?? 40);
+            return Number.isFinite(rawSteps) && rawSteps > 0
+              ? Math.min(80, Math.max(1, Math.trunc(rawSteps)))
+              : 40;
+          })(),
+          finalVerificationReserve: payload.finalVerificationReserve ?? null,
+          evidenceContract: payload.evidenceContract ?? null,
+          aciProfile: payload.aciProfile,
+          aciOptions: payload.aciOptions,
+          turnAciLedger: turnAciState.turnAciLedger,
+          turnReadFiles: turnAciState.turnReadFiles,
+          turnAciStore: turnAciState.turnAciStore,
+          initialStep: checkpoint?.step ?? payload.resumedFromStep ?? 0,
+          isRecovery: Boolean(job.reclaimedFromCrash || checkpoint?.step > 0 || job.attempts > 1),
+          canRetry: job.attempts < job.maxAttempts,
+          leaseGuard,
+          signal: combinedSignal,
+          trafficSource: classifiedTraffic.trafficSource,
+          isSynthetic: classifiedTraffic.isSynthetic,
+          distillSyntheticTurns: Boolean(payload.distillSyntheticTurns),
+        });
+        this.activeTurnPromises.set(turnId, turnPromise);
         try {
-          await this.#runTurnLoop({
-            sessionId,
-            turnId,
-            input: payload.input ?? '',
-            model: resolvedModel,
-            mode: payload.mode ?? session.mode ?? 'direct',
-            permissionMode: payload.permissionMode ?? session.permissionMode ?? 'auto-safe',
-            effort: payload.effort ?? null,
-            workspaceRoot: payload.workspaceRoot ?? session.workspaceRoot ?? this.getWorkspaceRoot(),
-            maxSteps: (() => {
-              const rawSteps = Number(payload.maxSteps ?? 40);
-              return Number.isFinite(rawSteps) && rawSteps > 0
-                ? Math.min(80, Math.max(1, Math.trunc(rawSteps)))
-                : 40;
-            })(),
-            finalVerificationReserve: payload.finalVerificationReserve ?? null,
-            evidenceContract: payload.evidenceContract ?? null,
-            aciProfile: payload.aciProfile,
-            aciOptions: payload.aciOptions,
-            turnAciLedger: turnAciState.turnAciLedger,
-            turnReadFiles: turnAciState.turnReadFiles,
-            turnAciStore: turnAciState.turnAciStore,
-            initialStep: checkpoint?.step ?? payload.resumedFromStep ?? 0,
-            isRecovery: Boolean(job.reclaimedFromCrash || checkpoint?.step > 0 || job.attempts > 1),
-            canRetry: job.attempts < job.maxAttempts,
-            leaseGuard,
-            signal: combinedSignal,
-            trafficSource: classifiedTraffic.trafficSource,
-            isSynthetic: classifiedTraffic.isSynthetic,
-            distillSyntheticTurns: Boolean(payload.distillSyntheticTurns),
-          });
+          await turnPromise;
         } catch (err) {
           if (isLeaseLostError(err)) throw err;
           if (this.closed || !this.store.db?.isOpen) return;
           throw err;
+        } finally {
+          if (this.activeTurnPromises.get(turnId) === turnPromise) {
+            this.activeTurnPromises.delete(turnId);
+          }
         }
       },
     );
@@ -2203,6 +2214,7 @@ export class DirectAgentRuntime {
     let totalCacheWrite = null;
     let totalCacheEligible = null;
     let steps = initialStep;
+    let assistantStepCount = initialStep;
     let effectiveModel = model || null;
     let contextWindow = 128_000;
     let actualProvider = 'pool';
@@ -2544,13 +2556,17 @@ export class DirectAgentRuntime {
           aciStore,
           ledger: aciLedger,
           supervisor: this.contextSupervisor,
+          mainModel: effectiveModel,
           criticalFiles: evidenceContract?.requiredChangedFiles ?? [],
           priorReadFiles: turnReadFiles ? [...turnReadFiles] : [],
           aciProfile: aciResolved.aciProfile,
           admissionEnabled: aciResolved.admissionEnabled,
           dtocEnabled: aciResolved.dtocEnabled,
           supervisorEnabled: aciResolved.supervisorEnabled,
-          supervisorConfigOverride: aciResolved.supervisorConfigOverride,
+          supervisorConfigOverride: {
+            ...aciResolved.supervisorConfigOverride,
+            mainModel: effectiveModel,
+          },
         },
         messages: assembled.messages,
         tools: effectiveTools,
@@ -2607,6 +2623,7 @@ export class DirectAgentRuntime {
           return queued?.length ? queued.splice(0) : [];
         },
         onAssistantMessage: ({ text, reasoning, toolCalls }) => {
+          assistantStepCount += 1;
           this.store.tx(() => {
             assertLeaseInTx(leaseGuard, { sessionId, turnId });
             this.store.db
@@ -2852,6 +2869,9 @@ export class DirectAgentRuntime {
               steps,
               inputTokens: totalIn,
               outputTokens: totalOut,
+              cacheReadTokens: totalCacheRead,
+              cacheWriteTokens: totalCacheWrite,
+              cacheEligibleInputTokens: totalCacheEligible,
               error: errorMessage,
               code: errorCode,
               verdict: finalVerdict,
@@ -3150,7 +3170,8 @@ export class DirectAgentRuntime {
       if (this.closed || !this.store.db?.isOpen) return;
       const classified = classifyError(err);
 
-      // Recover partial token usage & route metadata attached by AgentLoop/InferenceEngine
+      // Recover partial token usage & route metadata attached by AgentLoop/InferenceEngine,
+      // checkpointStore, and MetricsCollector provider_usage events.
       const errUsage = classified.usage || err?.usage || err?.partialUsage || null;
       if (errUsage) {
         totalIn = Math.max(totalIn, Number(errUsage.inputTokens ?? 0));
@@ -3159,9 +3180,46 @@ export class DirectAgentRuntime {
         if (errUsage.cacheWriteTokens != null) totalCacheWrite = Math.max(totalCacheWrite ?? 0, errUsage.cacheWriteTokens);
         totalCacheEligible = errUsage.cacheEligibleInputTokens ?? totalCacheEligible;
       }
+      const cpSnapshot = this.checkpointStore?.loadLatest?.(turnId) ?? null;
+      if (cpSnapshot?.state) {
+        totalIn = Math.max(totalIn, Number(cpSnapshot.state.totalIn ?? 0) || 0);
+        totalOut = Math.max(totalOut, Number(cpSnapshot.state.totalOut ?? 0) || 0);
+        if (cpSnapshot.state.totalCacheRead != null) {
+          totalCacheRead = Math.max(totalCacheRead ?? 0, Number(cpSnapshot.state.totalCacheRead) || 0);
+        }
+        if (cpSnapshot.state.totalCacheWrite != null) {
+          totalCacheWrite = Math.max(totalCacheWrite ?? 0, Number(cpSnapshot.state.totalCacheWrite) || 0);
+        }
+        if (cpSnapshot.state.totalCacheEligible != null) {
+          totalCacheEligible = Math.max(totalCacheEligible ?? 0, Number(cpSnapshot.state.totalCacheEligible) || 0);
+        }
+      }
+      const metricsUsage = this.metrics?.getTurnProviderUsage?.(turnId) ?? null;
+      if (metricsUsage) {
+        totalIn = Math.max(totalIn, Number(metricsUsage.inputTokens ?? 0) || 0);
+        totalOut = Math.max(totalOut, Number(metricsUsage.outputTokens ?? 0) || 0);
+        if (metricsUsage.cacheReadTokens != null) {
+          totalCacheRead = Math.max(totalCacheRead ?? 0, Number(metricsUsage.cacheReadTokens) || 0);
+        }
+        if (metricsUsage.cacheWriteTokens != null) {
+          totalCacheWrite = Math.max(totalCacheWrite ?? 0, Number(metricsUsage.cacheWriteTokens) || 0);
+        }
+        if (metricsUsage.cacheEligibleInputTokens != null) {
+          totalCacheEligible = Math.max(totalCacheEligible ?? 0, Number(metricsUsage.cacheEligibleInputTokens) || 0);
+        }
+      }
       const errRoute = classified.route || err?.route || null;
       if (errRoute?.provider) actualProvider = errRoute.provider;
+      else if (metricsUsage?.provider && (!actualProvider || actualProvider === 'pool')) {
+        actualProvider = metricsUsage.provider;
+      }
       if (errRoute?.accountId) actualAccountId = errRoute.accountId;
+      steps = Math.max(
+        steps,
+        Number(classified.steps ?? err?.steps ?? 0) || 0,
+        Number(cpSnapshot?.step ?? 0) || 0,
+        assistantStepCount,
+      );
 
       // Graceful shutdown abort keeps turn recoverable (never marks cancelled/failed)
       if (
@@ -3196,8 +3254,23 @@ export class DirectAgentRuntime {
         }
       }
 
+      const preCatchTurn = this.store.db
+        .prepare('SELECT state, phase, step FROM direct_turns WHERE id=?')
+        .get(turnId);
+      const jobCancelled =
+        leaseGuard?.jobId &&
+        this.store.db.prepare('SELECT status FROM runtime_jobs WHERE id=?').get(leaseGuard.jobId)?.status ===
+          'cancelled';
+      const isCancelledTurn =
+        Boolean(signal?.aborted) &&
+        signal?.reason !== 'lease_lost' &&
+        preCatchTurn?.state === 'cancelled' &&
+        (!leaseGuard?.jobId || jobCancelled);
+
       // Fix D6 / D7 / P0-1: NEVER swallow LEASE_LOST before RecoveryWorker.#runJob sees it!
-      if (isLeaseLostError(classified)) {
+      // When cancelTurn() cancelled the job/turn while the loop was unwinding, persist final
+      // cancellation telemetry before exiting cleanly.
+      if (isLeaseLostError(classified) && !isCancelledTurn) {
         turnFencedOrTerminal = true;
         if (signal?.aborted && catchReasoningMetrics) {
           this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
@@ -3217,7 +3290,7 @@ export class DirectAgentRuntime {
       if (classified.code === 'RECONCILIATION_REQUIRED' || classified.code === 'APPROVAL_PARKED') {
         throw classified;
       }
-      if (!checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
+      if (!isCancelledTurn && !checkLeaseHeld(leaseGuard, { sessionId, turnId })) {
         turnFencedOrTerminal = true;
         if (signal?.aborted && catchReasoningMetrics) {
           this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
@@ -3240,17 +3313,16 @@ export class DirectAgentRuntime {
 
       const durationMs = Date.now() - started;
       const finishedAt = Date.now();
-      const isCancelled = signal.aborted || classified.category === 'cancellation';
+      const isCancelled = Boolean(signal?.aborted || classified.category === 'cancellation' || isCancelledTurn);
       const message = String(classified?.detail?.message ?? classified?.message ?? err);
       const nextState = isCancelled ? 'cancelled' : 'failed';
 
-      const currentTurn = this.store.db
-        .prepare('SELECT state, phase, step FROM direct_turns WHERE id=?')
-        .get(turnId);
-      if (!currentTurn || ['completed', 'failed', 'cancelled'].includes(currentTurn.state)) {
-        if (isCancelled && currentTurn?.state === 'cancelled' && catchReasoningMetrics) {
-          this.#backfillCancelledReasoningMetrics(turnId, catchReasoningMetrics);
-        }
+      const currentTurn = preCatchTurn;
+      if (
+        !currentTurn ||
+        ['completed', 'failed'].includes(currentTurn.state) ||
+        (!isCancelled && currentTurn.state === 'cancelled')
+      ) {
         return;
       }
 
@@ -3258,32 +3330,79 @@ export class DirectAgentRuntime {
         throw classified;
       }
 
+      const catchSteps = Math.max(
+        Number(classified.steps ?? 0) || 0,
+        Number(steps || 0),
+        Number(currentTurn?.step ?? 0) || 0,
+      );
       const totalTokens = totalIn + totalOut;
       let outbox = null;
       try {
         outbox = this.store.tx(() => {
-          assertLeaseInTx(leaseGuard, { sessionId, turnId });
+          const txTurn = this.store.db
+            .prepare('SELECT state, phase, step, finishedAt FROM direct_turns WHERE id=?')
+            .get(turnId);
+          if (!txTurn || ['completed', 'failed'].includes(txTurn.state)) return null;
+          if (!isCancelled || txTurn.state !== 'cancelled') {
+            assertLeaseInTx(leaseGuard, { sessionId, turnId });
+          } else if (leaseGuard?.jobId) {
+            const txJob = this.store.db
+              .prepare('SELECT status, fence FROM runtime_jobs WHERE id=?')
+              .get(leaseGuard.jobId);
+            if (txJob && txJob.status === 'active' && txJob.fence !== leaseGuard.fence) {
+              throw new RecoveryError('LEASE_LOST', {
+                message: `Lease lost during cancelled turn ${turnId}`,
+                detail: { jobId: leaseGuard.jobId, turnId },
+              });
+            }
+          }
+
           const res = this.store.db
             .prepare(
-              "UPDATE direct_turns SET state=?, phase=?, error=?, inputTokens=?, outputTokens=?, durationMs=?, finishedAt=?, activeFence=NULL WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
+              "UPDATE direct_turns SET state=?, phase=?, error=?, step=MAX(COALESCE(step, 0), ?), inputTokens=?, outputTokens=?, durationMs=?, finishedAt=?, activeFence=NULL WHERE id=? AND state NOT IN ('completed','failed','cancelled')",
             )
             .run(
               nextState,
               nextState,
               isCancelled ? null : message.slice(0, 1000),
+              catchSteps,
               totalIn,
               totalOut,
               durationMs,
               finishedAt,
               turnId,
             );
-          if ((res.changes ?? 0) === 0) return null;
-          this.store.db
-            .prepare(
-              "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
-            )
-            .run(nextState, finishedAt, sessionId);
-          if (totalTokens > 0 && effectiveModel) {
+          if ((res.changes ?? 0) === 0) {
+            if (!isCancelled || txTurn.state !== 'cancelled') return null;
+            this.store.db
+              .prepare(
+                `UPDATE direct_turns
+                 SET step = MAX(COALESCE(step, 0), ?),
+                     inputTokens = MAX(COALESCE(inputTokens, 0), ?),
+                     outputTokens = MAX(COALESCE(outputTokens, 0), ?),
+                     durationMs = COALESCE(NULLIF(durationMs, 0), ?),
+                     finishedAt = COALESCE(finishedAt, ?),
+                     activeFence = NULL
+                 WHERE id=? AND state='cancelled'`,
+              )
+              .run(catchSteps, totalIn, totalOut, durationMs, finishedAt, turnId);
+          } else {
+            this.store.db
+              .prepare(
+                "UPDATE direct_sessions SET state=?, updatedAt=? WHERE id=? AND state NOT IN ('cancelled','completed')",
+              )
+              .run(nextState, finishedAt, sessionId);
+          }
+          const usageAt = txTurn.finishedAt ?? finishedAt;
+          const alreadyHasUsage =
+            totalTokens > 0 && effectiveModel
+              ? this.store.db
+                  .prepare(
+                    'SELECT 1 FROM nexus_usage WHERE sessionId=? AND model=? AND inputTokens=? AND outputTokens=? AND createdAt>=? LIMIT 1',
+                  )
+                  .get(sessionId, effectiveModel, totalIn, totalOut, started)
+              : null;
+          if (totalTokens > 0 && effectiveModel && !alreadyHasUsage) {
             this.store.db
               .prepare(
                 `INSERT INTO nexus_usage(
@@ -3303,27 +3422,32 @@ export class DirectAgentRuntime {
                 durationMs,
                 trafficSource,
                 isSynthetic ? 1 : 0,
-                finishedAt,
+                usageAt,
               );
           }
-          convergeScheduledRunForTurn(this.store, turnId, {
-            status: nextState,
-            error: isCancelled ? null : message.slice(0, 1000),
-            finishedAt,
-          });
-          const phaseEv = this.eventRouter.insertPersistedInTx({
-            sessionId,
-            turnId,
-            type: RUNTIME_EVENTS.TURN_PHASE_CHANGED,
-            data: {
-              from: classified.deferredPhaseTransition?.from || currentTurn.phase || 'running',
-              to: nextState,
-              step: classified.steps ?? steps,
-              reason: classified.code || nextState,
-            },
-            audit: false,
-            at: finishedAt,
-          });
+          if ((res.changes ?? 0) > 0) {
+            convergeScheduledRunForTurn(this.store, turnId, {
+              status: nextState,
+              error: isCancelled ? null : message.slice(0, 1000),
+              finishedAt,
+            });
+          }
+          const phaseEv =
+            (res.changes ?? 0) > 0
+              ? this.eventRouter.insertPersistedInTx({
+                  sessionId,
+                  turnId,
+                  type: RUNTIME_EVENTS.TURN_PHASE_CHANGED,
+                  data: {
+                    from: classified.deferredPhaseTransition?.from || currentTurn.phase || 'running',
+                    to: nextState,
+                    step: catchSteps,
+                    reason: classified.code || nextState,
+                  },
+                  audit: false,
+                  at: finishedAt,
+                })
+              : null;
           const termEv = this.eventRouter.insertPersistedInTx({
             sessionId,
             turnId,
@@ -3334,6 +3458,7 @@ export class DirectAgentRuntime {
                   sessionId,
                   model: effectiveModel,
                   provider: actualProvider,
+                  steps: catchSteps,
                   inputTokens: totalIn,
                   outputTokens: totalOut,
                   cacheReadTokens: totalCacheRead,
@@ -3349,6 +3474,7 @@ export class DirectAgentRuntime {
                   sessionId,
                   model: effectiveModel,
                   provider: actualProvider,
+                  steps: catchSteps,
                   inputTokens: totalIn,
                   outputTokens: totalOut,
                   cacheReadTokens: totalCacheRead,
@@ -3372,7 +3498,7 @@ export class DirectAgentRuntime {
       }
 
       if (outbox) {
-        this.eventRouter.fanoutPersisted(outbox.phaseEv);
+        if (outbox.phaseEv) this.eventRouter.fanoutPersisted(outbox.phaseEv);
         this.eventRouter.fanoutPersisted(outbox.termEv);
 
         safeIsolateSideEffect(() => {
