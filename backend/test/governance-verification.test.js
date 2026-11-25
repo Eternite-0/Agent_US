@@ -9,7 +9,7 @@ import { rmDirSafe } from './fixtures.js';
 import { Store } from '../src/store.js';
 import { AccountPool } from '../src/pool.js';
 import { DirectAgentRuntime } from '../src/direct-agent.js';
-import { EvidenceVerifier } from '../src/governance/verifier.js';
+import { EvidenceVerifier, isExplicitFileDeleteCommand } from '../src/governance/verifier.js';
 import { buildRepairNote } from '../src/verifier.js';
 import { ScheduledTaskRunner } from '../src/governance/scheduler.js';
 import { ControlPlane } from '../src/governance/control-plane.js';
@@ -372,6 +372,238 @@ test('P6 EvidenceVerifier tolerates explicitly cleaned temporary files while kee
     });
     assert.equal(reorderedRes.accepted, false);
     assert.ok(reorderedRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+  } finally {
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  }
+});
+
+test('P6 EvidenceVerifier recognizes container /testbed/ paths, git clean -f*, and Python inline deletions', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-p6-container-del-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-p6-container-del-work-'));
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const verifier = new EvidenceVerifier({ store });
+
+  try {
+    writeFileSync(join(workDir, 'keep.py'), 'ok = True\n', 'utf8');
+
+    // 1. Container /testbed/ rm -f deletion matches workspace-relative write_file path
+    const containerRmRes = verifier.verify({
+      sessionId: 's-container',
+      turnId: 't-rm-testbed',
+      workspaceRoot: workDir,
+      text: '已修复并清理临时测试文件。',
+      node: { requiredFiles: ['keep.py'] },
+      execution: { files: { 'keep.py': true } },
+      events: [
+        { type: 'tool/call', data: { callId: 'w1', name: 'write_file', arguments: { path: 'keep.py' } } },
+        { type: 'tool/result', data: { callId: 'w1', name: 'write_file', isError: false, receipt: { callId: 'w1' } } },
+        {
+          type: 'tool/call',
+          data: { callId: 'w2', name: 'write_file', arguments: { path: 'tests/test_tmp_env_versions.py' } },
+        },
+        { type: 'tool/result', data: { callId: 'w2', name: 'write_file', isError: false, receipt: { callId: 'w2' } } },
+        {
+          type: 'tool/call',
+          data: {
+            callId: 'b1',
+            name: 'bash',
+            arguments: { command: 'rm -f /testbed/tests/test_tmp_env_versions.py' },
+          },
+        },
+        { type: 'tool/result', data: { callId: 'b1', name: 'bash', isError: false, receipt: { callId: 'b1', exitCode: 0 } } },
+      ],
+    });
+    assert.equal(containerRmRes.accepted, true, containerRmRes.reasons.join('; '));
+    assert.deepEqual(containerRmRes.checks.cleanedUpTempFiles, ['tests/test_tmp_env_versions.py']);
+
+    // 2. write_file with /testbed/ prefix aligns with delete_file using relative path (and vice versa)
+    const alignedDeleteToolRes = verifier.verify({
+      sessionId: 's-container',
+      turnId: 't-align-del',
+      workspaceRoot: workDir,
+      text: '已清理临时脚本。',
+      events: [
+        {
+          type: 'tool/call',
+          data: { callId: 'a1', name: 'write_file', arguments: { path: '/testbed/tests/test_tmp_align.py' } },
+        },
+        { type: 'tool/result', data: { callId: 'a1', name: 'write_file', isError: false, receipt: { callId: 'a1' } } },
+        {
+          type: 'tool/call',
+          data: { callId: 'a2', name: 'delete_file', arguments: { path: 'tests/test_tmp_align.py' } },
+        },
+        { type: 'tool/result', data: { callId: 'a2', name: 'delete_file', isError: false, receipt: { callId: 'a2' } } },
+        {
+          type: 'tool/call',
+          data: { callId: 'a3', name: 'write_file', arguments: { path: 'tests/test_tmp_work.py' } },
+        },
+        { type: 'tool/result', data: { callId: 'a3', name: 'write_file', isError: false, receipt: { callId: 'a3' } } },
+        {
+          type: 'tool/call',
+          data: { callId: 'a4', name: 'delete_file', arguments: { path: '/work/tests/test_tmp_work.py' } },
+        },
+        { type: 'tool/result', data: { callId: 'a4', name: 'delete_file', isError: false, receipt: { callId: 'a4' } } },
+      ],
+    });
+    assert.equal(alignedDeleteToolRes.accepted, true, alignedDeleteToolRes.reasons.join('; '));
+    assert.deepEqual(alignedDeleteToolRes.checks.cleanedUpTempFiles, [
+      'tests/test_tmp_align.py',
+      'tests/test_tmp_work.py',
+    ]);
+
+    // 3. Confinement check: delete_file with path traversal outside /testbed/ must NOT match
+    const escapeDelRes = verifier.verify({
+      sessionId: 's-container',
+      turnId: 't-escape-del',
+      workspaceRoot: workDir,
+      text: '已清理。',
+      events: [
+        {
+          type: 'tool/call',
+          data: { callId: 'e1', name: 'write_file', arguments: { path: 'tests/test_tmp_safe.py' } },
+        },
+        { type: 'tool/result', data: { callId: 'e1', name: 'write_file', isError: false, receipt: { callId: 'e1' } } },
+        {
+          type: 'tool/call',
+          data: { callId: 'e2', name: 'delete_file', arguments: { path: '/testbed/../outside/test_tmp_safe.py' } },
+        },
+        { type: 'tool/result', data: { callId: 'e2', name: 'delete_file', isError: false, receipt: { callId: 'e2' } } },
+      ],
+    });
+    assert.equal(escapeDelRes.accepted, false);
+    assert.ok(escapeDelRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+
+    // 4. git clean -fd and git clean -fdx -- tests/test_tmp_env_versions.py
+    for (const [idx, cmd] of [
+      'git clean -fd',
+      'git clean -fdx -- tests/test_tmp_env_versions.py',
+      'git clean -fd tests',
+      'git clean -f',
+    ].entries()) {
+      const res = verifier.verify({
+        sessionId: 's-container',
+        turnId: `t-git-clean-${idx}`,
+        workspaceRoot: workDir,
+        text: '已清理工作区。',
+        events: [
+          {
+            type: 'tool/call',
+            data: { callId: `gc-w-${idx}`, name: 'write_file', arguments: { path: 'tests/test_tmp_env_versions.py' } },
+          },
+          { type: 'tool/result', data: { callId: `gc-w-${idx}`, name: 'write_file', isError: false, receipt: { callId: `gc-w-${idx}` } } },
+          { type: 'tool/call', data: { callId: `gc-b-${idx}`, name: 'bash', arguments: { command: cmd } } },
+          { type: 'tool/result', data: { callId: `gc-b-${idx}`, name: 'bash', isError: false, receipt: { callId: `gc-b-${idx}`, exitCode: 0 } } },
+        ],
+      });
+      assert.equal(res.accepted, true, `${cmd} failed: ${res.reasons.join('; ')}`);
+      assert.deepEqual(res.checks.cleanedUpTempFiles, ['tests/test_tmp_env_versions.py']);
+    }
+
+    // 5. git clean dry-run / non-matching pathspec / required file / failed exitCode / pre-write STILL fail DISK_FILE_MISSING
+    for (const [idx, badCase] of [
+      { cmd: 'git clean -fdn', exitCode: 0 },
+      { cmd: 'git clean -n tests/test_tmp_env_versions.py', exitCode: 0 },
+      { cmd: 'git clean -fd other_dir', exitCode: 0 },
+      { cmd: 'git clean -fd', exitCode: 1 },
+    ].entries()) {
+      const res = verifier.verify({
+        sessionId: 's-container',
+        turnId: `t-git-clean-bad-${idx}`,
+        workspaceRoot: workDir,
+        text: '已清理。',
+        events: [
+          {
+            type: 'tool/call',
+            data: { callId: `gcb-w-${idx}`, name: 'write_file', arguments: { path: 'tests/test_tmp_env_versions.py' } },
+          },
+          { type: 'tool/result', data: { callId: `gcb-w-${idx}`, name: 'write_file', isError: false, receipt: { callId: `gcb-w-${idx}` } } },
+          { type: 'tool/call', data: { callId: `gcb-b-${idx}`, name: 'bash', arguments: { command: badCase.cmd } } },
+          {
+            type: 'tool/result',
+            data: {
+              callId: `gcb-b-${idx}`,
+              name: 'bash',
+              isError: badCase.exitCode !== 0,
+              receipt: { callId: `gcb-b-${idx}`, exitCode: badCase.exitCode },
+            },
+          },
+        ],
+      });
+      assert.equal(res.accepted, false, `${badCase.cmd} should not excuse missing disk file`);
+      assert.ok(res.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+    }
+
+    const reqGitCleanRes = verifier.verify({
+      sessionId: 's-container',
+      turnId: 't-git-clean-req',
+      workspaceRoot: workDir,
+      text: '完成。',
+      node: { requiredFiles: ['delivered_tmp.py'] },
+      events: [
+        { type: 'tool/call', data: { callId: 'gcr-w', name: 'write_file', arguments: { path: 'delivered_tmp.py' } } },
+        { type: 'tool/result', data: { callId: 'gcr-w', name: 'write_file', isError: false, receipt: { callId: 'gcr-w' } } },
+        { type: 'tool/call', data: { callId: 'gcr-b', name: 'bash', arguments: { command: 'git clean -fd' } } },
+        { type: 'tool/result', data: { callId: 'gcr-b', name: 'bash', isError: false, receipt: { callId: 'gcr-b', exitCode: 0 } } },
+      ],
+    });
+    assert.equal(reqGitCleanRes.accepted, false);
+    assert.ok(reqGitCleanRes.reasons.some((r) => r.includes('DISK_FILE_MISSING')));
+
+    // 6. Python inline/script deletions: Path(...).unlink(), pathlib.Path(...).unlink(), os.unlink(...), os.remove(...), shutil.rmtree(...)
+    for (const [idx, pyCase] of [
+      {
+        rel: 'tests/test_tmp_env_versions.py',
+        cmd: `python3 -c "from pathlib import Path; Path('/testbed/tests/test_tmp_env_versions.py').unlink()"`,
+      },
+      {
+        rel: 'tests/test_tmp_env_versions.py',
+        cmd: `python3 -c "import pathlib; pathlib.Path('/work/tests/test_tmp_env_versions.py').unlink(missing_ok=True)"`,
+      },
+      {
+        rel: 'tests/test_tmp_x.py',
+        cmd: `python3 -c "import os; os.unlink('tests/test_tmp_x.py')"`,
+      },
+      {
+        rel: 'tests/test_tmp_x.py',
+        cmd: `python3 -c "import os; os.remove('/testbed/tests/test_tmp_x.py')"`,
+      },
+      {
+        rel: 'tests/tmp_dir/helper.py',
+        cmd: `python3 -c "import shutil; shutil.rmtree('/testbed/tests/tmp_dir')"`,
+      },
+    ].entries()) {
+      const res = verifier.verify({
+        sessionId: 's-container',
+        turnId: `t-py-del-${idx}`,
+        workspaceRoot: workDir,
+        text: '已清理 Python 临时文件。',
+        events: [
+          { type: 'tool/call', data: { callId: `py-w-${idx}`, name: 'write_file', arguments: { path: pyCase.rel } } },
+          { type: 'tool/result', data: { callId: `py-w-${idx}`, name: 'write_file', isError: false, receipt: { callId: `py-w-${idx}` } } },
+          { type: 'tool/call', data: { callId: `py-b-${idx}`, name: 'bash', arguments: { command: pyCase.cmd } } },
+          { type: 'tool/result', data: { callId: `py-b-${idx}`, name: 'bash', isError: false, receipt: { callId: `py-b-${idx}`, exitCode: 0 } } },
+        ],
+      });
+      assert.equal(res.accepted, true, `${pyCase.cmd} failed: ${res.reasons.join('; ')}`);
+      assert.deepEqual(res.checks.cleanedUpTempFiles, [pyCase.rel]);
+    }
+
+    // 7. Direct helper checks for workspaceRoot prefix matching & negative non-delete Python commands
+    const hostAbs = join(workDir, 'tests', 'test_tmp_x.py');
+    assert.equal(
+      isExplicitFileDeleteCommand(`rm -f "${hostAbs}"`, 'tests/test_tmp_x.py', { workspaceRoot: workDir }),
+      true,
+    );
+    assert.equal(
+      isExplicitFileDeleteCommand(
+        `python3 -c "from pathlib import Path; Path('/testbed/tests/test_tmp_env_versions.py').read_text()"`,
+        'tests/test_tmp_env_versions.py',
+        { workspaceRoot: workDir },
+      ),
+      false,
+    );
   } finally {
     store.close();
     rmDirSafe(dataDir);
