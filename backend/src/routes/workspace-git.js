@@ -8,6 +8,7 @@ import { Fault } from '../store.js';
 import { normalizeProtectedSegment } from '../tools/sandbox.js';
 
 const execFileAsync = promisify(execFile);
+const realpathNative = realpathSync.native ?? realpathSync;
 const fault = (code, status, message, extra = {}) => new Fault(code, status, { message, ...extra });
 
 const ALLOWED_ENV_EXAMPLES = new Set(['.env.example', '.env.sample', '.env.template']);
@@ -127,7 +128,7 @@ function stripWinPrefix(p) {
 function canonicalizeAncestors(targetPath) {
   const abs = resolve(targetPath);
   try {
-    return realpathSync(abs);
+    return stripWinPrefix(realpathNative(abs));
   } catch {
     let cur = abs;
     while (!existsSync(cur)) {
@@ -136,7 +137,7 @@ function canonicalizeAncestors(targetPath) {
       cur = parent;
     }
     try {
-      const realAnc = realpathSync(cur);
+      const realAnc = stripWinPrefix(realpathNative(cur));
       const suffix = relative(cur, abs);
       return suffix ? resolve(realAnc, suffix) : realAnc;
     } catch {
@@ -151,8 +152,10 @@ export function confineGitPath(workspaceRoot, rawPath) {
   }
   const input = rawPath.trim();
   const root = resolve(workspaceRoot);
-  const realRoot = existsSync(root) ? realpathSync(root) : root;
-  const full = isAbsolute(input) ? resolve(input) : resolve(realRoot, input);
+  const realRoot = existsSync(root) ? stripWinPrefix(realpathNative(root)) : canonicalizeAncestors(root);
+  const full = isAbsolute(input)
+    ? join(canonicalizeAncestors(dirname(resolve(input))), basename(resolve(input)))
+    : resolve(realRoot, input);
   const rel = relative(realRoot, full);
   if (!rel || isOutsideRel(rel)) {
     throw fault('GIT_INVALID_PATH', 400, `Git 路径超出工作区范围: ${input}`);
@@ -259,7 +262,7 @@ export async function getGitStatusFor(cwd) {
 
 export async function getGitChangesFor(cwd) {
   if (!(await isWorkTree(cwd))) return { ...emptyChanges };
-  const realCwd = realpathSync(resolve(cwd));
+  const realCwd = stripWinPrefix(realpathNative(resolve(cwd)));
   const readOptions = await readOnlyGitOptions(realCwd);
 
   const [topRes, headRes, headShaRes, aheadBehindRes, statusRes] = await Promise.all([
@@ -270,7 +273,7 @@ export async function getGitChangesFor(cwd) {
     git(realCwd, [...readOptions, '-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all']),
   ]);
 
-  const realTop = realpathSync(resolve(topRes.stdout));
+  const realTop = stripWinPrefix(realpathNative(resolve(topRes.stdout)));
   const remapRepoPath = (repoRel) => {
     const clean = String(repoRel || '').replace(/\\/g, '/');
     if (!clean) return null;

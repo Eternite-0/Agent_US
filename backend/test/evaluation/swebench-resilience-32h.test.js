@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -30,7 +31,7 @@ const SCRIPT_PATH = resolve(BACKEND_DIR, 'scripts', 'benchmark-swebench.mjs');
 
 const tempDirs = [];
 function makeTmp(prefix) {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const dir = (realpathSync.native ?? realpathSync)(mkdtempSync(join(tmpdir(), prefix)));
   tempDirs.push(dir);
   return dir;
 }

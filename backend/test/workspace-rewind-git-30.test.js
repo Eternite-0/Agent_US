@@ -55,7 +55,7 @@ async function waitTurnTerminal(directAgent, sessionId, turnId, timeoutMs = 8000
 }
 
 async function setupEnv(t, { adapter = null, initGit = false } = {}) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'agent-us-30-snapgit-')));
+  const root = (realpathSync.native ?? realpathSync)(mkdtempSync(join(tmpdir(), 'agent-us-30-snapgit-')));
   const dataDir = join(root, 'data');
   const workDir = join(root, 'workspace');
   const emptyHome = join(root, 'home');
@@ -663,7 +663,7 @@ test('Cross-module route hooks: onboarding detect/import, workspace customizatio
 });
 
 test('WP6.1: stageGitPaths filters escaping symlinks on all=true while keeping explicit paths strict', async (t) => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'agent-us-32-stage-symlink-')));
+  const root = (realpathSync.native ?? realpathSync)(mkdtempSync(join(tmpdir(), 'agent-us-32-stage-symlink-')));
   const outsideDir = join(root, 'outside');
   const repoDir = join(root, 'repo');
   const escapeDirLink = join(repoDir, 'escape-dir-link');

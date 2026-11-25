@@ -6,11 +6,13 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { sha256Hex } from './integrity.js';
 import {
   isProtectedPathSegment,
@@ -1502,10 +1504,43 @@ const DIAG_SKIP_DIRS = new Set([
   'var',
 ]);
 
+function realpathNativeSafe(targetPath) {
+  const abs = resolve(targetPath);
+  const realFn = realpathSync.native ?? realpathSync;
+  try {
+    return realFn(abs);
+  } catch {
+    let cur = abs;
+    while (!existsSync(cur)) {
+      const parent = dirname(cur);
+      if (parent === cur) return abs;
+      cur = parent;
+    }
+    try {
+      const realAnc = realFn(cur);
+      const suffix = relative(cur, abs);
+      return suffix ? resolve(realAnc, suffix) : realAnc;
+    } catch {
+      return abs;
+    }
+  }
+}
+
 export function normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir = null) {
-  let s = String(rawFile ?? '')
-    .trim()
-    .replace(/^file:\/\//i, '');
+  const raw = String(rawFile ?? '').trim();
+  let s = raw;
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      s = fileURLToPath(raw);
+    } catch {
+      const stripped = raw.replace(/^file:\/\//i, '');
+      try {
+        s = decodeURIComponent(stripped);
+      } catch {
+        s = stripped;
+      }
+    }
+  }
   if (!/^\\\\[^\\]/.test(s)) {
     s = s.replace(/\\\\/g, '\\');
   }
@@ -1517,7 +1552,12 @@ export function normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir = null) 
       const root = resolve(workspaceRoot);
       const anchor = baseDir ? resolve(baseDir) : root;
       const abs = isAbsolute(s) ? resolve(s) : resolve(anchor, s);
-      const rel = relative(root, abs).replace(/\\/g, '/');
+      let rel = relative(root, abs).replace(/\\/g, '/');
+      if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+        const realRoot = realpathNativeSafe(root);
+        const realAbs = realpathNativeSafe(abs);
+        rel = relative(realRoot, realAbs).replace(/\\/g, '/');
+      }
       if (rel && !rel.startsWith('..') && !isAbsolute(rel)) return rel;
     } catch {
       // keep cleaned string

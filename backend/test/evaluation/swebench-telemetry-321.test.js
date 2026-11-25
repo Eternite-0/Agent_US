@@ -641,7 +641,7 @@ describe('SWE-bench Telemetry 3.2.1 (T1, T2, T3, --turn-timeout-ms, Supervisor D
           workspaceRoot: repoDir,
           useAppPool: false,
           model: 'deepseek-chat',
-          turnTimeoutMs: 250,
+          turnTimeoutMs: 1500,
           outputDir: outDir,
         },
         {

@@ -263,7 +263,10 @@ jobs:
             console.log(`Copied ${copied} baseline .jsonl file(s) from ${baselineDir} to ${shardDir}`);
           }
 
-          const smokeDir = join(evidenceRoot, 'swebench-smoke5');
+          const archivedSmokeDir = join(evidenceRoot, 'archive', 'swebench-smoke5');
+          const smokeDir = existsSync(archivedSmokeDir)
+            ? archivedSmokeDir
+            : join(evidenceRoot, 'swebench-smoke5');
           if (seedSmoke5 && model === 'deepseek-v4.1-flash' && existsSync(smokeDir)) {
             for (const arm of arms) {
               const smokeTelePath = join(smokeDir, `telemetry.${arm}.jsonl`);
@@ -485,7 +488,7 @@ jobs:
             echo "No changes in ${OUT_DIR}; skipping commit."
             exit 0
           fi
-          git commit -m "docs(eval): update SWE-bench ${INPUT_SUBSET} results (${INPUT_MODEL})"
+          git commit -m "docs(eval): update SWE-bench ${INPUT_SUBSET} results (${INPUT_MODEL}) [skip ci]"
           for attempt in 1 2 3; do
             if git pull --rebase && git push; then
               exit 0

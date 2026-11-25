@@ -19,6 +19,7 @@ import { ToolPermissionPolicy } from '../../src/tools/policy.js';
 import { modelToolCatalog } from '../../src/tools/selection.js';
 import { WORKSPACE_TOOL_META, createWorkspaceTools } from '../../src/workspace-tools.js';
 import {
+  normalizeDiagnosticFile,
   parseAndCompressDiagnosticsOutput,
   resolveTscRunner,
   runDiagnostics,
@@ -468,4 +469,31 @@ test('query_symbol_graph returns definitions with endLine/signature, cross-file 
   }
   const reviewProfile = capReg.synthesizeProfile({ taskType: 'review' });
   assert.ok(reviewProfile.toolCeiling.includes('query_symbol_graph'));
+});
+
+test('normalizeDiagnosticFile decodes percent-encoded file URLs (e.g. %7E) and resolves native realpath aliases', (t) => {
+  const { root, put } = createTempWorkspace(t, 'diag-26-url-');
+  const tildeWs = join(root, 'dir~1');
+  const testFile = join(tildeWs, 'test', 'assertions.test.js');
+  put('dir~1/test/assertions.test.js', 'export const ok = true;\n');
+
+  const encodedUrl = pathToFileURL(testFile).href.replace('dir~1', 'dir%7E1');
+  assert.match(encodedUrl, /dir%7E1/);
+  assert.equal(normalizeDiagnosticFile(encodedUrl, tildeWs), 'test/assertions.test.js');
+
+  const nonExistentUrl = pathToFileURL(join(tildeWs, 'test', 'future.test.js')).href.replace('dir~1', 'dir%7E1');
+  assert.equal(normalizeDiagnosticFile(nonExistentUrl, tildeWs), 'test/future.test.js');
+
+  // Symlink/junction alias workspaceRoot vs file URL pointing to canonical target
+  const aliasWs = join(root, 'alias-ws');
+  let aliasCreated = false;
+  try {
+    symlinkSync(tildeWs, aliasWs, process.platform === 'win32' ? 'junction' : 'dir');
+    aliasCreated = true;
+  } catch {
+    // Skip symlink/junction sub-check if OS forbids it
+  }
+  if (aliasCreated) {
+    assert.equal(normalizeDiagnosticFile(encodedUrl, aliasWs), 'test/assertions.test.js');
+  }
 });

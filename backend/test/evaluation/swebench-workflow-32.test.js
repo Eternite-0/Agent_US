@@ -277,7 +277,7 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
     assert.ok(mergeBlock.includes('path: backend/docs/evidence/${{ inputs.output_subdir }}'));
     assert.ok(mergeBlock.includes('if: inputs.commit_results == true'));
     assert.ok(
-      mergeBlock.includes('docs(eval): update SWE-bench ${INPUT_SUBSET} results (${INPUT_MODEL})'),
+      mergeBlock.includes('docs(eval): update SWE-bench ${INPUT_SUBSET} results (${INPUT_MODEL}) [skip ci]'),
     );
     assert.ok(mergeBlock.includes('git pull --rebase && git push'));
   });
@@ -479,6 +479,51 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
     });
     assert.equal(runOtherModel.status, 0, runOtherModel.stderr);
     assert.equal(existsSync(join(shardOut2, 'telemetry.raw_full.jsonl')), false);
+
+    // Archive smoke-5 path takes precedence over legacy evidenceRoot/swebench-smoke5 fallback
+    const archivedSmokeDir = join(evidenceRoot, 'archive', 'swebench-smoke5');
+    mkdirSync(archivedSmokeDir, { recursive: true });
+    writeFileSync(
+      join(archivedSmokeDir, 'telemetry.raw_full.jsonl'),
+      JSON.stringify({ instance_id: 'id__arch1', model: 'deepseek-v4.1-flash', status: 'completed' }) + '\n',
+      'utf8',
+    );
+    writeFileSync(
+      join(archivedSmokeDir, 'predictions.raw_full.jsonl'),
+      JSON.stringify({ instance_id: 'id__arch1', model_patch: 'archive_patch1' }) + '\n',
+      'utf8',
+    );
+    writeFileSync(
+      join(archivedSmokeDir, 'eval.raw_full.jsonl'),
+      JSON.stringify({ instance_id: 'id__arch1', resolved: true }) + '\n',
+      'utf8',
+    );
+
+    const shardOutArchive = join(tmpRoot, 'shard-archive');
+    const runArchiveSeed = spawnSync(process.execPath, [scriptPath], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        SHARD_INDEX: '1',
+        INPUT_RESUME: 'false',
+        INPUT_SEED_SMOKE5: 'true',
+        INPUT_MODEL: 'deepseek-v4.1-flash',
+        INPUT_ARMS: 'raw_full',
+        INPUT_OUTPUT_SUBDIR: 'swebench-mini50',
+        SWEBENCH_SEED_TARGET_DIR: shardOutArchive,
+        SWEBENCH_EVIDENCE_ROOT: evidenceRoot,
+      },
+    });
+    assert.equal(runArchiveSeed.status, 0, runArchiveSeed.stderr);
+    const archiveTele = readFileSync(join(shardOutArchive, 'telemetry.raw_full.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    assert.deepEqual(
+      archiveTele.map((r) => r.instance_id),
+      ['id__arch1'],
+      'archive/swebench-smoke5 must be preferred when present',
+    );
 
     // Path traversal output_subdir must fail
     const badRes = spawnSync(process.execPath, [scriptPath], {

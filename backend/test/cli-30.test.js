@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -715,8 +716,9 @@ test('CLI supports --swarm, import --yes/--skip, and interactive REPL (/steer, /
 });
 
 test('Real Fastify /v1/* server + agent-us.mjs subprocess syncs piped stdin, approvals, and --resume across GUI store', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-real-v1-'));
-  const ws = mkdtempSync(join(tmpdir(), 'cli-real-ws-'));
+  const realTmp = realpathSync.native ?? realpathSync;
+  const dir = realTmp(mkdtempSync(join(tmpdir(), 'cli-real-v1-')));
+  const ws = realTmp(mkdtempSync(join(tmpdir(), 'cli-real-ws-')));
   writeFileSync(join(ws, 'hello.txt'), 'original\n', 'utf8');
   const token = 'real-cli-sync-token-1234567890';
   writeFileSync(join(dir, '.dev-token'), token, 'utf8');
