@@ -44,7 +44,7 @@ export const VALID_DTOC_POLICIES = Object.freeze([
   CACHE_AWARE_V31_DTOC_POLICY,
 ]);
 export const DEFAULT_DTOC_MIN_PROMPT_TOKENS = 24000;
-export const DEFAULT_V31_MIN_PROMPT_TOKENS = 32000;
+export const DEFAULT_V31_MIN_PROMPT_TOKENS = 48000;
 export const DEFAULT_V31_MIN_NET_SAVINGS_TOKENS = 3500;
 export const DEFAULT_V31_EVICTION_COOLDOWN_STEPS = 6;
 export const DEFAULT_DTOC_PRESSURE_MIN_TOKENS = 28000;
@@ -1601,7 +1601,12 @@ function computeEpochTriggerState(
         : 0;
 
     const hasCandidates = tier1Count + tier2Count > 0;
-    const netSavingsMet = combinedNetSavings >= v31MinSavings;
+    const isCriticalPressure = singleStepRatio >= 0.80 || emergencyTriggered;
+    const suffixAmortizationMinSavings = !isCriticalPressure
+      ? Math.ceil(invalidatedSuffixTokens * 0.35)
+      : 0;
+    const requiredNetSavingsTokens = Math.max(v31MinSavings, suffixAmortizationMinSavings);
+    const netSavingsMet = combinedNetSavings >= requiredNetSavingsTokens;
     const triggered = emergencyTriggered
       ? hasCandidates && combinedNetSavings > 0
       : hasCandidates && cooldownPassed && netSavingsMet;
@@ -1631,6 +1636,7 @@ function computeEpochTriggerState(
       dtocPolicy: policy,
       dtocMinPromptTokens: v31MinPrompt,
       minNetSavingsTokens: v31MinSavings,
+      requiredNetSavingsTokens,
       evictionCooldownSteps: v31CooldownSteps,
       recentEditShieldSteps: effectiveShieldSteps,
       tokensBefore,
@@ -2727,10 +2733,11 @@ export function compressMessagesEpoch(
   }).totalTokens;
   const netSavingsTokens = Math.max(0, tokensBefore - tokensAfterPreview);
 
+  const v31MinSavingsReq = trigger.requiredNetSavingsTokens ?? trigger.minNetSavingsTokens;
   const v31AbortedSavings =
     trigger.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY &&
     (stagedCompressions.length === 0 ||
-      (emergencyTriggered ? netSavingsTokens <= 0 : netSavingsTokens < trigger.minNetSavingsTokens));
+      (emergencyTriggered ? netSavingsTokens <= 0 : netSavingsTokens < v31MinSavingsReq));
   if (
     v31AbortedSavings ||
     ((trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||

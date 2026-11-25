@@ -25,6 +25,8 @@ const FAST_TIER_RE = /(?:^|[-_./\s])(?:flash|lite|nano|micro|instant|fast)(?:$|[
 const LIGHT_TIER_RE = /(?:^|[-_./\s])(?:mini|haiku|small|turbo|air|quick)(?:$|[-_./\s0-9])/i;
 const HEAVY_TIER_RE = /(?:^|[-_./\s])(?:opus|pro|max|ultra|reasoner|thinking|r1|heavy|xhigh)(?:$|[-_./\s0-9])/i;
 const UTILITY_MODEL_RE = /(?:^|[-_./\s])(?:embed|embedding|whisper|tts|dall|flux|image|rerank|moderation)(?:$|[-_./\s0-9])/i;
+const AUTO_SKIP_REASONING_RE = /reasoner|thinking|\br1\b|^o[134](?:$|-)|deepseek-r|qwq/i;
+const AUTO_SKIP_V4_RE = /deepseek-v4/i;
 
 const VALID_ADMISSION_DECISIONS = new Set([
   'DIRECT',
@@ -214,6 +216,11 @@ export function normalizeSupervisorConfig(raw = {}) {
       ? Math.min(200000, Math.max(1000, Math.trunc(Number(input.dtocMinPromptTokens))))
       : base.dtocMinPromptTokens;
 
+  const mainModel =
+    typeof input.mainModel === 'string' && input.mainModel.trim()
+      ? input.mainModel.trim()
+      : null;
+
   return {
     enabled,
     mode,
@@ -224,6 +231,7 @@ export function normalizeSupervisorConfig(raw = {}) {
     timeoutMs,
     admissionEnabled,
     dtocMinPromptTokens,
+    ...(mainModel ? { mainModel } : {}),
   };
 }
 
@@ -294,8 +302,15 @@ export class ContextSupervisor {
    * Resolves the effective supervisor model dynamically from the user's live
    * AccountPool catalog and route health — with ZERO hardcoded model names.
    */
-  resolveModel(configOverride = null) {
+  resolveModel(configOverride = null, { mainModel = null } = {}) {
     const config = configOverride ? normalizeSupervisorConfig(configOverride) : this.getConfig();
+    const effectiveMainModel =
+      (typeof mainModel === 'string' && mainModel.trim() ? mainModel.trim() : null) ??
+      (typeof configOverride?.mainModel === 'string' && configOverride.mainModel.trim()
+        ? configOverride.mainModel.trim()
+        : null) ??
+      config.mainModel ??
+      null;
     const now = Date.now();
     const catalog =
       typeof this.pool?.getActiveCatalog === 'function'
@@ -426,6 +441,40 @@ export class ContextSupervisor {
     }
 
     // auto mode
+    const chosenCandidate = recommendedModel
+      ? healthyEligible.find((c) => c.alias === recommendedModel) ?? null
+      : null;
+    const chosenLabel = chosenCandidate
+      ? `${chosenCandidate.alias} ${chosenCandidate.upstreamModel}`.toLowerCase()
+      : String(recommendedModel || '').toLowerCase();
+    const matchesMainModel = Boolean(
+      effectiveMainModel &&
+        recommendedModel &&
+        (recommendedModel === effectiveMainModel ||
+          chosenCandidate?.upstreamModel === effectiveMainModel),
+    );
+    const matchesReasoning = Boolean(
+      recommendedModel &&
+        (AUTO_SKIP_REASONING_RE.test(chosenLabel) ||
+          chosenCandidate?.capabilities?.reasoning === true),
+    );
+    const matchesV4WithoutLegacyFastBypass = Boolean(
+      recommendedModel &&
+        AUTO_SKIP_V4_RE.test(chosenLabel) &&
+        !(!effectiveMainModel && chosenCandidate?.hasFastTier),
+    );
+    if (matchesMainModel || matchesReasoning || matchesV4WithoutLegacyFastBypass) {
+      return {
+        config,
+        active: false,
+        effectiveModel: null,
+        rationale: 'auto_skip_same_or_reasoning_model_deterministic',
+        recommendedModel,
+        recommendedRationale,
+        candidates,
+      };
+    }
+
     return {
       config,
       active: Boolean(recommendedModel),
@@ -605,8 +654,9 @@ export class ContextSupervisor {
     learnedGuidelines = [],
     signal = null,
     configOverride = null,
+    mainModel = null,
   } = {}) {
-    const resolved = this.resolveModel(configOverride);
+    const resolved = this.resolveModel(configOverride, { mainModel });
     const config = resolved.config;
 
     if (!config.enabled || config.mode === 'off') {
@@ -846,8 +896,9 @@ export class ContextSupervisor {
     learnedGuidelines = [],
     signal = null,
     configOverride = null,
+    mainModel = null,
   } = {}) {
-    const resolved = this.resolveModel(configOverride);
+    const resolved = this.resolveModel(configOverride, { mainModel });
     const config = resolved.config;
 
     if (!config.enabled || config.mode === 'off') {

@@ -17,12 +17,25 @@ export const ADMISSION_DECISIONS = Object.freeze({
 });
 
 export const DEFAULT_ADMISSION_MIN_CHARS = 1400;
-export const DEFAULT_WORKING_SET_READ_MAX_CHARS = 16000;
+export const DEFAULT_WORKING_SET_READ_MAX_CHARS = 42000;
 export const DEFAULT_PROBE_ADMISSION_MIN_CHARS = 2400;
 export const DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS = 6;
+export const DEFAULT_MIN_SUPERVISOR_BATCH_CHARS = 16000;
+export const DEFAULT_OVERSIZED_EXEC_MIN_CHARS = 6000;
+export const DEFAULT_OVERSIZED_EXEC_MAX_RENDERED_CHARS = 3200;
+export const DEFAULT_OVERSIZED_SEARCH_MIN_CHARS = 4500;
+export const DEFAULT_OVERSIZED_SEARCH_MAX_RENDERED_CHARS = 2800;
 
 const VALID_DECISIONS = new Set(Object.values(ADMISSION_DECISIONS));
 const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delete_file']);
+const EXEC_ERROR_TOOLS = new Set(['bash', 'start_process', 'run_diagnostics']);
+const READ_ONLY_DEDUP_TOOLS = new Set([
+  'read_file',
+  'grep',
+  'glob',
+  'inspect_repository',
+  'query_symbol_graph',
+]);
 const NOISY_PROBE_TOOLS = new Set([
   'grep',
   'glob',
@@ -42,6 +55,9 @@ const ALWAYS_DIRECT_TOOLS = new Set([
 
 const ERROR_OUTPUT_RE =
   /(?:^exitCode:\s*[1-9]\d*\b|exit\s+code[:=\s]+[1-9]\d*\b|AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|ECONNREFUSED|Traceback \(most recent call last\)|\b(?:FAIL|FAILED|FATAL|PANIC)\b|✖\s|×\s|^not ok \d+|^\s*(?:Expected|Actual|Received)\b|^\s+at\s+\S+:\d+:\d+|^\s+File\s+".+",\s+line\s+\d+|\bTS\d{4,5}:|\berror\[E\d+\]|\bError:\s|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/m;
+
+const EXEC_FAILURE_CUE_RE =
+  /(?:Traceback \(most recent call last\)|^\s*File\s+".+",\s+line\s+\d+|AssertionError|\b(?:FAIL|FAILED|ERROR|FATAL|PANIC)\b|not ok \d+|failingTests|^\s*E\s+(?:assert|AssertionError)|=== FAILURES ===|--- FAIL:)/;
 
 const DECOY_PATH_SEGMENT_RE =
   /(?:^|\/)(?:legacy|archive|v0|v1[-_]compat|backup|old[-_]version|mock[-_]data|storybook)(?:\/|$)/i;
@@ -96,6 +112,287 @@ const STOPWORDS = new Set([
 
 function sha256Hex(text) {
   return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
+}
+
+function stableArgsStringify(value) {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((v) => stableArgsStringify(v)).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys
+    .filter((k) => value[k] !== undefined)
+    .map((k) => `${JSON.stringify(k)}:${stableArgsStringify(value[k])}`)
+    .join(',')}}`;
+}
+
+function clipSummaryLine(line, maxLen = 200) {
+  const clean = sanitize(String(line ?? ''));
+  if (clean.length <= maxLen) return clean;
+  return `${clean.slice(0, Math.max(8, maxLen - 3))}...`;
+}
+
+function wrapAdmittedPayload(headerLine, bodyText, envelope) {
+  if (!bodyText) return headerLine;
+  if (envelope?.wrapped && envelope?.id) {
+    return `${headerLine}\n${rewrapUntrusted(envelope.id, bodyText)}`;
+  }
+  return `${headerLine}\n${bodyText}`;
+}
+
+function fitWrappedSectionBudget(headerLine, buildBody, envelope, maxChars) {
+  const wrapperMargin = envelope?.wrapped && envelope?.id
+    ? `<untrusted id="${envelope.id}" bytes="999999"></untrusted id="${envelope.id}">`.length + 2
+    : 0;
+  const maxBodyChars = Math.max(120, maxChars - headerLine.length - wrapperMargin - 4);
+  let body = buildBody(maxBodyChars);
+  let rendered = wrapAdmittedPayload(headerLine, body, envelope);
+  if (rendered.length <= maxChars) {
+    return rendered;
+  }
+  const over = rendered.length - maxChars;
+  body = buildBody(Math.max(80, maxBodyChars - over - 16));
+  rendered = wrapAdmittedPayload(headerLine, body, envelope);
+  if (rendered.length <= maxChars) {
+    return rendered;
+  }
+  // Final hard trim on body lines if needed
+  const lines = body.split('\n');
+  while (lines.length > 1 && wrapAdmittedPayload(headerLine, lines.join('\n'), envelope).length > maxChars) {
+    lines.pop();
+  }
+  rendered = wrapAdmittedPayload(headerLine, lines.join('\n'), envelope);
+  if (rendered.length <= maxChars) {
+    return rendered;
+  }
+  const remaining = Math.max(0, maxChars - headerLine.length - wrapperMargin - 4);
+  return wrapAdmittedPayload(headerLine, body.slice(0, remaining), envelope).slice(0, maxChars);
+}
+
+/**
+ * Renders a bounded high-fidelity summary (<= 3200 chars) for oversized bash /
+ * start_process / run_diagnostics outputs while preserving head, failure/traceback
+ * context, tail, and lossless line-range restore instructions.
+ */
+function renderOversizedExecLogSummary({
+  ref,
+  innerText,
+  envelope,
+  maxChars = DEFAULT_OVERSIZED_EXEC_MAX_RENDERED_CHARS,
+}) {
+  const headerLine = `${formatAciRefStub(ref, { decision: ADMISSION_DECISIONS.SUPPORTING })} [expand_context 可按行无损展开]`;
+  const rawLines = String(innerText ?? '').split(/\r?\n/);
+  const totalLines = rawLines.length;
+
+  const headEnd = Math.min(20, totalLines);
+  const headLines = [];
+  for (let i = 0; i < headEnd; i += 1) {
+    headLines.push(`${i + 1}: ${clipSummaryLine(rawLines[i], 180)}`);
+  }
+
+  // Extract failure/traceback windows
+  const matchWindows = [];
+  for (let i = 0; i < totalLines; i += 1) {
+    const line = rawLines[i];
+    if (!EXEC_FAILURE_CUE_RE.test(line)) continue;
+    const isTraceback = /Traceback \(most recent call last\)/i.test(line);
+    const from = Math.max(0, i - (isTraceback ? 1 : 2));
+    const to = Math.min(totalLines - 1, i + (isTraceback ? 12 : 5));
+    if (matchWindows.length && from <= matchWindows.at(-1).to + 2) {
+      matchWindows.at(-1).to = Math.max(matchWindows.at(-1).to, to);
+    } else {
+      matchWindows.push({ from, to });
+    }
+    if (matchWindows.length >= 12) break;
+  }
+
+  const tailStart = Math.max(headEnd, totalLines - 30);
+  const tailLines = [];
+  for (let i = tailStart; i < totalLines; i += 1) {
+    tailLines.push(`${i + 1}: ${clipSummaryLine(rawLines[i], 180)}`);
+  }
+
+  const footer = `Restore lines: expand_context({ ref: "${ref.uri}", startLine, endLine })`;
+
+  const buildBody = (budget) => {
+    const reserveFooter = footer.length + 4;
+    const avail = Math.max(80, budget - reserveFooter);
+
+    const headBudget = Math.max(80, Math.floor(avail * 0.25));
+    const failBudget = matchWindows.length > 0 ? Math.max(120, Math.floor(avail * 0.42)) : 0;
+    const tailBudget = Math.max(100, avail - headBudget - failBudget);
+
+    const takeLinesFront = (linesArr, maxB) => {
+      const kept = [];
+      let used = 0;
+      for (const l of linesArr) {
+        if (used + l.length + 1 > maxB) break;
+        kept.push(l);
+        used += l.length + 1;
+      }
+      return kept;
+    };
+
+    const takeLinesTail = (linesArr, maxB) => {
+      const kept = [];
+      let used = 0;
+      for (let i = linesArr.length - 1; i >= 0; i -= 1) {
+        const l = linesArr[i];
+        if (used + l.length + 1 > maxB) break;
+        kept.unshift(l);
+        used += l.length + 1;
+      }
+      return kept;
+    };
+
+    const headKept = takeLinesFront(headLines, headBudget);
+    const headSec = headKept.length ? `Head (L1-${headKept.length}):\n${headKept.join('\n')}` : '';
+
+    let failSec = '';
+    if (matchWindows.length > 0 && failBudget > 40) {
+      const blocks = [];
+      let used = 0;
+      for (const w of matchWindows) {
+        const chunk = [];
+        for (let idx = w.from; idx <= w.to; idx += 1) {
+          const formatted = `${idx + 1}: ${clipSummaryLine(rawLines[idx], 180)}`;
+          if (used + formatted.length + 24 > failBudget) break;
+          chunk.push(formatted);
+          used += formatted.length + 1;
+        }
+        if (chunk.length > 0) {
+          blocks.push(`@@ L${w.from + 1}-${w.to + 1} @@\n${chunk.join('\n')}`);
+          used += 24;
+        }
+        if (used >= failBudget) break;
+      }
+      if (blocks.length > 0) {
+        failSec = `Failures/Tracebacks:\n${blocks.join('\n...\n')}`;
+      }
+    }
+
+    const remainingForTail = Math.max(
+      tailBudget,
+      avail - (headSec ? headSec.length + 2 : 0) - (failSec ? failSec.length + 2 : 0),
+    );
+    const tailKept = takeLinesTail(tailLines, remainingForTail);
+    const tailSec = tailKept.length
+      ? `Tail (L${totalLines - tailKept.length + 1}-${totalLines}):\n${tailKept.join('\n')}`
+      : '';
+
+    return [headSec, failSec, tailSec, footer].filter(Boolean).join('\n\n');
+  };
+
+  const text = fitWrappedSectionBudget(headerLine, buildBody, envelope, maxChars);
+  return { text, decision: ADMISSION_DECISIONS.SUPPORTING };
+}
+
+/**
+ * Renders a file/directory-clustered summary (<= 2800 chars) for oversized grep
+ * and glob outputs while preserving artifact:// restore references.
+ */
+function renderOversizedSearchClusteredSummary({
+  ref,
+  lowerTool,
+  innerText,
+  envelope,
+  maxChars = DEFAULT_OVERSIZED_SEARCH_MAX_RENDERED_CHARS,
+}) {
+  const headerLine = formatAciRefStub(ref, { decision: ADMISSION_DECISIONS.SUPPORTING });
+  const rawLines = String(innerText ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim().length > 0);
+  const footer = `Restore full results: expand_context({ ref: "${ref.uri}", startLine, endLine })`;
+
+  let overviewTitle = '';
+  const countLines = [];
+  const sampleLines = [];
+
+  if (lowerTool === 'grep') {
+    const byFile = new Map();
+    const unmatched = [];
+    for (const line of rawLines) {
+      const m = line.match(/^((?:[A-Za-z]:)?[^:\r\n]+):(\d+):(.*)$/);
+      if (m) {
+        const file = m[1].trim();
+        if (!byFile.has(file)) byFile.set(file, []);
+        byFile.get(file).push({ lineNo: m[2], text: m[3].trim() });
+      } else {
+        unmatched.push(line);
+      }
+    }
+    if (byFile.size > 0) {
+      const sorted = [...byFile.entries()].sort((a, b) => b[1].length - a[1].length);
+      const totalHits = sorted.reduce((s, [, list]) => s + list.length, 0);
+      overviewTitle = `Clustered Grep Summary (${sorted.length} files, ${totalHits} hits):`;
+      for (const [file, list] of sorted.slice(0, 24)) {
+        countLines.push(`- ${clipSummaryLine(file, 120)} (${list.length} hits)`);
+      }
+      if (sorted.length > 24) {
+        countLines.push(`- ... +${sorted.length - 24} more files`);
+      }
+      for (const [file, list] of sorted.slice(0, 10)) {
+        for (const h of list.slice(0, 2)) {
+          sampleLines.push(`${clipSummaryLine(file, 90)}:${h.lineNo}: ${clipSummaryLine(h.text, 140)}`);
+        }
+      }
+    } else {
+      overviewTitle = `Clustered Grep Summary (${unmatched.length} lines):`;
+      for (const l of unmatched.slice(0, 18)) {
+        sampleLines.push(clipSummaryLine(l, 160));
+      }
+    }
+  } else {
+    // glob
+    const contentLines = rawLines.filter((l, idx) => !(idx === 0 && /^找到\s+\d+\s+个匹配文件[:：]?$/.test(l)));
+    const byDir = new Map();
+    for (const p of contentLines) {
+      const clean = p.replace(/\\/g, '/').trim();
+      const parts = clean.split('/').filter(Boolean);
+      const dir = parts.length <= 1 ? '.' : parts.slice(0, Math.min(2, parts.length - 1)).join('/');
+      if (!byDir.has(dir)) byDir.set(dir, []);
+      byDir.get(dir).push(clean);
+    }
+    const sorted = [...byDir.entries()].sort((a, b) => b[1].length - a[1].length);
+    overviewTitle = `Clustered Glob Summary (${sorted.length} dirs, ${contentLines.length} files):`;
+    for (const [dir, list] of sorted.slice(0, 24)) {
+      countLines.push(`- ${clipSummaryLine(dir, 120)} (${list.length} files)`);
+    }
+    if (sorted.length > 24) {
+      countLines.push(`- ... +${sorted.length - 24} more dirs`);
+    }
+    for (const [, list] of sorted.slice(0, 10)) {
+      for (const f of list.slice(0, 2)) {
+        sampleLines.push(clipSummaryLine(f, 150));
+      }
+    }
+  }
+
+  const buildBody = (budget) => {
+    const avail = Math.max(80, budget - footer.length - overviewTitle.length - 8);
+    const countsBudget = Math.max(60, Math.floor(avail * 0.48));
+    const keptCounts = [];
+    let usedCounts = 0;
+    for (const l of countLines) {
+      if (usedCounts + l.length + 1 > countsBudget) break;
+      keptCounts.push(l);
+      usedCounts += l.length + 1;
+    }
+    const samplesBudget = Math.max(60, avail - usedCounts - 24);
+    const keptSamples = [];
+    let usedSamples = 0;
+    for (const l of sampleLines) {
+      if (usedSamples + l.length + 1 > samplesBudget) break;
+      keptSamples.push(l);
+      usedSamples += l.length + 1;
+    }
+    const countsSec = keptCounts.length ? `Per-File Counts:\n${keptCounts.join('\n')}` : '';
+    const samplesSec = keptSamples.length ? `Top Matches:\n${keptSamples.join('\n')}` : '';
+    return [overviewTitle, countsSec, samplesSec, footer].filter(Boolean).join('\n\n');
+  };
+
+  const text = fitWrappedSectionBudget(headerLine, buildBody, envelope, maxChars);
+  return { text, decision: ADMISSION_DECISIONS.SUPPORTING };
 }
 
 function pathsMatch(a, b) {
@@ -498,6 +795,8 @@ function buildFocusedHunks({
 
 function renderProgressivePayload({
   decision,
+  reason = '',
+  lowerTool = '',
   ref,
   rawOutput,
   envelope,
@@ -508,6 +807,25 @@ function renderProgressivePayload({
 }) {
   if (decision === ADMISSION_DECISIONS.DIRECT) {
     return { text: rawOutput, decision };
+  }
+
+  if (reason === 'oversized_exec_log_fidelity_summary') {
+    return renderOversizedExecLogSummary({
+      ref,
+      innerText: envelope?.inner ?? rawOutput,
+      envelope,
+      maxChars: DEFAULT_OVERSIZED_EXEC_MAX_RENDERED_CHARS,
+    });
+  }
+
+  if (reason === 'oversized_search_clustered_summary') {
+    return renderOversizedSearchClusteredSummary({
+      ref,
+      lowerTool,
+      innerText: envelope?.inner ?? rawOutput,
+      envelope,
+      maxChars: DEFAULT_OVERSIZED_SEARCH_MAX_RENDERED_CHARS,
+    });
   }
 
   const originalLen = rawOutput.length;
@@ -676,10 +994,11 @@ export class PreInjectionAdmissionController {
       0,
       Number(maxSupervisorAdmissionCalls ?? DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS),
     );
-    this.activeHashesByPath = new Map(); // normPath -> { sha256, step, uri, refId, lineRange }
+    this.activeHashesByPath = new Map(); // normPath / `${normPath}#${lineRange}` / `__probe__:*` -> { sha256, step, uri, refId, lineRange }
     this.activeUriByPathStep = new Map(); // `${normPath}@${step}` -> uri
     this.activeSymbols = new Set();
     this.activeImports = new Set();
+    this._mutatedFilesSeen = new Set();
     this.supervisorAdmissionCalls = 0;
   }
 
@@ -693,7 +1012,13 @@ export class PreInjectionAdmissionController {
     }
     for (const mp of mutatedFiles ?? []) {
       const norm = normalizeContextPath(mp);
-      if (norm) this.invalidatePath(norm);
+      if (norm) {
+        if (!this._mutatedFilesSeen.has(norm)) {
+          this._mutatedFilesSeen.add(norm);
+          this.invalidatePath(norm);
+        }
+        this.activeImports.add(norm);
+      }
     }
     for (const ef of errorFiles ?? []) {
       const norm = normalizeContextPath(ef);
@@ -705,6 +1030,10 @@ export class PreInjectionAdmissionController {
     const norm = normalizeContextPath(rawPath);
     if (!norm) return;
     for (const key of this.activeHashesByPath.keys()) {
+      if (key.startsWith('__probe__:')) {
+        this.activeHashesByPath.delete(key);
+        continue;
+      }
       const baseKey = key.split('#')[0];
       if (pathsMatch(baseKey, norm)) {
         this.activeHashesByPath.delete(key);
@@ -751,6 +1080,8 @@ export class PreInjectionAdmissionController {
       admissionMinChars = undefined,
       workingSetReadMaxChars = undefined,
       maxSupervisorAdmissionCalls = null,
+      minSupervisorBatchChars = undefined,
+      mainModel = null,
     } = {},
   ) {
     const items = Array.isArray(executedBatch) ? executedBatch : [];
@@ -826,20 +1157,17 @@ export class PreInjectionAdmissionController {
       const contentSha256 = sha256Hex(innerText);
       const originalTokens = estimateTokens(rawOutput);
 
-      const isErr = Boolean(item?.isError) || ERROR_OUTPUT_RE.test(innerText);
+      const isExecErrorTool = EXEC_ERROR_TOOLS.has(lowerTool);
+      const isErr =
+        Boolean(item?.isError) || (isExecErrorTool && ERROR_OUTPUT_RE.test(innerText));
       const isMutation = MUTATION_TOOLS.has(lowerTool);
       const isAlwaysDirectTool = ALWAYS_DIRECT_TOOLS.has(lowerTool);
-      const isNarrowSlice =
-        lowerTool === 'read_file' &&
-        (args?.startLine != null || args?.endLine != null) &&
-        (() => {
-          const from = Number(args?.startLine ?? 1);
-          const to =
-            args?.endLine != null
-              ? Number(args.endLine)
-              : parsedRead?.endLine ?? from + 399;
-          return Number.isFinite(from) && Number.isFinite(to) && to >= from && to - from + 1 <= 120;
-        })();
+      const isReadOnlyDedupTool = READ_ONLY_DEDUP_TOOLS.has(lowerTool);
+      const isReadProbeTool =
+        lowerTool === 'grep' ||
+        lowerTool === 'glob' ||
+        lowerTool === 'inspect_repository' ||
+        lowerTool === 'query_symbol_graph';
 
       const structure = extractStructure(
         targetPath,
@@ -853,6 +1181,22 @@ export class PreInjectionAdmissionController {
         errorFiles,
         mutatedFiles,
       });
+
+      const isDecoy = Boolean(domainInfo.isDecoy || domainInfo.suppressedAsDecoy);
+      const sliceStartArg = args?.startLine ?? args?.start_line;
+      const sliceEndArg = args?.endLine ?? args?.end_line;
+      const isNarrowSlice =
+        lowerTool === 'read_file' &&
+        !isDecoy &&
+        (sliceStartArg != null || sliceEndArg != null) &&
+        (() => {
+          const from = Number(sliceStartArg ?? 1);
+          const to =
+            sliceEndArg != null
+              ? Number(sliceEndArg)
+              : parsedRead?.endLine ?? from + 399;
+          return Number.isFinite(from) && Number.isFinite(to) && to >= from && to - from + 1 <= 400;
+        })();
 
       const promptTarget = domainInfo.matchedPrompt;
       const errorTarget = domainInfo.matchedError;
@@ -945,6 +1289,15 @@ export class PreInjectionAdmissionController {
         ]),
       ].slice(0, 12);
 
+      const isSliceRead =
+        args?.startLine != null ||
+        args?.endLine != null ||
+        args?.start_line != null ||
+        args?.end_line != null;
+      const probeKey = isReadProbeTool
+        ? `__probe__:${lowerTool}:${stableArgsStringify(args)}`
+        : null;
+
       const id = String(tc.id || `cand_${step}_${idx}`);
       const ctxRecord = {
         idx,
@@ -959,6 +1312,9 @@ export class PreInjectionAdmissionController {
         parsedRead,
         targetPath,
         normPath,
+        probeKey,
+        isReadProbeTool,
+        isSliceRead,
         lineRange,
         contentSha256,
         originalTokens,
@@ -981,13 +1337,49 @@ export class PreInjectionAdmissionController {
       const isNoisyProbeTool = NOISY_PROBE_TOOLS.has(lowerTool);
       const smallFastPathMaxChars = isNoisyProbeTool ? probeMinChars : minChars;
 
+      // DUPLICATE check (runs BEFORE isErr for read-only tools, isNarrowSlice, explicit_read_working_set, and oversized compression)
+      const sliceKey = !isReadProbeTool && normPath && isSliceRead ? `${normPath}#${lineRange}` : null;
+      const activeMem = probeKey
+        ? this.activeHashesByPath.get(probeKey)
+        : normPath
+          ? ((sliceKey && this.activeHashesByPath.get(sliceKey)) ||
+              this.activeHashesByPath.get(normPath))
+          : null;
+      const storeMatch =
+        !activeMem && !isReadProbeTool && normPath
+          ? this.aciStore?.findByPathAndHash?.(targetPath, contentSha256)
+          : null;
+      const dupMatch =
+        !item?.isError &&
+        (isReadOnlyDedupTool || !isErr) &&
+        (activeMem && activeMem.sha256 === contentSha256
+          ? activeMem
+          : storeMatch && storeMatch.sha256 === contentSha256
+            ? storeMatch
+            : null);
+
       // Deterministic Pre-Screen & Fast-Paths
-      if (isErr) {
-        ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
-        ctxRecord.reason = 'error_output';
-      } else if (isMutation) {
+      if (isMutation) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'mutation_output';
+      } else if (isExecErrorTool && innerText.length > DEFAULT_OVERSIZED_EXEC_MIN_CHARS) {
+        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
+        ctxRecord.reason = 'oversized_exec_log_fidelity_summary';
+      } else if (dupMatch && innerText.length > smallFastPathMaxChars) {
+        ctxRecord.decision = ADMISSION_DECISIONS.DUPLICATE;
+        ctxRecord.priorStep = dupMatch.step ?? 0;
+        ctxRecord.reason = `duplicate_unchanged_step_${ctxRecord.priorStep}`;
+      } else if (isErr) {
+        ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
+        ctxRecord.reason = 'error_output';
+      } else if (
+        (lowerTool === 'grep' || lowerTool === 'glob') &&
+        !item?.isError &&
+        innerText.length > DEFAULT_OVERSIZED_SEARCH_MIN_CHARS &&
+        !isDecoy
+      ) {
+        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
+        ctxRecord.reason = 'oversized_search_clustered_summary';
       } else if (isAlwaysDirectTool) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'always_direct_tool';
@@ -997,76 +1389,47 @@ export class PreInjectionAdmissionController {
       } else if (innerText.length <= smallFastPathMaxChars) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'small_payload_fast_path';
+      } else if (
+        lowerTool === 'read_file' &&
+        !isErr &&
+        !isDecoy &&
+        innerText.length <= effectiveWorkingSetMax
+      ) {
+        ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
+        ctxRecord.reason = 'explicit_read_working_set';
+      } else if (
+        (promptTarget && !domainInfo.isDecoy && innerText.length <= 2600) ||
+        ((errorTarget || mutatedTarget) && innerText.length <= 6000) ||
+        (score > 0.72 && innerText.length <= 2600 && !domainInfo.isDecoy)
+      ) {
+        ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
+        ctxRecord.reason = 'high_signal_direct';
+      } else if (
+        score <= 0.14 &&
+        domainInfo.domains.length === 0 &&
+        !domainInfo.suppressedAsDecoy &&
+        callChainHits === 0 &&
+        querySymbolHits === 0 &&
+        errorSymbolHits === 0 &&
+        !promptTarget &&
+        !errorTarget &&
+        !mutatedTarget
+      ) {
+        ctxRecord.decision = ADMISSION_DECISIONS.IRRELEVANT;
+        ctxRecord.reason = 'zero_signal_noise';
       } else {
-        // Check DUPLICATE against activeHashesByPath or aciStore BEFORE explicit_read_working_set
-        const isSliceRead =
-          args?.startLine != null ||
-          args?.endLine != null ||
-          args?.start_line != null ||
-          args?.end_line != null;
-        const sliceKey = normPath && isSliceRead ? `${normPath}#${lineRange}` : null;
-        const activeMem = normPath
-          ? ((sliceKey && this.activeHashesByPath.get(sliceKey)) ||
-              this.activeHashesByPath.get(normPath))
-          : null;
-        const storeMatch =
-          !activeMem && normPath
-            ? this.aciStore?.findByPathAndHash?.(targetPath, contentSha256)
-            : null;
-        const dupMatch =
-          activeMem && activeMem.sha256 === contentSha256
-            ? activeMem
-            : storeMatch && storeMatch.sha256 === contentSha256
-              ? storeMatch
-              : null;
-
-        if (dupMatch) {
-          ctxRecord.decision = ADMISSION_DECISIONS.DUPLICATE;
-          ctxRecord.priorStep = dupMatch.step ?? 0;
-          ctxRecord.reason = `duplicate_unchanged_step_${ctxRecord.priorStep}`;
-        } else if (
-          lowerTool === 'read_file' &&
-          !isErr &&
-          !domainInfo.isDecoy &&
-          !domainInfo.suppressedAsDecoy &&
-          innerText.length <= effectiveWorkingSetMax
-        ) {
-          ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
-          ctxRecord.reason = 'explicit_read_working_set';
-        } else if (
-          (promptTarget && !domainInfo.isDecoy && innerText.length <= 2600) ||
-          ((errorTarget || mutatedTarget) && innerText.length <= 6000) ||
-          (score > 0.72 && innerText.length <= 2600 && !domainInfo.isDecoy)
-        ) {
-          ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
-          ctxRecord.reason = 'high_signal_direct';
-        } else if (
-          score <= 0.14 &&
-          domainInfo.domains.length === 0 &&
-          !domainInfo.suppressedAsDecoy &&
-          callChainHits === 0 &&
-          querySymbolHits === 0 &&
-          errorSymbolHits === 0 &&
-          !promptTarget &&
-          !errorTarget &&
-          !mutatedTarget
-        ) {
-          ctxRecord.decision = ADMISSION_DECISIONS.IRRELEVANT;
-          ctxRecord.reason = 'zero_signal_noise';
+        const decoyConflict =
+          domainInfo.isDecoy && (domainInfo.rawDomains.length > 0 || querySymbolHits > 0);
+        const ambiguousScore = score >= 0.15 && score <= 0.72;
+        const largeMultiSection = innerText.length >= 2600;
+        if (ambiguousScore || decoyConflict || largeMultiSection) {
+          ambiguousQueue.push(ctxRecord);
+        } else if (isProtectedCritical || callChainHits > 0 || score >= 0.35) {
+          ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
+          ctxRecord.reason = 'deterministic_supporting';
         } else {
-          const decoyConflict =
-            domainInfo.isDecoy && (domainInfo.rawDomains.length > 0 || querySymbolHits > 0);
-          const ambiguousScore = score >= 0.15 && score <= 0.72;
-          const largeMultiSection = innerText.length >= 2600;
-          if (ambiguousScore || decoyConflict || largeMultiSection) {
-            ambiguousQueue.push(ctxRecord);
-          } else if (isProtectedCritical || callChainHits > 0 || score >= 0.35) {
-            ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
-            ctxRecord.reason = 'deterministic_supporting';
-          } else {
-            ctxRecord.decision = ADMISSION_DECISIONS.DEFER;
-            ctxRecord.reason = 'deterministic_defer';
-          }
+          ctxRecord.decision = ADMISSION_DECISIONS.DEFER;
+          ctxRecord.reason = 'deterministic_defer';
         }
       }
 
@@ -1075,6 +1438,11 @@ export class PreInjectionAdmissionController {
 
     // Selective Batched Supervisor Call (at most once per tool batch)
     let supervisorRes = null;
+    const hasExplicitMinSupBatchChars =
+      minSupervisorBatchChars !== undefined &&
+      minSupervisorBatchChars !== null &&
+      minSupervisorBatchChars !== '' &&
+      Number.isFinite(Number(minSupervisorBatchChars));
     if (
       supervisorEnabled &&
       supervisor &&
@@ -1082,8 +1450,15 @@ export class PreInjectionAdmissionController {
       ambiguousQueue.length > 0 &&
       this.supervisorAdmissionCalls < maxSupCalls
     ) {
-      const resolved = supervisor.resolveModel?.(supervisorConfigOverride);
-      if (resolved?.active) {
+      const resolved = supervisor.resolveModel?.(supervisorConfigOverride, { mainModel });
+      const effectiveMinSupBatchChars = hasExplicitMinSupBatchChars
+        ? Math.max(0, Number(minSupervisorBatchChars))
+        : resolved?.config?.mode === 'auto' &&
+            effectiveWorkingSetMax >= DEFAULT_WORKING_SET_READ_MAX_CHARS
+          ? DEFAULT_MIN_SUPERVISOR_BATCH_CHARS
+          : 0;
+      const ambiguousQueueChars = ambiguousQueue.reduce((sum, c) => sum + c.innerText.length, 0);
+      if (resolved?.active && ambiguousQueueChars >= effectiveMinSupBatchChars) {
         const supCandidates = ambiguousQueue.map((c) => ({
           id: c.id,
           path: c.targetPath,
@@ -1111,6 +1486,7 @@ export class PreInjectionAdmissionController {
             learnedGuidelines,
             signal,
             configOverride: supervisorConfigOverride,
+            mainModel,
           })
           .catch((err) => ({
             ok: false,
@@ -1213,12 +1589,7 @@ export class PreInjectionAdmissionController {
                 step,
               })
             : null;
-        const isSliceRead =
-          c.args?.startLine != null ||
-          c.args?.endLine != null ||
-          c.args?.start_line != null ||
-          c.args?.end_line != null;
-        if (c.normPath && !c.isMutation && !c.lowerTool.startsWith('bash')) {
+        if (!c.isMutation && !EXEC_ERROR_TOOLS.has(c.lowerTool)) {
           const directEntry = {
             sha256: c.contentSha256,
             step,
@@ -1226,12 +1597,24 @@ export class PreInjectionAdmissionController {
             refId: null,
             lineRange: c.lineRange,
           };
-          if (!isSliceRead) {
-            this.activeHashesByPath.set(c.normPath, directEntry);
-          } else if (c.reason === 'explicit_read_working_set') {
-            this.activeHashesByPath.set(`${c.normPath}#${c.lineRange}`, directEntry);
+          if (c.probeKey) {
+            if (!c.item?.isError) {
+              this.activeHashesByPath.set(c.probeKey, directEntry);
+            }
+          } else if (c.normPath) {
+            if (!c.isSliceRead) {
+              this.activeHashesByPath.set(c.normPath, directEntry);
+            } else if (
+              c.reason === 'explicit_read_working_set' ||
+              c.reason === 'narrow_line_slice' ||
+              c.lowerTool === 'read_file'
+            ) {
+              this.activeHashesByPath.set(`${c.normPath}#${c.lineRange}`, directEntry);
+            }
           }
-          this.activeUriByPathStep.set(`${c.normPath}@${step}`, directEntry.uri);
+          if (c.normPath) {
+            this.activeUriByPathStep.set(`${c.normPath}@${step}`, directEntry.uri);
+          }
         }
         this.#recordSymbolsFromStructure(c.targetPath, c.structure);
       } else {
@@ -1245,9 +1628,23 @@ export class PreInjectionAdmissionController {
           decision: finalDecision,
           priorStep: c.priorStep,
         });
+        if (c.probeKey && !c.item?.isError && finalDecision !== ADMISSION_DECISIONS.DUPLICATE) {
+          this.activeHashesByPath.set(c.probeKey, {
+            sha256: c.contentSha256,
+            step,
+            uri: ref.uri,
+            refId: ref.refId,
+            lineRange: c.lineRange,
+          });
+        }
         if (c.normPath) {
           this.activeUriByPathStep.set(`${c.normPath}@${step}`, ref.uri);
-          if (finalDecision === ADMISSION_DECISIONS.SUPPORTING && !c.args?.startLine && !c.args?.endLine) {
+          if (
+            !c.probeKey &&
+            finalDecision === ADMISSION_DECISIONS.SUPPORTING &&
+            !c.args?.startLine &&
+            !c.args?.endLine
+          ) {
             this.activeHashesByPath.set(c.normPath, {
               sha256: c.contentSha256,
               step,
@@ -1260,6 +1657,8 @@ export class PreInjectionAdmissionController {
         }
         const rendered = renderProgressivePayload({
           decision: finalDecision,
+          reason: c.reason,
+          lowerTool: c.lowerTool,
           ref,
           rawOutput: c.rawOutput,
           envelope: c.envelope,
