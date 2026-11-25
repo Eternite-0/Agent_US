@@ -141,7 +141,7 @@ function extractSeedNodeScript(workflowText) {
 }
 
 describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
-  const workflowText = readFileSync(WORKFLOW_PATH, 'utf8');
+  const workflowText = readFileSync(WORKFLOW_PATH, 'utf8').replace(/\r\n/g, '\n');
   const parsed = parseWorkflowStructure(workflowText);
   const tempDirs = [];
 
