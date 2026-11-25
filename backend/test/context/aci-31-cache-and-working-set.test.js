@@ -108,24 +108,24 @@ function wrapUntrustedTool(seq, body) {
   return `<untrusted id="cafebabe000011112222333344445555-tool-read_file-${seq}" bytes="${Buffer.byteLength(body, 'utf8')}">${body}</untrusted id="cafebabe000011112222333344445555-tool-read_file-${seq}">`;
 }
 
-test('v3.1 WP3 constants, policy helpers, and ACIEngine defaults preserve backward compat and 32k floor', () => {
+test('v3.1 WP3 constants, policy helpers, and ACIEngine defaults preserve backward compat and 48k floor', () => {
   assert.equal(CACHE_AWARE_V31_DTOC_POLICY, 'cache_aware_v31');
   assert.deepEqual([...CACHE_AWARE_V31_EPOCH_WATERMARKS], [0.78, 0.9]);
-  assert.equal(DEFAULT_V31_MIN_PROMPT_TOKENS, 32000);
+  assert.equal(DEFAULT_V31_MIN_PROMPT_TOKENS, 48000);
   assert.equal(DEFAULT_V31_MIN_NET_SAVINGS_TOKENS, 3500);
   assert.equal(DEFAULT_V31_EVICTION_COOLDOWN_STEPS, 6);
   assert.ok(VALID_DTOC_POLICIES.includes(CACHE_AWARE_V31_DTOC_POLICY));
   assert.equal(normalizeDtocPolicy(CACHE_AWARE_V31_DTOC_POLICY), CACHE_AWARE_V31_DTOC_POLICY);
   assert.deepEqual(resolveWatermarksForPolicy(CACHE_AWARE_V31_DTOC_POLICY), [0.78, 0.9]);
-  assert.equal(DEFAULT_WORKING_SET_READ_MAX_CHARS, 16000);
+  assert.equal(DEFAULT_WORKING_SET_READ_MAX_CHARS, 42000);
   assert.equal(DEFAULT_PROBE_ADMISSION_MIN_CHARS, 2400);
 
   const v31Engine = new ACIEngine({ dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY });
   assert.equal(v31Engine._explicitDtocMinPromptTokens, undefined);
-  assert.equal(v31Engine.dtocMinPromptTokens, 32000);
+  assert.equal(v31Engine.dtocMinPromptTokens, 48000);
   assert.equal(v31Engine.minNetSavingsTokens, 3500);
   assert.equal(v31Engine.evictionCooldownSteps, 6);
-  assert.equal(v31Engine.workingSetReadMaxChars, 16000);
+  assert.equal(v31Engine.workingSetReadMaxChars, 42000);
   assert.deepEqual(v31Engine.watermarks, [0.78, 0.9]);
 
   // Explicit numeric dtocMinPromptTokens is honored when supplied, while default 24000 stays isolated to legacy policies
@@ -145,7 +145,7 @@ test('v3.1 WP3 constants, policy helpers, and ACIEngine defaults preserve backwa
   assert.equal(v25Engine.minNetSavingsTokens, 1200);
 });
 
-test('v3.1 WP3 (a): <32k append-only cache floor performs 0 mutations across repeated edit/test churn', () => {
+test('v3.1 WP3 (a): <48k append-only cache floor performs 0 mutations across repeated edit/test churn', () => {
   const storeDir = mkdtempSync(join(tmpdir(), 'aci31-floor-'));
   const store = new Store(join(storeDir, 'engine.sqlite'));
   try {
@@ -181,13 +181,13 @@ test('v3.1 WP3 (a): <32k append-only cache floor performs 0 mutations across rep
     ];
 
     const tokensBefore = measureRequestComposition({ messages }).totalTokens;
-    assert.ok(tokensBefore > 12000 && tokensBefore < 32000, `Expected 12k..32k tokens, got ${tokensBefore}`);
+    assert.ok(tokensBefore > 12000 && tokensBefore < 48000, `Expected 12k..48k tokens, got ${tokensBefore}`);
 
     const snapshotBefore = JSON.stringify(messages);
     const probe = engine.inspectEpoch(messages, { currentStep: 10, cumulativeUsedTokens: 40000 });
     assert.equal(probe.triggered, false);
     assert.equal(probe.reason, 'append_only_cache_floor_v31');
-    assert.equal(probe.dtocMinPromptTokens, 32000);
+    assert.equal(probe.dtocMinPromptTokens, 48000);
     assert.equal(probe.invalidatedSuffixTokens, 0);
 
     const comp = engine.compress(messages, { currentStep: 10, cumulativeUsedTokens: 40000 });
@@ -211,7 +211,7 @@ test('v3.1 WP3 (a): <32k append-only cache floor performs 0 mutations across rep
   }
 });
 
-test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-step cooldown, shields active/contract/error/head, and reports invalidatedSuffixTokens', () => {
+test('v3.1 WP3 (b): >=48k amortized batch epoch requires >=max(3500, 0.35*suffix) net savings, 6-step cooldown, shields active/contract/error/head, and reports invalidatedSuffixTokens', () => {
   const storeDir = mkdtempSync(join(tmpdir(), 'aci31-epoch-'));
   const store = new Store(join(storeDir, 'engine.sqlite'));
   try {
@@ -226,8 +226,8 @@ test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-s
       contextWindow: 128000,
     });
 
-    // 1) Insufficient net savings (< 3500) even when >= 32k tokens -> abstains cleanly
-    const hugeShieldedSpec = `# SPEC\n${'Contract requirement line keeping prompt >= 32k.\n'.repeat(2700)}`;
+    // 1) Insufficient net savings (< 3500 / 0.35 * suffix) even when >= 48k tokens -> abstains cleanly
+    const hugeShieldedSpec = `# SPEC\n${'Contract requirement line keeping prompt >= 48k.\n'.repeat(4300)}`;
     const smallSuperseded = 'export const smallOld = 1;\n'.repeat(80); // ~2160 chars (~540 tok < 3500)
     const lowSavingsMsgs = [
       { role: 'user', content: [{ type: 'text', text: 'Update SPEC-compliant module' }] },
@@ -238,7 +238,7 @@ test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-s
       ...makeToolStep('ls_tail', 'read_file', { path: 'src/tail.js' }, 'export const tail = true;\n'.repeat(20), { step: 8 }),
     ];
     const lowTokens = measureRequestComposition({ messages: lowSavingsMsgs }).totalTokens;
-    assert.ok(lowTokens >= 32000, `Expected >= 32k tokens, got ${lowTokens}`);
+    assert.ok(lowTokens >= 48000, `Expected >= 48k tokens, got ${lowTokens}`);
 
     const lowRes = engine.compress(lowSavingsMsgs, { currentStep: 8, contractFiles: ['SPEC.md'] });
     assert.equal(lowRes.triggered, false);
@@ -246,15 +246,15 @@ test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-s
     assert.equal(lowRes.compressedCount, 0);
     assert.ok(lowRes.invalidatedSuffixTokens > 0, 'invalidatedSuffixTokens must be reported');
 
-    // 2) >= 32k with Tier-1 superseded + Tier-2 aged candidates totaling >= 3500 net savings
+    // 2) >= 48k with Tier-1 superseded + Tier-2 aged candidates totaling >= max(3500, 0.35 * invalidatedSuffixTokens) net savings
     const headCode = makeCodeModule('headBoot', 60);
     const specCode = `# Contract\n${'Strict spec invariant rule.\n'.repeat(160)}`;
-    const tier1PreMut = makeCodeModule('tier1StaleA', 270);
+    const tier1PreMut = makeCodeModule('tier1StaleA', 420);
     const tier1OldErr =
       'exitCode: 1\nAssertionError: old failure\n' +
-      Array.from({ length: 140 }, (_, i) => `at oldWorker${i} (src/old.js:${i + 1}:4)`).join('\n');
-    const tier2Aged1 = makeCodeModule('tier2AgedModuleOne', 270);
-    const tier2Aged2 = makeCodeModule('tier2AgedModuleTwo', 270);
+      Array.from({ length: 220 }, (_, i) => `at oldWorker${i} (src/old.js:${i + 1}:4)`).join('\n');
+    const tier2Aged1 = makeCodeModule('tier2AgedModuleOne', 420);
+    const tier2Aged2 = makeCodeModule('tier2AgedModuleTwo', 420);
     const recentPostMut = makeCodeModule('recentActive', 110);
     const latestErr =
       'exitCode: 1\nAssertionError: latest unresolved failure\n' +
@@ -274,7 +274,7 @@ test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-s
     ];
 
     const batchTokens = measureRequestComposition({ messages: batchMsgs }).totalTokens;
-    assert.ok(batchTokens >= 32000, `Expected >= 32k tokens, got ${batchTokens}`);
+    assert.ok(batchTokens >= 48000, `Expected >= 48k tokens, got ${batchTokens}`);
 
     const firstCandidateIdx = batchMsgs.findIndex((m) => m.toolCallId === 'v_t1_read');
     const expectedInvalidatedSuffix = measureRequestComposition({
@@ -287,7 +287,10 @@ test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-s
     assert.equal(comp1.epoch, 1);
     assert.equal(comp1.firstCandidateIndex, firstCandidateIdx);
     assert.equal(comp1.invalidatedSuffixTokens, expectedInvalidatedSuffix);
-    assert.ok(comp1.netSavingsTokens >= 3500, `Expected >= 3500 savings, got ${comp1.netSavingsTokens}`);
+    assert.ok(
+      comp1.netSavingsTokens >= Math.max(3500, Math.ceil(expectedInvalidatedSuffix * 0.35)),
+      `Expected >= max(3500, 0.35*suffix) savings, got ${comp1.netSavingsTokens}`,
+    );
     assert.equal(comp1.compressedCount, 4, 'Must batch-compress all Tier-1 (2) + Tier-2 (2) candidates in one epoch');
     assert.equal(comp1.supersededEvictions, 2);
     assert.equal(comp1.pairClosedValid, true);
@@ -304,17 +307,17 @@ test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-s
     assert.ok(findText('v_recent_read').includes('recentActive_1_'));
     assert.ok(findText('v_latest_err').includes('latest unresolved failure'));
 
-    // 3) 6-step cooldown blocks eviction at step 15 (15 - 10 = 5 < 6), even with >= 32k tokens & new stale reads
-    const extraAged = makeCodeModule('extraWave', 550);
+    // 3) 6-step cooldown blocks eviction at step 15 (15 - 10 = 5 < 6), even with >= 48k tokens & new stale reads
+    const extraAged = makeCodeModule('extraWave', 900);
     const step15Msgs = [
       ...comp1.messages,
       ...makeToolStep('v_extra_read', 'read_file', { path: 'src/extra.js' }, extraAged, { step: 11 }),
       ...makeToolStep('v_extra_edit', 'edit_file', { path: 'src/extra.js' }, 'Edited src/extra.js', { step: 12 }),
-      ...makeToolStep('v_extra_tail', 'read_file', { path: 'src/final.js' }, makeCodeModule('finalLive', 450), { step: 15 }),
+      ...makeToolStep('v_extra_tail', 'read_file', { path: 'src/final.js' }, makeCodeModule('finalLive', 700), { step: 15 }),
     ];
     assert.ok(
-      measureRequestComposition({ messages: step15Msgs }).totalTokens >= 32000,
-      'step15Msgs must exceed 32k floor so cooldown gate is exercised',
+      measureRequestComposition({ messages: step15Msgs }).totalTokens >= 48000,
+      'step15Msgs must exceed 48k floor so cooldown gate is exercised',
     );
     const cooldownBlocked = engine.compress(step15Msgs, { currentStep: 15, contractFiles: ['SPEC.md'] });
     assert.equal(cooldownBlocked.triggered, false);
@@ -347,7 +350,7 @@ test('v3.1 WP3 (b): >=32k amortized batch epoch requires >=3500 net savings, 6-s
   }
 });
 
-test('v3.1 WP4 (c & d): working-set verbatim read_file (<=16k), DUPLICATE repeat, >2400 probe slicing, and unified `${ln}: ` line numbers', async () => {
+test('v3.1 WP4 (c & d): working-set verbatim read_file (<=42k), DUPLICATE repeat, >2400 probe slicing, and unified `${ln}: ` line numbers', async () => {
   const storeDir = mkdtempSync(join(tmpdir(), 'aci31-ws-'));
   const store = new Store(join(storeDir, 'engine.sqlite'));
   try {
@@ -365,10 +368,10 @@ test('v3.1 WP4 (c & d): working-set verbatim read_file (<=16k), DUPLICATE repeat
       .split('\n')
       .map((line, i) => `${i + 1}: ${line}`)
       .join('\n')}`;
-    assert.ok(mod300Output.length > 8000 && mod300Output.length <= 16000, `Expected ~9k+ <=16k chars, got ${mod300Output.length}`);
+    assert.ok(mod300Output.length > 8000 && mod300Output.length <= 42000, `Expected ~9k+ <=42k chars, got ${mod300Output.length}`);
 
-    const hugeReadBody = makeCodeModule('giantRegistry', 450, 'lookupRegistryRule');
-    assert.ok(hugeReadBody.length > 16000, `Expected >16k chars, got ${hugeReadBody.length}`);
+    const hugeReadBody = makeCodeModule('giantRegistry', 520, 'lookupRegistryRule');
+    assert.ok(hugeReadBody.length > 42000, `Expected >42k chars, got ${hugeReadBody.length}`);
 
     const smallGrepOut = Array.from({ length: 40 }, (_, i) => `src/orders/calc.js:${i + 1}: validateOrder(item)`).join('\n');
     assert.ok(smallGrepOut.length > 1400 && smallGrepOut.length <= 2400, `Expected 1400..2400 chars, got ${smallGrepOut.length}`);
@@ -436,10 +439,10 @@ test('v3.1 WP4 (c & d): working-set verbatim read_file (<=16k), DUPLICATE repeat
     );
     assert.equal(byId1.b_large.admission.decision, ADMISSION_DECISIONS.IRRELEVANT);
 
-    // >16k read_file goes through 5-tier admission (SUPPORTING or DEFER) with unified `${ln}: ` line numbers
+    // >42k read_file goes through 5-tier admission (SUPPORTING or DEFER) with unified `${ln}: ` line numbers
     assert.ok(
       [ADMISSION_DECISIONS.SUPPORTING, ADMISSION_DECISIONS.DEFER].includes(byId1.r_huge.admission.decision),
-      `Expected >16k read_file to be sliced, got ${byId1.r_huge.admission.decision}`,
+      `Expected >42k read_file to be sliced, got ${byId1.r_huge.admission.decision}`,
     );
     assert.match(byId1.r_huge.admittedOutput, /^\[ACI-REF artifact:\/\/[0-9a-f]{64} \| (?:SUPPORTING|DEFER) \|[^\n]*@L\d+/m);
     assert.match(byId1.r_huge.admittedOutput, /^\d+: /m, 'Sliced output must use `${ln}: ` line prefixes');
