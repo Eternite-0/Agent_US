@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -97,6 +98,64 @@ const TEMP_CACHE_DIR_NAMES = new Set([
   '.tox',
 ]);
 const TEMP_CACHE_FILE_RE = /\.(?:pyc|pyo)$/i;
+const ARMS_EXPLICIT_SYM = Symbol('armsExplicit');
+
+/**
+ * Parses and validates a deterministic shard specification (`"<index>/<total>"` or `{ index, total }`).
+ */
+export function parseSweBenchShardSpec(raw) {
+  let index;
+  let total;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    if (
+      raw.index === '' ||
+      raw.index == null ||
+      raw.total === '' ||
+      raw.total == null
+    ) {
+      throw new Error(
+        `Invalid --shard "${JSON.stringify(raw)}"; expected "<index>/<total>" (e.g. "1/5")`,
+      );
+    }
+    index = Number(raw.index);
+    total = Number(raw.total);
+  } else if (typeof raw === 'string') {
+    const match = /^\s*([+-]?\d+)\s*\/\s*([+-]?\d+)\s*$/.exec(raw);
+    if (!match) {
+      throw new Error(
+        `Invalid --shard "${raw}"; expected "<index>/<total>" (e.g. "1/5")`,
+      );
+    }
+    index = Number(match[1]);
+    total = Number(match[2]);
+  } else {
+    throw new Error(
+      `Invalid --shard "${String(raw)}"; expected "<index>/<total>" (e.g. "1/5")`,
+    );
+  }
+
+  if (!Number.isInteger(total) || total < 1) {
+    throw new Error(
+      `Invalid --shard "${typeof raw === 'string' ? raw : `${index}/${total}`}": total must be an integer >= 1`,
+    );
+  }
+  if (!Number.isInteger(index) || index < 1 || index > total) {
+    throw new Error(
+      `Invalid --shard "${typeof raw === 'string' ? raw : `${index}/${total}`}": index must be an integer between 1 and ${total}`,
+    );
+  }
+  return { index, total };
+}
+
+/**
+ * Deterministically slices instances for a 1-based shard using interleaved modulo partitioning.
+ */
+export function sliceInstancesForShard(instances, shard) {
+  const list = Array.isArray(instances) ? instances : [];
+  if (!shard) return [...list];
+  const norm = parseSweBenchShardSpec(shard);
+  return list.filter((_, idx) => idx % norm.total === norm.index - 1);
+}
 
 function printSweBenchUsage() {
   console.log(
@@ -109,6 +168,8 @@ function printSweBenchUsage() {
       '  --fetch-dataset [path]         Download SWE-bench Verified Mini (50-instance) from HuggingFace',
       '  --subset <smoke-5|paper-50>    Deterministic stratified benchmark subset',
       '  --seed <n>                     PRNG seed for --subset (default: 42)',
+      '  --shard <index>/<total>        Run 1-based interleaved shard (e.g. 1/5) after --subset/--limit',
+      '  --merge-shards <dir1,dir2,...> Merge sharded JSONL outputs into summary.md / .tex without running inference',
       '  --dry-run                      Run deterministic offline Python bug trajectory with 64-tok KV sim',
       '  --arms <csv>                   Comma-separated ACI arms (default: raw_full,full_aci)',
       '  --model <model>                Model alias / name for predictions & inference',
@@ -182,6 +243,8 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     fetchDatasetPath: null,
     subset: null,
     seed: 42,
+    shard: null,
+    mergeShards: null,
     evaluate: false,
     evalOnly: false,
     predictions: null,
@@ -193,6 +256,7 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     resume: false,
     json: false,
     help: false,
+    [ARMS_EXPLICIT_SYM]: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -239,11 +303,13 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     } else if (arg === '--dataset') opts.dataset = String(nextVal());
     else if (arg.startsWith('--dataset=')) opts.dataset = splitEq('--dataset');
     else if (arg === '--arms') {
+      opts[ARMS_EXPLICIT_SYM] = true;
       opts.arms = String(nextVal())
         .split(',')
         .map((s) => s.trim().toLowerCase())
         .filter(Boolean);
     } else if (arg.startsWith('--arms=')) {
+      opts[ARMS_EXPLICIT_SYM] = true;
       opts.arms = splitEq('--arms')
         .split(',')
         .map((s) => s.trim().toLowerCase())
@@ -285,6 +351,19 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--subset=')) opts.subset = splitEq('--subset').trim().toLowerCase();
     else if (arg === '--seed') opts.seed = Number(nextVal());
     else if (arg.startsWith('--seed=')) opts.seed = Number(splitEq('--seed'));
+    else if (arg === '--shard') opts.shard = parseSweBenchShardSpec(String(nextVal()));
+    else if (arg.startsWith('--shard=')) opts.shard = parseSweBenchShardSpec(splitEq('--shard'));
+    else if (arg === '--merge-shards') {
+      opts.mergeShards = String(nextVal())
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else if (arg.startsWith('--merge-shards=')) {
+      opts.mergeShards = splitEq('--merge-shards')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
     else if (arg === '--predictions') opts.predictions = String(nextVal());
     else if (arg.startsWith('--predictions=')) opts.predictions = splitEq('--predictions');
     else if (arg === '--instance-ids') {
@@ -349,11 +428,21 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
   if (opts.instanceIds && opts.instanceIds.length === 0) {
     opts.instanceIds = null;
   }
+  if (opts.mergeShards !== null && opts.mergeShards.length === 0) {
+    throw new Error('--merge-shards requires at least one directory path');
+  }
   if (opts.evalOnly && (!opts.predictions || !opts.dataset)) {
     throw new Error('--eval-only requires both --predictions <path> and --dataset <path>');
   }
-  if (!opts.help && !opts.dryRun && !opts.dataset && !opts.fetchDataset && !opts.evalOnly) {
-    throw new Error('Provide --dataset <path> or --dry-run (or --fetch-dataset / --eval-only)');
+  if (
+    !opts.help &&
+    !opts.dryRun &&
+    !opts.dataset &&
+    !opts.fetchDataset &&
+    !opts.evalOnly &&
+    !(Array.isArray(opts.mergeShards) && opts.mergeShards.length > 0)
+  ) {
+    throw new Error('Provide --dataset <path> or --dry-run (or --fetch-dataset / --eval-only / --merge-shards)');
   }
 
   return opts;
@@ -1847,7 +1936,7 @@ async function runSweBenchInstanceArm({
     availableModels = Array.isArray(cloned.availableModels) ? cloned.availableModels : [resolvedModel];
     modelNameForPrediction = opts.model || resolvedModel || `agent-us-${arm}`;
   } else {
-    const liveCfg = providerConfig ?? resolveLiveProviderConfig(opts);
+    const liveCfg = providerConfig ?? resolveLiveProviderConfig(opts, runtimeDeps.env ?? process.env);
     if (!liveCfg?.apiKey) {
       throw new Error(
         'Live SWE-bench execution requires an enabled App Pool account (--use-app-pool) or SWEBENCH_API_KEY / TI_BENCH_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY (or use --dry-run)',
@@ -2069,6 +2158,450 @@ async function runWithConcurrency(items, concurrency, fn) {
   return out;
 }
 
+const SHARD_JSONL_FILE_RE = /^(predictions|telemetry|eval)\.([a-z0-9_-]+)\.jsonl$/i;
+const NATURAL_NAME_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+function compareLexAsc(a, b) {
+  const sa = String(a ?? '');
+  const sb = String(b ?? '');
+  if (sa < sb) return -1;
+  if (sa > sb) return 1;
+  return 0;
+}
+
+function hasShardJsonlFiles(dirPath) {
+  try {
+    if (!existsSync(dirPath) || !statSync(dirPath).isDirectory()) return false;
+    return readdirSync(dirPath, { withFileTypes: true }).some(
+      (entry) => entry.isFile() && SHARD_JSONL_FILE_RE.test(entry.name),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function discoverShardDirectories(rawDirs, { outputDir = null, resume = false } = {}) {
+  const discovered = [];
+  const seen = new Set();
+  const addDir = (dirPath) => {
+    const abs = resolve(String(dirPath));
+    if (seen.has(abs)) return;
+    try {
+      if (existsSync(abs) && statSync(abs).isDirectory()) {
+        seen.add(abs);
+        discovered.push(abs);
+      }
+    } catch {
+      // Ignore inaccessible path
+    }
+  };
+
+  if (resume && outputDir && hasShardJsonlFiles(outputDir)) {
+    addDir(outputDir);
+  }
+
+  for (const rawDir of rawDirs) {
+    const absDir = resolve(String(rawDir));
+    let isDir = false;
+    try {
+      isDir = existsSync(absDir) && statSync(absDir).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    if (!isDir) continue;
+
+    if (hasShardJsonlFiles(absDir)) {
+      addDir(absDir);
+    }
+
+    const subdirs = readdirSync(absDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((a, b) => NATURAL_NAME_COLLATOR.compare(a, b));
+
+    for (const name of subdirs) {
+      const subPath = join(absDir, name);
+      if (/^(?:swebench-)?shard-/i.test(name) || hasShardJsonlFiles(subPath)) {
+        addDir(subPath);
+      }
+    }
+  }
+
+  if (discovered.length === 0) {
+    throw new Error(
+      `No existing shard directories found for --merge-shards (${rawDirs.join(', ')})`,
+    );
+  }
+
+  return discovered;
+}
+
+function discoverArmsInShardDirs(sourceDirs) {
+  const found = new Set();
+  for (const dir of sourceDirs) {
+    let entries = [];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      entries = [];
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const match = SHARD_JSONL_FILE_RE.exec(entry.name);
+      if (match?.[2]) {
+        found.add(match[2].toLowerCase());
+      }
+    }
+  }
+  const ordered = [];
+  for (const arm of DEFAULT_ARMS) {
+    if (found.has(arm)) {
+      ordered.push(arm);
+      found.delete(arm);
+    }
+  }
+  return [...ordered, ...[...found].sort(compareLexAsc)];
+}
+
+function getShardCandidateRank(cand) {
+  const tele = cand.telemetry;
+  const pred = cand.prediction;
+  const ev = cand.evalRecord;
+
+  const nonEnvError = tele
+    ? tele.status !== 'env_error'
+      ? 1
+      : 0
+    : ev?.reason === 'env_error' && !pred
+      ? 0
+      : 1;
+  const teleAndPred = tele && tele.status !== 'env_error' && pred ? 1 : 0;
+
+  const evalReason = ev?.reason ?? tele?.evalReason ?? null;
+  const isEvaluated = Boolean(ev) || typeof tele?.resolved === 'boolean';
+  const evaluatedGood = isEvaluated && evalReason !== 'env_error' ? 1 : 0;
+
+  const completed = tele?.status === 'completed' ? 1 : 0;
+  const cacheAvailable = tele?.cacheStatus === 'available' ? 1 : 0;
+  const nonEmptyPatch =
+    Boolean(tele?.nonEmptyPatch) || String(pred?.model_patch ?? '').trim().length > 0 ? 1 : 0;
+
+  return [nonEnvError, teleAndPred, evaluatedGood, completed, cacheAvailable, nonEmptyPatch];
+}
+
+function isBetterShardCandidate(next, prev) {
+  const nextRank = getShardCandidateRank(next);
+  const prevRank = getShardCandidateRank(prev);
+  for (let i = 0; i < nextRank.length; i++) {
+    if (nextRank[i] !== prevRank[i]) {
+      return nextRank[i] > prevRank[i];
+    }
+  }
+  const tsNext = next.telemetry?.timestamp ? Date.parse(next.telemetry.timestamp) : NaN;
+  const tsPrev = prev.telemetry?.timestamp ? Date.parse(prev.telemetry.timestamp) : NaN;
+  if (Number.isFinite(tsNext) && Number.isFinite(tsPrev) && tsNext !== tsPrev) {
+    return tsNext > tsPrev;
+  }
+  return next.dirIdx >= prev.dirIdx;
+}
+
+async function resolveCanonicalInstanceOrderForMerge(opts, runtimeDeps, outputDir) {
+  if (opts.dataset) {
+    const dsPath = await resolveDatasetInputPath(opts, runtimeDeps);
+    let instances = loadSweBenchDataset(dsPath, {
+      instanceIds: opts.instanceIds,
+      limit: opts.subset ? null : opts.limit,
+    });
+    if (opts.subset) {
+      const subRes = selectSweBenchSubset(instances, {
+        preset: opts.subset,
+        seed: opts.seed,
+        outputDir,
+      });
+      instances = subRes.instances;
+      if (opts.limit != null && opts.limit > 0) {
+        instances = instances.slice(0, opts.limit);
+      }
+    }
+    return instances.map((inst) => inst.instance_id);
+  }
+  if (opts.subset) {
+    const cachePath = getDefaultSweBenchCachePath();
+    if (existsSync(cachePath)) {
+      let instances = loadSweBenchDataset(cachePath, {
+        instanceIds: opts.instanceIds,
+        limit: null,
+      });
+      const subRes = selectSweBenchSubset(instances, {
+        preset: opts.subset,
+        seed: opts.seed,
+        outputDir,
+      });
+      instances = subRes.instances;
+      if (opts.limit != null && opts.limit > 0) {
+        instances = instances.slice(0, opts.limit);
+      }
+      return instances.map((inst) => inst.instance_id);
+    }
+  }
+  return null;
+}
+
+async function mergeSweBenchShards(opts, rawOpts, runtimeDeps = {}) {
+  const outputDir = opts.outputDir
+    ? resolve(String(opts.outputDir))
+    : resolve(process.cwd(), 'swebench-results');
+  const sourceDirs = discoverShardDirectories(opts.mergeShards, {
+    outputDir,
+    resume: opts.resume,
+  });
+  mkdirSync(outputDir, { recursive: true });
+
+  const discoveredArms = discoverArmsInShardDirs(sourceDirs);
+  const armsExplicit =
+    rawOpts?.[ARMS_EXPLICIT_SYM] !== undefined
+      ? Boolean(rawOpts[ARMS_EXPLICIT_SYM])
+      : Array.isArray(rawOpts?.arms) && rawOpts.arms.length > 0;
+  const arms = armsExplicit
+    ? opts.arms
+    : discoveredArms.length > 0
+      ? discoveredArms
+      : opts.arms;
+
+  const canonicalIds = await resolveCanonicalInstanceOrderForMerge(opts, runtimeDeps, outputDir);
+  const orderIndex = canonicalIds
+    ? new Map(canonicalIds.map((id, idx) => [id, idx]))
+    : null;
+  const compareIds = (a, b) => {
+    if (orderIndex) {
+      const idxA = orderIndex.get(a);
+      const idxB = orderIndex.get(b);
+      if (idxA !== undefined && idxB !== undefined) return idxA - idxB;
+      if (idxA !== undefined) return -1;
+      if (idxB !== undefined) return 1;
+    }
+    return compareLexAsc(a, b);
+  };
+
+  const predictionsByArm = {};
+  const telemetryByArm = {};
+  const evalResultsByArm = {};
+  const predictionsFiles = {};
+  const telemetryFiles = {};
+  const evalFiles = {};
+  const seenMergedIds = new Set();
+
+  for (const arm of arms) {
+    const bestById = new Map();
+    let sawEvalFile = false;
+
+    for (let dirIdx = 0; dirIdx < sourceDirs.length; dirIdx++) {
+      const dir = sourceDirs[dirIdx];
+      const predMap = readJsonlRecords(join(dir, `predictions.${arm}.jsonl`), 'instance_id');
+      const teleMap = readJsonlRecords(join(dir, `telemetry.${arm}.jsonl`), 'instance_id');
+      const evalFilePath = join(dir, `eval.${arm}.jsonl`);
+      if (existsSync(evalFilePath)) sawEvalFile = true;
+      const evalMap = readJsonlRecords(evalFilePath, 'instance_id');
+
+      const dirIds = new Set([...predMap.keys(), ...teleMap.keys(), ...evalMap.keys()]);
+      for (const id of dirIds) {
+        const candidate = {
+          instance_id: id,
+          prediction: predMap.get(id) ?? null,
+          telemetry: teleMap.get(id) ?? null,
+          evalRecord: evalMap.get(id) ?? null,
+          dirIdx,
+        };
+        const prev = bestById.get(id);
+        if (!prev || isBetterShardCandidate(candidate, prev)) {
+          bestById.set(id, candidate);
+        }
+      }
+    }
+
+    const sortedCandidates = [...bestById.values()].sort((a, b) =>
+      compareIds(a.instance_id, b.instance_id),
+    );
+    const preds = [];
+    const rawTele = [];
+    const evals = [];
+
+    for (const cand of sortedCandidates) {
+      seenMergedIds.add(cand.instance_id);
+      if (cand.prediction) preds.push(cand.prediction);
+      if (cand.evalRecord) evals.push(cand.evalRecord);
+      if (cand.telemetry) {
+        rawTele.push(cand.telemetry);
+      } else if (cand.evalRecord) {
+        rawTele.push({
+          instance_id: cand.instance_id,
+          arm,
+          model: cand.prediction?.model_name_or_path ?? opts.model ?? 'eval',
+          status: 'completed',
+          wallClockMs: 0,
+          steps: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          cacheEligibleInputTokens: null,
+          cacheStatus: 'missing',
+          cacheHitRate: null,
+          nonEmptyPatch: Boolean(cand.prediction?.model_patch?.trim()),
+          admissionOriginalTokens: 0,
+          admissionInjectedTokens: 0,
+          admissionSavedTokens: 0,
+          admissionTokenReductionRate: 0,
+          epochTransitions: 0,
+        });
+      }
+    }
+
+    const mergedTele = mergeEvalResultsIntoTelemetry(rawTele, evals);
+    predictionsByArm[arm] = preds;
+    evalResultsByArm[arm] = evals;
+    telemetryByArm[arm] = mergedTele;
+
+    const predOutPath = join(outputDir, `predictions.${arm}.jsonl`);
+    const teleOutPath = join(outputDir, `telemetry.${arm}.jsonl`);
+    const evalOutPath = join(outputDir, `eval.${arm}.jsonl`);
+    writeJsonlRecords(predOutPath, preds);
+    writeJsonlRecords(teleOutPath, mergedTele);
+    predictionsFiles[arm] = predOutPath;
+    telemetryFiles[arm] = teleOutPath;
+    if (evals.length > 0 || sawEvalFile) {
+      writeJsonlRecords(evalOutPath, evals);
+      evalFiles[arm] = evalOutPath;
+    }
+  }
+
+  const expectedIds = canonicalIds
+    ? [...canonicalIds]
+    : [...seenMergedIds].sort(compareLexAsc);
+  const missingByArm = {};
+  const envErrorByArm = {};
+  const metricsByArm = {};
+  const evalByArm = {};
+
+  for (const arm of arms) {
+    const teleMap = new Map(telemetryByArm[arm].map((r) => [r.instance_id, r]));
+    const predMap = new Map(predictionsByArm[arm].map((r) => [r.instance_id, r]));
+    const evalMap = new Map(evalResultsByArm[arm].map((r) => [r.instance_id, r]));
+
+    missingByArm[arm] = expectedIds.filter(
+      (id) => !teleMap.has(id) && !predMap.has(id) && !evalMap.has(id),
+    );
+    const envErrIds = new Set();
+    for (const row of telemetryByArm[arm]) {
+      if (row?.status === 'env_error' || row?.evalReason === 'env_error') {
+        envErrIds.add(row.instance_id);
+      }
+    }
+    for (const ev of evalResultsByArm[arm]) {
+      if (ev?.reason === 'env_error') {
+        envErrIds.add(ev.instance_id);
+      }
+    }
+    envErrorByArm[arm] = [...envErrIds].sort(compareIds);
+
+    metricsByArm[arm] = computeArmAggregateMetrics(
+      arm,
+      telemetryByArm[arm],
+      predictionsByArm[arm],
+    );
+    if (evalResultsByArm[arm].length > 0) {
+      const results = evalResultsByArm[arm];
+      const resolvedCount = results.filter((r) => Boolean(r?.resolved)).length;
+      evalByArm[arm] = {
+        totalInstances: expectedIds.length,
+        evaluatedCount: results.length,
+        resolvedCount,
+        resolvedRate: round4(resolvedCount / results.length),
+        results,
+      };
+    }
+  }
+
+  const pairedByArm = computePairedResolutionMetrics(arms, telemetryByArm, arms[0]);
+  const summaryModel =
+    opts.model ||
+    arms
+      .map((a) => telemetryByArm[a]?.find((r) => r?.status !== 'env_error' && r?.model)?.model)
+      .find(Boolean) ||
+    arms.map((a) => predictionsByArm[a]?.[0]?.model_name_or_path).find(Boolean) ||
+    'default';
+
+  const summaryPath = join(outputDir, 'summary.md');
+  const md = renderSummaryMarkdown({
+    arms,
+    metricsByArm,
+    telemetryByArm,
+    pairedByArm,
+    meta: {
+      dryRun: false,
+      evalOnly: false,
+      model: summaryModel,
+      maxSteps: opts.maxSteps,
+      resumed: opts.resume,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  writeFileSync(summaryPath, md, { encoding: 'utf8', mode: 0o600 });
+
+  const hasAnyEvalRecords = arms.some((arm) => (evalResultsByArm[arm]?.length ?? 0) > 0);
+  let latexPath = null;
+  if (opts.exportLatex || hasAnyEvalRecords) {
+    latexPath = opts.exportLatexPath
+      ? resolve(String(opts.exportLatexPath))
+      : join(outputDir, 'swebench-paper-table.tex');
+    mkdirSync(dirname(latexPath), { recursive: true });
+    const tex = renderPaperLatexTable({
+      arms,
+      metricsByArm,
+      pairedByArm,
+      meta: {
+        subset: opts.subset ?? null,
+        seed: opts.seed,
+        model: summaryModel,
+      },
+    });
+    writeFileSync(latexPath, tex, { encoding: 'utf8', mode: 0o600 });
+  }
+
+  return {
+    benchmarkId: SWEBENCH_BENCHMARK_ID,
+    version: SWEBENCH_BENCHMARK_VERSION,
+    action: 'merge-shards',
+    outputDir,
+    sourceDirs,
+    arms,
+    instancesCount: seenMergedIds.size,
+    expectedInstancesCount: expectedIds.length,
+    mergedCountByArm: Object.fromEntries(
+      arms.map((arm) => [
+        arm,
+        new Set([
+          ...telemetryByArm[arm].map((r) => r.instance_id),
+          ...predictionsByArm[arm].map((r) => r.instance_id),
+        ]).size,
+      ]),
+    ),
+    missingByArm,
+    envErrorByArm,
+    summaryPath,
+    predictionsFiles,
+    telemetryFiles,
+    evalFiles,
+    evalByArm,
+    latexPath,
+    metricsByArm,
+    pairedByArm,
+    predictionsByArm,
+    telemetryByArm,
+  };
+}
+
 /**
  * Executes the SWE-bench Verified benchmark across requested ACI arms and writes
  * `predictions.<arm>.jsonl`, `telemetry.<arm>.jsonl`, `eval.<arm>.jsonl`,
@@ -2096,12 +2629,31 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     cleanupImages: rawOpts.cleanupImages !== undefined ? Boolean(rawOpts.cleanupImages) : true,
     useAppPool: rawOpts.useAppPool !== undefined ? rawOpts.useAppPool : null,
     appDataDir: rawOpts.appDataDir ?? null,
+    excludeAccounts: Array.isArray(rawOpts.excludeAccounts)
+      ? [...rawOpts.excludeAccounts]
+      : typeof rawOpts.excludeAccounts === 'string'
+        ? rawOpts.excludeAccounts
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [],
+    endpoint: rawOpts.endpoint ?? null,
+    protocol: rawOpts.protocol ?? null,
     supervisorModel: rawOpts.supervisorModel ?? null,
     deterministicAdmission: Boolean(rawOpts.deterministicAdmission),
     fetchDataset: Boolean(rawOpts.fetchDataset),
     fetchDatasetPath: rawOpts.fetchDatasetPath ?? null,
     subset: rawOpts.subset ?? null,
     seed: rawOpts.seed != null && Number.isInteger(Number(rawOpts.seed)) ? Number(rawOpts.seed) : 42,
+    shard: rawOpts.shard != null ? parseSweBenchShardSpec(rawOpts.shard) : null,
+    mergeShards: Array.isArray(rawOpts.mergeShards)
+      ? rawOpts.mergeShards.map((s) => String(s).trim()).filter(Boolean)
+      : typeof rawOpts.mergeShards === 'string'
+        ? rawOpts.mergeShards
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : null,
     evaluate: Boolean(rawOpts.evaluate),
     evalOnly: Boolean(rawOpts.evalOnly),
     predictions: rawOpts.predictions ?? null,
@@ -2112,6 +2664,13 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     concurrency: Math.max(1, Number(rawOpts.concurrency ?? 1)),
     resume: Boolean(rawOpts.resume),
   };
+
+  if (opts.mergeShards !== null) {
+    if (opts.mergeShards.length === 0) {
+      throw new Error('--merge-shards requires at least one directory path');
+    }
+    return mergeSweBenchShards(opts, rawOpts, runtimeDeps);
+  }
 
   const memorySwap = computeMemorySwap(opts.containerMemory);
   const removeImgFn = runtimeDeps.removeDockerImage ?? removeDockerImage;
@@ -2162,6 +2721,9 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       if (opts.limit != null && opts.limit > 0) {
         instances = instances.slice(0, opts.limit);
       }
+    }
+    if (opts.shard) {
+      instances = sliceInstancesForShard(instances, opts.shard);
     }
 
     const predMatch = /^predictions\.([a-z0-9_-]+)\.jsonl$/i.exec(basename(predPath));
@@ -2332,7 +2894,11 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         }
       }
     }
+    if (opts.shard) {
+      instances = sliceInstancesForShard(instances, opts.shard);
+    }
 
+    const shardIds = opts.shard ? new Set(instances.map((i) => i.instance_id)) : null;
     const predictionsByArm = {};
     const telemetryByArm = {};
     const completedByArm = {};
@@ -2351,19 +2917,40 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
             telePath: join(outputDir, `telemetry.${arm}.jsonl`),
           };
 
-      prepareJsonlFile(resumeState.predPath, opts.resume);
-      prepareJsonlFile(resumeState.telePath, opts.resume);
-
-      predictionsByArm[arm] = [...resumeState.predictionsById.values()];
-      telemetryByArm[arm] = [...resumeState.telemetryById.values()];
-      completedByArm[arm] = resumeState.completedIds;
+      if (shardIds && opts.resume) {
+        const filteredPreds = [...resumeState.predictionsById.values()].filter((r) =>
+          shardIds.has(r.instance_id),
+        );
+        const filteredTele = [...resumeState.telemetryById.values()].filter((r) =>
+          shardIds.has(r.instance_id),
+        );
+        const filteredCompleted = new Set(
+          [...resumeState.completedIds].filter((id) => shardIds.has(id)),
+        );
+        predictionsByArm[arm] = filteredPreds;
+        telemetryByArm[arm] = filteredTele;
+        completedByArm[arm] = filteredCompleted;
+        writeJsonlRecords(resumeState.predPath, filteredPreds);
+        writeJsonlRecords(resumeState.telePath, filteredTele);
+      } else {
+        prepareJsonlFile(resumeState.predPath, opts.resume);
+        prepareJsonlFile(resumeState.telePath, opts.resume);
+        predictionsByArm[arm] = [...resumeState.predictionsById.values()];
+        telemetryByArm[arm] = [...resumeState.telemetryById.values()];
+        completedByArm[arm] = resumeState.completedIds;
+      }
       filePathsByArm[arm] = { predPath: resumeState.predPath, telePath: resumeState.telePath };
 
       if (opts.evaluate) {
         const evalPath = join(outputDir, `eval.${arm}.jsonl`);
         evalFiles[arm] = evalPath;
         if (opts.resume && existsSync(evalPath)) {
-          evalResultsByArm[arm] = [...readJsonlRecords(evalPath, 'instance_id').values()];
+          let evalRows = [...readJsonlRecords(evalPath, 'instance_id').values()];
+          if (shardIds) {
+            evalRows = evalRows.filter((r) => shardIds.has(r.instance_id));
+            writeJsonlRecords(evalPath, evalRows);
+          }
+          evalResultsByArm[arm] = evalRows;
         } else {
           prepareJsonlFile(evalPath, false);
           evalResultsByArm[arm] = [];
@@ -2710,6 +3297,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       outputDir,
       temporaryOutputDir: createdTempOutput,
       arms: opts.arms,
+      shard: opts.shard,
       instancesCount: instances.length,
       resumed: opts.resume,
       summaryPath,
@@ -2752,6 +3340,40 @@ if (isMain) {
     console.log(
       `[${result.benchmarkId} v${result.version}] fetched ${result.count} instances -> ${result.outputPath}`,
     );
+  } else if (result.action === 'merge-shards') {
+    console.log(
+      `[${result.benchmarkId} v${result.version}] action=merge-shards sources=${result.sourceDirs.length} mergedInstances=${result.instancesCount} outputDir=${result.outputDir}`,
+    );
+    for (const arm of result.arms) {
+      const m = result.metricsByArm[arm];
+      const p = result.pairedByArm?.[arm];
+      const resStr =
+        m.evaluatedInstances > 0
+          ? ` resolved=${(m.resolvedRate * 100).toFixed(2)}% (${m.resolvedInstances}/${m.evaluatedInstances})`
+          : ' resolved=N/A';
+      const pairedStr =
+        p?.pairedResolvedTokenReduction != null && (p?.pairedResolvedCount ?? 0) > 0
+          ? ` pairedTokRed=${(p.pairedResolvedTokenReduction * 100).toFixed(2)}% (n=${p.pairedResolvedCount})`
+          : ' pairedTokRed=N/A';
+      const cacheStr =
+        m.totalCacheEligibleInputTokens > 0
+          ? ` cacheHit=${(m.cacheHitRate * 100).toFixed(2)}% (${m.totalCacheReadTokens}/${m.totalCacheEligibleInputTokens}, n=${m.cacheReportedInstances ?? 0})`
+          : ` cacheHit=N/A (n=${m.cacheReportedInstances ?? 0})`;
+      console.log(
+        `Arm ${arm}: merged=${result.mergedCountByArm?.[arm] ?? m.totalInstances} completed=${m.completedInstances}/${m.totalInstances}${resStr}${pairedStr}${cacheStr}`,
+      );
+      const missing = result.missingByArm?.[arm] ?? [];
+      const envErrs = result.envErrorByArm?.[arm] ?? [];
+      if (missing.length > 0) {
+        console.log(`  missing (${missing.length}, rerun with --resume): ${missing.join(', ')}`);
+      }
+      if (envErrs.length > 0) {
+        console.log(`  env_error (${envErrs.length}, rerun with --resume): ${envErrs.join(', ')}`);
+      }
+    }
+    if (result.latexPath) {
+      console.log(`LaTeX table written -> ${result.latexPath}`);
+    }
   } else {
     console.log(
       `[${result.benchmarkId} v${result.version}] dryRun=${Boolean(result.dryRun)} evalOnly=${Boolean(result.evalOnly)} instances=${result.instancesCount} outputDir=${result.outputDir}`,
