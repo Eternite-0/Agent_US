@@ -852,6 +852,55 @@ describe('SWE-bench Dataset Fetcher, Stratified Sampler & Evaluator (WP4 + WP5)'
     assert.equal(thrownDestroyed, true, 'destroy() must always run in finally');
     assert.equal(errEval.results[0].resolved, false);
     assert.equal(errEval.results[0].reason, 'eval_error');
+
+    // Recover from git checkout exitCode 128 (dubious ownership in /testbed) before applying test_patch
+    const recoveryCommands = [];
+    const recoveryEval = await evaluateSweBenchPredictions({
+      instances: [instances[0]],
+      predictions: [predictions[0]],
+      createDockerSession: async () => ({
+        workspaceRoot: '/tmp/recover-128',
+        async exec(cmd, opts) {
+          assert.equal(opts?.skipAntiCheatGuard, true);
+          recoveryCommands.push(cmd);
+          if (cmd === "git checkout -- 'tests/test_existing.py'") {
+            return {
+              exitCode: 128,
+              stdout: '',
+              stderr: "fatal: detected dubious ownership in repository at '/testbed'",
+              timedOut: false,
+            };
+          }
+          if (cmd.startsWith('pytest -rA')) {
+            return {
+              exitCode: 0,
+              stdout:
+                'PASSED tests/test_existing.py::test_new_fix\nPASSED tests/test_existing.py::test_keep\n',
+              stderr: '',
+              timedOut: false,
+            };
+          }
+          return { exitCode: 0, stdout: '', stderr: '', timedOut: false };
+        },
+        async destroy() {},
+      }),
+    });
+    assert.equal(recoveryEval.results[0].resolved, true);
+    assert.equal(recoveryEval.results[0].reason, 'resolved');
+    const idxCheckout = recoveryCommands.indexOf("git checkout -- 'tests/test_existing.py'");
+    const idxSafeDir = recoveryCommands.indexOf(
+      'git config --global --add safe.directory /testbed 2>/dev/null || true',
+    );
+    const idxForceCheckout = recoveryCommands.indexOf("git checkout -f -- 'tests/test_existing.py'");
+    const idxRmAdded = recoveryCommands.indexOf("rm -f -- 'tests/test_brand_new.py'");
+    const idxApplyTest = recoveryCommands.findIndex(
+      (c, i) => i > idxRmAdded && c.startsWith('git apply -v -'),
+    );
+    assert.ok(idxCheckout >= 0, 'Expected initial git checkout');
+    assert.ok(idxSafeDir > idxCheckout, 'Expected safe.directory recovery after exitCode 128');
+    assert.ok(idxForceCheckout > idxSafeDir, 'Expected git checkout -f retry after safe.directory');
+    assert.ok(idxRmAdded > idxForceCheckout, 'Expected rm -f -- on touched.added before git apply');
+    assert.ok(idxApplyTest > idxRmAdded, 'Expected test_patch git apply after cleanup');
   });
 
   test('mergeEvalResultsIntoTelemetry, computePairedResolutionMetrics, and renderPaperLatexTable compute paired savings and clean booktabs LaTeX', () => {

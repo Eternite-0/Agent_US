@@ -1381,8 +1381,18 @@ export async function evaluateSweBenchPredictions({
       if (testPatch.trim()) {
         const touched = parseDiffTouchedFiles(testPatch);
         if (touched.existing.length > 0) {
-          const resetCmd = `git checkout -- ${touched.existing.map(shellQuoteSingle).join(' ')}`;
-          await session.exec(resetCmd, { skipAntiCheatGuard: true });
+          const quotedExisting = touched.existing.map(shellQuoteSingle).join(' ');
+          const resetCmd = `git checkout -- ${quotedExisting}`;
+          const resetRes = await session.exec(resetCmd, { skipAntiCheatGuard: true });
+          if (!resetRes || resetRes.timedOut || resetRes.exitCode !== 0) {
+            await session.exec(
+              'git config --global --add safe.directory /testbed 2>/dev/null || true',
+              { skipAntiCheatGuard: true },
+            );
+            await session.exec(`git checkout -f -- ${quotedExisting}`, {
+              skipAntiCheatGuard: true,
+            });
+          }
         }
         if (touched.added.length > 0) {
           const rmCmd = `rm -f -- ${touched.added.map(shellQuoteSingle).join(' ')}`;

@@ -290,7 +290,268 @@ function extractChatMessageText(content) {
   return '';
 }
 
-function convertResponsesRequestToChatCompletions(body, targetModel) {
+const OPENAI_NATIVE_MODEL_RE = /^(?:gpt-|o[134](?:[-_]|$)|codex(?:-|$)|computer-use)/i;
+
+const HOSTED_RESPONSES_TOOL_TYPES = new Set([
+  'file_search',
+  'code_interpreter',
+  'image_generation',
+  'mcp',
+  'tool_search',
+]);
+
+function isDroppedHostedResponsesTool(type) {
+  const norm = String(type ?? '').trim().toLowerCase();
+  return norm.startsWith('web_search') || HOSTED_RESPONSES_TOOL_TYPES.has(norm);
+}
+
+function defaultShellParameters() {
+  return {
+    type: 'object',
+    properties: {
+      command: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Command and arguments to execute.',
+      },
+      workdir: {
+        type: 'string',
+        description: 'Optional working directory.',
+      },
+      timeout_ms: {
+        type: 'number',
+        description: 'Optional timeout in milliseconds.',
+      },
+    },
+    required: ['command'],
+  };
+}
+
+function defaultCustomToolParameters() {
+  return {
+    type: 'object',
+    properties: {
+      input: { type: 'string' },
+    },
+    required: ['input'],
+    additionalProperties: false,
+  };
+}
+
+function flattenAndNormalizeResponsesTools(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return [];
+  const normalized = [];
+
+  const visit = (toolList) => {
+    for (const t of toolList) {
+      if (!t || typeof t !== 'object') continue;
+      const tType = String(t.type ?? '').trim().toLowerCase();
+      if (tType === 'namespace') {
+        if (Array.isArray(t.tools)) {
+          visit(t.tools);
+        }
+        continue;
+      }
+      if (isDroppedHostedResponsesTool(tType)) {
+        continue;
+      }
+      if (tType === 'custom') {
+        const name = String(t.name || '').trim();
+        if (!name) continue;
+        normalized.push({
+          originalType: 'custom',
+          name,
+          ...(t.description !== undefined ? { description: String(t.description) } : {}),
+          parameters: defaultCustomToolParameters(),
+        });
+        continue;
+      }
+      if (tType === 'local_shell' || tType === 'shell') {
+        normalized.push({
+          originalType: tType,
+          name: String(t.name || tType),
+          description:
+            t.description !== undefined
+              ? String(t.description)
+              : 'Execute a shell command in the local environment.',
+          parameters: t.parameters || defaultShellParameters(),
+        });
+        continue;
+      }
+      if (tType === 'function') {
+        const fn = t.function && typeof t.function === 'object' ? t.function : t;
+        const name = String(fn.name || '').trim();
+        if (!name) continue;
+        normalized.push({
+          originalType: 'function',
+          name,
+          ...(fn.description !== undefined ? { description: String(fn.description) } : {}),
+          ...(fn.parameters !== undefined ? { parameters: fn.parameters } : {}),
+        });
+      }
+    }
+  };
+
+  visit(tools);
+  return normalized;
+}
+
+function stringifyToolInputArgs(item) {
+  if (item.type === 'custom_tool_call') {
+    if (typeof item.input === 'string') {
+      return JSON.stringify({ input: item.input });
+    }
+    if (typeof item.arguments === 'string') {
+      return item.arguments;
+    }
+    return JSON.stringify(item.input ?? item.arguments ?? {});
+  }
+  if (item.type === 'local_shell_call') {
+    const val = item.action ?? item.arguments ?? (item.command ? { command: item.command } : {});
+    return typeof val === 'string' ? val : JSON.stringify(val);
+  }
+  return typeof item.arguments === 'string'
+    ? item.arguments
+    : JSON.stringify(item.arguments ?? {});
+}
+
+function extractCustomToolInput(rawArguments) {
+  const fallback = typeof rawArguments === 'string' ? rawArguments : JSON.stringify(rawArguments ?? '');
+  try {
+    const parsed = typeof rawArguments === 'string' ? JSON.parse(rawArguments) : rawArguments;
+    if (parsed && typeof parsed === 'object' && typeof parsed.input === 'string') {
+      return parsed.input;
+    }
+  } catch {
+    // Keep raw string when arguments is not JSON
+  }
+  return fallback;
+}
+
+function extractLocalShellAction(rawArguments) {
+  let parsed = {};
+  try {
+    parsed = typeof rawArguments === 'string' ? JSON.parse(rawArguments) : rawArguments ?? {};
+  } catch {
+    parsed = {};
+  }
+  const command = Array.isArray(parsed?.command)
+    ? parsed.command.map((part) => String(part))
+    : typeof parsed?.command === 'string'
+      ? ['bash', '-lc', parsed.command]
+      : Array.isArray(parsed?.action?.command)
+        ? parsed.action.command.map((part) => String(part))
+        : [];
+  const workingDirectory = parsed?.working_directory ?? parsed?.workdir ?? parsed?.action?.working_directory;
+  const timeoutMs = parsed?.timeout_ms ?? parsed?.action?.timeout_ms;
+  return {
+    type: 'exec',
+    command,
+    ...(workingDirectory ? { working_directory: String(workingDirectory) } : {}),
+    ...(timeoutMs != null && Number.isFinite(Number(timeoutMs)) ? { timeout_ms: Number(timeoutMs) } : {}),
+  };
+}
+
+/**
+ * Sanitizes an OpenAI Responses API request body when targeting non-OpenAI models
+ * (stripping OpenAI-only parameters, flattening `namespace` tools, dropping hosted tools,
+ * converting `custom`/`local_shell`/`shell` tools to standard `function` schemas, and
+ * normalizing `input` items).
+ */
+export function sanitizeResponsesBodyForTargetModel(body, targetModel) {
+  if (!body || typeof body !== 'object') return body;
+  const resolvedModel = String(targetModel ?? body.model ?? '').trim();
+  const out = { ...body };
+  if (targetModel !== undefined && targetModel !== null && String(targetModel).trim()) {
+    out.model = String(targetModel).trim();
+  }
+
+  if (OPENAI_NATIVE_MODEL_RE.test(resolvedModel)) {
+    return out;
+  }
+
+  delete out.prompt_cache_key;
+  delete out.service_tier;
+
+  if (Array.isArray(out.include)) {
+    const filteredInclude = out.include.filter((item) => item !== 'reasoning.encrypted_content');
+    if (filteredInclude.length > 0) {
+      out.include = filteredInclude;
+    } else {
+      delete out.include;
+    }
+  }
+
+  if (Array.isArray(out.tools)) {
+    const normalizedTools = flattenAndNormalizeResponsesTools(out.tools).map((t) => ({
+      type: 'function',
+      name: t.name,
+      ...(t.description !== undefined ? { description: t.description } : {}),
+      ...(t.parameters !== undefined ? { parameters: t.parameters } : {}),
+    }));
+    if (normalizedTools.length > 0) {
+      out.tools = normalizedTools;
+    } else {
+      delete out.tools;
+    }
+  }
+
+  if (Array.isArray(out.input)) {
+    const normalizedInput = [];
+    for (let i = 0; i < out.input.length; i++) {
+      const item = out.input[i];
+      if (!item || typeof item !== 'object') {
+        normalizedInput.push(item);
+        continue;
+      }
+      if (item.type === 'reasoning' || item.type === 'item_reference') {
+        continue;
+      }
+      if (item.type === 'custom_tool_call' || item.type === 'local_shell_call') {
+        const callId = String(item.call_id || item.id || `fc_${i}`);
+        normalizedInput.push({
+          type: 'function_call',
+          ...(item.id ? { id: item.id } : {}),
+          call_id: callId,
+          name: String(item.name || (item.type === 'local_shell_call' ? 'local_shell' : 'custom_tool')),
+          arguments: stringifyToolInputArgs(item),
+        });
+        continue;
+      }
+      if (item.type === 'custom_tool_call_output' || item.type === 'local_shell_call_output') {
+        normalizedInput.push({
+          type: 'function_call_output',
+          ...(item.id ? { id: item.id } : {}),
+          call_id: String(item.call_id || ''),
+          output:
+            typeof item.output === 'string'
+              ? item.output
+              : JSON.stringify(item.output ?? ''),
+        });
+        continue;
+      }
+      normalizedInput.push(item);
+    }
+    out.input = normalizedInput;
+  }
+
+  return out;
+}
+
+function appendAssistantToolCall(messages, toolCall) {
+  const prev = messages.at(-1);
+  if (prev && prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
+    prev.tool_calls.push(toolCall);
+  } else {
+    messages.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: [toolCall],
+    });
+  }
+}
+
+export function convertResponsesRequestToChatCompletions(body, targetModel) {
   const messages = [];
   if (body?.instructions) {
     messages.push({ role: 'system', content: String(body.instructions) });
@@ -306,32 +567,38 @@ function convertResponsesRequestToChatCompletions(body, targetModel) {
         continue;
       }
       if (!item || typeof item !== 'object') continue;
-      if (item.type === 'function_call') {
+      if (item.type === 'reasoning' || item.type === 'item_reference') {
+        continue;
+      }
+      if (
+        item.type === 'function_call' ||
+        item.type === 'custom_tool_call' ||
+        item.type === 'local_shell_call'
+      ) {
         const callId = String(item.call_id || item.id || `fc_${messages.length}`);
-        const toolCall = {
+        const toolName = String(
+          item.name ||
+            (item.type === 'local_shell_call'
+              ? 'local_shell'
+              : item.type === 'custom_tool_call'
+                ? 'custom_tool'
+                : ''),
+        );
+        appendAssistantToolCall(messages, {
           id: callId,
           type: 'function',
           function: {
-            name: String(item.name || ''),
-            arguments:
-              typeof item.arguments === 'string'
-                ? item.arguments
-                : JSON.stringify(item.arguments ?? {}),
+            name: toolName,
+            arguments: stringifyToolInputArgs(item),
           },
-        };
-        const prev = messages.at(-1);
-        if (prev && prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
-          prev.tool_calls.push(toolCall);
-        } else {
-          messages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: [toolCall],
-          });
-        }
+        });
         continue;
       }
-      if (item.type === 'function_call_output') {
+      if (
+        item.type === 'function_call_output' ||
+        item.type === 'custom_tool_call_output' ||
+        item.type === 'local_shell_call_output'
+      ) {
         messages.push({
           role: 'tool',
           tool_call_id: String(item.call_id || ''),
@@ -361,22 +628,14 @@ function convertResponsesRequestToChatCompletions(body, targetModel) {
   };
 
   if (Array.isArray(body?.tools) && body.tools.length > 0) {
-    const mappedTools = [];
-    for (const t of body.tools) {
-      if (!t || typeof t !== 'object') continue;
-      if (t.type === 'function' && t.function) {
-        mappedTools.push({ type: 'function', function: t.function });
-      } else if (t.type === 'function' && t.name) {
-        mappedTools.push({
-          type: 'function',
-          function: {
-            name: t.name,
-            ...(t.description ? { description: t.description } : {}),
-            ...(t.parameters ? { parameters: t.parameters } : {}),
-          },
-        });
-      }
-    }
+    const mappedTools = flattenAndNormalizeResponsesTools(body.tools).map((t) => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        ...(t.description !== undefined ? { description: t.description } : {}),
+        ...(t.parameters !== undefined ? { parameters: t.parameters } : {}),
+      },
+    }));
     if (mappedTools.length > 0) {
       out.tools = mappedTools;
     }
@@ -394,7 +653,12 @@ function convertResponsesRequestToChatCompletions(body, targetModel) {
   return out;
 }
 
-function buildResponsesObjectFromChatCompletion(chatJson, targetModel, normalizedUsage) {
+function buildResponsesObjectFromChatCompletion(
+  chatJson,
+  targetModel,
+  normalizedUsage,
+  toolKindsByName = null,
+) {
   const msg = chatJson?.choices?.[0]?.message ?? {};
   const output = [];
   const textContent = typeof msg.content === 'string' ? msg.content : extractChatMessageText(msg.content);
@@ -412,14 +676,38 @@ function buildResponsesObjectFromChatCompletion(chatJson, targetModel, normalize
     for (let i = 0; i < msg.tool_calls.length; i++) {
       const tc = msg.tool_calls[i];
       const callId = String(tc?.id || `fc_${i}_${Date.now().toString(36)}`);
-      output.push({
-        id: callId,
-        type: 'function_call',
-        status: 'completed',
-        call_id: callId,
-        name: String(tc?.function?.name || ''),
-        arguments: String(tc?.function?.arguments ?? '{}'),
-      });
+      const toolName = String(tc?.function?.name || '');
+      const rawArgs = tc?.function?.arguments ?? '{}';
+      const argsStr = typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs);
+      const originalKind = toolKindsByName?.get(toolName) ?? null;
+
+      if (originalKind === 'custom') {
+        output.push({
+          id: callId,
+          type: 'custom_tool_call',
+          status: 'completed',
+          call_id: callId,
+          name: toolName,
+          input: extractCustomToolInput(rawArgs),
+        });
+      } else if (originalKind === 'local_shell') {
+        output.push({
+          id: callId,
+          type: 'local_shell_call',
+          status: 'completed',
+          call_id: callId,
+          action: extractLocalShellAction(rawArgs),
+        });
+      } else {
+        output.push({
+          id: callId,
+          type: 'function_call',
+          status: 'completed',
+          call_id: callId,
+          name: toolName,
+          arguments: argsStr,
+        });
+      }
     }
   }
 
@@ -432,9 +720,14 @@ function buildResponsesObjectFromChatCompletion(chatJson, targetModel, normalize
     object: 'response',
     created_at: Math.floor(Date.now() / 1000),
     status: 'completed',
+    error: null,
+    incomplete_details: null,
     model: targetModel,
     output,
     output_text: textContent || '',
+    parallel_tool_calls: true,
+    tool_choice: 'auto',
+    metadata: {},
     usage: {
       input_tokens: inTok,
       output_tokens: outTok,
@@ -939,7 +1232,8 @@ export class SweBenchMeteringProxy {
     }
 
     const originalModel = body.model ?? null;
-    body.model = this.targetModel;
+    const originalBody = { ...body, model: this.targetModel };
+    const sanitizedBody = sanitizeResponsesBodyForTargetModel(originalBody, this.targetModel);
     const headers = {
       'content-type': 'application/json',
       ...this.customHeaders,
@@ -953,18 +1247,18 @@ export class SweBenchMeteringProxy {
       upstreamRes = await this.fetchImpl(this.openaiResponsesUrl, {
         method: 'POST',
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(sanitizedBody),
         signal: AbortSignal.timeout(this.requestTimeoutMs),
       });
     } catch {
       upstreamRes = null;
     }
 
-    if (!upstreamRes || upstreamRes.status === 404 || upstreamRes.status === 405) {
+    if (!upstreamRes || [400, 404, 405, 422, 501].includes(upstreamRes.status)) {
       if (upstreamRes) {
         await upstreamRes.text().catch(() => {});
       }
-      await this.#handleOpenAiResponsesChatFallback(body, originalModel, headers, res);
+      await this.#handleOpenAiResponsesChatFallback(originalBody, originalModel, headers, res);
       return;
     }
 
@@ -1048,6 +1342,9 @@ export class SweBenchMeteringProxy {
   async #handleOpenAiResponsesChatFallback(body, originalModel, headers, res) {
     const wantStream = Boolean(body.stream);
     const chatPayload = convertResponsesRequestToChatCompletions(body, this.targetModel);
+    const toolKindsByName = new Map(
+      flattenAndNormalizeResponsesTools(body?.tools).map((t) => [t.name, t.originalType]),
+    );
 
     const upstreamRes = await this.fetchImpl(this.openaiChatUrl, {
       method: 'POST',
@@ -1087,7 +1384,12 @@ export class SweBenchMeteringProxy {
       usage,
     });
 
-    const responseObj = buildResponsesObjectFromChatCompletion(chatJson, this.targetModel, usage);
+    const responseObj = buildResponsesObjectFromChatCompletion(
+      chatJson,
+      this.targetModel,
+      usage,
+      toolKindsByName,
+    );
     if (!wantStream) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(responseObj));
@@ -1098,8 +1400,11 @@ export class SweBenchMeteringProxy {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
     });
+    let sequenceNumber = 0;
     const emitEvent = (eventName, dataObj) => {
-      res.write(`event: ${eventName}\ndata: ${JSON.stringify({ type: eventName, ...dataObj })}\n\n`);
+      res.write(
+        `event: ${eventName}\ndata: ${JSON.stringify({ type: eventName, sequence_number: sequenceNumber++, ...dataObj })}\n\n`,
+      );
     };
     const inProgress = { ...responseObj, status: 'in_progress', output: [], output_text: '' };
     emitEvent('response.created', { response: inProgress });
@@ -1153,6 +1458,28 @@ export class SweBenchMeteringProxy {
           item_id: item.id,
           output_index: idx,
           arguments: item.arguments,
+        });
+        emitEvent('response.output_item.done', { output_index: idx, item });
+      } else if (item.type === 'custom_tool_call') {
+        emitEvent('response.output_item.added', {
+          output_index: idx,
+          item: { ...item, status: 'in_progress', input: '' },
+        });
+        emitEvent('response.custom_tool_call_input.delta', {
+          item_id: item.id,
+          output_index: idx,
+          delta: item.input,
+        });
+        emitEvent('response.custom_tool_call_input.done', {
+          item_id: item.id,
+          output_index: idx,
+          input: item.input,
+        });
+        emitEvent('response.output_item.done', { output_index: idx, item });
+      } else if (item.type === 'local_shell_call') {
+        emitEvent('response.output_item.added', {
+          output_index: idx,
+          item: { ...item, status: 'in_progress' },
         });
         emitEvent('response.output_item.done', { output_index: idx, item });
       }
@@ -1760,6 +2087,25 @@ function probeHelpTextSync(bin, env) {
   }
 }
 
+/**
+ * Summarizes CLI failure stderr/stdout preserving head (250 chars) and tail (600 chars)
+ * when combined output exceeds `maxChars` (default 900).
+ */
+export function summarizeCliFailureOutput(stderr, stdout, maxChars = 900) {
+  const combined = [stderr, stdout]
+    .map((s) => String(s ?? '').trim())
+    .filter(Boolean)
+    .join('\n');
+  const redacted = redactSecrets(combined);
+  const limit = Math.max(100, Number(maxChars) || 900);
+  if (redacted.length <= limit) return redacted;
+  const headLen = limit === 900 ? 250 : Math.floor(limit * (250 / 900));
+  const tailLen = limit === 900 ? 600 : Math.max(1, limit - headLen - 40);
+  const omitted = redacted.length - headLen - tailLen;
+  if (omitted <= 0) return redacted.slice(0, limit);
+  return `${redacted.slice(0, headLen)}\n...[truncated ${omitted} chars]...\n${redacted.slice(-tailLen)}`;
+}
+
 async function runClaudeCodeArm({
   instance,
   workspaceRoot,
@@ -1839,7 +2185,7 @@ async function runClaudeCodeArm({
         ? `claude_code timed out after ${timeoutMs}ms`
         : res.exitCode === 0
           ? null
-          : `claude_code exited with code ${res.exitCode}: ${(res.stderr || res.stdout).trim().slice(0, 500)}`,
+          : `claude_code exited with code ${res.exitCode}: ${summarizeCliFailureOutput(res.stderr, res.stdout, 900)}`,
     };
   } finally {
     safeRmRf(isolatedHome);
@@ -1873,6 +2219,10 @@ async function runCodexCliArm({
       'model_provider = "swebench"',
       'approval_policy = "never"',
       'sandbox_mode = "danger-full-access"',
+      '',
+      '[features]',
+      'multi_agent_v2 = true',
+      'web_search_request = false',
       '',
       '[model_providers.swebench]',
       'name = "SWEBench"',
@@ -1919,7 +2269,7 @@ async function runCodexCliArm({
         ? `codex_cli timed out after ${timeoutMs}ms`
         : res.exitCode === 0
           ? null
-          : `codex_cli exited with code ${res.exitCode}: ${(res.stderr || res.stdout).trim().slice(0, 500)}`,
+          : `codex_cli exited with code ${res.exitCode}: ${summarizeCliFailureOutput(res.stderr, res.stdout, 900)}`,
     };
   } finally {
     safeRmRf(codexHome);
@@ -2105,21 +2455,56 @@ async function runBuiltinMiniSweAgentLoop({
       };
     }
 
-    const res = await fetch(`${proxy.openaiBaseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${PLACEHOLDER_PROXY_KEY}`,
-      },
-      body: JSON.stringify({
-        model: targetModel,
-        messages,
-        tools: bashToolSpec,
-      }),
-      signal: AbortSignal.timeout(Math.min(remainingMs, 180_000)),
-    });
+    let res = null;
+    let rawText = '';
+    let fetchErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const attemptRemainingMs = Math.round(deadline - performance.now());
+      if (attemptRemainingMs <= 0) {
+        return {
+          status: 'failed',
+          toolCallsCount,
+          error: `mini_swe_agent timed out after ${timeoutMs}ms`,
+        };
+      }
+      try {
+        res = await fetch(`${proxy.openaiBaseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${PLACEHOLDER_PROXY_KEY}`,
+          },
+          body: JSON.stringify({
+            model: targetModel,
+            messages,
+            tools: bashToolSpec,
+          }),
+          signal: AbortSignal.timeout(Math.min(attemptRemainingMs, 180_000)),
+        });
+        rawText = await res.text();
+        fetchErr = null;
+        if (res.status >= 500 && attempt === 0 && deadline - performance.now() > 30_000) {
+          continue;
+        }
+        break;
+      } catch (err) {
+        fetchErr = err;
+        res = null;
+        if (attempt === 0 && deadline - performance.now() > 30_000) {
+          continue;
+        }
+        break;
+      }
+    }
+    if (fetchErr || !res) {
+      const errMsg = redactSecrets(String(fetchErr?.message || fetchErr || 'Unknown fetch error'));
+      return {
+        status: 'failed',
+        toolCallsCount,
+        error: `mini_swe_agent LLM request failed: ${errMsg.slice(0, 400)}`,
+      };
+    }
 
-    const rawText = await res.text();
     if (!res.ok) {
       return {
         status: 'failed',
@@ -2299,7 +2684,7 @@ async function runMiniSweAgentArm({
           toolCallsCount: 0,
           error: res.timedOut
             ? `mini_swe_agent timed out after ${timeoutMs}ms`
-            : `mini_swe_agent CLI exited with code ${res.exitCode}: ${(res.stderr || res.stdout).trim().slice(0, 400)}`,
+            : `mini_swe_agent CLI exited with code ${res.exitCode}: ${summarizeCliFailureOutput(res.stderr, res.stdout, 900)}`,
         };
       }
       const reason = launchErr

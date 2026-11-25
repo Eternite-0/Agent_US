@@ -17,12 +17,15 @@ import { after, describe, test } from 'node:test';
 import {
   EXTERNAL_SWEBENCH_ARMS,
   SweBenchMeteringProxy,
+  convertResponsesRequestToChatCompletions,
   createTestbedShimBinDir,
   deriveUpstreamEndpoints,
   isExternalSweBenchArm,
   rewriteHostArgsForContainer,
   runExternalSweBenchArm,
   runMiniSweAgentCommand,
+  sanitizeResponsesBodyForTargetModel,
+  summarizeCliFailureOutput,
   validateShimGitArgs,
 } from '../../src/evaluation/swebench-external-agents.js';
 import {
@@ -810,7 +813,14 @@ if (!process.env.CODEX_HOME.startsWith(homedir()) || !process.env.CODEX_HOME.inc
   throw new Error('CODEX_HOME must live under homedir() rather than /tmp: ' + process.env.CODEX_HOME);
 }
 const cfgText = readFileSync(join(process.env.CODEX_HOME, 'config.toml'), 'utf8');
-if (!cfgText.includes('wire_api = "responses"') || cfgText.includes('wire_api = "chat"') || !cfgText.includes('model = "deepseek-v4.1-flash"')) {
+if (
+  !cfgText.includes('wire_api = "responses"') ||
+  cfgText.includes('wire_api = "chat"') ||
+  !cfgText.includes('model = "deepseek-v4.1-flash"') ||
+  !cfgText.includes('[features]') ||
+  !cfgText.includes('multi_agent_v2 = true') ||
+  !cfgText.includes('web_search_request = false')
+) {
   throw new Error('Invalid CODEX_HOME/config.toml: ' + cfgText);
 }
 const res = await fetch(process.env.OPENAI_BASE_URL + '/responses', {
@@ -1057,5 +1067,414 @@ writeFileSync(join(process.cwd(), 'pkg', 'calc.py'), 'def add_capped(a, b, cap=1
     assert.ok(mergedTex.includes('\\texttt{mini\\_swe\\_agent}'));
 
     await upstream.close();
+  });
+
+  test('sanitizeResponsesBodyForTargetModel & convertResponsesRequestToChatCompletions normalize Codex v0.172 payloads for non-OpenAI models', () => {
+    const rawBody = {
+      model: 'gpt-5-codex',
+      instructions: 'System prompt',
+      prompt_cache_key: 'cache-key-123',
+      service_tier: 'priority',
+      include: ['reasoning.encrypted_content', 'message.output_text.logprobs'],
+      tools: [
+        {
+          type: 'namespace',
+          name: 'workspace',
+          tools: [
+            {
+              type: 'function',
+              name: 'read_file',
+              description: 'Read a file',
+              parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+            },
+            { type: 'web_search_preview' },
+          ],
+        },
+        { type: 'web_search', search_context_size: 'medium' },
+        { type: 'file_search' },
+        { type: 'code_interpreter' },
+        { type: 'image_generation' },
+        { type: 'mcp', server_label: 'docs' },
+        { type: 'tool_search' },
+        { type: 'custom', name: 'apply_patch', description: 'Apply a unified patch' },
+        { type: 'local_shell' },
+        { type: 'shell', description: 'Run shell cmd' },
+      ],
+      input: [
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'Dev rule' }] },
+        { type: 'reasoning', id: 'rs_1', summary: [] },
+        { type: 'item_reference', id: 'ir_1' },
+        { type: 'custom_tool_call', call_id: 'call_patch_1', name: 'apply_patch', input: '*** Begin Patch\n*** End Patch' },
+        { type: 'custom_tool_call_output', call_id: 'call_patch_1', output: 'Success. Updated 1 file.' },
+        { type: 'local_shell_call', call_id: 'call_sh_1', action: { type: 'exec', command: ['pytest', '-q'] } },
+        { type: 'local_shell_call_output', call_id: 'call_sh_1', output: '1 passed' },
+      ],
+    };
+
+    const rawSnapshot = JSON.stringify(rawBody);
+
+    // 1. OpenAI-native model preserves OpenAI-only fields & tools
+    const openaiOut = sanitizeResponsesBodyForTargetModel(rawBody, 'gpt-5-codex');
+    assert.equal(openaiOut.prompt_cache_key, 'cache-key-123');
+    assert.equal(openaiOut.service_tier, 'priority');
+    assert.deepEqual(openaiOut.include, ['reasoning.encrypted_content', 'message.output_text.logprobs']);
+    assert.equal(openaiOut.tools.some((t) => t.type === 'namespace'), true);
+    assert.equal(JSON.stringify(rawBody), rawSnapshot, 'sanitize must not mutate input body');
+
+    // 2. Non-OpenAI model strips OpenAI-only fields, flattens namespace, drops hosted tools, normalizes custom/shell/input
+    const sanitized = sanitizeResponsesBodyForTargetModel(rawBody, 'deepseek-v4.1-flash');
+    assert.equal(sanitized.model, 'deepseek-v4.1-flash');
+    assert.equal('prompt_cache_key' in sanitized, false);
+    assert.equal('service_tier' in sanitized, false);
+    assert.deepEqual(sanitized.include, ['message.output_text.logprobs']);
+    assert.deepEqual(
+      sanitized.tools.map((t) => [t.type, t.name]),
+      [
+        ['function', 'read_file'],
+        ['function', 'apply_patch'],
+        ['function', 'local_shell'],
+        ['function', 'shell'],
+      ],
+    );
+    const applyPatchSchema = sanitized.tools.find((t) => t.name === 'apply_patch');
+    assert.deepEqual(applyPatchSchema, {
+      type: 'function',
+      name: 'apply_patch',
+      description: 'Apply a unified patch',
+      parameters: {
+        type: 'object',
+        properties: { input: { type: 'string' } },
+        required: ['input'],
+        additionalProperties: false,
+      },
+    });
+    assert.equal(sanitized.input.some((it) => it.type === 'reasoning' || it.type === 'item_reference'), false);
+    const fcPatch = sanitized.input.find((it) => it.call_id === 'call_patch_1' && it.type === 'function_call');
+    assert.ok(fcPatch);
+    assert.equal(JSON.parse(fcPatch.arguments).input, '*** Begin Patch\n*** End Patch');
+    const fcoPatch = sanitized.input.find((it) => it.call_id === 'call_patch_1' && it.type === 'function_call_output');
+    assert.equal(fcoPatch.output, 'Success. Updated 1 file.');
+
+    // If include only had reasoning.encrypted_content, include is removed cleanly
+    const onlyEnc = sanitizeResponsesBodyForTargetModel(
+      { model: 'gpt-5', include: ['reasoning.encrypted_content'], input: 'hi' },
+      'claude-3-5-sonnet',
+    );
+    assert.equal('include' in onlyEnc, false);
+
+    // 3. convertResponsesRequestToChatCompletions handles all Codex v0.172 input/tool forms
+    const chatPayload = convertResponsesRequestToChatCompletions(rawBody, 'deepseek-v4.1-flash');
+    assert.equal(chatPayload.model, 'deepseek-v4.1-flash');
+    assert.deepEqual(
+      chatPayload.tools.map((t) => t.function.name),
+      ['read_file', 'apply_patch', 'local_shell', 'shell'],
+    );
+    assert.equal(chatPayload.messages[0].role, 'system');
+    assert.equal(chatPayload.messages[1].role, 'system');
+    assert.equal(chatPayload.messages[1].content, 'Dev rule');
+    assert.equal(chatPayload.messages[2].role, 'assistant');
+    assert.equal(chatPayload.messages[2].tool_calls[0].function.name, 'apply_patch');
+    assert.equal(chatPayload.messages[3].role, 'tool');
+    assert.equal(chatPayload.messages[3].tool_call_id, 'call_patch_1');
+    assert.equal(chatPayload.messages[4].role, 'assistant');
+    assert.equal(chatPayload.messages[4].tool_calls[0].function.name, 'local_shell');
+    assert.equal(chatPayload.messages[5].role, 'tool');
+    assert.equal(chatPayload.messages[5].tool_call_id, 'call_sh_1');
+  });
+
+  test('SweBenchMeteringProxy Codex v0.172 HTTP 400 fallback reconstructs custom/local_shell/function calls with monotonic sequence_number', async () => {
+    const upstreamRequests = [];
+    let responsesStatusToReturn = 400;
+
+    const upstream = createServer(async (req, res) => {
+      const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
+      const chunks = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      upstreamRequests.push({ pathname: urlObj.pathname, body });
+
+      if (urlObj.pathname === '/v1/responses') {
+        res.writeHead(responsesStatusToReturn, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Unsupported Responses API parameter' } }));
+        return;
+      }
+
+      if (urlObj.pathname === '/v1/chat/completions') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            id: 'chat_codex_fb_1',
+            object: 'chat.completion',
+            model: body.model,
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: 'Applying patch and running test.',
+                  tool_calls: [
+                    {
+                      id: 'call_custom_1',
+                      type: 'function',
+                      function: {
+                        name: 'apply_patch',
+                        arguments: JSON.stringify({ input: '*** Begin Patch\n*** End Patch' }),
+                      },
+                    },
+                    {
+                      id: 'call_ls_1',
+                      type: 'function',
+                      function: {
+                        name: 'local_shell',
+                        arguments: JSON.stringify({ command: ['pytest', '-q'], workdir: '/testbed' }),
+                      },
+                    },
+                    {
+                      id: 'call_fn_1',
+                      type: 'function',
+                      function: {
+                        name: 'read_file',
+                        arguments: JSON.stringify({ path: 'pkg/calc.py' }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+            usage: {
+              prompt_tokens: 1200,
+              completion_tokens: 80,
+              prompt_tokens_details: { cached_tokens: 900 },
+            },
+          }),
+        );
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const port = upstream.address().port;
+    const proxy = new SweBenchMeteringProxy({
+      targetModel: 'deepseek-v4.1-flash',
+      apiKey: 'sk-codex-fb-secret',
+      endpoint: `http://127.0.0.1:${port}/v1`,
+    });
+
+    try {
+      await proxy.start();
+      const res = await fetch(`${proxy.openaiBaseUrl}/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-5.4-codex',
+          stream: true,
+          prompt_cache_key: 'codex-session-1',
+          service_tier: 'auto',
+          include: ['reasoning.encrypted_content'],
+          tools: [
+            {
+              type: 'namespace',
+              name: 'fs',
+              tools: [
+                { type: 'function', name: 'read_file', parameters: { type: 'object', properties: {} } },
+              ],
+            },
+            { type: 'custom', name: 'apply_patch', description: 'Apply patch' },
+            { type: 'local_shell' },
+            { type: 'web_search' },
+          ],
+          input: [
+            { type: 'reasoning', id: 'rs_prev', summary: [] },
+            { type: 'item_reference', id: 'ir_prev' },
+            { type: 'message', role: 'user', content: 'Fix bug' },
+          ],
+        }),
+      });
+      assert.equal(res.status, 200);
+      const sseText = await res.text();
+
+      // Verify /v1/responses received sanitized body before HTTP 400 fallback
+      const respReq = upstreamRequests.find((r) => r.pathname === '/v1/responses');
+      assert.ok(respReq);
+      assert.equal('prompt_cache_key' in respReq.body, false);
+      assert.equal('service_tier' in respReq.body, false);
+      assert.equal('include' in respReq.body, false);
+      assert.equal(respReq.body.tools.some((t) => t.type === 'namespace' || t.type === 'web_search' || t.type === 'custom'), false);
+
+      // Verify /v1/chat/completions fallback received flattened tools & filtered input
+      const chatReq = upstreamRequests.find((r) => r.pathname === '/v1/chat/completions');
+      assert.ok(chatReq);
+      assert.deepEqual(
+        chatReq.body.tools.map((t) => t.function.name),
+        ['read_file', 'apply_patch', 'local_shell'],
+      );
+      assert.deepEqual(chatReq.body.messages, [{ role: 'user', content: 'Fix bug' }]);
+
+      // Parse every SSE event and assert monotonic sequence_number 0..N-1 + standard fields
+      const events = sseText
+        .trim()
+        .split(/\n\n+/)
+        .map((block) => {
+          const dataLine = block.split('\n').find((l) => l.startsWith('data: '));
+          return JSON.parse(dataLine.slice(6));
+        });
+      assert.ok(events.length >= 10);
+      events.forEach((ev, idx) => {
+        assert.equal(ev.sequence_number, idx, `Event ${idx} (${ev.type}) sequence_number mismatch`);
+      });
+
+      const createdEv = events.find((e) => e.type === 'response.created');
+      const completedEv = events.find((e) => e.type === 'response.completed');
+      assert.ok(createdEv);
+      assert.ok(completedEv);
+      for (const rObj of [createdEv.response, completedEv.response]) {
+        assert.equal(rObj.parallel_tool_calls, true);
+        assert.equal(rObj.tool_choice, 'auto');
+        assert.deepEqual(rObj.metadata, {});
+        assert.equal(rObj.error, null);
+        assert.equal(rObj.incomplete_details, null);
+      }
+
+      const output = completedEv.response.output;
+      assert.equal(output[0].type, 'message');
+      assert.equal(output[1].type, 'custom_tool_call');
+      assert.equal(output[1].name, 'apply_patch');
+      assert.equal(output[1].input, '*** Begin Patch\n*** End Patch');
+      assert.equal(output[2].type, 'local_shell_call');
+      assert.deepEqual(output[2].action, {
+        type: 'exec',
+        command: ['pytest', '-q'],
+        working_directory: '/testbed',
+      });
+      assert.equal(output[3].type, 'function_call');
+      assert.equal(output[3].name, 'read_file');
+      assert.ok(events.some((e) => e.type === 'response.custom_tool_call_input.delta'));
+      assert.ok(events.some((e) => e.type === 'response.custom_tool_call_input.done'));
+
+      // Also verify HTTP 422 / 501 trigger fallback
+      for (const code of [422, 501]) {
+        responsesStatusToReturn = code;
+        const fbRes = await fetch(`${proxy.openaiBaseUrl}/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-5', stream: false, input: 'hi' }),
+        });
+        assert.equal(fbRes.status, 200, `Expected HTTP ${code} on /v1/responses to fall back`);
+      }
+    } finally {
+      await proxy.stop();
+      upstream.closeAllConnections?.();
+      await new Promise((r) => upstream.close(r));
+    }
+  });
+
+  test('summarizeCliFailureOutput preserves head + tail on long CLI errors and runCodexCliArm uses it', async () => {
+    const longStderr = `HEAD_MARKER:${'a'.repeat(600)}:MIDDLE_NOISE:${'b'.repeat(600)}:TAIL_ERROR_ROOT_CAUSE`;
+    const summary = summarizeCliFailureOutput(longStderr, 'STDOUT_TAIL_DETAIL', 900);
+    assert.ok(summary.startsWith('HEAD_MARKER:'));
+    assert.ok(summary.includes('...[truncated '));
+    assert.ok(summary.includes('TAIL_ERROR_ROOT_CAUSE'));
+    assert.ok(summary.includes('STDOUT_TAIL_DETAIL'));
+    assert.ok(summary.length <= 900);
+
+    const tmpRoot = makeRealTempDir('agent-us-codex-err-');
+    trackTmp(tmpRoot);
+    const repoDir = join(tmpRoot, 'repo');
+    mkdirSync(repoDir, { recursive: true });
+    createTempPythonRepo(repoDir, 'codex-err');
+
+    const failCodex = join(tmpRoot, 'fail-codex.mjs');
+    writeFileSync(
+      failCodex,
+      `process.stderr.write(${JSON.stringify(longStderr)}); process.exit(1);\n`,
+      'utf8',
+    );
+    const upstream = await startMockDualUpstreamServer({ targetModel: 'deepseek-v4.1-flash' });
+    try {
+      const res = await runExternalSweBenchArm({
+        arm: 'codex_cli',
+        instance: { instance_id: 'acme__cerr-01', repo: 'acme/cerr', base_commit: 'HEAD', problem_statement: 'Fix' },
+        workspaceRoot: repoDir,
+        opts: { model: 'deepseek-v4.1-flash', turnTimeoutMs: 15_000 },
+        liveConfig: { apiKey: 'sk-test', endpoint: upstream.baseUrl, protocol: 'openai', model: 'deepseek-v4.1-flash' },
+        runtimeDeps: { codexBin: failCodex, env: process.env },
+      });
+      assert.equal(res.status, 'failed');
+      assert.match(res.error, /^codex_cli exited with code 1: HEAD_MARKER:/);
+      assert.match(res.error, /TAIL_ERROR_ROOT_CAUSE/);
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  test('runBuiltinMiniSweAgentLoop handles fetch timeout without throwing and retries once when >30s remain', async () => {
+    const tmpRoot = makeRealTempDir('agent-us-mini-to-');
+    trackTmp(tmpRoot);
+    const repoDir = join(tmpRoot, 'repo');
+    mkdirSync(repoDir, { recursive: true });
+    createTempPythonRepo(repoDir, 'mini-to');
+
+    // 1. Short timeout (<= 30s remaining): fetch times out via AbortSignal.timeout, no retry, returns failed gracefully
+    const hangingServer = createServer((_req, _res) => {
+      // Intentionally hang longer than turnTimeoutMs
+    });
+    await new Promise((r) => hangingServer.listen(0, '127.0.0.1', r));
+    try {
+      const hangPort = hangingServer.address().port;
+      const timeoutRes = await runExternalSweBenchArm({
+        arm: 'mini_swe_agent',
+        instance: { instance_id: 'acme__to-01', repo: 'acme/to', base_commit: 'HEAD', problem_statement: 'Fix' },
+        workspaceRoot: repoDir,
+        opts: { model: 'deepseek-v4.1-flash', maxSteps: 3, turnTimeoutMs: 400 },
+        liveConfig: { apiKey: 'sk-test', endpoint: `http://127.0.0.1:${hangPort}/v1`, protocol: 'openai', model: 'deepseek-v4.1-flash' },
+        runtimeDeps: { forceBuiltinMiniSweAgent: true, env: process.env },
+      });
+      assert.equal(timeoutRes.status, 'failed');
+      assert.match(timeoutRes.error, /mini_swe_agent (?:LLM request failed|timed out)/);
+    } finally {
+      hangingServer.closeAllConnections?.();
+      await new Promise((r) => hangingServer.close(r));
+    }
+
+    // 2. >30s remaining: transient connection failure on attempt 0 retries once and succeeds; persistent failure returns failed
+    let retryServerHits = 0;
+    const retryServer = createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      retryServerHits += 1;
+      if (retryServerHits === 1) {
+        req.socket.destroy();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: 'retry_ok',
+          choices: [{ message: { role: 'assistant', content: 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\nRecovered after retry.' } }],
+          usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 50 } },
+        }),
+      );
+    });
+    await new Promise((r) => retryServer.listen(0, '127.0.0.1', r));
+    try {
+      const retryPort = retryServer.address().port;
+      const retryRes = await runExternalSweBenchArm({
+        arm: 'mini_swe_agent',
+        instance: { instance_id: 'acme__rt-01', repo: 'acme/rt', base_commit: 'HEAD', problem_statement: 'Fix' },
+        workspaceRoot: repoDir,
+        opts: { model: 'deepseek-v4.1-flash', maxSteps: 3, turnTimeoutMs: 40_000 },
+        liveConfig: { apiKey: 'sk-test', endpoint: `http://127.0.0.1:${retryPort}/v1`, protocol: 'openai', model: 'deepseek-v4.1-flash' },
+        runtimeDeps: { forceBuiltinMiniSweAgent: true, env: process.env },
+      });
+      assert.equal(retryRes.status, 'completed');
+      assert.equal(retryServerHits, 2);
+    } finally {
+      retryServer.closeAllConnections?.();
+      await new Promise((r) => retryServer.close(r));
+    }
   });
 });
