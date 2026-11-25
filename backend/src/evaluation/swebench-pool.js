@@ -731,6 +731,73 @@ export function hasExplicitEnvProviderKey(env = process.env) {
   return BENCH_API_KEY_ENV_VARS.some((k) => String(env?.[k] ?? '').trim().length > 0);
 }
 
+const OPENAI_FULL_ENDPOINT_SUFFIX_RE = /\/(?:chat\/completions|completions|responses|models)$/i;
+const ANTHROPIC_FULL_ENDPOINT_SUFFIX_RE = /\/(?:v1\/messages|messages)$/i;
+
+function parseHttpUrlSafe(raw) {
+  if (!/^https?:\/\//i.test(raw)) return null;
+  try {
+    return new URL(raw);
+  } catch {
+    return null;
+  }
+}
+
+function inferProtocolFromEndpoint(rawEndpoint, { keySource, model }) {
+  if (keySource === 'ANTHROPIC_API_KEY' || /^claude-/i.test(model)) {
+    return 'anthropic';
+  }
+  const trimmed = String(rawEndpoint ?? '').trim().replace(/\/+$/, '');
+  if (!trimmed) return 'openai';
+  const parsed = parseHttpUrlSafe(trimmed);
+  const hostname = parsed ? parsed.hostname.toLowerCase() : '';
+  const cleanPath = parsed ? parsed.pathname.replace(/\/+$/, '').toLowerCase() : trimmed.toLowerCase();
+  if (cleanPath.endsWith('/v1/messages')) return 'anthropic';
+  if (cleanPath.endsWith('/messages') && /anthropic/i.test(hostname || trimmed)) return 'anthropic';
+  if (/anthropic\.com/i.test(hostname || trimmed)) return 'anthropic';
+  return 'openai';
+}
+
+/**
+ * Normalizes a SWE-bench provider endpoint into the base URL expected by
+ * `PoolLlmAdapter` / `AccountPool` (OpenAI SDK appends `/chat/completions`;
+ * Anthropic appends `/messages` if ending in `/v1`, otherwise `/v1/messages`).
+ */
+export function normalizeSweBenchEndpoint(rawEndpoint, protocol = 'openai') {
+  const raw = String(rawEndpoint ?? '').trim();
+  if (!raw) return '';
+
+  const normalizedProtocol =
+    String(protocol ?? 'openai').trim().toLowerCase() === 'anthropic' ? 'anthropic' : 'openai';
+
+  if (normalizedProtocol === 'anthropic') {
+    let cleaned = raw.replace(/\/+$/, '');
+    if (ANTHROPIC_FULL_ENDPOINT_SUFFIX_RE.test(cleaned)) {
+      cleaned = cleaned.replace(ANTHROPIC_FULL_ENDPOINT_SUFFIX_RE, '').replace(/\/+$/, '');
+    }
+    return cleaned;
+  }
+
+  const parsed = parseHttpUrlSafe(raw);
+  const hostname = parsed ? parsed.hostname.toLowerCase() : '';
+  const hadNoPathSegments = parsed ? parsed.pathname.replace(/\/+$/, '') === '' : false;
+
+  let hadTrailingSlash = /\/+$/.test(raw);
+  let cleaned = raw.replace(/\/+$/, '');
+  while (OPENAI_FULL_ENDPOINT_SUFFIX_RE.test(cleaned)) {
+    cleaned = cleaned.replace(OPENAI_FULL_ENDPOINT_SUFFIX_RE, '');
+    const innerTrailing = /\/+$/.test(cleaned);
+    cleaned = cleaned.replace(/\/+$/, '');
+    if (!hadTrailingSlash && !innerTrailing) break;
+    hadTrailingSlash = innerTrailing;
+  }
+
+  if (hadNoPathSegments && hostname !== 'api.githubcopilot.com') {
+    return `${cleaned}/v1`;
+  }
+  return cleaned;
+}
+
 /**
  * Resolves live provider key, endpoint, protocol, and default model from CLI options
  * and environment variables with provider-aware endpoint inference.
@@ -762,11 +829,13 @@ export function resolveLiveProviderConfig(opts = {}, env = process.env) {
   const envProtocolHit = readFirstNonEmptyEnv(env, BENCH_PROTOCOL_ENV_VARS);
   const rawExplicitProtocol = explicitProtocol || envProtocolHit.value.toLowerCase();
 
-  let endpoint = rawExplicitEndpoint.replace(/\/+$/, '');
+  let endpoint = '';
   let protocol = rawExplicitProtocol;
 
-  if (!endpoint) {
-    if (keySource === 'DEEPSEEK_API_KEY') {
+  if (!rawExplicitEndpoint) {
+    if (protocol === 'anthropic') {
+      endpoint = 'https://api.anthropic.com';
+    } else if (keySource === 'DEEPSEEK_API_KEY') {
       endpoint = 'https://api.deepseek.com/v1';
       if (!protocol) protocol = 'openai';
     } else if (keySource === 'ANTHROPIC_API_KEY' || /^claude-/i.test(model)) {
@@ -779,15 +848,18 @@ export function resolveLiveProviderConfig(opts = {}, env = process.env) {
       endpoint = 'https://api.openai.com/v1';
       if (!protocol) protocol = 'openai';
     }
-  } else if (!protocol) {
-    protocol =
-      keySource === 'ANTHROPIC_API_KEY' || /^claude-/i.test(model) || /anthropic\.com/i.test(endpoint)
-        ? 'anthropic'
-        : 'openai';
+  } else {
+    if (!protocol) {
+      protocol = inferProtocolFromEndpoint(rawExplicitEndpoint, { keySource, model });
+    }
+    endpoint = normalizeSweBenchEndpoint(rawExplicitEndpoint, protocol);
   }
 
+  const normalizedProtocol = protocol || 'openai';
+  endpoint = normalizeSweBenchEndpoint(endpoint, normalizedProtocol);
+
   const preset =
-    protocol === 'anthropic'
+    normalizedProtocol === 'anthropic'
       ? endpoint === 'https://api.anthropic.com'
         ? 'anthropic'
         : 'custom-anthropic'
@@ -800,7 +872,7 @@ export function resolveLiveProviderConfig(opts = {}, env = process.env) {
   return {
     apiKey,
     endpoint,
-    protocol: protocol || 'openai',
+    protocol: normalizedProtocol,
     model,
     preset,
     keySource,
