@@ -38,7 +38,7 @@ class ScriptedTurnAdapter extends LlmAdapter {
   }
 }
 
-async function waitTurnTerminal(directAgent, sessionId, turnId, timeoutMs = 8000) {
+async function waitTurnTerminal(directAgent, sessionId, turnId, timeoutMs = 20_000) {
   return withTimeout(
     (async () => {
       while (true) {

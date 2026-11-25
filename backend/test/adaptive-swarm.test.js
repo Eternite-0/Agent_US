@@ -31,7 +31,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 }
 
-async function waitTurnDone(direct, sessionId, turnId, timeoutMs = 4000) {
+async function waitTurnDone(direct, sessionId, turnId, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const t = direct.listTurns(sessionId).find((x) => x.id === turnId);

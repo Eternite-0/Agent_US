@@ -151,7 +151,7 @@ jobs:
             Write-Error "No backend test files discovered"
             exit 1
           }
-          Write-Host "Running $($tests.Count) backend test files individually (--test-timeout=180000, concurrency=4)"
+          Write-Host "Running $($tests.Count) backend test files individually (--test-timeout=180000, concurrency=2)"
           $failed = $false
           foreach ($testFile in $tests) {
             Write-Host "::group::$testFile"
@@ -159,7 +159,7 @@ jobs:
             $prevNativePref = $PSNativeCommandUseErrorActionPreference
             $PSNativeCommandUseErrorActionPreference = $false
             try {
-              & node --test --test-concurrency=4 --test-timeout=180000 $testFile *> $logFile
+              & node --test --test-concurrency=2 --test-timeout=180000 $testFile *> $logFile
               $code = $LASTEXITCODE
             } finally {
               $PSNativeCommandUseErrorActionPreference = $prevNativePref

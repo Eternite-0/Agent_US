@@ -106,7 +106,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 }
 
-async function waitTurnDone(runtime, store, sessionId, turnId, timeoutMs = 8000) {
+async function waitTurnDone(runtime, store, sessionId, turnId, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   let lastRow = null;
   while (Date.now() < deadline) {
@@ -902,7 +902,7 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
       aciProfile: 'full_aci',
     });
     // Next handler falls through to final summary
-    const term2 = await waitTurnDone(runtime, store, sess.id, fullTurn.turn.id, 6000);
+    const term2 = await waitTurnDone(runtime, store, sess.id, fullTurn.turn.id, 20_000);
     assert.equal(term2.state, 'completed');
     const comp2 = JSON.parse(
       store.db

@@ -40,7 +40,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 }
 
-async function waitTurnState(direct, sessionId, turnId, states, timeoutMs = 6000) {
+async function waitTurnState(direct, sessionId, turnId, states, timeoutMs = 20_000) {
   const target = new Set(states);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

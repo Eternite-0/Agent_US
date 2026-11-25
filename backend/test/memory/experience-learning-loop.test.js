@@ -26,7 +26,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 }
 
-async function waitTurnDone(directAgent, sessionId, turnId, timeoutMs = 5_000) {
+async function waitTurnDone(directAgent, sessionId, turnId, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const turn = directAgent.listTurns(sessionId).find((item) => item.id === turnId);

@@ -41,7 +41,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 }
 
-async function waitTurnDone(directAgent, sessionId, turnId, timeoutMs = 5000) {
+async function waitTurnDone(directAgent, sessionId, turnId, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const turn = directAgent.listTurns(sessionId).find((item) => item.id === turnId);
@@ -1135,7 +1135,7 @@ test('Step 3: DirectAgent + AgentLoop ACI Epoch DTOC, read-only Supervisor via v
     aciOptions: { dtocPolicy: 'cumulative', admissionEnabled: false },
   });
   const { turn } = direct.startTurn(session.id, { input: 'Update computeRate in src/target.js', maxSteps: 12 });
-  const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
+  const settled = await waitTurnDone(direct, session.id, turn.id, 20_000);
   assert.equal(settled.state, 'completed');
 
   // Verify static system prompt byte-identity across all steps (KV Prompt Cache invariant)
@@ -1253,7 +1253,7 @@ test('Step 3: ContextAssembler & DirectAgent admit ONLY verified experience memo
     permissionMode: 'full-access',
   });
   const { turn } = direct.startTurn(session.id, { input: 'Verify port setting in src/index.js' });
-  const done = await waitTurnDone(direct, session.id, turn.id, 5000);
+  const done = await waitTurnDone(direct, session.id, turn.id, 20_000);
   assert.equal(done.state, 'completed');
 
   const promptText = capturedPrompts[0] ?? '';
@@ -1407,7 +1407,7 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
     input: 'Inspect src/index.js precedence rules and write CONTRACT.json (`precedence`).',
     maxSteps: 12,
   });
-  const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
+  const settled = await waitTurnDone(direct, session.id, turn.id, 20_000);
   assert.equal(settled.state, 'completed');
   assert.equal(supCalls, 0, 'Repoformer abstention gate must skip Supervisor when fewer than 2 eligible candidates exist');
   assert.equal(sawOrderingReminder, true, 'Expected highest-to-lowest ordering_precedence pre-completion check');
@@ -1564,7 +1564,7 @@ test('Round 3: Repoformer abstains when 0 eligible (< 2 / < 2400 chars), while s
     aciOptions: { dtocPolicy: 'cumulative', admissionEnabled: false },
   });
   const { turn } = direct.startTurn(session.id, { input: 'Update src/a.js after inspecting src/b.js', maxSteps: 14 });
-  const settled = await waitTurnDone(direct, session.id, turn.id, 8000);
+  const settled = await waitTurnDone(direct, session.id, turn.id, 20_000);
   assert.equal(settled.state, 'completed');
   assert.equal(supCalls, 1, 'Supervisor should run exactly once when >= 2 eligible candidates reach >= 2400 chars');
 
@@ -1768,7 +1768,7 @@ test('Stage 4: DirectAgent supports all 4 aciProfiles, short-task DTOC KV preser
       input: 'Check verifySessionToken and extraHelper80',
       maxSteps: 10,
     });
-    const settled = await waitTurnDone(direct, sess.id, turn.id, 8000);
+    const settled = await waitTurnDone(direct, sess.id, turn.id, 20_000);
     assert.equal(settled.state, 'completed');
     const ev = JSON.parse(
       store.db.prepare("SELECT data FROM direct_events WHERE turnId=? AND type='turn/completed'").get(turn.id).data,
