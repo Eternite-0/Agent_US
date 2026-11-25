@@ -1,6 +1,6 @@
 # Agent_US 2.3 后端架构
 
-Agent_US 2.3 以 `DirectAgentRuntime` 组装交互会话和自治执行，普通 turn 与 Swarm 子 turn 共用 `AgentRuntimeKernel`。本文对应 `c7c3558136541b70121fec7b1a84fcedd591b967` 的实现快照。真实 Provider、独立验收与确定性控制对照见 [2.3 验收报告](2.3-general-autonomous-agent-report.md)。
+Agent_US 2.3 以 `DirectAgentRuntime` 组装交互会话和自治执行，普通 turn 与 Swarm 子 turn 共用 `AgentRuntimeKernel`。本文对应 `c7c3558136541b70121fec7b1a84fcedd591b967` 的实现快照。真实 Provider、独立验收与确定性控制对照见 [2.3 验收报告](archive/2.3-general-autonomous-agent-report.md)。
 
 ## 七层逻辑架构
 
@@ -82,4 +82,4 @@ stateDiagram-v2
 - 陌生仓库验收覆盖自主规划、并行 worktree、真实 `SIGKILL`、人工核对恢复、Reviewer、产物应用及应用后测试。`tj/commander.js` 的 `1393 PASS / 0 FAIL / 2 SKIP` 属于该次任务。
 - 确定性离线测试覆盖迁移、租约、审批、并行产物冲突、Reviewer 契约和预算边界，独立于真实模型评分。大型仓库仍需按范围复查，外置工具链的验证取决于环境是否已安装所需依赖。
 
-详见 [2.3 验收报告](2.3-general-autonomous-agent-report.md)、[后端启动与测试命令](../README.md) 和 [CI 工作流](../../.github/workflows/ci.yml)。
+详见 [2.3 验收报告](archive/2.3-general-autonomous-agent-report.md)、[后端启动与测试命令](../README.md) 和 [CI 工作流](../../.github/workflows/ci.yml)。

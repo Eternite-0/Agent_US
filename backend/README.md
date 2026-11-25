@@ -69,4 +69,4 @@ node --test --test-concurrency=4 --test-timeout=60000 test/<suite>.test.js
 
 CI 在 Windows 和 Ubuntu 上逐文件运行核心回归，排除 `security.test.js`、`providers.test.js` 和 `integration.test.js`。见 [CI 工作流](../.github/workflows/ci.yml)。
 
-2.3 的真实 Provider、陌生仓库、独立 Reviewer、恢复和离线控制结果见 [`docs/2.3-general-autonomous-agent-report.md`](docs/2.3-general-autonomous-agent-report.md)。
+2.3 的真实 Provider、陌生仓库、独立 Reviewer、恢复和离线控制结果见 [`docs/archive/2.3-general-autonomous-agent-report.md`](docs/archive/2.3-general-autonomous-agent-report.md)。
