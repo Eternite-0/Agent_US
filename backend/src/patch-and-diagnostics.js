@@ -1541,8 +1541,9 @@ export function normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir = null) 
       }
     }
   }
-  if (!/^\\\\[^\\]/.test(s)) {
-    s = s.replace(/\\\\/g, '\\');
+  const isUnc = /^\\\\[^\\]/.test(s) || /^\/\/[^/]/.test(s);
+  if (!isUnc) {
+    s = s.replace(/\\\\/g, '\\').replace(/\/{2,}/g, '/');
   }
   if (/^\/[A-Za-z]:/.test(s)) {
     s = s.slice(1);
@@ -1563,7 +1564,8 @@ export function normalizeDiagnosticFile(rawFile, workspaceRoot, baseDir = null) 
       // keep cleaned string
     }
   }
-  return s.replace(/\\/g, '/').replace(/^\.\//, '');
+  const normalized = s.replace(/\\/g, '/').replace(/^\.\//, '');
+  return isUnc ? normalized : normalized.replace(/\/{2,}/g, '/');
 }
 
 function isBlockedDiagnosticsRel(relPath) {

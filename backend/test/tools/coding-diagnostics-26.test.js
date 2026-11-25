@@ -497,3 +497,16 @@ test('normalizeDiagnosticFile decodes percent-encoded file URLs (e.g. %7E) and r
     assert.equal(normalizeDiagnosticFile(encodedUrl, aliasWs), 'test/assertions.test.js');
   }
 });
+
+test('normalizeDiagnosticFile collapses duplicate slashes across file URLs and preserves UNC paths', () => {
+  assert.equal(normalizeDiagnosticFile('file:///D://work//app//index.ts', null), 'D:/work/app/index.ts');
+  assert.equal(normalizeDiagnosticFile('/D://work//app//index.ts', null), 'D:/work/app/index.ts');
+  assert.equal(normalizeDiagnosticFile('file:///D:\\\\work\\\\app\\\\index.ts', null), 'D:/work/app/index.ts');
+  assert.equal(
+    normalizeDiagnosticFile('file:///C:/Users/RUNNER%7E1/AppData/Local/Temp/ws/test/a.test.js', null),
+    'C:/Users/RUNNER~1/AppData/Local/Temp/ws/test/a.test.js',
+  );
+  assert.equal(normalizeDiagnosticFile('file:///home/dev/a.ts', null), '/home/dev/a.ts');
+  assert.equal(normalizeDiagnosticFile('\\\\server\\share\\src\\app.ts', null), '//server/share/src/app.ts');
+  assert.equal(normalizeDiagnosticFile('//server/share/src/app.ts', null), '//server/share/src/app.ts');
+});
