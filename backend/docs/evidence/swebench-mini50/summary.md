@@ -4,9 +4,9 @@
 - **Mode**: dataset
 - **Model**: deepseek-v4.1-flash
 - **Max Steps**: 60
-- **Arms**: raw_full, full_aci
+- **Arms**: raw_full, full_aci, claude_code, mini_swe_agent
 - **Resumed**: false
-- **Updated At**: 2026-11-25T12:44:11.488Z
+- **Updated At**: 2026-11-25T19:59:12.489Z
 
 ## Per-Arm Metrics
 
@@ -14,6 +14,8 @@
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `raw_full` | 35/50 | 36.00% (18/50) | 3314561 | 0.00% (n=18) | 58497753 | 1164337 | 97.09% (54571392/56207643, n=49) | 1630 (32.6) | 14471307 | 98.00% (49/50) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
 | `full_aci` | 35/50 | 42.00% (21/50) | 2963502 | 30.03% (n=13) | 61124185 | 1109362 | 96.69% (59051904/61070627, n=50) | 1792 (35.84) | 13552121 | 100.00% (50/50) | 20.31% (235519/1159547) | 4 | 0 calls / 0 tok / 0 ms |
+| `claude_code` | 49/50 | 72.00% (36/50) | 1458418 | 43.26% (n=17) | 51894596 | 608438 | 96.08% (49861248/51894596, n=50) | 1470 (29.4) | 9773978 | 100.00% (50/50) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
+| `mini_swe_agent` | 28/50 | 61.70% (29/47) | 1112834 | 48.84% (n=15) | 30500859 | 1771334 | 96.05% (29297024/30500859, n=47) | 1901 (38.02) | 17807670 | 80.00% (40/50) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
 
 ## Instance Telemetry
 
@@ -119,3 +121,103 @@
 | `full_aci` | `sphinx-doc__sphinx-10323` | completed | no | 24 | 502023 | 10227 | 96.79% | 123107 | yes | 3.37% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-9461` | completed | no | 60 | 3158331 | 53164 | 96.08% | 392139 | yes | 4.98% | 1 |
 | `full_aci` | `sphinx-doc__sphinx-10435` | completed | no | 14 | 165709 | 6126 | 94.39% | 75963 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12209` | completed | yes | 25 | 553628 | 7964 | 95.58% | 108742 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12155` | completed | yes | 24 | 542047 | 11839 | 93.84% | 208199 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12050` | completed | yes | 14 | 232669 | 3350 | 92.37% | 57301 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12193` | completed | no | 19 | 322283 | 4221 | 94.13% | 75475 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12039` | completed | yes | 10 | 208356 | 5417 | 82.01% | 54224 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12304` | completed | yes | 13 | 232058 | 4823 | 91.56% | 62519 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-9296` | completed | yes | 17 | 268684 | 2396 | 93.28% | 61150 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12308` | completed | yes | 16 | 301937 | 5111 | 93.31% | 130837 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11951` | completed | yes | 12 | 172029 | 2168 | 89.44% | 58799 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12262` | completed | yes | 27 | 520900 | 6827 | 95.34% | 114108 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11999` | completed | yes | 14 | 298173 | 5856 | 90.66% | 108802 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11964` | completed | yes | 12 | 256710 | 5882 | 88.65% | 106263 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12273` | completed | yes | 28 | 758612 | 18464 | 86.96% | 167116 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11848` | completed | yes | 10 | 152787 | 3126 | 87.30% | 62188 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12774` | completed | yes | 20 | 422518 | 8213 | 95.00% | 99785 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11885` | completed | yes | 54 | 2144308 | 20193 | 97.85% | 397856 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11815` | completed | yes | 18 | 320503 | 4757 | 93.49% | 82527 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12713` | completed | yes | 22 | 425151 | 6519 | 95.02% | 151305 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12143` | completed | yes | 12 | 173200 | 2117 | 90.01% | 66823 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11790` | completed | yes | 12 | 190689 | 2933 | 90.82% | 47557 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12708` | completed | yes | 29 | 737087 | 9639 | 95.88% | 122752 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-11880` | completed | no | 20 | 313328 | 3533 | 94.25% | 77000 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12276` | completed | no | 23 | 412687 | 3770 | 94.82% | 92363 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12406` | completed | yes | 29 | 735038 | 10639 | 94.87% | 204599 | yes | 0.00% | 0 |
+| `claude_code` | `django__django-12325` | completed | yes | 34 | 707248 | 18745 | 86.33% | 167464 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8721` | completed | no | 28 | 770790 | 14753 | 94.49% | 242964 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8548` | completed | yes | 90 | 5565225 | 43936 | 98.61% | 609066 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8035` | completed | yes | 38 | 1290799 | 17429 | 97.08% | 298287 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8269` | completed | no | 27 | 653336 | 7359 | 89.28% | 617306 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-7748` | completed | yes | 51 | 1852817 | 18544 | 97.57% | 249158 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-9320` | completed | yes | 13 | 263025 | 5011 | 89.74% | 87427 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-7985` | completed | no | 27 | 823578 | 14130 | 94.31% | 219823 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-10673` | completed | yes | 65 | 3468831 | 32162 | 97.43% | 446414 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8475` | completed | no | 16 | 278822 | 3699 | 92.64% | 58675 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-7590` | completed | yes | 24 | 646264 | 10258 | 95.17% | 112824 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-9367` | completed | no | 15 | 275883 | 6083 | 91.31% | 113957 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-10466` | completed | yes | 47 | 1637880 | 19607 | 96.54% | 230815 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8265` | completed | no | 34 | 1140137 | 24128 | 95.20% | 331407 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-7757` | completed | yes | 13 | 234188 | 3220 | 91.17% | 48603 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-9281` | completed | yes | 12 | 201806 | 3783 | 90.95% | 48303 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-9229` | completed | no | 85 | 4324853 | 33545 | 96.97% | 657571 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8551` | completed | yes | 48 | 1828638 | 21526 | 97.66% | 232869 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-9698` | completed | yes | 9 | 138497 | 1978 | 85.95% | 49755 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-11510` | failed | no | 106 | 6996986 | 51292 | 98.36% | 903178 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8056` | completed | no | 24 | 611429 | 12449 | 95.75% | 168443 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-9230` | completed | yes | 19 | 372106 | 14604 | 83.45% | 185329 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-8638` | completed | yes | 51 | 2011014 | 17579 | 96.63% | 248620 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-10323` | completed | yes | 13 | 242211 | 2823 | 91.21% | 49541 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-9461` | completed | no | 81 | 4402878 | 40935 | 98.48% | 582943 | yes | 0.00% | 0 |
+| `claude_code` | `sphinx-doc__sphinx-10435` | completed | no | 20 | 459973 | 9103 | 85.96% | 94946 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12209` | failed | yes | 60 | 860908 | 118717 | 96.64% | 655212 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12155` | completed | yes | 26 | 201331 | 6415 | 93.01% | 91429 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12050` | completed | yes | 18 | 48644 | 2902 | 88.68% | 63153 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12193` | completed | yes | 49 | 535990 | 15487 | 95.88% | 178609 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12039` | completed | yes | 24 | 302015 | 10538 | 93.96% | 104469 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12304` | completed | yes | 28 | 197709 | 7028 | 93.42% | 102527 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-9296` | completed | yes | 10 | 34057 | 1153 | 83.44% | 40839 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12308` | failed | yes | 60 | 938875 | 49013 | 96.65% | 359952 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11951` | completed | yes | 13 | 47224 | 2182 | 87.01% | 39315 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12262` | completed | yes | 46 | 472149 | 9340 | 95.32% | 145079 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11999` | completed | yes | 30 | 465027 | 15510 | 94.52% | 134824 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11964` | completed | yes | 21 | 212893 | 8670 | 92.59% | 87448 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12273` | failed | yes | 45 | 769322 | 70707 | 95.67% | 905992 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11848` | completed | yes | 15 | 80652 | 9492 | 89.67% | 71950 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12774` | completed | yes | 30 | 221355 | 13320 | 93.68% | 128901 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11885` | failed | yes | 60 | 1203299 | 69498 | 96.33% | 823658 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11815` | completed | yes | 44 | 503787 | 26577 | 95.96% | 221489 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12713` | completed | yes | 39 | 326573 | 11313 | 94.77% | 167670 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12143` | completed | yes | 25 | 169547 | 5820 | 90.75% | 135878 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11790` | completed | yes | 24 | 240977 | 8866 | 92.42% | 90396 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12708` | completed | yes | 33 | 397213 | 23890 | 94.35% | 180931 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-11880` | completed | no | 14 | 44952 | 1793 | 87.13% | 38350 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12276` | completed | no | 27 | 155244 | 4032 | 92.51% | 77358 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12406` | failed | no | 51 | 988844 | 175022 | 96.05% | 905217 | no | 0.00% | 0 |
+| `mini_swe_agent` | `django__django-12325` | failed | yes | 60 | 806051 | 116477 | 96.39% | 631661 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8721` | failed | no | 60 | 1351378 | 32156 | 96.88% | 293060 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8548` | failed | no | 60 | 2058649 | 156933 | 97.28% | 760192 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8035` | env_error | - | 0 | 0 | 0 | N/A | 902816 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8269` | completed | no | 57 | 1016029 | 16182 | 96.30% | 196433 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-7748` | env_error | - | 0 | 0 | 0 | N/A | 902718 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-9320` | completed | yes | 30 | 262299 | 12430 | 94.04% | 115605 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-7985` | failed | no | 60 | 1035605 | 89997 | 96.80% | 514177 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-10673` | failed | no | 45 | 792535 | 62318 | 96.02% | 902989 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8475` | completed | no | 48 | 1021813 | 11618 | 95.33% | 156748 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-7590` | failed | no | 60 | 851137 | 104858 | 96.49% | 528689 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-9367` | completed | no | 6 | 21050 | 1715 | 66.89% | 34289 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-10466` | failed | yes | 60 | 1013709 | 42795 | 96.85% | 310769 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8265` | failed | no | 60 | 1401735 | 39179 | 96.91% | 305119 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-7757` | completed | yes | 41 | 501423 | 5964 | 95.32% | 111387 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-9281` | completed | yes | 18 | 91617 | 5305 | 90.25% | 65742 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-9229` | failed | no | 60 | 1680439 | 31958 | 96.63% | 472291 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8551` | failed | no | 60 | 1344530 | 54786 | 97.08% | 366483 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-9698` | completed | yes | 27 | 284745 | 6251 | 93.05% | 130494 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-11510` | env_error | - | 0 | 0 | 0 | N/A | 902961 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8056` | failed | no | 60 | 1139224 | 80625 | 96.63% | 852762 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-9230` | completed | yes | 32 | 337441 | 14403 | 94.26% | 138703 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-8638` | failed | no | 60 | 1440198 | 73770 | 96.80% | 836887 | no | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-10323` | completed | yes | 53 | 842693 | 11428 | 96.85% | 172084 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-9461` | failed | no | 60 | 1529213 | 107938 | 97.01% | 549225 | yes | 0.00% | 0 |
+| `mini_swe_agent` | `sphinx-doc__sphinx-10435` | failed | no | 32 | 258759 | 24963 | 93.79% | 902740 | no | 0.00% | 0 |
