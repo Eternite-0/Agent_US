@@ -473,8 +473,13 @@ export function isFailedVerificationSuperseded(
     }
   }
   if (setsOverlap(passTargets.dirs, failTargets.dirs)) return true;
-  if (setsOverlap(passTargets.stems, failTargets.stems)) return true;
   if (setsOverlap(passTargets.appLabels, failTargets.appLabels)) return true;
+
+  const failHasConcreteFiles = failTargets.targets.some((t) => TEST_SUBJECT_EXT_RE.test(t));
+  const passHasConcreteFiles = passTargets.targets.some((t) => TEST_SUBJECT_EXT_RE.test(t));
+  if (!(failHasConcreteFiles && passHasConcreteFiles) && setsOverlap(passTargets.stems, failTargets.stems)) {
+    return true;
+  }
 
   const mutatedSignals = extractMutatedTargetSignals(allMutatedFiles, workspaceRoot);
   if (
@@ -1982,7 +1987,7 @@ export class EvidenceVerifier {
     }
 
     // 3. Verify claimed file mutations exist on disk when workspaceRoot is supplied
-    if (workspaceRoot && (events.length || turnReceipts.length)) {
+    if (workspaceRoot && events.length) {
       const latestWriteInfo = new Map();
       const resolvedPaths = new Map();
       const deletionEvents = [];

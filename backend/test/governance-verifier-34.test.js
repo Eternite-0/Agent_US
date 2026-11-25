@@ -243,12 +243,22 @@ test('EvidenceVerifier supersession negative cases preserve stale-edit, post-pas
   assert.equal(staleAfterPass.checks.staleVerificationAfterEdit, true);
   assert.ok(staleAfterPass.reasons.some((r) => r.includes('STALE_VERIFICATION_AFTER_EDIT')));
 
-  // 5. Direct helper check: failRun.index >= passRun.index never supersedes
+  // 5. Direct helper checks:
+  // - failRun.index >= passRun.index never supersedes
   assert.equal(
     isFailedVerificationSuperseded(
       { index: 3, command: 'pytest', cwd: '.', exitCode: 1, output: '' },
       { index: 2, command: 'pytest', cwd: '.', exitCode: 0, output: '' },
       { lastCodeMutationIndex: 0, allMutatedFiles: ['app.js'], workspaceRoot: workDir },
+    ),
+    false,
+  );
+  // - Same filename in a different directory (total.test.mjs vs other/total.test.mjs) must NOT supersede on bare stem
+  assert.equal(
+    isFailedVerificationSuperseded(
+      { index: 1, command: 'node --test total.test.mjs', cwd: '.', exitCode: 1, output: '' },
+      { index: 2, command: 'node --test total.test.mjs', cwd: 'other', exitCode: 0, output: '' },
+      { lastCodeMutationIndex: -1, allMutatedFiles: [], workspaceRoot: workDir },
     ),
     false,
   );
