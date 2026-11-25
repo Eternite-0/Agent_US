@@ -227,6 +227,7 @@ export class DirectAgentRuntime {
     this.steeringQueues = new Map(); // sessionId -> string[]
     this.readFileStates = new Map(); // sessionId -> Map(relPath -> { sha256, at })
     this.sessionSandboxes = new Map(); // sessionId -> { sandbox, disableWorkspaceHooks, disableWorkspaceMcp, forcedToolDeny }
+    this.sessionTrafficSources = new Map(); // sessionId -> raw trafficSource override (e.g. 'benchmark')
     this.sessionProjects = new Map(); // sessionId -> projectId override
     this.sessionAciConfigs = new Map(); // sessionId -> { aciProfile, aciOptions }
     this.turnAciStates = new Map(); // turnId -> { sessionId, turnAciLedger, turnReadFiles, turnAciStore }
@@ -288,6 +289,7 @@ export class DirectAgentRuntime {
         this.steeringQueues.delete(sessionId);
         this.readFileStates.delete(sessionId);
         this.sessionSandboxes.delete(sessionId);
+        this.sessionTrafficSources.delete(sessionId);
         this.sessionProjects.delete(sessionId);
         this.sessionAciConfigs.delete(sessionId);
         for (const [tid, st] of this.turnAciStates.entries()) {
@@ -1032,6 +1034,9 @@ export class DirectAgentRuntime {
     const useBenchmarkSandbox = Boolean(sandbox || inheritedCfg || activeProfile === 'benchmark');
     if (!useBenchmarkSandbox) {
       const created = this.sessionRepo.createSession(sessionOpts);
+      if (sessionOpts.trafficSource != null && String(sessionOpts.trafficSource).trim()) {
+        this.sessionTrafficSources.set(created.id, String(sessionOpts.trafficSource).trim().toLowerCase());
+      }
       if (projectId && String(projectId).trim()) {
         this.sessionProjects.set(created.id, String(projectId).trim());
       }
@@ -1059,6 +1064,9 @@ export class DirectAgentRuntime {
       ...sessionOpts,
       toolDeny: mergedToolDeny,
     });
+    if (sessionOpts.trafficSource != null && String(sessionOpts.trafficSource).trim()) {
+      this.sessionTrafficSources.set(created.id, String(sessionOpts.trafficSource).trim().toLowerCase());
+    }
 
     if (projectId && String(projectId).trim()) {
       this.sessionProjects.set(created.id, String(projectId).trim());
@@ -1067,6 +1075,7 @@ export class DirectAgentRuntime {
 
     this.sessionSandboxes.set(created.id, {
       sandbox: resolvedSandbox,
+      sandboxProfile: activeProfile ?? 'benchmark',
       disableWorkspaceHooks:
         disableWorkspaceHooks ?? inheritedCfg?.disableWorkspaceHooks ?? true,
       disableWorkspaceMcp:
@@ -1788,6 +1797,10 @@ export class DirectAgentRuntime {
       ...(aciProfile !== undefined ? { aciProfile } : {}),
       ...(aciOptions !== undefined && aciOptions && typeof aciOptions === 'object' ? { aciOptions } : {}),
       trafficSource: classifiedTraffic.trafficSource,
+      rawTrafficSource:
+        trafficSource !== undefined && trafficSource !== null
+          ? String(trafficSource).trim().toLowerCase()
+          : (this.sessionTrafficSources.get(sessionId) ?? null),
       isSynthetic: classifiedTraffic.isSynthetic,
       ...(distillSyntheticTurns !== undefined ? { distillSyntheticTurns: Boolean(distillSyntheticTurns) } : {}),
     };
@@ -2037,7 +2050,11 @@ export class DirectAgentRuntime {
           canRetry: job.attempts < job.maxAttempts,
           leaseGuard,
           signal: combinedSignal,
-          trafficSource: classifiedTraffic.trafficSource,
+          trafficSource:
+            payload.rawTrafficSource === 'benchmark' || this.sessionTrafficSources.get(sessionId) === 'benchmark'
+              ? 'benchmark'
+              : classifiedTraffic.trafficSource,
+          sandboxProfile: payload.sandboxProfile ?? null,
           isSynthetic: classifiedTraffic.isSynthetic,
           distillSyntheticTurns: Boolean(payload.distillSyntheticTurns),
         });
@@ -2176,6 +2193,7 @@ export class DirectAgentRuntime {
     leaseGuard = null,
     signal,
     trafficSource = 'production',
+    sandboxProfile = null,
     isSynthetic = false,
     distillSyntheticTurns = false,
   }) {
@@ -2184,6 +2202,7 @@ export class DirectAgentRuntime {
     const turnModifiedFiles = new Set();
     let sessionObj = null;
     const sbxCfg = this.#resolveSessionSandboxConfig(sessionId);
+    const resolvedSandboxProfile = sandboxProfile ?? sbxCfg?.sandboxProfile ?? (sbxCfg ? 'benchmark' : null);
     if (sbxCfg?.sandbox) {
       sbxCfg.sandbox.resolveBackend();
     }
@@ -2550,6 +2569,8 @@ export class DirectAgentRuntime {
         provider: 'pool',
         effort,
         workspaceRoot,
+        trafficSource,
+        sandboxProfile: resolvedSandboxProfile,
         execution: evidenceContract ? { evidenceContract } : null,
         aci: {
           engine: aciEngine,

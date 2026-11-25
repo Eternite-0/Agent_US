@@ -293,6 +293,7 @@ export class TurnManager {
     sessionId,
     turnId,
     leaseGuard = null,
+    benchmarkMode = false,
   }) {
     this.store = store;
     this.eventRouter = eventRouter;
@@ -300,6 +301,7 @@ export class TurnManager {
     this.sessionId = sessionId;
     this.turnId = turnId;
     this.leaseGuard = leaseGuard;
+    this.benchmarkMode = Boolean(benchmarkMode);
     this.totalIn = 0;
     this.totalOut = 0;
     this.totalCacheRead = null;
@@ -335,9 +337,11 @@ export class TurnManager {
         sig = sha256Hex(`${tc.name}::${tc.arguments}::${isError}`);
       }
     }
+    const windowSize = this.benchmarkMode ? 8 : 6;
+    const repeatThreshold = this.benchmarkMode ? 5 : 3;
     this.recentCallSigs.push(sig);
-    if (this.recentCallSigs.length > 6) this.recentCallSigs.shift();
-    return sig !== null && this.recentCallSigs.filter((s) => s === sig).length >= 3;
+    if (this.recentCallSigs.length > windowSize) this.recentCallSigs.shift();
+    return sig !== null && this.recentCallSigs.filter((s) => s === sig).length >= repeatThreshold;
   }
 
   saveCheckpoint({ step, phase, state }) {
@@ -426,9 +430,15 @@ export class AgentLoop {
     workspaceRoot = null,
     node = null,
     execution = null,
+    trafficSource = null,
+    sandboxProfile = null,
     aci = null,
     pool = null,
   }) {
+    const benchmarkMode =
+      trafficSource === 'benchmark' ||
+      sandboxProfile === 'benchmark' ||
+      execution?.benchmarkMode === true;
     const sm = new TurnStateMachine({
       store: this.store,
       eventRouter: this.eventRouter,
@@ -446,6 +456,7 @@ export class AgentLoop {
       sessionId,
       turnId,
       leaseGuard,
+      benchmarkMode,
     });
 
     if (initialStep > 0 && this.checkpointStore && turnId) {
@@ -483,6 +494,7 @@ export class AgentLoop {
     const reasoningTracker = new ExecutionReasoningTracker({
       workspaceRoot,
       baselineTestFiles: execution?.baselineTestFiles ?? node?.baselineTestFiles ?? null,
+      benchmarkMode,
     });
     if (Array.isArray(aci?.priorReadFiles) && aci.priorReadFiles.length > 0) {
       reasoningTracker.seedReadFiles(aci.priorReadFiles);
@@ -2141,15 +2153,9 @@ export class AgentLoop {
                 content: [{ type: 'text', text: steeringText }],
               });
             }
-          } else if (
-            !tm.thrashWarned &&
-            !(
-              policyBlockWarned &&
-              batchTrigger?.pattern === STUCK_PATTERNS.EXACT_REPEAT &&
-              batchTrigger?.isPolicyRejection
-            )
-          ) {
+          } else if (!tm.thrashWarned) {
             tm.thrashWarned = true;
+            tm.recentCallSigs = [];
             const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(
               batchTrigger,
               batchAntiThrashing,

@@ -579,7 +579,13 @@ export function buildSweBenchPrompt(instance, { containerMode = false } = {}) {
   parts.push(
     '',
     containerMode
-      ? 'Locate the root cause using grep and read_file, apply a minimal targeted fix with edit_file or apply_patch, run the relevant Python/repository test suite inside /testbed using bash (e.g., pytest, Django runtests, or SymPy bin/test — do NOT rely on host diagnostics), and verify the resulting git diff.'
+      ? [
+          'Workspace & Tool Conventions:',
+          '- Repository files live directly at the workspace root (mounted at /testbed inside bash).',
+          '- Prefer workspace-relative paths (e.g., django/..., sphinx/...) for read_file, edit_file, apply_patch, grep, and glob.',
+          '- Locate the root cause with grep and read_file, apply a minimal targeted fix with edit_file or apply_patch, and run targeted Python/repository tests inside /testbed via bash (e.g., pytest, Django runtests.py, or SymPy bin/test — do NOT rely on host diagnostics).',
+          '- Delete any temporary reproduction scripts before finishing, and leave only your minimal fix changes uncommitted in the workspace for `git diff`.',
+        ].join('\n')
       : 'Locate the root cause using grep and read_file, apply a minimal targeted fix, run the relevant test suite to confirm all tests pass, and verify the resulting git diff.',
   );
   return parts.join('\n');

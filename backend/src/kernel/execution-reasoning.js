@@ -444,8 +444,9 @@ function collectExistingTestPaths(workspaceRoot, maxEntries = 200) {
  * fingerprints, falsified-attempt ledger, and live mutation-vs-verification evidence.
  */
 export class ExecutionReasoningTracker {
-  constructor({ workspaceRoot = null, baselineTestFiles = null } = {}) {
+  constructor({ workspaceRoot = null, baselineTestFiles = null, benchmarkMode = false } = {}) {
     this.workspaceRoot = workspaceRoot;
+    this.benchmarkMode = Boolean(benchmarkMode);
     this.seq = 0;
     this._baselineTestFilesSet = Array.isArray(baselineTestFiles)
       ? new Set(
@@ -1506,19 +1507,20 @@ export class ExecutionReasoningTracker {
   #evaluateStuckPatterns({ step, seq, fingerprint, effectiveIsError, isPolicyRejection = false }) {
     let detected = null;
 
-    // Pattern 1: Exact repeat (>= 3 identical tool + args + error calls in recent window or consecutive)
+    // Pattern 1: Exact repeat (>= 3 identical tool + args + error calls in recent window or consecutive; >= 5 in benchmarkMode)
+    const exactRepeatThreshold = this.benchmarkMode ? 5 : 3;
     if (effectiveIsError) {
       const last = this._actionHistory.at(-1);
       const recentExactCount = this._actionHistory
         .slice(-8)
         .filter((a) => a.isError && a.actionKey === last?.actionKey).length;
-      if (this._consecutiveExactFailedStreak.count >= 3 || recentExactCount >= 3) {
+      if (this._consecutiveExactFailedStreak.count >= exactRepeatThreshold || recentExactCount >= exactRepeatThreshold) {
         detected = {
           pattern: STUCK_PATTERNS.EXACT_REPEAT,
           step,
           seq,
           signature: fingerprint?.signature ?? last?.actionKey ?? 'exact_repeat',
-          summary: `Repeated identical failing call ${last?.toolName} (>= 3 times)`,
+          summary: `Repeated identical failing call ${last?.toolName} (>= ${exactRepeatThreshold} times)`,
           ...(isPolicyRejection ? { isPolicyRejection: true } : {}),
         };
       }
@@ -1562,8 +1564,12 @@ export class ExecutionReasoningTracker {
       };
     }
 
-    // Pattern 4: Normalized same-error-signature streak (>= 3 even when args vary; deferred to >= 4 during self-test calibration)
-    const streakThreshold = this._selfTestEditCycles >= 1 && this._selfTestEditCycles < 4 ? 4 : 3;
+    // Pattern 4: Normalized same-error-signature streak (>= 3 even when args vary; deferred to >= 4 during self-test calibration, >= 5 in benchmarkMode)
+    const baseStreakThreshold = this.benchmarkMode ? 5 : 3;
+    const streakThreshold =
+      this._selfTestEditCycles >= 1 && this._selfTestEditCycles < 4
+        ? Math.max(4, baseStreakThreshold)
+        : baseStreakThreshold;
     if (!detected && effectiveIsError && !isPolicyRejection && this._consecutiveErrorStreak.count >= streakThreshold) {
       detected = {
         pattern: STUCK_PATTERNS.SAME_ERROR_STREAK,

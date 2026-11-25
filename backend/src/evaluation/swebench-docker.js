@@ -1674,7 +1674,6 @@ export class SweBenchDockerAdapter {
   mapHostCwdToContainer(cwd = this.workspaceRoot) {
     const raw = cwd == null || String(cwd).trim() === '' ? this.workspaceRoot : String(cwd).trim();
     const rootAbs = resolve(this.workspaceRoot);
-    const targetAbs = isAbsolute(raw) ? resolve(raw) : resolve(rootAbs, raw);
 
     const checkInside = (base, cand) => {
       const rel = relative(base, cand);
@@ -1684,26 +1683,47 @@ export class SweBenchDockerAdapter {
       return rel;
     };
 
-    const lexicalRel = checkInside(rootAbs, targetAbs);
+    const validateInsideWithSymlinks = (targetAbs) => {
+      const lexicalRel = checkInside(rootAbs, targetAbs);
+      let canonicalRel = lexicalRel;
+      if (existsSync(rootAbs)) {
+        const realRoot = realpathIfExists(rootAbs);
+        let probe = targetAbs;
+        const tail = [];
+        while (!existsSync(probe)) {
+          const parent = resolve(probe, '..');
+          if (parent === probe) break;
+          tail.unshift(basename(probe));
+          probe = parent;
+        }
+        if (existsSync(probe)) {
+          const realBase = realpathIfExists(probe);
+          const realTarget = tail.length ? resolve(realBase, ...tail) : realBase;
+          canonicalRel = checkInside(realRoot, realTarget);
+        }
+      }
+      return canonicalRel;
+    };
 
-    let canonicalRel = lexicalRel;
-    if (existsSync(rootAbs)) {
-      const realRoot = realpathIfExists(rootAbs);
-      let probe = targetAbs;
-      const tail = [];
-      while (!existsSync(probe)) {
-        const parent = resolve(probe, '..');
-        if (parent === probe) break;
-        tail.unshift(basename(probe));
-        probe = parent;
+    const rawPosix = raw.replace(/\\/g, '/');
+    if (rawPosix === '/testbed' || rawPosix.startsWith('/testbed/')) {
+      const normPosix = posixPath.normalize(rawPosix).replace(/\/+$/, '') || '/';
+      if (normPosix === '/testbed') return '/testbed';
+      if (!normPosix.startsWith('/testbed/')) {
+        throw new Error(`Working directory "${cwd}" escapes workspaceRoot "${this.workspaceRoot}"`);
       }
-      if (existsSync(probe)) {
-        const realBase = realpathIfExists(probe);
-        const realTarget = tail.length ? resolve(realBase, ...tail) : realBase;
-        canonicalRel = checkInside(realRoot, realTarget);
-      }
+      const subRel = normPosix.slice('/testbed/'.length);
+      validateInsideWithSymlinks(join(rootAbs, subRel));
+      return normPosix;
     }
 
+    const trimmedPosix = rawPosix.replace(/\/+$/, '');
+    if ((trimmedPosix === 'testbed' || trimmedPosix === './testbed') && !existsSync(join(rootAbs, 'testbed'))) {
+      return '/testbed';
+    }
+
+    const targetAbs = isAbsolute(raw) ? resolve(raw) : resolve(rootAbs, raw);
+    const canonicalRel = validateInsideWithSymlinks(targetAbs);
     const posixRel = canonicalRel ? canonicalRel.split(/[\\/]/).filter(Boolean).join('/') : '';
     return posixRel ? posixPath.join('/testbed', posixRel) : '/testbed';
   }

@@ -11,7 +11,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { hostname as osHostname, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix as posixPath, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { id as uuid } from '../store.js';
 import { sandbox as dockerSandbox } from '../tools.js';
@@ -142,7 +142,20 @@ export function resolveConfinedPath(workspaceRoot, rawPath) {
   const root = resolve(workspaceRoot);
   const input = String(rawPath ?? '').trim();
   if (!input) throw new Error('路径不能为空');
-  const full = isAbsolute(input) ? resolve(input) : resolve(root, input);
+  const rootPosix = root.replace(/\\/g, '/').replace(/\/+$/, '');
+  let effectiveInput = input;
+  if (rootPosix !== '/testbed' && !rootPosix.startsWith('/testbed/')) {
+    const inputPosix = input.replace(/\\/g, '/');
+    if (inputPosix === '/testbed' || inputPosix.startsWith('/testbed/')) {
+      const normPosix = posixPath.normalize(inputPosix);
+      if (normPosix === '/testbed') {
+        effectiveInput = '.';
+      } else if (normPosix.startsWith('/testbed/')) {
+        effectiveInput = normPosix.slice('/testbed/'.length) || '.';
+      }
+    }
+  }
+  const full = isAbsolute(effectiveInput) ? resolve(effectiveInput) : resolve(root, effectiveInput);
   const rel = relative(root, full);
   if (isOutsideRelative(rel)) {
     throw new Error(`路径超出当前工作区边界: ${input}`);
