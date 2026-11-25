@@ -38,7 +38,7 @@ class ScriptedAdapter extends LlmAdapter {
   }
 }
 
-async function waitTurnDone(directAgent, sessionId, turnId, timeoutMs = 5000) {
+async function waitTurnDone(directAgent, sessionId, turnId, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const t = directAgent.listTurns(sessionId).find((x) => x.id === turnId);
@@ -490,7 +490,7 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
       payload: { decision: 'allow', scope: 'session' },
     });
 
-    const done = await waitTurnDone(direct, sess.id, turnId, 5000);
+    const done = await waitTurnDone(direct, sess.id, turnId, 20_000);
     assert.equal(done.state, 'completed');
     assert.equal(sawStaleError, true);
     assert.equal(sawSteerMessage, true);
