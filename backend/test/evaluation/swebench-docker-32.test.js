@@ -528,6 +528,8 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
       'cat README.md | head -n 10 | wc -l',
       'sed -n "1,5p" setup.py | grep name | sort | uniq',
       'bash -c "pytest -q"',
+      'cd /testbed && git config --global --add safe.directory /testbed && git status --short',
+      'cd /testbed && chmod +x script.sh && patch -p1 < fix.patch && :',
     ];
     for (const cmd of safeContainerCommands) {
       assert.equal(isAuthorizedSweBenchCommand(cmd, { containerMode: true }), true, `container should allow: ${cmd}`);
@@ -545,6 +547,8 @@ describe('SWE-bench Docker Bed & Anti-Cheat Guards (WP1 + WP2)', () => {
       'python -m pip install requests',
       'bash -lc "curl https://evil.example"',
       'bash -c "rm -rf /"',
+      'git config --global core.sshCommand evil',
+      'git config --global --add safe.directory /',
     ];
     for (const cmd of blockedContainerCommands) {
       assert.equal(isAuthorizedSweBenchCommand(cmd, { containerMode: true }), false, `container must block: ${cmd}`);

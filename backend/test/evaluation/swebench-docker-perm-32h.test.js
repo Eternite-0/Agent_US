@@ -250,9 +250,18 @@ describe('SWE-bench Docker cleanup & permission hardening (docker-perm-32h)', ()
     });
 
     await adapter.start();
+    const startCallsCount = calls.length;
+    assert.ok(
+      calls.some(
+        (c) =>
+          c.args[0] === 'exec' &&
+          c.args.includes('git config --global --add safe.directory /testbed 2>/dev/null || true'),
+      ),
+      'start() must configure git safe.directory /testbed inside container',
+    );
     await adapter.destroy();
 
-    const postStartCalls = calls.slice(2);
+    const postStartCalls = calls.slice(startCallsCount);
     assert.equal(postStartCalls.length, 2);
     assert.deepEqual(postStartCalls[0].args, [
       'exec',
@@ -288,8 +297,9 @@ describe('SWE-bench Docker cleanup & permission hardening (docker-perm-32h)', ()
     });
 
     await adapterErr.start();
+    const errStartCount = errCalls.length;
     await adapterErr.destroy();
-    const afterStartErr = errCalls.slice(2);
+    const afterStartErr = errCalls.slice(errStartCount);
     assert.equal(afterStartErr[0][0], 'exec');
     assert.deepEqual(afterStartErr[1], ['rm', '-f', 'cid-linux-err-2']);
 
@@ -311,8 +321,9 @@ describe('SWE-bench Docker cleanup & permission hardening (docker-perm-32h)', ()
     });
 
     await adapterWin.start();
+    const winStartCount = winCalls.length;
     await adapterWin.destroy();
-    const afterStartWin = winCalls.slice(2);
+    const afterStartWin = winCalls.slice(winStartCount);
     assert.deepEqual(afterStartWin, [['rm', '-f', 'cid-win-3']]);
   });
 });

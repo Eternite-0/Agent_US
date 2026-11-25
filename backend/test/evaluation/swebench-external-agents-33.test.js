@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
 import {
@@ -22,6 +22,7 @@ import {
   isExternalSweBenchArm,
   rewriteHostArgsForContainer,
   runExternalSweBenchArm,
+  runMiniSweAgentCommand,
   validateShimGitArgs,
 } from '../../src/evaluation/swebench-external-agents.js';
 import {
@@ -66,7 +67,10 @@ function createTempPythonRepo(rootDir, bugTag = 'v1') {
   return { baseCommit };
 }
 
-async function startMockDualUpstreamServer({ targetModel = 'deepseek-v4.1-flash' } = {}) {
+async function startMockDualUpstreamServer({
+  targetModel = 'deepseek-v4.1-flash',
+  supportNativeResponses = true,
+} = {}) {
   const recordedRequests = [];
   let miniStep = 0;
 
@@ -330,6 +334,59 @@ async function startMockDualUpstreamServer({ targetModel = 'deepseek-v4.1-flash'
       return;
     }
 
+    if (urlObj.pathname === '/v1/responses') {
+      if (!supportNativeResponses) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Responses API not supported' } }));
+        return;
+      }
+      if (body.model !== targetModel) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: `Unknown model ${body.model}` } }));
+        return;
+      }
+      const nativeUsage = {
+        input_tokens: 900,
+        output_tokens: 70,
+        total_tokens: 970,
+        input_tokens_details: { cached_tokens: 650 },
+      };
+      const nativeResponseObj = {
+        id: 'resp_native_1',
+        object: 'response',
+        status: 'completed',
+        model: body.model,
+        output: [
+          {
+            id: 'msg_native_1',
+            type: 'message',
+            status: 'completed',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Native Responses API ok.', annotations: [] }],
+          },
+        ],
+        output_text: 'Native Responses API ok.',
+        usage: nativeUsage,
+      };
+      if (body.stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        res.write(
+          `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { ...nativeResponseObj, status: 'in_progress', output: [] } })}\n\n`,
+        );
+        res.write(
+          `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'Native Responses ' })}\n\n`,
+        );
+        res.write(
+          `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: nativeResponseObj })}\n\n`,
+        );
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(nativeResponseObj));
+      return;
+    }
+
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `Unhandled path ${urlObj.pathname}` } }));
   });
@@ -373,10 +430,12 @@ describe('Agent_US 3.3 External Agents Benchmark Framework', () => {
 
     const p1 = deriveUpstreamEndpoints('https://api.example.com/v1/');
     assert.equal(p1.openaiChatUrl, 'https://api.example.com/v1/chat/completions');
+    assert.equal(p1.openaiResponsesUrl, 'https://api.example.com/v1/responses');
     assert.equal(p1.anthropicMessagesUrl, 'https://api.example.com/v1/messages');
 
     const p2 = deriveUpstreamEndpoints('https://api.example.com');
     assert.equal(p2.openaiChatUrl, 'https://api.example.com/v1/chat/completions');
+    assert.equal(p2.openaiResponsesUrl, 'https://api.example.com/v1/responses');
     assert.equal(p2.anthropicMessagesUrl, 'https://api.example.com/v1/messages');
 
     const p3 = deriveUpstreamEndpoints('https://api.example.com/v1/chat/completions');
@@ -465,42 +524,76 @@ describe('Agent_US 3.3 External Agents Benchmark Framework', () => {
       assert.equal(upC2.body.stream_options?.include_usage, true);
       assert.equal(upC2.headers.authorization, `Bearer ${secretKey}`);
 
-      // 5. OpenAI /v1/responses compatibility fallback (SSE with tool call translation)
+      // 5. Native OpenAI /v1/responses streaming SSE + non-streaming JSON
       const r1Res = await fetch(`${proxy.openaiBaseUrl}/responses`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer client-placeholder' },
         body: JSON.stringify({
           model: 'codex-mini-latest',
           instructions: 'Be concise.',
           input: 'Run pytest',
           stream: true,
-          trigger_tool_call: false,
         }),
       });
       assert.equal(r1Res.status, 200);
       const r1Text = await r1Res.text();
       assert.match(r1Text, /event: response\.completed/);
-      assert.match(r1Text, /OpenAI JSON response ok\./);
+      assert.match(r1Text, /Native Responses /);
+      const upR1 = upstream.recordedRequests.at(-1);
+      assert.equal(upR1.pathname, '/v1/responses');
+      assert.equal(upR1.body.model, 'deepseek-v4.1-flash');
+      assert.equal(upR1.headers.authorization, `Bearer ${secretKey}`);
 
       const metrics = proxy.getMetrics();
       // Expected totals across 5 steps:
-      // m1 (Anthropic JSON): in = 100 + 300 + 100 = 500, out = 45, cr = 300, cw = 100, elig = 500
-      // m2 (Anthropic SSE):  in = 120 + 80 + 40 = 240,  out = 35, cr = 80,  cw = 40,  elig = 240
-      // c1 (OpenAI JSON):    in = 800,                  out = 50, cr = 600, cw = 0,   elig = 800
-      // c2 (OpenAI SSE):     in = 1000,                 out = 60, cr = 750, cw = 0,   elig = 1000
-      // r1 (/responses->chat): in = 800,                out = 50, cr = 600, cw = 0,   elig = 800
+      // m1 (Anthropic JSON):     in = 500,  out = 45, cr = 300, cw = 100, elig = 500
+      // m2 (Anthropic SSE):      in = 240,  out = 35, cr = 80,  cw = 40,  elig = 240
+      // c1 (OpenAI JSON):        in = 800,  out = 50, cr = 600, cw = 0,   elig = 800
+      // c2 (OpenAI SSE):         in = 1000, out = 60, cr = 750, cw = 0,   elig = 1000
+      // r1 (Native /responses):  in = 900,  out = 70, cr = 650, cw = 0,   elig = 900
       assert.equal(metrics.steps, 5);
-      assert.equal(metrics.inputTokens, 3340);
-      assert.equal(metrics.outputTokens, 240);
-      assert.equal(metrics.totalTokens, 3580);
-      assert.equal(metrics.cacheReadTokens, 2330);
+      assert.equal(metrics.inputTokens, 3440);
+      assert.equal(metrics.outputTokens, 260);
+      assert.equal(metrics.totalTokens, 3700);
+      assert.equal(metrics.cacheReadTokens, 2380);
       assert.equal(metrics.cacheWriteTokens, 140);
-      assert.equal(metrics.cacheEligibleInputTokens, 3340);
+      assert.equal(metrics.cacheEligibleInputTokens, 3440);
       assert.equal(metrics.cacheStatus, 'available');
-      assert.equal(metrics.cacheHitRate, Number((2330 / 3340).toFixed(4)));
+      assert.equal(metrics.cacheHitRate, Number((2380 / 3440).toFixed(4)));
       assert.equal(JSON.stringify(metrics).includes(secretKey), false, 'API key must never appear in metrics');
 
-      // 6. Verify gateway omitting cache_creation_input_tokens still computes Anthropic cacheEligibleInputTokens
+      // 6. Verify 404 automatic fallback from /v1/responses -> /v1/chat/completions
+      const legacyUpstream = await startMockDualUpstreamServer({
+        targetModel: 'deepseek-v4.1-flash',
+        supportNativeResponses: false,
+      });
+      const fallbackProxy = new SweBenchMeteringProxy({
+        targetModel: 'deepseek-v4.1-flash',
+        apiKey: secretKey,
+        endpoint: legacyUpstream.baseUrl,
+      });
+      try {
+        await fallbackProxy.start();
+        const fbRes = await fetch(`${fallbackProxy.openaiBaseUrl}/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-5-codex', input: 'fallback test', stream: true }),
+        });
+        assert.equal(fbRes.status, 200);
+        const fbText = await fbRes.text();
+        assert.match(fbText, /event: response\.completed/);
+        assert.match(fbText, /OpenAI JSON response ok\./);
+        const fbMetrics = fallbackProxy.getMetrics();
+        assert.equal(fbMetrics.steps, 1);
+        assert.equal(fbMetrics.inputTokens, 800);
+        assert.equal(fbMetrics.cacheReadTokens, 600);
+        assert.equal(fbMetrics.cacheStatus, 'available');
+      } finally {
+        await fallbackProxy.stop();
+        await legacyUpstream.close();
+      }
+
+      // 7. Verify gateway omitting cache_creation_input_tokens still computes Anthropic cacheEligibleInputTokens
       proxy.resetMetrics();
       const m3Res = await fetch(`${proxy.anthropicBaseUrl}/v1/messages?omit_cache_create=1`, {
         method: 'POST',
@@ -707,19 +800,23 @@ writeFileSync(join(process.cwd(), 'pkg', 'calc.py'), 'def add_capped(a, b, cap=1
     writeFileSync(
       mockCodexBin,
       `import { readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
 if (!args.includes('exec') || !args.includes('--dangerously-bypass-approvals-and-sandbox') || !args.includes('--skip-git-repo-check')) {
   throw new Error('Unexpected codex args: ' + JSON.stringify(args));
 }
+if (!process.env.CODEX_HOME.startsWith(homedir()) || !process.env.CODEX_HOME.includes('.agent-us-codex-home-')) {
+  throw new Error('CODEX_HOME must live under homedir() rather than /tmp: ' + process.env.CODEX_HOME);
+}
 const cfgText = readFileSync(join(process.env.CODEX_HOME, 'config.toml'), 'utf8');
-if (!cfgText.includes('wire_api = "chat"') || !cfgText.includes('model = "deepseek-v4.1-flash"')) {
+if (!cfgText.includes('wire_api = "responses"') || cfgText.includes('wire_api = "chat"') || !cfgText.includes('model = "deepseek-v4.1-flash"')) {
   throw new Error('Invalid CODEX_HOME/config.toml: ' + cfgText);
 }
-const res = await fetch(process.env.OPENAI_BASE_URL + '/chat/completions', {
+const res = await fetch(process.env.OPENAI_BASE_URL + '/responses', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: 'Bearer ' + process.env.OPENAI_API_KEY },
-  body: JSON.stringify({ model: 'gpt-4o', stream: true, messages: [{ role: 'user', content: 'fix' }] }),
+  body: JSON.stringify({ model: 'gpt-4o', stream: true, input: 'fix' }),
 });
 if (!res.ok) throw new Error('Proxy returned ' + res.status + ': ' + await res.text());
 await res.text();
@@ -820,6 +917,92 @@ writeFileSync(join(process.cwd(), 'pkg', 'calc.py'), 'def add_capped(a, b, cap=1
     assert.equal(fbRes.status, 'completed');
     assert.equal(warnedFallback, true);
     assert.match(readFileSync(join(fallbackRepo, 'pkg', 'calc.py'), 'utf8'), /min\(cap, a \+ b\)/);
+
+    // Also verify runMiniSweAgentCommand & mini_swe_agent loop catch sandbox policy blocks cleanly (exitCode 126) without throwing
+    const fakeBlockedSandbox = {
+      containerId: 'cid-mini-recover',
+      dockerBin: 'docker',
+      exec: async (cmd) => {
+        if (/git checkout/.test(cmd)) {
+          throw new Error(`Blocked unauthorized or anti-cheat SWE-bench command: ${cmd}`);
+        }
+        return { exitCode: 0, stdout: 'M pkg/calc.py\n', stderr: '' };
+      },
+    };
+    const blockedCmdRes = await runMiniSweAgentCommand({
+      command: 'git checkout main',
+      workspaceRoot: fallbackRepo,
+      sessionSandbox: fakeBlockedSandbox,
+      shimBinDir: tmpRoot,
+    });
+    assert.equal(blockedCmdRes.exitCode, 126);
+    assert.match(blockedCmdRes.output, /Blocked unauthorized or anti-cheat/);
+
+    let recoverTurn = 0;
+    const recoverServer = createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      recoverTurn += 1;
+      if (recoverTurn === 1) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'rec_1',
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'git checkout main' }) } }],
+            },
+          }],
+          usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 0 } },
+        }));
+        return;
+      }
+      if (recoverTurn === 2) {
+        const lastToolMsg = body.messages.at(-1)?.content ?? '';
+        assert.match(lastToolMsg, /returncode: 126/);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'rec_2',
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: [{ id: 'c2', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'cd /testbed && git status --short' }) } }],
+            },
+          }],
+          usage: { prompt_tokens: 150, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 80 } },
+        }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'rec_3',
+        choices: [{ message: { role: 'assistant', content: 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\nRecovered.' } }],
+        usage: { prompt_tokens: 180, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 120 } },
+      }));
+    });
+    await new Promise((r) => recoverServer.listen(0, '127.0.0.1', r));
+    try {
+      const recPort = recoverServer.address().port;
+      const recRes = await runExternalSweBenchArm({
+        arm: 'mini_swe_agent',
+        instance: { instance_id: 'acme__rec-01', repo: 'acme/rec', base_commit: 'HEAD', problem_statement: 'Recover cleanly' },
+        workspaceRoot: fallbackRepo,
+        opts: { model: 'deepseek-v4.1-flash', maxSteps: 5, turnTimeoutMs: 30_000 },
+        liveConfig: { apiKey: secretEnvKey, endpoint: `http://127.0.0.1:${recPort}/v1`, protocol: 'openai', model: 'deepseek-v4.1-flash' },
+        sessionSandbox: fakeBlockedSandbox,
+        containerMode: true,
+        runtimeDeps: { forceBuiltinMiniSweAgent: true, env: process.env },
+      });
+      assert.equal(recRes.status, 'completed');
+      assert.equal(recRes.metrics.steps, 3);
+      assert.equal(recRes.toolCallsCount, 2);
+    } finally {
+      recoverServer.closeAllConnections?.();
+      await new Promise((r) => recoverServer.close(r));
+    }
 
     // Verify --merge-shards merges raw_full/full_aci alongside external arms
     const shardBuiltin = join(tmpRoot, 'shard-builtin');

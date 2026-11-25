@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import {
   basename,
   delimiter,
@@ -146,18 +146,47 @@ export function deriveUpstreamEndpoints(rawEndpoint) {
     // Keep lexical fallback if a non-standard URL string was supplied
   }
 
-  const openaiChatUrl =
+  const openaiBase =
     !pathname && hostname !== 'api.githubcopilot.com'
-      ? `${cleaned}/v1/chat/completions`
-      : `${cleaned}/chat/completions`;
+      ? `${cleaned}/v1`
+      : cleaned;
+  const openaiChatUrl = `${openaiBase}/chat/completions`;
+  const openaiResponsesUrl = `${openaiBase}/responses`;
 
   const anthropicBase = cleaned.replace(/\/v1$/i, '').replace(/\/+$/, '');
   const anthropicMessagesUrl = `${anthropicBase}/v1/messages`;
 
   return {
     normalizedBase: cleaned,
+    openaiBase,
     openaiChatUrl,
+    openaiResponsesUrl,
     anthropicMessagesUrl,
+  };
+}
+
+function normalizeResponsesUsage(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const input = safeCount(
+    raw.input_tokens ?? raw.prompt_tokens,
+  );
+  const output = safeCount(
+    raw.output_tokens ?? raw.completion_tokens,
+  );
+  const read = safeCount(
+    raw.input_tokens_details?.cached_tokens ??
+      raw.prompt_tokens_details?.cached_tokens ??
+      raw.prompt_cache_hit_tokens ??
+      raw.cache_read_input_tokens,
+  );
+  const write = safeCount(raw.cache_creation_input_tokens);
+  const eligible = read != null && input != null && input >= read ? input : null;
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    cacheReadTokens: read,
+    cacheWriteTokens: write,
+    cacheEligibleInputTokens: eligible,
   };
 }
 
@@ -438,7 +467,9 @@ export class SweBenchMeteringProxy {
     this.apiKey = String(apiKey ?? '').trim();
     const derived = deriveUpstreamEndpoints(endpoint);
     this.normalizedBase = derived.normalizedBase;
+    this.openaiBase = derived.openaiBase;
     this.openaiChatUrl = derived.openaiChatUrl;
+    this.openaiResponsesUrl = derived.openaiResponsesUrl;
     this.anthropicMessagesUrl = derived.anthropicMessagesUrl;
     this.customHeaders = customHeaders && typeof customHeaders === 'object' ? { ...customHeaders } : {};
     this.requestTimeoutMs = Math.max(1_000, Number(requestTimeoutMs) || 300_000);
@@ -620,7 +651,7 @@ export class SweBenchMeteringProxy {
     }
 
     if (method === 'POST' && (pathname === '/v1/responses' || pathname === '/responses')) {
-      await this.#handleOpenAiResponsesCompatibility(req, res);
+      await this.#handleOpenAiResponses(req, res);
       return;
     }
 
@@ -896,7 +927,7 @@ export class SweBenchMeteringProxy {
     });
   }
 
-  async #handleOpenAiResponsesCompatibility(req, res) {
+  async #handleOpenAiResponses(req, res) {
     const rawBody = await readRequestBodyText(req);
     let body;
     try {
@@ -908,8 +939,7 @@ export class SweBenchMeteringProxy {
     }
 
     const originalModel = body.model ?? null;
-    const wantStream = Boolean(body.stream);
-    const chatPayload = convertResponsesRequestToChatCompletions(body, this.targetModel);
+    body.model = this.targetModel;
     const headers = {
       'content-type': 'application/json',
       ...this.customHeaders,
@@ -917,6 +947,107 @@ export class SweBenchMeteringProxy {
     if (this.apiKey) {
       headers.authorization = `Bearer ${this.apiKey}`;
     }
+
+    let upstreamRes;
+    try {
+      upstreamRes = await this.fetchImpl(this.openaiResponsesUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.requestTimeoutMs),
+      });
+    } catch {
+      upstreamRes = null;
+    }
+
+    if (!upstreamRes || upstreamRes.status === 404 || upstreamRes.status === 405) {
+      if (upstreamRes) {
+        await upstreamRes.text().catch(() => {});
+      }
+      await this.#handleOpenAiResponsesChatFallback(body, originalModel, headers, res);
+      return;
+    }
+
+    const contentType = String(upstreamRes.headers.get('content-type') || '');
+    const isSse = contentType.toLowerCase().includes('text/event-stream') && upstreamRes.body;
+    const respHeaders = buildPassthroughResponseHeaders(upstreamRes.headers);
+    if (!respHeaders['content-type']) {
+      respHeaders['content-type'] = isSse ? 'text/event-stream; charset=utf-8' : 'application/json';
+    }
+    res.writeHead(upstreamRes.status, respHeaders);
+
+    if (isSse) {
+      const merged = {};
+      const decoder = new TextDecoder('utf-8');
+      let lineBuf = '';
+      const reader = upstreamRes.body.getReader();
+      const consumeSseLine = (line) => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) return;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') return;
+        try {
+          const parsed = JSON.parse(payload);
+          const rawUsage = parsed?.response?.usage ?? parsed?.usage;
+          if (rawUsage) {
+            mergeUsageSnapshot(merged, normalizeResponsesUsage(rawUsage));
+          }
+        } catch {
+          // Ignore partial/non-JSON SSE data lines
+        }
+      };
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.byteLength > 0) {
+            res.write(Buffer.from(value));
+            lineBuf += decoder.decode(value, { stream: true });
+            const lines = lineBuf.split(/\r?\n/);
+            lineBuf = lines.pop() ?? '';
+            for (const line of lines) {
+              consumeSseLine(line);
+            }
+          }
+        }
+        lineBuf += decoder.decode();
+        if (lineBuf.trim()) {
+          consumeSseLine(lineBuf);
+        }
+      } finally {
+        if (!res.writableEnded) res.end();
+      }
+      this.#recordRequestMetric({
+        path: '/v1/responses',
+        originalModel,
+        statusCode: upstreamRes.status,
+        stream: true,
+        usage: Object.keys(merged).length > 0 ? merged : null,
+      });
+      return;
+    }
+
+    const text = await upstreamRes.text();
+    res.end(text);
+    let usage = null;
+    try {
+      const parsed = JSON.parse(text);
+      usage = normalizeResponsesUsage(parsed?.usage ?? parsed?.response?.usage);
+    } catch {
+      usage = null;
+    }
+    this.#recordRequestMetric({
+      path: '/v1/responses',
+      originalModel,
+      statusCode: upstreamRes.status,
+      stream: false,
+      usage,
+    });
+  }
+
+  async #handleOpenAiResponsesChatFallback(body, originalModel, headers, res) {
+    const wantStream = Boolean(body.stream);
+    const chatPayload = convertResponsesRequestToChatCompletions(body, this.targetModel);
 
     const upstreamRes = await this.fetchImpl(this.openaiChatUrl, {
       method: 'POST',
@@ -1730,7 +1861,12 @@ async function runCodexCliArm({
   const bin = String(
     runtimeDeps.codexBin || baseEnv.SWEBENCH_CODEX_BIN || 'codex',
   ).trim();
-  const codexHome = mkdtempSync(join(tmpdir(), 'agent-us-swe-codex-home-'));
+  let codexHome;
+  try {
+    codexHome = mkdtempSync(join(homedir(), '.agent-us-codex-home-'));
+  } catch {
+    codexHome = mkdtempSync(join(tmpdir(), 'agent-us-swe-codex-home-'));
+  }
   try {
     const configToml = [
       `model = ${JSON.stringify(targetModel)}`,
@@ -1742,7 +1878,7 @@ async function runCodexCliArm({
       'name = "SWEBench"',
       `base_url = ${JSON.stringify(proxy.openaiBaseUrl)}`,
       'env_key = "OPENAI_API_KEY"',
-      'wire_api = "chat"',
+      'wire_api = "responses"',
       '',
     ].join('\n');
     writeFileSync(join(codexHome, 'config.toml'), configToml, 'utf8');
@@ -1802,14 +1938,14 @@ function extractFencedBashCommand(text) {
   return match ? match[1].trim() : null;
 }
 
-async function runMiniSweAgentCommand({
+export async function runMiniSweAgentCommand({
   command,
   workspaceRoot,
   sessionSandbox,
   shimBinDir,
-  baseEnv,
-  customTestCmd,
-  timeoutMs,
+  baseEnv = process.env,
+  customTestCmd = null,
+  timeoutMs = 120_000,
 }) {
   const cmd = String(command ?? '').trim();
   if (!cmd) {
@@ -1817,12 +1953,21 @@ async function runMiniSweAgentCommand({
   }
 
   if (sessionSandbox && typeof sessionSandbox.exec === 'function') {
-    const res = await sessionSandbox.exec(cmd, { timeoutMs });
-    const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
-    return {
-      exitCode: res.exitCode ?? 1,
-      output: truncateCommandOutputForMini(combined || `(exit ${res.exitCode ?? 1}, no output)`),
-    };
+    try {
+      const res = await sessionSandbox.exec(cmd, { timeoutMs });
+      const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+      return {
+        exitCode: res.exitCode ?? 1,
+        output: truncateCommandOutputForMini(combined || `(exit ${res.exitCode ?? 1}, no output)`),
+      };
+    } catch (err) {
+      const errMsg = redactSecrets(String(err?.message || err || 'Command blocked or failed'));
+      const isPolicyBlock = /blocked unauthorized|anti-cheat/i.test(errMsg);
+      return {
+        exitCode: isPolicyBlock ? 126 : 1,
+        output: truncateCommandOutputForMini(errMsg),
+      };
+    }
   }
 
   const analysis = analyzeCommand(cmd);
@@ -2132,17 +2277,23 @@ async function runMiniSweAgentArm({
         MSWEA_CONFIGURED: 'true',
       };
       const prompt = buildExternalSweBenchPrompt(instance, { containerMode });
-      const res = await spawnExternalCliWithTimeout({
-        bin: externalBin,
-        args: ['-m', targetModel, '-t', prompt, '-y', '--exit-immediately'],
-        cwd: workspaceRoot,
-        env: childEnv,
-        timeoutMs,
-      });
-      if (!res.timedOut && res.exitCode === 0) {
+      let res = null;
+      let launchErr = null;
+      try {
+        res = await spawnExternalCliWithTimeout({
+          bin: externalBin,
+          args: ['-m', targetModel, '-t', prompt, '-y', '--exit-immediately'],
+          cwd: workspaceRoot,
+          env: childEnv,
+          timeoutMs,
+        });
+      } catch (err) {
+        launchErr = err;
+      }
+      if (res && !res.timedOut && res.exitCode === 0 && proxy.getMetrics().steps > 0) {
         return { status: 'completed', toolCallsCount: 0, error: null };
       }
-      if (proxy.getMetrics().steps > 0) {
+      if (res && proxy.getMetrics().steps > 0) {
         return {
           status: 'failed',
           toolCallsCount: 0,
@@ -2151,8 +2302,11 @@ async function runMiniSweAgentArm({
             : `mini_swe_agent CLI exited with code ${res.exitCode}: ${(res.stderr || res.stdout).trim().slice(0, 400)}`,
         };
       }
+      const reason = launchErr
+        ? `launch error (${launchErr?.message ?? launchErr})`
+        : `exit=${res?.exitCode ?? 'unknown'}`;
       warnFn?.(
-        `[MINI-SWE-AGENT] External CLI "${externalBin}" failed before issuing any LLM step (exit=${res.exitCode}); falling back to built-in single-bash ReAct loop.`,
+        `[MINI-SWE-AGENT] External CLI "${externalBin}" did not complete an LLM step (${reason}); falling back to built-in single-bash ReAct loop.`,
       );
     } finally {
       safeRmRf(isolatedHome);

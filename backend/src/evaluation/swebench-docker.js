@@ -239,11 +239,14 @@ const CONTAINER_SAFE_COMMANDS = new Set([
   'mv',
   'rm',
   'ln',
+  'chmod',
+  'patch',
   'true',
   'false',
   'test',
   '[',
   '[[',
+  ':',
   'uname',
   'nproc',
   'date',
@@ -1253,7 +1256,23 @@ function unwrapTokens(rawTokens) {
   return rawTokens.slice(idx);
 }
 
+function isSafeGitSafeDirectoryConfigArgs(rest) {
+  if (!Array.isArray(rest) || rest.length < 3) return false;
+  if (String(rest[0] ?? '').toLowerCase() !== 'config') return false;
+  let idx = 1;
+  if (rest[idx] === '--global') idx++;
+  if (rest[idx] === '--add') idx++;
+  return (
+    idx === rest.length - 2 &&
+    rest[idx] === 'safe.directory' &&
+    rest[idx + 1] === '/testbed'
+  );
+}
+
 function isAntiCheatGitArgs(rest) {
+  if (isSafeGitSafeDirectoryConfigArgs(rest)) {
+    return false;
+  }
   let subcmd = null;
   const subArgs = [];
   for (let i = 0; i < rest.length; i++) {
@@ -1485,6 +1504,7 @@ function isSafeContainerSegment(segment) {
   }
 
   if (head === 'git') {
+    if (isSafeGitSafeDirectoryConfigArgs(rest)) return true;
     if (isAntiCheatGitArgs(rest)) return false;
     const sub = rest.find((t) => !t.startsWith('-'))?.toLowerCase();
     if (!sub) return rest.every((t) => t === '--version' || t === '-v' || t === '--help');
@@ -1726,6 +1746,12 @@ export class SweBenchDockerAdapter {
           'MPLCONFIGDIR=/tmp/mpl',
           '-e',
           'GIT_TERMINAL_PROMPT=0',
+          '-e',
+          'GIT_CONFIG_COUNT=1',
+          '-e',
+          'GIT_CONFIG_KEY_0=safe.directory',
+          '-e',
+          'GIT_CONFIG_VALUE_0=/testbed',
           this.image,
           'tail',
           '-f',
@@ -1753,6 +1779,22 @@ export class SweBenchDockerAdapter {
         }
 
         this.containerId = cid;
+        await invokeExecFile(
+          this.execFileImpl,
+          this.dockerBin,
+          [
+            'exec',
+            cid,
+            'sh',
+            '-c',
+            'git config --global --add safe.directory /testbed 2>/dev/null || true',
+          ],
+          {
+            env: buildDockerClientEnv(),
+            windowsHide: true,
+            timeout: 15_000,
+          },
+        ).catch(() => {});
         return cid;
       } finally {
         this._startPromise = null;
