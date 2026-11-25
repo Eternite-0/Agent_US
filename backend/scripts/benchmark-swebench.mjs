@@ -8,7 +8,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -42,6 +41,7 @@ import {
   isAuthorizedSweBenchCommand,
   removeDockerImage,
   resolveSweBenchDockerImage,
+  safeRmRf,
   scrubAntiCheatGitRefs,
 } from '../src/evaluation/swebench-docker.js';
 import {
@@ -68,6 +68,7 @@ export {
   resolveLiveProviderConfig,
   isThinkingOrReasoningModel,
   resolveSupervisorExecutionConfig,
+  safeRmRf,
 };
 
 export const SWEBENCH_BENCHMARK_ID = 'agent-us-swebench-verified';
@@ -592,30 +593,38 @@ async function runGitAsyncChecked(args, cwd) {
 /**
  * Removes temporary Python and pytest cache artifacts without touching `.git`.
  */
-export function cleanPythonTestCaches(workspaceRoot) {
-  const root = resolve(String(workspaceRoot));
-  const walk = (dir) => {
-    let entries;
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const ent of entries) {
-      if (ent.name === '.git' || ent.isSymbolicLink()) continue;
-      const full = join(dir, ent.name);
-      if (ent.isDirectory()) {
-        if (TEMP_CACHE_DIR_NAMES.has(ent.name)) {
-          rmSync(full, { recursive: true, force: true });
-        } else {
-          walk(full);
-        }
-      } else if (ent.isFile() && TEMP_CACHE_FILE_RE.test(ent.name)) {
-        rmSync(full, { force: true });
+export function cleanPythonTestCaches(workspaceRoot, { rmFn = safeRmRf } = {}) {
+  try {
+    const root = resolve(String(workspaceRoot));
+    const walk = (dir) => {
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
       }
-    }
-  };
-  walk(root);
+      for (const ent of entries) {
+        if (ent.name === '.git' || ent.isSymbolicLink()) continue;
+        const full = join(dir, ent.name);
+        try {
+          if (ent.isDirectory()) {
+            if (TEMP_CACHE_DIR_NAMES.has(ent.name)) {
+              rmFn(full);
+            } else {
+              walk(full);
+            }
+          } else if (ent.isFile() && TEMP_CACHE_FILE_RE.test(ent.name)) {
+            rmFn(full);
+          }
+        } catch {
+          // Best-effort cache cleanup; EACCES/EPERM must never abort diff extraction
+        }
+      }
+    };
+    walk(root);
+  } catch {
+    // Best-effort cache cleanup; never abort extractInstanceGitDiff
+  }
 }
 
 /**
@@ -1688,6 +1697,18 @@ function computeMemorySwap(memory) {
   return norm === '2g' ? '2.5g' : undefined;
 }
 
+/**
+ * Returns true ONLY for fatal startup/configuration errors that must abort the benchmark run.
+ */
+export function isFatalBenchmarkConfigError(err) {
+  if (!err) return false;
+  if (err.isFatalConfigError === true) return true;
+  const msg = String(err?.message || err || '');
+  return /Requires an enabled App Pool account|No App AccountPool database|No enabled provider accounts found|No default model found|All .* matched --exclude-accounts|Live SWE-bench execution requires|Provide --dataset|Invalid --|Missing value for|--workspace-root does not exist/i.test(
+    msg,
+  );
+}
+
 function isEnvironmentOrDockerError(err, { containerMode = false } = {}) {
   if (!err) return false;
   if (err.isEnvError === true) return true;
@@ -1794,12 +1815,12 @@ function buildEvalDockerSessionFactory(opts, runtimeDeps = {}) {
           try {
             await dockerAdapter.destroy?.();
           } finally {
-            rmSync(evalWs, { recursive: true, force: true });
+            safeRmRf(evalWs);
           }
         },
       };
     } catch (err) {
-      rmSync(evalWs, { recursive: true, force: true });
+      safeRmRf(evalWs);
       throw err;
     }
   };
@@ -1871,7 +1892,7 @@ async function commitContainerBaselineChanges(workspaceRoot, fallbackCommit) {
 /**
  * Executes a single `(instance, arm)` evaluation turn via `DirectAgentRuntime`.
  */
-async function runSweBenchInstanceArm({
+export async function runSweBenchInstanceArm({
   instance,
   arm,
   workspaceRoot,
@@ -2111,7 +2132,9 @@ async function runSweBenchInstanceArm({
     }
 
     const wallClockMs = Math.max(1, Math.round(performance.now() - started));
-    const { patch } = await extractInstanceGitDiff(workspaceRoot, effectiveBaseCommit);
+    await sessionSandbox?.repairHostWorkspacePermissions?.().catch(() => {});
+    const extractDiffFn = runtimeDeps.extractInstanceGitDiff ?? extractInstanceGitDiff;
+    const { patch } = await extractDiffFn(workspaceRoot, effectiveBaseCommit);
 
     const prediction = formatPredictionRecord({
       instanceId: instance.instance_id,
@@ -2138,7 +2161,7 @@ async function runSweBenchInstanceArm({
     } finally {
       await sessionSandbox?.destroy?.().catch(() => {});
       store.close();
-      rmSync(stateDir, { recursive: true, force: true });
+      safeRmRf(stateDir);
     }
   }
 }
@@ -2663,6 +2686,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     limit: rawOpts.limit ?? null,
     concurrency: Math.max(1, Number(rawOpts.concurrency ?? 1)),
     resume: Boolean(rawOpts.resume),
+    json: Boolean(rawOpts.json),
   };
 
   if (opts.mergeShards !== null) {
@@ -2995,6 +3019,23 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       return metricsByArm;
     };
 
+    const progressLog = runtimeDeps.log ?? (opts.json ? console.error : console.log);
+    const shardTag = opts.shard ? ` shard=${opts.shard.index}/${opts.shard.total}` : '';
+    const logSweProgress = (instanceIdx, instance, arm, t) => {
+      const cacheHit =
+        t?.cacheStatus === 'available' && t?.cacheHitRate != null
+          ? `${(t.cacheHitRate * 100).toFixed(1)}%`
+          : 'N/A';
+      progressLog(
+        `[SWE-PROGRESS]${shardTag} idx=${instanceIdx + 1}/${instances.length} instance=${instance.instance_id} arm=${arm} status=${t?.status ?? 'unknown'} steps=${t?.steps ?? 0} inTok=${t?.inputTokens ?? 0} cacheHit=${cacheHit}`,
+      );
+    };
+    const logSweEval = (instanceIdx, instance, arm, resRow) => {
+      progressLog(
+        `[SWE-EVAL]${shardTag} idx=${instanceIdx + 1}/${instances.length} instance=${instance.instance_id} arm=${arm} resolved=${Boolean(resRow?.resolved)} reason=${resRow?.reason ?? 'unknown'}`,
+      );
+    };
+
     const persistResult = (arm, { prediction = null, telemetry }) => {
       const { predPath, telePath } = filePathsByArm[arm];
       if (prediction) {
@@ -3010,7 +3051,8 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
 
     if (opts.dryRun) {
       for (const arm of opts.arms) {
-        for (const instance of instances) {
+        for (let instanceIdx = 0; instanceIdx < instances.length; instanceIdx++) {
+          const instance = instances[instanceIdx];
           if (completedByArm[arm].has(instance.instance_id)) continue;
           await resetGitWorktreeToCommit(dryRunRepoDir, instance.base_commit);
           const adapter = runtimeDeps.createAdapter
@@ -3026,6 +3068,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
             runtimeDeps,
           });
           persistResult(arm, result);
+          logSweProgress(instanceIdx, instance, arm, result.telemetry);
           await resetGitWorktreeToCommit(dryRunRepoDir, instance.base_commit);
         }
       }
@@ -3059,7 +3102,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
       const extractFn = runtimeDeps.extractTestbedFromImage ?? extractTestbedFromImage;
 
       // Outer loop over instances -> inner loop over arms + per-instance eval + immediate docker rmi cleanup
-      await runWithConcurrency(instances, opts.concurrency, async (instance) => {
+      await runWithConcurrency(instances, opts.concurrency, async (instance, instanceIdx) => {
         const pendingArms = opts.arms.filter(
           (arm) => !completedByArm[arm].has(instance.instance_id),
         );
@@ -3109,15 +3152,22 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
           }
 
           if (setupEnvError) {
+            if (isFatalBenchmarkConfigError(setupEnvError)) {
+              throw setupEnvError;
+            }
+            const warnFn = runtimeDeps.warn ?? console.error;
             for (const arm of pendingArms) {
-              persistResult(arm, {
-                telemetry: buildEnvErrorTelemetryRow({
-                  instance,
-                  arm,
-                  modelName: opts.model || providerConfig?.model || `agent-us-${arm}`,
-                  error: setupEnvError,
-                }),
+              warnFn(
+                `[INSTANCE-ERROR] instance=${instance.instance_id} arm=${arm} error=${redactSecrets(String(setupEnvError?.message || setupEnvError))}`,
+              );
+              const envErrTelemetry = buildEnvErrorTelemetryRow({
+                instance,
+                arm,
+                modelName: opts.model || providerConfig?.model || `agent-us-${arm}`,
+                error: setupEnvError,
               });
+              persistResult(arm, { telemetry: envErrTelemetry });
+              logSweProgress(instanceIdx, instance, arm, envErrTelemetry);
             }
             return;
           }
@@ -3164,23 +3214,27 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
                 );
               }
               persistResult(arm, result);
+              logSweProgress(instanceIdx, instance, arm, result.telemetry);
             } catch (err) {
-              if (isEnvironmentOrDockerError(err, { containerMode: hasContainer })) {
-                persistResult(arm, {
-                  telemetry: buildEnvErrorTelemetryRow({
-                    instance,
-                    arm,
-                    modelName: opts.model || providerConfig?.model || `agent-us-${arm}`,
-                    wallClockMs: Math.max(1, Math.round(performance.now() - armStarted)),
-                    error: err,
-                  }),
-                });
-              } else {
+              if (isFatalBenchmarkConfigError(err)) {
                 throw err;
               }
+              const warnFn = runtimeDeps.warn ?? console.error;
+              warnFn(
+                `[INSTANCE-ERROR] instance=${instance.instance_id} arm=${arm} error=${redactSecrets(String(err?.message || err))}`,
+              );
+              const envErrTelemetry = buildEnvErrorTelemetryRow({
+                instance,
+                arm,
+                modelName: opts.model || providerConfig?.model || `agent-us-${arm}`,
+                wallClockMs: Math.max(1, Math.round(performance.now() - armStarted)),
+                error: err,
+              });
+              persistResult(arm, { telemetry: envErrTelemetry });
+              logSweProgress(instanceIdx, instance, arm, envErrTelemetry);
             } finally {
               if (armWs && armWs !== seedWs) {
-                rmSync(armWs, { recursive: true, force: true });
+                safeRmRf(armWs);
               }
             }
           }
@@ -3219,11 +3273,16 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
                   );
                   writeJsonlRecords(filePathsByArm[arm].telePath, telemetryByArm[arm]);
                   writeIncrementalSummary();
+                  logSweEval(instanceIdx, instance, arm, resRow);
                 }
               } catch (evalErr) {
-                if (!isEnvironmentOrDockerError(evalErr, { containerMode: true })) {
+                if (isFatalBenchmarkConfigError(evalErr)) {
                   throw evalErr;
                 }
+                const warnFn = runtimeDeps.warn ?? console.error;
+                warnFn(
+                  `[INSTANCE-ERROR] instance=${instance.instance_id} arm=${arm} stage=evaluate error=${redactSecrets(String(evalErr?.message || evalErr))}`,
+                );
                 const errResRow = {
                   instance_id: instance.instance_id,
                   resolved: false,
@@ -3238,12 +3297,13 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
                 );
                 writeJsonlRecords(filePathsByArm[arm].telePath, telemetryByArm[arm]);
                 writeIncrementalSummary();
+                logSweEval(instanceIdx, instance, arm, errResRow);
               }
             }
           }
         } finally {
           if (seedWs) {
-            rmSync(seedWs, { recursive: true, force: true });
+            safeRmRf(seedWs);
           }
           if (opts.cleanupImages && imagesToCleanup.length > 0) {
             for (const img of imagesToCleanup) {
@@ -3313,7 +3373,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     };
   } finally {
     if (dryRunRepoDir) {
-      rmSync(dryRunRepoDir, { recursive: true, force: true });
+      safeRmRf(dryRunRepoDir);
     }
   }
 }
