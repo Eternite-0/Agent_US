@@ -1,7 +1,7 @@
-import { execFile, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, isAbsolute, join, posix as posixPath, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, parse, posix as posixPath, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { analyzeCommand, scanCommandSyntax } from '../tools/command-analyzer.js';
 import { buildStrictSandboxEnv, runHardenedGit } from '../tools/benchmark-sandbox.js';
@@ -314,6 +314,128 @@ function realpathIfExists(targetPath) {
     return stripWinExtendedPrefix(realpathSync(abs));
   } catch {
     return stripWinExtendedPrefix(abs);
+  }
+}
+
+function chmodTreeTopDown(rootPath, { chmodSyncImpl, readdirSyncImpl, lstatSyncImpl }) {
+  let rootIsSymlink = false;
+  let chmoddedRoot = false;
+  const visit = (entryPath, isRoot) => {
+    let stat = null;
+    try {
+      stat = lstatSyncImpl(entryPath);
+    } catch {
+      return;
+    }
+    if (stat?.isSymbolicLink?.()) {
+      if (isRoot) rootIsSymlink = true;
+      return;
+    }
+    try {
+      chmodSyncImpl(entryPath, 0o777);
+      if (isRoot) chmoddedRoot = true;
+    } catch {
+      // Ignore per-entry chmod errors so sibling entries still get processed.
+    }
+    if (stat?.isDirectory?.()) {
+      let entries = [];
+      try {
+        entries = readdirSyncImpl(entryPath);
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const name = typeof entry === 'string' ? entry : entry?.name;
+        if (!name) continue;
+        visit(join(entryPath, name), false);
+      }
+    }
+  };
+  visit(rootPath, true);
+  if (!rootIsSymlink && !chmoddedRoot) {
+    try {
+      chmodSyncImpl(rootPath, 0o777);
+    } catch {
+      // Ignore fallback chmod errors on root path.
+    }
+  }
+}
+
+/**
+ * Safely removes a directory or file path recursively, recovering from Linux
+ * bind-mount permission errors via top-down `chmod 0777` and optional
+ * passwordless `sudo -n rm -rf --`, never throwing on cleanup failure.
+ */
+export function safeRmRf(targetPath, opts = {}) {
+  const {
+    platform = process.platform,
+    rmSyncImpl = rmSync,
+    chmodSyncImpl = chmodSync,
+    readdirSyncImpl = readdirSync,
+    lstatSyncImpl = lstatSync,
+    execFileSyncImpl = execFileSync,
+    warn = console.warn,
+  } = opts ?? {};
+
+  if (!targetPath || !String(targetPath).trim()) {
+    return false;
+  }
+
+  let resolved = '';
+  try {
+    resolved = resolve(String(targetPath));
+    if (resolved === '/' || parse(resolved).root === resolved) {
+      warn(`[CLEANUP-WARN] Refusing to remove root path: ${resolved}`);
+      return false;
+    }
+
+    if (rmSyncImpl === rmSync && !existsSync(resolved)) {
+      return true;
+    }
+
+    try {
+      rmSyncImpl(resolved, { recursive: true, force: true, maxRetries: 2 });
+      return true;
+    } catch (err) {
+      const msg = String(err?.message || '');
+      const code = String(err?.code || '');
+      if (code === 'ENOENT') {
+        return true;
+      }
+      const isPermErr =
+        ['EACCES', 'EPERM', 'ENOTEMPTY'].includes(code) ||
+        /permission denied|EACCES|EPERM/i.test(msg);
+      if (!isPermErr) {
+        throw err;
+      }
+
+      chmodTreeTopDown(resolved, { chmodSyncImpl, readdirSyncImpl, lstatSyncImpl });
+      try {
+        rmSyncImpl(resolved, { recursive: true, force: true, maxRetries: 2 });
+        return true;
+      } catch (retryErr) {
+        if (String(retryErr?.code || '') === 'ENOENT') {
+          return true;
+        }
+        if (platform !== 'win32') {
+          execFileSyncImpl('sudo', ['-n', 'rm', '-rf', '--', resolved], {
+            stdio: 'ignore',
+            timeout: 15_000,
+          });
+          return true;
+        }
+        throw retryErr;
+      }
+    }
+  } catch (outerErr) {
+    try {
+      warn(
+        `[CLEANUP-WARN] Failed to remove temporary path ${resolved || String(targetPath)}: ${String(outerErr?.message || outerErr)}`,
+      );
+    } catch {
+      // Never throw from cleanup warnings.
+    }
+    return false;
   }
 }
 
@@ -642,7 +764,7 @@ export async function extractTestbedFromImage({
       // Windows non-Developer-Mode environments cannot materialize Linux symlinks via `docker cp`.
       // Copy all non-symlink files (including .git and uncommitted env pins), then restore tracked symlinks via `core.symlinks=false`.
       usedSymlinkFallback = true;
-      rmSync(resolvedTargetDir, { recursive: true, force: true });
+      safeRmRf(resolvedTargetDir);
       mkdirSync(resolvedTargetDir, { recursive: true });
       const hostMount = realpathIfExists(resolvedTargetDir);
       try {
@@ -669,7 +791,7 @@ export async function extractTestbedFromImage({
           },
         );
       } catch {
-        rmSync(resolvedTargetDir, { recursive: true, force: true });
+        safeRmRf(resolvedTargetDir);
         mkdirSync(resolvedTargetDir, { recursive: true });
         await invokeExecFile(
           execFileImpl,
@@ -1471,6 +1593,9 @@ export class SweBenchDockerAdapter {
     execFileImpl = null,
     customTestCmd = null,
     maxCaptureBytes = 4 * 1024 * 1024,
+    platform = null,
+    getuid = null,
+    getgid = null,
   } = {}) {
     this.image = validateNonEmptyFlagArg(image, 'Docker image');
     if (!workspaceRoot || !String(workspaceRoot).trim()) {
@@ -1497,6 +1622,9 @@ export class SweBenchDockerAdapter {
     this.execFileImpl = execFileImpl;
     this.customTestCmd = customTestCmd;
     this.maxCaptureBytes = Math.max(1024, Number(maxCaptureBytes) || 4 * 1024 * 1024);
+    this.platform = platform;
+    this.getuid = getuid;
+    this.getgid = getgid;
 
     this.isSweBenchContainer = true;
     this.containerId = null;
@@ -1770,6 +1898,43 @@ export class SweBenchDockerAdapter {
     return this.run(command, opts?.cwd ?? this.workspaceRoot, opts);
   }
 
+  async repairHostWorkspacePermissions(cidOverride = null) {
+    if ((this.platform ?? process.platform) === 'win32') return;
+    const getuidFn = this.getuid ?? process.getuid;
+    if (typeof getuidFn !== 'function') return;
+    const cid = cidOverride ?? this.containerId;
+    if (!cid) return;
+
+    try {
+      const uid = getuidFn();
+      if (!Number.isInteger(uid) || uid < 0) return;
+      const getgidFn = this.getgid ?? process.getgid;
+      const rawGid = typeof getgidFn === 'function' ? getgidFn() : uid;
+      const gid = Number.isInteger(rawGid) && rawGid >= 0 ? rawGid : uid;
+
+      await invokeExecFile(
+        this.execFileImpl,
+        this.dockerBin,
+        [
+          'exec',
+          '-u',
+          '0',
+          cid,
+          'sh',
+          '-c',
+          `chown -R ${uid}:${gid} /testbed 2>/dev/null || chmod -R a+rwX /testbed 2>/dev/null || true`,
+        ],
+        {
+          env: buildDockerClientEnv(),
+          windowsHide: true,
+          timeout: 15_000,
+        },
+      );
+    } catch {
+      // Best-effort permission repair; never fail container teardown.
+    }
+  }
+
   async destroy() {
     this._destroyed = true;
     if (this._startPromise) {
@@ -1778,6 +1943,7 @@ export class SweBenchDockerAdapter {
     const cid = this.containerId;
     this.containerId = null;
     if (!cid) return;
+    await this.repairHostWorkspacePermissions(cid).catch(() => {});
     await invokeExecFile(this.execFileImpl, this.dockerBin, ['rm', '-f', cid], {
       env: buildDockerClientEnv(),
       windowsHide: true,
