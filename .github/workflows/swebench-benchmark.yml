@@ -1,0 +1,497 @@
+name: SWE-bench Cloud Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      subset:
+        description: 'SWE-bench Verified subset to run'
+        type: choice
+        options:
+          - paper-50
+          - smoke-5
+        default: paper-50
+      model:
+        description: 'Cloud provider model ID, e.g. deepseek-chat or deepseek-v4.1-flash'
+        type: string
+        required: true
+        default: deepseek-v4.1-flash
+      arms:
+        description: 'Comma-separated arms, e.g. raw_full,full_aci or deterministic_progressive,aci_26'
+        type: string
+        required: true
+        default: raw_full,full_aci
+      protocol:
+        description: 'Upstream API protocol for SWEBENCH_PROTOCOL'
+        type: choice
+        options:
+          - openai
+          - anthropic
+        default: openai
+      shards:
+        description: 'Number of parallel GitHub Actions runners'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+          - '10'
+        default: '5'
+      max_steps:
+        description: 'Maximum agent steps per instance (1-80)'
+        type: string
+        default: '60'
+      limit:
+        description: 'Optional max instances cap for quick preflight test (e.g. 1)'
+        type: string
+        required: false
+        default: ''
+      seed_smoke5:
+        description: 'Seed already-verified smoke-5 records when model=deepseek-v4.1-flash to skip 5 finished tasks'
+        type: boolean
+        default: true
+      resume:
+        description: 'Skip instances already completed in output_subdir'
+        type: boolean
+        default: true
+      output_subdir:
+        description: 'Subfolder under backend/docs/evidence/'
+        type: string
+        default: swebench-mini50
+      commit_results:
+        description: 'Auto-commit merged results & LaTeX table back to branch'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-matrix:
+    name: Prepare Shard Matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.prep.outputs.matrix }}
+    steps:
+      - name: Verify SWEBENCH_API_KEY secret is configured
+        shell: bash
+        env:
+          SWEBENCH_API_KEY: ${{ secrets.SWEBENCH_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWEBENCH_API_KEY:-}" ]; then
+            echo "::error title=Missing SWEBENCH_API_KEY secret::Repository secret SWEBENCH_API_KEY is missing. Go to Settings -> Secrets and variables -> Actions -> New repository secret and add SWEBENCH_API_KEY (请在 GitHub 仓库 Settings -> Secrets and variables -> Actions 中新增 SWEBENCH_API_KEY Secret 后重试)。"
+            exit 1
+          fi
+
+      - name: Validate workflow inputs and build shard matrix
+        id: prep
+        shell: bash
+        env:
+          INPUT_SUBSET: ${{ inputs.subset }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_ARMS: ${{ inputs.arms }}
+          INPUT_PROTOCOL: ${{ inputs.protocol }}
+          INPUT_SHARDS: ${{ inputs.shards }}
+          INPUT_MAX_STEPS: ${{ inputs.max_steps }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_OUTPUT_SUBDIR" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$INPUT_OUTPUT_SUBDIR" == *..* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == */* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == "." ]]; then
+            echo "::error title=Invalid output_subdir::output_subdir must match ^[A-Za-z0-9._-]+$ and must not contain '..' or '/'."
+            exit 1
+          fi
+          case "$INPUT_SUBSET" in
+            paper-50|smoke-5) ;;
+            *)
+              echo "::error title=Invalid subset::Expected paper-50 or smoke-5."
+              exit 1
+              ;;
+          esac
+          case "$INPUT_PROTOCOL" in
+            openai|anthropic) ;;
+            *)
+              echo "::error title=Invalid protocol::Expected openai or anthropic."
+              exit 1
+              ;;
+          esac
+          case "$INPUT_SHARDS" in
+            1|2|3|5|10) ;;
+            *)
+              echo "::error title=Invalid shards::Expected one of 1, 2, 3, 5, 10."
+              exit 1
+              ;;
+          esac
+          if [[ ! "$INPUT_MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || [ "$INPUT_MAX_STEPS" -gt 80 ]; then
+            echo "::error title=Invalid max_steps::max_steps must be an integer between 1 and 80."
+            exit 1
+          fi
+          if [ -n "$INPUT_LIMIT" ] && [[ ! "$INPUT_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=Invalid limit::limit must be empty or a positive integer."
+            exit 1
+          fi
+          if [ -z "$INPUT_MODEL" ] || [[ "$INPUT_MODEL" =~ [[:space:]] ]]; then
+            echo "::error title=Invalid model::model must be a non-empty provider model ID without whitespace."
+            exit 1
+          fi
+          if [[ ! "$INPUT_ARMS" =~ ^[A-Za-z0-9_]+([[:space:]]*,[[:space:]]*[A-Za-z0-9_]+)*$ ]]; then
+            echo "::error title=Invalid arms::arms must be a non-empty comma-separated list of arm IDs."
+            exit 1
+          fi
+          MATRIX="["
+          for ((i = 1; i <= INPUT_SHARDS; i++)); do
+            if [ "$i" -gt 1 ]; then
+              MATRIX+=","
+            fi
+            MATRIX+="${i}"
+          done
+          MATRIX+="]"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Prepared ${INPUT_SHARDS} shard(s): ${MATRIX}"
+
+  run-shard:
+    name: Run Shard ${{ matrix.shard }}/${{ inputs.shards }}
+    needs: [prepare-matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix backend ci
+
+      - name: Seed shard output directory
+        id: seed-shard
+        shell: bash
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          INPUT_RESUME: ${{ inputs.resume }}
+          INPUT_SEED_SMOKE5: ${{ inputs.seed_smoke5 }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_ARMS: ${{ inputs.arms }}
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const shardIndex = String(process.env.SHARD_INDEX ?? '').trim();
+          const resume = String(process.env.INPUT_RESUME ?? '').trim() === 'true';
+          const seedSmoke5 = String(process.env.INPUT_SEED_SMOKE5 ?? '').trim() === 'true';
+          const model = String(process.env.INPUT_MODEL ?? '').trim();
+          const outputSubdir = String(process.env.INPUT_OUTPUT_SUBDIR ?? '').trim();
+          const arms = String(process.env.INPUT_ARMS ?? '')
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean);
+
+          if (
+            !/^[A-Za-z0-9._-]+$/.test(outputSubdir) ||
+            outputSubdir.includes('..') ||
+            outputSubdir.includes('/') ||
+            outputSubdir === '.'
+          ) {
+            throw new Error(`Invalid output_subdir: ${outputSubdir}`);
+          }
+          if (!/^[1-9]\d*$/.test(shardIndex)) {
+            throw new Error(`Invalid shard index: ${shardIndex}`);
+          }
+
+          const shardDir = process.env.SWEBENCH_SEED_TARGET_DIR || `/tmp/swebench-out/shard-${shardIndex}`;
+          const evidenceRoot = process.env.SWEBENCH_EVIDENCE_ROOT || join('backend', 'docs', 'evidence');
+          mkdirSync(shardDir, { recursive: true });
+
+          const readJsonlMap = (filePath) => {
+            const map = new Map();
+            if (!existsSync(filePath)) return map;
+            for (const line of readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                const obj = JSON.parse(trimmed);
+                const id = String(obj?.instance_id ?? '').trim();
+                if (id) map.set(id, obj);
+              } catch {
+                // Ignore truncated trailing lines
+              }
+            }
+            return map;
+          };
+
+          const writeJsonlMap = (filePath, map) => {
+            const lines = [...map.values()].map((row) => JSON.stringify(row));
+            writeFileSync(filePath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
+          };
+
+          const baselineDir = join(evidenceRoot, outputSubdir);
+          if (resume && existsSync(baselineDir)) {
+            let copied = 0;
+            for (const name of readdirSync(baselineDir)) {
+              if (name.endsWith('.jsonl')) {
+                copyFileSync(join(baselineDir, name), join(shardDir, name));
+                copied += 1;
+              }
+            }
+            console.log(`Copied ${copied} baseline .jsonl file(s) from ${baselineDir} to ${shardDir}`);
+          }
+
+          const smokeDir = join(evidenceRoot, 'swebench-smoke5');
+          if (seedSmoke5 && model === 'deepseek-v4.1-flash' && existsSync(smokeDir)) {
+            for (const arm of arms) {
+              const smokeTelePath = join(smokeDir, `telemetry.${arm}.jsonl`);
+              const smokePredPath = join(smokeDir, `predictions.${arm}.jsonl`);
+              const smokeEvalPath = join(smokeDir, `eval.${arm}.jsonl`);
+              if (!existsSync(smokeTelePath) || !existsSync(smokePredPath)) continue;
+
+              const smokeTele = readJsonlMap(smokeTelePath);
+              const smokePred = readJsonlMap(smokePredPath);
+              const smokeEval = readJsonlMap(smokeEvalPath);
+
+              const dstTelePath = join(shardDir, `telemetry.${arm}.jsonl`);
+              const dstPredPath = join(shardDir, `predictions.${arm}.jsonl`);
+              const dstEvalPath = join(shardDir, `eval.${arm}.jsonl`);
+
+              const dstTele = readJsonlMap(dstTelePath);
+              const dstPred = readJsonlMap(dstPredPath);
+              const dstEval = readJsonlMap(dstEvalPath);
+
+              const baselineIds = new Set([...dstTele.keys(), ...dstPred.keys(), ...dstEval.keys()]);
+              let seededCount = 0;
+
+              for (const [id, teleRow] of smokeTele.entries()) {
+                if (baselineIds.has(id)) continue;
+                if (!teleRow || teleRow.status === 'env_error') continue;
+                if (teleRow.model && teleRow.model !== 'deepseek-v4.1-flash') continue;
+                const predRow = smokePred.get(id);
+                if (!predRow) continue;
+
+                dstTele.set(id, teleRow);
+                dstPred.set(id, predRow);
+                const evalRow = smokeEval.get(id);
+                if (evalRow) dstEval.set(id, evalRow);
+                seededCount += 1;
+              }
+
+              if (seededCount > 0) {
+                writeJsonlMap(dstTelePath, dstTele);
+                writeJsonlMap(dstPredPath, dstPred);
+                if (dstEval.size > 0) writeJsonlMap(dstEvalPath, dstEval);
+                console.log(`Seeded ${seededCount} verified smoke-5 record(s) for arm=${arm} into ${shardDir}`);
+              }
+            }
+          }
+          EOF
+
+      - name: Run SWE-bench shard benchmark
+        shell: bash
+        env:
+          SWEBENCH_API_KEY: ${{ secrets.SWEBENCH_API_KEY }}
+          SWEBENCH_ENDPOINT: ${{ secrets.SWEBENCH_ENDPOINT }}
+          SWEBENCH_PROTOCOL: ${{ inputs.protocol }}
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          SHARD_INDEX: ${{ matrix.shard }}
+          INPUT_SUBSET: ${{ inputs.subset }}
+          INPUT_SHARDS: ${{ inputs.shards }}
+          INPUT_ARMS: ${{ inputs.arms }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_MAX_STEPS: ${{ inputs.max_steps }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            backend/scripts/benchmark-swebench.mjs
+            --dataset hf:verified-mini
+            --subset "$INPUT_SUBSET"
+            --shard "${SHARD_INDEX}/${INPUT_SHARDS}"
+            --arms "$INPUT_ARMS"
+            --model "$INPUT_MODEL"
+            --no-use-app-pool
+            --docker-preset epoch
+            --max-steps "$INPUT_MAX_STEPS"
+            --turn-timeout-ms 900000
+            --container-memory 3g
+            --concurrency 1
+            --cleanup-images
+            --resume
+            --evaluate
+            --output-dir "/tmp/swebench-out/shard-${SHARD_INDEX}"
+          )
+          if [ -n "$INPUT_LIMIT" ]; then
+            ARGS+=(--limit "$INPUT_LIMIT")
+          fi
+          node "${ARGS[@]}"
+
+      - name: Upload shard output artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swebench-shard-${{ matrix.shard }}
+          path: /tmp/swebench-out/shard-${{ matrix.shard }}
+          if-no-files-found: warn
+
+  merge-and-publish:
+    name: Merge Shards and Publish Results
+    needs: [prepare-matrix, run-shard]
+    if: always() && needs.prepare-matrix.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix backend ci
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: swebench-shard-*
+          path: /tmp/swebench-shards
+
+      - name: Merge shard outputs and export LaTeX table
+        shell: bash
+        env:
+          INPUT_ARMS: ${{ inputs.arms }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_SUBSET: ${{ inputs.subset }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_RESUME: ${{ inputs.resume }}
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_OUTPUT_SUBDIR" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$INPUT_OUTPUT_SUBDIR" == *..* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == */* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == "." ]]; then
+            echo "::error::Invalid output_subdir: ${INPUT_OUTPUT_SUBDIR}"
+            exit 1
+          fi
+          OUT_DIR="backend/docs/evidence/${INPUT_OUTPUT_SUBDIR}"
+          SHARD_DIRS=()
+          if [ "$INPUT_RESUME" = "true" ] && [ -d "$OUT_DIR" ]; then
+            SHARD_DIRS+=("$OUT_DIR")
+          fi
+          if [ -d /tmp/swebench-shards ]; then
+            while IFS= read -r -d '' dir; do
+              SHARD_DIRS+=("$dir")
+            done < <(find /tmp/swebench-shards -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+          fi
+          if [ "${#SHARD_DIRS[@]}" -eq 0 ]; then
+            echo "::error::No shard directories or baseline directory found to merge"
+            exit 1
+          fi
+          MERGE_SHARDS_ARG="$(IFS=,; echo "${SHARD_DIRS[*]}")"
+          ARGS=(
+            backend/scripts/benchmark-swebench.mjs
+            --dataset hf:verified-mini
+            --merge-shards "$MERGE_SHARDS_ARG"
+            --arms "$INPUT_ARMS"
+            --model "$INPUT_MODEL"
+            --subset "$INPUT_SUBSET"
+            --output-dir "$OUT_DIR"
+            --export-latex
+          )
+          if [ -n "$INPUT_LIMIT" ]; then
+            ARGS+=(--limit "$INPUT_LIMIT")
+          fi
+          node "${ARGS[@]}"
+
+      - name: Append summary.md to GitHub Step Summary
+        if: always()
+        shell: bash
+        env:
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_OUTPUT_SUBDIR" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$INPUT_OUTPUT_SUBDIR" == *..* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == */* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == "." ]]; then
+            echo "::error::Invalid output_subdir: ${INPUT_OUTPUT_SUBDIR}"
+            exit 1
+          fi
+          SUMMARY_FILE="backend/docs/evidence/${INPUT_OUTPUT_SUBDIR}/summary.md"
+          if [ -f "$SUMMARY_FILE" ]; then
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary.md produced at ${SUMMARY_FILE}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload merged results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swebench-merged-${{ inputs.output_subdir }}
+          path: backend/docs/evidence/${{ inputs.output_subdir }}
+          if-no-files-found: warn
+
+      - name: Commit and push merged results
+        if: inputs.commit_results == true
+        shell: bash
+        env:
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+          INPUT_SUBSET: ${{ inputs.subset }}
+          INPUT_MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_OUTPUT_SUBDIR" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$INPUT_OUTPUT_SUBDIR" == *..* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == */* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == "." ]]; then
+            echo "::error::Invalid output_subdir: ${INPUT_OUTPUT_SUBDIR}"
+            exit 1
+          fi
+          OUT_DIR="backend/docs/evidence/${INPUT_OUTPUT_SUBDIR}"
+          if [ ! -d "$OUT_DIR" ]; then
+            echo "Output directory ${OUT_DIR} does not exist; skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$OUT_DIR"
+          if git diff --cached --quiet; then
+            echo "No changes in ${OUT_DIR}; skipping commit."
+            exit 0
+          fi
+          git commit -m "docs(eval): update SWE-bench ${INPUT_SUBSET} results (${INPUT_MODEL})"
+          for attempt in 1 2 3; do
+            if git pull --rebase && git push; then
+              exit 0
+            fi
+            echo "Push attempt ${attempt}/3 failed; retrying..." >&2
+            sleep 3
+          done
+          echo "::error::Failed to push merged SWE-bench results after 3 attempts"
+          exit 1
