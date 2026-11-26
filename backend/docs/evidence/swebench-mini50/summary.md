@@ -6,14 +6,14 @@
 - **Max Steps**: 60
 - **Arms**: raw_full, full_aci, claude_code, mini_swe_agent
 - **Resumed**: false
-- **Updated At**: 2026-11-26T07:34:53.518Z
+- **Updated At**: 2026-11-26T07:53:31.976Z
 
 ## Per-Arm Metrics
 
 | Arm | Instances | Resolved Rate (%) | Tokens / Resolved | Paired Resolved Token Reduction | Total Input Tokens | Total Output Tokens | Real Provider Cache Hit Rate | Steps (Mean) | Wall-Clock Time (ms) | Non-Empty Patch Rate | ACI Admission Token Reduction Rate | DTOC Epoch Transitions | Supervisor Cost |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `raw_full` | 29/50 | 69.44% (25/36) | 1294252 | 0.00% (n=25) | 31530356 | 825956 | 97.22% (30647552/31524876, n=36) | 992 (19.84) | 12222898 | 70.00% (35/50) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
-| `full_aci` | 27/50 | 73.53% (25/34) | 1130210 | -35.03% (n=24) | 27632360 | 622879 | 96.56% (26682368/27632360, n=34) | 962 (19.24) | 12266157 | 68.00% (34/50) | 21.29% (130818/614517) | 1 | 0 calls / 0 tok / 0 ms |
+| `raw_full` | 29/50 | 69.44% (25/36) | 1294252 | 0.00% (n=25) | 31530356 | 825956 | 97.22% (30647552/31524876, n=36) | 992 (19.84) | 8263225 | 70.00% (35/50) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
+| `full_aci` | 27/50 | 73.53% (25/34) | 1130210 | -35.03% (n=24) | 27632360 | 622879 | 96.56% (26682368/27632360, n=34) | 962 (19.24) | 8028454 | 68.00% (34/50) | 21.29% (130818/614517) | 1 | 0 calls / 0 tok / 0 ms |
 | `claude_code` | 49/50 | 72.00% (36/50) | 1458418 | 13.77% (n=24) | 51894596 | 608438 | 96.08% (49861248/51894596, n=50) | 1470 (29.4) | 9773978 | 100.00% (50/50) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
 | `mini_swe_agent` | 28/50 | 58.00% (29/50) | 1112834 | 12.76% (n=24) | 30500859 | 1771334 | 96.05% (29297024/30500859, n=47) | 1907 (38.14) | 15109708 | 80.00% (40/50) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
 
@@ -48,29 +48,29 @@
 | `raw_full` | `django__django-12325` | completed | yes | 60 | 2426854 | 39226 | 98.61% | 507266 | yes | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-8721` | completed | no | 16 | 259659 | 5271 | 94.89% | 67081 | yes | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-8548` | failed | no | 60 | 3280356 | 41841 | 98.33% | 379621 | yes | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-8035` | env_error | - | 1 | 0 | 0 | N/A | 285010 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-8035` | env_error | - | 1 | 0 | 0 | N/A | 3228 | no | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-8269` | completed | no | 28 | 543925 | 10076 | 96.34% | 118468 | yes | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-7748` | completed | no | 60 | 3725580 | 54230 | 98.41% | 464587 | yes | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-9320` | env_error | - | 1 | 0 | 0 | N/A | 287893 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-9320` | env_error | - | 1 | 0 | 0 | N/A | 3023 | no | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-7985` | completed | no | 55 | 4164557 | 76028 | 96.21% | 877698 | yes | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-10673` | env_error | - | 1 | 0 | 0 | N/A | 285326 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-10673` | env_error | - | 1 | 0 | 0 | N/A | 3516 | no | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-8475` | completed | no | 15 | 217079 | 6573 | 90.50% | 82467 | yes | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-7590` | failed | no | 18 | 371576 | 23879 | 95.66% | 451153 | yes | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-9367` | env_error | - | 1 | 0 | 0 | N/A | 291058 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-9367` | env_error | - | 1 | 0 | 0 | N/A | 3480 | no | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-10466` | cancelled | yes | 52 | 1362370 | 130581 | 97.13% | 903417 | yes | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-8265` | env_error | - | 1 | 0 | 0 | N/A | 285233 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-8265` | env_error | - | 1 | 0 | 0 | N/A | 3492 | no | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-7757` | completed | yes | 19 | 272005 | 4347 | 94.68% | 76290 | yes | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-9281` | env_error | - | 1 | 0 | 0 | N/A | 286801 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-9281` | env_error | - | 1 | 0 | 0 | N/A | 2992 | no | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-9229` | completed | no | 60 | 3238660 | 61116 | 98.42% | 485845 | yes | 0.00% | 0 |
 | `raw_full` | `sphinx-doc__sphinx-8551` | cancelled | no | 35 | 847382 | 119671 | 94.71% | 903673 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-9698` | env_error | - | 1 | 0 | 0 | N/A | 284632 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-11510` | env_error | - | 1 | 0 | 0 | N/A | 282842 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-8056` | env_error | - | 1 | 0 | 0 | N/A | 286069 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-9230` | env_error | - | 1 | 0 | 0 | N/A | 284103 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-8638` | env_error | - | 1 | 0 | 0 | N/A | 288279 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-10323` | env_error | - | 1 | 0 | 0 | N/A | 289464 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-9461` | env_error | - | 1 | 0 | 0 | N/A | 284655 | no | 0.00% | 0 |
-| `raw_full` | `sphinx-doc__sphinx-10435` | env_error | - | 1 | 0 | 0 | N/A | 289086 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-9698` | env_error | - | 1 | 0 | 0 | N/A | 3244 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-11510` | env_error | - | 1 | 0 | 0 | N/A | 4201 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-8056` | env_error | - | 1 | 0 | 0 | N/A | 2895 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-9230` | env_error | - | 1 | 0 | 0 | N/A | 2999 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-8638` | env_error | - | 1 | 0 | 0 | N/A | 3483 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-10323` | env_error | - | 1 | 0 | 0 | N/A | 3296 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-9461` | env_error | - | 1 | 0 | 0 | N/A | 7562 | no | 0.00% | 0 |
+| `raw_full` | `sphinx-doc__sphinx-10435` | env_error | - | 1 | 0 | 0 | N/A | 3367 | no | 0.00% | 0 |
 | `full_aci` | `django__django-12209` | completed | yes | 35 | 898412 | 15992 | 97.37% | 173474 | yes | 6.38% | 0 |
 | `full_aci` | `django__django-12155` | completed | yes | 14 | 207466 | 8450 | 95.32% | 83247 | yes | 21.94% | 0 |
 | `full_aci` | `django__django-12050` | completed | yes | 11 | 88626 | 2791 | 95.90% | 43965 | yes | 0.00% | 0 |
@@ -98,29 +98,29 @@
 | `full_aci` | `django__django-12325` | completed | yes | 30 | 652742 | 13057 | 94.44% | 323015 | yes | 10.28% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-8721` | failed | no | 30 | 692093 | 9413 | 95.51% | 126360 | yes | 36.19% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-8548` | completed | no | 55 | 2848570 | 35916 | 96.39% | 358626 | yes | 29.68% | 1 |
-| `full_aci` | `sphinx-doc__sphinx-8035` | env_error | - | 1 | 0 | 0 | N/A | 288585 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-8035` | env_error | - | 1 | 0 | 0 | N/A | 2809 | no | 0.00% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-8269` | completed | no | 27 | 447640 | 7396 | 96.39% | 101665 | yes | 16.98% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-7748` | completed | no | 45 | 1816777 | 35791 | 98.07% | 290240 | yes | 19.72% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-9320` | completed | yes | 13 | 173163 | 3910 | 93.43% | 339119 | yes | 17.77% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-7985` | cancelled | no | 35 | 1512482 | 53960 | 94.50% | 902578 | yes | 37.21% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-10673` | env_error | - | 1 | 0 | 0 | N/A | 286271 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-10673` | env_error | - | 1 | 0 | 0 | N/A | 3072 | no | 0.00% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-8475` | completed | no | 38 | 815638 | 18836 | 95.48% | 233124 | yes | 40.24% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-7590` | env_error | - | 1 | 0 | 0 | N/A | 282914 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-9367` | env_error | - | 1 | 0 | 0 | N/A | 287097 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-10466` | env_error | - | 1 | 0 | 0 | N/A | 286841 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-8265` | env_error | - | 1 | 0 | 0 | N/A | 285847 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-7590` | env_error | - | 1 | 0 | 0 | N/A | 3626 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-9367` | env_error | - | 1 | 0 | 0 | N/A | 2826 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-10466` | env_error | - | 1 | 0 | 0 | N/A | 3589 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-8265` | env_error | - | 1 | 0 | 0 | N/A | 2775 | no | 0.00% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-7757` | completed | yes | 55 | 1378459 | 25198 | 96.91% | 356691 | yes | 39.68% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-9281` | env_error | - | 1 | 0 | 0 | N/A | 286694 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-9281` | env_error | - | 1 | 0 | 0 | N/A | 2840 | no | 0.00% | 0 |
 | `full_aci` | `sphinx-doc__sphinx-9229` | failed | no | 53 | 1590909 | 109175 | 96.79% | 868288 | yes | 4.98% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-8551` | env_error | - | 1 | 0 | 0 | N/A | 284646 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-9698` | env_error | - | 1 | 0 | 0 | N/A | 286703 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-11510` | env_error | - | 1 | 0 | 0 | N/A | 284354 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-8056` | env_error | - | 1 | 0 | 0 | N/A | 285402 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-9230` | env_error | - | 1 | 0 | 0 | N/A | 284765 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-8638` | env_error | - | 1 | 0 | 0 | N/A | 282307 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-10323` | env_error | - | 1 | 0 | 0 | N/A | 290852 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-9461` | env_error | - | 1 | 0 | 0 | N/A | 3686 | no | 0.00% | 0 |
-| `full_aci` | `sphinx-doc__sphinx-10435` | env_error | - | 1 | 0 | 0 | N/A | 281550 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-8551` | env_error | - | 1 | 0 | 0 | N/A | 2451 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-9698` | env_error | - | 1 | 0 | 0 | N/A | 2914 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-11510` | env_error | - | 1 | 0 | 0 | N/A | 3457 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-8056` | env_error | - | 1 | 0 | 0 | N/A | 2766 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-9230` | env_error | - | 1 | 0 | 0 | N/A | 4552 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-8638` | env_error | - | 1 | 0 | 0 | N/A | 2446 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-10323` | env_error | - | 1 | 0 | 0 | N/A | 3261 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-9461` | env_error | - | 1 | 0 | 0 | N/A | 3498 | no | 0.00% | 0 |
+| `full_aci` | `sphinx-doc__sphinx-10435` | env_error | - | 1 | 0 | 0 | N/A | 3929 | no | 0.00% | 0 |
 | `claude_code` | `django__django-12209` | completed | yes | 25 | 553628 | 7964 | 95.58% | 108742 | yes | 0.00% | 0 |
 | `claude_code` | `django__django-12155` | completed | yes | 24 | 542047 | 11839 | 93.84% | 208199 | yes | 0.00% | 0 |
 | `claude_code` | `django__django-12050` | completed | yes | 14 | 232669 | 3350 | 92.37% | 57301 | yes | 0.00% | 0 |
