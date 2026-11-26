@@ -1540,6 +1540,7 @@ export class AgentLoop {
           stepResult = await this.inferenceEngine.streamStep({
             ...requestOptions,
             pool,
+            trafficSource,
             onRouteFailover: ({ attempt, statusCode, fromAccountId, toAccountId, reason }) => {
               this.eventRouter.emitPersisted({
                 sessionId,

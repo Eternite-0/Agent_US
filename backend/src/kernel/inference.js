@@ -7,11 +7,23 @@ import { CancellationError, classifyError, InferenceError } from './errors.js';
  * finish reason detection, and safe transient retries (only prior to partial emission).
  */
 export class InferenceEngine {
-  constructor(adapter, { maxRetries = 3, retryDelayMs = 200, pool = null } = {}) {
+  constructor(
+    adapter,
+    {
+      maxRetries = 3,
+      retryDelayMs = 200,
+      pool = null,
+      trafficSource = null,
+      benchmarkRetryBaseMs = 3000,
+    } = {},
+  ) {
     this.adapter = adapter;
     this.pool = pool ?? adapter?.pool ?? null;
     this.maxRetries = Math.max(0, Number(maxRetries ?? 3));
     this.retryDelayMs = Math.max(25, Number(retryDelayMs ?? 200));
+    this.trafficSource = trafficSource ? String(trafficSource).trim().toLowerCase() : null;
+    const parsedBenchBase = Number(benchmarkRetryBaseMs ?? 3000);
+    this.benchmarkRetryBaseMs = Math.max(1, Number.isFinite(parsedBenchBase) ? parsedBenchBase : 3000);
   }
 
   async streamStep({
@@ -25,17 +37,24 @@ export class InferenceEngine {
     signal,
     pool = null,
     excludeAccountIds = null,
+    trafficSource = null,
+    benchmarkRetryBaseMs = null,
     onTextDelta = null,
     onReasoningDelta = null,
     onRetryBudget = null,
     onRouteFailover = null,
   }) {
     const activePool = pool ?? this.pool ?? this.adapter?.pool ?? null;
-    const excludedAccounts = new Set(
+    const initialExcludedAccounts = new Set(
       excludeAccountIds
         ? [...excludeAccountIds].filter(Boolean).map(String)
         : [],
     );
+    const excludedAccounts = new Set(initialExcludedAccounts);
+    const effectiveTrafficSource = String(trafficSource ?? this.trafficSource ?? '')
+      .trim()
+      .toLowerCase();
+    const isBenchmarkMode = effectiveTrafficSource === 'benchmark';
     let attempt = 0;
     let activeMaxTokens = maxTokens;
     for (;;) {
@@ -155,6 +174,20 @@ export class InferenceEngine {
             if (tid) excludedAccounts.add(String(tid));
           }
         }
+        const rawHttpStatus = Number(
+          err?.detail?.statusCode ??
+            err?.cause?.status ??
+            err?.cause?.statusCode ??
+            err?.status ??
+            err?.statusCode ??
+            0,
+        );
+        const isPermanentClientOrAuthError =
+          rawHttpStatus === 400 ||
+          rawHttpStatus === 401 ||
+          rawHttpStatus === 403 ||
+          rawHttpStatus === 404 ||
+          rawHttpStatus === 422;
         const poolAlreadyExhausted =
           err?.code === 'PROVIDER_UNAVAILABLE' &&
           err?.detail?.exhausted === true &&
@@ -165,21 +198,54 @@ export class InferenceEngine {
             sessionKey,
             excludeAccountIds: excludedAccounts.size ? [...excludedAccounts] : null,
           }).length === 0;
+        const initialExcludesList = initialExcludedAccounts.size
+          ? [...initialExcludedAccounts]
+          : null;
+        let hasTransientPoolRoutes = false;
+        if (isBenchmarkMode && !isPermanentClientOrAuthError && activePool) {
+          if (typeof activePool.hasTransientCooldownRoutes === 'function') {
+            hasTransientPoolRoutes = activePool.hasTransientCooldownRoutes(model, {
+              provider: resolvedProvider,
+              excludeAccountIds: initialExcludesList,
+            });
+          } else if (typeof activePool.resolveRoutes === 'function') {
+            hasTransientPoolRoutes =
+              activePool.resolveRoutes(model, {
+                provider: resolvedProvider,
+                sessionKey,
+                excludeAccountIds: initialExcludesList,
+              }).length > 0 &&
+              Array.isArray(err?.detail?.triedAccountIds) &&
+              err.detail.triedAccountIds.length > 0;
+          }
+        }
+        const canBypassPoolExhaustion =
+          isBenchmarkMode &&
+          poolAlreadyExhausted &&
+          !isPermanentClientOrAuthError &&
+          hasTransientPoolRoutes;
+        const effectiveMaxRetries =
+          isBenchmarkMode && !isPermanentClientOrAuthError
+            ? Math.max(this.maxRetries, 5)
+            : this.maxRetries;
         if (
           !emittedAnything &&
-          !poolAlreadyExhausted &&
+          (!poolAlreadyExhausted || canBypassPoolExhaustion) &&
           classified.retryable &&
-          attempt < this.maxRetries
+          !(isBenchmarkMode && isPermanentClientOrAuthError) &&
+          attempt < effectiveMaxRetries
         ) {
           attempt++;
-          const rawStatus = Number(
-            err?.status ??
-              err?.statusCode ??
-              err?.cause?.status ??
-              err?.cause?.statusCode ??
-              err?.detail?.statusCode ??
-              0,
-          );
+          const rawStatus = isBenchmarkMode
+            ? rawHttpStatus
+            : Number(
+                err?.status ??
+                  err?.statusCode ??
+                  err?.cause?.status ??
+                  err?.cause?.statusCode ??
+                  err?.detail?.statusCode ??
+                  0,
+              );
           const statusCode =
             rawStatus ||
             (/\b(429|500|502|503|504)\b/.exec(String(err?.message ?? ''))
@@ -231,9 +297,42 @@ export class InferenceEngine {
           const hasDifferentStandby = Boolean(
             toAccountId && fromAccountId && toAccountId !== fromAccountId,
           );
-          const backoffMs = hasDifferentStandby
-            ? Math.min(25, this.retryDelayMs)
-            : this.retryDelayMs * attempt;
+          const hasPostFailureTransientRoutes =
+            hasTransientPoolRoutes ||
+            canBypassPoolExhaustion ||
+            (isBenchmarkMode &&
+              nextCandidateRoutes.length === 0 &&
+              typeof activePool?.hasTransientCooldownRoutes === 'function' &&
+              activePool.hasTransientCooldownRoutes(model, {
+                provider: resolvedProvider,
+                excludeAccountIds: initialExcludesList,
+              }));
+          const cyclingSingleOrExhaustedPool =
+            isBenchmarkMode &&
+            nextCandidateRoutes.length === 0 &&
+            hasPostFailureTransientRoutes;
+          let backoffMs;
+          if (hasDifferentStandby) {
+            backoffMs = Math.min(25, this.retryDelayMs);
+          } else if (isBenchmarkMode) {
+            const parsedStepBase = Number(
+              benchmarkRetryBaseMs ?? this.benchmarkRetryBaseMs ?? 3000,
+            );
+            const baseMs = Math.max(
+              1,
+              Number.isFinite(parsedStepBase) ? parsedStepBase : 3000,
+            );
+            const expMs = Math.min(45_000, baseMs * Math.pow(2, attempt - 1));
+            const jitterMs =
+              baseMs >= 100
+                ? Math.floor(
+                    Math.random() * Math.min(1000, Math.max(1, Math.floor(expMs * 0.2))),
+                  )
+                : 0;
+            backoffMs = Math.min(45_000, expMs + jitterMs);
+          } else {
+            backoffMs = this.retryDelayMs * attempt;
+          }
           try {
             await delay(backoffMs, undefined, { signal });
           } catch (delayErr) {
@@ -257,6 +356,18 @@ export class InferenceEngine {
             };
             cancelled.abortedBeforeProvider = true;
             throw cancelled;
+          }
+          if (cyclingSingleOrExhaustedPool) {
+            const transientIds = [...excludedAccounts].filter(
+              (id) => !initialExcludedAccounts.has(id),
+            );
+            excludedAccounts.clear();
+            for (const id of initialExcludedAccounts) {
+              excludedAccounts.add(id);
+            }
+            activePool?.clearTransientCooldowns?.(
+              transientIds.length ? transientIds : null,
+            );
           }
           continue;
         }

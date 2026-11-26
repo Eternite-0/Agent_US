@@ -2656,6 +2656,43 @@ export class AccountPool {
     });
   }
 
+  hasTransientCooldownRoutes(model, { provider = null, excludeAccountIds = null } = {}) {
+    const routes = this.resolveRoutes(model, { provider, excludeAccountIds });
+    const now = Date.now();
+    return routes.some(
+      (r) => r.source === 'pool' && (r.status === 'cooldown' || Number(r.cooldownUntil || 0) > now),
+    );
+  }
+
+  clearTransientCooldowns(accountIds = null) {
+    const rawIds =
+      typeof accountIds === 'string'
+        ? [accountIds]
+        : accountIds
+          ? [...accountIds]
+          : [];
+    const ids = rawIds
+      .filter((id) => typeof id === 'string' && id.trim().length > 0 && !id.startsWith('legacy:'))
+      .map((id) => id.trim());
+    const now = Date.now();
+    this.store.tx(() => {
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => '?').join(',');
+        this.store.db
+          .prepare(
+            `UPDATE provider_accounts SET cooldownUntil = 0, status = 'healthy', updatedAt = ? WHERE enabled = 1 AND status != 'unhealthy' AND (status = 'cooldown' OR cooldownUntil > 0) AND id IN (${placeholders})`,
+          )
+          .run(now, ...ids);
+      } else {
+        this.store.db
+          .prepare(
+            `UPDATE provider_accounts SET cooldownUntil = 0, status = 'healthy', updatedAt = ? WHERE enabled = 1 AND status != 'unhealthy' AND (status = 'cooldown' OR cooldownUntil > 0)`,
+          )
+          .run(now);
+      }
+    });
+  }
+
   async testModel({ model, accountId = null, preset = null }) {
     return withTraceContext({ trafficSource: 'probe', isSynthetic: true, model }, async () => {
       const started = Date.now();
