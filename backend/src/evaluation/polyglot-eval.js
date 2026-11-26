@@ -742,9 +742,86 @@ function copyExerciseEntryFiltered(srcDir, dstDir, relPrefix, hiddenSet) {
   }
 }
 
+function sha256Buffer(buf) {
+  return createHash('sha256').update(buf).digest('hex');
+}
+
+function pathEntryExists(p) {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shouldUnlockTestFile(relPath, language, testFileSet = null) {
+  const norm = toPosixRelPath(relPath);
+  if (!norm) return false;
+  const lang = String(language ?? '').trim().toLowerCase();
+  const inTestSet = Boolean(testFileSet?.has(norm));
+  const isTest = inTestSet || isTestPathForLanguage(norm, lang);
+  if (!isTest) return false;
+  if (lang === 'java') {
+    return /\.java$/i.test(norm);
+  }
+  if (lang === 'javascript') {
+    return (
+      /\.(?:spec|test)\.(?:js|mjs|cjs|ts)$/i.test(norm) ||
+      (inTestSet && /\.(?:js|mjs|cjs|ts)$/i.test(norm))
+    );
+  }
+  return false;
+}
+
+/**
+ * Unlocks disabled Exercism/Aider Polyglot test cases so both agent self-testing
+ * and final grading execute the full test suite:
+ * - Java: strips `@Disabled` / `@Disabled("...")` annotations while preserving imports
+ * - JavaScript: replaces `xtest(` with `test(`
+ */
+export function unlockPolyglotTestContent(content, language) {
+  const text = String(content ?? '');
+  const lang = String(language ?? '').trim().toLowerCase();
+  if (lang === 'java') {
+    return text.replace(/@Disabled\b(?:\([^)]*\))?\s*\r?\n?/g, '');
+  }
+  if (lang === 'javascript') {
+    return text.replace(/\bxtest\s*\(/g, 'test(');
+  }
+  return text;
+}
+
+function unlockWorkspaceTestFiles(exercise, workspaceRoot) {
+  const lang = String(exercise?.language ?? '').trim().toLowerCase();
+  if (lang !== 'java' && lang !== 'javascript') return [];
+  const absWs = resolve(String(workspaceRoot));
+  const solutionSet = new Set(dedupeStrings(exercise?.solutionFiles ?? []));
+  const testFileSet = new Set(dedupeStrings(exercise?.testFiles ?? []));
+  const candidates = dedupeStrings([
+    ...testFileSet,
+    ...walkRelativeFiles(absWs),
+  ]);
+  const unlockedFiles = [];
+  for (const rel of candidates) {
+    if (solutionSet.has(rel)) continue;
+    if (!shouldUnlockTestFile(rel, lang, testFileSet)) continue;
+    const fullPath = join(absWs, rel);
+    if (!isFileSync(fullPath)) continue;
+    const original = readFileSync(fullPath, 'utf8');
+    const unlocked = unlockPolyglotTestContent(original, lang);
+    if (unlocked !== original) {
+      writeFileSync(fullPath, unlocked, 'utf8');
+      unlockedFiles.push(rel);
+    }
+  }
+  return unlockedFiles;
+}
+
 /**
  * Creates an isolated per-task workspace directory copied from the pristine benchmark snapshot,
- * strictly omitting `.meta/` and reference example/exemplar solutions so the agent cannot cheat.
+ * strictly omitting `.meta/` and reference example/exemplar solutions so the agent cannot cheat,
+ * unlocking Exercism disabled Java/JS tests, and symlinking shared JS dependencies when configured.
  */
 export function preparePolyglotWorkspace(
   exercise,
@@ -759,25 +836,50 @@ export function preparePolyglotWorkspace(
   const hiddenSet = new Set(dedupeStrings(exercise.hiddenFiles ?? []));
 
   copyExerciseEntryFiltered(exercise.exerciseDir, workspaceRoot, '', hiddenSet);
+  const unlockedTestFiles = unlockWorkspaceTestFiles(exercise, workspaceRoot);
 
   let linkedNodeModules = null;
-  if (exercise.language === 'javascript' && !existsSync(join(workspaceRoot, 'node_modules'))) {
-    const candidates = [
-      sharedJsNodeModulesDir ? resolve(String(sharedJsNodeModulesDir)) : null,
-      exercise.languageRootDir ? join(exercise.languageRootDir, 'node_modules') : null,
-      exercise.languageRootDir ? join(dirname(exercise.languageRootDir), 'node_modules') : null,
-    ].filter(Boolean);
-    for (const cand of candidates) {
-      if (isDirSync(cand)) {
+  let linkedPackageLock = null;
+  if (exercise.language === 'javascript') {
+    const wsNodeModules = join(workspaceRoot, 'node_modules');
+    const wsPackageLock = join(workspaceRoot, 'package-lock.json');
+    if (!pathEntryExists(wsNodeModules)) {
+      const rawCandidates = [
+        join(exercise.exerciseDir, 'node_modules'),
+        sharedJsNodeModulesDir ? resolve(String(sharedJsNodeModulesDir)) : null,
+        exercise.languageRootDir ? join(exercise.languageRootDir, 'node_modules') : null,
+        exercise.languageRootDir ? join(dirname(exercise.languageRootDir), 'node_modules') : null,
+      ].filter(Boolean);
+      for (const rawCand of rawCandidates) {
+        const cand =
+          basename(rawCand).toLowerCase() !== 'node_modules' && isDirSync(join(rawCand, 'node_modules'))
+            ? join(rawCand, 'node_modules')
+            : rawCand;
+        if (!isDirSync(cand)) continue;
         try {
           symlinkSync(
             cand,
-            join(workspaceRoot, 'node_modules'),
+            wsNodeModules,
             process.platform === 'win32' ? 'junction' : 'dir',
           );
           linkedNodeModules = cand;
         } catch {
+          // Clean fallback: resolvePolyglotGradePlan still exposes `cand` via NODE_PATH / PATH.
           linkedNodeModules = cand;
+        }
+        const srcPackageLock = join(dirname(cand), 'package-lock.json');
+        if (isFileSync(srcPackageLock) && !pathEntryExists(wsPackageLock)) {
+          try {
+            symlinkSync(srcPackageLock, wsPackageLock, 'file');
+            linkedPackageLock = srcPackageLock;
+          } catch {
+            try {
+              copyFileSync(srcPackageLock, wsPackageLock);
+              linkedPackageLock = srcPackageLock;
+            } catch {
+              // Best-effort lockfile fallback
+            }
+          }
         }
         break;
       }
@@ -788,6 +890,8 @@ export function preparePolyglotWorkspace(
     workspaceRoot,
     pristineSnapshotDir: exercise.exerciseDir,
     linkedNodeModules,
+    linkedPackageLock,
+    unlockedTestFiles,
     cleanup: () => safeRmDir(workspaceRoot),
   };
 }
@@ -795,7 +899,8 @@ export function preparePolyglotWorkspace(
 /**
  * Anti-cheating test integrity guard: forcefully restores ALL original exercise test files
  * and read-only harness/config files from the clean pristine benchmark snapshot into
- * `workspaceRoot` BEFORE running grading tests, and deletes any rogue test files or `.meta/`.
+ * `workspaceRoot` BEFORE running grading tests (re-applying official Java/JS test unlocking),
+ * preserves shared `node_modules` symlinks, and deletes any rogue test files or `.meta/`.
  */
 export function restoreProtectedTestFiles(exercise, workspaceRoot) {
   if (!exercise?.exerciseDir || !isDirSync(exercise.exerciseDir)) {
@@ -820,20 +925,43 @@ export function restoreProtectedTestFiles(exercise, workspaceRoot) {
     ),
   ]).filter((rel) => !solutionSet.has(rel) && pristineSet.has(rel));
 
+  const testFileSet = new Set(
+    dedupeStrings([
+      ...(exercise.testFiles ?? []),
+      ...protectedList.filter((rel) => isTestPathForLanguage(rel, exercise.language)),
+    ]),
+  );
+
   const restoredFiles = [];
   const tamperedFiles = [];
+  const unlockedTestFiles = [];
 
   for (const rel of protectedList) {
     const srcPath = join(absPristine, rel);
     const dstPath = join(absWs, rel);
     if (!isFileSync(srcPath)) continue;
 
+    const unlockNeeded = shouldUnlockTestFile(rel, exercise.language, testFileSet);
+    let expectedUnlockedBuf = null;
+    if (unlockNeeded) {
+      const rawText = readFileSync(srcPath, 'utf8');
+      const unlockedText = unlockPolyglotTestContent(rawText, exercise.language);
+      expectedUnlockedBuf = Buffer.from(unlockedText, 'utf8');
+      if (unlockedText !== rawText) {
+        unlockedTestFiles.push(rel);
+      }
+    }
+
     let modifiedOrMissing = false;
-    if (!isFileSync(dstPath)) {
+    const dstIsSymlink = pathEntryExists(dstPath) && lstatSync(dstPath).isSymbolicLink();
+    if (dstIsSymlink || !isFileSync(dstPath)) {
       modifiedOrMissing = true;
     } else {
       try {
-        if (sha256File(srcPath) !== sha256File(dstPath)) {
+        const expectedHash = expectedUnlockedBuf
+          ? sha256Buffer(expectedUnlockedBuf)
+          : sha256File(srcPath);
+        if (expectedHash !== sha256File(dstPath)) {
           modifiedOrMissing = true;
         }
       } catch {
@@ -842,7 +970,14 @@ export function restoreProtectedTestFiles(exercise, workspaceRoot) {
     }
 
     mkdirSync(dirname(dstPath), { recursive: true });
-    copyFileSync(srcPath, dstPath);
+    if (dstIsSymlink) {
+      rmSync(dstPath, { force: true });
+    }
+    if (expectedUnlockedBuf) {
+      writeFileSync(dstPath, expectedUnlockedBuf);
+    } else {
+      copyFileSync(srcPath, dstPath);
+    }
     try {
       chmodSync(dstPath, statSync(srcPath).mode);
     } catch {
@@ -881,6 +1016,7 @@ export function restoreProtectedTestFiles(exercise, workspaceRoot) {
     restoredFiles,
     tamperedFiles,
     removedRogueTestFiles,
+    unlockedTestFiles,
     integrityViolation: tamperedFiles.length > 0 || removedRogueTestFiles.length > 0,
   };
 }
@@ -1797,8 +1933,46 @@ export function createPolyglotDryRunFixture({
       );
       writeExFile(
         exDir,
+        'settings.gradle',
+        `rootProject.name = '${slug}'\n`,
+      );
+      writeExFile(
+        exDir,
         'build.gradle',
-        "plugins { id 'java' }\nrepositories { mavenCentral() }\ntest { useJUnitPlatform() }\n",
+        [
+          'def wsDir = project.projectDir',
+          "tasks.register('test') {",
+          '    doLast {',
+          "        def outDir = new File(wsDir, 'build/classes')",
+          '        outDir.mkdirs()',
+          "        def javaHome = new File(System.getProperty('java.home'))",
+          "        def isWin = System.getProperty('os.name').toLowerCase().contains('win')",
+          '        def findTool = { String name ->',
+          '            def exe = isWin ? "${name}.exe" : name',
+          '            def c1 = new File(javaHome, "bin/${exe}")',
+          '            if (c1.exists()) return c1.absolutePath',
+          '            def c2 = javaHome.parentFile ? new File(javaHome.parentFile, "bin/${exe}") : null',
+          '            if (c2 && c2.exists()) return c2.absolutePath',
+          '            return name',
+          '        }',
+          '        def runCmd = { List<String> cmd, String label ->',
+          '            def proc = new ProcessBuilder(cmd)',
+          '                .directory(wsDir)',
+          '                .redirectErrorStream(true)',
+          '                .start()',
+          "            def out = proc.inputStream.getText('UTF-8')",
+          '            def code = proc.waitFor()',
+          '            if (out) println(out)',
+          '            if (code != 0) {',
+          '                throw new org.gradle.api.GradleException("${label} failed with exit code ${code}")',
+          '            }',
+          '        }',
+          "        runCmd([findTool('javac'), '-d', outDir.absolutePath, 'src/main/java/Adder.java', 'src/test/java/AdderTest.java'], 'javac')",
+          "        runCmd([findTool('java'), '-cp', outDir.absolutePath, 'AdderTest'], 'AdderTest')",
+          '    }',
+          '}',
+          '',
+        ].join('\n'),
       );
       writeExFile(
         exDir,
@@ -1808,7 +1982,18 @@ export function createPolyglotDryRunFixture({
       writeExFile(
         exDir,
         'src/test/java/AdderTest.java',
-        'public class AdderTest {\n    public void testAdd() {\n        if (Adder.add(2, 3) != 5) throw new AssertionError("expected 5");\n    }\n}\n',
+        [
+          'public class AdderTest {',
+          '    public void testAdd() {',
+          '        if (Adder.add(2, 3) != 5) throw new AssertionError("expected 5");',
+          '    }',
+          '',
+          '    public static void main(String[] args) {',
+          '        new AdderTest().testAdd();',
+          '    }',
+          '}',
+          '',
+        ].join('\n'),
       );
     }
 
@@ -2022,14 +2207,16 @@ export function createDryRunMeteringFetch({ exercise, workspaceRoot, mode = 'ful
       const bugFix = detectBugFixInText(solText);
 
       if (isBashOnly) {
+        const nodeCmd = `${JSON.stringify(process.execPath)} --input-type=commonjs`;
         if (!hasToolId('poly-dry-inspect')) {
+          const inspectJs = `console.log(require('fs').readFileSync(${JSON.stringify(primarySolution)},'utf8'))`;
           return {
             toolCalls: [
               {
                 id: 'poly-dry-inspect',
                 name: 'bash',
                 arguments: {
-                  command: `node -e "console.log(require('fs').readFileSync(${JSON.stringify(primarySolution)},'utf8'))"`,
+                  command: `${nodeCmd} -e ${JSON.stringify(inspectJs)}`,
                 },
               },
             ],
@@ -2043,7 +2230,7 @@ export function createDryRunMeteringFetch({ exercise, workspaceRoot, mode = 'ful
               {
                 id: 'poly-dry-edit',
                 name: 'bash',
-                arguments: { command: `node -e ${JSON.stringify(patchJs)}` },
+                arguments: { command: `${nodeCmd} -e ${JSON.stringify(patchJs)}` },
               },
             ],
             finalText: '',

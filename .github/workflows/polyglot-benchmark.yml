@@ -187,10 +187,12 @@ jobs:
               export PATH="${HOME}/.local/bin:${PATH}"
             fi
           fi
-          # Install cmake / build-essential only if absent on ubuntu-latest
+          # Ensure C++ toolchain & official Aider Polyglot libraries (cmake, g++, Boost, TBB)
           MISSING_APT=()
           command -v cmake >/dev/null 2>&1 || MISSING_APT+=(cmake)
           command -v g++ >/dev/null 2>&1 || MISSING_APT+=(g++)
+          dpkg-query -W -f='${Status}' libboost-all-dev 2>/dev/null | grep -q "install ok installed" || MISSING_APT+=(libboost-all-dev)
+          dpkg-query -W -f='${Status}' libtbb-dev 2>/dev/null | grep -q "install ok installed" || MISSING_APT+=(libtbb-dev)
           if [ "${#MISSING_APT[@]}" -gt 0 ]; then
             sudo apt-get update -qq
             sudo apt-get install -y --no-install-recommends "${MISSING_APT[@]}"
@@ -241,9 +243,11 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --single-branch https://github.com/Aider-AI/polyglot-benchmark.git /tmp/polyglot-benchmark
-          if [ -f /tmp/polyglot-benchmark/javascript/package.json ]; then
-            npm --prefix /tmp/polyglot-benchmark/javascript install --no-audit --no-fund
-          fi
+          mkdir -p /tmp/polyglot-npm-install
+          (
+            cd /tmp/polyglot-npm-install
+            npm init -y && npm install --no-audit --no-fund jest @babel/core@7.25.2 @exercism/babel-preset-javascript@0.2.1 @exercism/eslint-config-javascript@0.6.0 @types/jest@29.5.12 @types/node@20.12.12 babel-jest@29.6.4 core-js@3.37.1 eslint@8.49.0
+          )
 
       - name: Run Polyglot shard benchmark
         shell: bash
@@ -273,6 +277,7 @@ jobs:
             --shard-index "$SHARD_INDEX"
             --shard-count "$INPUT_SHARDS"
             --benchmark-dir /tmp/polyglot-benchmark
+            --shared-js-node-modules /tmp/polyglot-npm-install/node_modules
             --max-steps "$INPUT_MAX_STEPS"
             --no-use-app-pool
             --output "/tmp/polyglot-out/shard-${SHARD_INDEX}.json"

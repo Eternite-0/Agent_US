@@ -36,6 +36,7 @@ function printPolyglotUsage() {
       '  --shard-count <n>                   Total number of shards (default: 1)',
       '  --shard <i/n>                       Optional 1-based shard alias (e.g. 1/3 -> index 0, count 3)',
       '  --benchmark-dir <dir>               Pre-cloned Aider-AI/polyglot-benchmark directory',
+      '  --shared-js-node-modules <dir>      Shared JS node_modules directory to symlink into JS exercise workspaces',
       '  --output <path>                     Output JSON file or directory (writes JSON + Markdown)',
       `  --max-steps <n>                     Max agent steps per exercise (default: ${DEFAULT_POLYGLOT_MAX_STEPS}, max: ${MAX_POLYGLOT_STEPS})`,
       '  --turn-timeout-ms <ms>              Per-exercise agent timeout in ms',
@@ -77,6 +78,7 @@ export function parsePolyglotCliArgs(argv = process.argv.slice(2)) {
     shardIndex: 0,
     shardCount: 1,
     benchmarkDir: null,
+    sharedJsNodeModulesDir: null,
     output: null,
     maxSteps: DEFAULT_POLYGLOT_MAX_STEPS,
     turnTimeoutMs: null,
@@ -153,6 +155,8 @@ export function parsePolyglotCliArgs(argv = process.argv.slice(2)) {
       opts.shardCount = total;
     } else if (arg === '--benchmark-dir') opts.benchmarkDir = String(nextVal()).trim();
     else if (arg.startsWith('--benchmark-dir=')) opts.benchmarkDir = splitEq('--benchmark-dir').trim();
+    else if (arg === '--shared-js-node-modules') opts.sharedJsNodeModulesDir = String(nextVal()).trim() || null;
+    else if (arg.startsWith('--shared-js-node-modules=')) opts.sharedJsNodeModulesDir = splitEq('--shared-js-node-modules').trim() || null;
     else if (arg === '--output') opts.output = String(nextVal()).trim();
     else if (arg.startsWith('--output=')) opts.output = splitEq('--output').trim();
     else if (arg === '--max-steps') opts.maxSteps = Number(nextVal());

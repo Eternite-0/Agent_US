@@ -1,5 +1,15 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -8,6 +18,7 @@ import {
   POLYGLOT_LANGUAGES,
   POLYGLOT_MODES,
   aggregatePolyglotResults,
+  createDryRunMeteringFetch,
   createPolyglotDryRunFixture,
   ensurePolyglotBenchmarkRepo,
   gradePolyglotWorkspace,
@@ -19,6 +30,7 @@ import {
   runPolyglotExerciseMode,
   selectPolyglotSubset,
   slicePolyglotShard,
+  unlockPolyglotTestContent,
 } from '../../src/evaluation/polyglot-eval.js';
 import {
   parsePolyglotCliArgs,
@@ -432,6 +444,367 @@ describe('Aider Polyglot 6-language benchmark evaluation', () => {
     } finally {
       fixture.cleanup();
       rmSync(outRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('unlocks Java @Disabled(...) and JS xtest( in both preparePolyglotWorkspace and restoreProtectedTestFiles', async () => {
+    const root = makeTempDir('polyglot-unlock-');
+    try {
+      // 1. Java exercise with both bare @Disabled and @Disabled("Remove to run test")
+      const javaExDir = join(root, 'java', 'exercises', 'practice', 'two-fer');
+      mkdirSync(join(javaExDir, '.meta'), { recursive: true });
+      mkdirSync(join(javaExDir, 'src', 'main', 'java'), { recursive: true });
+      mkdirSync(join(javaExDir, 'src', 'test', 'java'), { recursive: true });
+      writeFileSync(
+        join(javaExDir, '.meta', 'config.json'),
+        JSON.stringify({
+          title: 'Two Fer',
+          files: {
+            solution: ['src/main/java/Twofer.java'],
+            test: ['src/test/java/TwoferTest.java'],
+          },
+        }),
+        'utf8',
+      );
+      writeFileSync(
+        join(javaExDir, 'src', 'main', 'java', 'Twofer.java'),
+        'public class Twofer { public String twofer(String name) { return name == null ? "One for you, one for me." : "One for " + name + ", one for me."; } }\n',
+        'utf8',
+      );
+      const rawJavaTest = [
+        'import org.junit.jupiter.api.Disabled;',
+        'import org.junit.jupiter.api.Test;',
+        '',
+        'public class TwoferTest {',
+        '    @Test',
+        '    public void noNameGiven() {}',
+        '',
+        '    @Disabled("Remove to run test")',
+        '    @Test',
+        '    public void aNameGiven() {}',
+        '',
+        '    @Disabled',
+        '    @Test',
+        '    public void anotherNameGiven() {}',
+        '}',
+        '',
+      ].join('\n');
+      writeFileSync(join(javaExDir, 'src', 'test', 'java', 'TwoferTest.java'), rawJavaTest, 'utf8');
+
+      // 2. JS exercise with xtest( in both .spec.js and .test.js
+      const jsExDir = join(root, 'javascript', 'exercises', 'practice', 'adder-xtest');
+      mkdirSync(join(jsExDir, '.meta'), { recursive: true });
+      writeFileSync(
+        join(jsExDir, '.meta', 'config.json'),
+        JSON.stringify({
+          title: 'Adder XTest',
+          files: {
+            solution: ['adder.js'],
+            test: ['adder.spec.js', 'extra.test.js'],
+          },
+        }),
+        'utf8',
+      );
+      writeFileSync(
+        join(jsExDir, 'package.json'),
+        JSON.stringify({
+          name: 'adder-xtest',
+          type: 'module',
+          scripts: { test: 'node --test adder.spec.js extra.test.js' },
+        }),
+        'utf8',
+      );
+      writeFileSync(
+        join(jsExDir, 'adder.js'),
+        'export function add(a, b) {\n  return a === 2 && b === 3 ? 5 : a - b;\n}\n',
+        'utf8',
+      );
+      writeFileSync(
+        join(jsExDir, 'adder.spec.js'),
+        [
+          "import test from 'node:test';",
+          "import assert from 'node:assert/strict';",
+          "import { add } from './adder.js';",
+          '',
+          "test('first case enabled', () => {",
+          '  assert.equal(add(2, 3), 5);',
+          '});',
+          '',
+          "xtest('second case initially disabled', () => {",
+          '  assert.equal(add(10, 25), 35);',
+          '});',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+      writeFileSync(
+        join(jsExDir, 'extra.test.js'),
+        [
+          "import test from 'node:test';",
+          "import assert from 'node:assert/strict';",
+          "import { add } from './adder.js';",
+          '',
+          "xtest ('spaced xtest case', () => {",
+          '  assert.equal(add(-4, 9), 5);',
+          '});',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+
+      // Pure helper sanity checks
+      const unlockedJavaDirect = unlockPolyglotTestContent(rawJavaTest, 'java');
+      assert.equal(/@Disabled/.test(unlockedJavaDirect), false);
+      assert.ok(unlockedJavaDirect.includes('import org.junit.jupiter.api.Disabled;'));
+      assert.ok(unlockedJavaDirect.includes('public void aNameGiven()'));
+      assert.ok(unlockedJavaDirect.includes('public void anotherNameGiven()'));
+
+      const javaEx = loadPolyglotExercises(root, { languages: ['java'] })[0];
+      const javaWs = preparePolyglotWorkspace(javaEx);
+      try {
+        const javaTestWsPath = join(javaWs.workspaceRoot, 'src', 'test', 'java', 'TwoferTest.java');
+        const preparedJava = readFileSync(javaTestWsPath, 'utf8');
+        assert.equal(/@Disabled/.test(preparedJava), false, 'preparePolyglotWorkspace must strip @Disabled and @Disabled(...)');
+        assert.ok(preparedJava.includes('import org.junit.jupiter.api.Disabled;'));
+        assert.equal((preparedJava.match(/@Test/g) ?? []).length, 3);
+
+        // Untouched unlocked workspace should NOT trigger false integrity violation
+        const cleanRestore = restoreProtectedTestFiles(javaEx, javaWs.workspaceRoot);
+        assert.equal(cleanRestore.integrityViolation, false);
+        assert.equal(/@Disabled/.test(readFileSync(javaTestWsPath, 'utf8')), false);
+
+        // Simulate agent tampering (re-disabling tests) -> restoreProtectedTestFiles catches tamper and re-unlocks
+        writeFileSync(javaTestWsPath, rawJavaTest, 'utf8');
+        const tamperedRestore = restoreProtectedTestFiles(javaEx, javaWs.workspaceRoot);
+        assert.equal(tamperedRestore.integrityViolation, true);
+        assert.ok(tamperedRestore.tamperedFiles.includes('src/test/java/TwoferTest.java'));
+        const afterRestoreJava = readFileSync(javaTestWsPath, 'utf8');
+        assert.equal(/@Disabled/.test(afterRestoreJava), false, 'restoreProtectedTestFiles must unlock @Disabled annotations');
+        assert.ok(afterRestoreJava.includes('import org.junit.jupiter.api.Disabled;'));
+      } finally {
+        javaWs.cleanup();
+      }
+
+      const jsEx = loadPolyglotExercises(root, { languages: ['javascript'] })[0];
+      const jsWs = preparePolyglotWorkspace(jsEx);
+      try {
+        const specPath = join(jsWs.workspaceRoot, 'adder.spec.js');
+        const extraPath = join(jsWs.workspaceRoot, 'extra.test.js');
+        const preparedSpec = readFileSync(specPath, 'utf8');
+        const preparedExtra = readFileSync(extraPath, 'utf8');
+        assert.equal(/\bxtest\s*\(/.test(preparedSpec), false, 'preparePolyglotWorkspace must unlock xtest( in .spec.js');
+        assert.equal(/\bxtest\s*\(/.test(preparedExtra), false, 'preparePolyglotWorkspace must unlock xtest( in .test.js');
+        assert.equal((preparedSpec.match(/\btest\(/g) ?? []).length, 2);
+        assert.equal((preparedExtra.match(/\btest\(/g) ?? []).length, 1);
+
+        // Partial starter passes only the 1st test -> unlocked xtest( MUST cause real native grading to FAIL!
+        const failGrade = await gradePolyglotWorkspace(jsEx, jsWs.workspaceRoot);
+        assert.equal(failGrade.passed, false);
+        assert.equal(failGrade.gradeMode, 'native');
+        assert.equal(failGrade.integrity.integrityViolation, false);
+
+        // Tamper test back to xtest( -> restoreProtectedTestFiles must catch it and re-unlock
+        writeFileSync(specPath, readFileSync(join(jsExDir, 'adder.spec.js'), 'utf8'), 'utf8');
+        const tamperedJsRestore = restoreProtectedTestFiles(jsEx, jsWs.workspaceRoot);
+        assert.equal(tamperedJsRestore.integrityViolation, true);
+        assert.ok(tamperedJsRestore.tamperedFiles.includes('adder.spec.js'));
+        assert.equal(/\bxtest\s*\(/.test(readFileSync(specPath, 'utf8')), false);
+
+        // Fix solution -> all unlocked tests pass!
+        writeFileSync(
+          join(jsWs.workspaceRoot, 'adder.js'),
+          'export function add(a, b) {\n  return a + b;\n}\n',
+          'utf8',
+        );
+        const passGrade = await gradePolyglotWorkspace(jsEx, jsWs.workspaceRoot);
+        assert.equal(passGrade.passed, true);
+        assert.equal(passGrade.gradeMode, 'native');
+        assert.equal(passGrade.integrity.integrityViolation, false);
+      } finally {
+        jsWs.cleanup();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('symlinks shared JS node_modules and package-lock.json cleanly, preserves them across restore, and parses --shared-js-node-modules', () => {
+    const fixture = createPolyglotDryRunFixture({ exercisesPerLanguage: 1 });
+    const sharedRoot = makeTempDir('polyglot-shared-js-');
+    const sharedNm = join(sharedRoot, 'node_modules');
+    const sharedPkgDir = join(sharedNm, 'fake-exercism-dep');
+    const sharedLock = join(sharedRoot, 'package-lock.json');
+    try {
+      mkdirSync(sharedPkgDir, { recursive: true });
+      writeFileSync(join(sharedPkgDir, 'index.js'), 'export const marker = "shared-ok";\n', 'utf8');
+      const lockContent = JSON.stringify({ name: 'polyglot-npm-install', lockfileVersion: 3 }, null, 2);
+      writeFileSync(sharedLock, lockContent, 'utf8');
+
+      const jsEx = loadPolyglotExercises(fixture.benchmarkDir, { languages: ['javascript'] })[0];
+      const ws = preparePolyglotWorkspace(jsEx, { sharedJsNodeModulesDir: sharedNm });
+      try {
+        const wsNm = join(ws.workspaceRoot, 'node_modules');
+        const wsLock = join(ws.workspaceRoot, 'package-lock.json');
+
+        assert.equal(ws.linkedNodeModules, sharedNm);
+        assert.equal(existsSync(wsNm), true);
+        assert.equal(lstatSync(wsNm).isSymbolicLink(), true, 'workspace node_modules should be a symlink/junction');
+        assert.equal(realpathSync(wsNm), realpathSync(sharedNm));
+        assert.equal(existsSync(join(wsNm, 'fake-exercism-dep', 'index.js')), true);
+
+        assert.equal(existsSync(wsLock), true, 'package-lock.json from shared parent dir should be linked/present');
+        assert.equal(readFileSync(wsLock, 'utf8'), lockContent);
+        if (lstatSync(wsLock).isSymbolicLink()) {
+          assert.equal(realpathSync(wsLock), realpathSync(sharedLock));
+        }
+
+        // restoreProtectedTestFiles must NOT break the symlink or flag false integrity violations
+        const integrity = restoreProtectedTestFiles(jsEx, ws.workspaceRoot);
+        assert.equal(integrity.integrityViolation, false);
+        assert.equal(lstatSync(wsNm).isSymbolicLink(), true, 'restoreProtectedTestFiles must preserve node_modules symlink');
+        assert.equal(realpathSync(wsNm), realpathSync(sharedNm));
+        assert.equal(existsSync(wsLock), true);
+      } finally {
+        ws.cleanup();
+      }
+
+      // Workspace cleanup must NOT delete contents of the shared node_modules directory
+      assert.equal(existsSync(join(sharedPkgDir, 'index.js')), true);
+      assert.equal(existsSync(sharedLock), true);
+
+      // Existing exercise package-lock.json must be preserved over shared parent lockfile
+      const customLock = JSON.stringify({ name: 'exercise-owned-lock', lockfileVersion: 3 });
+      writeFileSync(join(jsEx.exerciseDir, 'package-lock.json'), customLock, 'utf8');
+      const jsExWithLock = loadPolyglotExercises(fixture.benchmarkDir, { languages: ['javascript'] })[0];
+      const ws2 = preparePolyglotWorkspace(jsExWithLock, { sharedJsNodeModulesDir: sharedNm });
+      try {
+        assert.equal(readFileSync(join(ws2.workspaceRoot, 'package-lock.json'), 'utf8'), customLock);
+        assert.equal(lstatSync(join(ws2.workspaceRoot, 'package-lock.json')).isSymbolicLink(), false);
+      } finally {
+        ws2.cleanup();
+      }
+
+      // CLI parsing for --shared-js-node-modules (both space-separated and =)
+      const cliA = parsePolyglotCliArgs(['--shared-js-node-modules', '/tmp/polyglot-npm-install/node_modules']);
+      assert.equal(cliA.sharedJsNodeModulesDir, '/tmp/polyglot-npm-install/node_modules');
+      const cliB = parsePolyglotCliArgs(['--shared-js-node-modules=/tmp/polyglot-npm-install/node_modules']);
+      assert.equal(cliB.sharedJsNodeModulesDir, '/tmp/polyglot-npm-install/node_modules');
+    } finally {
+      fixture.cleanup();
+      rmSync(sharedRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('uses process.execPath --input-type=commonjs in dry-run bash mode and provides self-contained pure-JDK adder-java-01', async () => {
+    const fixture = createPolyglotDryRunFixture({ exercisesPerLanguage: 1 });
+    try {
+      // 1. Verify createDryRunMeteringFetch isBashOnly emits process.execPath + --input-type=commonjs
+      const jsEx = loadPolyglotExercises(fixture.benchmarkDir, { languages: ['javascript'] })[0];
+      const jsWs = preparePolyglotWorkspace(jsEx);
+      try {
+        const dryFetch = createDryRunMeteringFetch({
+          exercise: jsEx,
+          workspaceRoot: jsWs.workspaceRoot,
+          mode: 'mini_swe_agent',
+        });
+        const bashTools = [
+          { type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+        ];
+        const expectedPrefix = `${JSON.stringify(process.execPath)} --input-type=commonjs -e `;
+
+        const res1 = await dryFetch('https://dry.invalid/v1/chat/completions', {
+          method: 'POST',
+          body: JSON.stringify({ model: POLYGLOT_DEFAULT_MODEL, messages: [{ role: 'user', content: 'solve' }], tools: bashTools }),
+        });
+        const j1 = await res1.json();
+        const inspectCmd = JSON.parse(j1.choices[0].message.tool_calls[0].function.arguments).command;
+        assert.ok(inspectCmd.startsWith(expectedPrefix), `inspect command must use process.execPath --input-type=commonjs, got: ${inspectCmd}`);
+
+        const res2 = await dryFetch('https://dry.invalid/v1/chat/completions', {
+          method: 'POST',
+          body: JSON.stringify({
+            model: POLYGLOT_DEFAULT_MODEL,
+            messages: [
+              { role: 'user', content: 'solve' },
+              { role: 'tool', tool_call_id: 'poly-dry-inspect', content: 'ok' },
+            ],
+            tools: bashTools,
+          }),
+        });
+        const j2 = await res2.json();
+        const editCmd = JSON.parse(j2.choices[0].message.tool_calls[0].function.arguments).command;
+        assert.ok(editCmd.startsWith(expectedPrefix), `edit command must use process.execPath --input-type=commonjs, got: ${editCmd}`);
+      } finally {
+        jsWs.cleanup();
+      }
+
+      // 2. Verify adder-java-01 fixture uses pure-JDK self-contained Gradle task (no Maven Central / JUnit downloads)
+      const javaEx = loadPolyglotExercises(fixture.benchmarkDir, { languages: ['java'] })[0];
+      const buildGradle = readFileSync(join(javaEx.exerciseDir, 'build.gradle'), 'utf8');
+      assert.ok(buildGradle.includes("tasks.register('test')"));
+      assert.equal(buildGradle.includes('mavenCentral()'), false);
+      assert.equal(buildGradle.includes('useJUnitPlatform()'), false);
+      assert.equal(existsSync(join(javaEx.exerciseDir, 'settings.gradle')), true);
+
+      const javaWs = preparePolyglotWorkspace(javaEx);
+      try {
+        // Honest dry-run fallback when gradle binary is missing
+        const missingRunner = async () => ({ exitCode: 127, notFound: true, timedOut: false, stdout: '', stderr: 'not found' });
+        const failFallback = await gradePolyglotWorkspace(javaEx, javaWs.workspaceRoot, {
+          dryRunFallbackOnMissingToolchain: true,
+          commandRunner: missingRunner,
+        });
+        assert.equal(failFallback.passed, false);
+        assert.equal(failFallback.gradeMode, 'dry_run_toolchain_fallback');
+
+        // Verify javac + java compile & execute AdderTest honestly if JDK is installed on host
+        const javacCheck = spawnSync('javac', ['-version'], { encoding: 'utf8' });
+        const classesDir = join(javaWs.workspaceRoot, 'build', 'classes');
+        if (javacCheck.status === 0) {
+          mkdirSync(classesDir, { recursive: true });
+          const c1 = spawnSync('javac', ['-d', classesDir, 'src/main/java/Adder.java', 'src/test/java/AdderTest.java'], {
+            cwd: javaWs.workspaceRoot,
+            encoding: 'utf8',
+          });
+          assert.equal(c1.status, 0, `javac failed: ${c1.stderr}`);
+          const r1 = spawnSync('java', ['-cp', classesDir, 'AdderTest'], {
+            cwd: javaWs.workspaceRoot,
+            encoding: 'utf8',
+          });
+          assert.notEqual(r1.status, 0, 'buggy Adder.java must fail AdderTest');
+        }
+
+        // Apply real fix
+        writeFileSync(
+          join(javaWs.workspaceRoot, 'src', 'main', 'java', 'Adder.java'),
+          'public class Adder {\n    public static int add(int a, int b) {\n        return a + b;\n    }\n}\n',
+          'utf8',
+        );
+
+        const passFallback = await gradePolyglotWorkspace(javaEx, javaWs.workspaceRoot, {
+          dryRunFallbackOnMissingToolchain: true,
+          commandRunner: missingRunner,
+        });
+        assert.equal(passFallback.passed, true);
+        assert.equal(passFallback.gradeMode, 'dry_run_toolchain_fallback');
+
+        if (javacCheck.status === 0) {
+          const c2 = spawnSync('javac', ['-d', classesDir, 'src/main/java/Adder.java', 'src/test/java/AdderTest.java'], {
+            cwd: javaWs.workspaceRoot,
+            encoding: 'utf8',
+          });
+          assert.equal(c2.status, 0, `javac failed: ${c2.stderr}`);
+          const r2 = spawnSync('java', ['-cp', classesDir, 'AdderTest'], {
+            cwd: javaWs.workspaceRoot,
+            encoding: 'utf8',
+          });
+          assert.equal(r2.status, 0, `fixed Adder.java must pass AdderTest: ${r2.stderr}`);
+        }
+      } finally {
+        javaWs.cleanup();
+      }
+    } finally {
+      fixture.cleanup();
     }
   });
 });

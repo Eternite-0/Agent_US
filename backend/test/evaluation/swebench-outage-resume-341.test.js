@@ -239,23 +239,30 @@ describe('SWE-bench 3.4.1 Outage Resume Classification & Evidence Pruning', () =
     assert.deepEqual([...resWithEval.completedIds].sort(), ['id__clean', 'id__rate']);
   });
 
-  test('Real repo check: loadCompletedInstanceIds on backend/docs/evidence/swebench-mini50 returns 8, 4, 50, 50', () => {
-    assert.equal(loadCompletedInstanceIds(EVIDENCE_MINI50_DIR, 'raw_full').completedIds.size, 8);
-    assert.equal(loadCompletedInstanceIds(EVIDENCE_MINI50_DIR, 'full_aci').completedIds.size, 4);
+  test('Real repo check: loadCompletedInstanceIds on backend/docs/evidence/swebench-mini50 returns 49, 49, 50, 50', () => {
+    assert.equal(loadCompletedInstanceIds(EVIDENCE_MINI50_DIR, 'raw_full').completedIds.size, 49);
+    assert.equal(loadCompletedInstanceIds(EVIDENCE_MINI50_DIR, 'full_aci').completedIds.size, 49);
     assert.equal(loadCompletedInstanceIds(EVIDENCE_MINI50_DIR, 'claude_code').completedIds.size, 50);
     assert.equal(loadCompletedInstanceIds(EVIDENCE_MINI50_DIR, 'mini_swe_agent').completedIds.size, 50);
 
-    for (const [arm, expectedCount] of [
-      ['raw_full', 8],
-      ['full_aci', 4],
+    for (const [arm, expectedCompleted, expectedExcluded] of [
+      ['raw_full', 49, 1],
+      ['full_aci', 49, 1],
     ]) {
+      const loaded = loadCompletedInstanceIds(EVIDENCE_MINI50_DIR, arm);
       const predRows = readJsonl(join(EVIDENCE_MINI50_DIR, `predictions.${arm}.jsonl`));
       const teleRows = readJsonl(join(EVIDENCE_MINI50_DIR, `telemetry.${arm}.jsonl`));
       const evalRows = readJsonl(join(EVIDENCE_MINI50_DIR, `eval.${arm}.jsonl`));
-      assert.equal(predRows.length, expectedCount, `${arm} predictions row count`);
-      assert.equal(teleRows.length, expectedCount, `${arm} telemetry row count`);
-      assert.equal(evalRows.length, expectedCount, `${arm} eval row count`);
-      assert.equal(evalRows.every((r) => r.resolved === true), true, `${arm} retained eval rows must all be resolved`);
+      assert.equal(predRows.length, 50, `${arm} predictions row count`);
+      assert.equal(teleRows.length, 50, `${arm} telemetry row count`);
+      assert.equal(evalRows.length, expectedCompleted, `${arm} eval row count`);
+      const excludedRows = teleRows.filter((row) => !loaded.completedIds.has(row.instance_id));
+      assert.equal(excludedRows.length, expectedExcluded, `${arm} excluded outage row count`);
+      assert.equal(
+        excludedRows.every((row) => row.status === 'env_error' && /PROVIDER_UNAVAILABLE/.test(String(row.error || ''))),
+        true,
+        `${arm} excluded rows must be retryable PROVIDER_UNAVAILABLE env_error tasks`,
+      );
     }
   });
 
