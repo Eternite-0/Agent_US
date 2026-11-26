@@ -115,6 +115,7 @@ const TEMP_CACHE_DIR_NAMES = new Set([
 ]);
 const TEMP_CACHE_FILE_RE = /\.(?:pyc|pyo)$/i;
 const ARMS_EXPLICIT_SYM = Symbol('armsExplicit');
+const TRANSIENT_PROVIDER_OUTAGE_RE = /\b(?:PROVIDER_UNAVAILABLE|RATE_LIMITED)\b/i;
 
 /**
  * Parses and validates a deterministic shard specification (`"<index>/<total>"` or `{ index, total }`).
@@ -1168,22 +1169,37 @@ function readJsonlRecords(filePath, idField = 'instance_id') {
 }
 
 /**
+ * Returns true if a telemetry row represents a retryable environment or transient provider outage.
+ * Unresolved `PROVIDER_UNAVAILABLE` / `RATE_LIMITED` rows are retried unless `evalRow.resolved === true`.
+ */
+export function isRetryableOutageTelemetry(tele, evalRow = null) {
+  if (!tele) return false;
+  if (tele.status === 'env_error') return true;
+  if (TRANSIENT_PROVIDER_OUTAGE_RE.test(String(tele.error ?? ''))) {
+    return evalRow?.resolved !== true;
+  }
+  return false;
+}
+
+/**
  * Loads already completed `instance_id`s and rows for an arm from existing JSONL outputs,
- * deduplicating by `instance_id` (latest wins) and treating `status === 'env_error'` as incomplete.
+ * deduplicating by `instance_id` (latest wins) and treating retryable outage rows as incomplete.
  */
 export function loadCompletedInstanceIds(outputDir, arm) {
   const predPath = join(outputDir, `predictions.${arm}.jsonl`);
   const telePath = join(outputDir, `telemetry.${arm}.jsonl`);
+  const evalPath = join(outputDir, `eval.${arm}.jsonl`);
   const predExists = existsSync(predPath);
   const teleExists = existsSync(telePath);
   const predictionsById = readJsonlRecords(predPath, 'instance_id');
   const telemetryById = readJsonlRecords(telePath, 'instance_id');
+  const evalById = readJsonlRecords(evalPath, 'instance_id');
 
   const completedIds = new Set();
   if (predExists && teleExists) {
     for (const id of predictionsById.keys()) {
       const tele = telemetryById.get(id);
-      if (tele && tele.status !== 'env_error') {
+      if (tele && !isRetryableOutageTelemetry(tele, evalById.get(id))) {
         completedIds.add(id);
       }
     }
@@ -1191,13 +1207,13 @@ export function loadCompletedInstanceIds(outputDir, arm) {
     for (const id of predictionsById.keys()) completedIds.add(id);
   } else if (teleExists) {
     for (const [id, tele] of telemetryById.entries()) {
-      if (tele?.status !== 'env_error') {
+      if (!isRetryableOutageTelemetry(tele, evalById.get(id))) {
         completedIds.add(id);
       }
     }
   }
 
-  return { predictionsById, telemetryById, completedIds, predPath, telePath };
+  return { predictionsById, telemetryById, evalById, completedIds, predPath, telePath, evalPath };
 }
 
 function prepareJsonlFile(filePath, resume) {
@@ -1658,7 +1674,15 @@ export function extractTurnTelemetryRow({
   }
 
   const nonEmptyPatch = String(modelPatch ?? '').trim().length > 0;
-  const status = String(turnRow?.state ?? (evRow?.type === 'turn/completed' ? 'completed' : 'failed'));
+  const errorText = turnRow?.error ? redactSecrets(String(turnRow.error)) : null;
+  let status = String(turnRow?.state ?? (evRow?.type === 'turn/completed' ? 'completed' : 'failed'));
+  if (
+    errorText &&
+    TRANSIENT_PROVIDER_OUTAGE_RE.test(errorText) &&
+    (!nonEmptyPatch || inputTokens === 0)
+  ) {
+    status = 'env_error';
+  }
 
   return {
     instance_id: instance.instance_id,
@@ -1687,7 +1711,7 @@ export function extractTurnTelemetryRow({
     admissionDecisions: aciMetrics?.admissionDecisions ?? aciTelemetry?.admissionDecisions ?? null,
     supervisorCost: aciMetrics?.supervisorCost ?? null,
     toolCallsCount: Number(receiptCount) || 0,
-    error: turnRow?.error ? redactSecrets(String(turnRow.error)) : null,
+    error: errorText,
     timestamp: new Date().toISOString(),
   };
 }
@@ -2437,26 +2461,36 @@ function getShardCandidateRank(cand) {
   const tele = cand.telemetry;
   const pred = cand.prediction;
   const ev = cand.evalRecord;
+  const retryableOutage = isRetryableOutageTelemetry(tele, ev);
 
   const nonEnvError = tele
-    ? tele.status !== 'env_error'
+    ? !retryableOutage
       ? 1
       : 0
     : ev?.reason === 'env_error' && !pred
       ? 0
       : 1;
-  const teleAndPred = tele && tele.status !== 'env_error' && pred ? 1 : 0;
+  const teleAndPred = tele && !retryableOutage && pred ? 1 : 0;
 
   const evalReason = ev?.reason ?? tele?.evalReason ?? null;
   const isEvaluated = Boolean(ev) || typeof tele?.resolved === 'boolean';
-  const evaluatedGood = isEvaluated && evalReason !== 'env_error' ? 1 : 0;
+  const evaluatedGood = !retryableOutage && isEvaluated && evalReason !== 'env_error' ? 1 : 0;
+  const resolvedGood = ev?.resolved === true || tele?.resolved === true ? 1 : 0;
 
   const completed = tele?.status === 'completed' ? 1 : 0;
   const cacheAvailable = tele?.cacheStatus === 'available' ? 1 : 0;
   const nonEmptyPatch =
     Boolean(tele?.nonEmptyPatch) || String(pred?.model_patch ?? '').trim().length > 0 ? 1 : 0;
 
-  return [nonEnvError, teleAndPred, evaluatedGood, completed, cacheAvailable, nonEmptyPatch];
+  return [
+    nonEnvError,
+    teleAndPred,
+    evaluatedGood,
+    resolvedGood,
+    completed,
+    cacheAvailable,
+    nonEmptyPatch,
+  ];
 }
 
 function isBetterShardCandidate(next, prev) {
@@ -2664,7 +2698,11 @@ async function mergeSweBenchShards(opts, rawOpts, runtimeDeps = {}) {
     );
     const envErrIds = new Set();
     for (const row of telemetryByArm[arm]) {
-      if (row?.status === 'env_error' || row?.evalReason === 'env_error') {
+      if (
+        row?.status === 'env_error' ||
+        row?.evalReason === 'env_error' ||
+        isRetryableOutageTelemetry(row, evalMap.get(row.instance_id))
+      ) {
         envErrIds.add(row.instance_id);
       }
     }
@@ -3070,6 +3108,7 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     }
 
     const shardIds = opts.shard ? new Set(instances.map((i) => i.instance_id)) : null;
+    const currentRunIds = new Set(instances.map((i) => i.instance_id));
     const predictionsByArm = {};
     const telemetryByArm = {};
     const completedByArm = {};
@@ -3083,48 +3122,73 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
         : {
             predictionsById: new Map(),
             telemetryById: new Map(),
+            evalById: new Map(),
             completedIds: new Set(),
             predPath: join(outputDir, `predictions.${arm}.jsonl`),
             telePath: join(outputDir, `telemetry.${arm}.jsonl`),
+            evalPath: join(outputDir, `eval.${arm}.jsonl`),
           };
 
-      if (shardIds && opts.resume) {
-        const filteredPreds = [...resumeState.predictionsById.values()].filter((r) =>
-          shardIds.has(r.instance_id),
-        );
-        const filteredTele = [...resumeState.telemetryById.values()].filter((r) =>
-          shardIds.has(r.instance_id),
-        );
-        const filteredCompleted = new Set(
-          [...resumeState.completedIds].filter((id) => shardIds.has(id)),
-        );
-        predictionsByArm[arm] = filteredPreds;
-        telemetryByArm[arm] = filteredTele;
-        completedByArm[arm] = filteredCompleted;
+      const staleRetryableIds = new Set();
+      if (opts.resume) {
+        for (const [id, tele] of resumeState.telemetryById.entries()) {
+          if (!currentRunIds.has(id)) continue;
+          if (resumeState.completedIds.has(id)) continue;
+          const evalRow = resumeState.evalById?.get(id) ?? null;
+          if (isRetryableOutageTelemetry(tele, evalRow)) {
+            staleRetryableIds.add(id);
+          }
+        }
+      }
+
+      const filteredPreds = [...resumeState.predictionsById.values()].filter(
+        (r) => (!shardIds || shardIds.has(r.instance_id)) && !staleRetryableIds.has(r.instance_id),
+      );
+      const filteredTele = [...resumeState.telemetryById.values()].filter(
+        (r) => (!shardIds || shardIds.has(r.instance_id)) && !staleRetryableIds.has(r.instance_id),
+      );
+      const filteredCompleted = shardIds
+        ? new Set([...resumeState.completedIds].filter((id) => shardIds.has(id)))
+        : resumeState.completedIds;
+
+      predictionsByArm[arm] = filteredPreds;
+      telemetryByArm[arm] = filteredTele;
+      completedByArm[arm] = filteredCompleted;
+
+      if ((shardIds && opts.resume) || (opts.resume && staleRetryableIds.size > 0)) {
         writeJsonlRecords(resumeState.predPath, filteredPreds);
         writeJsonlRecords(resumeState.telePath, filteredTele);
       } else {
         prepareJsonlFile(resumeState.predPath, opts.resume);
         prepareJsonlFile(resumeState.telePath, opts.resume);
-        predictionsByArm[arm] = [...resumeState.predictionsById.values()];
-        telemetryByArm[arm] = [...resumeState.telemetryById.values()];
-        completedByArm[arm] = resumeState.completedIds;
       }
       filePathsByArm[arm] = { predPath: resumeState.predPath, telePath: resumeState.telePath };
 
+      const evalPath = resumeState.evalPath ?? join(outputDir, `eval.${arm}.jsonl`);
       if (opts.evaluate) {
-        const evalPath = join(outputDir, `eval.${arm}.jsonl`);
         evalFiles[arm] = evalPath;
         if (opts.resume && existsSync(evalPath)) {
-          let evalRows = [...readJsonlRecords(evalPath, 'instance_id').values()];
-          if (shardIds) {
-            evalRows = evalRows.filter((r) => shardIds.has(r.instance_id));
+          const rawEvalRows = [
+            ...(resumeState.evalById ?? readJsonlRecords(evalPath, 'instance_id')).values(),
+          ];
+          const evalRows = rawEvalRows.filter(
+            (r) => (!shardIds || shardIds.has(r.instance_id)) && !staleRetryableIds.has(r.instance_id),
+          );
+          if (shardIds || evalRows.length !== rawEvalRows.length) {
             writeJsonlRecords(evalPath, evalRows);
           }
           evalResultsByArm[arm] = evalRows;
         } else {
           prepareJsonlFile(evalPath, false);
           evalResultsByArm[arm] = [];
+        }
+      } else if (opts.resume && staleRetryableIds.size > 0 && existsSync(evalPath)) {
+        const rawEvalRows = [
+          ...(resumeState.evalById ?? readJsonlRecords(evalPath, 'instance_id')).values(),
+        ];
+        const evalRows = rawEvalRows.filter((r) => !staleRetryableIds.has(r.instance_id));
+        if (evalRows.length !== rawEvalRows.length) {
+          writeJsonlRecords(evalPath, evalRows);
         }
       }
     }
@@ -3135,6 +3199,12 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
     const resolveBenchmarkSummaryModel = () =>
       opts.model ||
       providerConfig?.model ||
+      telemetryByArm[opts.arms[0]]?.find(
+        (r) =>
+          r?.status !== 'env_error' &&
+          !TRANSIENT_PROVIDER_OUTAGE_RE.test(String(r?.error ?? '')) &&
+          r?.model,
+      )?.model ||
       telemetryByArm[opts.arms[0]]?.find((r) => r?.status !== 'env_error' && r?.model)?.model ||
       telemetryByArm[opts.arms[0]]?.[0]?.model ||
       (opts.dryRun ? 'swebench-dry-run-sim' : 'default');

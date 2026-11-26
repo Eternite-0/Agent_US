@@ -177,7 +177,7 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
       shards: { type: 'choice', default: "'5'", options: ["'1'", "'2'", "'3'", "'5'", "'10'"] },
       max_steps: { type: 'string', default: "'60'" },
       limit: { type: 'string', required: 'false', default: "''" },
-      seed_smoke5: { type: 'boolean', default: 'true' },
+      seed_smoke5: { type: 'boolean', default: 'false' },
       resume: { type: 'boolean', default: 'true' },
       output_subdir: { type: 'string', default: 'swebench-mini50' },
       commit_results: { type: 'boolean', default: 'true' },

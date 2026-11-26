@@ -49,7 +49,7 @@ on:
       seed_smoke5:
         description: 'Seed already-verified smoke-5 records when model=deepseek-v4.1-flash to skip 5 finished tasks'
         type: boolean
-        default: true
+        default: false
       resume:
         description: 'Skip instances already completed in output_subdir'
         type: boolean
