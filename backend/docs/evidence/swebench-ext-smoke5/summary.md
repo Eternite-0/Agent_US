@@ -6,7 +6,7 @@
 - **Max Steps**: 60
 - **Arms**: raw_full, full_aci, claude_code, codex_cli, mini_swe_agent
 - **Resumed**: false
-- **Updated At**: 2026-11-25T18:28:14.832Z
+- **Updated At**: 2026-11-26T03:58:03.542Z
 
 ## Per-Arm Metrics
 
@@ -15,7 +15,7 @@
 | `raw_full` | 3/5 | 80.00% (4/5) | 2520877 | 0.00% (n=4) | 9911605 | 171902 | 98.12% (9719552/9906222, n=5) | 182 (36.4) | 1694595 | 100.00% (5/5) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
 | `full_aci` | 4/5 | 80.00% (4/5) | 1366001 | 66.61% (n=4) | 5369771 | 94234 | 93.55% (4973312/5316213, n=5) | 176 (35.2) | 1501602 | 100.00% (5/5) | 24.20% (27424/113328) | 0 | 0 calls / 0 tok / 0 ms |
 | `claude_code` | 5/5 | 60.00% (3/5) | 1754697 | 32.31% (n=3) | 5197458 | 66633 | 96.11% (4995328/5197458, n=5) | 164 (32.8) | 1348080 | 100.00% (5/5) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
-| `codex_cli` | 0/5 | 0.00% (0/5) | N/A | N/A | 0 | 0 | N/A (0/0, n=0) | 5 (1) | 36544 | 0.00% (0/5) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
+| `codex_cli` | 0/5 | 0.00% (0/5) | N/A | N/A | 0 | 0 | N/A (0/0, n=0) | 5 (1) | 37230 | 0.00% (0/5) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
 | `mini_swe_agent` | 1/5 | 40.00% (2/5) | 1924739 | -53.79% (n=2) | 3580135 | 269342 | 96.19% (3443712/3580135, n=5) | 217 (43.4) | 2511991 | 80.00% (4/5) | 0.00% (0/0) | 0 | 0 calls / 0 tok / 0 ms |
 
 ## Instance Telemetry
@@ -37,11 +37,11 @@
 | `claude_code` | `django__django-12155` | completed | yes | 24 | 560221 | 14081 | 93.81% | 321991 | yes | 0.00% | 0 |
 | `claude_code` | `sphinx-doc__sphinx-8721` | completed | no | 58 | 2106146 | 23949 | 97.04% | 609951 | yes | 0.00% | 0 |
 | `claude_code` | `django__django-12050` | completed | yes | 8 | 106254 | 1520 | 87.22% | 41454 | yes | 0.00% | 0 |
-| `codex_cli` | `django__django-12209` | failed | no | 1 | 0 | 0 | N/A | 10726 | no | 0.00% | 0 |
-| `codex_cli` | `sphinx-doc__sphinx-8035` | failed | no | 1 | 0 | 0 | N/A | 5155 | no | 0.00% | 0 |
-| `codex_cli` | `django__django-12155` | failed | no | 1 | 0 | 0 | N/A | 8101 | no | 0.00% | 0 |
-| `codex_cli` | `sphinx-doc__sphinx-8721` | failed | no | 1 | 0 | 0 | N/A | 4950 | no | 0.00% | 0 |
-| `codex_cli` | `django__django-12050` | failed | no | 1 | 0 | 0 | N/A | 7612 | no | 0.00% | 0 |
+| `codex_cli` | `django__django-12209` | failed | no | 1 | 0 | 0 | N/A | 8462 | no | 0.00% | 0 |
+| `codex_cli` | `sphinx-doc__sphinx-8035` | failed | no | 1 | 0 | 0 | N/A | 5597 | no | 0.00% | 0 |
+| `codex_cli` | `django__django-12155` | failed | no | 1 | 0 | 0 | N/A | 9172 | no | 0.00% | 0 |
+| `codex_cli` | `sphinx-doc__sphinx-8721` | failed | no | 1 | 0 | 0 | N/A | 5359 | no | 0.00% | 0 |
+| `codex_cli` | `django__django-12050` | failed | no | 1 | 0 | 0 | N/A | 8640 | no | 0.00% | 0 |
 | `mini_swe_agent` | `django__django-12209` | failed | no | 60 | 1028164 | 119445 | 96.83% | 692385 | yes | 0.00% | 0 |
 | `mini_swe_agent` | `sphinx-doc__sphinx-8035` | failed | no | 19 | 146785 | 22596 | 88.60% | 903176 | no | 0.00% | 0 |
 | `mini_swe_agent` | `django__django-12155` | failed | yes | 60 | 726667 | 95683 | 96.21% | 556388 | yes | 0.00% | 0 |
