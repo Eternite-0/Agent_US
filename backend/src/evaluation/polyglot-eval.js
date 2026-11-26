@@ -832,7 +832,11 @@ export function preparePolyglotWorkspace(
   }
   const base = workspaceBaseDir ? resolve(String(workspaceBaseDir)) : tmpdir();
   mkdirSync(base, { recursive: true });
-  const workspaceRoot = mkdtempSync(join(base, `agent-us-polyglot-${exercise.language}-`));
+  const holderDir = mkdtempSync(join(base, `agent-us-polyglot-${exercise.language}-`));
+  const slugDirName =
+    basename(String(exercise.slug || basename(exercise.exerciseDir)).trim()) || 'exercise';
+  const workspaceRoot = join(holderDir, slugDirName);
+  mkdirSync(workspaceRoot, { recursive: true });
   const hiddenSet = new Set(dedupeStrings(exercise.hiddenFiles ?? []));
 
   copyExerciseEntryFiltered(exercise.exerciseDir, workspaceRoot, '', hiddenSet);
@@ -887,12 +891,13 @@ export function preparePolyglotWorkspace(
   }
 
   return {
+    holderDir,
     workspaceRoot,
     pristineSnapshotDir: exercise.exerciseDir,
     linkedNodeModules,
     linkedPackageLock,
     unlockedTestFiles,
-    cleanup: () => safeRmDir(workspaceRoot),
+    cleanup: () => safeRmDir(holderDir),
   };
 }
 
@@ -2208,6 +2213,10 @@ export function createDryRunMeteringFetch({ exercise, workspaceRoot, mode = 'ful
 
       if (isBashOnly) {
         const nodeCmd = `${JSON.stringify(process.execPath)} --input-type=commonjs`;
+        const wrapBase64Eval = (jsCode) => {
+          const b64 = Buffer.from(jsCode, 'utf8').toString('base64');
+          return `${nodeCmd} -e "eval(Buffer.from('${b64}','base64').toString('utf8'))"`;
+        };
         if (!hasToolId('poly-dry-inspect')) {
           const inspectJs = `console.log(require('fs').readFileSync(${JSON.stringify(primarySolution)},'utf8'))`;
           return {
@@ -2216,7 +2225,7 @@ export function createDryRunMeteringFetch({ exercise, workspaceRoot, mode = 'ful
                 id: 'poly-dry-inspect',
                 name: 'bash',
                 arguments: {
-                  command: `${nodeCmd} -e ${JSON.stringify(inspectJs)}`,
+                  command: wrapBase64Eval(inspectJs),
                 },
               },
             ],
@@ -2230,7 +2239,7 @@ export function createDryRunMeteringFetch({ exercise, workspaceRoot, mode = 'ful
               {
                 id: 'poly-dry-edit',
                 name: 'bash',
-                arguments: { command: `${nodeCmd} -e ${JSON.stringify(patchJs)}` },
+                arguments: { command: wrapBase64Eval(patchJs) },
               },
             ],
             finalText: '',
@@ -3578,9 +3587,25 @@ function medianOf(nums) {
     : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
 }
 
-function isBetterRecord(next, prev) {
+const ENV_FAILURE_GRADE_ERROR_RE =
+  /No SOURCES given to target:\s*agent-us-polyglot-|cmake -S \. -B build[\s\S]*cannot be regenerated correctly\.|Unsupported class file major version/i;
+
+function isEnvironmentFailureRecord(rec) {
+  if (!rec || typeof rec !== 'object') return true;
+  if (rec.status === 'env_error') return true;
+  const gradeErr = String(rec.gradeError ?? '');
+  return Boolean(gradeErr && ENV_FAILURE_GRADE_ERROR_RE.test(gradeErr));
+}
+
+function parseRecordTimestampMs(rec) {
+  if (!rec?.timestamp) return 0;
+  const ms = Date.parse(rec.timestamp);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+export function isBetterRecord(next, prev) {
   const rank = (r) => [
-    r?.status !== 'env_error' ? 1 : 0,
+    isEnvironmentFailureRecord(r) ? 0 : 1,
     r?.passed === true ? 1 : 0,
     r?.status === 'completed' ? 1 : 0,
     r?.cacheStatus === 'available' ? 1 : 0,
@@ -3590,13 +3615,12 @@ function isBetterRecord(next, prev) {
   for (let i = 0; i < rn.length; i++) {
     if (rn[i] !== rp[i]) return rn[i] > rp[i];
   }
-  const tn = next?.timestamp ? Date.parse(next.timestamp) : 0;
-  const tp = prev?.timestamp ? Date.parse(prev.timestamp) : 0;
-  return tn >= tp;
+  return parseRecordTimestampMs(next) >= parseRecordTimestampMs(prev);
 }
 
 /**
  * Loads and flattens Polyglot shard JSON records from one or more directories or JSON files.
+ * Preserves caller input order across arguments while sorting entries deterministically within each directory.
  */
 export function loadShardResultsFromDir(dirOrFilePaths) {
   const inputs = Array.isArray(dirOrFilePaths) ? dirOrFilePaths : [dirOrFilePaths];
@@ -3630,9 +3654,17 @@ export function loadShardResultsFromDir(dirOrFilePaths) {
     if (inp) collect(inp);
   }
 
+  const uniqueFiles = [];
+  const seenFiles = new Set();
+  for (const file of jsonFiles) {
+    if (seenFiles.has(file)) continue;
+    seenFiles.add(file);
+    uniqueFiles.push(file);
+  }
+
   const allRecords = [];
   const metaList = [];
-  for (const file of [...new Set(jsonFiles)].sort(compareAsc)) {
+  for (const file of uniqueFiles) {
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8'));
       if (Array.isArray(parsed)) {
@@ -3649,7 +3681,7 @@ export function loadShardResultsFromDir(dirOrFilePaths) {
   }
 
   return {
-    sourceFiles: [...new Set(jsonFiles)].sort(compareAsc),
+    sourceFiles: uniqueFiles,
     records: allRecords,
     metaList,
   };

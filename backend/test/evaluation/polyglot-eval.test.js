@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
   POLYGLOT_DEFAULT_MODEL,
@@ -22,7 +22,9 @@ import {
   createPolyglotDryRunFixture,
   ensurePolyglotBenchmarkRepo,
   gradePolyglotWorkspace,
+  isBetterRecord,
   loadPolyglotExercises,
+  loadShardResultsFromDir,
   preparePolyglotWorkspace,
   renderPolyglotMarkdownReport,
   resolvePolyglotGradePlan,
@@ -668,7 +670,9 @@ describe('Aider Polyglot 6-language benchmark evaluation', () => {
         ws.cleanup();
       }
 
-      // Workspace cleanup must NOT delete contents of the shared node_modules directory
+      // Workspace cleanup must remove outer holderDir and NOT delete contents of the shared node_modules directory
+      assert.equal(existsSync(ws.workspaceRoot), false);
+      assert.equal(existsSync(dirname(ws.workspaceRoot)), false);
       assert.equal(existsSync(join(sharedPkgDir, 'index.js')), true);
       assert.equal(existsSync(sharedLock), true);
 
@@ -719,6 +723,12 @@ describe('Aider Polyglot 6-language benchmark evaluation', () => {
         const j1 = await res1.json();
         const inspectCmd = JSON.parse(j1.choices[0].message.tool_calls[0].function.arguments).command;
         assert.ok(inspectCmd.startsWith(expectedPrefix), `inspect command must use process.execPath --input-type=commonjs, got: ${inspectCmd}`);
+        const inspectPayloadMatch = /^"eval\(Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)\.toString\('utf8'\)\)"$/.exec(
+          inspectCmd.slice(expectedPrefix.length),
+        );
+        assert.ok(inspectPayloadMatch, `inspect command must use single-line Base64 eval without inner double quotes, got: ${inspectCmd}`);
+        const decodedInspect = Buffer.from(inspectPayloadMatch[1], 'base64').toString('utf8');
+        assert.ok(decodedInspect.includes('adder.js'));
 
         const res2 = await dryFetch('https://dry.invalid/v1/chat/completions', {
           method: 'POST',
@@ -734,6 +744,12 @@ describe('Aider Polyglot 6-language benchmark evaluation', () => {
         const j2 = await res2.json();
         const editCmd = JSON.parse(j2.choices[0].message.tool_calls[0].function.arguments).command;
         assert.ok(editCmd.startsWith(expectedPrefix), `edit command must use process.execPath --input-type=commonjs, got: ${editCmd}`);
+        const editPayloadMatch = /^"eval\(Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)\.toString\('utf8'\)\)"$/.exec(
+          editCmd.slice(expectedPrefix.length),
+        );
+        assert.ok(editPayloadMatch, `edit command must use single-line Base64 eval without inner double quotes, got: ${editCmd}`);
+        const decodedEdit = Buffer.from(editPayloadMatch[1], 'base64').toString('utf8');
+        assert.ok(decodedEdit.includes('adder.js') && decodedEdit.includes('return a + b;'));
       } finally {
         jsWs.cleanup();
       }
@@ -805,6 +821,354 @@ describe('Aider Polyglot 6-language benchmark evaluation', () => {
       }
     } finally {
       fixture.cleanup();
+    }
+  });
+
+  it('places prepared workspaces under holderDir/<slug> across all 6 languages and cleans up outer holderDir', () => {
+    const fixture = createPolyglotDryRunFixture({ exercisesPerLanguage: 1 });
+    const cppRoot = makeTempDir('polyglot-cpp-slug-');
+    try {
+      const loaded = loadPolyglotExercises(fixture.benchmarkDir);
+      assert.equal(loaded.length, 6);
+
+      for (const ex of loaded) {
+        const ws = preparePolyglotWorkspace(ex);
+        const outerDir = dirname(ws.workspaceRoot);
+        try {
+          assert.equal(basename(ws.workspaceRoot), ex.slug, `basename(workspaceRoot) must equal slug for ${ex.id}`);
+          assert.equal(ws.holderDir, outerDir);
+          assert.ok(
+            basename(outerDir).startsWith(`agent-us-polyglot-${ex.language}-`),
+            `expected outer holderDir prefix for ${ex.language}, got ${basename(outerDir)}`,
+          );
+          assert.equal(existsSync(ws.workspaceRoot), true);
+        } finally {
+          ws.cleanup();
+        }
+        assert.equal(existsSync(ws.workspaceRoot), false);
+        assert.equal(existsSync(outerDir), false, `cleanup() must remove outer holderDir for ${ex.id}`);
+      }
+
+      // Exercism C++ convention: CMakeLists derives source filename from CMAKE_CURRENT_SOURCE_DIR basename (`diamond`)
+      const diamondDir = join(cppRoot, 'cpp', 'exercises', 'practice', 'diamond');
+      mkdirSync(join(diamondDir, '.meta'), { recursive: true });
+      writeFileSync(
+        join(diamondDir, '.meta', 'config.json'),
+        JSON.stringify({ title: 'Diamond', files: { solution: ['diamond.cpp', 'diamond.h'], test: ['diamond_test.cpp'] } }),
+        'utf8',
+      );
+      writeFileSync(
+        join(diamondDir, 'CMakeLists.txt'),
+        'get_filename_component(exercise ${CMAKE_CURRENT_SOURCE_DIR} NAME)\nadd_executable(${exercise} ${exercise}.cpp ${exercise}_test.cpp)\n',
+        'utf8',
+      );
+      writeFileSync(join(diamondDir, 'diamond.h'), '#pragma once\n', 'utf8');
+      writeFileSync(join(diamondDir, 'diamond.cpp'), '#include "diamond.h"\n', 'utf8');
+      writeFileSync(join(diamondDir, 'diamond_test.cpp'), 'int main() { return 0; }\n', 'utf8');
+
+      const diamondEx = loadPolyglotExercises(cppRoot, { languages: ['cpp'] })[0];
+      const diamondWs = preparePolyglotWorkspace(diamondEx);
+      const diamondHolder = dirname(diamondWs.workspaceRoot);
+      try {
+        assert.equal(basename(diamondWs.workspaceRoot), 'diamond');
+        assert.equal(existsSync(join(diamondWs.workspaceRoot, 'diamond.cpp')), true);
+      } finally {
+        diamondWs.cleanup();
+      }
+      assert.equal(existsSync(diamondHolder), false);
+    } finally {
+      fixture.cleanup();
+      rmSync(cppRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('supports repeated --aggregate incremental merge from existing summary.json and overwrites stale CMake/JDK25 env failures', async () => {
+    // 1. CLI repeated --aggregate accumulation preserves exact argument order
+    const parsed = parsePolyglotCliArgs([
+      '--aggregate', '/baseline/summary.json',
+      '--aggregate', '/tmp/polyglot-shards',
+      '--aggregate=/tmp/extra-a.json,/tmp/extra-b.json',
+    ]);
+    assert.deepEqual(parsed.aggregate, [
+      '/baseline/summary.json',
+      '/tmp/polyglot-shards',
+      '/tmp/extra-a.json',
+      '/tmp/extra-b.json',
+    ]);
+
+    // 2. Direct isBetterRecord assertions for CMake & JDK 25 environment failure signatures
+    const staleCppEnvFail = {
+      exerciseId: 'cpp/diamond',
+      language: 'cpp',
+      slug: 'diamond',
+      mode: 'full_aci',
+      status: 'completed',
+      passed: false,
+      cacheStatus: 'available',
+      gradeError: 'cmake -S . -B build -DEXERCISM_RUN_ALL_TESTS=1 failed (exit 1): CMake Error at CMakeLists.txt:20: No SOURCES given to target: agent-us-polyglot-cpp-abc123',
+      timestamp: '2026-11-26T10:00:00.000Z',
+    };
+    const staleCppTruncatedEnvFail = {
+      exerciseId: 'cpp/clock',
+      language: 'cpp',
+      slug: 'clock',
+      mode: 'full_aci',
+      status: 'completed',
+      passed: false,
+      cacheStatus: 'available',
+      gradeError: 'cmake -S . -B build -DEXERCISM_RUN_ALL_TESTS=1 failed (exit 1): CMake Warning (deprecated) at CMakeLists.txt:5 ... [truncated 769 chars] ... les cannot be regenerated correctly.\n-- The CXX compiler identification is GNU 15.2.0',
+      timestamp: '2026-11-26T10:00:00.000Z',
+    };
+    const staleJavaEnvFail = {
+      exerciseId: 'java/two-fer',
+      language: 'java',
+      slug: 'two-fer',
+      mode: 'full_aci',
+      status: 'completed',
+      passed: false,
+      cacheStatus: 'available',
+      gradeError: './gradlew test failed (exit 1): Unsupported class file major version 69',
+      timestamp: '2026-11-26T10:00:00.000Z',
+    };
+    const realSolvedCpp = {
+      ...staleCppEnvFail,
+      passed: true,
+      gradeError: null,
+      timestamp: '2026-11-27T04:00:00.000Z',
+    };
+    const realUnsolvedCpp = {
+      ...staleCppEnvFail,
+      status: 'failed',
+      passed: false,
+      cacheStatus: 'missing',
+      gradeError: 'ctest --test-dir build --output-on-failure failed (exit 8): 1 test failed',
+      timestamp: '2026-11-27T04:00:00.000Z',
+    };
+    const realUnsolvedCppClock = {
+      ...staleCppTruncatedEnvFail,
+      status: 'failed',
+      passed: false,
+      cacheStatus: 'missing',
+      gradeError: 'cmake --build build failed (exit 2): compile error in clock.cpp',
+      timestamp: '2026-11-27T04:00:00.000Z',
+    };
+    const realUnsolvedJava = {
+      ...staleJavaEnvFail,
+      status: 'failed',
+      passed: false,
+      cacheStatus: 'missing',
+      gradeError: './gradlew test failed (exit 1): AssertionFailedError: expected <foo>',
+      timestamp: '2026-11-27T04:00:00.000Z',
+    };
+
+    assert.equal(isBetterRecord(realSolvedCpp, staleCppEnvFail), true);
+    assert.equal(isBetterRecord(realUnsolvedCpp, staleCppEnvFail), true);
+    assert.equal(isBetterRecord(realUnsolvedCppClock, staleCppTruncatedEnvFail), true);
+    assert.equal(isBetterRecord(realUnsolvedJava, staleJavaEnvFail), true);
+    assert.equal(isBetterRecord(staleCppEnvFail, realUnsolvedCpp), false);
+    assert.equal(isBetterRecord(staleCppTruncatedEnvFail, realUnsolvedCppClock), false);
+    assert.equal(isBetterRecord(staleJavaEnvFail, realUnsolvedJava), false);
+
+    // Deterministic tie-breaking between two valid non-env-error records
+    const validOlder = {
+      exerciseId: 'python/adder',
+      language: 'python',
+      slug: 'adder',
+      mode: 'full_aci',
+      status: 'completed',
+      passed: true,
+      cacheStatus: 'available',
+      gradeError: null,
+      timestamp: '2026-11-26T10:00:00.000Z',
+    };
+    const validNewer = { ...validOlder, timestamp: '2026-11-27T04:00:00.000Z' };
+    assert.equal(isBetterRecord(validNewer, validOlder), true);
+    assert.equal(isBetterRecord(validOlder, validNewer), false);
+    assert.equal(isBetterRecord({ ...validOlder, timestamp: undefined }, { ...validOlder, timestamp: undefined }), true);
+
+    // 3. End-to-end CLI multi-`--aggregate` merge: existing summary.json (z-existing/) + new shards (a-shards/)
+    const workRoot = makeTempDir('polyglot-inc-merge-');
+    const existingDir = join(workRoot, 'z-existing');
+    const newShardDir = join(workRoot, 'a-shards');
+    const outDir = join(workRoot, 'merged');
+    mkdirSync(existingDir, { recursive: true });
+    mkdirSync(newShardDir, { recursive: true });
+    try {
+      const makeRec = (overrides) => ({
+        model: POLYGLOT_DEFAULT_MODEL,
+        status: 'completed',
+        passed: true,
+        gradeMode: 'native',
+        steps: 3,
+        inputTokens: 1000,
+        outputTokens: 200,
+        totalTokens: 1200,
+        cacheReadTokens: 600,
+        cacheEligibleInputTokens: 1000,
+        cacheStatus: 'available',
+        cacheHitRate: 0.6,
+        wallClockMs: 1500,
+        error: null,
+        gradeError: null,
+        timestamp: '2026-11-26T10:00:00.000Z',
+        ...overrides,
+      });
+
+      const existingRecords = [
+        // 4 untouched languages preserved
+        makeRec({ exerciseId: 'go/two-fer', language: 'go', slug: 'two-fer', mode: 'full_aci' }),
+        makeRec({ exerciseId: 'javascript/two-fer', language: 'javascript', slug: 'two-fer', mode: 'full_aci' }),
+        makeRec({ exerciseId: 'python/two-fer', language: 'python', slug: 'two-fer', mode: 'full_aci' }),
+        makeRec({ exerciseId: 'rust/two-fer', language: 'rust', slug: 'two-fer', mode: 'full_aci' }),
+        // Stale C++ & Java environment failures (both full_aci and raw_full)
+        makeRec({
+          exerciseId: 'cpp/diamond',
+          language: 'cpp',
+          slug: 'diamond',
+          mode: 'full_aci',
+          passed: false,
+          gradeError: 'cmake -S . -B build -DEXERCISM_RUN_ALL_TESTS=1 failed (exit 1): No SOURCES given to target: agent-us-polyglot-cpp-old1',
+        }),
+        makeRec({
+          exerciseId: 'cpp/diamond',
+          language: 'cpp',
+          slug: 'diamond',
+          mode: 'raw_full',
+          passed: false,
+          gradeError: 'cmake -S . -B build -DEXERCISM_RUN_ALL_TESTS=1 failed (exit 1): CMake Warning (deprecated) at CMakeLists.txt:5 ... [truncated 769 chars] ... les cannot be regenerated correctly.\n-- The CXX compiler identification is GNU 15.2.0',
+        }),
+        makeRec({
+          exerciseId: 'java/two-fer',
+          language: 'java',
+          slug: 'two-fer',
+          mode: 'full_aci',
+          passed: false,
+          gradeError: './gradlew test failed (exit 1): Unsupported class file major version 69',
+        }),
+        makeRec({
+          exerciseId: 'java/two-fer',
+          language: 'java',
+          slug: 'two-fer',
+          mode: 'raw_full',
+          passed: false,
+          gradeError: './gradlew test failed (exit 1): Unsupported class file major version 69',
+        }),
+      ];
+
+      const existingSummary = aggregatePolyglotResults(existingRecords, {
+        modes: ['raw_full', 'full_aci'],
+        meta: { preset: 'polyglot-36', model: POLYGLOT_DEFAULT_MODEL, dryRun: false },
+      });
+      const existingSummaryPath = join(existingDir, 'summary.json');
+      writeFileSync(existingSummaryPath, JSON.stringify(existingSummary, null, 2), 'utf8');
+
+      // New shard outputs for cpp & java (mix of solved and real unsolved failures)
+      const shard0Records = [
+        makeRec({
+          exerciseId: 'cpp/diamond',
+          language: 'cpp',
+          slug: 'diamond',
+          mode: 'full_aci',
+          passed: true,
+          gradeError: null,
+          wallClockMs: 2222,
+          timestamp: '2026-11-27T04:10:00.000Z',
+        }),
+        makeRec({
+          exerciseId: 'cpp/diamond',
+          language: 'cpp',
+          slug: 'diamond',
+          mode: 'raw_full',
+          status: 'failed',
+          passed: false,
+          cacheStatus: 'missing',
+          gradeError: 'ctest --test-dir build --output-on-failure failed (exit 8): real assertion failure',
+          wallClockMs: 3333,
+          timestamp: '2026-11-27T04:10:00.000Z',
+        }),
+      ];
+      const shard1Records = [
+        makeRec({
+          exerciseId: 'java/two-fer',
+          language: 'java',
+          slug: 'two-fer',
+          mode: 'full_aci',
+          passed: true,
+          gradeError: null,
+          wallClockMs: 4444,
+          timestamp: '2026-11-27T04:12:00.000Z',
+        }),
+        makeRec({
+          exerciseId: 'java/two-fer',
+          language: 'java',
+          slug: 'two-fer',
+          mode: 'raw_full',
+          status: 'completed',
+          passed: false,
+          cacheStatus: 'missing',
+          gradeError: './gradlew test failed (exit 1): TwoferTest > aNameGiven FAILED',
+          wallClockMs: 5555,
+          timestamp: '2026-11-27T04:12:00.000Z',
+        }),
+      ];
+      writeFileSync(
+        join(newShardDir, 'shard-0.json'),
+        JSON.stringify(aggregatePolyglotResults(shard0Records, { meta: { preset: 'polyglot-36', model: POLYGLOT_DEFAULT_MODEL } }), null, 2),
+        'utf8',
+      );
+      writeFileSync(
+        join(newShardDir, 'shard-1.json'),
+        JSON.stringify(aggregatePolyglotResults(shard1Records, { meta: { preset: 'polyglot-36', model: POLYGLOT_DEFAULT_MODEL } }), null, 2),
+        'utf8',
+      );
+
+      // Verify loadShardResultsFromDir preserves input order (z-existing/summary.json BEFORE a-shards/*)
+      const loadedCheck = loadShardResultsFromDir([existingSummaryPath, newShardDir]);
+      assert.equal(loadedCheck.sourceFiles[0], existingSummaryPath);
+      assert.equal(loadedCheck.sourceFiles.length, 3);
+
+      const merged = await runPolyglotCli([
+        '--aggregate', existingSummaryPath,
+        '--aggregate', newShardDir,
+        '--preset', 'polyglot-36',
+        '--model', POLYGLOT_DEFAULT_MODEL,
+        '--modes', 'raw_full,full_aci',
+        '--output', outDir,
+        '--json',
+      ]);
+
+      assert.equal(merged.action, 'aggregate');
+      assert.equal(merged.sourceFiles[0], existingSummaryPath);
+      assert.equal(merged.report.meta.totalUniqueExercises, 6);
+      assert.deepEqual(merged.report.languages, [...POLYGLOT_LANGUAGES]);
+
+      const byKey = new Map(merged.report.records.map((r) => [`${r.mode}::${r.exerciseId}`, r]));
+      // Untouched 4 languages preserved
+      for (const id of ['go/two-fer', 'javascript/two-fer', 'python/two-fer', 'rust/two-fer']) {
+        assert.equal(byKey.get(`full_aci::${id}`)?.passed, true, `untouched ${id} must be preserved`);
+      }
+      // Solved cpp & java overwrote stale env errors
+      assert.equal(byKey.get('full_aci::cpp/diamond')?.passed, true);
+      assert.equal(byKey.get('full_aci::cpp/diamond')?.wallClockMs, 2222);
+      assert.equal(byKey.get('full_aci::java/two-fer')?.passed, true);
+      assert.equal(byKey.get('full_aci::java/two-fer')?.wallClockMs, 4444);
+      // Unsolved real cpp & java ALSO overwrote stale env errors!
+      assert.equal(byKey.get('raw_full::cpp/diamond')?.passed, false);
+      assert.equal(byKey.get('raw_full::cpp/diamond')?.wallClockMs, 3333);
+      assert.ok(byKey.get('raw_full::cpp/diamond')?.gradeError?.includes('real assertion failure'));
+      assert.equal(byKey.get('raw_full::java/two-fer')?.passed, false);
+      assert.equal(byKey.get('raw_full::java/two-fer')?.wallClockMs, 5555);
+      assert.ok(byKey.get('raw_full::java/two-fer')?.gradeError?.includes('TwoferTest'));
+
+      // Zero stale env-error signatures remain anywhere in merged records
+      for (const rec of merged.report.records) {
+        const ge = String(rec.gradeError ?? '');
+        assert.equal(ge.includes('No SOURCES given to target: agent-us-polyglot-'), false);
+        assert.equal(ge.includes('cannot be regenerated correctly.'), false);
+        assert.equal(ge.includes('Unsupported class file major version'), false);
+      }
+    } finally {
+      rmSync(workRoot, { recursive: true, force: true });
     }
   });
 });

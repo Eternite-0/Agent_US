@@ -57,6 +57,10 @@ on:
         description: 'Auto-commit aggregated Markdown + JSON report back to branch'
         type: boolean
         default: false
+      merge_existing:
+        description: 'Merge new shard outputs with existing summary.json (preserves untouched languages)'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -175,6 +179,12 @@ jobs:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
+      - name: Setup Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
       - name: Verify and lightweight-setup 6-language toolchains
         shell: bash
         run: |
@@ -201,7 +211,12 @@ jobs:
           g++ --version | head -n 1
           cmake --version | head -n 1
           go version
-          java -version 2>&1 | head -n 1
+          JAVA_VER_LINE="$(java -version 2>&1 | head -n 1)"
+          echo "${JAVA_VER_LINE} (JAVA_HOME=${JAVA_HOME:-unset})"
+          if ! echo "$JAVA_VER_LINE" | grep -qE '"21(\.|")'; then
+            echo "::error title=Unexpected Java version::Expected JDK 21, got: ${JAVA_VER_LINE}"
+            exit 1
+          fi
           (gradle --version | head -n 3) || (mvn --version | head -n 1) || true
           node --version
           python3 --version
@@ -337,6 +352,7 @@ jobs:
           INPUT_MODEL: ${{ inputs.model }}
           INPUT_MODES: ${{ inputs.modes }}
           INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+          INPUT_MERGE_EXISTING: ${{ inputs.merge_existing }}
         run: |
           set -euo pipefail
           if [[ ! "$INPUT_OUTPUT_SUBDIR" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$INPUT_OUTPUT_SUBDIR" == *..* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == */* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == "." ]]; then
@@ -344,8 +360,14 @@ jobs:
             exit 1
           fi
           OUT_DIR="backend/docs/evidence/${INPUT_OUTPUT_SUBDIR}"
+          AGG_ARGS=()
+          if [ "${INPUT_MERGE_EXISTING}" = "true" ] && [ -f "${OUT_DIR}/summary.json" ]; then
+            echo "Incremental merge enabled: loading baseline ${OUT_DIR}/summary.json before /tmp/polyglot-shards"
+            AGG_ARGS+=(--aggregate "${OUT_DIR}/summary.json")
+          fi
+          AGG_ARGS+=(--aggregate /tmp/polyglot-shards)
           node backend/scripts/benchmark-polyglot.mjs \
-            --aggregate /tmp/polyglot-shards \
+            "${AGG_ARGS[@]}" \
             --preset "$INPUT_PRESET" \
             --model "$INPUT_MODEL" \
             --modes "$INPUT_MODES" \

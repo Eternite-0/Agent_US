@@ -1105,7 +1105,7 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     assert.match(keepPatch, /src\/discounts\/calculator\.py/);
     assert.equal(keepPatch.includes('env_pin_setup.py'), false, 'Pre-existing container env baseline edits must not leak into model_patch');
 
-    // Verify reconciling turn (e.g. from timed-out container bash call) settles cleanly without unsettled-await hang
+    // Verify reconciling turn (e.g. from mid-flight aborted non-replayable bash call) settles cleanly without unsettled-await hang
     let reconStage = 0;
     const reconOut = makeTmp('swe-wp5-recon-');
     const reconRes = await runSweBenchBenchmark(
@@ -1129,7 +1129,9 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
             start: async () => 'stub-cid',
             run: async (cmd) => {
               if (cmd.includes('git diff')) {
-                return { exitCode: 124, stdout: '', stderr: '[timeout after 500ms]', timedOut: true };
+                const abortErr = new Error('container exec aborted mid-flight');
+                abortErr.name = 'AbortError';
+                throw abortErr;
               }
               return { exitCode: 0, stdout: '1 passed\n', stderr: '', timedOut: false };
             },

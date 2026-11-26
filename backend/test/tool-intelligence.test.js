@@ -5,12 +5,15 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
+import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { scheduleToolBatch } from '../src/patch-and-diagnostics.js';
 import { ToolDispatcher, isParallelReadTool } from '../src/tools/dispatcher.js';
 import { TurnManager } from '../src/kernel/agent-loop.js';
 import { McpLifecycleManager } from '../src/tools/mcp-lifecycle.js';
 import { createWorkspaceTools } from '../src/workspace-tools.js';
 import { Store } from '../src/store.js';
+import { AccountPool } from '../src/pool.js';
+import { DirectAgentRuntime } from '../src/direct-agent.js';
 import { UnknownOutcomeReconciler } from '../src/durable/reconciliation.js';
 import { EvidenceVerifier } from '../src/governance/verifier.js';
 import { rmDirSafe } from './fixtures.js';
@@ -139,4 +142,124 @@ test('EvidenceVerifier records failed shell receipts observationally without pos
   const v2 = verdict();
   assert.equal(v2.checks.failedShellReceipts, 1);
   assert.equal(v2.accepted, true);
+});
+
+test('timed-out bash command reports COMMAND_TIMEOUT failure (exitCode 124) without outcomeUnknown or reconciling lock', async (t) => {
+  const { root, store, reconciler, dispatcher } = fixture(t);
+
+  // 1. Direct host bash.execute timeout: killProcessTree settles deterministically with COMMAND_TIMEOUT and outcomeUnknown !== true
+  const hostTools = createWorkspaceTools({ workspaceRoot: root, store, permissionMode: 'full-access' });
+  const bashTool = hostTools.find((x) => x.name === 'bash');
+  assert.ok(bashTool);
+  const reportedOutcomes = [];
+  const rawOut = await bashTool.execute(
+    { command: 'node -e "setTimeout(() => {}, 10000)"', timeoutMs: 500 },
+    { callId: 'bash-host-to', reportOutcome: (facts) => reportedOutcomes.push(facts) },
+  );
+  assert.equal(reportedOutcomes.length, 1);
+  assert.equal(reportedOutcomes[0].exitCode, 124);
+  assert.equal(reportedOutcomes[0].errorCode, 'COMMAND_TIMEOUT');
+  assert.notEqual(reportedOutcomes[0].outcomeUnknown, true);
+  assert.equal('outcomeUnknown' in reportedOutcomes[0], false);
+  assert.match(rawOut, /exitCode: 124/);
+  assert.match(rawOut, /\[timeout after 500ms\]/);
+
+  // 2. ToolDispatcher + UnknownOutcomeReconciler + EvidenceVerifier: timed-out bash records failed (never outcome_unknown / block_reconciliation)
+  const stubTools = createWorkspaceTools({
+    workspaceRoot: root,
+    store,
+    permissionMode: 'full-access',
+    sandbox: {
+      async run() {
+        return { exitCode: 124, stdout: '', stderr: '[timeout after 500ms]', timedOut: true };
+      },
+    },
+  });
+  const [dispatched] = await dispatcher.dispatchBatch({
+    sessionId: 'sess-bash-to',
+    turnId: 'turn-bash-to',
+    tools: stubTools,
+    permissionMode: 'full-access',
+    toolCalls: [tc('tc-bash-to', 'bash', { command: 'sleep 30', timeoutMs: 500 })],
+  });
+  assert.equal(dispatched.isError, true);
+  assert.match(dispatched.output, /\[COMMAND_TIMEOUT\]/);
+  assert.doesNotMatch(dispatched.output, /执行结果未知/);
+  assert.equal(dispatched.receipt.status, 'failed');
+  assert.equal(dispatched.receipt.exitCode, 124);
+  assert.equal(dispatched.receipt.errorCode, 'COMMAND_TIMEOUT');
+  assert.equal(reconciler.listReconciliations({ sessionId: 'sess-bash-to', status: 'pending' }).length, 0);
+
+  const verdict = new EvidenceVerifier({ store }).verify({
+    sessionId: 'sess-bash-to',
+    turnId: 'turn-bash-to',
+    workspaceRoot: root,
+    text: 'Timed-out command handled.',
+    events: [{ type: 'tool/result', data: { receipt: dispatched.receipt, effectiveArgs: dispatched.parsedArgs } }],
+  });
+  assert.equal(verdict.accepted, true);
+  assert.equal(verdict.verdict, 'pass');
+  assert.equal(verdict.checks.pendingReconciliations, 0);
+  assert.equal(verdict.checks.failedShellReceipts, 1);
+
+  // 3. End-to-end DirectAgentRuntime turn: real host bash timeout completes turn without entering reconciling lock
+  const rtDir = mkdtempSync(join(tmpdir(), 'agent-us-bash-to-rt-'));
+  const rtStore = new Store(join(rtDir, 'engine.sqlite'));
+  const pool = new AccountPool(rtStore, { root: rtDir });
+  pool.setDefaultModel('mock-coder');
+  let step = 0;
+  class TimeoutOnceAdapter extends LlmAdapter {
+    async *stream() {
+      if (step === 0) {
+        step = 1;
+        yield {
+          type: 'block-end',
+          index: 0,
+          block: {
+            type: 'tool-call',
+            id: 'rt-bash-to',
+            name: 'bash',
+            arguments: JSON.stringify({ command: 'node -e "setTimeout(() => {}, 10000)"', timeoutMs: 500 }),
+          },
+        };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
+      yield { type: 'text-delta', index: 0, text: 'Handled timed-out command cleanly.' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  }
+  const direct = new DirectAgentRuntime(rtStore, pool, {
+    defaultWorkspace: root,
+    dataRoot: rtDir,
+    adapter: new TimeoutOnceAdapter(),
+  });
+  t.after(async () => {
+    await direct.close();
+    rtStore.close();
+    rmDirSafe(rtDir);
+  });
+
+  const sess = direct.createSession({ workspaceRoot: root, permissionMode: 'full-access' });
+  const started = direct.startTurn(sess.id, { input: 'run slow command with 500ms timeout' });
+  const deadline = Date.now() + 15_000;
+  let finalTurn = null;
+  while (Date.now() < deadline) {
+    const cur = direct.listTurns(sess.id).find((x) => x.id === started.turn.id);
+    if (cur && ['completed', 'failed', 'cancelled', 'reconciling'].includes(cur.state)) {
+      finalTurn = cur;
+      break;
+    }
+    await delay(25);
+  }
+  assert.ok(finalTurn, 'turn must settle');
+  assert.equal(finalTurn.state, 'completed', `expected completed, got ${finalTurn.state}`);
+  assert.notEqual(direct.getSession(sess.id).state, 'reconciling');
+  assert.equal(direct.reconciler.listReconciliations({ sessionId: sess.id, status: 'pending' }).length, 0);
+  const dbReceipt = rtStore.db
+    .prepare('SELECT status, exitCode, errorCode FROM tool_receipts WHERE sessionId=? AND callId=?')
+    .get(sess.id, 'rt-bash-to');
+  assert.equal(dbReceipt?.status, 'failed');
+  assert.equal(dbReceipt?.exitCode, 124);
+  assert.equal(dbReceipt?.errorCode, 'COMMAND_TIMEOUT');
 });

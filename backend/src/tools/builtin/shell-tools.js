@@ -385,7 +385,7 @@ export function createShellTools({
         const exitCode = Number.isInteger(res.exitCode) ? res.exitCode : 1;
         ctx?.reportOutcome?.({
           exitCode,
-          ...(res.timedOut ? { errorCode: 'COMMAND_TIMEOUT', outcomeUnknown: true } : {}),
+          ...(res.timedOut ? { errorCode: 'COMMAND_TIMEOUT' } : {}),
         });
         const combined = [
           `exitCode: ${exitCode}`,

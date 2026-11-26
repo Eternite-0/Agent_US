@@ -45,7 +45,7 @@ function printPolyglotUsage() {
       '  --no-use-app-pool                   Require explicit API key env var instead of App Pool',
       '  --app-data-dir <dir>                Explicit App data directory containing engine.sqlite',
       '  --dry-run                           Run offline deterministic closed-loop benchmark via SweBenchMeteringProxy',
-      '  --aggregate <dir[,dir2,...]>        Merge shard JSON results into unified Markdown + JSON summary report',
+      '  --aggregate <path[,path2,...]>      Merge shard/summary JSON files or dirs (repeatable; in order)',
       '  --json                              Print JSON report to stdout',
       '  --help, -h                          Show this help message',
       '',
@@ -167,16 +167,16 @@ export function parsePolyglotCliArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--grade-timeout-ms=')) opts.gradeTimeoutMs = Number(splitEq('--grade-timeout-ms'));
     else if (arg === '--app-data-dir') opts.appDataDir = String(nextVal()).trim();
     else if (arg.startsWith('--app-data-dir=')) opts.appDataDir = splitEq('--app-data-dir').trim();
-    else if (arg === '--aggregate') {
-      opts.aggregate = String(nextVal())
+    else if (arg === '--aggregate' || arg.startsWith('--aggregate=')) {
+      const raw = arg === '--aggregate' ? String(nextVal()) : splitEq('--aggregate');
+      const items = raw
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
-    } else if (arg.startsWith('--aggregate=')) {
-      opts.aggregate = splitEq('--aggregate')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
+      if (items.length === 0) {
+        throw new Error('--aggregate requires at least one directory or JSON file path');
+      }
+      opts.aggregate = [...(opts.aggregate ?? []), ...items];
     } else {
       throw new Error(`Unknown CLI flag: ${arg}`);
     }
