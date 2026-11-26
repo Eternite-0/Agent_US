@@ -6,53 +6,53 @@
 - **Modes**: `raw_full`, `full_aci`, `claude_code`, `mini_swe_agent`
 - **Languages**: `cpp`, `go`, `java`, `javascript`, `python`, `rust`
 - **Unique Exercises**: 36
-- **Shard**: 0/3
+- **Shard**: 0/4
 - **Dry Run**: false
-- **Updated At**: 2026-11-26T18:45:46.696Z
+- **Updated At**: 2026-11-26T20:09:18.855Z
 
 ## Overall 4-Way Comparison
 
 | Mode | Solved | Solve Rate | Input Tokens | Output Tokens | Total Tokens | Tokens / Solved | Cache Read Hit Rate | Mean Steps | Mean Latency (ms) | Tamper Violations |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `raw_full` | 24/36 | 66.67% | 2081158 | 110032 | 2191190 | 91300 | 90.70% (1887616/2081158) | 7.5556 | 36428 | 0 |
-| `full_aci` | 23/36 | 63.89% | 2598648 | 125932 | 2724580 | 118460 | 91.69% (2382720/2598648) | 8.8611 | 37726 | 0 |
-| `claude_code` | 23/36 | 63.89% | 5432811 | 140775 | 5573586 | 242330 | 88.69% (4818176/5432811) | 8.2222 | 43759 | 0 |
-| `mini_swe_agent` | 23/36 | 63.89% | 645773 | 66040 | 711813 | 30948 | 72.84% (470400/645773) | 5.1667 | 25993 | 0 |
+| `raw_full` | 36/36 | 100.00% | 1631203 | 102116 | 1733319 | 48148 | 89.14% (1452160/1629069) | 6.25 | 33585 | 0 |
+| `full_aci` | 35/36 | 97.22% | 1934346 | 119235 | 2053581 | 58674 | 90.20% (1744768/1934346) | 7.0556 | 34732 | 0 |
+| `claude_code` | 35/36 | 97.22% | 4867049 | 132563 | 4999612 | 142846 | 87.64% (4265472/4867049) | 7.3611 | 42930 | 0 |
+| `mini_swe_agent` | 35/36 | 97.22% | 438598 | 59272 | 497870 | 14225 | 66.42% (291328/438598) | 4.0278 | 16693 | 0 |
 
 ## Per-Language Solve Rate Matrix
 
 | Language | `raw_full` | `full_aci` | `claude_code` | `mini_swe_agent` |
 | --- | ---: | ---: | ---: | ---: |
-| `cpp` | 0/6 (0.00%) | 0/6 (0.00%) | 0/6 (0.00%) | 0/6 (0.00%) |
+| `cpp` | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) |
 | `go` | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) |
-| `java` | 0/6 (0.00%) | 0/6 (0.00%) | 0/6 (0.00%) | 0/6 (0.00%) |
+| `java` | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) |
 | `javascript` | 6/6 (100.00%) | 5/6 (83.33%) | 5/6 (83.33%) | 6/6 (100.00%) |
 | `python` | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) | 5/6 (83.33%) |
 | `rust` | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) | 6/6 (100.00%) |
-| **Overall** | **24/36 (66.67%)** | **23/36 (63.89%)** | **23/36 (63.89%)** | **23/36 (63.89%)** |
+| **Overall** | **36/36 (100.00%)** | **35/36 (97.22%)** | **35/36 (97.22%)** | **35/36 (97.22%)** |
 
 ## Per-Exercise Details
 
 | Mode | Exercise | Language | Status | Passed | Steps | Input Tokens | Output Tokens | Cache Hit Rate | Latency (ms) | Tamper Restored |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `claude_code` | `cpp/diamond` | `cpp` | completed | no | 7 | 106705 | 2035 | 85.05% | 37156 | no |
-| `claude_code` | `cpp/linked-list` | `cpp` | completed | no | 8 | 133273 | 3549 | 87.30% | 35137 | no |
-| `claude_code` | `cpp/perfect-numbers` | `cpp` | completed | no | 10 | 151766 | 2478 | 89.49% | 36275 | no |
-| `claude_code` | `cpp/space-age` | `cpp` | completed | no | 8 | 118641 | 1904 | 86.96% | 32694 | no |
-| `claude_code` | `cpp/sublist` | `cpp` | completed | no | 8 | 134088 | 2706 | 87.25% | 35720 | no |
-| `claude_code` | `cpp/zebra-puzzle` | `cpp` | completed | no | 8 | 119295 | 3927 | 87.45% | 40511 | no |
+| `claude_code` | `cpp/diamond` | `cpp` | completed | yes | 5 | 71235 | 1290 | 79.24% | 34834 | no |
+| `claude_code` | `cpp/linked-list` | `cpp` | completed | yes | 6 | 91448 | 2057 | 82.16% | 40129 | no |
+| `claude_code` | `cpp/perfect-numbers` | `cpp` | completed | yes | 5 | 67503 | 1005 | 79.64% | 32494 | no |
+| `claude_code` | `cpp/space-age` | `cpp` | completed | yes | 4 | 53559 | 948 | 74.56% | 30876 | no |
+| `claude_code` | `cpp/sublist` | `cpp` | completed | yes | 5 | 76503 | 1553 | 78.97% | 32931 | no |
+| `claude_code` | `cpp/zebra-puzzle` | `cpp` | completed | yes | 5 | 74593 | 4340 | 81.34% | 47418 | no |
 | `claude_code` | `go/dominoes` | `go` | completed | yes | 6 | 87330 | 1637 | 82.81% | 24131 | no |
 | `claude_code` | `go/ledger` | `go` | completed | yes | 27 | 898090 | 26095 | 93.62% | 337953 | no |
 | `claude_code` | `go/matrix` | `go` | completed | yes | 5 | 80711 | 1736 | 79.93% | 25551 | no |
 | `claude_code` | `go/palindrome-products` | `go` | completed | yes | 5 | 71252 | 1860 | 80.30% | 24643 | no |
 | `claude_code` | `go/protein-translation` | `go` | completed | yes | 5 | 69070 | 930 | 79.50% | 22115 | no |
 | `claude_code` | `go/transpose` | `go` | completed | yes | 5 | 70206 | 2398 | 79.31% | 26939 | no |
-| `claude_code` | `java/all-your-base` | `java` | completed | no | 6 | 86196 | 1274 | 83.01% | 18241 | no |
-| `claude_code` | `java/custom-set` | `java` | completed | no | 10 | 178227 | 3149 | 89.63% | 33558 | no |
-| `claude_code` | `java/hangman` | `java` | completed | no | 9 | 184874 | 8205 | 90.08% | 60074 | no |
-| `claude_code` | `java/ocr-numbers` | `java` | completed | no | 6 | 92501 | 2565 | 83.16% | 25462 | no |
-| `claude_code` | `java/react` | `java` | completed | no | 7 | 132357 | 7381 | 88.10% | 51561 | no |
-| `claude_code` | `java/simple-linked-list` | `java` | completed | no | 7 | 97228 | 1536 | 85.31% | 22621 | no |
+| `claude_code` | `java/all-your-base` | `java` | completed | yes | 7 | 100572 | 1228 | 85.27% | 24687 | no |
+| `claude_code` | `java/custom-set` | `java` | completed | yes | 5 | 81893 | 1787 | 79.24% | 19691 | no |
+| `claude_code` | `java/hangman` | `java` | completed | yes | 6 | 119570 | 9942 | 85.96% | 60619 | no |
+| `claude_code` | `java/ocr-numbers` | `java` | completed | yes | 4 | 58368 | 2006 | 75.44% | 20180 | no |
+| `claude_code` | `java/react` | `java` | completed | yes | 7 | 121592 | 5477 | 86.85% | 39424 | no |
+| `claude_code` | `java/simple-linked-list` | `java` | completed | yes | 4 | 52553 | 864 | 75.26% | 15854 | no |
 | `claude_code` | `javascript/affine-cipher` | `javascript` | completed | no | 8 | 126574 | 2991 | 87.47% | 32006 | no |
 | `claude_code` | `javascript/book-store` | `javascript` | completed | yes | 7 | 103335 | 1812 | 85.59% | 29281 | no |
 | `claude_code` | `javascript/house` | `javascript` | completed | yes | 5 | 80437 | 1926 | 80.20% | 17714 | no |
@@ -71,24 +71,24 @@
 | `claude_code` | `rust/poker` | `rust` | completed | yes | 12 | 227116 | 3398 | 91.19% | 50818 | no |
 | `claude_code` | `rust/variable-length-quantity` | `rust` | completed | yes | 10 | 157818 | 2108 | 89.54% | 48693 | no |
 | `claude_code` | `rust/word-count` | `rust` | completed | yes | 8 | 103437 | 990 | 87.49% | 20454 | no |
-| `full_aci` | `cpp/diamond` | `cpp` | completed | no | 11 | 75862 | 2657 | 90.27% | 47195 | no |
-| `full_aci` | `cpp/linked-list` | `cpp` | completed | no | 10 | 86858 | 3814 | 91.22% | 66725 | no |
-| `full_aci` | `cpp/perfect-numbers` | `cpp` | completed | no | 9 | 51224 | 2245 | 88.71% | 27443 | no |
-| `full_aci` | `cpp/space-age` | `cpp` | completed | no | 11 | 67065 | 2906 | 91.23% | 50236 | no |
-| `full_aci` | `cpp/sublist` | `cpp` | completed | no | 10 | 78532 | 2872 | 90.46% | 36019 | no |
-| `full_aci` | `cpp/zebra-puzzle` | `cpp` | completed | no | 16 | 177164 | 9686 | 94.72% | 84382 | no |
+| `full_aci` | `cpp/diamond` | `cpp` | completed | yes | 8 | 47556 | 1819 | 88.82% | 41456 | no |
+| `full_aci` | `cpp/linked-list` | `cpp` | completed | yes | 5 | 31925 | 2599 | 81.79% | 39329 | no |
+| `full_aci` | `cpp/perfect-numbers` | `cpp` | completed | yes | 6 | 29671 | 1084 | 84.99% | 30564 | no |
+| `full_aci` | `cpp/space-age` | `cpp` | completed | yes | 6 | 28215 | 1587 | 86.65% | 36618 | no |
+| `full_aci` | `cpp/sublist` | `cpp` | completed | yes | 6 | 35005 | 1263 | 83.37% | 30113 | no |
+| `full_aci` | `cpp/zebra-puzzle` | `cpp` | completed | yes | 8 | 62395 | 5894 | 92.11% | 62857 | no |
 | `full_aci` | `go/dominoes` | `go` | completed | yes | 5 | 25145 | 1127 | 83.48% | 12905 | no |
 | `full_aci` | `go/ledger` | `go` | completed | yes | 7 | 86184 | 9384 | 90.30% | 54577 | no |
 | `full_aci` | `go/matrix` | `go` | completed | yes | 5 | 29911 | 1549 | 80.45% | 13697 | no |
 | `full_aci` | `go/palindrome-products` | `go` | completed | yes | 5 | 26741 | 2132 | 86.64% | 16627 | no |
 | `full_aci` | `go/protein-translation` | `go` | completed | yes | 5 | 23912 | 1323 | 82.97% | 14084 | no |
 | `full_aci` | `go/transpose` | `go` | completed | yes | 5 | 22477 | 1568 | 81.43% | 14798 | no |
-| `full_aci` | `java/all-your-base` | `java` | completed | no | 17 | 117852 | 3154 | 94.27% | 51543 | no |
-| `full_aci` | `java/custom-set` | `java` | completed | no | 13 | 120464 | 3168 | 92.02% | 46442 | no |
-| `full_aci` | `java/hangman` | `java` | completed | no | 17 | 204011 | 6686 | 94.87% | 63491 | no |
-| `full_aci` | `java/ocr-numbers` | `java` | completed | no | 15 | 117429 | 3701 | 92.76% | 48707 | no |
-| `full_aci` | `java/react` | `java` | completed | no | 13 | 119201 | 5462 | 94.50% | 50918 | no |
-| `full_aci` | `java/simple-linked-list` | `java` | completed | no | 14 | 77714 | 2153 | 93.39% | 36677 | no |
+| `full_aci` | `java/all-your-base` | `java` | completed | yes | 10 | 53293 | 1572 | 89.83% | 30269 | no |
+| `full_aci` | `java/custom-set` | `java` | completed | yes | 9 | 69969 | 2403 | 89.09% | 37556 | no |
+| `full_aci` | `java/hangman` | `java` | completed | yes | 11 | 142199 | 12209 | 94.97% | 91946 | no |
+| `full_aci` | `java/ocr-numbers` | `java` | completed | yes | 7 | 44445 | 3019 | 88.99% | 29916 | no |
+| `full_aci` | `java/react` | `java` | completed | yes | 6 | 41927 | 6813 | 88.23% | 48041 | no |
+| `full_aci` | `java/simple-linked-list` | `java` | completed | yes | 9 | 42474 | 1545 | 90.41% | 23308 | no |
 | `full_aci` | `javascript/affine-cipher` | `javascript` | completed | no | 19 | 177639 | 5985 | 94.83% | 64099 | no |
 | `full_aci` | `javascript/book-store` | `javascript` | completed | yes | 9 | 52671 | 1696 | 90.16% | 21953 | no |
 | `full_aci` | `javascript/house` | `javascript` | completed | yes | 6 | 40711 | 1851 | 84.58% | 19452 | no |
@@ -107,24 +107,24 @@
 | `full_aci` | `rust/poker` | `rust` | completed | yes | 8 | 79398 | 4696 | 89.15% | 33305 | no |
 | `full_aci` | `rust/variable-length-quantity` | `rust` | completed | yes | 6 | 37804 | 1926 | 87.02% | 17528 | no |
 | `full_aci` | `rust/word-count` | `rust` | completed | yes | 4 | 12997 | 719 | 86.67% | 9258 | no |
-| `mini_swe_agent` | `cpp/diamond` | `cpp` | completed | no | 7 | 22805 | 1326 | 76.90% | 26997 | no |
-| `mini_swe_agent` | `cpp/linked-list` | `cpp` | completed | no | 11 | 66196 | 3552 | 85.47% | 38146 | no |
-| `mini_swe_agent` | `cpp/perfect-numbers` | `cpp` | completed | no | 6 | 19669 | 1447 | 72.89% | 22470 | no |
-| `mini_swe_agent` | `cpp/space-age` | `cpp` | completed | no | 5 | 12294 | 980 | 67.68% | 20729 | no |
-| `mini_swe_agent` | `cpp/sublist` | `cpp` | completed | no | 6 | 22947 | 1042 | 75.86% | 19648 | no |
-| `mini_swe_agent` | `cpp/zebra-puzzle` | `cpp` | completed | no | 9 | 34794 | 3917 | 82.77% | 34448 | no |
+| `mini_swe_agent` | `cpp/diamond` | `cpp` | completed | yes | 3 | 6002 | 665 | 59.71% | 25656 | no |
+| `mini_swe_agent` | `cpp/linked-list` | `cpp` | completed | yes | 3 | 9046 | 1176 | 56.60% | 26632 | no |
+| `mini_swe_agent` | `cpp/perfect-numbers` | `cpp` | completed | yes | 3 | 5985 | 496 | 62.02% | 22748 | no |
+| `mini_swe_agent` | `cpp/space-age` | `cpp` | completed | yes | 3 | 5340 | 801 | 59.93% | 25546 | no |
+| `mini_swe_agent` | `cpp/sublist` | `cpp` | completed | yes | 4 | 13167 | 594 | 69.02% | 24533 | no |
+| `mini_swe_agent` | `cpp/zebra-puzzle` | `cpp` | completed | yes | 4 | 7654 | 2184 | 66.89% | 34103 | no |
 | `mini_swe_agent` | `go/dominoes` | `go` | completed | yes | 3 | 7472 | 948 | 53.10% | 8414 | no |
 | `mini_swe_agent` | `go/ledger` | `go` | completed | yes | 5 | 23349 | 6287 | 69.62% | 34387 | no |
 | `mini_swe_agent` | `go/matrix` | `go` | completed | yes | 3 | 9698 | 1004 | 50.15% | 7865 | no |
 | `mini_swe_agent` | `go/palindrome-products` | `go` | completed | yes | 5 | 8667 | 1415 | 62.03% | 12555 | no |
 | `mini_swe_agent` | `go/protein-translation` | `go` | completed | yes | 3 | 6078 | 614 | 54.75% | 6483 | no |
 | `mini_swe_agent` | `go/transpose` | `go` | completed | yes | 3 | 5352 | 1697 | 50.22% | 12747 | no |
-| `mini_swe_agent` | `java/all-your-base` | `java` | completed | no | 5 | 13246 | 839 | 72.47% | 80825 | no |
-| `mini_swe_agent` | `java/custom-set` | `java` | completed | no | 7 | 24213 | 1693 | 72.42% | 19306 | no |
-| `mini_swe_agent` | `java/hangman` | `java` | completed | no | 7 | 27766 | 4712 | 79.75% | 35395 | no |
-| `mini_swe_agent` | `java/ocr-numbers` | `java` | completed | no | 9 | 37956 | 2293 | 81.61% | 146487 | no |
-| `mini_swe_agent` | `java/react` | `java` | completed | no | 7 | 18716 | 2640 | 72.49% | 143612 | no |
-| `mini_swe_agent` | `java/simple-linked-list` | `java` | completed | no | 6 | 13324 | 1228 | 73.97% | 16080 | no |
+| `mini_swe_agent` | `java/all-your-base` | `java` | completed | yes | 3 | 5989 | 545 | 55.57% | 9039 | no |
+| `mini_swe_agent` | `java/custom-set` | `java` | completed | yes | 3 | 10414 | 939 | 49.16% | 10799 | no |
+| `mini_swe_agent` | `java/hangman` | `java` | completed | yes | 6 | 18153 | 5610 | 75.45% | 37406 | no |
+| `mini_swe_agent` | `java/ocr-numbers` | `java` | completed | yes | 4 | 10729 | 1083 | 69.20% | 16545 | no |
+| `mini_swe_agent` | `java/react` | `java` | completed | yes | 5 | 9984 | 4137 | 56.41% | 26906 | no |
+| `mini_swe_agent` | `java/simple-linked-list` | `java` | completed | yes | 3 | 4288 | 671 | 59.70% | 9421 | no |
 | `mini_swe_agent` | `javascript/affine-cipher` | `javascript` | completed | yes | 12 | 60873 | 4549 | 87.05% | 40429 | no |
 | `mini_swe_agent` | `javascript/book-store` | `javascript` | completed | yes | 4 | 7748 | 620 | 59.47% | 9775 | no |
 | `mini_swe_agent` | `javascript/house` | `javascript` | completed | yes | 6 | 18997 | 718 | 70.75% | 12853 | no |
@@ -143,24 +143,24 @@
 | `mini_swe_agent` | `rust/poker` | `rust` | completed | yes | 6 | 29490 | 2327 | 73.35% | 17852 | no |
 | `mini_swe_agent` | `rust/variable-length-quantity` | `rust` | completed | yes | 3 | 8026 | 587 | 49.44% | 6212 | no |
 | `mini_swe_agent` | `rust/word-count` | `rust` | completed | yes | 3 | 6797 | 339 | 52.73% | 5788 | no |
-| `raw_full` | `cpp/diamond` | `cpp` | completed | no | 8 | 47551 | 2779 | 88.29% | 33984 | no |
-| `raw_full` | `cpp/linked-list` | `cpp` | completed | no | 8 | 64892 | 4688 | 90.54% | 70802 | no |
-| `raw_full` | `cpp/perfect-numbers` | `cpp` | completed | no | 8 | 44963 | 2133 | 87.68% | 29679 | no |
-| `raw_full` | `cpp/space-age` | `cpp` | completed | no | 8 | 40390 | 2180 | 88.10% | 34271 | no |
-| `raw_full` | `cpp/sublist` | `cpp` | completed | no | 8 | 50492 | 1954 | 87.21% | 26815 | no |
-| `raw_full` | `cpp/zebra-puzzle` | `cpp` | completed | no | 8 | 52814 | 5302 | 91.85% | 45286 | no |
+| `raw_full` | `cpp/diamond` | `cpp` | completed | yes | 5 | 22068 | 1044 | 80.04% | 31004 | no |
+| `raw_full` | `cpp/linked-list` | `cpp` | completed | yes | 6 | 38694 | 2622 | 84.02% | 37250 | no |
+| `raw_full` | `cpp/perfect-numbers` | `cpp` | completed | yes | 4 | 18016 | 1158 | 79.57% | 28020 | no |
+| `raw_full` | `cpp/space-age` | `cpp` | completed | yes | 4 | 17252 | 1240 | 80.87% | 28365 | no |
+| `raw_full` | `cpp/sublist` | `cpp` | completed | yes | 5 | 27966 | 1538 | 80.55% | 29177 | no |
+| `raw_full` | `cpp/zebra-puzzle` | `cpp` | completed | yes | 7 | 43561 | 5621 | 91.68% | 55414 | no |
 | `raw_full` | `go/dominoes` | `go` | completed | yes | 6 | 31973 | 2042 | 84.47% | 17011 | no |
 | `raw_full` | `go/ledger` | `go` | completed | yes | 8 | 91505 | 9182 | 90.92% | 69732 | no |
 | `raw_full` | `go/matrix` | `go` | completed | yes | 5 | 27707 | 1293 | 79.46% | 14544 | no |
 | `raw_full` | `go/palindrome-products` | `go` | completed | yes | 7 | 38520 | 2694 | 89.72% | 30887 | no |
 | `raw_full` | `go/protein-translation` | `go` | completed | yes | 5 | 22631 | 1007 | 80.88% | 25125 | no |
 | `raw_full` | `go/transpose` | `go` | completed | yes | 5 | 18448 | 973 | 72.85% | 19091 | no |
-| `raw_full` | `java/all-your-base` | `java` | completed | no | 14 | 87214 | 2302 | 92.32% | 53009 | no |
-| `raw_full` | `java/custom-set` | `java` | completed | no | 13 | 114292 | 2956 | 92.06% | 40368 | no |
-| `raw_full` | `java/hangman` | `java` | completed | no | 15 | 166310 | 6470 | 94.74% | 58710 | no |
-| `raw_full` | `java/ocr-numbers` | `java` | completed | no | 12 | 87568 | 3137 | 92.23% | 54973 | no |
-| `raw_full` | `java/react` | `java` | completed | no | 11 | 86342 | 4835 | 92.80% | 53517 | no |
-| `raw_full` | `java/simple-linked-list` | `java` | completed | no | 13 | 87136 | 3816 | 93.43% | 63025 | no |
+| `raw_full` | `java/all-your-base` | `java` | completed | yes | 8 | 44334 | 2216 | 88.64% | 41175 | no |
+| `raw_full` | `java/custom-set` | `java` | completed | yes | 9 | 68702 | 2693 | 88.87% | 30826 | no |
+| `raw_full` | `java/hangman` | `java` | completed | yes | 6 | 47790 | 7479 | 88.39% | 52304 | no |
+| `raw_full` | `java/ocr-numbers` | `java` | completed | yes | 9 | 51467 | 1844 | 89.53% | 28337 | no |
+| `raw_full` | `java/react` | `java` | completed | yes | 9 | 71815 | 5759 | 91.61% | 60961 | no |
+| `raw_full` | `java/simple-linked-list` | `java` | completed | yes | 7 | 28344 | 1422 | 87.91% | 39262 | no |
 | `raw_full` | `javascript/affine-cipher` | `javascript` | completed | yes | 10 | 62148 | 2442 | 89.39% | 34843 | no |
 | `raw_full` | `javascript/book-store` | `javascript` | completed | yes | 4 | 17505 | 784 | 80.43% | 9818 | no |
 | `raw_full` | `javascript/house` | `javascript` | completed | yes | 4 | 22429 | 779 | 77.61% | 10475 | no |
