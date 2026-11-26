@@ -213,6 +213,8 @@ test('E2E 2.5: inspect_repository (relatedTo) -> unified-diff apply_patch -> run
     model: 'test-main-model',
     permissionMode: 'full-access',
     aciProfile: 'full_aci',
+    toolModes: { repoIntelligence: true, diagnostics: true },
+    includeTools: ['apply_patch'],
     budget: { maxSteps: 8, maxTotalTokens: 120000 },
   });
 
@@ -379,6 +381,7 @@ test('E2E 2.5: Supervisor 8s circuit breaker opens after 2 timeouts, retry prese
     model: 'main-model',
     permissionMode: 'full-access',
     aciProfile: 'full_aci',
+    toolModes: { diagnostics: true },
     budget: { maxSteps: 10, maxTokens: 18000, maxTotalTokens: 18000 },
   });
 

@@ -24,10 +24,12 @@ import { redactSecrets } from '../src/envelope.js';
 import {
   SWEBENCH_HF_FULL_DATASET_ID,
   SWEBENCH_HF_MINI_DATASET_ID,
+  SWEBENCH_SUBSET_PRESETS,
   computePairedResolutionMetrics,
   evaluateSweBenchPredictions,
   fetchSweBenchVerifiedDataset,
   getDefaultSweBenchCachePath,
+  getRecommendedDatasetForSubset,
   mergeEvalResultsIntoTelemetry,
   normalizeSweBenchExtendedFields,
   parseTestTargetList,
@@ -183,7 +185,8 @@ function printSweBenchUsage() {
       '  --dataset <path|hf:verified-mini|hf:verified-full>',
       '                                 Local .jsonl/.json dataset or HF alias (default: verified-mini)',
       '  --fetch-dataset [path]         Download SWE-bench Verified Mini (50-instance) from HuggingFace',
-      '  --subset <smoke-5|paper-50>    Deterministic stratified benchmark subset',
+      '  --subset <smoke-5|paper-50|diverse-12|diverse-36|diverse-60>',
+      '                                 Deterministic stratified benchmark subset (diverse-* uses all 12 Verified repos)',
       '  --seed <n>                     PRNG seed for --subset (default: 42)',
       '  --shard <index>/<total>        Run 1-based interleaved shard (e.g. 1/5) after --subset/--limit',
       '  --merge-shards <dir1,dir2,...> Merge sharded JSONL outputs into summary.md / .tex without running inference',
@@ -439,8 +442,10 @@ export function parseSweBenchCliArgs(argv = process.argv.slice(2)) {
   if (!opts.containerMemory || !/^\d+(?:\.\d+)?[bkmg]?$/i.test(opts.containerMemory)) {
     throw new Error(`Invalid --container-memory "${opts.containerMemory}"; expected size like "2g" or "4096m"`);
   }
-  if (opts.subset !== null && !['smoke-5', 'paper-50'].includes(opts.subset)) {
-    throw new Error(`Invalid --subset "${opts.subset}"; expected "smoke-5" or "paper-50"`);
+  if (opts.subset !== null && !SWEBENCH_SUBSET_PRESETS.includes(opts.subset)) {
+    throw new Error(
+      `Invalid --subset "${opts.subset}"; expected one of: ${SWEBENCH_SUBSET_PRESETS.join(', ')}`,
+    );
   }
   if (opts.instanceIds && opts.instanceIds.length === 0) {
     opts.instanceIds = null;
@@ -562,7 +567,11 @@ export function loadSweBenchDataset(datasetPath, { instanceIds = null, limit = n
 /**
  * Formats a SWE-bench instance prompt with problem description, hints, and verification rules.
  */
-export function buildSweBenchPrompt(instance, { containerMode = false } = {}) {
+export function buildSweBenchPrompt(
+  instance,
+  { containerMode = false, containerWorkdir = '/testbed' } = {},
+) {
+  const workdir = String(containerWorkdir || '/testbed').trim() || '/testbed';
   const parts = [
     `Repository: ${instance.repo || 'local'}`,
     `Instance ID: ${instance.instance_id}`,
@@ -582,9 +591,9 @@ export function buildSweBenchPrompt(instance, { containerMode = false } = {}) {
     containerMode
       ? [
           'Workspace & Tool Conventions:',
-          '- Repository files live directly at the workspace root (mounted at /testbed inside bash).',
+          `- Repository files live directly at the workspace root (mounted at ${workdir} inside bash).`,
           '- Prefer workspace-relative paths (e.g., django/..., sphinx/...) for read_file, edit_file, apply_patch, grep, and glob.',
-          '- Locate the root cause with grep and read_file, apply a minimal targeted fix with edit_file or apply_patch, and run targeted Python/repository tests inside /testbed via bash (e.g., pytest, Django runtests.py, or SymPy bin/test — do NOT rely on host diagnostics).',
+          `- Locate the root cause with grep and read_file, apply a minimal targeted fix with edit_file or apply_patch, and run targeted Python/repository tests inside ${workdir} via bash (e.g., pytest, Django runtests.py, or SymPy bin/test — do NOT rely on host diagnostics).`,
           '- Delete any temporary reproduction scripts before finishing, and leave only your minimal fix changes uncommitted in the workspace for `git diff`.',
         ].join('\n')
       : 'Locate the root cause using grep and read_file, apply a minimal targeted fix, run the relevant test suite to confirm all tests pass, and verify the resulting git diff.',
@@ -2530,7 +2539,11 @@ async function resolveCanonicalInstanceOrderForMerge(opts, runtimeDeps, outputDi
     return instances.map((inst) => inst.instance_id);
   }
   if (opts.subset) {
-    const cachePath = getDefaultSweBenchCachePath();
+    const useFull = getRecommendedDatasetForSubset(opts.subset) === 'hf:verified-full';
+    const cachePath = getDefaultSweBenchCachePath(
+      undefined,
+      useFull ? 'swebench_verified.jsonl' : 'swebench_verified_mini.jsonl',
+    );
     if (existsSync(cachePath)) {
       let instances = loadSweBenchDataset(cachePath, {
         instanceIds: opts.instanceIds,
@@ -2884,15 +2897,20 @@ export async function runSweBenchBenchmark(rawOpts = {}, runtimeDeps = {}) {
   const memorySwap = computeMemorySwap(opts.containerMemory);
   const removeImgFn = runtimeDeps.removeDockerImage ?? removeDockerImage;
 
-  // Standalone --fetch-dataset mode (defaults to verified-mini 50-instance dataset)
+  // Standalone --fetch-dataset mode (defaults to verified-mini 50-instance dataset, or verified-full for diverse-* subsets)
   if (opts.fetchDataset && !opts.dataset && !opts.dryRun && !opts.evalOnly) {
+    const useFull = getRecommendedDatasetForSubset(opts.subset) === 'hf:verified-full';
+    const datasetId = useFull ? SWEBENCH_HF_FULL_DATASET_ID : SWEBENCH_HF_MINI_DATASET_ID;
     const targetPath = opts.fetchDatasetPath
       ? resolve(String(opts.fetchDatasetPath))
-      : getDefaultSweBenchCachePath();
+      : getDefaultSweBenchCachePath(
+          undefined,
+          useFull ? 'swebench_verified.jsonl' : 'swebench_verified_mini.jsonl',
+        );
     const fetchFn = runtimeDeps.fetchSweBenchVerifiedDataset ?? fetchSweBenchVerifiedDataset;
     const fetched = await fetchFn({
       outputPath: targetPath,
-      datasetId: SWEBENCH_HF_MINI_DATASET_ID,
+      datasetId,
     });
     return {
       benchmarkId: SWEBENCH_BENCHMARK_ID,

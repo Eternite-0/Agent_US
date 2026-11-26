@@ -370,7 +370,7 @@ test('glue: DirectAgent catch path persists reasoningMetrics to turn/failed even
   assert.ok(distilled[0].metadata.errorFingerprints.includes('src/a.js:10'));
 });
 
-test('glue: ExecutionReasoningTracker.getState() preserves v.signature, a.target, a.editedFiles, and a.fingerprint.signature across MultiStageCompactor.prepareRequest', async (t) => {
+test('glue: ExecutionReasoningTracker.getState() preserves filesMutated, verifications, and hasUnverifiedMutationsAfterLastPass across MultiStageCompactor.prepareRequest', async (t) => {
   const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-r2-data-'));
   const workDir = mkdtempSync(join(tmpdir(), 'agent-us-glue-r2-work-'));
   const store = new Store(join(dataDir, 'engine.sqlite'));
@@ -411,11 +411,11 @@ test('glue: ExecutionReasoningTracker.getState() preserves v.signature, a.target
 
   const reasoningState = tracker.getState();
   const v0 = reasoningState.verifications[0];
-  const a0 = reasoningState.falsifiedAttempts[0];
-  assert.ok(v0?.signature, 'ExecutionReasoningTracker must record v.signature');
-  assert.ok(a0?.target, 'ExecutionReasoningTracker must record a.target');
-  assert.deepEqual(a0?.editedFiles, ['src/tax.js']);
-  assert.equal(a0?.fingerprint?.signature, v0.signature);
+  assert.deepEqual(reasoningState.filesMutated, ['src/tax.js']);
+  assert.equal(v0?.command, 'node --test test/tax.test.js');
+  assert.equal(v0?.passed, false);
+  assert.equal(v0?.exitCode, 1);
+  assert.equal(reasoningState.hasUnverifiedMutationsAfterLastPass, true);
 
   const compactor = new MultiStageCompactor({ store });
   const filler = 'long-history '.repeat(750);
@@ -442,18 +442,16 @@ test('glue: ExecutionReasoningTracker.getState() preserves v.signature, a.target
     (m) => m.role === 'assistant' && m.content?.[0]?.text?.includes('[历史上下文摘要]'),
   )?.content?.[0]?.text ?? '';
 
-  assert.ok(summaryText.includes(v0.signature), 'Stage-2 summary anchor must preserve v.signature verbatim');
-  assert.ok(summaryText.includes(a0.target), 'Stage-2 summary anchor must preserve a.target verbatim');
-  assert.ok(summaryText.includes('src/tax.js'), 'Stage-2 summary anchor must preserve a.editedFiles verbatim');
-  assert.ok(summaryText.includes(a0.fingerprint.signature), 'Stage-2 summary anchor must preserve a.fingerprint.signature verbatim');
+  assert.ok(summaryText.includes('src/tax.js'), 'Stage-2 summary anchor must preserve modifiedFiles verbatim');
+  assert.ok(summaryText.includes('node --test test/tax.test.js'), 'Stage-2 summary anchor must preserve verification command');
 
   const persisted = compactor.listCompactions(sessId)[0];
   assert.ok(persisted, 'compaction record should be persisted');
-  assert.equal(persisted.taskState.verificationLedger[0].signature, v0.signature);
-  assert.ok(persisted.taskState.verificationLedger[0].failureExcerpt.includes(v0.signature));
-  assert.equal(persisted.taskState.falsifiedAttempts[0].errorSignature, a0.fingerprint.signature);
-  assert.deepEqual(persisted.taskState.falsifiedAttempts[0].editedFiles, ['src/tax.js']);
-  assert.ok(persisted.taskState.falsifiedAttempts[0].target.includes(a0.target));
+  assert.equal(persisted.taskState.modifiedFiles[0].path, 'src/tax.js');
+  assert.equal(persisted.taskState.verificationLedger[0].command, 'node --test test/tax.test.js');
+  assert.equal(persisted.taskState.verificationLedger[0].passed, false);
+  assert.equal(persisted.taskState.verificationLedger[0].exitCode, 1);
+  assert.equal(persisted.taskState.hasUnverifiedMutationsAfterLastPass, true);
 });
 
 test('glue: DirectAgent catch path persists reasoningMetrics on TURN_CANCELLED event', async (t) => {
@@ -666,13 +664,12 @@ test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers f
     if (stepCall === 4) {
       assert.match(userText, /\[预算收尾提醒\]/);
       assert.match(userText, /次模型调用/);
-      assert.match(userText, /update_plan/);
       sawWrapUp = true;
       yield {
         type: 'block-end',
         block: { type: 'tool-call', id: 'tc-g4-4', name: 'read_file', arguments: JSON.stringify({ path: 'a.js' }) },
       };
-      // Remaining after step 4: ~12,400 (< ~15k accumulated across 3 distinct files + catalog/system -> reserveInference TOKEN_BUDGET -> budget_prune!)
+      // Remaining after step 4: ~12,400 (< accumulated across 4 reads + catalog + maxOutputTokens -> reserveInference TOKEN_BUDGET -> budget_prune!)
       yield { type: 'usage', usage: { inputTokens: 26_700, outputTokens: 300 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
@@ -766,7 +763,7 @@ test('glue: DirectAgent with sessionBudget triggers early wrap-up and recovers f
           arguments: JSON.stringify({ path: 'c.js', content: 'export const ok = true;\n' }),
         },
       };
-      // Used: 20,400 + 22,200 = 42,600 out of 60,000 => remaining = 17,400 (between ~10.7k estIn and ~24.5k Tier-2 limit)
+      // Used: 20,400 + 22,200 = 42,600 out of 60,000 => remaining = 17,400 (between estIn and Tier-2 limit)
       yield { type: 'usage', usage: { inputTokens: 22_000, outputTokens: 200 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
@@ -844,6 +841,7 @@ test('glue: Wave 2 compute_file_digest confinement, expand_context lossless rest
     workspaceRoot: workDir,
     store,
     permissionMode: 'auto-safe',
+    toolModes: { meta: true, contextRecall: true },
   });
   const digestTool = tools.find((tool) => tool.name === 'compute_file_digest');
   const expandTool = tools.find((tool) => tool.name === 'expand_context');
@@ -877,21 +875,15 @@ test('glue: Wave 2 compute_file_digest confinement, expand_context lossless rest
     .replace(/\n?<\/tool_result>$/, '');
   assert.equal(restoredBody.slice(restoredBody.indexOf('\n') + 1), rawBlobText);
 
-  // 3. AgentLoop ContractReasoningEngine pre-completion deliverable check without breaking static system prompt
+  // 3. AgentLoop completes cleanly without heuristic pre-completion interception while keeping static system prompt byte-identical
   const staticSys = buildStaticSystemPrompt('fixed-nonce-w2');
   let loopStep = 0;
-  let sawContractNudge = false;
   const kernel = new AgentRuntimeKernel({
     store,
     adapter: {
       async *stream({ messages }) {
         loopStep += 1;
         assert.equal(messages[0]?.content?.[0]?.text, staticSys);
-        const userText = messages
-          .filter((m) => m.role === 'user')
-          .flatMap((m) => m.content ?? [])
-          .map((b) => b.text ?? '')
-          .join('\n');
         if (loopStep === 1) {
           yield {
             type: 'block-end',
@@ -909,15 +901,6 @@ test('glue: Wave 2 compute_file_digest confinement, expand_context lossless rest
           return;
         }
         if (loopStep === 3) {
-          // Attempts early stop BEFORE creating required handoff/digest.txt!
-          yield { type: 'text-delta', text: 'Updated src/a.js.' };
-          yield { type: 'finish', reason: { kind: 'stop' } };
-          return;
-        }
-        if (loopStep === 4) {
-          assert.match(userText, /\[契约与根因核对\]/);
-          assert.match(userText, /handoff\/digest\.txt/);
-          sawContractNudge = true;
           yield {
             type: 'block-end',
             block: {
@@ -930,7 +913,7 @@ test('glue: Wave 2 compute_file_digest confinement, expand_context lossless rest
           yield { type: 'finish', reason: { kind: 'tool-calls' } };
           return;
         }
-        if (loopStep === 5) {
+        if (loopStep === 4) {
           yield {
             type: 'block-end',
             block: {
@@ -971,8 +954,9 @@ test('glue: Wave 2 compute_file_digest confinement, expand_context lossless rest
     }),
   });
   assert.equal(contractTurn.status, 'completed');
-  assert.equal(sawContractNudge, true);
-  assert.equal(contractTurn.reasoningMetrics?.contractComplianceSignals?.ready, true);
+  assert.equal(loopStep, 5);
+  assert.deepEqual(contractTurn.reasoningMetrics?.filesMutated, ['src/a.js', 'handoff/digest.txt']);
+  assert.equal(contractTurn.reasoningMetrics?.latestVerificationPassed, true);
 });
 
 test('Step 3: DirectAgent + AgentLoop ACI Epoch DTOC, read-only Supervisor via v1Routes, KV cache invariance, and expand_context roundtrip', async (t) => {
@@ -1274,7 +1258,7 @@ test('Step 3: ContextAssembler & DirectAgent admit ONLY verified experience memo
   assert.ok(completedEv.experienceMemory.usedTokens > 0);
 });
 
-test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-only Supervisor while single-step tokens stay ~5k, plus ordering_precedence pre-completion check', async (t) => {
+test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-only Supervisor abstention while single-step tokens stay ~5k', async (t) => {
   const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-r2-cumul-data-'));
   const workDir = mkdtempSync(join(tmpdir(), 'agent-us-r2-cumul-ws-'));
   mkdirSync(join(workDir, 'src'), { recursive: true });
@@ -1298,7 +1282,6 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
   const sysPrefixes = [];
   let supCalls = 0;
   let stepIdx = 0;
-  let sawOrderingReminder = false;
 
   class CumulativeAciAdapter extends LlmAdapter {
     async *stream(opts) {
@@ -1356,15 +1339,7 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
-      if (stepIdx === 6) {
-        yield { type: 'text-delta', index: 0, text: 'Produced CONTRACT.json.' };
-        yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
-        yield { type: 'finish', reason: { kind: 'stop' } };
-        return;
-      }
-      const lastUser = [...(opts.messages ?? [])].reverse().find((m) => m.role === 'user')?.content?.[0]?.text ?? '';
-      if (/highest-to-lowest/i.test(lastUser)) sawOrderingReminder = true;
-      yield { type: 'text-delta', index: 0, text: 'Verified highest-to-lowest precedence in CONTRACT.json.' };
+      yield { type: 'text-delta', index: 0, text: 'Produced CONTRACT.json.' };
       yield { type: 'usage', usage: { inputTokens: 4000, outputTokens: 200 } };
       yield { type: 'finish', reason: { kind: 'stop' } };
     }
@@ -1410,7 +1385,7 @@ test('Round 2: Cumulative 160k session budget triggers ACI Epoch DTOC + read-onl
   const settled = await waitTurnDone(direct, session.id, turn.id, 20_000);
   assert.equal(settled.state, 'completed');
   assert.equal(supCalls, 0, 'Repoformer abstention gate must skip Supervisor when fewer than 2 eligible candidates exist');
-  assert.equal(sawOrderingReminder, true, 'Expected highest-to-lowest ordering_precedence pre-completion check');
+  assert.equal(stepIdx, 6, 'Turn should complete without heuristic pre-completion interruption');
   for (const p of sysPrefixes) assert.equal(p, sysPrefixes[0]);
 
   const completedEv = JSON.parse(
@@ -1592,6 +1567,7 @@ test('Stage 4: expand_context verifies SHA-256 across outline/hunk/verbatim and 
     workspaceRoot: workDir,
     store,
     permissionMode: 'auto-safe',
+    toolModes: { meta: true, contextRecall: true },
   });
   const expandTool = tools.find((tool) => tool.name === 'expand_context');
   assert.ok(expandTool);

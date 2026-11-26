@@ -2,28 +2,45 @@ import { mergeUsageSnapshot } from '../observability/prompt-cache.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CancellationError, classifyError, InferenceError } from './errors.js';
 
+const PERMANENT_CLIENT_OR_AUTH_STATUSES = new Set([400, 401, 403, 404, 422]);
+const TRANSIENT_BACKOFF_STATUSES = new Set([429, 502, 503, 504]);
+
 /**
  * Unified inference engine wrapping LlmAdapter streaming calls, token accounting,
- * finish reason detection, and safe transient retries (only prior to partial emission).
+ * finish reason detection, and universal transient retries (with exponential backoff
+ * on 429/502/503/504 and transient pool cooldown recovery, strictly prior to partial emission).
  */
 export class InferenceEngine {
   constructor(
     adapter,
     {
-      maxRetries = 3,
+      maxRetries = 5,
       retryDelayMs = 200,
+      transientRetryBaseMs = null,
+      maxRetryDelayMs = 45_000,
       pool = null,
-      trafficSource = null,
-      benchmarkRetryBaseMs = 3000,
     } = {},
   ) {
     this.adapter = adapter;
     this.pool = pool ?? adapter?.pool ?? null;
-    this.maxRetries = Math.max(0, Number(maxRetries ?? 3));
-    this.retryDelayMs = Math.max(25, Number(retryDelayMs ?? 200));
-    this.trafficSource = trafficSource ? String(trafficSource).trim().toLowerCase() : null;
-    const parsedBenchBase = Number(benchmarkRetryBaseMs ?? 3000);
-    this.benchmarkRetryBaseMs = Math.max(1, Number.isFinite(parsedBenchBase) ? parsedBenchBase : 3000);
+    this.maxRetries = Math.max(0, Number(maxRetries ?? 5));
+    const hasExplicitRetryDelay =
+      arguments.length > 1 &&
+      arguments[1] != null &&
+      Object.hasOwn(arguments[1], 'retryDelayMs') &&
+      arguments[1].retryDelayMs !== undefined;
+    this.retryDelayMs = Math.max(1, Number(retryDelayMs ?? 200));
+    const defaultTransientBase = hasExplicitRetryDelay ? this.retryDelayMs : 2000;
+    const parsedTransientBase = Number(transientRetryBaseMs ?? defaultTransientBase);
+    this.transientRetryBaseMs = Math.max(
+      1,
+      Number.isFinite(parsedTransientBase) ? parsedTransientBase : defaultTransientBase,
+    );
+    const parsedMaxDelay = Number(maxRetryDelayMs ?? 45_000);
+    this.maxRetryDelayMs = Math.max(
+      this.transientRetryBaseMs,
+      Number.isFinite(parsedMaxDelay) ? parsedMaxDelay : 45_000,
+    );
   }
 
   async streamStep({
@@ -37,8 +54,7 @@ export class InferenceEngine {
     signal,
     pool = null,
     excludeAccountIds = null,
-    trafficSource = null,
-    benchmarkRetryBaseMs = null,
+    transientRetryBaseMs = null,
     onTextDelta = null,
     onReasoningDelta = null,
     onRetryBudget = null,
@@ -51,10 +67,6 @@ export class InferenceEngine {
         : [],
     );
     const excludedAccounts = new Set(initialExcludedAccounts);
-    const effectiveTrafficSource = String(trafficSource ?? this.trafficSource ?? '')
-      .trim()
-      .toLowerCase();
-    const isBenchmarkMode = effectiveTrafficSource === 'benchmark';
     let attempt = 0;
     let activeMaxTokens = maxTokens;
     for (;;) {
@@ -182,12 +194,12 @@ export class InferenceEngine {
             err?.statusCode ??
             0,
         );
-        const isPermanentClientOrAuthError =
-          rawHttpStatus === 400 ||
-          rawHttpStatus === 401 ||
-          rawHttpStatus === 403 ||
-          rawHttpStatus === 404 ||
-          rawHttpStatus === 422;
+        const statusCode =
+          rawHttpStatus ||
+          (/\b(429|500|502|503|504)\b/.exec(String(err?.message ?? ''))
+            ? Number(RegExp.$1)
+            : null);
+        const isPermanentClientOrAuthError = PERMANENT_CLIENT_OR_AUTH_STATUSES.has(rawHttpStatus);
         const poolAlreadyExhausted =
           err?.code === 'PROVIDER_UNAVAILABLE' &&
           err?.detail?.exhausted === true &&
@@ -202,7 +214,7 @@ export class InferenceEngine {
           ? [...initialExcludedAccounts]
           : null;
         let hasTransientPoolRoutes = false;
-        if (isBenchmarkMode && !isPermanentClientOrAuthError && activePool) {
+        if (!isPermanentClientOrAuthError && activePool) {
           if (typeof activePool.hasTransientCooldownRoutes === 'function') {
             hasTransientPoolRoutes = activePool.hasTransientCooldownRoutes(model, {
               provider: resolvedProvider,
@@ -220,37 +232,17 @@ export class InferenceEngine {
           }
         }
         const canBypassPoolExhaustion =
-          isBenchmarkMode &&
           poolAlreadyExhausted &&
           !isPermanentClientOrAuthError &&
           hasTransientPoolRoutes;
-        const effectiveMaxRetries =
-          isBenchmarkMode && !isPermanentClientOrAuthError
-            ? Math.max(this.maxRetries, 5)
-            : this.maxRetries;
         if (
           !emittedAnything &&
           (!poolAlreadyExhausted || canBypassPoolExhaustion) &&
           classified.retryable &&
-          !(isBenchmarkMode && isPermanentClientOrAuthError) &&
-          attempt < effectiveMaxRetries
+          !isPermanentClientOrAuthError &&
+          attempt < this.maxRetries
         ) {
           attempt++;
-          const rawStatus = isBenchmarkMode
-            ? rawHttpStatus
-            : Number(
-                err?.status ??
-                  err?.statusCode ??
-                  err?.cause?.status ??
-                  err?.cause?.statusCode ??
-                  err?.detail?.statusCode ??
-                  0,
-              );
-          const statusCode =
-            rawStatus ||
-            (/\b(429|500|502|503|504)\b/.exec(String(err?.message ?? ''))
-              ? Number(RegExp.$1)
-              : null);
           const fromAccountId =
             route?.accountId ??
             err?.accountId ??
@@ -300,38 +292,42 @@ export class InferenceEngine {
           const hasPostFailureTransientRoutes =
             hasTransientPoolRoutes ||
             canBypassPoolExhaustion ||
-            (isBenchmarkMode &&
-              nextCandidateRoutes.length === 0 &&
+            (nextCandidateRoutes.length === 0 &&
               typeof activePool?.hasTransientCooldownRoutes === 'function' &&
               activePool.hasTransientCooldownRoutes(model, {
                 provider: resolvedProvider,
                 excludeAccountIds: initialExcludesList,
               }));
           const cyclingSingleOrExhaustedPool =
-            isBenchmarkMode &&
-            nextCandidateRoutes.length === 0 &&
-            hasPostFailureTransientRoutes;
+            nextCandidateRoutes.length === 0 && hasPostFailureTransientRoutes;
           let backoffMs;
           if (hasDifferentStandby) {
             backoffMs = Math.min(25, this.retryDelayMs);
-          } else if (isBenchmarkMode) {
+          } else if (
+            TRANSIENT_BACKOFF_STATUSES.has(statusCode) ||
+            cyclingSingleOrExhaustedPool
+          ) {
             const parsedStepBase = Number(
-              benchmarkRetryBaseMs ?? this.benchmarkRetryBaseMs ?? 3000,
+              transientRetryBaseMs ?? this.transientRetryBaseMs,
             );
             const baseMs = Math.max(
               1,
-              Number.isFinite(parsedStepBase) ? parsedStepBase : 3000,
+              Number.isFinite(parsedStepBase) ? parsedStepBase : this.transientRetryBaseMs,
             );
-            const expMs = Math.min(45_000, baseMs * Math.pow(2, attempt - 1));
+            const expMs = Math.min(this.maxRetryDelayMs, baseMs * Math.pow(2, attempt - 1));
             const jitterMs =
               baseMs >= 100
                 ? Math.floor(
                     Math.random() * Math.min(1000, Math.max(1, Math.floor(expMs * 0.2))),
                   )
                 : 0;
-            backoffMs = Math.min(45_000, expMs + jitterMs);
+            backoffMs = Math.min(this.maxRetryDelayMs, expMs + jitterMs);
           } else {
-            backoffMs = this.retryDelayMs * attempt;
+            const expMs = Math.min(
+              this.maxRetryDelayMs,
+              this.retryDelayMs * Math.pow(2, attempt - 1),
+            );
+            backoffMs = expMs;
           }
           try {
             await delay(backoffMs, undefined, { signal });

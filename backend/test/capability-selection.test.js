@@ -29,7 +29,16 @@ test('read-only hides writes and outward MCP, not the argument-dependent shell; 
   assert.equal(pick(limited,'mcp__x__lookup'), undefined);
   assert.equal(pick(limited,'edit_file'), undefined);
   assert.match(pick(limited,'bash').description,/只读命令/);
-  for (const name of ['glob','grep','read_file','inspect_repository']) assert.ok(isParallelReadTool(pick(tools,name)));
+  const defaultCore = createWorkspaceTools({ workspaceRoot: process.cwd() });
+  assert.equal(defaultCore.length, 6, `default coding tools must converge to 6 core primitives, got ${defaultCore.length}`);
+  assert.equal(pick(defaultCore, 'apply_patch'), undefined);
+  assert.equal(pick(defaultCore, 'inspect_repository'), undefined);
+  for (const name of ['glob','grep','read_file']) assert.ok(isParallelReadTool(pick(tools,name)));
+  const withRepoIntel = createWorkspaceTools({
+    workspaceRoot: process.cwd(),
+    toolModes: { repoIntelligence: true },
+  });
+  assert.ok(isParallelReadTool(pick(withRepoIntel, 'inspect_repository')));
   assert.equal(isParallelReadTool(pick(tools,'mcp__x__lookup')),false);
 });
 

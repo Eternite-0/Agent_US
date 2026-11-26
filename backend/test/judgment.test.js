@@ -25,7 +25,9 @@ test('JudgmentService supports native sys1 HTTP API, redacts secrets, caches res
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
       JSON.stringify({
-        answers: { unexpected_stop: { type: 'noul', noul: 0.88 } },
+        answers: {
+          route_triage: { domain: 'coding', complexity: 'medium', confidence: 0.91 },
+        },
         usage: { inputTokens: 40, outputTokens: 1 },
       }),
     );
@@ -42,42 +44,40 @@ test('JudgmentService supports native sys1 HTTP API, redacts secrets, caches res
       model: 'agnes-sys1-1.0',
       key: 'test-key',
     },
-    uses: { stopCheck: true },
+    uses: { routeTriage: true },
     attemptMs: 100,
   });
 
+  // Premature-stop interception was removed from JudgmentService.
+  assert.equal(judgment.detectPrematureStop, undefined);
+
   // First call hits server and scrubs secrets before sending!
-  const r1 = await judgment.detectPrematureStop({
-    requestText: 'Check key sk-proj-secret1234567890abcdef and fix bug',
-    replyText: 'I will now inspect the test suite and fix it.',
-    hasTools: false,
+  const r1 = await judgment.triageRoute({
+    input: 'Check key sk-proj-secret1234567890abcdef and fix bug',
     onUsage: (u) => usageLog.push(u),
   });
-  assert.equal(r1.shouldContinue, true);
-  assert.equal(r1.prob, 0.88);
+  assert.equal(r1.status, 'ok');
+  assert.equal(r1.domain, 'coding');
+  assert.equal(r1.complexity, 'medium');
+  assert.equal(r1.confidence, 0.91);
   assert.equal(r1.cached, false);
   assert.equal(usageLog[0].caller, 'judgment');
   assert.doesNotMatch(JSON.stringify(receivedBodies[0]), /sk-proj-secret/);
   assert.match(JSON.stringify(receivedBodies[0]), /\[REDACTED_API_KEY\]/);
 
   // Second identical call hits bounded LRU cache (no extra HTTP call).
-  const r2 = await judgment.detectPrematureStop({
-    requestText: 'Check key sk-proj-secret1234567890abcdef and fix bug',
-    replyText: 'I will now inspect the test suite and fix it.',
-    hasTools: false,
+  const r2 = await judgment.triageRoute({
+    input: 'Check key sk-proj-secret1234567890abcdef and fix bug',
   });
-  assert.equal(r2.shouldContinue, true);
+  assert.equal(r2.status, 'ok');
   assert.equal(r2.cached, true);
   assert.equal(receivedBodies.length, 1);
 
   // Timeout gracefully degrades to unavailable without throwing!
   slowMode = true;
-  const r3 = await judgment.detectPrematureStop({
-    requestText: 'Different request',
-    replyText: 'I will run tests next.',
-    hasTools: false,
+  const r3 = await judgment.triageRoute({
+    input: 'Different request that times out',
   });
-  assert.equal(r3.shouldContinue, false);
   assert.equal(r3.status, 'unavailable');
 });
 
@@ -168,14 +168,14 @@ test('Auto-review allows low-risk clean calls, escalates tainted/outward/contrad
   assert.equal(outwardVerdict.risk, 'high');
 });
 
-test('Premature-stop detector triggers single warm continuation in Engine when Coder promises action without tool call', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'stop-check-'));
+test('Engine completes worker reply directly without premature-stop interception while retaining routeTriage', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'route-triage-'));
   const store = new Store(join(root, 'engine.sqlite'));
-  const p = store.add('projects', { name: 'stop' });
+  const p = store.add('projects', { name: 'triage' });
   const task = store.submit({
     projectId: p.id,
     input: 'create note.txt',
-    idempotencyKey: 'stop-1',
+    idempotencyKey: 'triage-1',
   });
   const plan = {
     type: 'coding',
@@ -202,25 +202,21 @@ test('Premature-stop detector triggers single warm continuation in Engine when C
     if (sys.includes('Evaluate the original'))
       return JSON.stringify({ accepted: true, reason: 'ok' });
     workerReplies++;
-    return workerReplies === 1
-      ? 'I will now analyze the details and write the final summary.'
-      : 'Final summary: all details analyzed and complete.';
+    return 'Final summary: completed directly on first turn.';
   });
-  let judgeCalls = 0;
+  let triageCalls = 0;
   const judgment = new JudgmentService({
     provider: {
       kind: 'custom',
       model: 'sys1-mock',
-      decide: async ({ state }) => {
-        judgeCalls++;
+      decide: async ({ use }) => {
+        if (use === 'judgment.route') triageCalls++;
         return {
-          answer: {
-            prob: state.reply.includes('I will now') ? 0.92 : 0.05,
-          },
+          answer: { domain: 'coding', complexity: 'simple', confidence: 0.95 },
         };
       },
     },
-    uses: { stopCheck: true, routeTriage: true },
+    uses: { routeTriage: true },
   });
   const engine = new Engine({
     store,
@@ -240,11 +236,14 @@ test('Premature-stop detector triggers single warm continuation in Engine when C
     await delay(50);
   }
   assert.equal(store.get('tasks', task.id).status, 'completed');
-  assert.equal(workerReplies, 2);
+  assert.equal(workerReplies, 1);
   const [art] = store.list('artifacts', { taskId: task.id });
-  assert.match(art.text, /Final summary: all details analyzed/);
-  assert.ok(
-    store.events(0, task.id).some((e) => e.type === 'judgment.stop_continued'),
+  assert.match(art.text, /Final summary: completed directly/);
+  const evs = store.events(0, task.id);
+  assert.equal(
+    evs.some((e) => e.type === 'judgment.stop_continued'),
+    false,
   );
-  assert.ok(judgeCalls >= 1);
+  assert.ok(evs.some((e) => e.type === 'judgment.route_triaged'));
+  assert.equal(triageCalls, 1);
 });

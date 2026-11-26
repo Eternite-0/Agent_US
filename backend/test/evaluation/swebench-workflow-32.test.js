@@ -170,7 +170,11 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
 
   test('Defines all 11 workflow_dispatch inputs with expected types, options, and defaults', () => {
     const expectedInputs = {
-      subset: { type: 'choice', default: 'paper-50', options: ['paper-50', 'smoke-5'] },
+      subset: {
+        type: 'choice',
+        default: 'paper-50',
+        options: ['paper-50', 'smoke-5', 'diverse-12', 'diverse-36', 'diverse-60'],
+      },
       model: { type: 'string', required: 'true', default: 'deepseek-v4.1-flash' },
       arms: { type: 'string', required: 'true', default: 'raw_full,full_aci' },
       protocol: { type: 'choice', default: 'openai', options: ['openai', 'anthropic'] },
@@ -306,7 +310,10 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
     const mergeBlock = getSliceBetween(workflowText, '  merge-and-publish:', null);
 
     const requiredShardFlags = [
-      '--dataset hf:verified-mini',
+      'DATASET_ALIAS="hf:verified-mini"',
+      'DATASET_ALIAS="hf:verified-full"',
+      'diverse-12|diverse-36|diverse-60',
+      '--dataset "$DATASET_ALIAS"',
       '--subset "$INPUT_SUBSET"',
       '--shard "${SHARD_INDEX}/${INPUT_SHARDS}"',
       '--arms "$INPUT_ARMS"',
@@ -328,7 +335,10 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
     }
 
     const requiredMergeFlags = [
-      '--dataset hf:verified-mini',
+      'DATASET_ALIAS="hf:verified-mini"',
+      'DATASET_ALIAS="hf:verified-full"',
+      'diverse-12|diverse-36|diverse-60',
+      '--dataset "$DATASET_ALIAS"',
       '--merge-shards "$MERGE_SHARDS_ARG"',
       '--arms "$INPUT_ARMS"',
       '--model "$INPUT_MODEL"',
@@ -339,6 +349,22 @@ describe('SWE-bench Cloud Benchmark GitHub Actions Workflow (3.2c)', () => {
     ];
     for (const flag of requiredMergeFlags) {
       assert.ok(mergeBlock.includes(flag), `merge-and-publish missing CLI flag: ${flag}`);
+    }
+
+    // Verify diverse-* presets parse cleanly against benchmark-swebench.mjs CLI
+    for (const diversePreset of ['diverse-12', 'diverse-36', 'diverse-60']) {
+      const parsedDiverse = parseSweBenchCliArgs([
+        '--dataset',
+        'hf:verified-full',
+        '--subset',
+        diversePreset,
+        '--arms',
+        'raw_full,full_aci',
+        '--model',
+        'deepseek-v4.1-flash',
+      ]);
+      assert.equal(parsedDiverse.dataset, 'hf:verified-full');
+      assert.equal(parsedDiverse.subset, diversePreset);
     }
 
     const parsedMixed = parseSweBenchCliArgs([

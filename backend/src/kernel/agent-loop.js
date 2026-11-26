@@ -1,21 +1,15 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { extname, join, relative, resolve } from 'node:path';
-import { sha256Hex } from '../integrity.js';
-import { computeArgsDigest } from '../tools/dispatcher.js';
-import { compactTwoStage, estimateTokens, excerpt } from '../context.js';
+import { compactTwoStage, excerpt } from '../context.js';
 import { verifyTurn, buildRepairNote } from '../verifier.js';
 import { BudgetError, RecoveryError, classifyError } from './errors.js';
 import { RUNTIME_EVENTS } from './events.js';
 import {
+  CONSECUTIVE_DUPLICATE_THRESHOLD,
   ExecutionReasoningTracker,
-  MUTATING_FILE_TOOLS,
-  STUCK_PATTERNS,
+  serializeToolCallKey,
 } from './execution-reasoning.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
-import {
-  evaluateContractReadiness,
-  extractTaskContract,
-} from './contract-reasoning.js';
 import { resolveTurnOutcome } from './verdict.js';
 import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
 import { selectOffloadableAciCandidates } from '../context/aci-engine.js';
@@ -183,8 +177,7 @@ function computeActiveCriticalContextRecall({ criticalFiles = [], reasoningTrack
 }
 
 /**
- * Default DecisionEngine handles premature-stop detection, verification gate,
- * repair loop policy, and thrashing circuit-breaker checks.
+ * Default DecisionEngine handles reconciliation gating and explicit verifier repair policy.
  */
 export class DecisionEngine {
   constructor({ judgment = null, verifier = null, maxRepairRounds = 1 } = {}) {
@@ -199,12 +192,9 @@ export class DecisionEngine {
   }
 
   async shouldContinueOnIdle({
-    input,
     stepText,
     steps,
     maxSteps,
-    stopContinuedOnce,
-    repairedOnce,
     repairRound,
     verifierEvents,
     node,
@@ -213,34 +203,7 @@ export class DecisionEngine {
     turnId = null,
     workspaceRoot = null,
     reasoningState = null,
-    contractReadiness = null,
-    signal,
   }) {
-    if (
-      this.judgment &&
-      typeof this.judgment.detectPrematureStop === 'function' &&
-      !stopContinuedOnce &&
-      stepText &&
-      steps < maxSteps
-    ) {
-      const check = await this.judgment
-        .detectPrematureStop({
-          requestText: input,
-          replyText: stepText,
-          hasTools: false,
-          alreadyContinued: stopContinuedOnce,
-          signal,
-        })
-        .catch(() => null);
-      if (check?.shouldContinue && check.note) {
-        return {
-          action: 'continue_stop',
-          note: check.note,
-          meta: { prob: check.prob, cached: !!check.cached },
-        };
-      }
-    }
-
     if (this.verifier) {
       const verdict = await Promise.resolve(
         this.verifier({
@@ -259,18 +222,14 @@ export class DecisionEngine {
       }
       if (verdict && (verdict.verdict !== 'pass' || verdict.accepted === false)) {
         const effectiveMaxRepairRounds =
-          !this._explicitMaxRepairRounds &&
-          (execution?.evidenceContract || execution?.requirePostEditVerification)
+          !this._explicitMaxRepairRounds && execution?.evidenceContract
             ? Math.max(this.maxRepairRounds, 2)
             : this.maxRepairRounds;
         if (repairRound < effectiveMaxRepairRounds && steps < maxSteps) {
           return {
             action: 'repair',
             verdict,
-            note: !node && !execution?.evidenceContract &&
-              verdict.reasons?.length === 1 && verdict.reasons[0].startsWith('FABRICATED_PASS_CLAIM:')
-              ? `[验证未通过] ${verdict.reasons[0]}\n完成后用自然语言如实汇报执行过的验证和结果。`
-              : buildRepairNote(verdict, { reasoningState, contractReadiness }),
+            note: buildRepairNote(verdict, { reasoningState }),
           };
         }
         return { action: 'fail', verdict };
@@ -283,7 +242,8 @@ export class DecisionEngine {
 }
 
 /**
- * TurnManager tracks per-turn usage, steering drain, thrashing detection, and checkpoint persistence.
+ * TurnManager tracks per-turn usage, lightweight consecutive exact-duplicate detection,
+ * and checkpoint persistence.
  */
 export class TurnManager {
   constructor({
@@ -293,7 +253,6 @@ export class TurnManager {
     sessionId,
     turnId,
     leaseGuard = null,
-    benchmarkMode = false,
   }) {
     this.store = store;
     this.eventRouter = eventRouter;
@@ -301,14 +260,13 @@ export class TurnManager {
     this.sessionId = sessionId;
     this.turnId = turnId;
     this.leaseGuard = leaseGuard;
-    this.benchmarkMode = Boolean(benchmarkMode);
     this.totalIn = 0;
     this.totalOut = 0;
     this.totalCacheRead = null;
     this.totalCacheWrite = null;
     this.totalCacheEligible = null;
-    this.recentCallSigs = [];
-    this.thrashWarned = false;
+    this.lastToolCallKey = null;
+    this.consecutiveToolCallCount = 0;
   }
 
   addUsage(usage) {
@@ -326,22 +284,23 @@ export class TurnManager {
   }
 
   recordToolSignature(tc, isError, effectiveArgs, pending = false) {
-    // Polling a still-running operation is not a repeated failure or effect.
-    // Keep other successful reads in the existing no-progress check.
-    let sig = null;
-    if (isError || !pending) {
-      try {
-        sig = computeArgsDigest(tc.name, { args: effectiveArgs ?? tc.arguments, isError });
-      } catch {
-        // Malformed/unknown tool arguments must not crash the turn's warning path.
-        sig = sha256Hex(`${tc.name}::${tc.arguments}::${isError}`);
-      }
+    // Polling a still-running operation is not a duplicate loop.
+    if (pending && !isError) {
+      return false;
     }
-    const windowSize = this.benchmarkMode ? 8 : 6;
-    const repeatThreshold = this.benchmarkMode ? 5 : 3;
-    this.recentCallSigs.push(sig);
-    if (this.recentCallSigs.length > windowSize) this.recentCallSigs.shift();
-    return sig !== null && this.recentCallSigs.filter((s) => s === sig).length >= repeatThreshold;
+    const key = serializeToolCallKey(tc, effectiveArgs);
+    if (key === this.lastToolCallKey) {
+      this.consecutiveToolCallCount += 1;
+    } else {
+      this.lastToolCallKey = key;
+      this.consecutiveToolCallCount = 1;
+    }
+    if (this.consecutiveToolCallCount >= CONSECUTIVE_DUPLICATE_THRESHOLD) {
+      this.consecutiveToolCallCount = 0;
+      this.lastToolCallKey = null;
+      return true;
+    }
+    return false;
   }
 
   saveCheckpoint({ step, phase, state }) {
@@ -430,15 +389,9 @@ export class AgentLoop {
     workspaceRoot = null,
     node = null,
     execution = null,
-    trafficSource = null,
-    sandboxProfile = null,
     aci = null,
     pool = null,
   }) {
-    const benchmarkMode =
-      trafficSource === 'benchmark' ||
-      sandboxProfile === 'benchmark' ||
-      execution?.benchmarkMode === true;
     const sm = new TurnStateMachine({
       store: this.store,
       eventRouter: this.eventRouter,
@@ -456,7 +409,6 @@ export class AgentLoop {
       sessionId,
       turnId,
       leaseGuard,
-      benchmarkMode,
     });
 
     if (initialStep > 0 && this.checkpointStore && turnId) {
@@ -493,8 +445,6 @@ export class AgentLoop {
     const argStrikes = new Map();
     const reasoningTracker = new ExecutionReasoningTracker({
       workspaceRoot,
-      baselineTestFiles: execution?.baselineTestFiles ?? node?.baselineTestFiles ?? null,
-      benchmarkMode,
     });
     if (Array.isArray(aci?.priorReadFiles) && aci.priorReadFiles.length > 0) {
       reasoningTracker.seedReadFiles(aci.priorReadFiles);
@@ -715,33 +665,8 @@ export class AgentLoop {
       });
       return latestAciSnapshot;
     };
-    let taskContract = null;
-    let lastContractFilesReadCount = -1;
-    let lastContractReadiness = null;
-    const refreshContractReadiness = () => {
-      if (!workspaceRoot) return null;
-      const filesRead = reasoningTracker.filesRead;
-      if (!taskContract || filesRead.length !== lastContractFilesReadCount) {
-        const rawPrompt = String(input ?? '');
-        const repoCtxIdx = rawPrompt.search(/\r?\n\r?\n\[Repository Intelligence(?: Context)?\]\r?\n/);
-        const contractPrompt = repoCtxIdx >= 0 ? rawPrompt.slice(0, repoCtxIdx) : rawPrompt;
-        taskContract = extractTaskContract({ prompt: contractPrompt, workspaceRoot, filesRead });
-        reasoningTracker.setTaskContract?.(taskContract);
-        lastContractFilesReadCount = filesRead.length;
-      }
-      lastContractReadiness = evaluateContractReadiness({
-        contract: taskContract,
-        reasoningState: reasoningTracker.getState(),
-        workspaceRoot,
-        verifierEvents,
-      });
-      reasoningTracker.updateContractEvaluation(lastContractReadiness);
-      return lastContractReadiness;
-    };
-
     let steps = Number(initialStep || 0);
     let executedStepsThisTurn = 0;
-    let stopContinuedOnce = false;
     let verificationReserveAdvised = false;
     let budgetReserveAdvised = false;
     let budgetFinalCallAdvised = false;
@@ -803,12 +728,7 @@ export class AgentLoop {
       return snap ? { ...snap, budgetWatermarks: wm ? { ...wm } : null } : null;
     };
     let finalStepAdvised = false;
-    let repairedOnce = false;
     let repairRound = 0;
-    let monologueWarned = false;
-    let policyBlockWarned = false;
-    const nonFatalPatternsWarned = new Set();
-    let contractCompletionChecked = false;
     let postPassGraceUsed = false;
     let postPassGraceStepActive = false;
     let finalAssistantText = '';
@@ -1009,8 +929,8 @@ export class AgentLoop {
               ? `按每次调用重放当前约 ${currentStepEstimatedIn} tokens 上下文计，累计预算仅剩约 ${Math.max(1, approxTurnsLeft ?? 1)} 次模型调用`
               : `剩余时间约 ${Math.max(0, Math.round((remainingDurationMs ?? 0) / 1000))}s`;
           const budgetWrapUpText = execution?.evidenceContract
-            ? `[预算收尾提醒] 当前剩余预算约 ${remainingTokens ?? '未知'} tokens（${turnsNote}） / ${remainingDurationMs !== null ? `${Math.max(0, Math.round(remainingDurationMs / 1000))}s` : '无时间限制'}。请立即停止探索性读取（read_file/grep/glob），严禁将修改拆成多步、调用额外的 update_plan、辅助探测命令或未授权脚本；${hasUnverifiedMutations ? '请立即将剩余最小修改合并并仅运行至多 1 次必需测试验证后，' : '你当前无未验证变更，请勿再执行多余工具调用，直接'}立即输出简洁总结与完整的 Evidence Manifest v1.0.0 JSON。`
-            : `[预算收尾提醒] 当前剩余预算约 ${remainingTokens ?? '未知'} tokens（${turnsNote}）。请立即停止探索性读取，严禁将修改拆成多步、调用额外的 update_plan、额外 bash 探测或未授权辅助脚本；${hasUnverifiedMutations ? '仅在必要时运行至多 1 次关键验证后' : ''}立即输出简洁的最终交付总结，切勿耗尽预算。`;
+            ? `[预算收尾提醒] 当前剩余预算约 ${remainingTokens ?? '未知'} tokens（${turnsNote}） / ${remainingDurationMs !== null ? `${Math.max(0, Math.round(remainingDurationMs / 1000))}s` : '无时间限制'}。请立即停止探索性读取（read_file/grep/glob），严禁将修改拆成多步、调用额外辅助探测命令或未授权脚本；${hasUnverifiedMutations ? '请立即将剩余最小修改合并并仅运行至多 1 次必需测试验证后，' : '你当前无未验证变更，请勿再执行多余工具调用，直接'}立即输出简洁总结与完整的 Evidence Manifest v1.0.0 JSON。`
+            : `[预算收尾提醒] 当前剩余预算约 ${remainingTokens ?? '未知'} tokens（${turnsNote}）。请立即停止探索性读取，严禁将修改拆成多步、调用额外 bash 探测或未授权辅助脚本；${hasUnverifiedMutations ? '仅在必要时运行至多 1 次关键验证后' : ''}立即输出简洁的最终交付总结，切勿耗尽预算。`;
           messages.push({
             role: 'user',
             content: [
@@ -1131,9 +1051,7 @@ export class AgentLoop {
             // Only shield genuine spec/contract docs (SPEC.md, CONTRACT.json, etc.), never target src/ files to be edited.
             const strictContractDocRe =
               /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
-            const contractFiles = [
-              ...(taskContract?.contractFilesOnDisk ?? []),
-            ].filter((filePath) =>
+            const contractFiles = resolvedAciCriticalFiles.filter((filePath) =>
               strictContractDocRe.test(String(filePath || '').replace(/\\/g, '/')),
             );
             const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
@@ -1540,7 +1458,6 @@ export class AgentLoop {
           stepResult = await this.inferenceEngine.streamStep({
             ...requestOptions,
             pool,
-            trafficSource,
             onRouteFailover: ({ attempt, statusCode, fromAccountId, toAccountId, reason }) => {
               this.eventRouter.emitPersisted({
                 sessionId,
@@ -1717,11 +1634,7 @@ export class AgentLoop {
             continue;
           }
 
-          const monologueTrigger = reasoningTracker.recordAssistantTurn({
-            text: stepResult.text,
-            toolCallCount: 0,
-            step: steps,
-          });
+          reasoningTracker.recordAssistantTurn();
 
           verifierEvents.push({
             type: 'turn/end',
@@ -1729,14 +1642,10 @@ export class AgentLoop {
           });
 
           sm.transition(TURN_PHASES.VERIFYING, { step: steps, persist: profile?.persistTurn !== false });
-          refreshContractReadiness();
           const decision = await this.decisionEngine.shouldContinueOnIdle({
-            input,
             stepText: stepResult.text,
             steps,
             maxSteps,
-            stopContinuedOnce,
-            repairedOnce,
             repairRound,
             verifierEvents,
             node,
@@ -1745,53 +1654,12 @@ export class AgentLoop {
             turnId,
             workspaceRoot,
             reasoningState: reasoningTracker.getState(),
-            contractReadiness: lastContractReadiness,
-            signal,
           });
 
-          if (decision.action === 'continue_stop') {
-            stopContinuedOnce = true;
-            if (monologueTrigger) {
-              if (monologueWarned) {
-                stopReason = 'thrashing_circuit_break';
-                break;
-              }
-              monologueWarned = true;
-              this.eventRouter.emitPersisted({
-                sessionId,
-                turnId,
-                type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
-                data: {
-                  step: steps,
-                  pattern: monologueTrigger.pattern,
-                  fingerprint: monologueTrigger.fingerprint ?? null,
-                  falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
-                },
-                audit: false,
-              });
-              messages.push({
-                role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: `${decision.note}\n\n${reasoningTracker.buildDiagnosticSteeringMessage(monologueTrigger)}`,
-                  },
-                ],
-              });
-              continue;
-            }
-            messages.push({ role: 'user', content: [{ type: 'text', text: decision.note }] });
-            continue;
-          }
           if (decision.action === 'repair') {
-            repairedOnce = true;
             repairRound++;
-            reasoningTracker.recordRepairRound({ step: steps });
+            reasoningTracker.recordRepairRound();
             finalVerdict = decision.verdict;
-            if (monologueTrigger && monologueWarned) {
-              stopReason = 'thrashing_circuit_break';
-              break;
-            }
             this.eventRouter.emitPersisted({
               sessionId,
               turnId,
@@ -1801,24 +1669,7 @@ export class AgentLoop {
                 reasons: decision.verdict.reasons,
               },
             });
-            let noteText = decision.note;
-            if (monologueTrigger && !monologueWarned) {
-              monologueWarned = true;
-              this.eventRouter.emitPersisted({
-                sessionId,
-                turnId,
-                type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
-                data: {
-                  step: steps,
-                  pattern: monologueTrigger.pattern,
-                  fingerprint: monologueTrigger.fingerprint ?? null,
-                  falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
-                },
-                audit: false,
-              });
-              noteText = `${noteText}\n\n${reasoningTracker.buildDiagnosticSteeringMessage(monologueTrigger)}`;
-            }
-            messages.push({ role: 'user', content: [{ type: 'text', text: noteText }] });
+            messages.push({ role: 'user', content: [{ type: 'text', text: decision.note }] });
             continue;
           }
           if (decision.action === 'reconcile') {
@@ -1833,40 +1684,6 @@ export class AgentLoop {
             idleDecisionAction = 'fail';
             break;
           }
-          if (
-            hadToolCalls &&
-            !contractCompletionChecked &&
-            steps < maxSteps &&
-            !budgetReserveAdvised &&
-            !budgetFinalCallAdvised &&
-            (remainingTokens === null || remainingTokens > finalManifestReserve + estTurnCost) &&
-            lastContractReadiness?.evaluated &&
-            (!lastContractReadiness.ready ||
-              lastContractReadiness.gaps?.some((g) => g.kind === 'ordering_precedence_verify'))
-          ) {
-            const actionableGaps = lastContractReadiness.gaps.filter(
-              (g) =>
-                g.kind === 'forbidden_mutation' ||
-                g.kind === 'invalid_json' ||
-                g.kind === 'missing_exports' ||
-                g.kind === 'missing_constraint_ids' ||
-                g.kind === 'ordering_precedence_verify' ||
-                (g.kind === 'missing_deliverables' && reasoningTracker.filesMutated.length > 0),
-            );
-            if (actionableGaps.length > 0) {
-              contractCompletionChecked = true;
-              messages.push({
-                role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: `${lastContractReadiness.checklistText}\n请仅补齐上述明确缺失的契约交付项并确认验证通过后输出最终回复。`,
-                  },
-                ],
-              });
-              continue;
-            }
-          }
           if (drainSteering && injectSteeringMessages(drainSteering()) > 0) {
             continue;
           }
@@ -1880,11 +1697,7 @@ export class AgentLoop {
 
         // Tools dispatch phase
         hadToolCalls = true;
-        reasoningTracker.recordAssistantTurn({
-          text: stepResult.text,
-          toolCallCount: stepResult.toolCalls.length,
-          step: steps,
-        });
+        reasoningTracker.recordAssistantTurn();
         sm.transition(TURN_PHASES.TOOLS, { step: steps, persist: profile?.persistTurn !== false });
         const postTestToolsEval = evaluatePostTestCompletionReserve({
           lastRunTestsPassed: reasoningTracker.lastRunTestsPassed,
@@ -1976,7 +1789,7 @@ export class AgentLoop {
             errorSymbols,
             mutatedFiles: [...reasoningTracker.filesMutated],
             errorSummary: lastErrFp,
-            contractHints: lastContractReadiness?.missingContractReads ?? [],
+            contractHints: [],
             supervisor: aci.supervisor ?? null,
             supervisorEnabled: aciSupervisorEnabled,
             supervisorConfigOverride: aciSupervisorConfigOverride,
@@ -1994,13 +1807,27 @@ export class AgentLoop {
           syncAciMetrics();
         }
 
-        let detectedThrashing = false;
-        let batchTrigger = null;
-        let batchAntiThrashing = null;
         for (let batchIdx = 0; batchIdx < preparedBatch.length; batchIdx += 1) {
           const item = preparedBatch[batchIdx];
           const { tc, isError, durationMs, receipt, output } = item;
-          const promptOutput = excerpt(String(admittedOutputs[batchIdx] ?? output ?? ''), 32000);
+          let duplicateReminder = null;
+          if (!item.gated) {
+            tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending);
+            const reasoningEvent = reasoningTracker.recordToolResult({
+              tc,
+              args: item.parsedArgs,
+              output,
+              isError,
+              pending: item.pending,
+              receipt,
+              step: steps,
+            });
+            duplicateReminder = reasoningEvent?.duplicateReminder ?? null;
+          }
+          const basePromptOutput = excerpt(String(admittedOutputs[batchIdx] ?? output ?? ''), 32000);
+          const promptOutput = duplicateReminder
+            ? `${basePromptOutput}\n${duplicateReminder}`
+            : basePromptOutput;
           await onToolResult?.({
             tc,
             output,
@@ -2048,30 +1875,6 @@ export class AgentLoop {
               audit: false,
             });
           }
-          if (!item.gated) {
-            if (tm.thrashWarned && MUTATING_FILE_TOOLS.has(tc.name) && !isError) {
-              tm.recentCallSigs = [];
-            }
-            const tmRepeat = tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending);
-            const reasoningEvent = reasoningTracker.recordToolResult({
-              tc,
-              args: item.parsedArgs,
-              output,
-              isError,
-              pending: item.pending,
-              receipt,
-              step: steps,
-            });
-            if (reasoningEvent?.trigger) {
-              detectedThrashing = true;
-              batchTrigger = reasoningEvent.trigger;
-            } else if (tmRepeat) {
-              detectedThrashing = true;
-            }
-            if (reasoningEvent?.antiThrashing) {
-              batchAntiThrashing = reasoningEvent.antiThrashing;
-            }
-          }
         }
 
         tm.saveCheckpoint({
@@ -2091,9 +1894,7 @@ export class AgentLoop {
           },
         });
 
-        refreshContractReadiness();
-
-        if (aci?.engine || aci?.aciStore || aci?.ledger || reasoningTracker._antiThrashingTriggered) {
+        if (aci?.engine || aci?.aciStore || aci?.ledger) {
           const stepWm = buildBudgetWatermarks();
           const stepAciTelemetry = buildAciTelemetry(stepWm);
           if (stepAciTelemetry && typeof this.eventRouter.emitEphemeral === 'function') {
@@ -2109,142 +1910,16 @@ export class AgentLoop {
           }
         }
 
-        if (detectedThrashing) {
-          const isNonFatalPattern =
-            batchTrigger?.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP ||
-            batchTrigger?.pattern === STUCK_PATTERNS.SELF_TEST_CALIBRATION;
-          if (isNonFatalPattern) {
-            if (!nonFatalPatternsWarned.has(batchTrigger.pattern)) {
-              nonFatalPatternsWarned.add(batchTrigger.pattern);
-              if (batchTrigger.pattern === STUCK_PATTERNS.POLICY_BLOCK_LOOP) {
-                policyBlockWarned = true;
-              }
-              const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(
-                batchTrigger,
-                batchAntiThrashing,
-              );
-              const warnWm = buildBudgetWatermarks();
-              const warnTelemetry = buildAciTelemetry(warnWm);
-              this.eventRouter.emitPersisted({
-                sessionId,
-                turnId,
-                type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
-                data: {
-                  step: steps,
-                  pattern: batchTrigger.pattern,
-                  fingerprint: batchTrigger.fingerprint ?? null,
-                  falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
-                  antiThrashingTriggered: reasoningTracker._antiThrashingTriggered,
-                  ...(batchAntiThrashing
-                    ? {
-                        antiThrashing: {
-                          file: batchAntiThrashing.file,
-                          streak: batchAntiThrashing.streak,
-                          contracts: batchAntiThrashing.contracts,
-                          callers: batchAntiThrashing.callers,
-                        },
-                      }
-                    : {}),
-                  ...(warnTelemetry ? { aciTelemetry: warnTelemetry } : {}),
-                },
-                audit: false,
-              });
-              messages.push({
-                role: 'user',
-                content: [{ type: 'text', text: steeringText }],
-              });
-            }
-          } else if (!tm.thrashWarned) {
-            tm.thrashWarned = true;
-            tm.recentCallSigs = [];
-            const steeringText = reasoningTracker.buildDiagnosticSteeringMessage(
-              batchTrigger,
-              batchAntiThrashing,
-            );
-            const warnWm = buildBudgetWatermarks();
-            const warnTelemetry = buildAciTelemetry(warnWm);
-            this.eventRouter.emitPersisted({
-              sessionId,
-              turnId,
-              type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
-              data: {
-                step: steps,
-                pattern: batchTrigger?.pattern ?? 'exact_repeat',
-                fingerprint: batchTrigger?.fingerprint ?? null,
-                falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
-                antiThrashingTriggered: reasoningTracker._antiThrashingTriggered,
-                ...(batchAntiThrashing
-                  ? {
-                      antiThrashing: {
-                        file: batchAntiThrashing.file,
-                        streak: batchAntiThrashing.streak,
-                        contracts: batchAntiThrashing.contracts,
-                        callers: batchAntiThrashing.callers,
-                      },
-                    }
-                  : {}),
-                ...(warnTelemetry ? { aciTelemetry: warnTelemetry } : {}),
-              },
-              audit: false,
-            });
-            messages.push({
-              role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text: steeringText,
-                },
-              ],
-            });
-          } else {
-            stopReason = 'thrashing_circuit_break';
-            break;
-          }
-        } else if (batchAntiThrashing) {
-          const guidanceText =
-            batchAntiThrashing.guidance ||
-            reasoningTracker.buildAntiThrashingGuidance(batchAntiThrashing);
-          const warnWm = buildBudgetWatermarks();
-          const warnTelemetry = buildAciTelemetry(warnWm);
-          this.eventRouter.emitPersisted({
-            sessionId,
-            turnId,
-            type: RUNTIME_EVENTS.LOOP_THRASHING_WARNING,
-            data: {
-              step: steps,
-              pattern: 'anti_thrashing_self_diagnosis',
-              antiThrashingTriggered: true,
-              antiThrashing: {
-                file: batchAntiThrashing.file,
-                streak: batchAntiThrashing.streak,
-                contracts: batchAntiThrashing.contracts,
-                callers: batchAntiThrashing.callers,
-              },
-              fingerprint: batchAntiThrashing.fingerprint ?? null,
-              falsifiedAttemptCount: reasoningTracker.falsifiedAttempts.length,
-              ...(warnTelemetry ? { aciTelemetry: warnTelemetry } : {}),
-            },
-            audit: false,
-          });
-          messages.push({
-            role: 'user',
-            content: [{ type: 'text', text: guidanceText }],
-          });
-        }
-
         // Drain steering queued during inference/tool-batch execution before starting next step
         if (drainSteering) {
           injectSteeringMessages(drainSteering());
         }
       }
 
-      // If the execution loop ended without a normal idle verification (step budget exhausted
-      // or anti-loop thrashing break), STILL run final verification so unknown side effects
-      // or failed checks are never skipped to falsely claim completion.
+      // If the execution loop ended without a normal idle verification (step budget exhausted),
+      // run final verification so unknown side effects or explicit contract failures are surfaced.
       if (idleDecisionAction === null) {
-        if (stopReason !== 'thrashing_circuit_break') {
-          stopReason = 'max_steps';
-        }
+        stopReason = 'max_steps';
         if (this.decisionEngine?.verifier) {
           if (sm.phase !== TURN_PHASES.VERIFYING && !sm.isTerminal()) {
             sm.transition(TURN_PHASES.VERIFYING, {

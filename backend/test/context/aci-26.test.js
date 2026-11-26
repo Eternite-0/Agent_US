@@ -8,7 +8,10 @@ import { rmDirSafe } from '../fixtures.js';
 import { Store } from '../../src/store.js';
 import { AccountPool } from '../../src/pool.js';
 import { DirectAgentRuntime } from '../../src/direct-agent.js';
-import { PreInjectionAdmissionController } from '../../src/context/aci-admission.js';
+import {
+  PreInjectionAdmissionController,
+  computeTextSignalStats,
+} from '../../src/context/aci-admission.js';
 import {
   ContextEvidenceLedger,
   ReversibleContextStore,
@@ -211,7 +214,7 @@ test('v2.6 Superseded Output Eviction evicts stale reads & resolved/old errors, 
       ...makeToolStep('tc_1', 'read_file', { path: 'SPEC.md' }, contractText), // contract file protected
       ...makeToolStep('tc_2', 'read_file', { path: 'src/target.js', startLine: 1, endLine: 40 }, oldPartialReadB), // superseded by full read tc_5
       ...makeToolStep('tc_3', 'read_file', { path: 'src/alpha.js' }, preMutReadA), // superseded by edit tc_6 EVEN AT RECENT STEP!
-      ...makeToolStep('tc_4', 'run_diagnostics', { kind: 'test' }, oldFailDiag, { isError: true }), // superseded by tc_8
+      ...makeToolStep('tc_4', 'bash', { command: 'node --test test/alpha.test.js' }, oldFailDiag, { isError: true }), // superseded by tc_8
       ...makeToolStep('tc_5', 'read_file', { path: 'src/target.js' }, newerFullReadB), // aged later candidate or active
       ...makeToolStep('tc_6', 'edit_file', { path: 'src/alpha.js' }, 'Patched src/alpha.js'),
       ...makeToolStep('tc_7', 'read_file', { path: 'src/alpha.js' }, activePostMutA), // recent post-mutation read (age=1) -> PROTECTED!
@@ -509,122 +512,72 @@ test('v2.6 Partial Hash-Verified Recovery: expand_context supports omitted level
   }
 });
 
-test('v2.6 Anti-Thrashing Self-Diagnosis Guard triggers at sameFileFailedEditStreak >= 2 even across unrelated reads and names contracts + cross-file callers', () => {
-  const workDir = mkdtempSync(join(tmpdir(), 'agent-us-v26-thrash-'));
-  try {
-    mkdirSync(join(workDir, 'src'), { recursive: true });
-    writeFileSync(join(workDir, 'SPEC.md'), '# Billing Spec\ncalculatePrice must preserve currency rounding.\n');
-    writeFileSync(join(workDir, 'CONTRACT.json'), JSON.stringify({ exports: ['calculatePrice'] }));
-    writeFileSync(
-      join(workDir, 'src', 'pricing.js'),
-      'export function calculatePrice(qty, unit) { return qty * unit; }\n',
-    );
-    writeFileSync(
-      join(workDir, 'src', 'checkout.js'),
-      'import { calculatePrice } from "./pricing.js";\nexport function checkoutTotal(q, u) { return calculatePrice(q, u); }\n',
-    );
-    writeFileSync(join(workDir, 'src', 'notes.js'), 'export const notes = "unrelated";\n');
+test('v2.6+ language-agnostic structural spans and pure statistical signals work across C++, Rust, Go, Java, Python without extension/framework hardcoding', () => {
+  const rustCode = [
+    'pub fn compute_price(qty: i64, unit: i64) -> i64 {',
+    '    let subtotal = qty * unit;',
+    '    subtotal',
+    '}',
+    '',
+    'pub struct OrderBook {',
+    '    pub count: usize,',
+    '}',
+  ].join('\n');
+  const rustSpans = extractBoundedSymbolSpans('src/pricing.rs', rustCode, ['compute_price']);
+  assert.equal(rustSpans.windows.length, 1);
+  assert.equal(rustSpans.windows[0].from, 1);
+  assert.equal(rustSpans.windows[0].to, 4);
 
-    const tracker = new ExecutionReasoningTracker({ workspaceRoot: workDir });
-    tracker.setTaskContract({ contractFiles: ['SPEC.md', 'CONTRACT.json'] });
+  const goCode = [
+    'package pricing',
+    'func CalculateTotal(a int, b int) int {',
+    '    return a + b',
+    '}',
+  ].join('\n');
+  const goSpans = extractBoundedSymbolSpans('pkg/pricing.go', goCode, ['CalculateTotal']);
+  assert.equal(goSpans.windows.length, 1);
+  assert.equal(goSpans.windows[0].from, 2);
+  assert.equal(goSpans.windows[0].to, 4);
 
-    // Cycle 1: edit src/pricing.js -> fail verification
-    tracker.recordToolResult({
-      tc: { id: 'e1', name: 'edit_file' },
-      args: { path: 'src/pricing.js' },
-      output: 'Edited src/pricing.js',
-      isError: false,
-      step: 1,
-    });
-    const v1 = tracker.recordToolResult({
-      tc: { id: 't1', name: 'bash' },
-      args: { command: 'node --test test/pricing.test.js' },
-      output: 'exitCode: 1\nAssertionError: checkoutTotal mismatch',
-      isError: true,
-      step: 2,
-    });
-    assert.equal(v1.antiThrashing, null);
-    assert.equal(tracker.getState().antiThrashingTriggered, false);
+  const pyCode = [
+    'def compute_discount(total, rate):',
+    '    if rate <= 0:',
+    '        return 0',
+    '    return total * rate',
+    '',
+    'def next_fn():',
+    '    return 1',
+  ].join('\n');
+  const pySpans = extractBoundedSymbolSpans('scripts/discount', pyCode, ['compute_discount']);
+  assert.equal(pySpans.windows.length, 1);
+  assert.equal(pySpans.windows[0].from, 1);
+  assert.ok(pySpans.windows[0].to >= 4 && pySpans.windows[0].to <= 5);
+  assert.ok(pySpans.text.includes('return total * rate'));
+  assert.equal(pySpans.text.includes('next_fn'), false);
 
-    // Unrelated read between cycles resets _editTestFailCycles, NOT per-file streak!
-    tracker.recordToolResult({
-      tc: { id: 'r_unrel', name: 'read_file' },
-      args: { path: 'src/notes.js' },
-      output: 'export const notes = "unrelated";',
-      isError: false,
-      step: 3,
-    });
+  // Statistical text signals: repeatedLineRatio, charEntropy, and generic exitCode
+  const repetitiveLog = `exitCode: 0\n${'Compiling worker crate v1.0.0\n'.repeat(60)}`;
+  const repStats = computeTextSignalStats(repetitiveLog);
+  assert.equal(repStats.exitCode, 0);
+  assert.ok(repStats.repeatedLineRatio >= 0.9, `Expected high repeatedLineRatio, got ${repStats.repeatedLineRatio}`);
+  assert.ok(repStats.bytes > 1000 && repStats.tokens > 200);
 
-    // Cycle 2: edit src/pricing.js again -> fail verification again -> streak == 2!
-    tracker.recordToolResult({
-      tc: { id: 'e2', name: 'edit_file' },
-      args: { path: 'src/pricing.js' },
-      output: 'Edited src/pricing.js',
-      isError: false,
-      step: 4,
-    });
-    const v2 = tracker.recordToolResult({
-      tc: { id: 't2', name: 'bash' },
-      args: { command: 'node --test test/pricing.test.js' },
-      output: 'exitCode: 1\nAssertionError: checkoutTotal mismatch again',
-      isError: true,
-      step: 5,
-    });
-
-    assert.ok(v2.antiThrashing, 'Expected antiThrashing trigger at sameFileFailedEditStreak=2');
-    assert.equal(v2.antiThrashing.file, 'src/pricing.js');
-    assert.equal(v2.antiThrashing.streak, 2);
-    assert.ok(v2.antiThrashing.contracts.includes('SPEC.md'));
-    assert.ok(v2.antiThrashing.contracts.includes('CONTRACT.json'));
-    assert.ok(v2.antiThrashing.callers.some((c) => c.includes('src/checkout.js')));
-    assert.match(v2.antiThrashing.guidance, /src\/pricing\.js/);
-    assert.match(v2.antiThrashing.guidance, /SPEC\.md/);
-    assert.match(v2.antiThrashing.guidance, /src\/checkout\.js/);
-    assert.match(v2.antiThrashing.guidance, /query_symbol_graph/);
-
-    const metricsFail = tracker.getMetrics();
-    assert.equal(metricsFail.antiThrashingTriggered, true);
-    assert.equal(metricsFail.sameFileFailedEditStreaks['src/pricing.js'], 2);
-    assert.equal(metricsFail.aciMetrics.antiThrashingTriggered, true);
-
-    // Passing verification resets active streak counters while keeping historical trigger bit
-    tracker.recordToolResult({
-      tc: { id: 't3', name: 'bash' },
-      args: { command: 'node --test test/pricing.test.js' },
-      output: 'ok 1 - all tests passed',
-      isError: false,
-      step: 6,
-    });
-    const metricsPass = tracker.getMetrics({ finalOutcomePassed: true });
-    assert.equal(metricsPass.antiThrashingTriggered, true);
-    assert.deepEqual(metricsPass.sameFileFailedEditStreaks, {});
-  } finally {
-    rmDirSafe(workDir);
-  }
+  const failingLog = 'exitCode: 2\nerror[E0308]: mismatched types in src/pricing.rs:12\n';
+  const failStats = computeTextSignalStats(failingLog);
+  assert.equal(failStats.exitCode, 2);
+  assert.ok(failStats.charEntropy > 3.0);
 });
 
-test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci telemetry, static prompt invariance, and profile compatibility', async () => {
-  assert.ok(READ_TOOLS.has('query_symbol_graph'));
-  assert.ok(EVIDENCE_READ_TOOLS.has('query_symbol_graph'));
+test('v2.6 Core language-agnostic EVIDENCE_READ_TOOLS + DirectAgentRuntime aci_26/full_aci telemetry, static prompt invariance, and profile compatibility', async () => {
+  assert.ok(READ_TOOLS.has('read_file'));
+  assert.ok(EVIDENCE_READ_TOOLS.has('read_file'));
+  assert.ok(EVIDENCE_READ_TOOLS.has('grep'));
+  assert.ok(EVIDENCE_READ_TOOLS.has('glob'));
+  assert.equal(EVIDENCE_READ_TOOLS.has('query_symbol_graph'), false);
+  assert.equal(EVIDENCE_READ_TOOLS.has('inspect_repository'), false);
+  assert.equal(EVIDENCE_READ_TOOLS.has('run_diagnostics'), false);
 
-  // Admission ALWAYS_DIRECT bypass for query_symbol_graph even on large output
-  const admission = new PreInjectionAdmissionController();
-  const largeGraphOut = 'Caller edge\n'.repeat(250);
-  const admitRes = await admission.admitBatch(
-    [
-      {
-        tc: { id: 'q1', name: 'query_symbol_graph' },
-        parsedArgs: { symbol: 'calculatePrice' },
-        output: largeGraphOut,
-        isError: false,
-      },
-    ],
-    { step: 1 },
-  );
-  assert.equal(admitRes.decisions[0].decision, 'DIRECT');
-  assert.equal(admitRes.admittedItems[0].admission.decision, 'DIRECT');
-
-  // End-to-end DirectAgentRuntime with aciProfile='aci_26' + mock provider adapter
+  // End-to-end DirectAgentRuntime with aciProfile='aci_26' + explicit contextRecall opt-in + mock provider adapter
   const dataDir = mkdtempSync(join(tmpdir(), 'agent-us-v26-e2e-data-'));
   const workDir = mkdtempSync(join(tmpdir(), 'agent-us-v26-e2e-ws-'));
   const store = new Store(join(dataDir, 'engine.sqlite'));
@@ -716,7 +669,7 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
       yield { type: 'usage', usage: { inputTokens: 900, outputTokens: 50 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
     },
-    // Step 3: failing test #1
+    // Step 3: failing shell test #1
     async function* () {
       stepIdx += 1;
       yield {
@@ -725,14 +678,14 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
         block: {
           type: 'tool-call',
           id: 'c_test1',
-          name: 'run_diagnostics',
-          arguments: JSON.stringify({ kind: 'test' }),
+          name: 'bash',
+          arguments: JSON.stringify({ command: 'node --test pricing.test.js' }),
         },
       };
       yield { type: 'usage', usage: { inputTokens: 950, outputTokens: 30 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
     },
-    // Step 4: read unrelated.js (to verify streak still catches same-file thrashing!) + edit pricing.js wrongly again
+    // Step 4: grep callers and apply final fix to pricing.js
     async function* () {
       stepIdx += 1;
       yield {
@@ -740,9 +693,9 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
         index: 0,
         block: {
           type: 'tool-call',
-          id: 'c_unrel',
-          name: 'read_file',
-          arguments: JSON.stringify({ path: 'unrelated.js' }),
+          id: 'c_grep',
+          name: 'grep',
+          arguments: JSON.stringify({ pattern: 'computeFee' }),
         },
       };
       yield {
@@ -754,14 +707,14 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
           name: 'write_file',
           arguments: JSON.stringify({
             path: 'pricing.js',
-            content: 'export function computeFee(n) { return n * 3; }\n',
+            content: 'export function computeFee(n) { return n * 2; }\n',
           }),
         },
       };
-      yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 45 } };
+      yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 50 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
     },
-    // Step 5: failing test #2 -> triggers antiThrashingTriggered!
+    // Step 5: passing shell verification
     async function* () {
       stepIdx += 1;
       yield {
@@ -770,66 +723,14 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
         block: {
           type: 'tool-call',
           id: 'c_test2',
-          name: 'run_diagnostics',
-          arguments: JSON.stringify({ kind: 'test' }),
+          name: 'bash',
+          arguments: JSON.stringify({ command: 'node --test pricing.test.js' }),
         },
       };
-      yield { type: 'usage', usage: { inputTokens: 1050, outputTokens: 30 } };
+      yield { type: 'usage', usage: { inputTokens: 1100, outputTokens: 25 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
     },
-    // Step 6: inspect anti-thrashing tail guidance, call query_symbol_graph, fix pricing.js, and pass test!
-    async function* (opts) {
-      stepIdx += 1;
-      const tailUserText = opts.messages
-        .filter((m) => m.role === 'user')
-        .map((m) => m.content?.[0]?.text ?? '')
-        .join('\n');
-      assert.match(tailUserText, /Anti-Thrashing Self-Diagnosis/);
-      assert.match(tailUserText, /pricing\.js/);
-      assert.match(tailUserText, /caller\.js/);
-      yield {
-        type: 'block-end',
-        index: 0,
-        block: {
-          type: 'tool-call',
-          id: 'c_qsg',
-          name: 'query_symbol_graph',
-          arguments: JSON.stringify({ symbol: 'computeFee' }),
-        },
-      };
-      yield {
-        type: 'block-end',
-        index: 1,
-        block: {
-          type: 'tool-call',
-          id: 'c_edit3',
-          name: 'write_file',
-          arguments: JSON.stringify({
-            path: 'pricing.js',
-            content: 'export function computeFee(n) { return n * 2; }\n',
-          }),
-        },
-      };
-      yield { type: 'usage', usage: { inputTokens: 1100, outputTokens: 50 } };
-      yield { type: 'finish', reason: { kind: 'tool-calls' } };
-    },
-    // Step 7: passing verification
-    async function* () {
-      stepIdx += 1;
-      yield {
-        type: 'block-end',
-        index: 0,
-        block: {
-          type: 'tool-call',
-          id: 'c_test3',
-          name: 'run_diagnostics',
-          arguments: JSON.stringify({ kind: 'test' }),
-        },
-      };
-      yield { type: 'usage', usage: { inputTokens: 1150, outputTokens: 25 } };
-      yield { type: 'finish', reason: { kind: 'tool-calls' } };
-    },
-    // Step 8: final summary
+    // Step 6: final summary
     async function* () {
       yield { type: 'text-delta', index: 0, text: 'Fixed computeFee in pricing.js and verified pricing.test.js passes.' };
       yield { type: 'usage', usage: { inputTokens: 1200, outputTokens: 25 } };
@@ -851,6 +752,7 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
       model: 'mock-v26',
       workspaceRoot: workDir,
       permissionMode: 'full-access',
+      toolModes: { contextRecall: true },
     });
     offEph = runtime.subscribe(sess.id, (ev) => {
       if (ev?.type === 'aci/telemetry') ephemeralTelemetry.push(ev.data);
@@ -863,10 +765,10 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
 
     const term = await waitTurnDone(runtime, store, sess.id, turn.id, 10000);
     assert.equal(term.state, 'completed', `Turn failed: ${term.error}`);
-    assert.ok(stepIdx >= 7);
+    assert.ok(stepIdx >= 5);
 
     // Static System Prompt Invariance across ALL provider calls!
-    assert.ok(adapter.calls.length >= 6);
+    assert.ok(adapter.calls.length >= 5);
     const baseSystem = adapter.calls[0].system;
     for (let i = 1; i < adapter.calls.length; i += 1) {
       assert.equal(adapter.calls[i].system, baseSystem, `System prompt drifted on call ${i}!`);
@@ -881,27 +783,16 @@ test('v2.6 Pre-wiring query_symbol_graph + DirectAgentRuntime aci_26/full_aci te
     assert.ok(data.aciTelemetry, 'aciTelemetry emitted on turn/completed');
     assert.equal(data.aciTelemetry.aciProfile, 'aci_26');
     assert.equal(data.aciTelemetry.dtocPolicy, 'trajectory_eviction_v26');
-    assert.equal(data.aciTelemetry.antiThrashingTriggered, true);
     assert.ok(data.aciTelemetry.decisions);
-    assert.equal(data.reasoningMetrics.antiThrashingTriggered, true);
     assert.ok(capturedRefUri, 'Expected billing_rates.js to spill to artifact:// uri');
     assert.ok(data.aciTelemetry.partialRecoveries >= 1);
-
-    const thrashWarnEv = store.db
-      .prepare("SELECT * FROM direct_events WHERE turnId=? AND type='loop/thrashing_warning' ORDER BY seq ASC LIMIT 1")
-      .get(turn.id);
-    assert.ok(thrashWarnEv);
-    const warnData = JSON.parse(thrashWarnEv.data);
-    assert.equal(warnData.antiThrashingTriggered, true);
-    assert.ok(warnData.aciTelemetry, 'loop/thrashing_warning carries aciTelemetry');
     assert.ok(ephemeralTelemetry.length >= 1, 'Expected ephemeral aci/telemetry events during turn');
 
-    // Verify full_aci also defaults to trajectory_eviction_v26 on DirectAgentRuntime
+    // Verify full_aci also keeps compatible DTOC policy on DirectAgentRuntime
     const fullTurn = runtime.startTurn(sess.id, {
       input: 'Confirm tests still pass.',
       aciProfile: 'full_aci',
     });
-    // Next handler falls through to final summary
     const term2 = await waitTurnDone(runtime, store, sess.id, fullTurn.turn.id, 20_000);
     assert.equal(term2.state, 'completed');
     const comp2 = JSON.parse(

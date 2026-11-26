@@ -18,6 +18,65 @@ const VALID_EFFECTS = new Set(Object.values(EFFECT_CLASSES));
 const VALID_RISKS = new Set(Object.values(RISK_LEVELS));
 
 /**
+ * Converged language-agnostic atomic coding tools exposed by default (6 core primitives).
+ */
+export const DEFAULT_CODING_TOOLS = Object.freeze([
+  'read_file',
+  'edit_file',
+  'write_file',
+  'glob',
+  'grep',
+  'bash',
+]);
+
+/**
+ * Optional advanced tool groups mounted ONLY when their corresponding mode is explicitly enabled.
+ */
+export const ADVANCED_TOOL_GROUPS = Object.freeze({
+  patch: Object.freeze(['apply_patch']),
+  repoIntelligence: Object.freeze(['inspect_repository', 'query_symbol_graph']),
+  diagnostics: Object.freeze(['run_diagnostics']),
+  contextRecall: Object.freeze(['expand_context', 'read_blob']),
+  meta: Object.freeze(['update_plan', 'search_history', 'compute_file_digest', 'web_fetch']),
+  backgroundProcesses: Object.freeze(['start_process', 'read_process_output', 'kill_process']),
+  swarm: Object.freeze(['spawn_subagent', 'swarm_orchestrate', 'send_agent_message']),
+  webFetch: Object.freeze(['web_fetch']),
+});
+
+/**
+ * Resolves the exact set of built-in tool names to register for a workspace toolset.
+ * Defaults strictly to the 6 language-agnostic core coding primitives.
+ */
+export function resolveEnabledToolNames({
+  toolProfile = 'core',
+  toolModes = null,
+  includeTools = null,
+} = {}) {
+  const enabled = new Set(DEFAULT_CODING_TOOLS);
+  if (toolProfile === 'full') {
+    for (const groupTools of Object.values(ADVANCED_TOOL_GROUPS)) {
+      for (const name of groupTools) enabled.add(name);
+    }
+  }
+  if (toolModes && typeof toolModes === 'object') {
+    for (const [modeKey, active] of Object.entries(toolModes)) {
+      if (!active) continue;
+      const groupTools = ADVANCED_TOOL_GROUPS[modeKey];
+      if (groupTools) {
+        for (const name of groupTools) enabled.add(name);
+      }
+    }
+  }
+  if (Array.isArray(includeTools)) {
+    for (const rawName of includeTools) {
+      const name = String(rawName ?? '').trim();
+      if (name) enabled.add(name);
+    }
+  }
+  return enabled;
+}
+
+/**
  * Defines and validates a normalized ToolDefinition backed by Zod or JSON Schema.
  */
 export function defineTool(spec) {

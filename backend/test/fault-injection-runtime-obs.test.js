@@ -1234,10 +1234,10 @@ test('Phase 4 Observability E2E: all 10 KPIs, all 12 trace fields, pool routing 
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
-      // Model falsely claims all tests passed (both initially AND on repair)! Deterministic EvidenceVerifier MUST reject!
-      yield { type: 'text-delta', index: 0, text: 'All tests passed with 0 failures! Build succeeded.' };
+      // Model output truncated at max-tokens (both initially AND on repair) -> deterministic verifier MUST reject!
+      yield { type: 'text-delta', index: 0, text: 'Truncated verification report...' };
       yield { type: 'usage', usage: { inputTokens: 60, outputTokens: 15 } };
-      yield { type: 'finish', reason: { kind: 'stop' } };
+      yield { type: 'finish', reason: { kind: 'max-tokens' } };
       return;
     }
 

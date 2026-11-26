@@ -436,15 +436,6 @@ export class Engine {
                 this.verifier({ events, text: replyText, node, execution })
             : null,
         repairPolicy: this.repairPolicy,
-        stopCheck:
-          node && this.judgment?.uses?.stopCheck
-            ? (params) =>
-                this.judgment.detectPrematureStop({
-                  ...params,
-                  signal,
-                  onUsage: (usage) => this.observe('usage', execution, usage),
-                })
-            : null,
         onUsage: (usage) => this.observe('usage', execution, usage),
         onTelemetry: (telemetry) =>
           this.observe('telemetry.step', execution, {

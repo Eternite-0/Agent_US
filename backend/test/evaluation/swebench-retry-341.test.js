@@ -57,23 +57,23 @@ function sendOpenAiSuccess(res, content = 'recovered-ok') {
 }
 
 function createSingleAccountHarness(endpoint) {
-  const dir = makeTmp('swe-retry-341-');
+  const dir = makeTmp('transient-retry-');
   const store = new Store(':memory:');
   const pool = new AccountPool(store, { root: dir });
   const account = pool.createAccount({
     preset: 'openai',
-    label: 'Single Benchmark Account',
+    label: 'Single Pool Account',
     priority: 10,
     endpoint,
-    credential: 'sk-test-341',
+    credential: 'sk-test-retry',
     models: ['gpt-test'],
   });
   const adapter = new PoolLlmAdapter(pool);
   return { store, pool, account, adapter };
 }
 
-describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
-  test('Test A: single-account pool recovers from 2 consecutive HTTP 502/429 errors in benchmark mode and clears cooldown', async (t) => {
+describe('Universal Transient Upstream Exponential Backoff', () => {
+  test('Test A: default InferenceEngine recovers from consecutive HTTP 502/429/503/504 errors on a single-account pool without any mode flag', async (t) => {
     let requests = 0;
     const srv = await startOpenAiMockServer((_req, res) => {
       requests++;
@@ -87,7 +87,12 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
         res.end(JSON.stringify({ error: { message: 'Too Many Requests' } }));
         return;
       }
-      sendOpenAiSuccess(res, 'recovered-on-attempt-3');
+      if (requests === 3) {
+        res.writeHead(504, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Gateway Timeout' } }));
+        return;
+      }
+      sendOpenAiSuccess(res, 'recovered-on-attempt-4');
     });
     const { store, pool, account, adapter } = createSingleAccountHarness(srv.baseUrl);
     t.after(async () => {
@@ -98,8 +103,7 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
     const failoverEvents = [];
     const engine = new InferenceEngine(adapter, {
       pool,
-      trafficSource: 'benchmark',
-      benchmarkRetryBaseMs: 5,
+      transientRetryBaseMs: 5,
     });
 
     const result = await engine.streamStep({
@@ -109,19 +113,20 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
       onRouteFailover: (ev) => failoverEvents.push(ev),
     });
 
-    assert.equal(requests, 3);
-    assert.equal(result.text, 'recovered-on-attempt-3');
+    assert.equal(requests, 4);
+    assert.equal(result.text, 'recovered-on-attempt-4');
     assert.equal(result.route?.accountId, account.id);
-    assert.equal(failoverEvents.length, 2);
+    assert.equal(failoverEvents.length, 3);
     assert.equal(failoverEvents[0].statusCode, 502);
     assert.equal(failoverEvents[1].statusCode, 429);
+    assert.equal(failoverEvents[2].statusCode, 504);
 
     const accAfter = pool.getAccount(account.id);
     assert.equal(accAfter.status, 'healthy');
     assert.equal(Number(accAfter.cooldownUntil), 0);
   });
 
-  test('Test B: non-benchmark regression guard fast-fails after 1 attempt when exhausted: true', async (t) => {
+  test('Test B: respects maxRetries ceiling on persistent 502/503 outages and surfaces exhausted PROVIDER_UNAVAILABLE', async (t) => {
     let requests = 0;
     const srv = await startOpenAiMockServer((_req, res) => {
       requests++;
@@ -136,8 +141,8 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
 
     const engine = new InferenceEngine(adapter, {
       pool,
-      retryDelayMs: 25,
-      benchmarkRetryBaseMs: 5,
+      maxRetries: 2,
+      transientRetryBaseMs: 5,
     });
 
     await assert.rejects(
@@ -153,11 +158,11 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
         err.cause?.detail?.exhausted === true,
     );
 
-    assert.equal(requests, 1);
+    assert.equal(requests, 3, 'initial attempt + 2 retries');
     assert.equal(pool.getAccount(account.id).status, 'cooldown');
   });
 
-  test('Test C: HTTP 401 auth error in benchmark mode fast-fails on attempt 1 and clearTransientCooldowns preserves unhealthy/disabled accounts', async (t) => {
+  test('Test C: HTTP 401 auth error fast-fails on attempt 1 and clearTransientCooldowns preserves unhealthy/disabled accounts', async (t) => {
     let requests = 0;
     const srv = await startOpenAiMockServer((_req, res) => {
       requests++;
@@ -185,8 +190,7 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
 
     const engine = new InferenceEngine(adapter, {
       pool,
-      trafficSource: 'benchmark',
-      benchmarkRetryBaseMs: 5,
+      transientRetryBaseMs: 5,
     });
 
     await assert.rejects(
@@ -218,7 +222,7 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
     assert.equal(pool.getAccount(disabledCooldown.id).status, 'cooldown');
   });
 
-  test('Test D: initial excludeAccountIds remains excluded across transient retry cycles', async (t) => {
+  test('Test D: initial excludeAccountIds remains excluded across universal transient retry cycles', async (t) => {
     let excludedHits = 0;
     let activeHits = 0;
     const srv = await startOpenAiMockServer((req, res) => {
@@ -245,7 +249,7 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
       res.writeHead(404).end();
     });
 
-    const dir = makeTmp('swe-retry-excl-');
+    const dir = makeTmp('transient-retry-excl-');
     const store = new Store(':memory:');
     const pool = new AccountPool(store, { root: dir });
     const basePort = new URL(srv.baseUrl).port;
@@ -276,8 +280,7 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
     const result = await engine.streamStep({
       provider: 'pool',
       model: 'gpt-test',
-      trafficSource: 'benchmark',
-      benchmarkRetryBaseMs: 5,
+      transientRetryBaseMs: 5,
       excludeAccountIds: [excludedAcc.id],
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
     });
@@ -291,7 +294,7 @@ describe('Single-Account Benchmark Exponential Backoff (3.4.1)', () => {
   });
 
   test('hasTransientCooldownRoutes detects pool cooldowns while ignoring healthy/unhealthy routes', () => {
-    const dir = makeTmp('swe-retry-has-cd-');
+    const dir = makeTmp('transient-retry-has-cd-');
     const store = new Store(':memory:');
     const pool = new AccountPool(store, { root: dir });
     try {

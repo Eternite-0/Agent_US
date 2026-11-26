@@ -1,9 +1,6 @@
 import { createHash } from 'node:crypto';
-import { extname } from 'node:path';
 import { estimateTokens, measureRequestComposition, pairClosed } from '../context.js';
 import { redactSecrets, sanitize } from '../envelope.js';
-import { classifyMutationPath, isVerificationCommand } from '../kernel/execution-reasoning.js';
-import { extractRepositorySymbols } from '../repo-symbols.js';
 import {
   ReversibleContextStore,
   computeSliceSha256,
@@ -63,15 +60,7 @@ export const DEFAULT_V26_HEAD_PREFIX_PROTECT_MESSAGES = 3;
 export const DEFAULT_V26_SUPERSEDED_MIN_CHARS = 360;
 export const DEFAULT_V26_AGED_MIN_CHARS = 480;
 export const EVIDENCE_READ_TOOLS = Object.freeze(
-  new Set([
-    'read_file',
-    'read_blob',
-    'expand_context',
-    'glob',
-    'grep',
-    'inspect_repository',
-    'query_symbol_graph',
-  ]),
+  new Set(['read_file', 'read_blob', 'expand_context', 'glob', 'grep']),
 );
 export const ACON_SETTINGS_KEY = 'aci.learned_guidelines';
 export const ACON_MAX_GUIDELINES = 12;
@@ -114,18 +103,19 @@ const V26_COMPRESSIBLE_TOOLS = new Set([
   'read_file',
   'read_blob',
   'expand_context',
-  'run_diagnostics',
   'glob',
   'grep',
   'bash',
   'start_process',
-  'inspect_repository',
-  'query_symbol_graph',
+  'run_diagnostics',
 ]);
 const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delete_file']);
 
-const ERROR_OUTPUT_RE =
-  /(?:^exitCode:\s*[1-9]\d*\b|\bexitCode:\s*[1-9]\d*\b|exit\s+code[:=\s]+[1-9]\d*\b|\[(?:NON_ZERO_EXIT|TOOL_ERROR)\]|AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|ECONNREFUSED|Traceback \(most recent call last\)|\b(?:FAIL|FAILED|FATAL|PANIC)\b|✖\s|×\s|^not ok \d+|^\s*(?:Expected|Actual|Received)\b|^\s+at\s+\S+:\d+:\d+|^\s+File\s+".+",\s+line\s+\d+|\bTS\d{4,5}:|\berror\[E\d+\]|\bError:\s|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/m;
+const GENERIC_ERROR_OUTPUT_RE =
+  /(?:^exitCode:\s*[1-9]\d*\b|\bexitCode:\s*[1-9]\d*\b|\bexit\s+code[:=\s]+[1-9]\d*\b|\[(?:NON_ZERO_EXIT|TOOL_ERROR)\]|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/im;
+
+const GENERIC_ERROR_SIGNAL_RE =
+  /(?:^exitCode:\s*[1-9]\d*\b|\bexit\s+code[:=\s]+[1-9]\d*\b|\b\w*(?:error|exception)\b|\b(?:fail(?:ed|ure)?|fatal|panic|traceback|assert(?:ion)?)\b|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/im;
 
 const STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'from', 'that', 'this', 'into', 'when', 'where',
@@ -135,20 +125,23 @@ const STOPWORDS = new Set([
 ]);
 
 const CONTRACT_PATH_RE =
-  /(?:^|\/)(?:agents\.md|spec\.md|constraints\.md|contract\.json|package\.json|tsconfig(?:\.[^/]+)?\.json|readme\.md|.*contract.*|.*schema.*|.*interface.*|.*types?\.[^/]+|.*\.d\.ts|store\.js|routes\/[^/]+|api\/[^/]+)$/i;
+  /(?:^|\/)(?:agents\.md|spec\.md|constraints\.md|contract\.[^/]+|readme\.md|.*contract.*|.*schema.*|.*interface.*|.*types?\.[^/]+|routes\/[^/]+|api\/[^/]+)$/i;
 
 const STRICT_DTOC_CONTRACT_RE =
   /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
 
-export function detectLanguageFromPath(filePath) {
-  const ext = extname(String(filePath || '').trim().toLowerCase());
-  if (ext === '.js' || ext === '.mjs' || ext === '.cjs' || ext === '.jsx') return 'javascript';
-  if (ext === '.ts' || ext === '.tsx') return 'typescript';
-  if (ext === '.py') return 'python';
-  if (ext === '.rs') return 'rust';
-  if (ext === '.go') return 'go';
-  return null;
-}
+const GENERIC_SYMBOL_DECL_PATTERNS = [
+  { kind: 'class', re: /^\s*(?:export\s+)?(?:default\s+)?(?:pub(?:\([^)]*\))?\s+|public\s+|private\s+|protected\s+|abstract\s+|final\s+|sealed\s+|static\s+)*(?:class|struct|enum|trait|interface|record|protocol)\s+([A-Za-z_][A-Za-z0-9_]*)\b/ },
+  { kind: 'function', re: /^\s*(?:export\s+)?(?:default\s+)?(?:pub(?:\([^)]*\))?\s+|public\s+|private\s+|protected\s+|static\s+|async\s+|inline\s+|virtual\s+|extern\s+|unsafe\s+)*(?:function\*?|fn|def|func|sub|proc)\s+(?:\([^)]*\)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^>]*>)?\s*\(/ },
+  { kind: 'function', re: /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/ },
+  { kind: 'method', re: /^\s*(?:public\s+|private\s+|protected\s+|static\s+|async\s+|override\s+|virtual\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^;{}]*\)\s*(?::\s*[^={\n]+)?\{/ },
+  { kind: 'const', re: /^\s*export\s+(?:const|let|var|type)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/ },
+  { kind: 'function', re: /^\s*(?:public|private|protected|static|inline|virtual|const|constexpr|unsigned|signed|void|bool|int|long|double|float|char|auto|string|String|[A-Z][A-Za-z0-9_<>:*&]+)\s+(?:[A-Za-z0-9_:*&<>]+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:const\s*)?(?:throws\s+[A-Za-z0-9_,\s]+)?\{/ },
+];
+
+const NON_SYMBOL_KEYWORDS = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'return', 'sizeof', 'typeof', 'new', 'delete', 'await', 'match', 'else',
+]);
 
 function isAciStubText(text) {
   if (typeof text !== 'string') return false;
@@ -182,31 +175,54 @@ function tokenizeIdentifiers(text) {
 
 export function extractSymbolsFromText(filePath, text) {
   const raw = String(text ?? '');
-  const path = String(filePath || 'unknown');
-  const lang = detectLanguageFromPath(path);
-  if (lang) {
-    try {
-      const extracted = extractRepositorySymbols(path, lang, raw);
-      const defs = (extracted.definitions ?? []).map((d) => ({
-        name: d.owner ? `${d.owner}.${d.name}` : d.name,
-        shortName: d.name,
-        kind: d.kind,
-        line: d.line,
-      }));
-      const calls = (extracted.calls ?? []).map((c) => ({
-        name: c.name,
-        specifier: c.specifier ?? null,
-        line: c.line,
-      }));
-      return {
-        definitions: defs,
-        calls,
-        names: [...new Set(defs.map((d) => d.name))],
-      };
-    } catch {
-      // Fallback below
+  const lines = raw.split(/\r?\n/);
+  const defs = [];
+  const calls = [];
+  const seenDefs = new Set();
+  const isJsonLike =
+    String(filePath || '').toLowerCase().endsWith('.json') || /^\s*[\[{]/.test(raw);
+
+  if (!isJsonLike) {
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      const lineNum = i + 1;
+      if (defs.length < 64) {
+        for (const pat of GENERIC_SYMBOL_DECL_PATTERNS) {
+          const m = line.match(pat.re);
+          if (m?.[1] && !NON_SYMBOL_KEYWORDS.has(m[1])) {
+            const key = `${m[1]}@${lineNum}`;
+            if (!seenDefs.has(key)) {
+              seenDefs.add(key);
+              defs.push({
+                name: m[1],
+                shortName: m[1],
+                kind: pat.kind,
+                line: lineNum,
+              });
+            }
+            break;
+          }
+        }
+      }
+      if (calls.length < 64) {
+        for (const cm of line.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]{2,})\s*\(/g)) {
+          const callee = cm[1];
+          if (NON_SYMBOL_KEYWORDS.has(callee) || STOPWORDS.has(callee.toLowerCase())) continue;
+          calls.push({ name: callee, specifier: null, line: lineNum });
+          if (calls.length >= 64) break;
+        }
+      }
     }
   }
+
+  if (defs.length > 0) {
+    return {
+      definitions: defs,
+      calls,
+      names: [...new Set(defs.map((d) => d.name))],
+    };
+  }
+
   const headingNames = [];
   for (const m of raw.matchAll(/^#{1,4}\s+(.+)$/gm)) {
     const h = m[1].trim();
@@ -230,11 +246,11 @@ export function extractErrorFeedbackSignals(errorText) {
     return { files: [], linesByFile: {}, symbols: [], signatures: [] };
   }
 
-  // Stack frames & file:line:col references
+  // Pure generic file:line references across any language/toolchain
   const pathPatterns = [
-    /(?:at\s+([A-Za-z_$][\w$.]*)\s+\()?((?:[A-Za-z]:)?[^:\s()"'`]+\.(?:js|mjs|cjs|ts|tsx|jsx|py|rs|go|json)):(\d+)(?::\d+)?\)?/g,
+    /(?:at\s+([A-Za-z_$][\w$.]*)\s+\()?((?:[A-Za-z]:)?[^:\s()"'`]+\.[A-Za-z][A-Za-z0-9]{0,7}):(\d+)(?::\d+)?\)?/g,
     /File\s+"([^"]+)",\s+line\s+(\d+)/g,
-    /(?:FAIL|ERROR|Error in)\s+([^\s:]+\.(?:js|mjs|cjs|ts|tsx|jsx|py|rs|go))/g,
+    /(?:FAIL|FAILED|ERROR|Error in)\s+([^\s:]+\.[A-Za-z][A-Za-z0-9]{0,7})/g,
   ];
 
   for (const m of text.matchAll(pathPatterns[0])) {
@@ -276,7 +292,7 @@ export function extractErrorFeedbackSignals(errorText) {
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    if (ERROR_OUTPUT_RE.test(trimmed)) {
+    if (GENERIC_ERROR_SIGNAL_RE.test(trimmed)) {
       signatures.push(trimmed.slice(0, 180));
       for (const tok of tokenizeIdentifiers(trimmed)) {
         symbols.add(tok);
@@ -806,8 +822,7 @@ function isErrorToolMessage(msg, text) {
   const raw = String(text ?? '');
   const m = raw.match(/^<untrusted\s+id="([^"]+)"\s+bytes="\d+">([\s\S]*)<\/untrusted\s+id="\1">$/);
   const inner = m ? m[2] : raw;
-  if (/\[run_diagnostics\s+[^\]]*\bok=false\b/i.test(inner)) return true;
-  if (ERROR_OUTPUT_RE.test(inner) || ERROR_OUTPUT_RE.test(raw)) return true;
+  if (GENERIC_ERROR_OUTPUT_RE.test(inner) || GENERIC_ERROR_OUTPUT_RE.test(raw)) return true;
   return false;
 }
 
@@ -820,6 +835,12 @@ function findLatestErrorToolMessageIndex(srcMessages = []) {
     }
   }
   return -1;
+}
+
+function isDocOnlyPath(rawPath) {
+  const norm = normalizeContextPath(rawPath).toLowerCase();
+  if (!norm) return false;
+  return /\.(?:md|txt|rst)$/i.test(norm);
 }
 
 function derivePhaseSignalsFromMessages(srcMessages = [], toolCallsById = new Map(), lastMutationStepByPath = new Map()) {
@@ -841,17 +862,13 @@ function derivePhaseSignalsFromMessages(srcMessages = [], toolCallsById = new Ma
 
     if (MUTATION_TOOLS.has(lowerTool) && !isErr) {
       for (const p of extractPathsFromMutationToolCall(lowerTool, args)) {
-        if (classifyMutationPath(p) === 'src') {
+        if (!isDocOnlyPath(p)) {
           srcMutSeqByPath.set(p, seq);
         }
       }
     }
 
-    const cmd = typeof args?.command === 'string' ? args.command.trim() : '';
-    const isVerif =
-      ((lowerTool === 'bash' || lowerTool === 'start_process') && isVerificationCommand(cmd)) ||
-      (lowerTool === 'run_diagnostics' && (!args?.kind || args.kind === 'test' || args.kind === 'auto' || args.kind === 'typecheck'));
-    if (isVerif) {
+    if (isVerificationToolCall(lowerTool, args)) {
       verificationCount += 1;
       if (!isErr) {
         lastPassingVerifSeq = seq;
@@ -861,7 +878,7 @@ function derivePhaseSignalsFromMessages(srcMessages = [], toolCallsById = new Ma
 
   if (srcMutSeqByPath.size === 0 && lastMutationStepByPath.size > 0 && lastPassingVerifSeq === -1) {
     for (const mutPath of lastMutationStepByPath.keys()) {
-      if (classifyMutationPath(mutPath) === 'src') {
+      if (!isDocOnlyPath(mutPath)) {
         srcMutSeqByPath.set(mutPath, 1);
       }
     }
@@ -873,9 +890,6 @@ function derivePhaseSignalsFromMessages(srcMessages = [], toolCallsById = new Ma
   }
   return { verificationCount, unverifiedSrcMutations };
 }
-
-const V26_VERIF_CMD_HINT_RE =
-  /\b(?:node\s+--test|node\s+--check|npm\s+test|npm\s+run\s+(?:test|check|typecheck|lint|build)|pnpm\s+(?:test|run\s+(?:test|check|typecheck))|npx\s+(?:tsc|vitest|jest|eslint|pytest)|pytest|vitest|jest|cargo\s+test|go\s+test)\b/i;
 
 function unwrapUntrustedText(rawText) {
   const raw = String(rawText ?? '');
@@ -889,7 +903,7 @@ function isVerificationToolCall(lowerTool, args = {}) {
   if (lowerTool === 'run_diagnostics') return true;
   if (lowerTool === 'bash' || lowerTool === 'start_process') {
     const cmd = typeof args?.command === 'string' ? args.command.trim() : typeof args?.cmd === 'string' ? args.cmd.trim() : '';
-    return Boolean(cmd && (isVerificationCommand(cmd) || V26_VERIF_CMD_HINT_RE.test(cmd)));
+    return Boolean(cmd);
   }
   return false;
 }
@@ -1192,9 +1206,6 @@ function extractToolTargetPath(toolName, args) {
     args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? '',
   ).trim();
   if (filePath) return filePath.replace(/\\/g, '/');
-  if (lower === 'query_symbol_graph' && args?.symbol) {
-    return `query_symbol_graph:${String(args.symbol).slice(0, 60)}`;
-  }
   if (lower === 'grep' && args?.pattern) {
     return `grep:${String(args.pattern).slice(0, 60)}`;
   }
@@ -2925,10 +2936,29 @@ export function compressMessagesEpoch(
   };
 }
 
-function computeBraceOrIndentSpan(allLines, startLineNum, { lang = null, maxSpanLines = 220, fallbackRadius = 12 } = {}) {
+function isIndentDelimitedBlockHeader(allLines, startIdx) {
+  const headerSlice = allLines.slice(startIdx, Math.min(allLines.length, startIdx + 3));
+  let hasBrace = false;
+  let endsWithColon = false;
+  for (const rawLine of headerSlice) {
+    const stripped = String(rawLine ?? '').replace(/#.*$/, '').replace(/\/\/.*$/, '').trimEnd();
+    if (!stripped) continue;
+    if (stripped.includes('{')) {
+      hasBrace = true;
+      break;
+    }
+    if (stripped.endsWith(':')) {
+      endsWithColon = true;
+      break;
+    }
+  }
+  return !hasBrace && endsWithColon;
+}
+
+function computeBraceOrIndentSpan(allLines, startLineNum, { maxSpanLines = 220, fallbackRadius = 12 } = {}) {
   const totalLines = allLines.length;
   const startIdx = Math.max(0, Math.min(totalLines - 1, Number(startLineNum) - 1));
-  if (lang === 'python') {
+  if (isIndentDelimitedBlockHeader(allLines, startIdx)) {
     const firstLine = allLines[startIdx] ?? '';
     const baseIndent = firstLine.match(/^(\s*)/)?.[1]?.length ?? 0;
     let endIdx = startIdx;
@@ -3042,8 +3072,7 @@ export function extractBoundedSymbolSpans(
     };
   }
 
-  const lang = detectLanguageFromPath(filePath);
-  const extracted = extractSymbolsFromText(filePath || 'unknown.js', raw);
+  const extracted = extractSymbolsFromText(filePath || 'unknown', raw);
   const defs = extracted.definitions ?? [];
   const rawWindows = [];
   const matchedSymbols = [];
@@ -3064,7 +3093,7 @@ export function extractBoundedSymbolSpans(
       matchedSymbols.push(sym);
       for (const d of matchedDefs.slice(0, 3)) {
         const span = d.line
-          ? computeBraceOrIndentSpan(allLines, d.line, { lang, fallbackRadius })
+          ? computeBraceOrIndentSpan(allLines, d.line, { fallbackRadius })
           : { from: 1, to: Math.min(allLines.length, 1 + fallbackRadius * 2) };
         rawWindows.push({ ...span, symbol: d.name || sym, kind: d.kind || 'symbol' });
       }
@@ -3301,7 +3330,7 @@ export function expandContext(
     const extracted = extractSymbolsFromText(path, raw);
     const imports = allLines
       .map((line, i) => ({ line, num: i + 1 }))
-      .filter((x) => /^\s*(?:import|export\s+.*from|from\s+\S+\s+import|use\s+)/.test(x.line))
+      .filter((x) => /^\s*(?:#include\b|import\b|export\s+.*from\b|from\s+\S+\s+import\b|use\s+|using\s+|package\s+)/.test(x.line))
       .slice(0, 12)
       .map((x) => `L${x.num}: ${x.line.trim()}`);
     const symbolLines = extracted.definitions

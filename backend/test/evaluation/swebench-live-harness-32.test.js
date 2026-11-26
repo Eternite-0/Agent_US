@@ -371,7 +371,7 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
     assert.throws(() => parseSweBenchCliArgs(['--dry-run', '--pull', 'bad']), /Invalid --pull/);
   });
 
-  test('WP1/WP2: Docker /testbed mount + PATH, anti-cheat scrub + command guard, toolDeny hides run_diagnostics while keeping .py ast.parse', async () => {
+  test('WP1/WP2: Docker /testbed mount + PATH, anti-cheat scrub + command guard, and toolDeny hides run_diagnostics without implicit per-edit diagnostics', async () => {
     const repoDir = makeTmp('swe-wp12-repo-');
     const baseCommit = seedBuggyPythonRepo(repoDir);
 
@@ -589,8 +589,13 @@ describe('SWE-bench Live Benchmark Harness Integration (3.2)', () => {
       }
       assert.match(
         syntaxWarningToolOutput,
-        /SyntaxError|自动语法诊断|invalid syntax|was never closed/i,
-        'edit_file must still run .py ast.parse quick syntax check when run_diagnostics is denied',
+        /已成功编辑 src\/discounts\/calculator\.py/,
+        'edit_file completes cleanly without implicit per-edit diagnostics subprocesses',
+      );
+      assert.doesNotMatch(
+        syntaxWarningToolOutput,
+        /自动语法诊断/i,
+        'edit_file must remain language-agnostic without implicit per-edit syntax diagnostics',
       );
 
       const runCall = mockDocker.calls.find((c) => c.args[0] === 'run');

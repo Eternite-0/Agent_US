@@ -1,0 +1,401 @@
+name: Aider Polyglot 6-Language Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: 'Stratified Polyglot benchmark preset'
+        type: choice
+        options:
+          - polyglot-36
+          - smoke-6
+        default: polyglot-36
+      model:
+        description: 'Target provider model ID (locked default: deepseek-v4.1-flash)'
+        type: string
+        required: true
+        default: deepseek-v4.1-flash
+      modes:
+        description: 'Comma-separated 4-way modes: raw_full,full_aci,claude_code,mini_swe_agent'
+        type: string
+        required: true
+        default: raw_full,full_aci,claude_code,mini_swe_agent
+      protocol:
+        description: 'Upstream API protocol for SWEBENCH_PROTOCOL'
+        type: choice
+        options:
+          - openai
+          - anthropic
+        default: openai
+      shards:
+        description: 'Number of parallel GitHub Actions runners (strictly <= 3)'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+        default: '3'
+      languages:
+        description: 'Optional comma-separated language filter (empty = all 6: cpp,go,java,javascript,python,rust)'
+        type: string
+        required: false
+        default: ''
+      max_steps:
+        description: 'Maximum agent steps per exercise (1-80)'
+        type: string
+        default: '40'
+      limit:
+        description: 'Optional max exercises cap for quick preflight test'
+        type: string
+        required: false
+        default: ''
+      output_subdir:
+        description: 'Subfolder under backend/docs/evidence/'
+        type: string
+        default: polyglot-36
+      commit_results:
+        description: 'Auto-commit aggregated Markdown + JSON report back to branch'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-matrix:
+    name: Prepare Shard Matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.prep.outputs.matrix }}
+    steps:
+      - name: Verify API key secret is configured
+        shell: bash
+        env:
+          SWEBENCH_API_KEY: ${{ secrets.SWEBENCH_API_KEY }}
+          POLYGLOT_API_KEY: ${{ secrets.POLYGLOT_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWEBENCH_API_KEY:-}" ] && [ -z "${POLYGLOT_API_KEY:-}" ]; then
+            echo "::error title=Missing API key secret::Repository secret SWEBENCH_API_KEY (or POLYGLOT_API_KEY) is missing. Configure it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Validate workflow inputs and build shard matrix
+        id: prep
+        shell: bash
+        env:
+          INPUT_PRESET: ${{ inputs.preset }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_MODES: ${{ inputs.modes }}
+          INPUT_PROTOCOL: ${{ inputs.protocol }}
+          INPUT_SHARDS: ${{ inputs.shards }}
+          INPUT_LANGUAGES: ${{ inputs.languages }}
+          INPUT_MAX_STEPS: ${{ inputs.max_steps }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_OUTPUT_SUBDIR" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$INPUT_OUTPUT_SUBDIR" == *..* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == */* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == "." ]]; then
+            echo "::error title=Invalid output_subdir::output_subdir must match ^[A-Za-z0-9._-]+$ and must not contain '..' or '/'."
+            exit 1
+          fi
+          case "$INPUT_PRESET" in
+            smoke-6|polyglot-36) ;;
+            *)
+              echo "::error title=Invalid preset::Expected smoke-6 or polyglot-36."
+              exit 1
+              ;;
+          esac
+          case "$INPUT_PROTOCOL" in
+            openai|anthropic) ;;
+            *)
+              echo "::error title=Invalid protocol::Expected openai or anthropic."
+              exit 1
+              ;;
+          esac
+          case "$INPUT_SHARDS" in
+            1|2|3) ;;
+            *)
+              echo "::error title=Invalid shards::shards must be strictly <= 3 (one of 1, 2, 3)."
+              exit 1
+              ;;
+          esac
+          if [[ ! "$INPUT_MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || [ "$INPUT_MAX_STEPS" -gt 80 ]; then
+            echo "::error title=Invalid max_steps::max_steps must be an integer between 1 and 80."
+            exit 1
+          fi
+          if [ -n "$INPUT_LIMIT" ] && [[ ! "$INPUT_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=Invalid limit::limit must be empty or a positive integer."
+            exit 1
+          fi
+          if [ -z "$INPUT_MODEL" ] || [[ "$INPUT_MODEL" =~ [[:space:]] ]]; then
+            echo "::error title=Invalid model::model must be a non-empty provider model ID without whitespace."
+            exit 1
+          fi
+          if [[ ! "$INPUT_MODES" =~ ^[A-Za-z0-9_]+([[:space:]]*,[[:space:]]*[A-Za-z0-9_]+)*$ ]]; then
+            echo "::error title=Invalid modes::modes must be a non-empty comma-separated list of mode IDs."
+            exit 1
+          fi
+          if [ -n "$INPUT_LANGUAGES" ] && [[ ! "$INPUT_LANGUAGES" =~ ^[A-Za-z]+([[:space:]]*,[[:space:]]*[A-Za-z]+)*$ ]]; then
+            echo "::error title=Invalid languages::languages must be empty or comma-separated language names."
+            exit 1
+          fi
+          MATRIX="["
+          for ((i = 0; i < INPUT_SHARDS; i++)); do
+            if [ "$i" -gt 0 ]; then
+              MATRIX+=","
+            fi
+            MATRIX+="${i}"
+          done
+          MATRIX+="]"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Prepared ${INPUT_SHARDS} shard(s): ${MATRIX}"
+
+  run-shard:
+    name: Run Shard ${{ matrix.shard }} (of ${{ inputs.shards }})
+    needs: [prepare-matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Verify and lightweight-setup 6-language toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Python pytest (lightweight install if missing)
+          if ! command -v pytest >/dev/null 2>&1; then
+            python3 -m pip install --user --break-system-packages pytest || python3 -m pip install --user pytest
+            if [ -d "${HOME}/.local/bin" ]; then
+              echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+              export PATH="${HOME}/.local/bin:${PATH}"
+            fi
+          fi
+          # Install cmake / build-essential only if absent on ubuntu-latest
+          MISSING_APT=()
+          command -v cmake >/dev/null 2>&1 || MISSING_APT+=(cmake)
+          command -v g++ >/dev/null 2>&1 || MISSING_APT+=(g++)
+          if [ "${#MISSING_APT[@]}" -gt 0 ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends "${MISSING_APT[@]}"
+          fi
+          echo "=== Verified 6-language native toolchains ==="
+          g++ --version | head -n 1
+          cmake --version | head -n 1
+          go version
+          java -version 2>&1 | head -n 1
+          (gradle --version | head -n 3) || (mvn --version | head -n 1) || true
+          node --version
+          python3 --version
+          pytest --version
+          rustc --version
+          cargo --version
+
+      - name: Install backend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix backend ci
+
+      - name: Install external benchmark agent CLIs (on-demand)
+        shell: bash
+        env:
+          INPUT_MODES: ${{ inputs.modes }}
+        run: |
+          set -euo pipefail
+          NORM_MODES=",$(echo "$INPUT_MODES" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'),"
+          case "$NORM_MODES" in
+            *,claude_code,*)
+              echo "Installing @anthropic-ai/claude-code CLI"
+              npm install -g @anthropic-ai/claude-code
+              ;;
+          esac
+          case "$NORM_MODES" in
+            *,mini_swe_agent,*)
+              echo "Installing Python mini-swe-agent CLI (built-in ReAct fallback also available)"
+              python3 -m pip install --user --break-system-packages mini-swe-agent || python3 -m pip install --user mini-swe-agent || true
+              if [ -d "${HOME}/.local/bin" ]; then
+                echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+              fi
+              ;;
+          esac
+
+      - name: Shallow clone Aider Polyglot benchmark & prepare JS test deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --single-branch https://github.com/Aider-AI/polyglot-benchmark.git /tmp/polyglot-benchmark
+          if [ -f /tmp/polyglot-benchmark/javascript/package.json ]; then
+            npm --prefix /tmp/polyglot-benchmark/javascript install --no-audit --no-fund
+          fi
+
+      - name: Run Polyglot shard benchmark
+        shell: bash
+        env:
+          SWEBENCH_API_KEY: ${{ secrets.SWEBENCH_API_KEY }}
+          SWEBENCH_ENDPOINT: ${{ secrets.SWEBENCH_ENDPOINT }}
+          SWEBENCH_PROTOCOL: ${{ inputs.protocol }}
+          POLYGLOT_API_KEY: ${{ secrets.POLYGLOT_API_KEY }}
+          POLYGLOT_ENDPOINT: ${{ secrets.POLYGLOT_ENDPOINT }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          INPUT_PRESET: ${{ inputs.preset }}
+          INPUT_SHARDS: ${{ inputs.shards }}
+          INPUT_MODES: ${{ inputs.modes }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_LANGUAGES: ${{ inputs.languages }}
+          INPUT_MAX_STEPS: ${{ inputs.max_steps }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/polyglot-out
+          ARGS=(
+            backend/scripts/benchmark-polyglot.mjs
+            --preset "$INPUT_PRESET"
+            --modes "$INPUT_MODES"
+            --model "$INPUT_MODEL"
+            --protocol "$SWEBENCH_PROTOCOL"
+            --shard-index "$SHARD_INDEX"
+            --shard-count "$INPUT_SHARDS"
+            --benchmark-dir /tmp/polyglot-benchmark
+            --max-steps "$INPUT_MAX_STEPS"
+            --no-use-app-pool
+            --output "/tmp/polyglot-out/shard-${SHARD_INDEX}.json"
+          )
+          if [ -n "$INPUT_LANGUAGES" ]; then
+            ARGS+=(--languages "$INPUT_LANGUAGES")
+          fi
+          if [ -n "$INPUT_LIMIT" ]; then
+            ARGS+=(--limit "$INPUT_LIMIT")
+          fi
+          node "${ARGS[@]}"
+
+      - name: Upload shard output artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: polyglot-shard-${{ matrix.shard }}
+          path: /tmp/polyglot-out
+          if-no-files-found: warn
+
+  aggregate-report:
+    name: Aggregate Shards & Publish 4-Way Report
+    needs: [prepare-matrix, run-shard]
+    if: always() && needs.prepare-matrix.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix backend ci
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: polyglot-shard-*
+          path: /tmp/polyglot-shards
+
+      - name: Aggregate shard JSON results into Markdown + JSON report
+        shell: bash
+        env:
+          INPUT_PRESET: ${{ inputs.preset }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_MODES: ${{ inputs.modes }}
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_OUTPUT_SUBDIR" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$INPUT_OUTPUT_SUBDIR" == *..* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == */* ]] || [[ "$INPUT_OUTPUT_SUBDIR" == "." ]]; then
+            echo "::error::Invalid output_subdir: ${INPUT_OUTPUT_SUBDIR}"
+            exit 1
+          fi
+          OUT_DIR="backend/docs/evidence/${INPUT_OUTPUT_SUBDIR}"
+          node backend/scripts/benchmark-polyglot.mjs \
+            --aggregate /tmp/polyglot-shards \
+            --preset "$INPUT_PRESET" \
+            --model "$INPUT_MODEL" \
+            --modes "$INPUT_MODES" \
+            --output "$OUT_DIR"
+
+      - name: Write 4-way report to GitHub Step Summary
+        if: always()
+        shell: bash
+        env:
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+        run: |
+          set -euo pipefail
+          SUMMARY_FILE="backend/docs/evidence/${INPUT_OUTPUT_SUBDIR}/summary.md"
+          if [ -f "$SUMMARY_FILE" ]; then
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary.md generated at ${SUMMARY_FILE}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload aggregated report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: polyglot-report-${{ inputs.output_subdir }}
+          path: backend/docs/evidence/${{ inputs.output_subdir }}
+          if-no-files-found: warn
+
+      - name: Commit and push aggregated report
+        if: inputs.commit_results == true
+        shell: bash
+        env:
+          INPUT_OUTPUT_SUBDIR: ${{ inputs.output_subdir }}
+          INPUT_PRESET: ${{ inputs.preset }}
+          INPUT_MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="backend/docs/evidence/${INPUT_OUTPUT_SUBDIR}"
+          if [ ! -d "$OUT_DIR" ]; then
+            echo "Output directory ${OUT_DIR} does not exist; skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$OUT_DIR"
+          if git diff --cached --quiet; then
+            echo "No changes in ${OUT_DIR}; skipping commit."
+            exit 0
+          fi
+          git commit -m "docs(eval): update Polyglot ${INPUT_PRESET} results (${INPUT_MODEL}) [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase && git push; then
+              exit 0
+            fi
+            echo "Push attempt ${attempt}/3 failed; retrying..." >&2
+            sleep 3
+          done
+          echo "::error::Failed to push aggregated Polyglot results after 3 attempts"
+          exit 1

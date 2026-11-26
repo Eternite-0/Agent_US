@@ -5,9 +5,30 @@ import { basename, isAbsolute, join, parse, posix as posixPath, relative, resolv
 import { promisify } from 'node:util';
 import { analyzeCommand, scanCommandSyntax } from '../tools/command-analyzer.js';
 import { buildStrictSandboxEnv, runHardenedGit } from '../tools/benchmark-sandbox.js';
-import { killProcessTree } from '../tools/sandbox.js';
+import { killProcessTree, resolveConfinedPath } from '../tools/sandbox.js';
 
 const execFileAsync = promisify(execFile);
+
+export const DEFAULT_CONTAINER_WORKDIR = '/testbed';
+
+/**
+ * Validates and normalizes an absolute POSIX container working directory
+ * (defaults to `/testbed`) without allowing root `/` or shell metacharacters.
+ */
+export function normalizeContainerWorkdir(rawWorkdir = DEFAULT_CONTAINER_WORKDIR) {
+  const value = rawWorkdir == null || String(rawWorkdir).trim() === ''
+    ? DEFAULT_CONTAINER_WORKDIR
+    : String(rawWorkdir).trim();
+  const posixRaw = value.replace(/\\/g, '/');
+  if (!posixRaw.startsWith('/') || /[\r\n\0\s'"`$;|&<>()]/.test(posixRaw)) {
+    throw new Error(`Invalid containerWorkdir "${rawWorkdir}": must be a safe absolute POSIX path`);
+  }
+  const normalized = posixPath.normalize(posixRaw).replace(/\/+$/, '');
+  if (!normalized || normalized === '/') {
+    throw new Error(`Invalid containerWorkdir "${rawWorkdir}": must not be root "/"`);
+  }
+  return normalized;
+}
 
 export const SWEBENCH_DOCKER_PRESETS = Object.freeze({
   epoch: 'ghcr.io/epoch-research/swe-bench.eval.x86_64.{instance_id}:latest',
@@ -729,8 +750,10 @@ export async function extractTestbedFromImage({
   dockerBin = 'docker',
   execFileImpl = null,
   gitRunner = null,
+  containerWorkdir = DEFAULT_CONTAINER_WORKDIR,
 } = {}) {
   const img = validateNonEmptyFlagArg(image, 'Docker image');
+  const workdir = normalizeContainerWorkdir(containerWorkdir);
   if (!targetDir || !String(targetDir).trim()) {
     throw new Error('targetDir is required for extractTestbedFromImage');
   }
@@ -753,7 +776,7 @@ export async function extractTestbedFromImage({
   let usedSymlinkFallback = false;
   try {
     try {
-      await invokeExecFile(execFileImpl, dockerBin, ['cp', `${cid}:/testbed/.`, resolvedTargetDir], {
+      await invokeExecFile(execFileImpl, dockerBin, ['cp', `${cid}:${workdir}/.`, resolvedTargetDir], {
         env,
         windowsHide: true,
         timeout: 300_000,
@@ -784,7 +807,7 @@ export async function extractTestbedFromImage({
             `${hostMount}:/out:rw`,
             img,
             '-c',
-            'cd /testbed && find . -mindepth 1 ! -type l -print0 | tar --no-recursion --null -T - -cf - | tar -C /out -xm --no-same-owner --no-same-permissions -f -',
+            `cd ${workdir} && find . -mindepth 1 ! -type l -print0 | tar --no-recursion --null -T - -cf - | tar -C /out -xm --no-same-owner --no-same-permissions -f -`,
           ],
           {
             env,
@@ -799,7 +822,7 @@ export async function extractTestbedFromImage({
         await invokeExecFile(
           execFileImpl,
           dockerBin,
-          ['cp', `${cid}:/testbed/.git`, join(resolvedTargetDir, '.git')],
+          ['cp', `${cid}:${workdir}/.git`, join(resolvedTargetDir, '.git')],
           {
             env,
             windowsHide: true,
@@ -1256,21 +1279,22 @@ function unwrapTokens(rawTokens) {
   return rawTokens.slice(idx);
 }
 
-function isSafeGitSafeDirectoryConfigArgs(rest) {
+function isSafeGitSafeDirectoryConfigArgs(rest, containerWorkdir = DEFAULT_CONTAINER_WORKDIR) {
   if (!Array.isArray(rest) || rest.length < 3) return false;
   if (String(rest[0] ?? '').toLowerCase() !== 'config') return false;
+  const workdir = normalizeContainerWorkdir(containerWorkdir);
   let idx = 1;
   if (rest[idx] === '--global') idx++;
   if (rest[idx] === '--add') idx++;
   return (
     idx === rest.length - 2 &&
     rest[idx] === 'safe.directory' &&
-    rest[idx + 1] === '/testbed'
+    rest[idx + 1] === workdir
   );
 }
 
-function isAntiCheatGitArgs(rest) {
-  if (isSafeGitSafeDirectoryConfigArgs(rest)) {
+function isAntiCheatGitArgs(rest, containerWorkdir = DEFAULT_CONTAINER_WORKDIR) {
+  if (isSafeGitSafeDirectoryConfigArgs(rest, containerWorkdir)) {
     return false;
   }
   let subcmd = null;
@@ -1312,7 +1336,7 @@ function isAntiCheatGitArgs(rest) {
 
 const SHELL_BINARIES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
 
-function hasAntiCheatTextOrSegments(cmdText, depth = 0) {
+function hasAntiCheatTextOrSegments(cmdText, depth = 0, containerWorkdir = DEFAULT_CONTAINER_WORKDIR) {
   if (depth > 4) return true;
   const text = String(cmdText ?? '');
   if (analyzeCommand(text).hardBlocked) return true;
@@ -1329,14 +1353,14 @@ function hasAntiCheatTextOrSegments(cmdText, depth = 0) {
   const parsed = extractShellSegmentsAndSubshells(text);
   if (parsed.unbalanced) return true;
   for (const seg of parsed.segments) {
-    if (segmentHasAntiCheatViolation(seg, depth + 1)) {
+    if (segmentHasAntiCheatViolation(seg, depth + 1, containerWorkdir)) {
       return true;
     }
   }
   return false;
 }
 
-function segmentHasAntiCheatViolation(segment, depth = 0) {
+function segmentHasAntiCheatViolation(segment, depth = 0, containerWorkdir = DEFAULT_CONTAINER_WORKDIR) {
   if (depth > 4) return true;
   const dequoted = segment.replace(/['"`\\]/g, '');
   if (
@@ -1358,13 +1382,13 @@ function segmentHasAntiCheatViolation(segment, depth = 0) {
   const rest = unwrapped.slice(1);
 
   if (head === 'git') {
-    return isAntiCheatGitArgs(rest);
+    return isAntiCheatGitArgs(rest, containerWorkdir);
   }
 
   if (SHELL_BINARIES.has(head)) {
     const cIdx = rest.findIndex((t) => t === '-c' || /^-[a-z]*c[a-z]*$/i.test(t));
     if (cIdx >= 0 && rest[cIdx + 1]) {
-      return hasAntiCheatTextOrSegments(rest[cIdx + 1], depth + 1);
+      return hasAntiCheatTextOrSegments(rest[cIdx + 1], depth + 1, containerWorkdir);
     }
   }
 
@@ -1479,7 +1503,7 @@ function isSafeHostTestSegment(segment) {
   return false;
 }
 
-function isSafeContainerSegment(segment) {
+function isSafeContainerSegment(segment, containerWorkdir = DEFAULT_CONTAINER_WORKDIR) {
   const stripped = stripLeadingEnvVars(segment, { allowSubshellChars: true });
   if (stripped.invalid) return false;
   if (!stripped.rest) return false;
@@ -1500,12 +1524,12 @@ function isSafeContainerSegment(segment) {
   if (head === 'sh' || head === 'bash') {
     const cIdx = rest.findIndex((t) => t === '-c' || /^-[a-z]*c[a-z]*$/i.test(t));
     if (cIdx < 0 || !rest[cIdx + 1]) return false;
-    return isAuthorizedSweBenchCommand(rest[cIdx + 1], { containerMode: true });
+    return isAuthorizedSweBenchCommand(rest[cIdx + 1], { containerMode: true, containerWorkdir });
   }
 
   if (head === 'git') {
-    if (isSafeGitSafeDirectoryConfigArgs(rest)) return true;
-    if (isAntiCheatGitArgs(rest)) return false;
+    if (isSafeGitSafeDirectoryConfigArgs(rest, containerWorkdir)) return true;
+    if (isAntiCheatGitArgs(rest, containerWorkdir)) return false;
     const sub = rest.find((t) => !t.startsWith('-'))?.toLowerCase();
     if (!sub) return rest.every((t) => t === '--version' || t === '-v' || t === '--help');
     return SAFE_CONTAINER_GIT_SUBCOMMANDS.has(sub);
@@ -1565,7 +1589,11 @@ function isSafeContainerSegment(segment) {
  */
 export function isAuthorizedSweBenchCommand(
   command,
-  { customTestCmd = null, containerMode = false } = {},
+  {
+    customTestCmd = null,
+    containerMode = false,
+    containerWorkdir = DEFAULT_CONTAINER_WORKDIR,
+  } = {},
 ) {
   const cmd = String(command ?? '').trim();
   if (!cmd || /[\0]/.test(cmd)) return false;
@@ -1576,7 +1604,7 @@ export function isAuthorizedSweBenchCommand(
   const parsed = extractShellSegmentsAndSubshells(cmd);
   if (parsed.unbalanced || !parsed.segments.length) return false;
 
-  if (hasAntiCheatTextOrSegments(cmd)) {
+  if (hasAntiCheatTextOrSegments(cmd, 0, containerWorkdir)) {
     return false;
   }
 
@@ -1591,17 +1619,19 @@ export function isAuthorizedSweBenchCommand(
     return isSafeHostTestSegment(parsed.segments[0]);
   }
 
-  return parsed.segments.every((seg) => isSafeContainerSegment(seg));
+  return parsed.segments.every((seg) => isSafeContainerSegment(seg, containerWorkdir));
 }
 
 /**
  * Isolated per-instance SWE-bench Docker container adapter mounting the host
- * workspace at `/testbed` and enforcing Conda PATH and anti-cheat command guards.
+ * workspace at `containerWorkdir` (default `/testbed`) and enforcing Conda PATH
+ * and anti-cheat command guards.
  */
 export class SweBenchDockerAdapter {
   constructor({
     image,
     workspaceRoot,
+    containerWorkdir = DEFAULT_CONTAINER_WORKDIR,
     pull = 'missing',
     network = 'none',
     memory = '2g',
@@ -1625,6 +1655,7 @@ export class SweBenchDockerAdapter {
       throw new Error(`Invalid pull policy "${pull}"; expected one of: missing, always, never`);
     }
     this.workspaceRoot = resolve(String(workspaceRoot));
+    this.containerWorkdir = normalizeContainerWorkdir(containerWorkdir);
     this.pull = pull;
     this.network = validateNonEmptyFlagArg(network, 'Docker network');
     this.memory = validateNonEmptyFlagArg(memory, 'Docker memory');
@@ -1668,12 +1699,48 @@ export class SweBenchDockerAdapter {
       networkIsolated: this.network === 'none',
       pathConfined: true,
       isSweBenchContainer: true,
+      containerWorkdir: this.containerWorkdir,
     };
+  }
+
+  /**
+   * Translates a container path (prefixed with `this.containerWorkdir`), a
+   * workspace-relative path, or a host path inside `this.workspaceRoot` into a
+   * verified host `{ full, rel }` tuple via `resolveConfinedPath`.
+   */
+  mapContainerPathToHost(rawPath) {
+    const input = String(rawPath ?? '').trim();
+    if (!input) {
+      throw new Error('Container path must not be empty');
+    }
+    const rootAbs = resolve(this.workspaceRoot);
+    const rootPosix = rootAbs.replace(/\\/g, '/').replace(/\/+$/, '');
+    const cw = this.containerWorkdir;
+    const rawPosix = input.replace(/\\/g, '/');
+    const trimmedRawPosix = rawPosix.replace(/\/+$/, '') || '/';
+    const alreadyInsideHostRoot =
+      trimmedRawPosix === rootPosix || rawPosix.startsWith(`${rootPosix}/`);
+
+    let effectiveInput = input;
+    if (!alreadyInsideHostRoot && (rawPosix === cw || rawPosix.startsWith(`${cw}/`))) {
+      const normPosix = posixPath.normalize(rawPosix).replace(/\/+$/, '') || '/';
+      if (normPosix === cw) {
+        effectiveInput = '.';
+      } else if (normPosix.startsWith(`${cw}/`)) {
+        effectiveInput = normPosix.slice(cw.length + 1) || '.';
+      } else {
+        throw new Error(`Container path "${rawPath}" escapes workspaceRoot "${this.workspaceRoot}"`);
+      }
+    }
+
+    return resolveConfinedPath(rootAbs, effectiveInput);
   }
 
   mapHostCwdToContainer(cwd = this.workspaceRoot) {
     const raw = cwd == null || String(cwd).trim() === '' ? this.workspaceRoot : String(cwd).trim();
     const rootAbs = resolve(this.workspaceRoot);
+    const cw = this.containerWorkdir;
+    const cwRel = cw.slice(1);
 
     const checkInside = (base, cand) => {
       const rel = relative(base, cand);
@@ -1706,26 +1773,34 @@ export class SweBenchDockerAdapter {
     };
 
     const rawPosix = raw.replace(/\\/g, '/');
-    if (rawPosix === '/testbed' || rawPosix.startsWith('/testbed/')) {
+    const rootPosix = rootAbs.replace(/\\/g, '/').replace(/\/+$/, '');
+    const trimmedRawPosix = rawPosix.replace(/\/+$/, '') || '/';
+    const alreadyInsideHostRoot =
+      trimmedRawPosix === rootPosix || rawPosix.startsWith(`${rootPosix}/`);
+
+    if (!alreadyInsideHostRoot && (rawPosix === cw || rawPosix.startsWith(`${cw}/`))) {
       const normPosix = posixPath.normalize(rawPosix).replace(/\/+$/, '') || '/';
-      if (normPosix === '/testbed') return '/testbed';
-      if (!normPosix.startsWith('/testbed/')) {
+      if (normPosix === cw) return cw;
+      if (!normPosix.startsWith(`${cw}/`)) {
         throw new Error(`Working directory "${cwd}" escapes workspaceRoot "${this.workspaceRoot}"`);
       }
-      const subRel = normPosix.slice('/testbed/'.length);
+      const subRel = normPosix.slice(cw.length + 1);
       validateInsideWithSymlinks(join(rootAbs, subRel));
       return normPosix;
     }
 
     const trimmedPosix = rawPosix.replace(/\/+$/, '');
-    if ((trimmedPosix === 'testbed' || trimmedPosix === './testbed') && !existsSync(join(rootAbs, 'testbed'))) {
-      return '/testbed';
+    if (
+      (trimmedPosix === cwRel || trimmedPosix === `./${cwRel}`) &&
+      !existsSync(join(rootAbs, ...cwRel.split('/')))
+    ) {
+      return cw;
     }
 
     const targetAbs = isAbsolute(raw) ? resolve(raw) : resolve(rootAbs, raw);
     const canonicalRel = validateInsideWithSymlinks(targetAbs);
     const posixRel = canonicalRel ? canonicalRel.split(/[\\/]/).filter(Boolean).join('/') : '';
-    return posixRel ? posixPath.join('/testbed', posixRel) : '/testbed';
+    return posixRel ? posixPath.join(cw, posixRel) : cw;
   }
 
   async start() {
@@ -1742,6 +1817,7 @@ export class SweBenchDockerAdapter {
         });
 
         const hostMount = realpathIfExists(this.workspaceRoot);
+        const workdir = this.containerWorkdir;
         const runArgs = [
           'run',
           '-d',
@@ -1751,9 +1827,9 @@ export class SweBenchDockerAdapter {
           ...(this.memorySwap ? [`--memory-swap=${this.memorySwap}`] : []),
           `--cpus=${this.cpus}`,
           '-v',
-          `${hostMount}:/testbed:rw`,
+          `${hostMount}:${workdir}:rw`,
           '-w',
-          '/testbed',
+          workdir,
           '-e',
           `PATH=${DEFAULT_TESTBED_PATH}`,
           '-e',
@@ -1771,7 +1847,7 @@ export class SweBenchDockerAdapter {
           '-e',
           'GIT_CONFIG_KEY_0=safe.directory',
           '-e',
-          'GIT_CONFIG_VALUE_0=/testbed',
+          `GIT_CONFIG_VALUE_0=${workdir}`,
           this.image,
           'tail',
           '-f',
@@ -1807,7 +1883,7 @@ export class SweBenchDockerAdapter {
             cid,
             'sh',
             '-c',
-            'git config --global --add safe.directory /testbed 2>/dev/null || true',
+            `git config --global --add safe.directory ${workdir} 2>/dev/null || true`,
           ],
           {
             env: buildDockerClientEnv(),
@@ -1846,7 +1922,11 @@ export class SweBenchDockerAdapter {
 
     if (
       !skipAntiCheatGuard &&
-      !isAuthorizedSweBenchCommand(cmd, { customTestCmd: this.customTestCmd, containerMode: true })
+      !isAuthorizedSweBenchCommand(cmd, {
+        customTestCmd: this.customTestCmd,
+        containerMode: true,
+        containerWorkdir: this.containerWorkdir,
+      })
     ) {
       throw new Error(`Blocked unauthorized or anti-cheat SWE-bench command: ${cmd}`);
     }
@@ -1973,6 +2053,7 @@ export class SweBenchDockerAdapter {
       const getgidFn = this.getgid ?? process.getgid;
       const rawGid = typeof getgidFn === 'function' ? getgidFn() : uid;
       const gid = Number.isInteger(rawGid) && rawGid >= 0 ? rawGid : uid;
+      const workdir = this.containerWorkdir;
 
       await invokeExecFile(
         this.execFileImpl,
@@ -1984,7 +2065,7 @@ export class SweBenchDockerAdapter {
           cid,
           'sh',
           '-c',
-          `chown -R ${uid}:${gid} /testbed 2>/dev/null || chmod -R a+rwX /testbed 2>/dev/null || true`,
+          `chown -R ${uid}:${gid} ${workdir} 2>/dev/null || chmod -R a+rwX ${workdir} 2>/dev/null || true`,
         ],
         {
           env: buildDockerClientEnv(),

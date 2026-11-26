@@ -14,7 +14,6 @@ import {
   applyFuzzyEdit,
   computeUnifiedDiff,
   runDiagnostics,
-  runQuickDiagnostics,
 } from '../../patch-and-diagnostics.js';
 import { EFFECT_CLASSES, RISK_LEVELS, defineTool } from '../registry.js';
 import { isProtectedPathSegment, resolveConfinedPath } from '../sandbox.js';
@@ -107,7 +106,14 @@ export function createFsTools({
   onBeforeMutate,
   onFileChanged,
   onHookConfigMutated = null,
+  includeApplyPatch = false,
+  includeDiagnostics = false,
+  resolvePath = null,
 }) {
+  const resolveTargetPath =
+    typeof resolvePath === 'function'
+      ? (rawPath) => resolvePath(rawPath)
+      : (rawPath) => resolveConfinedPath(workspaceRoot, rawPath);
   const notifyIfHookConfig = (rel, full, toolName, action = 'write') => {
     if (!isExecutableConfigPath(rel, { workspaceRoot, dataRoot })) return '';
     try {
@@ -139,7 +145,7 @@ export function createFsTools({
     });
   };
 
-  return [
+  const tools = [
     defineTool({
       name: 'read_file',
       description:
@@ -155,7 +161,7 @@ export function createFsTools({
       }),
       async execute(args, ctx) {
         await guardFallback('read_file', args, ctx);
-        const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+        const { full, rel } = resolveTargetPath(args.path);
         if (!existsSync(full)) return `文件不存在: ${rel}`;
         const st = statSync(full);
         if (st.isDirectory()) {
@@ -183,7 +189,7 @@ export function createFsTools({
     defineTool({
       name: 'edit_file',
       description:
-        '单文件局部修改首选工具：基于精确上下文块做局部替换（先用 read_file 获取最新内容，target 复制真实代码且不要带行号前缀；若文件已变化或目标不匹配，重新读取再编辑）。跨多文件或多处不连续 hunk 的原子修改可用 apply_patch；快速语法诊断不代替测试。',
+        '单文件局部修改首选工具：基于精确上下文块做局部替换（先用 read_file 获取最新内容，target 复制真实代码且不要带行号前缀；若文件已变化或目标不匹配，重新读取再编辑）。',
       effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
       riskLevel: RISK_LEVELS.MEDIUM,
       replayable: true,
@@ -195,7 +201,7 @@ export function createFsTools({
         replaceAll: z.boolean().optional().describe('是否替换全部匹配项（默认 false）'),
       }),
       async execute(args, ctx) {
-        const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+        const { full, rel } = resolveTargetPath(args.path);
         if (!existsSync(full)) throw new Error(`文件不存在: ${rel}`);
         const target = String(args.target ?? '');
         const replacement = String(args.replacement ?? '');
@@ -227,14 +233,13 @@ export function createFsTools({
           sha256After: sha256Hex(applied.after),
         });
         const hookNotice = notifyIfHookConfig(rel, full, 'edit_file', 'edit');
-        const diag = runQuickDiagnostics(full, rel);
-        return `已成功编辑 ${rel}（匹配级别: ${applied.tier}，替换 ${applied.replacedCount} 处）。${diag.summary}${hookNotice}`;
+        return `已成功编辑 ${rel}（匹配级别: ${applied.tier}，替换 ${applied.replacedCount} 处）。${hookNotice}`;
       },
     }),
 
     defineTool({
       name: 'write_file',
-      description: '新建文件或完整覆写工作区内指定文件（修改已有文件优先使用 edit_file 或 apply_patch），自动创建缺失父目录并执行快速语法诊断。',
+      description: '新建文件或完整覆写工作区内指定文件（修改已有文件优先使用 edit_file 或 apply_patch），自动创建缺失父目录。',
       effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
       riskLevel: RISK_LEVELS.MEDIUM,
       replayable: true,
@@ -244,7 +249,7 @@ export function createFsTools({
         content: z.string().describe('文件完整内容'),
       }),
       async execute(args, ctx) {
-        const { full, rel } = resolveConfinedPath(workspaceRoot, args.path);
+        const { full, rel } = resolveTargetPath(args.path);
         const content = String(args.content ?? '');
         if (existsSync(full)) checkStaleFile(rel, full);
         await guardFallback(
@@ -271,127 +276,7 @@ export function createFsTools({
           sha256After: sha256Hex(content),
         });
         const hookNotice = notifyIfHookConfig(rel, full, 'write_file', existed ? 'overwrite' : 'create');
-        const diag = runQuickDiagnostics(full, rel);
-        return `${existed ? '已覆写' : '已创建'} ${rel} (${Buffer.byteLength(content, 'utf8')} bytes)。${diag.summary}${hookNotice}`;
-      },
-    }),
-
-    defineTool({
-      name: 'apply_patch',
-      serializeZodSchema: false,
-      description:
-        '高精度跨多文件/多 hunk 原子补丁工具（单文件局部修改首选 edit_file；多文件或大范围原子修改优先使用 apply_patch）：同时透明支持 Codex 补丁（`*** Begin Patch`...`*** End Patch`）与标准 unified diff（`--- a/...`/`+++ b/...`/`@@ ... @@`），支持 `expectedHashes` 乐观并发锁与提交前 JS/JSON/Python 语法校验，并返回紧凑 diff 摘要与新 SHA-256。',
-      effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
-      riskLevel: RISK_LEVELS.MEDIUM,
-      replayable: true,
-      outward: false,
-      zodSchema: z.object({
-        patch: z.string().min(1).describe('完整补丁文本（Codex 格式或标准 unified diff）'),
-        format: z
-          .enum(['auto', 'codex', 'unified'])
-          .optional()
-          .describe('补丁格式（默认 auto 自动识别）'),
-        expectedHashes: z
-          .record(z.string(), z.string())
-          .optional()
-          .describe('可选：按相对路径指定的期望 SHA-256 哈希映射，不匹配时原子拒绝并返回 OPTIMISTIC_LOCK_CONFLICT'),
-        allowSyntaxError: z
-          .boolean()
-          .optional()
-          .describe('是否允许写入存在语法错误的 JS/JSON/Python 文件（默认 false，提交前校验失败原子拒绝）'),
-      }),
-      async execute(args, ctx) {
-        const patch = String(args.patch ?? '');
-        if (!patch.trim()) throw new Error('patch 不能为空');
-        await guardFallback('apply_patch', { preview: patch.slice(0, 400) }, ctx);
-        const touched = applyCodexPatch(patch, {
-          workspaceRoot,
-          resolveSafePath: resolveConfinedPath,
-          format: args.format ?? 'auto',
-          expectedHashes: args.expectedHashes ?? null,
-          allowSyntaxError: Boolean(args.allowSyntaxError),
-          readFileState,
-          checkStale: checkStaleFile,
-          onBeforeMutate,
-          onFileChanged,
-        });
-        const diagNotes = [];
-        const hookNotices = [];
-        const summaryLines = [];
-        let totalHunkChars = 0;
-        for (const t of touched) {
-          const hn = notifyIfHookConfig(t.path, t.full, 'apply_patch', t.action);
-          if (hn) hookNotices.push(hn);
-          if (t.fromPath) {
-            readFileState.delete(stateKeyFor(t.fromPath));
-          }
-          if (t.action === 'deleted') {
-            readFileState.delete(stateKeyFor(t.path));
-          } else if (existsSync(t.full)) {
-            trackFileHash(t.path, readFileSync(t.full, 'utf8'));
-            const d = runQuickDiagnostics(t.full, t.path);
-            if (!d.ok) diagNotes.push(d.summary);
-          }
-          const shaShort = t.sha256After ? `, sha256: ${t.sha256After.slice(0, 16)}` : '';
-          summaryLines.push(`- ${t.action}: ${t.path} (+${t.additions ?? 0}/-${t.deletions ?? 0}${shaShort})`);
-          if (t.compactHunks && totalHunkChars < 2400) {
-            const hunkSlice = t.compactHunks.slice(0, 2400 - totalHunkChars);
-            totalHunkChars += hunkSlice.length;
-            summaryLines.push(hunkSlice);
-          }
-        }
-        return `原子补丁已成功应用 (${touched.length} 个文件):\n${summaryLines.join('\n')}${diagNotes.join('')}${hookNotices.join('')}`;
-      },
-    }),
-
-    defineTool({
-      name: 'run_diagnostics',
-      serializeZodSchema: false,
-      description:
-        '只读结构化诊断工具（受工作区沙箱约束）：快速执行语法检查（node --check / JSON.parse / python ast.parse）、增量类型检查（tsc --noEmit --pretty false）或测试（node --test / pytest / unittest），并将冗长输出去重压缩为带 source（tsc/node-test/pytest/unittest/syntax）、行列定位及断言详情的结构化 JSON（diagnostics、failingTests、compression）与精简摘要。',
-      effectClass: EFFECT_CLASSES.READ_ONLY,
-      riskLevel: RISK_LEVELS.LOW,
-      replayable: true,
-      outward: false,
-      zodSchema: z.object({
-        kind: z
-          .enum(['auto', 'syntax', 'typecheck', 'test', 'lint'])
-          .optional()
-          .describe('诊断类型：auto（默认）、syntax、typecheck、test、lint'),
-        paths: z
-          .array(z.string().min(1))
-          .max(50)
-          .optional()
-          .describe('可选：限定诊断的工作区内文件或子目录路径列表'),
-        testPattern: z
-          .string()
-          .max(240)
-          .optional()
-          .describe('可选：传递给 node --test --test-name-pattern 或 pytest/unittest -k 的测试名过滤模式'),
-        maxDiagnostics: z
-          .number()
-          .int()
-          .min(1)
-          .max(100)
-          .optional()
-          .describe('最多保留的诊断条目与失败测试条数（默认 25）'),
-      }),
-      async execute(args = {}, ctx) {
-        await guardFallback('run_diagnostics', args, ctx);
-        const result = runDiagnostics(workspaceRoot, {
-          kind: args.kind ?? 'auto',
-          paths: args.paths ?? [],
-          testPattern: args.testPattern ?? '',
-          maxDiagnostics: args.maxDiagnostics ?? 25,
-        });
-        const structuredJson = JSON.stringify({
-          ok: result.ok,
-          kind: result.kind,
-          diagnostics: result.diagnostics,
-          failingTests: result.failingTests,
-          compression: result.compression,
-        });
-        return wrapResult('run_diagnostics', `${result.summary}\n\n${structuredJson}`);
+        return `${existed ? '已覆写' : '已创建'} ${rel} (${Buffer.byteLength(content, 'utf8')} bytes)。${hookNotice}`;
       },
     }),
 
@@ -410,7 +295,7 @@ export function createFsTools({
       async execute(args, ctx) {
         await guardFallback('glob', args, ctx);
         const base = args.path
-          ? resolveConfinedPath(workspaceRoot, args.path).full
+          ? resolveTargetPath(args.path).full
           : resolve(workspaceRoot);
         if (!existsSync(base)) return `目录不存在: ${args.path}`;
         const files = [];
@@ -445,7 +330,7 @@ export function createFsTools({
         const query = String(args.query ?? '');
         if (!query) throw new Error('query 不能为空');
         const base = args.path
-          ? resolveConfinedPath(workspaceRoot, args.path).full
+          ? resolveTargetPath(args.path).full
           : resolve(workspaceRoot);
         if (!existsSync(base)) return `路径不存在: ${args.path}`;
         const rx = args.isRegex
@@ -497,4 +382,130 @@ export function createFsTools({
       },
     }),
   ];
+
+  if (includeApplyPatch) {
+    tools.push(
+      defineTool({
+        name: 'apply_patch',
+        serializeZodSchema: false,
+        description:
+          '高精度跨多文件/多 hunk 原子补丁工具（单文件局部修改首选 edit_file；多文件或大范围原子修改优先使用 apply_patch）：透明支持 Codex 补丁（`*** Begin Patch`...`*** End Patch`）与标准 unified diff（`--- a/...`/`+++ b/...`/`@@ ... @@`），支持 `expectedHashes` 乐观并发锁，并返回紧凑 diff 摘要与新 SHA-256。',
+        effectClass: EFFECT_CLASSES.REVERSIBLE_WRITE,
+        riskLevel: RISK_LEVELS.MEDIUM,
+        replayable: true,
+        outward: false,
+        zodSchema: z.object({
+          patch: z.string().min(1).describe('完整补丁文本（Codex 格式或标准 unified diff）'),
+          format: z
+            .enum(['auto', 'codex', 'unified'])
+            .optional()
+            .describe('补丁格式（默认 auto 自动识别）'),
+          expectedHashes: z
+            .record(z.string(), z.string())
+            .optional()
+            .describe('可选：按相对路径指定的期望 SHA-256 哈希映射，不匹配时原子拒绝并返回 OPTIMISTIC_LOCK_CONFLICT'),
+          allowSyntaxError: z
+            .boolean()
+            .optional()
+            .describe('可选：默认 true（不自动触发语言相关语法检查子进程）'),
+        }),
+        async execute(args, ctx) {
+          const patch = String(args.patch ?? '');
+          if (!patch.trim()) throw new Error('patch 不能为空');
+          await guardFallback('apply_patch', { preview: patch.slice(0, 400) }, ctx);
+          const touched = applyCodexPatch(patch, {
+            workspaceRoot,
+            resolveSafePath: (_root, rawPath) => resolveTargetPath(rawPath),
+            format: args.format ?? 'auto',
+            expectedHashes: args.expectedHashes ?? null,
+            allowSyntaxError: args.allowSyntaxError ?? true,
+            readFileState,
+            checkStale: checkStaleFile,
+            onBeforeMutate,
+            onFileChanged,
+          });
+          const hookNotices = [];
+          const summaryLines = [];
+          let totalHunkChars = 0;
+          for (const t of touched) {
+            const hn = notifyIfHookConfig(t.path, t.full, 'apply_patch', t.action);
+            if (hn) hookNotices.push(hn);
+            if (t.fromPath) {
+              readFileState.delete(stateKeyFor(t.fromPath));
+            }
+            if (t.action === 'deleted') {
+              readFileState.delete(stateKeyFor(t.path));
+            } else if (existsSync(t.full)) {
+              trackFileHash(t.path, readFileSync(t.full, 'utf8'));
+            }
+            const shaShort = t.sha256After ? `, sha256: ${t.sha256After.slice(0, 16)}` : '';
+            summaryLines.push(`- ${t.action}: ${t.path} (+${t.additions ?? 0}/-${t.deletions ?? 0}${shaShort})`);
+            if (t.compactHunks && totalHunkChars < 2400) {
+              const hunkSlice = t.compactHunks.slice(0, 2400 - totalHunkChars);
+              totalHunkChars += hunkSlice.length;
+              summaryLines.push(hunkSlice);
+            }
+          }
+          return `原子补丁已成功应用 (${touched.length} 个文件):\n${summaryLines.join('\n')}${hookNotices.join('')}`;
+        },
+      }),
+    );
+  }
+
+  if (includeDiagnostics) {
+    tools.push(
+      defineTool({
+        name: 'run_diagnostics',
+        serializeZodSchema: false,
+        description:
+          '只读结构化诊断工具（受工作区沙箱约束，可选高级模式启用）：执行语法检查、类型检查或测试，并将冗长输出去重压缩为结构化 JSON（diagnostics、failingTests、compression）与精简摘要。',
+        effectClass: EFFECT_CLASSES.READ_ONLY,
+        riskLevel: RISK_LEVELS.LOW,
+        replayable: true,
+        outward: false,
+        zodSchema: z.object({
+          kind: z
+            .enum(['auto', 'syntax', 'typecheck', 'test', 'lint'])
+            .optional()
+            .describe('诊断类型：auto（默认）、syntax、typecheck、test、lint'),
+          paths: z
+            .array(z.string().min(1))
+            .max(50)
+            .optional()
+            .describe('可选：限定诊断的工作区内文件或子目录路径列表'),
+          testPattern: z
+            .string()
+            .max(240)
+            .optional()
+            .describe('可选：测试名过滤模式'),
+          maxDiagnostics: z
+            .number()
+            .int()
+            .min(1)
+            .max(100)
+            .optional()
+            .describe('最多保留的诊断条目与失败测试条数（默认 25）'),
+        }),
+        async execute(args = {}, ctx) {
+          await guardFallback('run_diagnostics', args, ctx);
+          const result = runDiagnostics(workspaceRoot, {
+            kind: args.kind ?? 'auto',
+            paths: args.paths ?? [],
+            testPattern: args.testPattern ?? '',
+            maxDiagnostics: args.maxDiagnostics ?? 25,
+          });
+          const structuredJson = JSON.stringify({
+            ok: result.ok,
+            kind: result.kind,
+            diagnostics: result.diagnostics,
+            failingTests: result.failingTests,
+            compression: result.compression,
+          });
+          return wrapResult('run_diagnostics', `${result.summary}\n\n${structuredJson}`);
+        },
+      }),
+    );
+  }
+
+  return tools;
 }

@@ -694,7 +694,7 @@ describe('Agent_US 2.4 Autonomous Reasoning Benchmark Suite', () => {
       assert.equal(summary.candidate.probes?.degenerateReplanGuard?.code, 'PLANNER_DEGENERATE_REPLAN_DENIED');
       assert.equal(summary.candidate.probes?.stuckLoopSelfCorrection?.detected, true);
       assert.equal(summary.candidate.probes?.stuckLoopSelfCorrection?.recovered, true);
-      assert.equal(summary.candidate.probes?.stuckLoopSelfCorrection?.pattern, 'edit_test_fail_loop');
+      assert.equal(summary.candidate.probes?.stuckLoopSelfCorrection?.pattern, 'exact_repeat');
       const lines = readFileSync(outPath, 'utf8').trim().split(/\r?\n/).map((l) => JSON.parse(l));
       assert.equal(lines.length, 4);
       const ar01Trial = lines.find((r) => r.taskId === 'ar-01-unfamiliar-codebase');

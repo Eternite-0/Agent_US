@@ -341,7 +341,11 @@ test('Fix A4-A6: Explicit digest-bound hook trust survives restart and is invali
     });
     direct.adapter = editAdapter;
     direct.kernel.inference.adapter = editAdapter;
-    const sessPatch = direct.createSession({ workspaceRoot: workDir, permissionMode: 'auto-safe' });
+    const sessPatch = direct.createSession({
+      workspaceRoot: workDir,
+      permissionMode: 'auto-safe',
+      toolModes: { patch: true },
+    });
     const tPatch = direct.startTurn(sessPatch.id, { input: 'patch hooks.json' });
     const dPatch = await waitTurnSettled(direct, sessPatch.id, tPatch.turn.id);
     assert.equal(dPatch.state, 'completed');

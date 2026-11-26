@@ -817,7 +817,7 @@ test('Post-test completion reserve gates non-essential tools, runs Stage-1 stale
   );
   writeFileSync(
     join(workDir, 'src', 'stale_big.txt'),
-    Array.from({ length: 420 }, (_, i) => `LOG LINE ${i}: informational trace output ${'abcdef12'.repeat(5)}`).join('\n'),
+    Array.from({ length: 180 }, (_, i) => `LOG LINE ${i}: informational trace output ${'abcdef12'.repeat(6)}`).join('\n'),
     'utf8',
   );
 
@@ -870,8 +870,8 @@ test('Post-test completion reserve gates non-essential tools, runs Stage-1 stale
           arguments: JSON.stringify({ command: 'node --test test/app.test.js' }),
         },
       };
-      // Consume enough tokens that remaining (~5500) <= completionReserveTokens (~9000) while unpruned prompt > 5500!
-      yield { type: 'usage', usage: { inputTokens: 10100, outputTokens: 1000 } };
+      // Consume enough tokens that remaining (~3700) <= completionReserveTokens while unpruned prompt + headroom > 3700!
+      yield { type: 'usage', usage: { inputTokens: 11900, outputTokens: 1000 } };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }

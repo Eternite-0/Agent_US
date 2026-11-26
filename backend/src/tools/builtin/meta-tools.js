@@ -95,9 +95,19 @@ export function createMetaTools({
   runSubagent = null,
   orchestrateSwarm = null,
   sendAgentMessage = null,
+  includeTools = null,
   signal = undefined,
 }) {
-  const tools = [
+  const allowedSet =
+    includeTools instanceof Set
+      ? includeTools
+      : Array.isArray(includeTools)
+        ? new Set(includeTools)
+        : null;
+  const want = (name) => allowedSet === null || allowedSet.has(name);
+  const tools = [];
+  if (want('update_plan')) {
+    tools.push(
     defineTool({
       name: 'update_plan',
       isConcurrencySafe: () => false,
@@ -226,7 +236,11 @@ export function createMetaTools({
         return `任务清单已更新（${done}/${steps.length} 已完成）。`;
       },
     }),
+    );
+  }
 
+  if (want('search_history')) {
+    tools.push(
     defineTool({
       name: 'search_history',
       description:
@@ -253,7 +267,11 @@ export function createMetaTools({
         return wrapResult('search_history', lines.join('\n'));
       },
     }),
+    );
+  }
 
+  if (want('read_blob')) {
+    tools.push(
     defineTool({
       name: 'read_blob',
       description: '读取被折叠溢写到 artifact://<sha256> 的超长工具输出片段。',
@@ -283,7 +301,11 @@ export function createMetaTools({
         );
       },
     }),
+    );
+  }
 
+  if (want('compute_file_digest')) {
+    tools.push(
     defineTool({
       name: 'compute_file_digest',
       readOnly: true,
@@ -362,7 +384,11 @@ export function createMetaTools({
         );
       },
     }),
+    );
+  }
 
+  if (want('expand_context')) {
+    tools.push(
     defineTool({
       name: 'expand_context',
       readOnly: true,
@@ -477,11 +503,11 @@ export function createMetaTools({
 
         if (level === 'outline') {
           mode = 'outline';
-          const pathForParse = blob.path || 'file.js';
+          const pathForParse = blob.path || 'file';
           const extracted = extractSymbolsFromText(pathForParse, fullText);
           const imports = lines
             .map((line, i) => ({ line, num: i + 1 }))
-            .filter((x) => /^\s*(?:import|export\s+.*from|from\s+\S+\s+import|use\s+)/.test(x.line))
+            .filter((x) => /^\s*(?:#include\b|import\b|export\s+.*from\b|from\s+\S+\s+import\b|use\s+|using\s+|package\s+)/.test(x.line))
             .slice(0, 16)
             .map((x) => `L${x.num}: ${x.line.trim()}`);
           const symbolLines = (extracted.definitions ?? [])
@@ -508,7 +534,7 @@ export function createMetaTools({
             rangeDesc = `hunk lines ${sLine}-${eLine}/${lines.length}`;
           } else if (requestedSymbols.length > 0) {
             const spanRes = extractBoundedSymbolSpans(
-              blob.path || 'file.js',
+              blob.path || 'file',
               fullText,
               requestedSymbols,
               { fallbackRadius: 12, maxChars },
@@ -537,7 +563,7 @@ export function createMetaTools({
         } else if (requestedSymbols.length > 0) {
           mode = 'symbol';
           const spanRes = extractBoundedSymbolSpans(
-            blob.path || 'file.js',
+            blob.path || 'file',
             fullText,
             requestedSymbols,
             { fallbackRadius: 12, maxChars },
@@ -593,7 +619,11 @@ export function createMetaTools({
         );
       },
     }),
+    );
+  }
 
+  if (want('web_fetch')) {
+    tools.push(
     defineTool({
       name: 'web_fetch',
       description: '只读抓取公开 HTTPS 网页内容用于查阅文档（自动防御 SSRF、DNS 重绑定、跳转与提示注入）。',
@@ -625,9 +655,10 @@ export function createMetaTools({
         return wrapResult('web_fetch', `${text.slice(0, 16000)}${suffix}`);
       },
     }),
-  ];
+    );
+  }
 
-  if (typeof runSubagent === 'function') {
+  if (want('spawn_subagent') && typeof runSubagent === 'function') {
     tools.push(
       defineTool({
         name: 'spawn_subagent',
@@ -692,7 +723,7 @@ export function createMetaTools({
     );
   }
 
-  if (typeof orchestrateSwarm === 'function') {
+  if (want('swarm_orchestrate') && typeof orchestrateSwarm === 'function') {
     tools.push(
       defineTool({
         name: 'swarm_orchestrate',
@@ -717,7 +748,7 @@ export function createMetaTools({
     );
   }
 
-  if (typeof sendAgentMessage === 'function') {
+  if (want('send_agent_message') && typeof sendAgentMessage === 'function') {
     tools.push(
       defineTool({
         name: 'send_agent_message',

@@ -250,6 +250,7 @@ test('apply_patch enforces optimistic concurrency lock atomicity via expectedHas
     store,
     readFileState,
     permissionMode: 'auto-safe',
+    toolModes: { patch: true },
     onFileChanged: (c) => dispatchedChanges.push(c),
   });
   const dispatcher = new ToolDispatcher({
@@ -493,11 +494,22 @@ test('run_diagnostics compresses 1200-line noisy output, executes syntax/test ch
   const store = new Store(join(dataDir, 'engine.sqlite'));
   t.after(() => store.close());
   const nonce = mintNonce();
+  const defaultTools = createWorkspaceTools({
+    workspaceRoot: root,
+    store,
+    nonce,
+    permissionMode: 'read-only',
+  });
+  assert.equal(defaultTools.length, 6, `default tools must converge to 6 core primitives, got ${defaultTools.length}`);
+  assert.equal(defaultTools.find((tl) => tl.name === 'apply_patch'), undefined);
+  assert.equal(defaultTools.find((tl) => tl.name === 'run_diagnostics'), undefined);
+
   const tools = createWorkspaceTools({
     workspaceRoot: root,
     store,
     nonce,
     permissionMode: 'read-only',
+    toolModes: { diagnostics: true, patch: true },
   });
   const dispatcher = new ToolDispatcher({
     store,
@@ -672,6 +684,7 @@ test('findCrossFileReferences, findRelatedTests, and inspect_repository return c
     workspaceRoot: root,
     store,
     permissionMode: 'read-only',
+    toolModes: { repoIntelligence: true },
   });
   const dispatcher = new ToolDispatcher({
     store,

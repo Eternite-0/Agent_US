@@ -43,7 +43,13 @@ export function modelToolCatalog(tools, policy, live) {
     } else if (tool.name === 'apply_patch') {
       description += ' 多文件或多处不连续 hunk 的原子修改优先使用 apply_patch（而非整文件 write_file）。';
     } else if (tool.name === 'write_file' && (names.has('edit_file') || names.has('apply_patch'))) {
-      description += ' 修改已有文件优先使用 edit_file 或 apply_patch；write_file 仅用于新建文件或整文件覆写。';
+      const editChoices = [
+        names.has('edit_file') ? 'edit_file' : null,
+        names.has('apply_patch') ? 'apply_patch' : null,
+      ]
+        .filter(Boolean)
+        .join(' 或 ');
+      description += ` 修改已有文件优先使用 ${editChoices}；write_file 仅用于新建文件或整文件覆写。`;
     } else if (tool.name === 'run_diagnostics') {
       description += ' 优先用于快速结构化语法/类型/测试检查。';
     } else if (tool.name === 'query_symbol_graph') {
@@ -52,7 +58,7 @@ export function modelToolCatalog(tools, policy, live) {
     if (decision === 'conditional') {
       const routes = tool.name === 'bash' && alternatives(names);
       description += `${routes ? ` 仓库侦察不用 shell：${routes}。` : ''}命令受策略逐条检查${live.permissionMode === 'read-only' ? '，仅限策略识别的只读命令' : '，可能需审批'}。`;
-      if (tool.name === 'bash') description += '测试按给定命令原样单独运行，不加管道、重定向或退出码包装。';
+      if (tool.name === 'bash') description += '按项目原生构建或测试命令执行并检查真实退出状态。';
     } else if (decision === 'ask') description += ' 需审批。';
     return { name: tool.name, description, parameters: tool.parameters };
   });

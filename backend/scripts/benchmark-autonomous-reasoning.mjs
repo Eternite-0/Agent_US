@@ -392,7 +392,7 @@ class DeterministicProbeAdapter extends LlmAdapter {
       (m) =>
         m.role === 'user' &&
         (m.content ?? []).some((b) =>
-          /STALE_VERIFICATION_AFTER_EDIT|UNRESOLVED_VERIFICATION_FAILURE|FABRICATED_PASS_CLAIM|验证未通过|复测/.test(
+          /output_truncated|被截断|验证未通过|复测/i.test(
             String(b?.text ?? ''),
           ),
         ),
@@ -455,14 +455,14 @@ class DeterministicProbeAdapter extends LlmAdapter {
     }
 
     if (this.requirePostEditVerify && !sawRepair && !hasToolResult('final-verify')) {
-      // Attempt to stop immediately after editing without post-edit test verification.
+      // Simulate an objective truncated turn (max-tokens / output_truncated) so EvidenceVerifier triggers a repair round.
       yield {
         type: 'text-delta',
         index: 0,
-        text: JSON.stringify(buildAutonomousReasoningEvidenceOutput(this.task).output),
+        text: JSON.stringify(buildAutonomousReasoningEvidenceOutput(this.task).output).slice(0, 80),
       };
       yield { type: 'usage', usage: { inputTokens: 190, outputTokens: 50 } };
-      yield { type: 'finish', reason: { kind: 'stop' } };
+      yield { type: 'finish', reason: { kind: 'max-tokens' } };
       return;
     }
 
@@ -1586,7 +1586,7 @@ export async function runArmDiagnosticProbes(armRuntime) {
     };
   }
 
-  // Probe 2: Stuck-loop self-correction (edit_test_fail_loop -> diagnostic steering -> read_file pivot -> recovery)
+  // Probe 2: Stuck-loop self-correction (6x consecutive identical tool calls -> byte-level tail dedup reminder -> read_file pivot -> recovery)
   const probeDir = mkdtempSync(join(tmpdir(), 'agent-us-ar-probe-'));
   const probeWork = join(probeDir, 'ws');
   mkdirSync(join(probeWork, 'src'), { recursive: true });
@@ -1612,10 +1612,6 @@ export async function runArmDiagnosticProbes(armRuntime) {
       .run(turnId, sessionId, 'Fix src/bug.js so val equals 42', 'probe-model', 'running', 'init', 0, now);
 
     const eventRouter = new EventRouter(store);
-    const thrashEvents = [];
-    eventRouter.subscribe(sessionId, (ev) => {
-      if (ev?.type === 'loop/thrashing_warning') thrashEvents.push(ev);
-    });
     const reconciler = new UnknownOutcomeReconciler(store, eventRouter);
     const checkpointStore = new CheckpointStore(store);
     const verifier = new EvidenceVerifier({ store, eventRouter });
@@ -1644,10 +1640,12 @@ export async function runArmDiagnosticProbes(armRuntime) {
       async *stream(opts) {
         probeStep += 1;
         const msgs = opts.messages ?? [];
-        const sawSteering = msgs.some(
+        const sawDedupReminder = msgs.some(
           (m) =>
-            m.role === 'user' &&
-            (m.content ?? []).some((b) => String(b?.text ?? '').includes('系统防死循环提示')),
+            m.role === 'tool' &&
+            (m.content ?? []).some((b) =>
+              String(b?.text ?? '').includes('repeated 6 consecutive times'),
+            ),
         );
         const hasReadBug = msgs.some(
           (m) =>
@@ -1658,30 +1656,17 @@ export async function runArmDiagnosticProbes(armRuntime) {
         const lastToolMsg = [...msgs].reverse().find((m) => m.role === 'tool');
         const lastPassed = String(lastToolMsg?.content?.[0]?.text ?? '').includes('pass 1');
 
-        if (!sawSteering) {
-          if (probeStep % 2 === 1) {
-            yield {
-              type: 'block-end',
-              index: 0,
-              block: {
-                type: 'tool-call',
-                id: `probe-w-${probeStep}`,
-                name: 'write_file',
-                arguments: JSON.stringify({ path: 'src/bug.js', content: `export const val = ${probeStep};\n` }),
-              },
-            };
-          } else {
-            yield {
-              type: 'block-end',
-              index: 0,
-              block: {
-                type: 'tool-call',
-                id: `probe-t-${probeStep}`,
-                name: 'bash',
-                arguments: JSON.stringify({ command: 'node --test test/bug.test.js' }),
-              },
-            };
-          }
+        if (!sawDedupReminder) {
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: {
+              type: 'tool-call',
+              id: `probe-repeat-${probeStep}`,
+              name: 'bash',
+              arguments: JSON.stringify({ command: 'node --test test/bug.test.js' }),
+            },
+          };
           yield { type: 'usage', usage: { inputTokens: 50, outputTokens: 20 } };
           yield { type: 'finish', reason: { kind: 'tool-calls' } };
           return;
@@ -1722,7 +1707,7 @@ export async function runArmDiagnosticProbes(armRuntime) {
           yield { type: 'finish', reason: { kind: 'tool-calls' } };
           return;
         }
-        yield { type: 'text-delta', index: 0, text: 'Recovered from edit_test_fail_loop after inspecting src/bug.js.' };
+        yield { type: 'text-delta', index: 0, text: 'Recovered from exact_repeat after inspecting src/bug.js.' };
         yield { type: 'usage', usage: { inputTokens: 50, outputTokens: 20 } };
         yield { type: 'finish', reason: { kind: 'stop' } };
       }
@@ -1738,7 +1723,7 @@ export async function runArmDiagnosticProbes(armRuntime) {
     const loopRes = await loop.run({
       sessionId,
       turnId,
-      profile: { name: 'eval', defaultMaxSteps: 10, streamDeltas: false, persistTurn: true },
+      profile: { name: 'eval', defaultMaxSteps: 12, streamDeltas: false, persistTurn: true },
       input: 'Fix src/bug.js so val equals 42',
       model: 'probe-model',
       messages: [
@@ -1748,15 +1733,17 @@ export async function runArmDiagnosticProbes(armRuntime) {
       tools,
       toolDispatcher: dispatcher,
       permissionMode: 'full-access',
-      budget: { maxSteps: 10 },
+      budget: { maxSteps: 12 },
       workspaceRoot: probeWork,
-      execution: { requirePostEditVerification: true },
     });
 
     const rm = loopRes.reasoningMetrics ?? {};
-    const detectedPattern = thrashEvents[0]?.data?.pattern ?? rm.stuckDetections?.[0]?.pattern ?? null;
+    const detectedPattern = rm.stuckDetections?.[0]?.pattern ?? null;
     stuckLoopSelfCorrection = {
-      detected: thrashEvents.length > 0 || (Array.isArray(rm.stuckDetections) && rm.stuckDetections.length > 0),
+      detected:
+        Array.isArray(rm.stuckDetections) &&
+        rm.stuckDetections.length > 0 &&
+        Number(rm.duplicateReminderCount ?? 0) >= 1,
       recovered: loopRes.status === 'completed' && Boolean(rm.selfCorrectionRecovered),
       pattern: detectedPattern,
       status: loopRes.status,

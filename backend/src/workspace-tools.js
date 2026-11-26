@@ -15,7 +15,15 @@ import {
   formatRepositorySummary,
   querySymbolGraph,
 } from './repo-intelligence.js';
-import { EFFECT_CLASSES, RISK_LEVELS, ToolRegistry, defineTool } from './tools/registry.js';
+import {
+  ADVANCED_TOOL_GROUPS,
+  DEFAULT_CODING_TOOLS,
+  EFFECT_CLASSES,
+  RISK_LEVELS,
+  ToolRegistry,
+  defineTool,
+  resolveEnabledToolNames,
+} from './tools/registry.js';
 import { ToolPermissionPolicy } from './tools/policy.js';
 import {
   HostSandboxAdapter,
@@ -30,7 +38,12 @@ import {
 } from './tools/builtin/shell-tools.js';
 import { createMetaTools } from './tools/builtin/meta-tools.js';
 
-export { BackgroundProcessManager };
+export {
+  ADVANCED_TOOL_GROUPS,
+  BackgroundProcessManager,
+  DEFAULT_CODING_TOOLS,
+  resolveEnabledToolNames,
+};
 
 export const WORKSPACE_TOOL_META = Object.freeze({
   read_file: { readOnly: true, risk: 'low', effectClass: 'read_only', replayable: true, outward: false },
@@ -356,6 +369,9 @@ export function createWorkspaceTools({
   sessionId = null,
   permissionMode = 'auto-safe',
   nonce = '',
+  toolProfile = 'core',
+  toolModes = null,
+  includeTools = null,
   getLivePolicy = null,
   getApprovedPrefixes = () => [],
   readFileState = new Map(),
@@ -497,7 +513,22 @@ export function createWorkspaceTools({
     verifyAndClearPermitProof(permit);
   };
 
+  const enabledNames = resolveEnabledToolNames({ toolProfile, toolModes, includeTools });
+  const resolveWorkspacePath =
+    typeof hostSandbox?.mapContainerPathToHost === 'function'
+      ? (rawPath) => hostSandbox.mapContainerPathToHost(rawPath)
+      : null;
   const registry = new ToolRegistry();
+  const shellTools = createShellTools({
+    workspaceRoot,
+    bgProcs,
+    sandbox: hostSandbox,
+    signal,
+    wrapResult,
+    guardFallback,
+    onToolOutput,
+  }).filter((tool) => enabledNames.has(tool.name));
+
   registry.registerMany([
     ...createFsTools({
       workspaceRoot,
@@ -508,16 +539,11 @@ export function createWorkspaceTools({
       onBeforeMutate,
       onFileChanged,
       onHookConfigMutated,
+      includeApplyPatch: enabledNames.has('apply_patch'),
+      includeDiagnostics: enabledNames.has('run_diagnostics'),
+      resolvePath: resolveWorkspacePath,
     }),
-    ...createShellTools({
-      workspaceRoot,
-      bgProcs,
-      sandbox: hostSandbox,
-      signal,
-      wrapResult,
-      guardFallback,
-      onToolOutput,
-    }),
+    ...shellTools,
     ...createMetaTools({
       workspaceRoot,
       store,
@@ -530,18 +556,27 @@ export function createWorkspaceTools({
       orchestrateSwarm,
       sendAgentMessage,
       resolveContextRef,
+      includeTools: enabledNames,
       signal,
     }),
-    createInspectRepositoryTool({
-      workspaceRoot,
-      wrapResult,
-      guardFallback,
-    }),
-    createQuerySymbolGraphTool({
-      workspaceRoot,
-      wrapResult,
-      guardFallback,
-    }),
+    ...(enabledNames.has('inspect_repository')
+      ? [
+          createInspectRepositoryTool({
+            workspaceRoot,
+            wrapResult,
+            guardFallback,
+          }),
+        ]
+      : []),
+    ...(enabledNames.has('query_symbol_graph')
+      ? [
+          createQuerySymbolGraphTool({
+            workspaceRoot,
+            wrapResult,
+            guardFallback,
+          }),
+        ]
+      : []),
   ]);
 
   return registry.list();

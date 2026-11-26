@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { estimateTokens } from '../context.js';
 import { redactSecrets, sanitize } from '../envelope.js';
-import { extractRepositorySymbols } from '../repo-symbols.js';
 import {
   ReversibleContextStore,
   formatAciRefStub,
@@ -28,36 +27,19 @@ export const DEFAULT_OVERSIZED_SEARCH_MAX_RENDERED_CHARS = 2800;
 
 const VALID_DECISIONS = new Set(Object.values(ADMISSION_DECISIONS));
 const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delete_file']);
-const EXEC_ERROR_TOOLS = new Set(['bash', 'start_process', 'run_diagnostics']);
-const READ_ONLY_DEDUP_TOOLS = new Set([
-  'read_file',
-  'grep',
-  'glob',
-  'inspect_repository',
-  'query_symbol_graph',
-]);
-const NOISY_PROBE_TOOLS = new Set([
-  'grep',
-  'glob',
-  'bash',
-  'start_process',
-  'inspect_repository',
-  'run_diagnostics',
-]);
-const ALWAYS_DIRECT_TOOLS = new Set([
-  'compute_file_digest',
-  'expand_context',
-  'query_symbol_graph',
-  'read_blob',
-  'update_plan',
-  'search_history',
-]);
+const EXEC_ERROR_TOOLS = new Set(['bash', 'start_process']);
+const READ_ONLY_DEDUP_TOOLS = new Set(['read_file', 'grep', 'glob']);
+const NOISY_PROBE_TOOLS = new Set(['grep', 'glob', 'bash', 'start_process']);
+const ALWAYS_DIRECT_TOOLS = new Set(['expand_context', 'read_blob']);
 
-const ERROR_OUTPUT_RE =
-  /(?:^exitCode:\s*[1-9]\d*\b|exit\s+code[:=\s]+[1-9]\d*\b|AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|ECONNREFUSED|Traceback \(most recent call last\)|\b(?:FAIL|FAILED|FATAL|PANIC)\b|✖\s|×\s|^not ok \d+|^\s*(?:Expected|Actual|Received)\b|^\s+at\s+\S+:\d+:\d+|^\s+File\s+".+",\s+line\s+\d+|\bTS\d{4,5}:|\berror\[E\d+\]|\bError:\s|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/m;
+const GENERIC_EXEC_ERROR_RE =
+  /(?:^exitCode:\s*[1-9]\d*\b|\bexit\s+code[:=\s]+[1-9]\d*\b|\[(?:NON_ZERO_EXIT|TOOL_ERROR)\]|^(?:FILE_NOT_FOUND|EISDIR|参数校验失败|安全策略拦截|文件不存在|读取失败|错误[:：]))/im;
 
-const EXEC_FAILURE_CUE_RE =
-  /(?:Traceback \(most recent call last\)|^\s*File\s+".+",\s+line\s+\d+|AssertionError|\b(?:FAIL|FAILED|ERROR|FATAL|PANIC)\b|not ok \d+|failingTests|^\s*E\s+(?:assert|AssertionError)|=== FAILURES ===|--- FAIL:)/;
+const GENERIC_SALIENT_FAILURE_RE =
+  /(?:\b\w*(?:error|exception)\b|\b(?:fail(?:ed|ure)?|fatal|panic|traceback|assert(?:ion)?)\b|^exitCode:\s*[1-9]\d*\b)/i;
+
+const STRUCTURED_JSON_STATUS_RE = /\{[\s\S]*"ok"\s*:\s*(?:true|false)\b/;
+const STRUCTURED_JSON_FAILURE_RE = /"ok"\s*:\s*false\b/;
 
 const DECOY_PATH_SEGMENT_RE =
   /(?:^|\/)(?:legacy|archive|v0|v1[-_]compat|backup|old[-_]version|mock[-_]data|storybook)(?:\/|$)/i;
@@ -84,19 +66,19 @@ const DOMAIN_RULES = Object.freeze({
     pathRe:
       /(?:^|\/|_|-)(?:store|db|database|sqlite|sql|migrat|schema|persist|persistence|storage|repo|repository|ledger|checkpoint|snapshot|blob|cache|state|wal)(?:$|\/|_|-|\.)/i,
     contentRe:
-      /\b(?:CREATE\s+TABLE|ALTER\s+TABLE|BEGIN\s+TRANSACTION|COMMIT|ROLLBACK|DatabaseSync|prepare\(|sqlite|putBlob|getBlob|persist|checkpoint|schemaVersion|migration)\b/i,
+      /\b(?:CREATE\s+TABLE|ALTER\s+TABLE|BEGIN\s+TRANSACTION|COMMIT|ROLLBACK|sqlite|persist|checkpoint|schemaVersion|migration)\b/i,
   },
   contract: {
     pathRe:
-      /(?:^|\/)(?:agents\.md|spec\.md|constraints\.md|contract\.json|package\.json|tsconfig(?:\.[^/]+)?\.json|openapi\.[^/]+|.*contract.*|.*schema.*|.*interface.*|.*types?\.[^/]+|.*\.d\.ts|routes\/[^/]+|api\/[^/]+)$/i,
+      /(?:^|\/)(?:agents\.md|spec\.md|constraints\.md|contract\.[^/]+|openapi\.[^/]+|.*contract.*|.*schema.*|.*interface.*|.*types?\.[^/]+|routes\/[^/]+|api\/[^/]+)$/i,
     contentRe:
-      /\b(?:interface\s+[A-Z]\w*|export\s+type\s+[A-Z]\w*|z\.object\(|JSONSchema|Evidence\s+Manifest|CONTRACT|precedence|C[1-9]\d*\b)/,
+      /\b(?:interface\s+[A-Z]\w*|JSONSchema|Evidence\s+Manifest|CONTRACT|precedence|C[1-9]\d*\b)/,
   },
   hidden_acceptance: {
     pathRe:
-      /(?:^|\/)(?:tests?|__tests__|acceptance|verify|verifier|spec)\/|\.(?:test|spec|acceptance)\.[cm]?[jt]sx?$/i,
+      /(?:^|\/)(?:tests?|__tests__|acceptance|verify|verifier|spec)\/|[._-](?:test|spec|acceptance)\.[^/]+$/i,
     contentRe:
-      /\b(?:assert\.|expect\(|describe\(|it\(|test\(|acceptanceCriteria|hidden_acceptance|invariant)\b/i,
+      /\b(?:assert|expect|acceptanceCriteria|hidden_acceptance|invariant)\b/i,
   },
 });
 
@@ -107,8 +89,77 @@ const STOPWORDS = new Set([
   'async', 'await', 'class', 'new', 'try', 'catch', 'throw', 'else', 'if',
   'src', 'lib', 'app', 'dist', 'build', 'test', 'tests', 'spec', 'docs', 'file',
   'files', 'code', 'fix', 'add', 'check', 'update', 'edit', 'read', 'write',
-  'mjs', 'cjs', 'jsx', 'tsx', 'json', 'yaml', 'yml', 'txt',
+  'json', 'yaml', 'yml', 'txt',
 ]);
+
+export function parseShellExitCode(text) {
+  const raw = String(text ?? '');
+  const m =
+    raw.match(/(?:^|\n)exitCode:\s*(-?\d+)\b/) ??
+    raw.match(/\bexit\s+code[:=\s]+(-?\d+)\b/i);
+  if (!m) return null;
+  const code = Number(m[1]);
+  return Number.isInteger(code) ? code : null;
+}
+
+function normalizeLineTemplate(line) {
+  return String(line ?? '')
+    .trim()
+    .replace(/\b0x[0-9a-f]+\b/gi, '<hex>')
+    .replace(/\b[0-9a-f]{8,}\b/gi, '<hex>')
+    .replace(/\d+/g, '<n>')
+    .slice(0, 120);
+}
+
+/**
+ * Pure language-agnostic structural & statistical signal analyzer for any tool output:
+ * byte/token length, repeated-line ratio, Shannon char entropy, and shell exitCode.
+ */
+export function computeTextSignalStats(text) {
+  const raw = String(text ?? '');
+  const chars = raw.length;
+  const bytes = Buffer.byteLength(raw, 'utf8');
+  const tokens = estimateTokens(raw);
+  const lines = raw ? raw.split(/\r?\n/) : [];
+  const nonEmpty = lines.map((l) => l.trim()).filter(Boolean);
+  const templateCounts = new Map();
+  let duplicateLines = 0;
+  for (const line of nonEmpty) {
+    const tpl = normalizeLineTemplate(line);
+    const prev = templateCounts.get(tpl) ?? 0;
+    if (prev > 0) duplicateLines += 1;
+    templateCounts.set(tpl, prev + 1);
+  }
+  const repeatedLineRatio =
+    nonEmpty.length >= 2 ? Number((duplicateLines / nonEmpty.length).toFixed(4)) : 0;
+
+  let charEntropy = 0;
+  const sampleLen = Math.min(chars, 16384);
+  if (sampleLen > 0) {
+    const freq = new Map();
+    for (let i = 0; i < sampleLen; i += 1) {
+      const ch = raw.charCodeAt(i);
+      freq.set(ch, (freq.get(ch) ?? 0) + 1);
+    }
+    let h = 0;
+    for (const count of freq.values()) {
+      const p = count / sampleLen;
+      h -= p * Math.log2(p);
+    }
+    charEntropy = Number(h.toFixed(4));
+  }
+
+  return {
+    chars,
+    bytes,
+    tokens,
+    lineCount: lines.length,
+    nonEmptyLineCount: nonEmpty.length,
+    repeatedLineRatio,
+    charEntropy,
+    exitCode: parseShellExitCode(raw),
+  };
+}
 
 function sha256Hex(text) {
   return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
@@ -189,14 +240,24 @@ function renderOversizedExecLogSummary({
     headLines.push(`${i + 1}: ${clipSummaryLine(rawLines[i], 180)}`);
   }
 
-  // Extract failure/traceback windows
+  // Extract rare / non-repetitive salient failure windows using generic statistical frequency + cues
+  const templateCounts = new Map();
+  for (let i = 0; i < totalLines; i += 1) {
+    const trimmed = rawLines[i].trim();
+    if (!trimmed) continue;
+    const tpl = normalizeLineTemplate(trimmed);
+    templateCounts.set(tpl, (templateCounts.get(tpl) ?? 0) + 1);
+  }
   const matchWindows = [];
   for (let i = 0; i < totalLines; i += 1) {
     const line = rawLines[i];
-    if (!EXEC_FAILURE_CUE_RE.test(line)) continue;
-    const isTraceback = /Traceback \(most recent call last\)/i.test(line);
-    const from = Math.max(0, i - (isTraceback ? 1 : 2));
-    const to = Math.min(totalLines - 1, i + (isTraceback ? 12 : 5));
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const freq = templateCounts.get(normalizeLineTemplate(trimmed)) ?? 0;
+    if (freq > 4) continue;
+    if (!GENERIC_SALIENT_FAILURE_RE.test(line)) continue;
+    const from = Math.max(0, i - 2);
+    const to = Math.min(totalLines - 1, i + 8);
     if (matchWindows.length && from <= matchWindows.at(-1).to + 2) {
       matchWindows.at(-1).to = Math.max(matchWindows.at(-1).to, to);
     } else {
@@ -417,16 +478,6 @@ function tokenizeIdentifiers(text) {
   return tokens;
 }
 
-function detectLanguageFromPath(filePath) {
-  const clean = String(filePath || '').trim().toLowerCase();
-  if (/\.(?:js|mjs|cjs|jsx)$/.test(clean)) return 'javascript';
-  if (/\.(?:ts|tsx)$/.test(clean)) return 'typescript';
-  if (/\.py$/.test(clean)) return 'python';
-  if (/\.rs$/.test(clean)) return 'rust';
-  if (/\.go$/.test(clean)) return 'go';
-  return null;
-}
-
 function parseToolArgs(rawArgs) {
   if (!rawArgs) return {};
   if (typeof rawArgs === 'object' && !Array.isArray(rawArgs)) return rawArgs;
@@ -443,7 +494,7 @@ export function extractPromptFileHints(promptText) {
   const hints = [];
   const seen = new Set();
   const re =
-    /(?:^|[\s`"'(\[])((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:js|mjs|cjs|ts|tsx|jsx|py|rs|go|json|md|txt|sql|ya?ml))(?=$|[\s`"'),:\]])/g;
+    /(?:^|[\s`"'(\[])((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.[A-Za-z][A-Za-z0-9]{0,7})(?=$|[\s`"'),:\]])/g;
   for (const m of text.matchAll(re)) {
     const candidate = String(m[1] || '').trim();
     if (!candidate || candidate.startsWith('http')) continue;
@@ -506,46 +557,65 @@ function parseReadFileBody(innerText) {
   };
 }
 
+const GENERIC_DECL_PATTERNS = [
+  { kind: 'class', re: /^\s*(?:export\s+)?(?:default\s+)?(?:pub(?:\([^)]*\))?\s+|public\s+|private\s+|protected\s+|abstract\s+|final\s+|sealed\s+|static\s+)*(?:class|struct|enum|trait|interface|record|protocol)\s+([A-Za-z_][A-Za-z0-9_]*)\b/ },
+  { kind: 'function', re: /^\s*(?:export\s+)?(?:default\s+)?(?:pub(?:\([^)]*\))?\s+|public\s+|private\s+|protected\s+|static\s+|async\s+|inline\s+|virtual\s+|extern\s+|unsafe\s+)*(?:function\*?|fn|def|func|sub|proc)\s+(?:\([^)]*\)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^>]*>)?\s*\(/ },
+  { kind: 'function', re: /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/ },
+  { kind: 'const', re: /^\s*export\s+(?:const|let|var|type)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/ },
+  { kind: 'function', re: /^\s*(?:public|private|protected|static|inline|virtual|const|constexpr|unsigned|signed|void|bool|int|long|double|float|char|auto|string|String|[A-Z][A-Za-z0-9_<>:*&]+)\s+(?:[A-Za-z0-9_:*&<>]+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:const\s*)?(?:throws\s+[A-Za-z0-9_,\s]+)?\{/ },
+];
+
+const CONTROL_CALL_KEYWORDS = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'return', 'sizeof', 'typeof', 'new', 'delete', 'await', 'match',
+]);
+
 function extractStructure(filePath, codeText, startLineOffset = 1) {
   const raw = String(codeText ?? '');
-  const lang = detectLanguageFromPath(filePath);
   const allLines = raw.split(/\r?\n/);
   const imports = [];
-  for (let i = 0; i < allLines.length; i += 1) {
-    const line = allLines[i];
-    if (/^\s*(?:import\b|export\s+.*from\b|from\s+\S+\s+import\b|use\s+|const\s+.*=\s*require\()/.test(line)) {
-      imports.push({ line: startLineOffset + i, text: line.trim().slice(0, 140) });
-      if (imports.length >= 16) break;
-    }
-  }
-
-  let definitions = [];
-  let calls = [];
-  if (lang) {
-    try {
-      const extracted = extractRepositorySymbols(filePath || 'unknown', lang, raw);
-      definitions = (extracted.definitions ?? []).map((d) => {
-        const name = d.owner ? `${d.owner}.${d.name}` : d.name;
-        const line = startLineOffset + (Number(d.line || 1) - 1);
-        return {
-          name,
-          shortName: d.name,
-          kind: d.kind,
-          line,
-        };
-      });
-      calls = (extracted.calls ?? []).map((c) => ({
-        name: c.name,
-        specifier: c.specifier ?? null,
-        line: startLineOffset + (Number(c.line || 1) - 1),
-      }));
-    } catch {
-      // Fallback below
-    }
-  }
-
+  const definitions = [];
+  const calls = [];
+  const seenDefs = new Set();
   const isJsonLike =
     String(filePath || '').toLowerCase().endsWith('.json') || /^\s*[\[{]/.test(raw);
+
+  for (let i = 0; i < allLines.length; i += 1) {
+    const line = allLines[i];
+    const lineNum = startLineOffset + i;
+    if (
+      imports.length < 16 &&
+      /^\s*(?:#include\b|import\b|export\s+.*from\b|from\s+\S+\s+import\b|use\s+|using\s+|package\s+|const\s+.*=\s*require\()/.test(line)
+    ) {
+      imports.push({ line: lineNum, text: line.trim().slice(0, 140) });
+    }
+    if (!isJsonLike && definitions.length < 64) {
+      for (const pat of GENERIC_DECL_PATTERNS) {
+        const m = line.match(pat.re);
+        if (m?.[1] && !CONTROL_CALL_KEYWORDS.has(m[1])) {
+          const key = `${m[1]}@${lineNum}`;
+          if (!seenDefs.has(key)) {
+            seenDefs.add(key);
+            definitions.push({
+              name: m[1],
+              shortName: m[1],
+              kind: pat.kind,
+              line: lineNum,
+            });
+          }
+          break;
+        }
+      }
+    }
+    if (calls.length < 64 && !isJsonLike) {
+      for (const cm of line.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]{2,})\s*\(/g)) {
+        const callee = cm[1];
+        if (CONTROL_CALL_KEYWORDS.has(callee) || STOPWORDS.has(callee.toLowerCase())) continue;
+        calls.push({ name: callee, specifier: null, line: lineNum });
+        if (calls.length >= 64) break;
+      }
+    }
+  }
+
   if (definitions.length === 0 && !isJsonLike) {
     for (let i = 0; i < allLines.length; i += 1) {
       const hm = allLines[i].match(/^#{1,4}\s+(.+)$/);
@@ -616,9 +686,6 @@ function extractTargetPath(toolName, args, parsedRead) {
     args?.path ?? args?.filePath ?? args?.file ?? args?.target_file ?? parsedRead?.headerPath ?? '',
   ).trim();
   if (explicit) return explicit.replace(/\\/g, '/');
-  if (lower === 'query_symbol_graph' && args?.symbol) {
-    return `query_symbol_graph:${String(args.symbol).slice(0, 60)}`;
-  }
   if (lower === 'grep' && args?.pattern) return `grep:${String(args.pattern).slice(0, 60)}`;
   if (lower === 'grep' && args?.query) return `grep:${String(args.query).slice(0, 60)}`;
   if (lower === 'glob' && args?.pattern) return `glob:${String(args.pattern).slice(0, 60)}`;
@@ -1157,17 +1224,20 @@ export class PreInjectionAdmissionController {
       const contentSha256 = sha256Hex(innerText);
       const originalTokens = estimateTokens(rawOutput);
 
-      const isExecErrorTool = EXEC_ERROR_TOOLS.has(lowerTool);
-      const isErr =
-        Boolean(item?.isError) || (isExecErrorTool && ERROR_OUTPUT_RE.test(innerText));
+      const textStats = computeTextSignalStats(innerText);
       const isMutation = MUTATION_TOOLS.has(lowerTool);
       const isAlwaysDirectTool = ALWAYS_DIRECT_TOOLS.has(lowerTool);
       const isReadOnlyDedupTool = READ_ONLY_DEDUP_TOOLS.has(lowerTool);
-      const isReadProbeTool =
-        lowerTool === 'grep' ||
-        lowerTool === 'glob' ||
-        lowerTool === 'inspect_repository' ||
-        lowerTool === 'query_symbol_graph';
+      const isReadProbeTool = lowerTool === 'grep' || lowerTool === 'glob';
+      const isStructuredJsonTool = !isReadOnlyDedupTool && STRUCTURED_JSON_STATUS_RE.test(innerText);
+      const isStructuredFailure = isStructuredJsonTool && STRUCTURED_JSON_FAILURE_RE.test(innerText);
+      const isExecErrorTool = EXEC_ERROR_TOOLS.has(lowerTool) || textStats.exitCode !== null;
+      const isErr =
+        Boolean(item?.isError) ||
+        isStructuredFailure ||
+        (isExecErrorTool &&
+          ((textStats.exitCode !== null && textStats.exitCode !== 0) ||
+            GENERIC_EXEC_ERROR_RE.test(innerText)));
 
       const structure = extractStructure(
         targetPath,
@@ -1328,6 +1398,7 @@ export class PreInjectionAdmissionController {
         errorSymbolHits,
         callChainHits,
         score,
+        textStats,
         focusSymbols,
         decision: null,
         reason: '',
@@ -1335,7 +1406,8 @@ export class PreInjectionAdmissionController {
       };
 
       const isNoisyProbeTool = NOISY_PROBE_TOOLS.has(lowerTool);
-      const smallFastPathMaxChars = isNoisyProbeTool ? probeMinChars : minChars;
+      const smallFastPathMaxChars =
+        isNoisyProbeTool || isStructuredJsonTool ? probeMinChars : minChars;
 
       // DUPLICATE check (runs BEFORE isErr for read-only tools, isNarrowSlice, explicit_read_working_set, and oversized compression)
       const sliceKey = !isReadProbeTool && normPath && isSliceRead ? `${normPath}#${lineRange}` : null;
@@ -1357,6 +1429,12 @@ export class PreInjectionAdmissionController {
           : storeMatch && storeMatch.sha256 === contentSha256
             ? storeMatch
             : null);
+
+      const isLowEntropyRepetitiveExec =
+        isExecErrorTool &&
+        !isErr &&
+        innerText.length > probeMinChars &&
+        (textStats.repeatedLineRatio >= 0.72 || textStats.charEntropy < 2.6);
 
       // Deterministic Pre-Screen & Fast-Paths
       if (isMutation) {
@@ -1383,6 +1461,12 @@ export class PreInjectionAdmissionController {
       } else if (isAlwaysDirectTool) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'always_direct_tool';
+      } else if (
+        isStructuredJsonTool &&
+        innerText.length <= DEFAULT_PROBE_ADMISSION_MIN_CHARS
+      ) {
+        ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
+        ctxRecord.reason = 'compact_structured_output';
       } else if (isNarrowSlice) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'narrow_line_slice';
@@ -1417,6 +1501,9 @@ export class PreInjectionAdmissionController {
       ) {
         ctxRecord.decision = ADMISSION_DECISIONS.IRRELEVANT;
         ctxRecord.reason = 'zero_signal_noise';
+      } else if (isLowEntropyRepetitiveExec) {
+        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
+        ctxRecord.reason = 'oversized_exec_log_fidelity_summary';
       } else {
         const decoyConflict =
           domainInfo.isDecoy && (domainInfo.rawDomains.length > 0 || querySymbolHits > 0);
@@ -1726,6 +1813,7 @@ export class PreInjectionAdmissionController {
         originalTokens: c.originalTokens,
         injectedTokens,
         tokensSaved,
+        textStats: c.textStats,
         reason: c.reason,
       };
       decisions.push(decisionRecord);

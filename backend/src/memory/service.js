@@ -127,7 +127,7 @@ function extractErrorTokensFromText(rawText) {
   const text = cleanText(rawText, 600);
   if (!text) return [];
   const tokens = [];
-  for (const match of text.matchAll(/\b([A-Z][A-Za-z]*Error|ERR_[A-Z0-9_]+|E_[A-Z0-9_]+|STALE_VERIFICATION_AFTER_EDIT|UNRESOLVED_VERIFICATION_FAILURE|FABRICATED_PASS_CLAIM|EVIDENCE_INCOMPLETE|DISK_FILE_MISSING|STEP_BUDGET_EXHAUSTED|LOOP_THRASHING_ABORT)\b/g)) {
+  for (const match of text.matchAll(/\b([A-Z][A-Za-z]*Error|ERR_[A-Z0-9_]+|E_[A-Z0-9_]+|EVIDENCE_INCOMPLETE|STEP_BUDGET_EXHAUSTED)\b/g)) {
     tokens.push(match[1].toLowerCase());
   }
   for (const match of text.matchAll(/\b([a-z0-9_./-]+\.[cm]?[jt]s:\d+(?::\d+)?)\b/gi)) {
@@ -162,9 +162,6 @@ function collectNormalizedFiles({
       if (args.file_path) addPath(args.file_path);
       if (Array.isArray(args.paths)) for (const p of args.paths) addPath(p);
     }
-  }
-  for (const missing of Array.isArray(verdict?.checks?.missingDiskFiles) ? verdict.checks.missingDiskFiles : []) {
-    addPath(missing);
   }
   return [...out].slice(0, 32);
 }

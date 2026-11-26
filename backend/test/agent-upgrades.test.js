@@ -267,6 +267,7 @@ test('DirectAgent Wave 1-3: Prompt Cache stability, AGENTS.md, /rewind, approval
         payload: { title: 'Wave Upgrade Test', permissionMode: 'auto-safe' },
       })
     ).json();
+    direct.sessionToolConfigs.set(sess.id, { toolModes: { meta: true } });
 
     // Turn 1 with multimodal image attachment & effort: 'high'
     const png1x1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -398,8 +399,8 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
           arguments: JSON.stringify({ command: 'git config --file cfg.ini --get demo.b' }),
         },
       };
-      // Trigger thrashing (3 identical calls to non-existent tool)
-      for (let k = 0; k < 3; k++) {
+      // Trigger pure byte-level exact duplicate reminder (6 consecutive identical calls, never aborts)
+      for (let k = 0; k < 6; k++) {
         yield {
           type: 'block-end',
           index: 2 + k,
@@ -419,7 +420,7 @@ test('DirectAgent enforces stale-file guard, session command-prefix approval cac
         .map((m) => m.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n'))
         .join('\n');
       if (allText.includes('防脏写拦截')) sawStaleError = true;
-      if (allText.includes('[系统防死循环提示]')) sawThrashWarning = true;
+      if (allText.includes('repeated 6 consecutive times')) sawThrashWarning = true;
       assert.ok(allText.includes('222'));
       yield { type: 'text-delta', index: 0, text: '所有安全与效率护栏均已验证。' };
       yield { type: 'finish', reason: { kind: 'stop' } };

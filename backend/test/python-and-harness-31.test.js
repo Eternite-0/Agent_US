@@ -125,11 +125,10 @@ test('WP5.2 syntax: resolvePythonRunner, validateCodeSyntax, edit_file, write_fi
     ],
   });
   assert.equal(badEdit.isError, false);
-  assert.match(badEdit.output, /自动语法诊断/);
-  assert.match(badEdit.output, /src\/calc\.py:2/);
-  assert.match(badEdit.output, /SyntaxError/);
+  // Per-edit implicit diagnostics subprocesses are removed so edits stay fast and language-agnostic
+  assert.doesNotMatch(badEdit.output, /自动语法诊断/);
 
-  // runDiagnostics kind='syntax' and kind='auto' both report the Python syntax error
+  // Direct runDiagnostics API kind='syntax' and kind='auto' still report syntax errors when explicitly called
   const diagSyn = runDiagnostics(root, { kind: 'syntax', paths: ['src/calc.py'] });
   assert.equal(diagSyn.ok, false);
   assert.equal(diagSyn.diagnostics.length, 1);
@@ -142,7 +141,7 @@ test('WP5.2 syntax: resolvePythonRunner, validateCodeSyntax, edit_file, write_fi
   assert.equal(diagAuto.ok, false);
   assert.equal(diagAuto.diagnostics[0].source, 'syntax');
 
-  // Fix via edit_file -> clean diagnostic
+  // Fix via edit_file -> clean edit without implicit diagnostic subprocess
   const [goodEdit] = await dispatcher.dispatchBatch({
     sessionId: 's-py-syn',
     turnId: 't-3',
@@ -163,7 +162,7 @@ test('WP5.2 syntax: resolvePythonRunner, validateCodeSyntax, edit_file, write_fi
   assert.equal(goodEdit.isError, false);
   assert.doesNotMatch(goodEdit.output, /自动语法诊断/);
 
-  // write_file catches IndentationError immediately
+  // write_file also omits implicit syntax-check subprocesses; direct runQuickDiagnostics still detects it when called explicitly
   const [badWrite] = await dispatcher.dispatchBatch({
     sessionId: 's-py-syn',
     turnId: 't-4',
@@ -181,8 +180,7 @@ test('WP5.2 syntax: resolvePythonRunner, validateCodeSyntax, edit_file, write_fi
     ],
   });
   assert.equal(badWrite.isError, false);
-  assert.match(badWrite.output, /自动语法诊断/);
-  assert.match(badWrite.output, /IndentationError/);
+  assert.doesNotMatch(badWrite.output, /自动语法诊断/);
   assert.equal(runQuickDiagnostics(join(root, 'src/indented.py'), 'src/indented.py').ok, false);
 
   // apply_patch rejects .py SyntaxError atomically pre-commit without mutating sibling.py
@@ -419,14 +417,32 @@ test('WP5.2 test diagnostics: pytest pass/fail, -k filter, auto mode, collection
   assert.equal(rawUnittest.failingTests[0].line, 9);
 });
 
-test('WP6.1 & WP6.2: selection prioritizes edit_file (#0) -> apply_patch (#1) and static prompt keeps 4-phase invariance', async (t) => {
+test('WP6.1 & WP6.2: default core tool surface converges to <=7 tools, selection prioritizes edit_file -> apply_patch, and static prompt stays language-agnostic & invariant', async (t) => {
   const { root } = createTempWorkspace(t, 'py-sel-31-');
-  const tools = createWorkspaceTools({
+  const coreTools = createWorkspaceTools({
     workspaceRoot: root,
     nonce: mintNonce(),
     permissionMode: 'auto-safe',
   });
   const policy = new ToolPermissionPolicy({ permissionMode: 'auto-safe' });
+  const coreCatalog = modelToolCatalog(coreTools, policy, { permissionMode: 'auto-safe' });
+  const coreNames = coreCatalog.map((c) => c.name);
+  assert.equal(coreNames.length, 6, `Expected 6 default core tools, got ${coreNames.length}: ${coreNames.join(', ')}`);
+  assert.equal(coreNames[0], 'edit_file');
+  assert.ok(coreNames.indexOf('edit_file') < coreNames.indexOf('write_file'));
+  assert.ok(coreNames.indexOf('write_file') < coreNames.indexOf('bash'));
+  assert.equal(coreNames.includes('apply_patch'), false);
+  assert.equal(coreNames.includes('run_diagnostics'), false);
+  assert.equal(coreNames.includes('inspect_repository'), false);
+  assert.equal(coreNames.includes('query_symbol_graph'), false);
+
+  // Explicit opt-in advanced tool modes still preserve priority ordering
+  const tools = createWorkspaceTools({
+    workspaceRoot: root,
+    nonce: mintNonce(),
+    permissionMode: 'auto-safe',
+    toolModes: { diagnostics: true, repoIntelligence: true, patch: true },
+  });
   const catalog = modelToolCatalog(tools, policy, { permissionMode: 'auto-safe' });
   const names = catalog.map((c) => c.name);
 
@@ -447,16 +463,15 @@ test('WP6.1 & WP6.2: selection prioritizes edit_file (#0) -> apply_patch (#1) an
   assert.match(writeDesc, /edit_file/);
   assert.match(writeDesc, /apply_patch/);
 
-  // 4-phase static prompt invariance & zero dynamic interpolation
+  // Language-agnostic static prompt invariance & zero dynamic interpolation
   const nonce = mintNonce();
   const promptA = buildStaticSystemPrompt(nonce);
   const promptB = buildStaticSystemPrompt(nonce);
   assert.equal(promptA, promptB);
   assert.match(promptA, /自然语言/);
-  assert.match(promptA, /1\.\s*\*\*精准定位\*\*/);
-  assert.match(promptA, /2\.\s*\*\*先读后改\*\*/);
-  assert.match(promptA, /3\.\s*\*\*最小原子修改\*\*[\s\S]*edit_file/);
-  assert.match(promptA, /4\.\s*\*\*测试闭环与根因复盘\*\*[\s\S]*git diff[\s\S]*git status/);
+  assert.match(promptA, /1\.\s*\*\*精准定位与先读后改\*\*/);
+  assert.match(promptA, /2\.\s*\*\*最小必要修改\*\*[\s\S]*edit_file/);
+  assert.match(promptA, /3\.\s*\*\*原生验证与根因闭环\*\*[\s\S]*bash/);
   assert.equal(promptA.includes(root), false);
   assert.doesNotMatch(promptA, /\b20\d{2}-\d{2}-\d{2}T/);
 

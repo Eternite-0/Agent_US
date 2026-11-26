@@ -137,28 +137,6 @@ export function resolveTurnOutcome({
     };
   }
 
-  if (loopStopReason === 'thrashing_circuit_break') {
-    const reason = 'LOOP_THRASHING_ABORT: 连续重复相同无效工具调用触发防死循环熔断';
-    const failVerdict = normalizeVerdict(
-      {
-        ...normalized,
-        verdict: VERDICT_KINDS.FAIL,
-        accepted: false,
-        reasons: [...new Set([...normalized.reasons, reason])],
-      },
-      { evidenceRequired: true, evidenceCount, verificationMode: 'loop_guard' },
-    );
-    return {
-      status: TERMINAL_STATES.FAILED,
-      phase: TERMINAL_STATES.FAILED,
-      errorCode: 'LOOP_THRASHING_ABORT',
-      errorMessage: failVerdict.reasons.join('; '),
-      verdict: failVerdict,
-      verifiedPass: false,
-      failureKind: 'tool_failure',
-    };
-  }
-
   if (loopStopReason === 'max_steps') {
     const reason = 'STEP_BUDGET_EXHAUSTED: 达到最大步数上限仍未完成最终交付';
     const failVerdict = normalizeVerdict(
@@ -363,7 +341,7 @@ export function classifyFailureKind(
   if (isVerificationFailure || code === 'VERIFICATION_FAILED' || code === 'SWARM_VERIFICATION_FAILED') {
     return 'verification_failure';
   }
-  if (hasToolFailure || err?.category === 'tool' || code === 'LOOP_THRASHING_ABORT') {
+  if (hasToolFailure || err?.category === 'tool') {
     return 'tool_failure';
   }
   return 'task_failure';

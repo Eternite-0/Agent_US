@@ -779,6 +779,7 @@ test('Scenario #16: Cross-OS path case sensitivity, dangling/intra-workspace sym
       sessionId: 'sess-s16',
       permissionMode: 'auto-safe',
       readFileState,
+      toolModes: { webFetch: true },
     });
     const readTool = tools.find((t) => t.name === 'read_file');
     const writeTool = tools.find((t) => t.name === 'write_file');

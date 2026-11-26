@@ -16,13 +16,10 @@ const CONSTRAINT_RE =
   /(?:必须|不要|禁止|务必|严格|保留|只能|不能|never|must|do not|don't|always|constraint|require)/i;
 
 const ACCEPTANCE_RE =
-  /(?:acceptance(?:\s+criteria)?|done\s+when|success\s+criteria|exit\s+criteria|verification\s+criteria|验收标准|完成条件|验收要求|通过条件|must\s+pass|0\s+fail(?:ures)?|0\s+skips?|npm\s+(?:test|run\s+(?:check|build|test))|node\s+--test|tsc\s+--noEmit)/i;
+  /(?:acceptance(?:\s+criteria)?|done\s+when|success\s+criteria|exit\s+criteria|verification\s+criteria|验收标准|完成条件|验收要求|通过条件|must\s+pass|all\s+tests?\s+pass|0\s+fail(?:ures)?|0\s+skips?)/i;
 
-const VERIFICATION_CMD_RE =
-  /(?:\b(?:npm\s+(?:test|run\s+(?:check|build|test|lint|typecheck|verify))|pnpm\s+(?:test|check|build)|yarn\s+(?:test|check|build)|node\s+--test|node\s+--check|npx\s+tsc|tsc\b|vitest|jest|mocha|pytest|unittest|cargo\s+(?:test|check)|go\s+test|mvn\s+test|gradle\s+test|eslint)\b)/i;
-
-const FAILURE_LINE_RE =
-  /(?:AssertionError|TypeError|ReferenceError|SyntaxError|RangeError|ERR_ASSERTION|ENOENT|EACCES|FAIL\b|FAILED|✖\s|not ok \d+|TS\d{4,5}:|error\[E\d+\]|参数校验失败|安全策略拦截|Error:\s|Traceback)/i;
+const GENERIC_FAILURE_EXCERPT_RE =
+  /(?:\b\w*(?:error|exception)\b|\b(?:fail(?:ed|ure)?|fatal|panic|assert(?:ion)?)\b|参数校验失败|安全策略拦截|错误[:：])/i;
 
 function safeGet(db, sql, ...params) {
   if (!db || typeof db.prepare !== 'function') return null;
@@ -58,7 +55,7 @@ function extractFailureExcerpt(content, maxLen = 280) {
   if (!lines.length) return '';
   const diagLines = [];
   for (let i = 0; i < lines.length; i++) {
-    if (FAILURE_LINE_RE.test(lines[i])) {
+    if (GENERIC_FAILURE_EXCERPT_RE.test(lines[i])) {
       diagLines.push(lines[i]);
       if (lines[i + 1] && !diagLines.includes(lines[i + 1])) {
         diagLines.push(lines[i + 1]);
@@ -427,23 +424,19 @@ export class MultiStageCompactor {
               : receipt?.status === 'finished'
                 ? 0
                 : null;
-      const hasFailMarkers = FAILURE_LINE_RE.test(content);
       const isFailed =
         (exitCode !== null && exitCode !== 0) ||
         meta?.isError === true ||
         receipt?.status === 'failed' ||
-        receipt?.status === 'rejected_before_effect' ||
-        hasFailMarkers;
+        receipt?.status === 'rejected_before_effect';
       const isPassed =
         !isFailed &&
         (exitCode === 0 || (receipt?.status === 'finished' && meta?.isError !== true));
 
       const isVerification =
-        VERIFICATION_CMD_RE.test(command) ||
-        VERIFICATION_CMD_RE.test(content.slice(0, 400)) ||
+        (isShell && (Boolean(command) || exitCode !== null)) ||
         lowerTool.includes('verify') ||
-        lowerTool.includes('test') ||
-        (isShell && (Boolean(command) || exitCode !== null));
+        lowerTool.includes('test');
 
       if (isVerification) {
         const key = command || `${toolName}#${r.toolCallId || r.seq}`;

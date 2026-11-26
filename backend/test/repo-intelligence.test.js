@@ -539,15 +539,29 @@ test('inspect_repository tool integrates with ToolDispatcher, enforces read-only
   try {
     assert.equal(WORKSPACE_TOOL_META.inspect_repository?.readOnly, true);
 
-    const tools = createWorkspaceTools({
+    const defaultTools = createWorkspaceTools({
       workspaceRoot: workDir,
       store,
       sessionId: 'sess-ri',
       permissionMode: 'read-only',
       nonce,
     });
+    assert.equal(
+      defaultTools.find((t) => t.name === 'inspect_repository'),
+      undefined,
+      'inspect_repository must be omitted from default core tool surface',
+    );
+
+    const tools = createWorkspaceTools({
+      workspaceRoot: workDir,
+      store,
+      sessionId: 'sess-ri',
+      permissionMode: 'read-only',
+      nonce,
+      toolModes: { repoIntelligence: true },
+    });
     const inspectTool = tools.find((t) => t.name === 'inspect_repository');
-    assert.ok(inspectTool, 'inspect_repository must be registered in createWorkspaceTools');
+    assert.ok(inspectTool, 'inspect_repository must be registered when repoIntelligence mode is enabled');
     assert.equal(inspectTool.meta.readOnly, true);
 
     // 1. Read-only mode executes inspect_repository via ToolDispatcher without approval

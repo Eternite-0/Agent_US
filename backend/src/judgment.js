@@ -64,7 +64,6 @@ export class JudgmentService {
   } = {}) {
     this.provider = provider;
     this.uses = {
-      stopCheck: !!uses.stopCheck,
       autoReview: !!uses.autoReview,
       routeTriage: !!uses.routeTriage,
     };
@@ -206,65 +205,6 @@ export class JudgmentService {
         durationMs: Date.now() - started,
       };
     }
-  }
-
-  /**
-   * Premature-stop / promise-without-action detector (Agnes `judgment/src/uses/stop.ts`).
-   */
-  async detectPrematureStop({
-    requestText,
-    replyText,
-    hasTools = false,
-    alreadyContinued = false,
-    signal,
-    onUsage,
-  }) {
-    if (
-      !this.uses.stopCheck ||
-      !this.provider ||
-      hasTools ||
-      alreadyContinued ||
-      !replyText?.trim()
-    ) {
-      return { shouldContinue: false, status: 'skipped' };
-    }
-    const state = {
-      request: String(requestText ?? '').slice(0, 2000),
-      reply: String(replyText ?? '').slice(-8000),
-    };
-    const question = {
-      id: 'unexpected_stop',
-      prompt:
-        'Did the assistant promise to perform an immediate next tool action (e.g., "I will now check/run/edit...") yet end the reply without invoking any tool? Return JSON {"yes": boolean, "prob": number (0..1)}.',
-      options: ['no', 'yes'],
-      responseSchema: { yes: 'boolean', prob: 'number' },
-    };
-    const res = await this.decide('judgment.stop', state, question, {
-      signal,
-      onUsage,
-    });
-    if (res.status !== 'ok') {
-      return { shouldContinue: false, status: 'unavailable', reason: res.reason };
-    }
-    const ans = res.answer;
-    const prob =
-      typeof ans?.prob === 'number'
-        ? ans.prob
-        : typeof ans?.noul === 'number'
-          ? ans.noul
-          : ans?.yes === true || ans?.choice === 'yes'
-            ? 1
-            : 0;
-    const shouldContinue = Number.isFinite(prob) && prob >= 0.5 && prob <= 1;
-    return {
-      shouldContinue,
-      prob,
-      cached: res.cached,
-      status: 'ok',
-      note: shouldContinue
-        ? `Detected a reply promising further action without executing tools${res.cached ? ' (cached)' : ''}. Continue executing the promised next step while respecting all permissions, approvals, and budgets.`
-        : null,
-    };
   }
 
   /**

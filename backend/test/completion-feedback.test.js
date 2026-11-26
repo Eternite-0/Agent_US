@@ -63,10 +63,10 @@ test('Fix B1-B3: fail -> repair -> still fail MUST fail across DB, REST, and SSE
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
       return;
     }
-    // Both initial reply AND repair reply fabricate passing tests!
-    yield { type: 'text-delta', index: 0, text: `第 ${idx} 次回复：全部测试通过，0 failures，构建成功。` };
+    // Both initial reply AND repair reply remain truncated at max-tokens (objective verification failure)
+    yield { type: 'text-delta', index: 0, text: `第 ${idx} 次回复（截断）...` };
     yield { type: 'usage', usage: { inputTokens: 15, outputTokens: 10 } };
-    yield { type: 'finish', reason: { kind: 'stop' } };
+    yield { type: 'finish', reason: { kind: 'max-tokens' } };
   });
 
   const direct = new DirectAgentRuntime(store, pool, {
@@ -147,9 +147,9 @@ test('Fix B3: fail -> repair -> pass re-verifies after repair and completes clea
       return;
     }
     if (idx === 1) {
-      // Fabricated claim triggers repair
-      yield { type: 'text-delta', index: 0, text: '测试全部通过，构建成功。' };
-      yield { type: 'finish', reason: { kind: 'stop' } };
+      // Truncated output triggers repair round
+      yield { type: 'text-delta', index: 0, text: '半截回复被截断...' };
+      yield { type: 'finish', reason: { kind: 'max-tokens' } };
       return;
     }
     // Repair round runs a passing command or reports truthfully
@@ -312,8 +312,8 @@ test('Fix B4 & B7: Final step still runs verification (pass completes, fail fail
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
-      yield { type: 'text-delta', index: 0, text: '测试全部通过，构建成功！' };
-      yield { type: 'finish', reason: { kind: 'stop' } };
+      yield { type: 'text-delta', index: 0, text: '最终步输出被截断...' };
+      yield { type: 'finish', reason: { kind: 'max-tokens' } };
       return;
     }
 
@@ -374,11 +374,12 @@ test('Fix B4 & B7: Final step still runs verification (pass completes, fail fail
     const d3 = await waitTurnState(direct, s3.id, t3.turn.id, ['completed', 'failed']);
     assert.equal(d3.state, 'failed', 'exhausting step budget without finishing MUST fail');
 
-    // 4. Thrashing anti-loop break -> MUST fail (never completed)
+    // 4. Repeated identical calls append reminder on 6th call and never abort early; step budget bounds total steps
     const s4 = direct.createSession({ workspaceRoot: workDir, permissionMode: 'full-access' });
     const t4 = direct.startTurn(s4.id, { input: 'CASE:THRASHING', maxSteps: 8 });
     const d4 = await waitTurnState(direct, s4.id, t4.turn.id, ['completed', 'failed']);
-    assert.equal(d4.state, 'failed', 'thrashing circuit breaker stop MUST fail');
+    assert.equal(d4.state, 'failed', 'endless tool calls must stop cleanly at step budget');
+    assert.match(String(d4.error || ''), /STEP_BUDGET_EXHAUSTED/);
   } finally {
     await direct.close();
     store.close();
@@ -576,8 +577,8 @@ test('Fix B6, B9, B13: Child verification fail, Swarm verify fail, Swarm budget 
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
-      yield { type: 'text-delta', index: 0, text: '子代理声称全部测试通过 (0 failures)。' };
-      yield { type: 'finish', reason: { kind: 'stop' } };
+      yield { type: 'text-delta', index: 0, text: '子代理输出被截断...' };
+      yield { type: 'finish', reason: { kind: 'max-tokens' } };
       return;
     }
 
@@ -769,13 +770,13 @@ test('Fix B4 & Schema v6->v7: Resumed execution still runs final verification an
   });
   store.close();
 
-  // Reopen DB on reboot; resumed turn fabricates pass claim without fixing failed bash -> MUST FAIL!
+  // Reopen DB on reboot; resumed turn produces max-tokens truncated reply -> final verification MUST still run & fail!
   store = new Store(dbPath);
   const pool = new AccountPool(store, { root: dataDir });
   pool.setDefaultModel('mock-res');
   const adapter = new ScriptedAdapter(async function* () {
-    yield { type: 'text-delta', index: 0, text: '恢复后确认：全部测试通过，0 failures。' };
-    yield { type: 'finish', reason: { kind: 'stop' } };
+    yield { type: 'text-delta', index: 0, text: '恢复后半截回复...' };
+    yield { type: 'finish', reason: { kind: 'max-tokens' } };
   });
   const direct = new DirectAgentRuntime(store, pool, {
     defaultWorkspace: workDir,
@@ -787,7 +788,7 @@ test('Fix B4 & Schema v6->v7: Resumed execution still runs final verification an
     const settled = await waitTurnState(direct, sessId, turnId, ['completed', 'failed', 'cancelled']);
     assert.equal(settled.state, 'failed', 'Resumed turn MUST NOT skip verification to claim completed');
     assert.equal(settled.verdict?.verdict, 'fail');
-    assert.ok(settled.verdict?.reasons?.some((r) => r.includes('FABRICATED_PASS_CLAIM')));
+    assert.ok(settled.verdict?.reasons?.some((r) => r.includes('output_truncated')));
   } finally {
     await direct.close();
     store.close();

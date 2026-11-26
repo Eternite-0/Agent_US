@@ -145,7 +145,7 @@ function makeToolStep(stepId, name, args, output, { isError = false } = {}) {
   ];
 }
 
-test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol expand_context + run_diagnostics node-test + anti-thrashing + query_symbol_graph + aciTelemetry', async (t) => {
+test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol expand_context + run_diagnostics node-test + query_symbol_graph + aciTelemetry', async (t) => {
   const caps = await probeAciRuntimeCapabilities();
   assert.equal(caps.capabilities.trajectoryEvictionV26, true);
 
@@ -223,7 +223,6 @@ test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol e
   let capturedRatesRef = null;
   let sawExpandPartialHeader = false;
   let sawNodeTestAssertionDiag = false;
-  let sawAntiThrashGuidance = false;
   let sawQuerySymbolGraphOutput = false;
 
   const adapter = new ScriptedAdapter(async function* (options) {
@@ -370,13 +369,6 @@ test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol e
     }
 
     if (step === 6) {
-      const userTail = msgs.filter((m) => m.role === 'user').map((m) => m.content?.[0]?.text ?? '').join('\n');
-      assert.match(userTail, /Anti-Thrashing Self-Diagnosis/);
-      assert.match(userTail, /src\/pricing\.js/);
-      assert.match(userTail, /CONSTRAINTS\.md/);
-      assert.match(userTail, /src\/caller\.js/);
-      sawAntiThrashGuidance = true;
-
       yield {
         type: 'block-end',
         index: 0,
@@ -444,6 +436,7 @@ test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol e
     model: 'main-model-26',
     permissionMode: 'full-access',
     aciProfile: 'aci_26',
+    toolModes: { diagnostics: true, repoIntelligence: true },
     budget: { maxSteps: 16, maxTotalTokens: 160000 },
   });
   offSub = direct.subscribe(sess.id, (ev) => {
@@ -460,7 +453,6 @@ test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol e
 
   assert.equal(sawExpandPartialHeader, true);
   assert.equal(sawNodeTestAssertionDiag, true);
-  assert.equal(sawAntiThrashGuidance, true);
   assert.equal(sawQuerySymbolGraphOutput, true);
 
   // Verify static system prompt invariance across ALL main calls
@@ -475,15 +467,14 @@ test('E2E 2.6: DirectAgent full_aci (trajectory_eviction_v26) + partial symbol e
   assert.ok(completedEv?.data?.budgetWatermarks);
   assert.ok(completedEv?.data?.aciTelemetry);
   assert.equal(completedEv.data.aciTelemetry.dtocPolicy, TRAJECTORY_EVICTION_V26_DTOC_POLICY);
-  assert.equal(completedEv.data.aciTelemetry.antiThrashingTriggered, true);
+  assert.equal(completedEv.data.aciTelemetry.antiThrashingTriggered, false);
   assert.ok(completedEv.data.aciTelemetry.partialRecoveries >= 1);
   assert.ok(completedEv.data.aciTelemetry.recoveryTokensSaved > 0);
   assert.ok(completedEv.data.aciTelemetry.decisions.IRRELEVANT >= 1);
   assert.ok(ephemeralAci.length >= 1);
 
   const thrashEv = events.find((e) => e.type === 'loop/thrashing_warning');
-  assert.ok(thrashEv?.data?.antiThrashingTriggered);
-  assert.ok(thrashEv?.data?.aciTelemetry);
+  assert.equal(thrashEv, undefined);
 });
 
 test('E2E 2.6: trajectory_eviction_v26 evicts superseded reads & resolved diagnostics below 28k while keeping aci_25 phase_watermark_v25 compat', () => {

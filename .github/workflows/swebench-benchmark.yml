@@ -4,11 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       subset:
-        description: 'SWE-bench Verified subset to run'
+        description: 'SWE-bench Verified subset to run (diverse-* runs on full 500-task Verified across all 12 repos)'
         type: choice
         options:
           - paper-50
           - smoke-5
+          - diverse-12
+          - diverse-36
+          - diverse-60
         default: paper-50
       model:
         description: 'Cloud provider model ID, e.g. deepseek-chat or deepseek-v4.1-flash'
@@ -105,9 +108,9 @@ jobs:
             exit 1
           fi
           case "$INPUT_SUBSET" in
-            paper-50|smoke-5) ;;
+            paper-50|smoke-5|diverse-12|diverse-36|diverse-60) ;;
             *)
-              echo "::error title=Invalid subset::Expected paper-50 or smoke-5."
+              echo "::error title=Invalid subset::Expected paper-50, smoke-5, diverse-12, diverse-36, or diverse-60."
               exit 1
               ;;
           esac
@@ -364,9 +367,15 @@ jobs:
           INPUT_LIMIT: ${{ inputs.limit }}
         run: |
           set -euo pipefail
+          DATASET_ALIAS="hf:verified-mini"
+          case "$INPUT_SUBSET" in
+            diverse-12|diverse-36|diverse-60)
+              DATASET_ALIAS="hf:verified-full"
+              ;;
+          esac
           ARGS=(
             backend/scripts/benchmark-swebench.mjs
-            --dataset hf:verified-mini
+            --dataset "$DATASET_ALIAS"
             --subset "$INPUT_SUBSET"
             --shard "${SHARD_INDEX}/${INPUT_SHARDS}"
             --arms "$INPUT_ARMS"
@@ -457,9 +466,15 @@ jobs:
             exit 1
           fi
           MERGE_SHARDS_ARG="$(IFS=,; echo "${SHARD_DIRS[*]}")"
+          DATASET_ALIAS="hf:verified-mini"
+          case "$INPUT_SUBSET" in
+            diverse-12|diverse-36|diverse-60)
+              DATASET_ALIAS="hf:verified-full"
+              ;;
+          esac
           ARGS=(
             backend/scripts/benchmark-swebench.mjs
-            --dataset hf:verified-mini
+            --dataset "$DATASET_ALIAS"
             --merge-shards "$MERGE_SHARDS_ARG"
             --arms "$INPUT_ARMS"
             --model "$INPUT_MODEL"

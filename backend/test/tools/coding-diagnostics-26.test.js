@@ -101,6 +101,7 @@ test('run_diagnostics executes incremental tsc --noEmit --pretty false using nea
     store,
     nonce: mintNonce(),
     permissionMode: 'read-only',
+    toolModes: { diagnostics: true },
   });
   const dispatcher = new ToolDispatcher({
     store,
@@ -379,11 +380,22 @@ test('query_symbol_graph returns definitions with endLine/signature, cross-file 
 
   const store = new Store(join(dataDir, 'engine.sqlite'));
   t.after(() => store.close());
+  const defaultTools = createWorkspaceTools({
+    workspaceRoot: root,
+    store,
+    nonce: mintNonce(),
+    permissionMode: 'read-only',
+  });
+  assert.equal(defaultTools.length, 6);
+  assert.equal(defaultTools.find((tl) => tl.name === 'apply_patch'), undefined);
+  assert.equal(defaultTools.find((tl) => tl.name === 'query_symbol_graph'), undefined);
+
   const tools = createWorkspaceTools({
     workspaceRoot: root,
     store,
     nonce: mintNonce(),
     permissionMode: 'read-only',
+    toolModes: { diagnostics: true, repoIntelligence: true, patch: true },
   });
   const symTool = tools.find((tl) => tl.name === 'query_symbol_graph');
   assert.ok(symTool);

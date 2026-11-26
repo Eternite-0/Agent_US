@@ -1238,6 +1238,7 @@ async function runDeterministicAciTrial({ task, armName, armRuntime, rep, opts, 
       sessionId,
       permissionMode: 'auto-safe',
       nonce: '0123456789abcdef0123456789abcdef',
+      ...(armName !== 'A' ? { includeTools: ['expand_context'] } : {}),
       sandbox: loopSandbox,
       resolveContextRef,
     });

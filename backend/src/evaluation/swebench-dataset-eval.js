@@ -14,6 +14,32 @@ import { fileURLToPath } from 'node:url';
 export const SWEBENCH_HF_MINI_DATASET_ID = 'MariusHobbhahn/swe-bench-verified-mini';
 export const SWEBENCH_HF_FULL_DATASET_ID = 'princeton-nlp/SWE-bench_Verified';
 export const SWEBENCH_HF_DATASET_ID = SWEBENCH_HF_MINI_DATASET_ID;
+export const SWEBENCH_VERIFIED_REPOS = Object.freeze([
+  'astropy/astropy',
+  'django/django',
+  'matplotlib/matplotlib',
+  'mwaskom/seaborn',
+  'pallets/flask',
+  'psf/requests',
+  'pydata/xarray',
+  'pylint-dev/pylint',
+  'pytest-dev/pytest',
+  'scikit-learn/scikit-learn',
+  'sphinx-doc/sphinx',
+  'sympy/sympy',
+]);
+export const SWEBENCH_SUBSET_PRESETS = Object.freeze([
+  'smoke-5',
+  'paper-50',
+  'diverse-12',
+  'diverse-36',
+  'diverse-60',
+]);
+export const DIVERSE_SUBSET_TARGETS = Object.freeze({
+  'diverse-12': 12,
+  'diverse-36': 36,
+  'diverse-60': 60,
+});
 export const SMOKE5_PREFERRED_REPOS = Object.freeze([
   'psf/requests',
   'pytest-dev/pytest',
@@ -22,7 +48,7 @@ export const SMOKE5_PREFERRED_REPOS = Object.freeze([
   'scikit-learn/scikit-learn',
 ]);
 
-const VALID_SUBSET_PRESETS = new Set(['smoke-5', 'paper-50']);
+const VALID_SUBSET_PRESETS = new Set(SWEBENCH_SUBSET_PRESETS);
 const DEFAULT_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const DEFAULT_HF_ROWS_URL = 'https://datasets-server.huggingface.co/rows';
 const MAX_TARGETS_PER_PYTEST_CMD = 60;
@@ -569,6 +595,149 @@ function selectPaper50Subset(instances, seed) {
   return selected;
 }
 
+/**
+ * Returns the recommended HuggingFace dataset alias for a SWE-bench subset preset.
+ */
+export function getRecommendedDatasetForSubset(preset) {
+  if (Object.hasOwn(DIVERSE_SUBSET_TARGETS, preset)) {
+    return 'hf:verified-full';
+  }
+  if (preset === 'smoke-5' || preset === 'paper-50') {
+    return 'hf:verified-mini';
+  }
+  return null;
+}
+
+/**
+ * Water-filling repo-balanced quota allocator ensuring every repository receives
+ * equal base rounds (capped at repo size) and remaining quota is redistributed
+ * deterministically across uncapped repositories without single-repo dominance.
+ */
+export function allocateBalancedRepoQuotas(repoGroups, totalQuota) {
+  const quotas = new Map();
+  if (!Array.isArray(repoGroups) || repoGroups.length === 0 || totalQuota <= 0) {
+    for (const g of repoGroups ?? []) quotas.set(g.key, 0);
+    return quotas;
+  }
+
+  const totalAvailable = repoGroups.reduce((sum, g) => sum + g.count, 0);
+  if (totalQuota >= totalAvailable) {
+    for (const g of repoGroups) quotas.set(g.key, g.count);
+    return quotas;
+  }
+
+  for (const g of repoGroups) quotas.set(g.key, 0);
+  let remaining = totalQuota;
+
+  if (remaining < repoGroups.length) {
+    const verifiedSet = new Set(SWEBENCH_VERIFIED_REPOS);
+    const ranked = [...repoGroups].sort((a, b) => {
+      const aVer = verifiedSet.has(a.key) ? 0 : 1;
+      const bVer = verifiedSet.has(b.key) ? 0 : 1;
+      if (aVer !== bVer) return aVer - bVer;
+      if (b.count !== a.count) return b.count - a.count;
+      return compareStringsAsc(a.key, b.key);
+    });
+    for (let i = 0; i < remaining; i++) {
+      quotas.set(ranked[i].key, 1);
+    }
+    return quotas;
+  }
+
+  while (remaining > 0) {
+    const uncapped = repoGroups.filter((g) => (quotas.get(g.key) ?? 0) < g.count);
+    if (uncapped.length === 0) break;
+
+    if (remaining >= uncapped.length) {
+      for (const g of uncapped) {
+        quotas.set(g.key, (quotas.get(g.key) ?? 0) + 1);
+      }
+      remaining -= uncapped.length;
+    } else {
+      uncapped.sort((a, b) => {
+        const remA = a.count - (quotas.get(a.key) ?? 0);
+        const remB = b.count - (quotas.get(b.key) ?? 0);
+        if (remB !== remA) return remB - remA;
+        if (b.count !== a.count) return b.count - a.count;
+        return compareStringsAsc(a.key, b.key);
+      });
+      for (let i = 0; i < remaining; i++) {
+        const pick = uncapped[i];
+        quotas.set(pick.key, (quotas.get(pick.key) ?? 0) + 1);
+      }
+      remaining = 0;
+    }
+  }
+
+  return quotas;
+}
+
+function selectDiverseSubset(instances, presetTarget, seed) {
+  const targetCount = Math.min(presetTarget, instances.length);
+  if (targetCount === 0) return [];
+
+  const byRepo = new Map();
+  for (const inst of instances) {
+    const repo = String(inst?.repo ?? '').trim() || 'unknown';
+    if (!byRepo.has(repo)) byRepo.set(repo, []);
+    byRepo.get(repo).push(inst);
+  }
+
+  const sortedRepos = [...byRepo.keys()].sort(compareStringsAsc);
+  for (const repo of sortedRepos) {
+    byRepo.get(repo).sort(
+      (a, b) =>
+        computeSweBenchComplexityScore(a) - computeSweBenchComplexityScore(b) ||
+        compareStringsAsc(a?.instance_id, b?.instance_id),
+    );
+  }
+
+  const repoGroups = sortedRepos.map((repo) => ({
+    key: repo,
+    count: byRepo.get(repo).length,
+  }));
+  const repoQuotas = allocateBalancedRepoQuotas(repoGroups, targetCount);
+
+  const rng = createMulberry32(seed);
+  const selected = [];
+
+  for (const repo of sortedRepos) {
+    const quota = repoQuotas.get(repo) ?? 0;
+    if (quota <= 0) continue;
+    const pool = byRepo.get(repo);
+    if (quota >= pool.length) {
+      selected.push(...pool);
+      continue;
+    }
+
+    const bins = buildComplexityStrataBins(pool);
+    if (quota === 1) {
+      const candidatePool =
+        pool.length === 2
+          ? pool
+          : (bins.find((b) => b.key === 'med') ?? bins[Math.floor(bins.length / 2)]).items;
+      const shuffled = shuffleWithRng(candidatePool, rng);
+      selected.push(shuffled[0]);
+      continue;
+    }
+
+    const binGroups = bins.map((b) => ({ key: b.key, count: b.items.length }));
+    const binQuotas = allocateLargestRemainder(binGroups, quota, rng);
+    for (const bin of bins) {
+      const bQuota = binQuotas.get(bin.key) ?? 0;
+      if (bQuota <= 0) continue;
+      if (bQuota >= bin.items.length) {
+        selected.push(...bin.items);
+      } else {
+        const shuffled = shuffleWithRng(bin.items, rng);
+        selected.push(...shuffled.slice(0, bQuota));
+      }
+    }
+  }
+
+  return selected;
+}
+
 function buildRepoDistribution(instances) {
   const counts = new Map();
   for (const inst of instances) {
@@ -583,7 +752,8 @@ function buildRepoDistribution(instances) {
 }
 
 /**
- * Deterministically samples a `smoke-5` or `paper-50` subset from SWE-bench instances.
+ * Deterministically samples a `smoke-5`, `paper-50`, `diverse-12`, `diverse-36`,
+ * or `diverse-60` subset from SWE-bench instances.
  */
 export function selectSweBenchSubset(
   instances,
@@ -591,7 +761,7 @@ export function selectSweBenchSubset(
 ) {
   if (!VALID_SUBSET_PRESETS.has(preset)) {
     throw new Error(
-      `Invalid SWE-bench subset preset "${preset}"; expected "smoke-5" or "paper-50"`,
+      `Invalid SWE-bench subset preset "${preset}"; expected one of: ${SWEBENCH_SUBSET_PRESETS.join(', ')}`,
     );
   }
   if (!Array.isArray(instances)) {
@@ -600,7 +770,11 @@ export function selectSweBenchSubset(
 
   const normalizedSeed = Number.isFinite(Number(seed)) ? Math.trunc(Number(seed)) : 42;
   const selected =
-    preset === 'smoke-5' ? selectSmoke5Subset(instances) : selectPaper50Subset(instances, normalizedSeed);
+    preset === 'smoke-5'
+      ? selectSmoke5Subset(instances)
+      : preset === 'paper-50'
+        ? selectPaper50Subset(instances, normalizedSeed)
+        : selectDiverseSubset(instances, DIVERSE_SUBSET_TARGETS[preset], normalizedSeed);
 
   const instanceIds = selected.map((inst) => String(inst.instance_id));
   const repoDistribution = buildRepoDistribution(selected);

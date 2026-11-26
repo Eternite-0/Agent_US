@@ -227,7 +227,7 @@ export class DirectAgentRuntime {
     this.steeringQueues = new Map(); // sessionId -> string[]
     this.readFileStates = new Map(); // sessionId -> Map(relPath -> { sha256, at })
     this.sessionSandboxes = new Map(); // sessionId -> { sandbox, disableWorkspaceHooks, disableWorkspaceMcp, forcedToolDeny }
-    this.sessionTrafficSources = new Map(); // sessionId -> raw trafficSource override (e.g. 'benchmark')
+    this.sessionToolConfigs = new Map(); // sessionId -> { toolProfile, toolModes, includeTools }
     this.sessionProjects = new Map(); // sessionId -> projectId override
     this.sessionAciConfigs = new Map(); // sessionId -> { aciProfile, aciOptions }
     this.turnAciStates = new Map(); // turnId -> { sessionId, turnAciLedger, turnReadFiles, turnAciStore }
@@ -289,7 +289,7 @@ export class DirectAgentRuntime {
         this.steeringQueues.delete(sessionId);
         this.readFileStates.delete(sessionId);
         this.sessionSandboxes.delete(sessionId);
-        this.sessionTrafficSources.delete(sessionId);
+        this.sessionToolConfigs.delete(sessionId);
         this.sessionProjects.delete(sessionId);
         this.sessionAciConfigs.delete(sessionId);
         for (const [tid, st] of this.turnAciStates.entries()) {
@@ -384,6 +384,7 @@ export class DirectAgentRuntime {
           sessionId,
           permissionMode,
           nonce,
+          toolProfile: 'full',
           processManager: this.processManager,
           sandbox: toolSandbox,
           getLivePolicy,
@@ -1003,6 +1004,9 @@ export class DirectAgentRuntime {
       projectId = null,
       aciProfile = undefined,
       aciOptions = undefined,
+      toolProfile = undefined,
+      toolModes = undefined,
+      includeTools = undefined,
       ...sessionOpts
     } = opts ?? {};
 
@@ -1023,6 +1027,33 @@ export class DirectAgentRuntime {
                 : undefined,
         });
       }
+      const inheritedTools =
+        this.sessionToolConfigs.get(sessionOpts.parentSessionId) ??
+        this.sessionToolConfigs.get(sessionOpts.rootSessionId) ??
+        this.sessionToolConfigs.get(callerSessionId) ??
+        null;
+      if (
+        toolProfile !== undefined ||
+        toolModes !== undefined ||
+        includeTools !== undefined ||
+        inheritedTools
+      ) {
+        this.sessionToolConfigs.set(createdSession.id, {
+          toolProfile: toolProfile ?? inheritedTools?.toolProfile,
+          toolModes:
+            toolModes !== undefined
+              ? { ...(inheritedTools?.toolModes ?? {}), ...(toolModes ?? {}) }
+              : inheritedTools?.toolModes
+                ? { ...inheritedTools.toolModes }
+                : undefined,
+          includeTools:
+            Array.isArray(includeTools)
+              ? [...new Set([...(inheritedTools?.includeTools ?? []), ...includeTools.map(String)])]
+              : inheritedTools?.includeTools
+                ? [...inheritedTools.includeTools]
+                : undefined,
+        });
+      }
     };
 
     const inheritedCfg =
@@ -1030,13 +1061,13 @@ export class DirectAgentRuntime {
       this.#resolveSessionSandboxConfig(sessionOpts.rootSessionId) ??
       this.#resolveSessionSandboxConfig(callerSessionId);
 
-    const activeProfile = sandboxProfile ?? (inheritedCfg ? 'benchmark' : null);
-    const useBenchmarkSandbox = Boolean(sandbox || inheritedCfg || activeProfile === 'benchmark');
-    if (!useBenchmarkSandbox) {
+    const hasRestrictedSandboxProfile =
+      typeof sandboxProfile === 'string' &&
+      sandboxProfile.trim().length > 0 &&
+      !['default', 'host', 'none'].includes(sandboxProfile.trim().toLowerCase());
+    const useIsolatedSandbox = Boolean(sandbox || inheritedCfg || hasRestrictedSandboxProfile);
+    if (!useIsolatedSandbox) {
       const created = this.sessionRepo.createSession(sessionOpts);
-      if (sessionOpts.trafficSource != null && String(sessionOpts.trafficSource).trim()) {
-        this.sessionTrafficSources.set(created.id, String(sessionOpts.trafficSource).trim().toLowerCase());
-      }
       if (projectId && String(projectId).trim()) {
         this.sessionProjects.set(created.id, String(projectId).trim());
       }
@@ -1064,9 +1095,6 @@ export class DirectAgentRuntime {
       ...sessionOpts,
       toolDeny: mergedToolDeny,
     });
-    if (sessionOpts.trafficSource != null && String(sessionOpts.trafficSource).trim()) {
-      this.sessionTrafficSources.set(created.id, String(sessionOpts.trafficSource).trim().toLowerCase());
-    }
 
     if (projectId && String(projectId).trim()) {
       this.sessionProjects.set(created.id, String(projectId).trim());
@@ -1075,7 +1103,6 @@ export class DirectAgentRuntime {
 
     this.sessionSandboxes.set(created.id, {
       sandbox: resolvedSandbox,
-      sandboxProfile: activeProfile ?? 'benchmark',
       disableWorkspaceHooks:
         disableWorkspaceHooks ?? inheritedCfg?.disableWorkspaceHooks ?? true,
       disableWorkspaceMcp:
@@ -1720,6 +1747,9 @@ export class DirectAgentRuntime {
       evidenceContract = null,
       aciProfile = undefined,
       aciOptions = undefined,
+      toolProfile = undefined,
+      toolModes = undefined,
+      includeTools = undefined,
       trafficSource = undefined,
       isSynthetic = undefined,
       distillSyntheticTurns = undefined,
@@ -1796,11 +1826,10 @@ export class DirectAgentRuntime {
       evidenceContract: evidenceContract && typeof evidenceContract === 'object' ? evidenceContract : null,
       ...(aciProfile !== undefined ? { aciProfile } : {}),
       ...(aciOptions !== undefined && aciOptions && typeof aciOptions === 'object' ? { aciOptions } : {}),
+      ...(toolProfile !== undefined ? { toolProfile } : {}),
+      ...(toolModes !== undefined && toolModes && typeof toolModes === 'object' ? { toolModes } : {}),
+      ...(Array.isArray(includeTools) ? { includeTools: includeTools.map(String) } : {}),
       trafficSource: classifiedTraffic.trafficSource,
-      rawTrafficSource:
-        trafficSource !== undefined && trafficSource !== null
-          ? String(trafficSource).trim().toLowerCase()
-          : (this.sessionTrafficSources.get(sessionId) ?? null),
       isSynthetic: classifiedTraffic.isSynthetic,
       ...(distillSyntheticTurns !== undefined ? { distillSyntheticTurns: Boolean(distillSyntheticTurns) } : {}),
     };
@@ -2042,6 +2071,9 @@ export class DirectAgentRuntime {
           evidenceContract: payload.evidenceContract ?? null,
           aciProfile: payload.aciProfile,
           aciOptions: payload.aciOptions,
+          toolProfile: payload.toolProfile,
+          toolModes: payload.toolModes,
+          includeTools: payload.includeTools,
           turnAciLedger: turnAciState.turnAciLedger,
           turnReadFiles: turnAciState.turnReadFiles,
           turnAciStore: turnAciState.turnAciStore,
@@ -2050,11 +2082,7 @@ export class DirectAgentRuntime {
           canRetry: job.attempts < job.maxAttempts,
           leaseGuard,
           signal: combinedSignal,
-          trafficSource:
-            payload.rawTrafficSource === 'benchmark' || this.sessionTrafficSources.get(sessionId) === 'benchmark'
-              ? 'benchmark'
-              : classifiedTraffic.trafficSource,
-          sandboxProfile: payload.sandboxProfile ?? null,
+          trafficSource: classifiedTraffic.trafficSource,
           isSynthetic: classifiedTraffic.isSynthetic,
           distillSyntheticTurns: Boolean(payload.distillSyntheticTurns),
         });
@@ -2184,6 +2212,9 @@ export class DirectAgentRuntime {
     evidenceContract = null,
     aciProfile = undefined,
     aciOptions = undefined,
+    toolProfile = undefined,
+    toolModes = undefined,
+    includeTools = undefined,
     turnAciLedger = null,
     turnReadFiles = null,
     turnAciStore = null,
@@ -2193,7 +2224,6 @@ export class DirectAgentRuntime {
     leaseGuard = null,
     signal,
     trafficSource = 'production',
-    sandboxProfile = null,
     isSynthetic = false,
     distillSyntheticTurns = false,
   }) {
@@ -2202,7 +2232,6 @@ export class DirectAgentRuntime {
     const turnModifiedFiles = new Set();
     let sessionObj = null;
     const sbxCfg = this.#resolveSessionSandboxConfig(sessionId);
-    const resolvedSandboxProfile = sandboxProfile ?? sbxCfg?.sandboxProfile ?? (sbxCfg ? 'benchmark' : null);
     if (sbxCfg?.sandbox) {
       sbxCfg.sandbox.resolveBackend();
     }
@@ -2405,6 +2434,23 @@ export class DirectAgentRuntime {
         }
       };
 
+      const sessionToolCfg = this.sessionToolConfigs.get(sessionId) ?? null;
+      const effectiveToolProfile = toolProfile ?? sessionToolCfg?.toolProfile ?? 'core';
+      const effectiveToolModes =
+        toolModes !== undefined
+          ? { ...(sessionToolCfg?.toolModes ?? {}), ...(toolModes ?? {}) }
+          : sessionToolCfg?.toolModes;
+      const explicitIncludeTools = [
+        ...new Set([
+          ...(Array.isArray(sessionToolCfg?.includeTools) ? sessionToolCfg.includeTools : []),
+          ...(Array.isArray(includeTools) ? includeTools : []),
+          ...(Array.isArray(livePolicyInitial?.allowTools) ? livePolicyInitial.allowTools : []),
+          ...(effectiveToolProfile === 'core' && (aciResolved.admissionEnabled || aciResolved.dtocEnabled)
+            ? ['expand_context']
+            : []),
+        ].map(String)),
+      ];
+
       const tools = createWorkspaceTools({
         workspaceRoot,
         dataRoot: this.dataRoot,
@@ -2412,6 +2458,9 @@ export class DirectAgentRuntime {
         sessionId,
         permissionMode: effectivePermissionMode,
         nonce,
+        toolProfile: effectiveToolProfile,
+        ...(effectiveToolModes ? { toolModes: effectiveToolModes } : {}),
+        ...(explicitIncludeTools.length ? { includeTools: explicitIncludeTools } : {}),
         getLivePolicy: () => this.#getLiveSessionPolicy(sessionId),
         getApprovedPrefixes: () => this.#getLiveSessionPolicy(sessionId)?.approvedPrefixes ?? [],
         readFileState,
@@ -2569,8 +2618,6 @@ export class DirectAgentRuntime {
         provider: 'pool',
         effort,
         workspaceRoot,
-        trafficSource,
-        sandboxProfile: resolvedSandboxProfile,
         execution: evidenceContract ? { evidenceContract } : null,
         aci: {
           engine: aciEngine,
@@ -2803,7 +2850,7 @@ export class DirectAgentRuntime {
         });
       }
 
-      // 2. Verification failed / step limit exhausted / thrashing break -> atomic terminal failed commit + outbox
+      // 2. Verification failed / step limit exhausted -> atomic terminal failed commit + outbox
       if (loopResult.status === 'failed') {
         const errorMessage = String(
           loopResult.errorMessage || loopResult.errorCode || 'VERIFICATION_FAILED',

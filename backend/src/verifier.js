@@ -3,8 +3,6 @@
  * inspired by Agnes Harness `packages/core/src/execution/turn/gate.ts`.
  */
 
-import { classifyMutationPath } from './kernel/execution-reasoning.js';
-
 const TOOL_CALL_AS_TEXT_RE =
   /\{\s*"(?:tool|name|function)"\s*:\s*"(?:shell|pty|git|read_file|write_file|mcp|read_blob)"|\btool_call\s*:\s*\{/i;
 
@@ -28,27 +26,6 @@ const REASON_TEXT = {
     `required deliverable file(s) are missing from the workspace: ${(ctx.missingFiles ?? []).join(', ')}`,
   unverified_coder_claim: () =>
     'the reply claimed tests/verification passed, but zero tool executions were recorded in this session',
-  STALE_VERIFICATION_AFTER_EDIT: (ctx) => {
-    const mutated =
-      ctx.mutatedFilesAfterVerification ?? ctx.checks?.mutatedFilesAfterVerification ?? [];
-    const filesText = Array.isArray(mutated) && mutated.length ? ` (${mutated.join(', ')})` : '';
-    return `files${filesText} were modified after the last passing verification; review your edits and re-run the verification command via bash after your final edit so it passes with exitCode 0`;
-  },
-  UNRESOLVED_VERIFICATION_FAILURE: (ctx) => {
-    const cmd =
-      ctx.unresolvedVerificationCommand ?? ctx.checks?.unresolvedVerificationCommand ?? null;
-    const excerpt =
-      ctx.diagnosticExcerpt ??
-      ctx.checks?.diagnosticExcerpt ??
-      ctx.failureFingerprint?.summary ??
-      null;
-    return `verification${cmd ? ` (${cmd})` : ''} is still failing${excerpt ? ` — ${excerpt}` : ''}; read the failing test and root-cause source files (read_file/grep), fix the underlying root cause instead of repeating blind edits, and re-run verification until exitCode is 0`;
-  },
-  POST_EDIT_VERIFICATION_MISSING: (ctx) => {
-    const mutated = ctx.mutatedFiles ?? ctx.checks?.mutatedFiles ?? [];
-    const filesText = Array.isArray(mutated) && mutated.length ? ` (${mutated.join(', ')})` : '';
-    return `files${filesText} were modified without running a verification command; run the relevant test/check command via bash to verify your changes`;
-  },
 };
 
 function extractAssistantText(event) {
@@ -179,15 +156,9 @@ export function buildRepairNote(
     result.reasons.length > 0 &&
     result.reasons.every((r) => String(r).startsWith('EVIDENCE_INCOMPLETE:'));
   const latestVerification = reasoningState?.verifications?.at(-1) ?? null;
-  const mutatedAfterVerify =
-    result?.mutatedFilesAfterVerification ?? result?.checks?.mutatedFilesAfterVerification ?? [];
-  const docOnlyMutationAfterPass =
-    Array.isArray(mutatedAfterVerify) &&
-    mutatedAfterVerify.length > 0 &&
-    mutatedAfterVerify.every((p) => classifyMutationPath(p) === 'doc');
   const verifiedAfterLastMutation = Boolean(
     latestVerification?.passed === true &&
-      (!reasoningState?.hasUnverifiedMutationsAfterLastPass || docOnlyMutationAfterPass),
+      !reasoningState?.hasUnverifiedMutationsAfterLastPass,
   );
   if (isEvidenceOnlyFailure && verifiedAfterLastMutation) {
     const mutatedList =
@@ -216,9 +187,6 @@ export function buildRepairNote(
     return `- ${reason}${explain ? `: ${explain(result)}` : ''}`;
   });
   const extra = [];
-  if (Array.isArray(mutatedAfterVerify) && mutatedAfterVerify.length > 0 && !docOnlyMutationAfterPass) {
-    extra.push(`Modified files needing re-verification: ${mutatedAfterVerify.join(', ')}.`);
-  }
   if (contractReadiness?.evaluated && !contractReadiness.ready && contractReadiness.checklistText) {
     extra.push(contractReadiness.checklistText);
   }

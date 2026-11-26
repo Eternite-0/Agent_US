@@ -406,7 +406,7 @@ test('Integration 3.1(a): 12-step Python coding turn + 64-token prefix KV cache 
       '# Pricing Engine Engineering Guidelines',
       '',
       ...Array.from(
-        { length: 185 },
+        { length: 235 },
         (_, i) => `- Policy ${i + 1}: Keep integer cent rounding deterministic in src/pricing/calculator.py and verify via pytest.`,
       ),
       '',
@@ -606,6 +606,7 @@ test('Integration 3.1(a): 12-step Python coding turn + 64-token prefix KV cache 
     model: 'deepseek-reasoner',
     permissionMode: 'workspace-write',
     aciProfile: 'full_aci',
+    toolModes: { diagnostics: true },
     budget: { maxSteps: 40 },
   });
   direct.subscribe(sess1.id, (ev) => {
@@ -647,11 +648,9 @@ test('Integration 3.1(a): 12-step Python coding turn + 64-token prefix KV cache 
   assert.match(wireCalcTool, /300: # rule-pad-300/);
   assert.equal(wireCalcTool.startsWith('[ACI-REF'), false, '300-line .py must NOT be skeletonized');
 
-  // 2) Python SyntaxError caught immediately with line numbers on BOTH edit_file & run_diagnostics
+  // 2) edit_file omits implicit per-edit syntax subprocesses (language-agnostic fast path); explicit run_diagnostics catches it with line numbers
   const wireBadEditTool = lastTurn1Msgs.find((m) => m.role === 'tool' && m.tool_call_id === 'c31_6')?.content ?? '';
-  assert.match(wireBadEditTool, /自动语法诊断/);
-  assert.match(wireBadEditTool, /src\/pricing\/calculator\.py:295/);
-  assert.match(wireBadEditTool, /SyntaxError/);
+  assert.doesNotMatch(wireBadEditTool, /自动语法诊断/);
 
   const wireDiagSynTool = lastTurn1Msgs.find((m) => m.role === 'tool' && m.tool_call_id === 'c31_7')?.content ?? '';
   assert.match(wireDiagSynTool, /"ok":false/);

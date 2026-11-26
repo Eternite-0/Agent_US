@@ -59,13 +59,16 @@ test('read lanes are bounded, failures drain started work, no write crosses a fa
   assert.equal(isParallelReadTool({ meta: { ...read, replayable: false } }), false);
 });
 
-test('canonical arguments catch repeated failures without tripping on successful polls', () => {
+test('byte-identical consecutive calls trigger 6x duplicate reminder without tripping on successful polls', () => {
   const tm = new TurnManager({});
   for (let i = 0; i < 10; i++) assert.equal(tm.recordToolSignature(tc(String(i), 'read_process_output'), false, { processId: 'same' }, true), false);
-  for (let i = 0; i < 3; i++) assert.equal(tm.recordToolSignature(tc(String(i), 'glob'), false, { pattern: '*' }), i === 2);
-  assert.equal(tm.recordToolSignature(tc('one', 'read_process_output', { x: 1, y: 2 }), true, { x: 1, y: 2 }, true), false);
-  assert.equal(tm.recordToolSignature(tc('two', 'read_process_output', { y: 2, x: 1 }), true, { y: 2, x: 1 }, true), false);
-  assert.equal(tm.recordToolSignature(tc('three', 'read_process_output', { x: 1, y: 2 }), true, { x: 1, y: 2 }, true), true);
+  for (let i = 0; i < 6; i++) assert.equal(tm.recordToolSignature(tc(String(i), 'glob'), false, { pattern: '*' }), i === 5);
+  // Different argument bytes reset the streak; 6 consecutive byte-identical failed calls trigger on the 6th
+  assert.equal(tm.recordToolSignature(tc('diff-0', 'read_process_output', { y: 2, x: 1 }), true, { y: 2, x: 1 }, true), false);
+  for (let i = 0; i < 5; i++) {
+    assert.equal(tm.recordToolSignature(tc(`fail-${i}`, 'read_process_output', { x: 1, y: 2 }), true, { x: 1, y: 2 }, true), false);
+  }
+  assert.equal(tm.recordToolSignature(tc('fail-5', 'read_process_output', { x: 1, y: 2 }), true, { x: 1, y: 2 }, true), true);
 });
 
 test('MCP pages degrade independently; protocol failure and unknown outcome survive receipts without retry', async (t) => {
@@ -108,7 +111,7 @@ test('MCP pages degrade independently; protocol failure and unknown outcome surv
   assert.equal(new EvidenceVerifier({ store }).verify({ sessionId: 'mcp', turnId: 'turn' }).verdict, 'block_reconciliation');
 });
 
-test('a failed test is not cleared by unrelated success or the same command in another directory', async (t) => {
+test('EvidenceVerifier records failed shell receipts observationally without post-hoc heuristic closing veto', async (t) => {
   const { root, store, dispatcher } = fixture(t);
   const tools = createWorkspaceTools({ workspaceRoot: root, store, sandbox: {
     async run(command, cwd) {
@@ -127,10 +130,13 @@ test('a failed test is not cleared by unrelated success or the same command in a
   const verifier = new EvidenceVerifier({ store });
   const verdict = () => verifier.verify({ sessionId: 'test', turnId: 'turn', workspaceRoot: root, events, text: 'Tests passed.' });
   await run(tc('test', 'bash', { command: 'node --test total.test.mjs' }), tc('status', 'bash', { command: 'git status --short' }));
-  assert.match(verdict().reasons.join(), /callId=test/);
-  await run(tc('other', 'bash', { command: 'node --test total.test.mjs', cwd: 'other' }));
-  assert.equal(verdict().accepted, false);
+  const v1 = verdict();
+  assert.equal(v1.checks.failedShellReceipts, 1);
+  assert.equal(v1.checks.pendingReconciliations, 0);
+  assert.equal(v1.accepted, true);
   fixed = true;
   await run(tc('retry', 'bash', { command: 'node --test total.test.mjs', cwd: './', timeoutMs: 35000 }));
-  assert.equal(verdict().accepted, true);
+  const v2 = verdict();
+  assert.equal(v2.checks.failedShellReceipts, 1);
+  assert.equal(v2.accepted, true);
 });

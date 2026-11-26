@@ -265,7 +265,7 @@ test('v3.1 WP3 (b): >=48k amortized batch epoch requires >=max(3500, 0.35*suffix
       ...makeToolStep('v_head', 'read_file', { path: 'src/boot.js' }, headCode, { step: 1 }), // index 2 (<3 head prefix)
       ...makeToolStep('v_spec', 'read_file', { path: 'SPEC.md' }, specCode, { step: 2 }), // strict contract
       ...makeToolStep('v_t1_read', 'read_file', { path: 'src/stale.js' }, tier1PreMut, { step: 3 }), // Tier 1 superseded by edit
-      ...makeToolStep('v_t1_err', 'run_diagnostics', { kind: 'test' }, tier1OldErr, { isError: true, step: 4 }), // Tier 1 superseded by v_latest_err
+      ...makeToolStep('v_t1_err', 'bash', { command: 'node --test test/old.test.js' }, tier1OldErr, { isError: true, step: 4 }), // Tier 1 superseded by v_latest_err
       ...makeToolStep('v_t2_a', 'read_file', { path: 'src/aged1.js' }, tier2Aged1, { step: 5 }), // Tier 2 aged
       ...makeToolStep('v_t2_b', 'read_file', { path: 'src/aged2.js' }, tier2Aged2, { step: 6 }), // Tier 2 aged
       ...makeToolStep('v_edit', 'edit_file', { path: 'src/stale.js' }, 'Edited src/stale.js', { step: 8 }), // recent edit (10 - 8 = 2 <= 4)

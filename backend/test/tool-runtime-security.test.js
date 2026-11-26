@@ -130,6 +130,11 @@ test('P3 Sandbox & Policy: Env sanitization, symlink escape guard, capability ma
         /逃逸|边界/,
       );
     }
+    // Core sandbox has zero hardcoded container-path stripping (external paths are rejected)
+    assert.throws(
+      () => resolveConfinedPath(root, '/testbed/src/app.py'),
+      /逃逸|边界|绝对路径|路径/,
+    );
   } finally {
     rmDirSafe(root);
     rmDirSafe(outside);
@@ -154,6 +159,7 @@ test('P3 ToolDispatcher: Zod 2-strike auto-recovery, outward MCP human gate, per
     store,
     sessionId: 's-p3',
     permissionMode: 'auto-safe',
+    toolModes: { contextRecall: true },
     mcpTools: [
       {
         fullName: 'mcp__ext__deploy',
