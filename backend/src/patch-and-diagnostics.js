@@ -3199,13 +3199,16 @@ export function runDiagnostics(
 
       const trimmedPattern = testPattern && String(testPattern).trim() ? String(testPattern).trim() : '';
       const pyRelArgs = pyCliTargets.map((t) => t.rel).filter((r) => r && r !== '.' && !r.startsWith('-'));
-      const pytestArgs = ['-m', 'pytest', '-q', '--tb=short'];
+      const pytestArgs = ['-B', '-m', 'pytest', '-q', '--tb=short'];
       if (trimmedPattern) {
         pytestArgs.push('-k', trimmedPattern);
       }
       pytestArgs.push(...pyRelArgs);
 
-      const pyEnv = sanitizeChildEnv(process.env);
+      const pyEnv = {
+        ...sanitizeChildEnv(process.env),
+        PYTHONDONTWRITEBYTECODE: '1',
+      };
       let usedRunner = 'pytest';
       let res = spawnSync(py.command, [...py.prefixArgs, ...pytestArgs], {
         cwd: root,
@@ -3220,7 +3223,7 @@ export function runDiagnostics(
       if (res.status !== 0 && /No module named ['"]?pytest['"]?/i.test(combined)) {
         usedRunner = 'unittest';
         const runUnittestArgs = (extraArgs) =>
-          spawnSync(py.command, [...py.prefixArgs, '-m', 'unittest', ...extraArgs], {
+          spawnSync(py.command, [...py.prefixArgs, '-B', '-m', 'unittest', ...extraArgs], {
             cwd: root,
             encoding: 'utf8',
             windowsHide: true,

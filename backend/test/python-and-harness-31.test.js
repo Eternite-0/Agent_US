@@ -6,6 +6,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -215,7 +217,8 @@ test('WP5.2 syntax: resolvePythonRunner, validateCodeSyntax, edit_file, write_fi
 test('WP5.2 test diagnostics: pytest pass/fail, -k filter, auto mode, collection errors, dual JS+Python, and unittest fallback', async (t) => {
   const { root, put } = createTempWorkspace(t, 'py-pytest-31-');
   put('pyproject.toml', '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n');
-  put('src/math_ops.py', 'def add(a, b):\n    return a - b\n');
+  const mathOpsPath = put('src/math_ops.py', 'def add(a, b):\n    return a - b\n');
+  const mathOpsInitialStat = statSync(mathOpsPath);
   put(
     'tests/test_math.py',
     [
@@ -262,12 +265,15 @@ test('WP5.2 test diagnostics: pytest pass/fail, -k filter, auto mode, collection
   });
   assert.equal(noMatch.ok, false);
 
-  // 4. Fix bug -> full pytest passes cleanly
+  // 4. Fix bug -> full pytest passes cleanly (even on same-second same-size overwrite without stale .pyc)
   put('src/math_ops.py', 'def add(a, b):\n    return a + b\n');
+  utimesSync(mathOpsPath, mathOpsInitialStat.atime, mathOpsInitialStat.mtime);
   const fullPass = runDiagnostics(root, { kind: 'test' });
   assert.equal(fullPass.ok, true);
   assert.deepEqual(fullPass.diagnostics, []);
   assert.deepEqual(fullPass.failingTests, []);
+  assert.equal(existsSync(join(root, 'src', '__pycache__')), false);
+  assert.equal(existsSync(join(root, 'tests', '__pycache__')), false);
 
   // 5. Collection SyntaxError & ImportError never return false-positive ok:true
   const { root: brokenRoot, put: putBroken } = createTempWorkspace(t, 'py-broken-col-');
@@ -298,7 +304,8 @@ test('WP5.2 test diagnostics: pytest pass/fail, -k filter, auto mode, collection
     'test/js_ok.test.js',
     "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('js ok', () => assert.equal(1 + 1, 2));\n",
   );
-  putMixed('tests/test_py_mix.py', 'def test_py_fail():\n    assert 10 == 20\n');
+  const mixPyPath = putMixed('tests/test_py_mix.py', 'def test_py_fail():\n    assert 10 == 20\n');
+  const mixPyInitialStat = statSync(mixPyPath);
 
   const mixedFail = runDiagnostics(mixedRoot, { kind: 'test' });
   assert.equal(mixedFail.ok, false);
@@ -306,8 +313,10 @@ test('WP5.2 test diagnostics: pytest pass/fail, -k filter, auto mode, collection
   assert.match(mixedFail.failingTests[0].testName, /test_py_fail/);
 
   putMixed('tests/test_py_mix.py', 'def test_py_pass():\n    assert 10 == 10\n');
+  utimesSync(mixPyPath, mixPyInitialStat.atime, mixPyInitialStat.mtime);
   const mixedPass = runDiagnostics(mixedRoot, { kind: 'test' });
   assert.equal(mixedPass.ok, true);
+  assert.equal(existsSync(join(mixedRoot, 'tests', '__pycache__')), false);
 
   // 7. unittest fallback when pytest is absent (isolated venv --without-pip)
   const pyRunner = resolvePythonRunner();
