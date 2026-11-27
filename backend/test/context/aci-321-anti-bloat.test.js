@@ -532,7 +532,7 @@ test('3.2.1 Supervisor auto-skip (reasoning/v4/mainModel) and minSupervisorBatch
   }
 });
 
-test('3.2.1 cache_aware_v31: 48k floor and 0.35 * invalidatedSuffixTokens gate (<80% vs >=80% critical pressure)', () => {
+test('3.2.1 cache_aware_v31: adaptive DP k* abolishes default 48k wall while honoring explicit dtocMinPromptTokens opt-in and cache-rate amortization', () => {
   assert.equal(DEFAULT_V31_MIN_PROMPT_TOKENS, 48000);
   const storeDir = mkdtempSync(join(tmpdir(), 'aci321-v31-'));
   const store = new Store(join(storeDir, 'engine.sqlite'));
@@ -551,7 +551,8 @@ test('3.2.1 cache_aware_v31: 48k floor and 0.35 * invalidatedSuffixTokens gate (
     const mkBlock = (prefix, lines) =>
       Array.from({ length: lines }, (_, i) => `export function ${prefix}_${i}(v) { return v + ${i} + "${'k'.repeat(50)}"; }`).join('\n');
 
-    // 1) ~40k prompt tokens (<48k floor) -> abstains with append_only_cache_floor_v31
+    // 1) ~40k prompt tokens (<48k): default cache_aware_v31 triggers adaptively (no static 48k wall),
+    // while explicit dtocMinPromptTokens=48000 opt-in still enforces append_only_cache_floor_v31.
     const msgs40k = [
       { role: 'user', content: [{ type: 'text', text: 'Update modules' }] },
       ...makeToolStep('h1', 'read_file', { path: 'README.md' }, 'Intro\n'.repeat(20), { step: 1 }),
@@ -562,11 +563,27 @@ test('3.2.1 cache_aware_v31: 48k floor and 0.35 * invalidatedSuffixTokens gate (
     ];
     const tok40k = measureRequestComposition({ messages: msgs40k }).totalTokens;
     assert.ok(tok40k >= 32000 && tok40k < 48000, `Expected 32k..48k tokens, got ${tok40k}`);
-    const floorRes = engine.inspectEpoch(msgs40k, { currentStep: 8 });
+    const adaptiveBelow48k = engine.inspectEpoch(msgs40k, { currentStep: 8 });
+    assert.equal(adaptiveBelow48k.triggered, true);
+    assert.equal(adaptiveBelow48k.reason, CACHE_AWARE_V31_DTOC_POLICY);
+    assert.ok(adaptiveBelow48k.optimalSplitIndex >= 0);
+
+    const floorOptInEngine = new ACIEngine({
+      store,
+      aciStore: new ReversibleContextStore(store),
+      ledger: new ContextEvidenceLedger(),
+      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
+      dtocMinPromptTokens: DEFAULT_V31_MIN_PROMPT_TOKENS,
+      maxTotalTokens: 400000,
+      contextWindow: 128000,
+    });
+    const floorRes = floorOptInEngine.inspectEpoch(msgs40k, { currentStep: 8 });
     assert.equal(floorRes.triggered, false);
     assert.equal(floorRes.reason, 'append_only_cache_floor_v31');
 
-    // 2) >=48k tokens, <80% contextWindow (128k), savings >= 3500 (~5k) BUT < 0.35 * invalidatedSuffixTokens (~40k * 0.35 = ~14k) -> abstains!
+    // 2) ~55k tokens with ~7k candidate savings before huge ~45k shielded suffix:
+    // default horizon (4 * 7k <= 0.6 * 55k) and hot cache (rho=0.95) abstain;
+    // high horizon + cold cache (rho=0) clears both DP inequalities!
     const msgsLowAmort = [
       { role: 'user', content: [{ type: 'text', text: 'Update modules' }] },
       ...makeToolStep('h2', 'read_file', { path: 'README.md' }, 'Intro\n'.repeat(20), { step: 1 }),
@@ -578,28 +595,28 @@ test('3.2.1 cache_aware_v31: 48k floor and 0.35 * invalidatedSuffixTokens gate (
     assert.ok(tokAmort >= 48000 && tokAmort < 128000 * 0.80, `Expected 48k..102k tokens, got ${tokAmort}`);
     const amortBlocked = engine.inspectEpoch(msgsLowAmort, { currentStep: 8, contractFiles: ['SPEC.md'] });
     assert.ok(amortBlocked.combinedNetSavingsTokens >= 3500, `Expected >= 3500 savings, got ${amortBlocked.combinedNetSavingsTokens}`);
-    assert.ok(
-      amortBlocked.combinedNetSavingsTokens < Math.ceil(amortBlocked.invalidatedSuffixTokens * 0.35),
-      'Test precondition: savings must be < 0.35 * invalidatedSuffixTokens',
-    );
     assert.equal(amortBlocked.netSavingsMet, false);
     assert.equal(amortBlocked.triggered, false);
     assert.equal(amortBlocked.reason, 'insufficient_net_savings');
 
-    // 3) At >= 80% contextWindow critical pressure, same savings >= 3500 IS allowed!
-    const smallCtxEngine = new ACIEngine({
-      store,
-      aciStore: new ReversibleContextStore(store),
-      ledger: new ContextEvidenceLedger(),
-      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
-      maxTotalTokens: 400000,
-      contextWindow: Math.floor(tokAmort / 0.82),
+    const hotCacheBlocked = engine.inspectEpoch(msgsLowAmort, {
+      currentStep: 8,
+      contractFiles: ['SPEC.md'],
+      estHorizon: 8,
+      observedCacheHitRate: 0.95,
     });
-    const criticalProbe = smallCtxEngine.inspectEpoch(msgsLowAmort, { currentStep: 8, contractFiles: ['SPEC.md'] });
-    assert.ok(criticalProbe.singleStepRatio >= 0.80);
-    assert.equal(criticalProbe.netSavingsMet, true);
-    assert.equal(criticalProbe.triggered, true);
-    assert.equal(criticalProbe.reason, CACHE_AWARE_V31_DTOC_POLICY);
+    assert.equal(hotCacheBlocked.triggered, false);
+    assert.equal(hotCacheBlocked.reason, 'insufficient_net_savings');
+
+    const coldCacheAllowed = engine.inspectEpoch(msgsLowAmort, {
+      currentStep: 8,
+      contractFiles: ['SPEC.md'],
+      estHorizon: 8,
+      observedCacheHitRate: 0,
+    });
+    assert.equal(coldCacheAllowed.netSavingsMet, true);
+    assert.equal(coldCacheAllowed.triggered, true);
+    assert.equal(coldCacheAllowed.reason, CACHE_AWARE_V31_DTOC_POLICY);
   } finally {
     store.close?.();
     rmDirSafe(storeDir);

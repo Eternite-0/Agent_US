@@ -983,7 +983,7 @@ test('Stage 4: classifyCriticalDomains detects 5 protected domains, suppresses d
     const controller = new PreInjectionAdmissionController({ aciStore, ledger, workingSetReadMaxChars: 2600 });
 
     const authGuardCode =
-      Array.from({ length: 55 }, (_, i) => `export function helperAuth${i}(x) { return x + ${i}; }`).join('\n') +
+      Array.from({ length: 120 }, (_, i) => `export function helperAuth${i}(x) { return x + ${i}; }`).join('\n') +
       '\nexport function verifySignature(token) {\n  if (!token) throw new Error("BAD_SIG");\n  return token.startsWith("sig_");\n}\n';
     const largeHelperCode =
       'import { targetEntry } from "./target.js";\n' +
@@ -1074,8 +1074,9 @@ test('Stage 4: classifyCriticalDomains detects 5 protected domains, suppresses d
     assert.equal(byId['tc-err'].admission.decision, ADMISSION_DECISIONS.DIRECT);
     assert.equal(byId['tc-slice'].admission.decision, ADMISSION_DECISIONS.DIRECT);
     assert.equal(byId['tc-prompt'].admission.decision, ADMISSION_DECISIONS.DIRECT);
-    assert.equal(byId['tc-noise'].admission.decision, ADMISSION_DECISIONS.IRRELEVANT);
-    assert.ok(!byId['tc-noise'].admittedOutput.includes('\n'));
+    // Non-decoy zero-signal bursts that clear the requery gate fold reversibly to DEFER (never IRRELEVANT)
+    assert.equal(byId['tc-noise'].admission.decision, ADMISSION_DECISIONS.DEFER);
+    assert.match(byId['tc-noise'].admittedOutput, /expand_context/);
     assert.ok(byId['tc-noise'].admittedOutput.length < batch1[4].output.length);
 
     // Critical guardrail protected src/auth/guard.js -> SUPPORTING with verifySignature hunk + outline + artifact://

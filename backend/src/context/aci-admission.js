@@ -24,6 +24,77 @@ export const DEFAULT_OVERSIZED_EXEC_MIN_CHARS = 6000;
 export const DEFAULT_OVERSIZED_EXEC_MAX_RENDERED_CHARS = 3200;
 export const DEFAULT_OVERSIZED_SEARCH_MIN_CHARS = 4500;
 export const DEFAULT_OVERSIZED_SEARCH_MAX_RENDERED_CHARS = 2800;
+export const DEFAULT_ADMISSION_CONTEXT_WINDOW = 128000;
+export const DEFAULT_NORMAL_REQUERY_RISK = 0.25;
+export const DEFAULT_ERROR_REQUERY_RISK = 0.65;
+export const DEFAULT_REQUERY_FLOOR_RATIO = 0.08;
+
+/**
+ * Online language-agnostic estimator for remaining trajectory horizon H_t.
+ * Adapts smoothly to exploration depth and unconverged edit/error state without
+ * fixed task-type or benchmark heuristics.
+ */
+export function estimateRemainingHorizon({
+  currentStep = 0,
+  hasUnverifiedEdits = false,
+  hasUnresolvedErrors = false,
+} = {}) {
+  const step = Math.max(0, Number.isFinite(Number(currentStep)) ? Number(currentStep) : 0);
+  const base = 2 + 6 / (1 + step / 8);
+  const editBoost = hasUnverifiedEdits ? 2 : 0;
+  const errorBoost = hasUnresolvedErrors ? 2 : 0;
+  const clamped = Math.min(12, Math.max(2, base + editBoost + errorBoost));
+  return Number(clamped.toFixed(2));
+}
+
+/**
+ * Evaluates the online adaptive requery-cost inequality for non-decoy lossy admission:
+ *   estHorizon * deltaTokens > requeryRisk * Math.max(P_t, Math.floor(contextWindow * 0.08))
+ * where requeryRisk = 0.65 for error/exception/non-zero-exit outputs and 0.25 otherwise.
+ */
+export function evaluateAdmissionRequeryGate({
+  originalTokens = 0,
+  summaryTokens = 0,
+  currentPromptTokens = 0,
+  contextWindow = DEFAULT_ADMISSION_CONTEXT_WINDOW,
+  estHorizon = 4,
+  isErrorOutput = false,
+} = {}) {
+  const origTok = Math.max(0, Number.isFinite(Number(originalTokens)) ? Number(originalTokens) : 0);
+  const sumTok = Math.max(0, Number.isFinite(Number(summaryTokens)) ? Number(summaryTokens) : 0);
+  const promptTokens = Math.max(
+    0,
+    Number.isFinite(Number(currentPromptTokens)) ? Number(currentPromptTokens) : 0,
+  );
+  const ctxWin = Math.max(
+    1,
+    Number.isFinite(Number(contextWindow)) && Number(contextWindow) > 0
+      ? Number(contextWindow)
+      : DEFAULT_ADMISSION_CONTEXT_WINDOW,
+  );
+  const horizon = Math.max(0, Number.isFinite(Number(estHorizon)) ? Number(estHorizon) : 0);
+  const deltaTokens = Math.max(0, origTok - sumTok);
+  const requeryRisk = isErrorOutput ? DEFAULT_ERROR_REQUERY_RISK : DEFAULT_NORMAL_REQUERY_RISK;
+  const penaltyBaseTokens = Math.max(promptTokens, Math.floor(ctxWin * DEFAULT_REQUERY_FLOOR_RATIO));
+  const rawExpectedGain = horizon * deltaTokens;
+  const rawExpectedPenalty = requeryRisk * penaltyBaseTokens;
+  const passed = rawExpectedGain > rawExpectedPenalty;
+
+  return {
+    passed,
+    deltaTokens,
+    originalTokens: origTok,
+    summaryTokens: sumTok,
+    currentPromptTokens: promptTokens,
+    contextWindow: ctxWin,
+    penaltyBaseTokens,
+    estHorizon: horizon,
+    isErrorOutput: Boolean(isErrorOutput),
+    requeryRisk,
+    expectedGain: Number(rawExpectedGain.toFixed(4)),
+    expectedPenalty: Number(rawExpectedPenalty.toFixed(4)),
+  };
+}
 
 const VALID_DECISIONS = new Set(Object.values(ADMISSION_DECISIONS));
 const MUTATION_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'delete_file']);
@@ -1034,12 +1105,22 @@ export class PreInjectionAdmissionController {
   constructor({
     aciStore,
     ledger = null,
+    contextWindow = DEFAULT_ADMISSION_CONTEXT_WINDOW,
     admissionMinChars = undefined,
     workingSetReadMaxChars = undefined,
     maxSupervisorAdmissionCalls = DEFAULT_MAX_SUPERVISOR_ADMISSION_CALLS,
   } = {}) {
     this.aciStore = aciStore ?? new ReversibleContextStore();
     this.ledger = ledger;
+    const hasExplicitContextWindow =
+      contextWindow !== undefined &&
+      contextWindow !== null &&
+      contextWindow !== '' &&
+      Number.isFinite(Number(contextWindow)) &&
+      Number(contextWindow) > 0;
+    this.contextWindow = hasExplicitContextWindow
+      ? Number(contextWindow)
+      : DEFAULT_ADMISSION_CONTEXT_WINDOW;
     const hasExplicitMinChars =
       admissionMinChars !== undefined &&
       admissionMinChars !== null &&
@@ -1128,11 +1209,59 @@ export class PreInjectionAdmissionController {
     }
   }
 
+  #registerDirectAdmission(c, step) {
+    const directMeta =
+      c.normPath && !c.isMutation && !c.lowerTool.startsWith('bash')
+        ? this.aciStore?.registerDirectHash?.(c.innerText, {
+            toolName: c.toolName,
+            path: c.targetPath,
+            lineRange: c.lineRange,
+            symbolOutline: c.structure.symbolLineOutline,
+            originalTokens: c.originalTokens,
+            step,
+          })
+        : null;
+    if (!c.isMutation && !EXEC_ERROR_TOOLS.has(c.lowerTool)) {
+      const directEntry = {
+        sha256: c.contentSha256,
+        step,
+        uri: directMeta?.uri ?? `artifact://${c.contentSha256}`,
+        refId: null,
+        lineRange: c.lineRange,
+      };
+      if (c.probeKey) {
+        if (!c.item?.isError) {
+          this.activeHashesByPath.set(c.probeKey, directEntry);
+        }
+      } else if (c.normPath) {
+        if (!c.isSliceRead) {
+          this.activeHashesByPath.set(c.normPath, directEntry);
+        } else if (
+          c.reason === 'explicit_read_working_set' ||
+          c.reason === 'narrow_line_slice' ||
+          c.lowerTool === 'read_file'
+        ) {
+          this.activeHashesByPath.set(`${c.normPath}#${c.lineRange}`, directEntry);
+        }
+      }
+      if (c.normPath) {
+        this.activeUriByPathStep.set(`${c.normPath}@${step}`, directEntry.uri);
+      }
+    }
+    this.#recordSymbolsFromStructure(c.targetPath, c.structure);
+  }
+
   async admitBatch(
     executedBatch = [],
     {
       query = '',
       step = 0,
+      currentStep = undefined,
+      currentPromptTokens = 0,
+      contextWindow = undefined,
+      hasUnverifiedEdits = false,
+      hasUnresolvedErrors = false,
+      estHorizon = undefined,
       promptFiles = null,
       errorFiles = [],
       errorSymbols = [],
@@ -1152,6 +1281,44 @@ export class PreInjectionAdmissionController {
     } = {},
   ) {
     const items = Array.isArray(executedBatch) ? executedBatch : [];
+    const effectiveStep =
+      currentStep !== undefined &&
+      currentStep !== null &&
+      currentStep !== '' &&
+      Number.isFinite(Number(currentStep))
+        ? Math.max(0, Math.trunc(Number(currentStep)))
+        : Number.isFinite(Number(step))
+          ? Math.max(0, Math.trunc(Number(step)))
+          : 0;
+    const effectivePromptTokens =
+      currentPromptTokens !== undefined &&
+      currentPromptTokens !== null &&
+      currentPromptTokens !== '' &&
+      Number.isFinite(Number(currentPromptTokens))
+        ? Math.max(0, Number(currentPromptTokens))
+        : 0;
+    const effectiveContextWindow =
+      contextWindow !== undefined &&
+      contextWindow !== null &&
+      contextWindow !== '' &&
+      Number.isFinite(Number(contextWindow)) &&
+      Number(contextWindow) > 0
+        ? Number(contextWindow)
+        : this.contextWindow;
+    const effectiveHasUnverifiedEdits = Boolean(hasUnverifiedEdits);
+    const effectiveHasUnresolvedErrors = Boolean(hasUnresolvedErrors);
+    const hasExplicitEstHorizon =
+      estHorizon !== undefined &&
+      estHorizon !== null &&
+      estHorizon !== '' &&
+      Number.isFinite(Number(estHorizon));
+    const effectiveEstHorizon = hasExplicitEstHorizon
+      ? Math.max(0, Number(estHorizon))
+      : estimateRemainingHorizon({
+          currentStep: effectiveStep,
+          hasUnverifiedEdits: effectiveHasUnverifiedEdits,
+          hasUnresolvedErrors: effectiveHasUnresolvedErrors,
+        });
     const hasOptAdmissionMinChars =
       admissionMinChars !== undefined &&
       admissionMinChars !== null &&
@@ -1231,13 +1398,22 @@ export class PreInjectionAdmissionController {
       const isReadProbeTool = lowerTool === 'grep' || lowerTool === 'glob';
       const isStructuredJsonTool = !isReadOnlyDedupTool && STRUCTURED_JSON_STATUS_RE.test(innerText);
       const isStructuredFailure = isStructuredJsonTool && STRUCTURED_JSON_FAILURE_RE.test(innerText);
-      const isExecErrorTool = EXEC_ERROR_TOOLS.has(lowerTool) || textStats.exitCode !== null;
+      const isExecErrorTool =
+        EXEC_ERROR_TOOLS.has(lowerTool) ||
+        lowerTool === 'run_diagnostics' ||
+        (!isReadOnlyDedupTool && textStats.exitCode !== null);
+      const hasNonZeroExit = textStats.exitCode !== null && textStats.exitCode !== 0;
       const isErr =
         Boolean(item?.isError) ||
         isStructuredFailure ||
         (isExecErrorTool &&
-          ((textStats.exitCode !== null && textStats.exitCode !== 0) ||
-            GENERIC_EXEC_ERROR_RE.test(innerText)));
+          (hasNonZeroExit ||
+            (textStats.exitCode !== 0 && GENERIC_EXEC_ERROR_RE.test(innerText))));
+      const isErrorOutput =
+        isErr ||
+        (isExecErrorTool &&
+          textStats.exitCode !== 0 &&
+          GENERIC_SALIENT_FAILURE_RE.test(innerText));
 
       const structure = extractStructure(
         targetPath,
@@ -1368,7 +1544,7 @@ export class PreInjectionAdmissionController {
         ? `__probe__:${lowerTool}:${stableArgsStringify(args)}`
         : null;
 
-      const id = String(tc.id || `cand_${step}_${idx}`);
+      const id = String(tc.id || `cand_${effectiveStep}_${idx}`);
       const ctxRecord = {
         idx,
         id,
@@ -1383,6 +1559,10 @@ export class PreInjectionAdmissionController {
         targetPath,
         normPath,
         probeKey,
+        isMutation,
+        isErr,
+        isErrorOutput,
+        isExecErrorTool,
         isReadProbeTool,
         isSliceRead,
         lineRange,
@@ -1403,13 +1583,20 @@ export class PreInjectionAdmissionController {
         decision: null,
         reason: '',
         priorStep: null,
+        requeryGate: null,
       };
 
-      const isNoisyProbeTool = NOISY_PROBE_TOOLS.has(lowerTool);
-      const smallFastPathMaxChars =
+      const isNoisyProbeTool = NOISY_PROBE_TOOLS.has(lowerTool) || lowerTool === 'run_diagnostics';
+      const baseSmallFastPathMaxChars =
         isNoisyProbeTool || isStructuredJsonTool ? probeMinChars : minChars;
+      const smallFastPathMaxChars = hasExplicitAdmissionMinChars
+        ? baseSmallFastPathMaxChars
+        : Math.min(
+            baseSmallFastPathMaxChars,
+            Math.max(400, Math.floor(effectiveContextWindow * DEFAULT_REQUERY_FLOOR_RATIO)),
+          );
 
-      // DUPLICATE check (runs BEFORE isErr for read-only tools, isNarrowSlice, explicit_read_working_set, and oversized compression)
+      // DUPLICATE check (lossless exact SHA-256 dedup: always-on regardless of P_t, before any lossy path)
       const sliceKey = !isReadProbeTool && normPath && isSliceRead ? `${normPath}#${lineRange}` : null;
       const activeMem = probeKey
         ? this.activeHashesByPath.get(probeKey)
@@ -1430,39 +1617,29 @@ export class PreInjectionAdmissionController {
             ? storeMatch
             : null);
 
-      const isLowEntropyRepetitiveExec =
-        isExecErrorTool &&
-        !isErr &&
-        innerText.length > probeMinChars &&
-        (textStats.repeatedLineRatio >= 0.72 || textStats.charEntropy < 2.6);
+      const optimisticRequeryGate = evaluateAdmissionRequeryGate({
+        originalTokens,
+        summaryTokens: 0,
+        currentPromptTokens: effectivePromptTokens,
+        contextWindow: effectiveContextWindow,
+        estHorizon: effectiveEstHorizon,
+        isErrorOutput,
+      });
 
       // Deterministic Pre-Screen & Fast-Paths
       if (isMutation) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'mutation_output';
-      } else if (isExecErrorTool && innerText.length > DEFAULT_OVERSIZED_EXEC_MIN_CHARS) {
-        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
-        ctxRecord.reason = 'oversized_exec_log_fidelity_summary';
-      } else if (dupMatch && innerText.length > smallFastPathMaxChars) {
+      } else if (dupMatch && innerText.length > 200) {
         ctxRecord.decision = ADMISSION_DECISIONS.DUPLICATE;
         ctxRecord.priorStep = dupMatch.step ?? 0;
         ctxRecord.reason = `duplicate_unchanged_step_${ctxRecord.priorStep}`;
-      } else if (isErr) {
-        ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
-        ctxRecord.reason = 'error_output';
-      } else if (
-        (lowerTool === 'grep' || lowerTool === 'glob') &&
-        !item?.isError &&
-        innerText.length > DEFAULT_OVERSIZED_SEARCH_MIN_CHARS &&
-        !isDecoy
-      ) {
-        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
-        ctxRecord.reason = 'oversized_search_clustered_summary';
       } else if (isAlwaysDirectTool) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'always_direct_tool';
       } else if (
         isStructuredJsonTool &&
+        !isDecoy &&
         innerText.length <= DEFAULT_PROBE_ADMISSION_MIN_CHARS
       ) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
@@ -1472,7 +1649,7 @@ export class PreInjectionAdmissionController {
         ctxRecord.reason = 'narrow_line_slice';
       } else if (innerText.length <= smallFastPathMaxChars) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
-        ctxRecord.reason = 'small_payload_fast_path';
+        ctxRecord.reason = isErrorOutput ? 'error_output' : 'small_payload_fast_path';
       } else if (
         lowerTool === 'read_file' &&
         !isErr &&
@@ -1481,6 +1658,23 @@ export class PreInjectionAdmissionController {
       ) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'explicit_read_working_set';
+      } else if (!isDecoy && !optimisticRequeryGate.passed) {
+        ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
+        ctxRecord.reason = isErrorOutput ? 'error_output' : 'requery_gate_direct_protect';
+        ctxRecord.requeryGate = {
+          ...optimisticRequeryGate,
+          bypassed: false,
+          bypassReason: null,
+        };
+      } else if (!isDecoy && isExecErrorTool) {
+        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
+        ctxRecord.reason = 'oversized_exec_log_fidelity_summary';
+      } else if (!isDecoy && isReadProbeTool && !isErrorOutput) {
+        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
+        ctxRecord.reason = 'oversized_search_clustered_summary';
+      } else if (!isDecoy && isErrorOutput) {
+        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
+        ctxRecord.reason = 'oversized_exec_log_fidelity_summary';
       } else if (
         (promptTarget && !domainInfo.isDecoy && innerText.length <= 2600) ||
         ((errorTarget || mutatedTarget) && innerText.length <= 6000) ||
@@ -1488,10 +1682,17 @@ export class PreInjectionAdmissionController {
       ) {
         ctxRecord.decision = ADMISSION_DECISIONS.DIRECT;
         ctxRecord.reason = 'high_signal_direct';
+      } else if (isDecoy) {
+        const decoyConflict = domainInfo.rawDomains.length > 0 || querySymbolHits > 0;
+        if (decoyConflict) {
+          ambiguousQueue.push(ctxRecord);
+        } else {
+          ctxRecord.decision = ADMISSION_DECISIONS.IRRELEVANT;
+          ctxRecord.reason = 'decoy_suppressed_deterministic';
+        }
       } else if (
         score <= 0.14 &&
         domainInfo.domains.length === 0 &&
-        !domainInfo.suppressedAsDecoy &&
         callChainHits === 0 &&
         querySymbolHits === 0 &&
         errorSymbolHits === 0 &&
@@ -1499,17 +1700,12 @@ export class PreInjectionAdmissionController {
         !errorTarget &&
         !mutatedTarget
       ) {
-        ctxRecord.decision = ADMISSION_DECISIONS.IRRELEVANT;
-        ctxRecord.reason = 'zero_signal_noise';
-      } else if (isLowEntropyRepetitiveExec) {
-        ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
-        ctxRecord.reason = 'oversized_exec_log_fidelity_summary';
+        ctxRecord.decision = ADMISSION_DECISIONS.DEFER;
+        ctxRecord.reason = 'zero_signal_defer';
       } else {
-        const decoyConflict =
-          domainInfo.isDecoy && (domainInfo.rawDomains.length > 0 || querySymbolHits > 0);
         const ambiguousScore = score >= 0.15 && score <= 0.72;
         const largeMultiSection = innerText.length >= 2600;
-        if (ambiguousScore || decoyConflict || largeMultiSection) {
+        if (ambiguousScore || largeMultiSection) {
           ambiguousQueue.push(ctxRecord);
         } else if (isProtectedCritical || callChainHits > 0 || score >= 0.35) {
           ctxRecord.decision = ADMISSION_DECISIONS.SUPPORTING;
@@ -1523,7 +1719,7 @@ export class PreInjectionAdmissionController {
       prepared.push(ctxRecord);
     }
 
-    // Selective Batched Supervisor Call (at most once per tool batch)
+    // Selective Batched Supervisor Call (at most once per tool batch, stage='admission')
     let supervisorRes = null;
     const hasExplicitMinSupBatchChars =
       minSupervisorBatchChars !== undefined &&
@@ -1537,7 +1733,10 @@ export class PreInjectionAdmissionController {
       ambiguousQueue.length > 0 &&
       this.supervisorAdmissionCalls < maxSupCalls
     ) {
-      const resolved = supervisor.resolveModel?.(supervisorConfigOverride, { mainModel });
+      const resolved = supervisor.resolveModel?.(supervisorConfigOverride, {
+        mainModel,
+        stage: 'admission',
+      });
       const effectiveMinSupBatchChars = hasExplicitMinSupBatchChars
         ? Math.max(0, Number(minSupervisorBatchChars))
         : resolved?.config?.mode === 'auto' &&
@@ -1574,6 +1773,7 @@ export class PreInjectionAdmissionController {
             signal,
             configOverride: supervisorConfigOverride,
             mainModel,
+            stage: 'admission',
           })
           .catch((err) => ({
             ok: false,
@@ -1602,7 +1802,7 @@ export class PreInjectionAdmissionController {
             durationMs: supervisorRes.durationMs ?? 0,
             ok: supervisorRes.ok,
             fallback: supervisorRes.fallback ?? null,
-            step,
+            step: effectiveStep,
           });
         }
       }
@@ -1616,7 +1816,7 @@ export class PreInjectionAdmissionController {
       }
     }
 
-    // Resolve ambiguous candidates with Supervisor validation + Critical Protection Guardrail
+    // Resolve ambiguous candidates with Supervisor validation + Critical & Non-Decoy Protection Guardrails
     for (const c of ambiguousQueue) {
       const supPick = supDecisionMap.get(c.id);
       if (supPick) {
@@ -1635,6 +1835,14 @@ export class PreInjectionAdmissionController {
         ) {
           finalDecision = ADMISSION_DECISIONS.SUPPORTING;
           reason = 'critical_protection_guardrail';
+        } else if (
+          !c.domainInfo.isDecoy &&
+          (finalDecision === ADMISSION_DECISIONS.IRRELEVANT ||
+            finalDecision === ADMISSION_DECISIONS.DUPLICATE)
+        ) {
+          // Non-decoy outputs cannot be dropped as IRRELEVANT or unverified DUPLICATE
+          finalDecision = ADMISSION_DECISIONS.DEFER;
+          reason = 'non_decoy_defer_guardrail';
         }
         c.decision = finalDecision;
         c.reason = reason;
@@ -1653,94 +1861,53 @@ export class PreInjectionAdmissionController {
       }
     }
 
-    // Store & progressively render each item
+    // Store, enforce dynamic requery-cost gate for non-decoy lossy summaries, & progressively render each item
     const admittedItems = [];
     const decisions = [];
     let batchOriginalTokens = 0;
     let batchInjectedTokens = 0;
+    let requeryGateEvaluatedCount = 0;
+    let requeryGatePassedCount = 0;
+    let requeryGateProtectedDirectCount = 0;
 
     for (const c of prepared) {
       let ref = null;
       let renderedText = c.rawOutput;
       let finalDecision = c.decision;
+      let requeryGate = c.requeryGate;
 
       if (finalDecision === ADMISSION_DECISIONS.DIRECT) {
-        const directMeta =
-          c.normPath && !c.isMutation && !c.lowerTool.startsWith('bash')
-            ? this.aciStore?.registerDirectHash?.(c.innerText, {
-                toolName: c.toolName,
-                path: c.targetPath,
-                lineRange: c.lineRange,
-                symbolOutline: c.structure.symbolLineOutline,
-                originalTokens: c.originalTokens,
-                step,
-              })
-            : null;
-        if (!c.isMutation && !EXEC_ERROR_TOOLS.has(c.lowerTool)) {
-          const directEntry = {
-            sha256: c.contentSha256,
-            step,
-            uri: directMeta?.uri ?? `artifact://${c.contentSha256}`,
-            refId: null,
-            lineRange: c.lineRange,
+        if (requeryGate) {
+          requeryGateEvaluatedCount += 1;
+          requeryGateProtectedDirectCount += 1;
+        } else {
+          requeryGate = {
+            ...evaluateAdmissionRequeryGate({
+              originalTokens: c.originalTokens,
+              summaryTokens: c.originalTokens,
+              currentPromptTokens: effectivePromptTokens,
+              contextWindow: effectiveContextWindow,
+              estHorizon: effectiveEstHorizon,
+              isErrorOutput: c.isErrorOutput,
+            }),
+            bypassed: true,
+            bypassReason: c.reason || 'direct_fast_path',
           };
-          if (c.probeKey) {
-            if (!c.item?.isError) {
-              this.activeHashesByPath.set(c.probeKey, directEntry);
-            }
-          } else if (c.normPath) {
-            if (!c.isSliceRead) {
-              this.activeHashesByPath.set(c.normPath, directEntry);
-            } else if (
-              c.reason === 'explicit_read_working_set' ||
-              c.reason === 'narrow_line_slice' ||
-              c.lowerTool === 'read_file'
-            ) {
-              this.activeHashesByPath.set(`${c.normPath}#${c.lineRange}`, directEntry);
-            }
-          }
-          if (c.normPath) {
-            this.activeUriByPathStep.set(`${c.normPath}@${step}`, directEntry.uri);
-          }
         }
-        this.#recordSymbolsFromStructure(c.targetPath, c.structure);
-      } else {
+        this.#registerDirectAdmission(c, effectiveStep);
+      } else if (finalDecision === ADMISSION_DECISIONS.DUPLICATE) {
         ref = this.aciStore.put(c.innerText, {
           toolName: c.toolName,
           path: c.targetPath,
           lineRange: c.lineRange,
           symbolOutline: c.structure.symbolLineOutline,
           originalTokens: c.originalTokens,
-          step,
+          step: effectiveStep,
           decision: finalDecision,
           priorStep: c.priorStep,
         });
-        if (c.probeKey && !c.item?.isError && finalDecision !== ADMISSION_DECISIONS.DUPLICATE) {
-          this.activeHashesByPath.set(c.probeKey, {
-            sha256: c.contentSha256,
-            step,
-            uri: ref.uri,
-            refId: ref.refId,
-            lineRange: c.lineRange,
-          });
-        }
         if (c.normPath) {
-          this.activeUriByPathStep.set(`${c.normPath}@${step}`, ref.uri);
-          if (
-            !c.probeKey &&
-            finalDecision === ADMISSION_DECISIONS.SUPPORTING &&
-            !c.args?.startLine &&
-            !c.args?.endLine
-          ) {
-            this.activeHashesByPath.set(c.normPath, {
-              sha256: c.contentSha256,
-              step,
-              uri: ref.uri,
-              refId: ref.refId,
-              lineRange: c.lineRange,
-            });
-            this.#recordSymbolsFromStructure(c.targetPath, c.structure);
-          }
+          this.activeUriByPathStep.set(`${c.normPath}@${effectiveStep}`, ref.uri);
         }
         const rendered = renderProgressivePayload({
           decision: finalDecision,
@@ -1756,6 +1923,195 @@ export class PreInjectionAdmissionController {
         });
         renderedText = rendered.text;
         finalDecision = rendered.decision;
+        if (finalDecision === ADMISSION_DECISIONS.DIRECT) {
+          this.#registerDirectAdmission(c, effectiveStep);
+        }
+        const dupSummaryTokens =
+          finalDecision === ADMISSION_DECISIONS.DIRECT
+            ? c.originalTokens
+            : estimateTokens(renderedText);
+        const dupDeltaTokens = Math.max(0, c.originalTokens - dupSummaryTokens);
+        requeryGate = {
+          passed: true,
+          bypassed: true,
+          bypassReason: 'lossless_duplicate',
+          deltaTokens: dupDeltaTokens,
+          originalTokens: c.originalTokens,
+          summaryTokens: dupSummaryTokens,
+          currentPromptTokens: effectivePromptTokens,
+          contextWindow: effectiveContextWindow,
+          penaltyBaseTokens: Math.max(
+            effectivePromptTokens,
+            Math.floor(effectiveContextWindow * DEFAULT_REQUERY_FLOOR_RATIO),
+          ),
+          estHorizon: effectiveEstHorizon,
+          isErrorOutput: c.isErrorOutput,
+          requeryRisk: 0,
+          expectedGain: Number((effectiveEstHorizon * dupDeltaTokens).toFixed(4)),
+          expectedPenalty: 0,
+        };
+      } else if (c.domainInfo.isDecoy) {
+        ref = this.aciStore.put(c.innerText, {
+          toolName: c.toolName,
+          path: c.targetPath,
+          lineRange: c.lineRange,
+          symbolOutline: c.structure.symbolLineOutline,
+          originalTokens: c.originalTokens,
+          step: effectiveStep,
+          decision: finalDecision,
+          priorStep: c.priorStep,
+        });
+        if (c.probeKey && !c.item?.isError) {
+          this.activeHashesByPath.set(c.probeKey, {
+            sha256: c.contentSha256,
+            step: effectiveStep,
+            uri: ref.uri,
+            refId: ref.refId,
+            lineRange: c.lineRange,
+          });
+        }
+        if (c.normPath) {
+          this.activeUriByPathStep.set(`${c.normPath}@${effectiveStep}`, ref.uri);
+        }
+        const rendered = renderProgressivePayload({
+          decision: finalDecision,
+          reason: c.reason,
+          lowerTool: c.lowerTool,
+          ref,
+          rawOutput: c.rawOutput,
+          envelope: c.envelope,
+          parsedRead: c.parsedRead,
+          structure: c.structure,
+          focusSymbols: c.focusSymbols,
+          priorStep: c.priorStep,
+        });
+        renderedText = rendered.text;
+        finalDecision = rendered.decision;
+        const decoySummaryTokens =
+          finalDecision === ADMISSION_DECISIONS.DIRECT
+            ? c.originalTokens
+            : estimateTokens(renderedText);
+        requeryGate = {
+          ...evaluateAdmissionRequeryGate({
+            originalTokens: c.originalTokens,
+            summaryTokens: decoySummaryTokens,
+            currentPromptTokens: effectivePromptTokens,
+            contextWindow: effectiveContextWindow,
+            estHorizon: effectiveEstHorizon,
+            isErrorOutput: c.isErrorOutput,
+          }),
+          bypassed: true,
+          bypassReason: 'decoy',
+        };
+      } else {
+        // Non-decoy lossy summarization MUST clear the exact requery-cost inequality
+        if (finalDecision === ADMISSION_DECISIONS.IRRELEVANT) {
+          finalDecision = ADMISSION_DECISIONS.DEFER;
+        }
+        const previewRef = {
+          uri: `artifact://${c.contentSha256}`,
+          sha256: c.contentSha256,
+          toolName: c.toolName,
+          path: c.targetPath,
+          lineRange: c.lineRange,
+          symbolOutline: c.structure.symbolLineOutline,
+          originalTokens: c.originalTokens,
+          decision: finalDecision,
+          priorStep: c.priorStep,
+        };
+        const previewRendered = renderProgressivePayload({
+          decision: finalDecision,
+          reason: c.reason,
+          lowerTool: c.lowerTool,
+          ref: previewRef,
+          rawOutput: c.rawOutput,
+          envelope: c.envelope,
+          parsedRead: c.parsedRead,
+          structure: c.structure,
+          focusSymbols: c.focusSymbols,
+          priorStep: c.priorStep,
+        });
+        const candidateSummaryTokens =
+          previewRendered.decision === ADMISSION_DECISIONS.DIRECT
+            ? c.originalTokens
+            : estimateTokens(previewRendered.text);
+        requeryGateEvaluatedCount += 1;
+        requeryGate = {
+          ...evaluateAdmissionRequeryGate({
+            originalTokens: c.originalTokens,
+            summaryTokens: candidateSummaryTokens,
+            currentPromptTokens: effectivePromptTokens,
+            contextWindow: effectiveContextWindow,
+            estHorizon: effectiveEstHorizon,
+            isErrorOutput: c.isErrorOutput,
+          }),
+          bypassed: false,
+          bypassReason: null,
+        };
+
+        if (previewRendered.decision !== ADMISSION_DECISIONS.DIRECT && requeryGate.passed) {
+          requeryGatePassedCount += 1;
+          ref = this.aciStore.put(c.innerText, {
+            toolName: c.toolName,
+            path: c.targetPath,
+            lineRange: c.lineRange,
+            symbolOutline: c.structure.symbolLineOutline,
+            originalTokens: c.originalTokens,
+            step: effectiveStep,
+            decision: previewRendered.decision,
+            priorStep: c.priorStep,
+          });
+          if (c.probeKey && !c.item?.isError) {
+            this.activeHashesByPath.set(c.probeKey, {
+              sha256: c.contentSha256,
+              step: effectiveStep,
+              uri: ref.uri,
+              refId: ref.refId,
+              lineRange: c.lineRange,
+            });
+          }
+          if (c.normPath) {
+            this.activeUriByPathStep.set(`${c.normPath}@${effectiveStep}`, ref.uri);
+            if (
+              !c.probeKey &&
+              previewRendered.decision === ADMISSION_DECISIONS.SUPPORTING &&
+              !c.args?.startLine &&
+              !c.args?.endLine
+            ) {
+              this.activeHashesByPath.set(c.normPath, {
+                sha256: c.contentSha256,
+                step: effectiveStep,
+                uri: ref.uri,
+                refId: ref.refId,
+                lineRange: c.lineRange,
+              });
+              this.#recordSymbolsFromStructure(c.targetPath, c.structure);
+            }
+          }
+          const committedRendered =
+            ref?.uri === previewRef.uri
+              ? previewRendered
+              : renderProgressivePayload({
+                  decision: previewRendered.decision,
+                  reason: c.reason,
+                  lowerTool: c.lowerTool,
+                  ref,
+                  rawOutput: c.rawOutput,
+                  envelope: c.envelope,
+                  parsedRead: c.parsedRead,
+                  structure: c.structure,
+                  focusSymbols: c.focusSymbols,
+                  priorStep: c.priorStep,
+                });
+          renderedText = committedRendered.text;
+          finalDecision = committedRendered.decision;
+        } else {
+          requeryGateProtectedDirectCount += 1;
+          finalDecision = ADMISSION_DECISIONS.DIRECT;
+          renderedText = c.rawOutput;
+          c.reason = c.isErrorOutput ? 'error_output' : 'requery_gate_direct_protect';
+          this.#registerDirectAdmission(c, effectiveStep);
+        }
       }
 
       const injectedTokens =
@@ -1771,7 +2127,7 @@ export class PreInjectionAdmissionController {
         path: c.targetPath,
         score: c.score,
         source: 'admission',
-        step,
+        step: effectiveStep,
         symbols: c.structure.symbolNames.slice(0, 16),
       });
       if (finalDecision === ADMISSION_DECISIONS.DIRECT || finalDecision === ADMISSION_DECISIONS.SUPPORTING) {
@@ -1780,7 +2136,7 @@ export class PreInjectionAdmissionController {
           path: c.targetPath,
           reason: c.reason,
           tokens: injectedTokens,
-          step,
+          step: effectiveStep,
         });
       }
       this.ledger?.recordAdmission?.({
@@ -1795,7 +2151,7 @@ export class PreInjectionAdmissionController {
         originalTokens: c.originalTokens,
         injectedTokens,
         tokensSaved,
-        step,
+        step: effectiveStep,
         reason: c.reason,
       });
 
@@ -1806,6 +2162,7 @@ export class PreInjectionAdmissionController {
         decision: finalDecision,
         criticalDomains: c.domainInfo.domains,
         isDecoy: c.domainInfo.isDecoy,
+        isErrorOutput: c.isErrorOutput,
         score: c.score,
         refId: ref?.refId ?? null,
         uri: ref?.uri ?? `artifact://${c.contentSha256}`,
@@ -1815,6 +2172,14 @@ export class PreInjectionAdmissionController {
         tokensSaved,
         textStats: c.textStats,
         reason: c.reason,
+        estHorizon: effectiveEstHorizon,
+        currentPromptTokens: effectivePromptTokens,
+        contextWindow: effectiveContextWindow,
+        deltaTokens: requeryGate.deltaTokens,
+        expectedGain: requeryGate.expectedGain,
+        expectedPenalty: requeryGate.expectedPenalty,
+        requeryRisk: requeryGate.requeryRisk,
+        requeryGate,
       };
       decisions.push(decisionRecord);
       admittedItems.push({
@@ -1824,14 +2189,34 @@ export class PreInjectionAdmissionController {
       });
     }
 
+    const telemetry = {
+      currentStep: effectiveStep,
+      currentPromptTokens: effectivePromptTokens,
+      contextWindow: effectiveContextWindow,
+      hasUnverifiedEdits: effectiveHasUnverifiedEdits,
+      hasUnresolvedErrors: effectiveHasUnresolvedErrors,
+      estHorizon: effectiveEstHorizon,
+      requeryGateEvaluatedCount,
+      requeryGatePassedCount,
+      requeryGateProtectedDirectCount,
+    };
+
     return {
       admittedItems,
       decisions,
       supervisorRes,
+      telemetry,
       stats: {
         originalTokens: batchOriginalTokens,
         injectedTokens: batchInjectedTokens,
         tokensSaved: Math.max(0, batchOriginalTokens - batchInjectedTokens),
+        currentStep: effectiveStep,
+        currentPromptTokens: effectivePromptTokens,
+        contextWindow: effectiveContextWindow,
+        estHorizon: effectiveEstHorizon,
+        requeryGateEvaluatedCount,
+        requeryGatePassedCount,
+        requeryGateProtectedDirectCount,
       },
     };
   }
@@ -1846,6 +2231,7 @@ export async function admitToolBatch(executedBatch, opts = {}) {
     new PreInjectionAdmissionController({
       aciStore: opts.aciStore,
       ledger: opts.ledger ?? null,
+      contextWindow: opts.contextWindow,
       admissionMinChars: opts.admissionMinChars,
       workingSetReadMaxChars: opts.workingSetReadMaxChars,
       maxSupervisorAdmissionCalls: opts.maxSupervisorAdmissionCalls,

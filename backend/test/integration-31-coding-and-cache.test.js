@@ -606,6 +606,7 @@ test('Integration 3.1(a): 12-step Python coding turn + 64-token prefix KV cache 
     model: 'deepseek-reasoner',
     permissionMode: 'workspace-write',
     aciProfile: 'full_aci',
+    aciOptions: { dtocMinPromptTokens: 48000 },
     toolModes: { diagnostics: true },
     budget: { maxSteps: 40 },
   });

@@ -1800,7 +1800,8 @@ test('Stage 4: DirectAgent supports all 4 aciProfiles, short-task DTOC KV preser
   assert.ok(fullRes.aciMetrics.hashVerifiedRestores >= 1);
   assert.ok(fullRes.aciMetrics.recoveryStats.hashVerifiedCount >= 1);
   assert.ok(fullRes.aciMetrics.ledger?.admissions?.length >= 3);
-  assert.equal(fullRes.aciMetrics.admissionDecisions.IRRELEVANT >= 1, true);
+  assert.equal(fullRes.aciMetrics.admissionDecisions.IRRELEVANT, 0, 'Non-decoy files must never be dropped as IRRELEVANT under Task 4.1');
+  assert.equal(fullRes.aciMetrics.admissionDecisions.DEFER >= 2, true, 'Non-decoy noise & large helper fold losslessly to reversible DEFER');
   assert.equal(fullRes.aciMetrics.admissionDecisions.SUPPORTING >= 1, true);
   for (const p of fullRes.sysPrefixes) {
     assert.equal(p, fullRes.sysPrefixes[0], 'System prompt prefix must stay byte-identical');

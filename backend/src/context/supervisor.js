@@ -48,6 +48,16 @@ const SUPERVISOR_SYSTEM_PROMPT = [
   'Only cite candidate IDs explicitly listed in the prompt. Output valid JSON only.',
 ].join('\n');
 
+const DTOC_EPOCH_ADJUDICATION_SYSTEM_PROMPT = [
+  'You are a strictly read-only Epoch Eviction Supervisor for Adaptive Context Intelligence (ACI).',
+  'You have ZERO tool privileges, cannot execute commands, cannot edit files, and cannot approve actions.',
+  'Review the compact metadata for aged context candidates at an epoch boundary and decide which candidate IDs are still semantically needed for the current task (keepRefs) versus explored noise safe to fold into lossless reversible references (compressRefs).',
+  'Keep candidates containing active specifications, unresolved failure context, or symbols directly needed for ongoing edits; mark completed exploration or peripheral reads as compressRefs.',
+  'Return ONLY a compact valid JSON object:',
+  '  { "keepRefs": string[], "compressRefs": string[] }',
+  'Only cite candidate IDs explicitly listed in the prompt. Output valid JSON only.',
+].join('\n');
+
 const ADMISSION_SUPERVISOR_SYSTEM_PROMPT = [
   'You are a strictly read-only Pre-Injection Context Admission Supervisor for Adaptive Context Intelligence (ACI).',
   'You have ZERO tool privileges, cannot execute commands, cannot edit files, and cannot approve actions.',
@@ -301,9 +311,21 @@ export class ContextSupervisor {
   /**
    * Resolves the effective supervisor model dynamically from the user's live
    * AccountPool catalog and route health — with ZERO hardcoded model names.
+   *
+   * Stage-aware policy:
+   * - `stage === 'admission'` (high-frequency per-step): preserve fast-skip
+   *   behavior when candidate matches `mainModel`, reasoning models, or
+   *   `AUTO_SKIP_V4_RE` so per-step admission runs zero-latency online math gating.
+   * - `stage === 'dtoc'` (low-frequency Epoch boundary, <= 3 calls/turn):
+   *   lift `matchesMainModel` and `AUTO_SKIP_V4_RE` forced skips and allow
+   *   directly reusing `mainModel` (when configured/available) for lightweight
+   *   read-only JSON semantic adjudication.
    */
-  resolveModel(configOverride = null, { mainModel = null } = {}) {
+  resolveModel(configOverride = null, { mainModel = null, stage = undefined } = {}) {
     const config = configOverride ? normalizeSupervisorConfig(configOverride) : this.getConfig();
+    const rawStage = stage ?? configOverride?.stage ?? 'admission';
+    const normalizedStage =
+      String(rawStage ?? 'admission').trim().toLowerCase() === 'dtoc' ? 'dtoc' : 'admission';
     const effectiveMainModel =
       (typeof mainModel === 'string' && mainModel.trim() ? mainModel.trim() : null) ??
       (typeof configOverride?.mainModel === 'string' && configOverride.mainModel.trim()
@@ -384,11 +406,14 @@ export class ContextSupervisor {
       }));
 
     if (!config.enabled || config.mode === 'off') {
+      const offReason = !config.enabled ? 'supervisor_disabled' : 'supervisor_mode_off';
       return {
         config,
+        stage: normalizedStage,
         active: false,
         effectiveModel: null,
-        rationale: !config.enabled ? 'supervisor_disabled' : 'supervisor_mode_off',
+        skipReason: offReason,
+        rationale: offReason,
         recommendedModel,
         recommendedRationale,
         candidates,
@@ -400,8 +425,10 @@ export class ContextSupervisor {
       if (!selected) {
         return {
           config,
+          stage: normalizedStage,
           active: false,
           effectiveModel: null,
+          skipReason: 'custom_model_missing',
           rationale: 'custom_model_missing_deterministic_fallback',
           recommendedModel,
           recommendedRationale,
@@ -421,8 +448,10 @@ export class ContextSupervisor {
       if (!customHealthy) {
         return {
           config,
+          stage: normalizedStage,
           active: false,
           effectiveModel: null,
+          skipReason: 'custom_model_unavailable',
           rationale: 'custom_model_unavailable_deterministic_fallback',
           recommendedModel,
           recommendedRationale,
@@ -431,8 +460,10 @@ export class ContextSupervisor {
       }
       return {
         config,
+        stage: normalizedStage,
         active: true,
         effectiveModel: selected,
+        skipReason: null,
         rationale: 'custom_model_selected',
         recommendedModel,
         recommendedRationale,
@@ -441,6 +472,16 @@ export class ContextSupervisor {
     }
 
     // auto mode
+    const isReasoningCandidate = (cand, fallbackAlias = '') => {
+      const lbl = cand
+        ? `${cand.alias} ${cand.upstreamModel}`.toLowerCase()
+        : String(fallbackAlias || '').toLowerCase();
+      return Boolean(
+        (cand || fallbackAlias) &&
+          (AUTO_SKIP_REASONING_RE.test(lbl) || cand?.capabilities?.reasoning === true),
+      );
+    };
+
     const chosenCandidate = recommendedModel
       ? healthyEligible.find((c) => c.alias === recommendedModel) ?? null
       : null;
@@ -454,20 +495,154 @@ export class ContextSupervisor {
           chosenCandidate?.upstreamModel === effectiveMainModel),
     );
     const matchesReasoning = Boolean(
-      recommendedModel &&
-        (AUTO_SKIP_REASONING_RE.test(chosenLabel) ||
-          chosenCandidate?.capabilities?.reasoning === true),
+      recommendedModel && isReasoningCandidate(chosenCandidate, recommendedModel),
     );
     const matchesV4WithoutLegacyFastBypass = Boolean(
       recommendedModel &&
         AUTO_SKIP_V4_RE.test(chosenLabel) &&
         !(!effectiveMainModel && chosenCandidate?.hasFastTier),
     );
+
+    if (normalizedStage === 'dtoc') {
+      // Epoch boundary (low-frequency): lift `matchesMainModel` and `AUTO_SKIP_V4_RE`
+      // forced skips and allow reusing `mainModel` directly when available.
+      const mainInHealthy = effectiveMainModel
+        ? healthyEligible.find(
+            (c) => c.alias === effectiveMainModel || c.upstreamModel === effectiveMainModel,
+          ) ?? null
+        : null;
+      const mainRoutesHealthy =
+        !mainInHealthy &&
+        effectiveMainModel &&
+        rawItems.length === 0 &&
+        typeof this.pool?.resolveRoutes === 'function'
+          ? isHealthyRouteList(this.pool.resolveRoutes(effectiveMainModel), now)
+          : false;
+      const hasInjectedAdapterWithoutCatalog = Boolean(
+        rawItems.length === 0 &&
+          effectiveMainModel &&
+          (!this.pool || (this.adapter && this.adapter !== this.pool.adapter)),
+      );
+      const canReuseMainDirect = Boolean(
+        effectiveMainModel &&
+          (mainInHealthy || mainRoutesHealthy || hasInjectedAdapterWithoutCatalog),
+      );
+
+      if (recommendedModel && chosenCandidate?.hasFastTier && !matchesReasoning) {
+        return {
+          config,
+          stage: normalizedStage,
+          active: true,
+          effectiveModel: recommendedModel,
+          skipReason: null,
+          rationale: recommendedRationale,
+          recommendedModel,
+          recommendedRationale,
+          candidates,
+        };
+      }
+
+      if (recommendedModel && !matchesReasoning) {
+        return {
+          config,
+          stage: normalizedStage,
+          active: true,
+          effectiveModel: recommendedModel,
+          skipReason: null,
+          rationale: matchesMainModel ? 'dtoc_reuse_main_model' : recommendedRationale,
+          recommendedModel,
+          recommendedRationale,
+          candidates,
+        };
+      }
+
+      if (mainInHealthy && !isReasoningCandidate(mainInHealthy)) {
+        return {
+          config,
+          stage: normalizedStage,
+          active: true,
+          effectiveModel: mainInHealthy.alias,
+          skipReason: null,
+          rationale: 'dtoc_reuse_main_model',
+          recommendedModel,
+          recommendedRationale,
+          candidates,
+        };
+      }
+
+      const nonReasoningHealthy = healthyEligible.find((c) => !isReasoningCandidate(c)) ?? null;
+      if (nonReasoningHealthy) {
+        return {
+          config,
+          stage: normalizedStage,
+          active: true,
+          effectiveModel: nonReasoningHealthy.alias,
+          skipReason: null,
+          rationale:
+            effectiveMainModel &&
+            (nonReasoningHealthy.alias === effectiveMainModel ||
+              nonReasoningHealthy.upstreamModel === effectiveMainModel)
+              ? 'dtoc_reuse_main_model'
+              : 'dtoc_non_reasoning_model',
+          recommendedModel,
+          recommendedRationale,
+          candidates,
+        };
+      }
+
+      if (canReuseMainDirect) {
+        return {
+          config,
+          stage: normalizedStage,
+          active: true,
+          effectiveModel: mainInHealthy?.alias ?? effectiveMainModel,
+          skipReason: null,
+          rationale: 'dtoc_reuse_main_model',
+          recommendedModel,
+          recommendedRationale,
+          candidates,
+        };
+      }
+
+      if (recommendedModel) {
+        return {
+          config,
+          stage: normalizedStage,
+          active: true,
+          effectiveModel: recommendedModel,
+          skipReason: null,
+          rationale: 'dtoc_epoch_fallback_model',
+          recommendedModel,
+          recommendedRationale,
+          candidates,
+        };
+      }
+
+      return {
+        config,
+        stage: normalizedStage,
+        active: false,
+        effectiveModel: null,
+        skipReason: 'no_healthy_route',
+        rationale: recommendedRationale,
+        recommendedModel,
+        recommendedRationale,
+        candidates,
+      };
+    }
+
+    // stage === 'admission' (high-frequency per-step): preserve fast-skip behavior
     if (matchesMainModel || matchesReasoning || matchesV4WithoutLegacyFastBypass) {
       return {
         config,
+        stage: normalizedStage,
         active: false,
         effectiveModel: null,
+        skipReason: matchesMainModel
+          ? 'matches_main_model'
+          : matchesReasoning
+            ? 'reasoning_model'
+            : 'auto_skip_v4_model',
         rationale: 'auto_skip_same_or_reasoning_model_deterministic',
         recommendedModel,
         recommendedRationale,
@@ -477,8 +652,10 @@ export class ContextSupervisor {
 
     return {
       config,
+      stage: normalizedStage,
       active: Boolean(recommendedModel),
       effectiveModel: recommendedModel,
+      skipReason: recommendedModel ? null : 'no_healthy_route',
       rationale: recommendedRationale,
       recommendedModel,
       recommendedRationale,
@@ -655,8 +832,9 @@ export class ContextSupervisor {
     signal = null,
     configOverride = null,
     mainModel = null,
+    stage = 'dtoc',
   } = {}) {
-    const resolved = this.resolveModel(configOverride, { mainModel });
+    const resolved = this.resolveModel(configOverride, { mainModel, stage });
     const config = resolved.config;
 
     if (!config.enabled || config.mode === 'off') {
@@ -731,18 +909,21 @@ export class ContextSupervisor {
 
     for (const c of candidateList) {
       if (!c || typeof c !== 'object') continue;
-      const canonicalId = String(c.refId ?? c.id ?? c.uri ?? '').trim();
+      const canonicalId = String(c.refId ?? c.id ?? c.ref ?? c.toolCallId ?? c.uri ?? '').trim();
       if (!canonicalId) continue;
       validIdMap.set(canonicalId, canonicalId);
+      if (c.id) validIdMap.set(String(c.id).trim(), canonicalId);
+      if (c.ref) validIdMap.set(String(c.ref).trim(), canonicalId);
+      if (c.toolCallId) validIdMap.set(String(c.toolCallId).trim(), canonicalId);
       if (c.uri) validIdMap.set(String(c.uri).trim(), canonicalId);
       promptCandidates.push({
         id: canonicalId,
         path: sanitize(redactSecrets(String(c.path ?? ''))).slice(0, 140),
         score: Number.isFinite(Number(c.score)) ? Number(Number(c.score).toFixed(3)) : 0,
-        tokens: Number(c.tokens ?? c.originalTokens ?? 0),
-        ageSteps: Number(c.ageSteps ?? 0),
+        tokens: Number(c.tokens ?? c.originalTokens ?? c.rawTokens ?? 0),
+        ageSteps: Number(c.ageSteps ?? c.age ?? 0),
         hasError: Boolean(c.hasError),
-        excerpt: sanitize(redactSecrets(String(c.excerpt ?? c.preview ?? ''))).slice(0, 260),
+        excerpt: sanitize(redactSecrets(String(c.shortSummary ?? c.summary ?? c.excerpt ?? c.preview ?? ''))).slice(0, 260),
       });
     }
 
@@ -883,6 +1064,293 @@ export class ContextSupervisor {
   }
 
   /**
+   * Low-frequency DTOC epoch semantic adjudication (`stage: 'dtoc'`).
+   * Uses a compact (~1k token) strictly read-only (`tools: []`) metadata payload
+   * (candidate ID, path, tool, token count, symbol outline, short summary) to
+   * classify active aged candidates into `{ keepRefs, compressRefs }`.
+   * Gracefully fails open to deterministic DP on error, timeout, or malformed JSON.
+   */
+  async evaluateEpoch({
+    query = '',
+    candidates = [],
+    errorSummary = '',
+    budgetSummary = '',
+    signal = null,
+    configOverride = null,
+    mainModel = null,
+    maxCandidates = 20,
+    maxInputChars = 3600,
+  } = {}) {
+    const resolved = this.resolveModel(configOverride, { mainModel, stage: 'dtoc' });
+    const config = resolved.config;
+
+    if (!config.enabled || config.mode === 'off') {
+      return {
+        ok: true,
+        bypassed: true,
+        usedLlm: false,
+        fallback: null,
+        stage: 'dtoc',
+        model: null,
+        rationale: resolved.rationale,
+        keepRefs: [],
+        compressRefs: [],
+        rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    const rawCandidates = Array.isArray(candidates) ? candidates : [];
+    if (rawCandidates.length === 0) {
+      return {
+        ok: true,
+        bypassed: true,
+        usedLlm: false,
+        fallback: null,
+        stage: 'dtoc',
+        model: resolved.effectiveModel ?? null,
+        rationale: 'no_aged_candidates',
+        keepRefs: [],
+        compressRefs: [],
+        rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    const effectiveAdapter = this.adapter ?? this.pool?.adapter ?? null;
+    if (!resolved.active || !resolved.effectiveModel || typeof effectiveAdapter?.stream !== 'function') {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        circuitOpen: this.isCircuitOpen(),
+        stage: 'dtoc',
+        model: resolved.effectiveModel ?? null,
+        rationale: !resolved.effectiveModel ? resolved.rationale : 'adapter_unavailable_deterministic_fallback',
+        keepRefs: [],
+        compressRefs: [],
+        rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    if (this.isCircuitOpen()) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        circuitOpen: true,
+        stage: 'dtoc',
+        model: resolved.effectiveModel,
+        rationale: 'supervisor_circuit_open_deterministic_fallback',
+        keepRefs: [],
+        compressRefs: [],
+        rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    const capCount = Math.max(1, Math.min(40, Math.trunc(Number(maxCandidates || 20))));
+    const charBudget = Math.max(600, Math.min(8000, Math.trunc(Number(maxInputChars || 3600))));
+    const cleanQuery = sanitize(redactSecrets(String(query ?? ''))).replace(/\s+/g, ' ').trim().slice(0, 320);
+    const cleanError = sanitize(redactSecrets(String(errorSummary ?? ''))).replace(/\s+/g, ' ').trim().slice(0, 240);
+    const cleanBudget = sanitize(redactSecrets(String(budgetSummary ?? ''))).replace(/\s+/g, ' ').trim().slice(0, 140);
+
+    const validIdMap = new Map();
+    const promptCandidates = [];
+    let approxChars =
+      cleanQuery.length + cleanError.length + cleanBudget.length + 120;
+
+    for (const c of rawCandidates.slice(0, capCount)) {
+      if (!c || typeof c !== 'object') continue;
+      const canonicalId = String(c.id ?? c.ref ?? c.refId ?? c.toolCallId ?? c.uri ?? '').trim();
+      if (!canonicalId) continue;
+      const rawSymbols = Array.isArray(c.symbolOutline)
+        ? c.symbolOutline
+        : Array.isArray(c.symbols)
+          ? c.symbols
+          : [];
+      const compactSymbols = rawSymbols
+        .map((s) => sanitize(redactSecrets(String(s ?? ''))).trim().slice(0, 40))
+        .filter(Boolean)
+        .slice(0, 6);
+      const compactSummary = sanitize(
+        redactSecrets(String(c.shortSummary ?? c.summary ?? c.excerpt ?? c.preview ?? '')),
+      )
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120);
+      const entry = {
+        id: canonicalId,
+        path: sanitize(redactSecrets(String(c.path ?? ''))).slice(0, 100),
+        tool: String(c.toolName ?? c.tool ?? 'tool').slice(0, 24),
+        tokens: Math.max(0, Math.trunc(Number(c.tokens ?? c.originalTokens ?? c.rawTokens ?? 0))),
+        ...(Number.isFinite(Number(c.chars)) && Number(c.chars) > 0
+          ? { chars: Math.trunc(Number(c.chars)) }
+          : {}),
+        age: Math.max(0, Math.trunc(Number(c.ageSteps ?? c.age ?? 0))),
+        ...(compactSymbols.length > 0 ? { symbols: compactSymbols } : {}),
+        ...(compactSummary ? { summary: compactSummary } : {}),
+      };
+      const entryCost = JSON.stringify(entry).length + 2;
+      if (promptCandidates.length > 0 && approxChars + entryCost > charBudget) {
+        break;
+      }
+      approxChars += entryCost;
+      validIdMap.set(canonicalId, canonicalId);
+      if (c.id) validIdMap.set(String(c.id).trim(), canonicalId);
+      if (c.ref) validIdMap.set(String(c.ref).trim(), canonicalId);
+      if (c.refId) validIdMap.set(String(c.refId).trim(), canonicalId);
+      if (c.toolCallId) validIdMap.set(String(c.toolCallId).trim(), canonicalId);
+      if (c.uri) validIdMap.set(String(c.uri).trim(), canonicalId);
+      promptCandidates.push(entry);
+    }
+
+    if (promptCandidates.length === 0) {
+      return {
+        ok: true,
+        bypassed: true,
+        usedLlm: false,
+        fallback: null,
+        stage: 'dtoc',
+        model: resolved.effectiveModel,
+        rationale: 'no_valid_candidates',
+        keepRefs: [],
+        compressRefs: [],
+        rejectedRefs: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: 0,
+      };
+    }
+
+    const userPayload = {
+      task: cleanQuery,
+      ...(cleanError ? { error: cleanError } : {}),
+      ...(cleanBudget ? { budget: cleanBudget } : {}),
+      candidates: promptCandidates,
+    };
+
+    const callRes = await this.#invokeReadOnlyStream({
+      effectiveAdapter,
+      model: resolved.effectiveModel,
+      system: DTOC_EPOCH_ADJUDICATION_SYSTEM_PROMPT,
+      userPayload,
+      maxTokens: Math.min(config.maxOutputTokens, 512),
+      timeoutMs: config.timeoutMs,
+      signal,
+    });
+    this.#recordSupervisorCallOutcome({ ok: callRes.ok, timedOut: callRes.timedOut });
+
+    if (!callRes.ok) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        circuitOpen: this.isCircuitOpen(),
+        timedOut: Boolean(callRes.timedOut),
+        stage: 'dtoc',
+        model: resolved.effectiveModel,
+        rationale: callRes.timedOut
+          ? 'supervisor_timeout_deterministic_fallback'
+          : 'supervisor_error_deterministic_fallback',
+        keepRefs: [],
+        compressRefs: [],
+        rejectedRefs: [],
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+        durationMs: callRes.durationMs,
+        error: callRes.error,
+      };
+    }
+
+    const parsed = callRes.parsed;
+    if (!parsed || (!Array.isArray(parsed.keepRefs) && !Array.isArray(parsed.compressRefs))) {
+      return {
+        ok: false,
+        bypassed: false,
+        usedLlm: false,
+        fallback: 'deterministic',
+        stage: 'dtoc',
+        model: resolved.effectiveModel,
+        rationale: 'invalid_json_deterministic_fallback',
+        keepRefs: [],
+        compressRefs: [],
+        rejectedRefs: [],
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+        durationMs: callRes.durationMs,
+      };
+    }
+
+    const rejectedRefs = [];
+    const filterRefs = (arr, excludeSet = null) => {
+      if (!Array.isArray(arr)) return [];
+      const out = [];
+      const seen = new Set();
+      for (const item of arr) {
+        const rawId = String(item ?? '').trim();
+        if (!rawId) continue;
+        const mapped = validIdMap.get(rawId);
+        if (!mapped) {
+          rejectedRefs.push(rawId);
+          continue;
+        }
+        if (excludeSet?.has(mapped) || seen.has(mapped)) continue;
+        seen.add(mapped);
+        out.push(mapped);
+        if (out.length >= 40) break;
+      }
+      return out;
+    };
+
+    const keepRefs = filterRefs(parsed.keepRefs);
+    const keepSet = new Set(keepRefs);
+    const compressRefs = filterRefs(parsed.compressRefs, keepSet);
+
+    return {
+      ok: true,
+      bypassed: false,
+      usedLlm: true,
+      fallback: null,
+      circuitOpen: false,
+      stage: 'dtoc',
+      model: resolved.effectiveModel,
+      rationale: resolved.rationale,
+      keepRefs,
+      compressRefs,
+      rejectedRefs,
+      inputTokens: callRes.inputTokens,
+      outputTokens: callRes.outputTokens,
+      totalTokens: callRes.totalTokens,
+      durationMs: callRes.durationMs,
+      usage: {
+        inputTokens: callRes.inputTokens,
+        outputTokens: callRes.outputTokens,
+        totalTokens: callRes.totalTokens,
+      },
+    };
+  }
+
+  /**
    * Executes a strictly read-only (`tools: []`) batched pre-injection admission
    * decision over ambiguous tool output candidates. Fails closed to deterministic
    * rules on timeout, error, tool-call attempt, or malformed JSON.
@@ -897,8 +1365,9 @@ export class ContextSupervisor {
     signal = null,
     configOverride = null,
     mainModel = null,
+    stage = 'admission',
   } = {}) {
-    const resolved = this.resolveModel(configOverride, { mainModel });
+    const resolved = this.resolveModel(configOverride, { mainModel, stage });
     const config = resolved.config;
 
     if (!config.enabled || config.mode === 'off') {

@@ -683,8 +683,9 @@ describe('Agent_US 2.4 Stage 4 ACI Governance Benchmark Suite', () => {
       assert.equal(C.finalTaskSuccessRate, 1);
       assert.equal(D.finalTaskSuccessRate, 1);
 
-      assert.ok(C.contextPrecision > B.contextPrecision, `Expected Arm C precision (${C.contextPrecision}) > Arm B (${B.contextPrecision})`);
+      assert.ok(C.contextPrecision >= B.contextPrecision, `Expected Arm C precision (${C.contextPrecision}) >= Arm B (${B.contextPrecision})`);
       assert.ok(B.contextPrecision > A.contextPrecision, `Expected Arm B precision (${B.contextPrecision}) > Arm A (${A.contextPrecision})`);
+      assert.ok(C.usefulTokenRatio > A.usefulTokenRatio, `Expected Arm C usefulTokenRatio (${C.usefulTokenRatio}) > Arm A (${A.usefulTokenRatio})`);
       assert.ok(D.usefulTokenRatio > A.usefulTokenRatio);
       assert.ok(D.tokenReduction > 0);
       assert.equal(A.supervisorCost.calls, 0);

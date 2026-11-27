@@ -908,16 +908,19 @@ export class DirectAgentRuntime {
       this.store && typeof this.store.getSetting === 'function'
         ? this.store.getSetting(ACI_CONFIG_KEY, null)
         : null;
+    // Adaptive telemetry-driven DP k* governs `cache_aware_v31` (`full_aci` / `aci_31`)
+    // by default with no static 48k floor override; pass `dtocMinPromptTokens` ONLY when
+    // explicitly configured by the caller, test, or persisted setting.
     const explicitV31DtocMinPrompt =
       mergedOptions.dtocMinPromptTokens != null &&
       Number.isFinite(Number(mergedOptions.dtocMinPromptTokens))
-        ? Math.max(1000, Math.trunc(Number(mergedOptions.dtocMinPromptTokens)))
+        ? Math.max(0, Math.trunc(Number(mergedOptions.dtocMinPromptTokens)))
         : mergedOptions.supervisorConfigOverride?.dtocMinPromptTokens != null &&
             Number.isFinite(Number(mergedOptions.supervisorConfigOverride.dtocMinPromptTokens))
-          ? Math.max(1000, Math.trunc(Number(mergedOptions.supervisorConfigOverride.dtocMinPromptTokens)))
+          ? Math.max(0, Math.trunc(Number(mergedOptions.supervisorConfigOverride.dtocMinPromptTokens)))
           : storedSupRaw?.dtocMinPromptTokens != null &&
               Number.isFinite(Number(storedSupRaw.dtocMinPromptTokens))
-            ? Math.max(1000, Math.trunc(Number(storedSupRaw.dtocMinPromptTokens)))
+            ? Math.max(0, Math.trunc(Number(storedSupRaw.dtocMinPromptTokens)))
             : undefined;
     const dtocMinPromptTokens =
       dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY_NAME

@@ -7,12 +7,17 @@ import { RUNTIME_EVENTS } from './events.js';
 import {
   CONSECUTIVE_DUPLICATE_THRESHOLD,
   ExecutionReasoningTracker,
+  MUTATING_FILE_TOOLS,
   serializeToolCallKey,
 } from './execution-reasoning.js';
 import { TURN_PHASES, TurnStateMachine } from './state-machine.js';
 import { resolveTurnOutcome } from './verdict.js';
 import { checkLeaseHeld, isLeaseLostError } from '../durable/lease-guard.js';
-import { selectOffloadableAciCandidates } from '../context/aci-engine.js';
+import { estimateRemainingHorizon } from '../context/aci-admission.js';
+import {
+  extractEpochAdjudicationCandidates,
+  selectOffloadableAciCandidates,
+} from '../context/aci-engine.js';
 import {
   computeCompletionReserveTokens,
   evaluatePostTestCompletionReserve,
@@ -22,6 +27,8 @@ import {
   estimateRequestInputTokens,
   normalizeBudgetLimit,
 } from '../swarm/budget-ledger.js';
+
+const PASSIVE_EXEC_TOOLS = new Set(['bash', 'start_process', 'run_diagnostics']);
 
 const NON_ESSENTIAL_POST_TEST_TOOLS = new Set([
   'read_file',
@@ -457,17 +464,53 @@ export class AgentLoop {
     const aciDtocEnabled = Boolean(aci?.engine) && aci?.dtocEnabled !== false;
     const aciSupervisorEnabled = aci?.supervisorEnabled !== false;
     const aciSupervisorConfigOverride = aci?.supervisorConfigOverride ?? null;
+    const aciMainModel = aci?.mainModel ?? aciSupervisorConfigOverride?.mainModel ?? model ?? null;
     const resolvedInitialSup = aci?.supervisor
       ? aciSupervisorConfigOverride
-        ? aci.supervisor.resolveModel?.(aciSupervisorConfigOverride)
+        ? aci.supervisor.resolveModel?.(aciSupervisorConfigOverride, {
+            mainModel: aciMainModel,
+            stage: 'admission',
+          })
         : {
             config: aci.supervisor.getConfig?.() ?? null,
-            effectiveModel: aci.supervisor.resolveModel?.()?.effectiveModel ?? null,
+            effectiveModel:
+              aci.supervisor.resolveModel?.(null, {
+                mainModel: aciMainModel,
+                stage: 'admission',
+              })?.effectiveModel ?? null,
           }
       : null;
     const initialSupCfg = resolvedInitialSup?.config ?? null;
     let dtocSupervisorCalls = 0;
     let aciSupervisorCalls = 0;
+    let passiveLastEditStep = -1;
+    let passiveLastCleanExecStep = -1;
+    let passiveLastExecHadError = false;
+    let passiveLastBatchHadError = false;
+    const isItemErrorSignal = (item) =>
+      Boolean(item?.isError) ||
+      (typeof item?.receipt?.exitCode === 'number' && item.receipt.exitCode !== 0) ||
+      item?.receipt?.status === 'failed';
+    const getPassiveTrajectoryFlags = (batchItems = null) => {
+      const hasBatchError =
+        Array.isArray(batchItems) && batchItems.some((it) => !it?.gated && isItemErrorSignal(it));
+      const hasBatchEdit =
+        Array.isArray(batchItems) &&
+        batchItems.some(
+          (it) =>
+            !it?.gated &&
+            !isItemErrorSignal(it) &&
+            MUTATING_FILE_TOOLS.has(String(it?.tc?.name ?? '')),
+        );
+      const hasUnverifiedEdits = Boolean(
+        hasBatchEdit ||
+          (passiveLastEditStep >= 0 && passiveLastEditStep > passiveLastCleanExecStep),
+      );
+      const hasUnresolvedErrors = Boolean(
+        hasBatchError || passiveLastExecHadError || passiveLastBatchHadError,
+      );
+      return { hasUnverifiedEdits, hasUnresolvedErrors };
+    };
     let aciSupervisorMode = !aciSupervisorEnabled
       ? 'off'
       : initialSupCfg
@@ -613,7 +656,8 @@ export class AgentLoop {
         admissionEnabled: aciAdmissionEnabled,
         dtocEnabled: aciDtocEnabled,
         dtocPolicy: dtocPolicyVal,
-        dtocMinPromptTokens: aci?.engine?.dtocMinPromptTokens ?? 24000,
+        dtocMinPromptTokens:
+          aci?.engine?.dtocMinPromptTokens !== undefined ? aci.engine.dtocMinPromptTokens : null,
         decisions,
         admissionDecisions,
         admissionOriginalTokens,
@@ -1048,12 +1092,24 @@ export class AgentLoop {
               (aci.engine.dtocPolicy === 'cache_aware_v31'
                 ? null
                 : (aci.engine.maxTotalTokens ?? epochContextWindow));
+            const observedCacheHitRate =
+              tm.totalIn > 0
+                ? Math.min(1, Math.max(0, Number(tm.totalCacheRead || 0) / tm.totalIn))
+                : 0;
+            const currentPromptTokens = estimateRequestInputTokens(requestOptions);
+            const { hasUnverifiedEdits, hasUnresolvedErrors } = getPassiveTrajectoryFlags();
+            const estHorizon = estimateRemainingHorizon({
+              currentStep: steps,
+              hasUnverifiedEdits,
+              hasUnresolvedErrors,
+            });
             // Only shield genuine spec/contract docs (SPEC.md, CONTRACT.json, etc.), never target src/ files to be edited.
             const strictContractDocRe =
               /(?:^|\/)(?:spec\.md|contract\.json|constraints\.md|agents\.md)$/i;
             const contractFiles = resolvedAciCriticalFiles.filter((filePath) =>
               strictContractDocRe.test(String(filePath || '').replace(/\\/g, '/')),
             );
+            const activeMutationTargets = [...reasoningTracker.filesMutated];
             const epochProbe = aci.engine.inspectEpoch?.(requestOptions.messages, {
               currentStep: steps,
               maxSteps,
@@ -1061,63 +1117,136 @@ export class AgentLoop {
               cumulativeUsedTokens,
               contextWindow: epochContextWindow,
               maxTotalTokens: epochMaxTotalTokens,
+              observedCacheHitRate,
+              estHorizon,
+              currentPromptTokens,
+              hasUnverifiedEdits,
+              hasUnresolvedErrors,
+              activeMutationTargets,
               contractFiles,
               verificationCount: reasoningTracker.verificationCount,
               unverifiedSrcMutations: reasoningTracker.unverifiedSrcMutations,
             });
             lastSingleStepRatio = Number((epochProbe?.singleStepRatio ?? 0).toFixed(4));
             if (epochProbe?.triggered) {
-              const activeMutationTargets = [...reasoningTracker.filesMutated];
-              const eligibleCandidates = selectOffloadableAciCandidates(requestOptions.messages, {
-                aciStore: aci.aciStore ?? aci.engine.aciStore ?? null,
-                currentStep: steps,
-                singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
-                singleStepBudget: aci.engine.singleStepBudget,
-                activeMutationTargets,
-                dtocPolicy: aci.engine.dtocPolicy,
-                contractFiles,
-                onlySuperseded: Boolean(
-                  epochProbe.supersededTriggered && !epochProbe.trajectoryTriggered,
-                ),
-              });
+              const probeAgedCandidates = Array.isArray(epochProbe.agedCandidates)
+                ? epochProbe.agedCandidates
+                : null;
+              const eligibleCandidates =
+                Array.isArray(epochProbe.adjudicationCandidates) &&
+                epochProbe.adjudicationCandidates.length > 0
+                  ? epochProbe.adjudicationCandidates
+                  : selectOffloadableAciCandidates(requestOptions.messages, {
+                      aciStore: aci.aciStore ?? aci.engine.aciStore ?? null,
+                      currentStep: steps,
+                      singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
+                      singleStepBudget: aci.engine.singleStepBudget,
+                      activeMutationTargets,
+                      dtocPolicy: aci.engine.dtocPolicy,
+                      contractFiles,
+                      onlySuperseded: Boolean(
+                        epochProbe.supersededTriggered && !epochProbe.trajectoryTriggered,
+                      ),
+                    });
               if (eligibleCandidates.length > 0) {
                 let keepRefs = [];
                 let compressRefs = [];
+                const isCacheAwareV31 = aci.engine.dtocPolicy === 'cache_aware_v31';
                 const isTrajectoryOnlyV26 = aci.engine.dtocPolicy === 'trajectory_eviction_v26';
-                const supervisorCandidates = isTrajectoryOnlyV26
-                  ? epochProbe.trajectoryTriggered
-                    ? eligibleCandidates.filter((c) => !c.superseded)
-                    : []
+                // For `cache_aware_v31` (and `trajectory_eviction_v26`), invoke low-frequency
+                // DTOC LLM adjudication ONLY when non-`superseded` active `aged` candidates exist;
+                // purely `superseded` epochs skip LLM and go straight to deterministic DP k*.
+                // Legacy policies (`cumulative` / `adaptive_single_step` / `phase_watermark_v25`)
+                // retain their Repoformer >= 2 candidates & >= 2400 chars abstention gate.
+                const agedCandidates =
+                  probeAgedCandidates !== null
+                    ? probeAgedCandidates
+                    : isTrajectoryOnlyV26 && !epochProbe.trajectoryTriggered
+                      ? []
+                      : eligibleCandidates.filter((c) => !c?.superseded);
+                const hasActiveAgedCandidates =
+                  epochProbe.hasAgedCandidates !== undefined
+                    ? Boolean(epochProbe.hasAgedCandidates) && agedCandidates.length > 0
+                    : agedCandidates.length > 0;
+                const legacySupervisorCandidates = isTrajectoryOnlyV26
+                  ? agedCandidates
                   : eligibleCandidates;
-                const totalEligibleChars = supervisorCandidates.reduce(
-                  (sum, c) => sum + (Number(c.chars) || 0),
+                const totalLegacyChars = legacySupervisorCandidates.reduce(
+                  (sum, c) => sum + (Number(c?.chars) || 0),
                   0,
                 );
+                const shouldInvokeEpochAdjudication = isCacheAwareV31
+                  ? hasActiveAgedCandidates
+                  : hasActiveAgedCandidates &&
+                    legacySupervisorCandidates.length >= 2 &&
+                    totalLegacyChars >= 2400;
                 if (
+                  shouldInvokeEpochAdjudication &&
                   aciSupervisorEnabled &&
                   aci.supervisor &&
-                  supervisorCandidates.length >= 2 &&
-                  totalEligibleChars >= 2400 &&
-                  dtocSupervisorCalls < 2
+                  dtocSupervisorCalls < 3
                 ) {
-                  const supStatus = aciSupervisorConfigOverride
-                    ? aci.supervisor.resolveModel?.(aciSupervisorConfigOverride)?.config
-                    : aci.supervisor.getConfig?.() ?? null;
-                  if (supStatus) {
-                    aciSupervisorMode = supStatus.enabled ? supStatus.mode : 'off';
+                  const supResolved = aci.supervisor.resolveModel?.(aciSupervisorConfigOverride, {
+                    mainModel: aciMainModel,
+                    stage: 'dtoc',
+                  });
+                  if (supResolved?.config) {
+                    aciSupervisorMode = supResolved.config.enabled ? supResolved.config.mode : 'off';
                   }
+                  const targetCandidates = isCacheAwareV31
+                    ? agedCandidates
+                    : legacySupervisorCandidates;
+                  const hasCompactMetadata = targetCandidates.every(
+                    (c) =>
+                      c &&
+                      (Array.isArray(c.symbolOutline) || typeof c.shortSummary === 'string'),
+                  );
+                  const compactCandidates = hasCompactMetadata
+                    ? targetCandidates
+                    : extractEpochAdjudicationCandidates(requestOptions.messages, {
+                        aciStore: aci.aciStore ?? aci.engine.aciStore ?? null,
+                        currentStep: steps,
+                        singleStepTriggered: Boolean(epochProbe.singleStepTriggered),
+                        singleStepBudget: aci.engine.singleStepBudget,
+                        activeMutationTargets,
+                        dtocPolicy: aci.engine.dtocPolicy,
+                        contractFiles,
+                        onlyAged: isCacheAwareV31 || isTrajectoryOnlyV26,
+                        firstCandidateIndex:
+                          Number.isInteger(epochProbe.optimalSplitIndex) &&
+                          epochProbe.optimalSplitIndex >= 0
+                            ? epochProbe.optimalSplitIndex
+                            : 0,
+                      });
+                  const adjudicationInput =
+                    compactCandidates.length > 0 ? compactCandidates : targetCandidates;
                   const lastErrFp = reasoningTracker.errorFingerprints.at(-1)?.summary ?? '';
-                  const supRes = await aci.supervisor
-                    .supervise({
-                      query: input,
-                      candidates: supervisorCandidates,
-                      errorSummary: lastErrFp,
-                      budgetSummary: `${Math.round(epochProbe.ratio * 100)}% (single=${epochProbe.tokensBefore}/${epochContextWindow}, cumulative=${cumulativeUsedTokens + epochProbe.tokensBefore}/${aci.engine.maxTotalTokens ?? 'unbounded'})`,
-                      learnedGuidelines: aci.engine.getGuidelines?.() ?? [],
-                      signal,
-                      configOverride: aciSupervisorConfigOverride,
-                    })
-                    .catch(() => null);
+                  const budgetSummary = `${Math.round(epochProbe.ratio * 100)}% (P_t=${currentPromptTokens}, rho=${observedCacheHitRate.toFixed(2)}, H_t=${estHorizon})`;
+                  const invokeEpochAdjudication =
+                    typeof aci.supervisor.evaluateEpoch === 'function'
+                      ? () =>
+                          aci.supervisor.evaluateEpoch({
+                            query: input,
+                            candidates: adjudicationInput,
+                            errorSummary: lastErrFp,
+                            budgetSummary,
+                            signal,
+                            configOverride: aciSupervisorConfigOverride,
+                            mainModel: aciMainModel,
+                          })
+                      : () =>
+                          aci.supervisor.supervise({
+                            query: input,
+                            candidates: adjudicationInput,
+                            errorSummary: lastErrFp,
+                            budgetSummary,
+                            learnedGuidelines: aci.engine.getGuidelines?.() ?? [],
+                            signal,
+                            configOverride: aciSupervisorConfigOverride,
+                            mainModel: aciMainModel,
+                            stage: 'dtoc',
+                          });
+                  const supRes = await invokeEpochAdjudication().catch(() => null);
                   if (supRes && !supRes.bypassed) {
                     if (supRes.model) {
                       dtocSupervisorCalls += 1;
@@ -1127,7 +1256,7 @@ export class AgentLoop {
                     aci.ledger?.recordSupervisorCall?.({
                       stage: 'dtoc',
                       model: supRes.model ?? aciSupervisorModel,
-                      candidateCount: supervisorCandidates.length,
+                      candidateCount: adjudicationInput.length,
                       decisions: {
                         keepRefs: supRes.keepRefs ?? [],
                         compressRefs: supRes.compressRefs ?? [],
@@ -1151,6 +1280,11 @@ export class AgentLoop {
                   cumulativeUsedTokens,
                   contextWindow: epochContextWindow,
                   maxTotalTokens: epochMaxTotalTokens,
+                  observedCacheHitRate,
+                  estHorizon,
+                  currentPromptTokens,
+                  hasUnverifiedEdits,
+                  hasUnresolvedErrors,
                   keepRefs,
                   compressRefs,
                   activeMutationTargets,
@@ -1184,6 +1318,15 @@ export class AgentLoop {
                       supersededTokensSaved: compResult.supersededTokensSaved ?? 0,
                       trajectoryTriggered: Boolean(compResult.trajectoryTriggered),
                       projectedTotalTokens: compResult.projectedTotalTokens ?? null,
+                      ...(compResult.optimalSplitIndex !== undefined
+                        ? { optimalSplitIndex: compResult.optimalSplitIndex }
+                        : {}),
+                      ...(compResult.observedCacheHitRate !== undefined
+                        ? { observedCacheHitRate: compResult.observedCacheHitRate }
+                        : {}),
+                      ...(compResult.estHorizon !== undefined
+                        ? { estHorizon: compResult.estHorizon }
+                        : {}),
                       tokens: {
                         before: compResult.tokensBefore,
                         after: compResult.tokensAfter,
@@ -1782,9 +1925,32 @@ export class AgentLoop {
           const errorSymbols = (reasoningTracker.errorFingerprints ?? [])
             .flatMap((fp) => [fp.errorType, fp.failingTarget])
             .filter(Boolean);
+          const admissionContextWindow = aci.engine.contextWindow ?? 128000;
+          const admissionPromptTokens = estimateRequestInputTokens({
+            provider,
+            model,
+            sessionKey: sessionId,
+            effort,
+            messages,
+            tools: requestOptions.tools,
+          });
+          const { hasUnverifiedEdits, hasUnresolvedErrors } =
+            getPassiveTrajectoryFlags(preparedBatch);
+          const admissionEstHorizon = estimateRemainingHorizon({
+            currentStep: steps,
+            hasUnverifiedEdits,
+            hasUnresolvedErrors,
+          });
           const admitResult = await aci.engine.admitToolBatch(preparedBatch, {
             query: input,
             step: steps,
+            currentStep: steps,
+            currentPromptTokens: admissionPromptTokens,
+            contextWindow: admissionContextWindow,
+            hasUnverifiedEdits,
+            hasUnresolvedErrors,
+            estHorizon: admissionEstHorizon,
+            mainModel: aciMainModel,
             errorFiles,
             errorSymbols,
             mutatedFiles: [...reasoningTracker.filesMutated],
@@ -1807,11 +1973,26 @@ export class AgentLoop {
           syncAciMetrics();
         }
 
+        let batchSawError = false;
         for (let batchIdx = 0; batchIdx < preparedBatch.length; batchIdx += 1) {
           const item = preparedBatch[batchIdx];
           const { tc, isError, durationMs, receipt, output } = item;
           let duplicateReminder = null;
           if (!item.gated) {
+            const itemFailed = isItemErrorSignal(item);
+            if (itemFailed) batchSawError = true;
+            const toolName = String(tc?.name ?? '');
+            if (!itemFailed && MUTATING_FILE_TOOLS.has(toolName)) {
+              passiveLastEditStep = steps;
+            }
+            if (PASSIVE_EXEC_TOOLS.has(toolName)) {
+              if (itemFailed) {
+                passiveLastExecHadError = true;
+              } else if (!item.pending) {
+                passiveLastExecHadError = false;
+                passiveLastCleanExecStep = steps;
+              }
+            }
             tm.recordToolSignature(tc, isError, item.parsedArgs, item.pending);
             const reasoningEvent = reasoningTracker.recordToolResult({
               tc,
@@ -1876,6 +2057,7 @@ export class AgentLoop {
             });
           }
         }
+        passiveLastBatchHadError = batchSawError;
 
         tm.saveCheckpoint({
           step: steps,

@@ -44,6 +44,7 @@ export const DEFAULT_DTOC_MIN_PROMPT_TOKENS = 24000;
 export const DEFAULT_V31_MIN_PROMPT_TOKENS = 48000;
 export const DEFAULT_V31_MIN_NET_SAVINGS_TOKENS = 3500;
 export const DEFAULT_V31_EVICTION_COOLDOWN_STEPS = 6;
+export const DEFAULT_ADAPTIVE_EPOCH_HORIZON = 4;
 export const DEFAULT_DTOC_PRESSURE_MIN_TOKENS = 28000;
 export const DEFAULT_DTOC_PRESSURE_RATIO = 0.65;
 export const DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS = 1200;
@@ -1233,8 +1234,18 @@ function extractLineRangeLabel(args, rawText) {
 
 function normalizeIdSet(values) {
   const set = new Set();
-  for (const v of values ?? []) {
-    const s = String(v ?? '').trim();
+  if (!values) return set;
+  for (const v of values) {
+    if (v == null) continue;
+    if (typeof v === 'object') {
+      const candidate = v.ref ?? v.refId ?? v.id ?? v.candidateId ?? v.toolCallId ?? v.uri ?? v.messageIndex;
+      if (candidate != null) {
+        const s = String(candidate).trim();
+        if (s) set.add(s);
+      }
+      continue;
+    }
+    const s = String(v).trim();
     if (s) set.add(s);
   }
   return set;
@@ -1242,6 +1253,429 @@ function normalizeIdSet(values) {
 
 function sha256HexLocal(text) {
   return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
+}
+
+function clampCacheHitRate(rawRate) {
+  if (rawRate === undefined || rawRate === null || rawRate === '') return 0;
+  const n = Number(rawRate);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(1, Math.max(0, n));
+}
+
+/**
+ * Pure online remaining-horizon estimator (zero task/language/benchmark rules).
+ * Used as fallback in DTOC when caller omits explicit `estHorizon`.
+ */
+export function estimateDtocHorizon({
+  currentStep = 0,
+  maxSteps = null,
+  estRemainingSteps = null,
+  hasUnverifiedEdits = false,
+  hasUnresolvedErrors = false,
+} = {}) {
+  if (
+    estRemainingSteps != null &&
+    estRemainingSteps !== '' &&
+    Number.isFinite(Number(estRemainingSteps)) &&
+    Number(estRemainingSteps) > 0
+  ) {
+    return Number(estRemainingSteps);
+  }
+  const step = Math.max(0, Number(currentStep || 0));
+  let horizon = DEFAULT_ADAPTIVE_EPOCH_HORIZON;
+  if (hasUnresolvedErrors) horizon += 2;
+  if (hasUnverifiedEdits) horizon += 1.5;
+  if (!hasUnresolvedErrors && !hasUnverifiedEdits && step >= 8) {
+    horizon = Math.max(2, horizon - Math.min(2, (step - 6) * 0.25));
+  }
+  if (
+    maxSteps != null &&
+    maxSteps !== '' &&
+    Number.isFinite(Number(maxSteps)) &&
+    Number(maxSteps) > 0
+  ) {
+    const remainingBudgetSteps = Math.max(1, Math.trunc(Number(maxSteps)) - step);
+    horizon = Math.min(horizon, remainingBudgetSteps);
+  }
+  return Number(Math.max(1, horizon).toFixed(4));
+}
+
+function buildCompactCandidateSummary(rawText, { maxChars = 160 } = {}) {
+  const inner = unwrapUntrustedText(rawText);
+  const lines = String(inner ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const joined = lines.slice(0, 3).join(' | ');
+  const cleaned = sanitize(redactSecrets(joined)).replace(/\s+/g, ' ').trim();
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, Math.max(16, maxChars - 3))}...`;
+}
+
+function candidateMatchesIdSet(cand, idSet) {
+  if (!idSet || idSet.size === 0 || !cand) return false;
+  const idx = cand.messageIndex ?? cand.index;
+  const rawPath = String(cand.path ?? cand.rawFilePath ?? '').trim();
+  const normPath = rawPath ? normalizeContextPath(rawPath) : '';
+  const keys = [
+    cand.ref,
+    cand.id,
+    cand.refId,
+    cand.candidateId,
+    cand.toolCallId,
+    cand.uri,
+    cand.artifactUri,
+    rawPath,
+    normPath,
+    idx != null && Number.isInteger(Number(idx)) ? String(idx) : null,
+    idx != null && Number.isInteger(Number(idx)) ? `tool_msg_${idx}` : null,
+    idx != null && Number.isInteger(Number(idx)) ? `msg_${idx}` : null,
+  ];
+  for (const k of keys) {
+    if (k && idSet.has(String(k))) return true;
+  }
+  return false;
+}
+
+/**
+ * Dynamic Programming Optimal Suffix Split Point `k*` solver for Cache-Aware DTOC.
+ *
+ * Preserves messages `[0 .. k-1]` 100% byte-identical for KV-Cache prefix reuse
+ * and compresses eligible candidates `i ∈ E` with `i >= k`:
+ *   S(k) = sum_{i in E, i >= k} s_i
+ *   I(k) = max(0, sum_{j = k}^{N - 1} messageTokens[j] - S(k))
+ *   netCacheAdjustedGain(k) = S(k) * (1 + Math.max(1, H_t - 1) * (1 - 0.9 * ρ_t)) - (0.9 * ρ_t) * I(k)
+ *   rawThreshold(k)         = Math.max(P_t * 0.6, I(k) * ρ_t)
+ *   feasible(k)             = S(k) > 0 && S(k) >= minNetSavingsTokens
+ *                             && netCacheAdjustedGain(k) > 0
+ *                             && H_t * S(k) > rawThreshold(k)
+ */
+export function solveOptimalEpochSplit({
+  messageTokens = [],
+  messages = null,
+  candidates = [],
+  observedCacheHitRate = 0,
+  estHorizon = DEFAULT_ADAPTIVE_EPOCH_HORIZON,
+  currentPromptTokens = undefined,
+  keepRefs = null,
+  minNetSavingsTokens = 0,
+} = {}) {
+  const msgToks =
+    Array.isArray(messageTokens) && messageTokens.length > 0
+      ? messageTokens.map((t) => Math.max(0, Number(t) || 0))
+      : Array.isArray(messages)
+        ? messages.map((m) => measureRequestComposition({ messages: [m] }).totalTokens)
+        : [];
+  const n = msgToks.length;
+  const totalMsgTokens = msgToks.reduce((sum, t) => sum + t, 0);
+
+  const rho = clampCacheHitRate(observedCacheHitRate);
+  const horizon =
+    estHorizon != null &&
+    estHorizon !== '' &&
+    Number.isFinite(Number(estHorizon)) &&
+    Number(estHorizon) > 0
+      ? Number(estHorizon)
+      : DEFAULT_ADAPTIVE_EPOCH_HORIZON;
+  const promptTokens =
+    currentPromptTokens != null &&
+    currentPromptTokens !== '' &&
+    Number.isFinite(Number(currentPromptTokens)) &&
+    Number(currentPromptTokens) > 0
+      ? Number(currentPromptTokens)
+      : totalMsgTokens;
+  const explicitMinSavings =
+    minNetSavingsTokens != null &&
+    minNetSavingsTokens !== '' &&
+    Number.isFinite(Number(minNetSavingsTokens))
+      ? Math.max(0, Number(minNetSavingsTokens))
+      : 0;
+
+  const keepSet = normalizeIdSet(keepRefs);
+  const dedupByIndex = new Map();
+  for (const raw of candidates ?? []) {
+    if (!raw || typeof raw !== 'object') continue;
+    const rawIdx = raw.messageIndex ?? raw.index;
+    if (rawIdx === undefined || rawIdx === null || !Number.isInteger(Number(rawIdx))) continue;
+    const messageIndex = Number(rawIdx);
+    if (messageIndex < 0 || (n > 0 && messageIndex >= n)) continue;
+    if (candidateMatchesIdSet(raw, keepSet)) continue;
+    const rawTokens = Math.max(
+      0,
+      Number(raw.rawTokens ?? raw.tokens ?? (n > 0 ? msgToks[messageIndex] : 0) ?? 0),
+    );
+    const stubTokens = Math.max(0, Number(raw.stubTokens ?? 0));
+    const savings =
+      raw.savings != null && Number.isFinite(Number(raw.savings))
+        ? Math.max(0, Number(raw.savings))
+        : Math.max(0, rawTokens - stubTokens);
+    if (savings <= 0) continue;
+    if (!dedupByIndex.has(messageIndex)) {
+      dedupByIndex.set(messageIndex, {
+        ...raw,
+        messageIndex,
+        rawTokens,
+        stubTokens,
+        savings,
+      });
+    }
+  }
+
+  const eligible = [...dedupByIndex.values()].sort((a, b) => a.messageIndex - b.messageIndex);
+  if (eligible.length === 0) {
+    return {
+      triggered: false,
+      optimalSplitIndex: -1,
+      firstCandidateIndex: -1,
+      observedCacheHitRate: rho,
+      estHorizon: horizon,
+      currentPromptTokens: promptTokens,
+      netCacheAdjustedGain: 0,
+      suffixTokens: 0,
+      invalidatedSuffixTokens: 0,
+      candidateSavings: 0,
+      rawThreshold: Number((promptTokens * 0.6).toFixed(4)),
+      cumulativeSavings: 0,
+      selectedCandidates: [],
+      eligibleCount: 0,
+      evaluations: [],
+    };
+  }
+
+  const suffixRaw = new Array(n + 1).fill(0);
+  for (let j = n - 1; j >= 0; j -= 1) {
+    suffixRaw[j] = suffixRaw[j + 1] + msgToks[j];
+  }
+
+  const cacheDiscount = 0.9 * rho;
+  const multiStepFactor = 1 + Math.max(1, horizon - 1) * (1 - cacheDiscount);
+  let cumSavings = 0;
+  const evaluations = [];
+  let bestFeasible = null;
+  let bestOverall = null;
+
+  for (let idx = eligible.length - 1; idx >= 0; idx -= 1) {
+    const cand = eligible[idx];
+    const k = cand.messageIndex;
+    cumSavings += cand.savings;
+    const rawSuffixAtK = n > 0 ? suffixRaw[k] : cumSavings;
+    const retainedSuffixTokens = Math.max(0, rawSuffixAtK - cumSavings);
+    const netCacheAdjustedGain =
+      cumSavings * multiStepFactor - cacheDiscount * retainedSuffixTokens;
+    const cumulativeSavings = horizon * cumSavings;
+    const rawThreshold = Math.max(promptTokens * 0.6, retainedSuffixTokens * rho);
+    const gainPositive = netCacheAdjustedGain > 0;
+    const thresholdMet = cumulativeSavings > rawThreshold;
+    const minSavingsMet = cumSavings >= explicitMinSavings;
+    const feasible = cumSavings > 0 && minSavingsMet && gainPositive && thresholdMet;
+
+    const entry = {
+      splitIndex: k,
+      candidateSavings: cumSavings,
+      rawSuffixTokens: rawSuffixAtK,
+      suffixTokens: retainedSuffixTokens,
+      netCacheAdjustedGain: Number(netCacheAdjustedGain.toFixed(4)),
+      cumulativeSavings: Number(cumulativeSavings.toFixed(4)),
+      rawThreshold: Number(rawThreshold.toFixed(4)),
+      gainPositive,
+      thresholdMet,
+      minSavingsMet,
+      feasible,
+      candidateCount: eligible.length - idx,
+    };
+    evaluations.push(entry);
+
+    // Iterating right-to-left (largest k first): strict `>` preserves longer KV prefix on exact ties.
+    if (!bestOverall || netCacheAdjustedGain > bestOverall._rawGain) {
+      bestOverall = { ...entry, _rawGain: netCacheAdjustedGain };
+    }
+    if (feasible && (!bestFeasible || netCacheAdjustedGain > bestFeasible._rawGain)) {
+      bestFeasible = { ...entry, _rawGain: netCacheAdjustedGain };
+    }
+  }
+  evaluations.reverse();
+
+  const chosen = bestFeasible ?? bestOverall;
+  const optimalSplitIndex = bestFeasible ? bestFeasible.splitIndex : -1;
+  const selectedCandidates =
+    bestFeasible && optimalSplitIndex >= 0
+      ? eligible.filter((c) => c.messageIndex >= optimalSplitIndex)
+      : [];
+
+  return {
+    triggered: Boolean(bestFeasible),
+    optimalSplitIndex,
+    firstCandidateIndex: optimalSplitIndex,
+    observedCacheHitRate: rho,
+    estHorizon: horizon,
+    currentPromptTokens: promptTokens,
+    netCacheAdjustedGain: chosen ? chosen.netCacheAdjustedGain : 0,
+    suffixTokens: chosen ? chosen.suffixTokens : 0,
+    invalidatedSuffixTokens: chosen ? chosen.suffixTokens : 0,
+    candidateSavings: chosen ? chosen.candidateSavings : 0,
+    rawThreshold: chosen ? chosen.rawThreshold : Number((promptTokens * 0.6).toFixed(4)),
+    cumulativeSavings: chosen ? chosen.cumulativeSavings : 0,
+    selectedCandidates,
+    eligibleCount: eligible.length,
+    evaluations,
+  };
+}
+
+function buildDtocCandidateDescriptor(msg, ev, index, supersededAnalysis, msgTokenCount) {
+  const resolvedPath =
+    ev.rawFilePath ||
+    supersededAnalysis?.toolMetaByIndex?.get(index)?.readEntry?.filePath ||
+    ev.targetPath;
+  const extracted = extractSymbolsFromText(resolvedPath, ev.rawText);
+  const outlineWithLines = extracted.definitions.length
+    ? extracted.definitions.slice(0, 12).map((d) => (d.line ? `${d.name}@L${d.line}` : d.name))
+    : extracted.names;
+  const lineRange = extractLineRangeLabel(ev.args, ev.rawText);
+  const supportingUri = extractSupportingUriFromText(ev.rawText);
+  const artifactUri = supportingUri || `artifact://${sha256HexLocal(ev.rawText)}`;
+  const putMeta = {
+    toolName: ev.toolName,
+    path: resolvedPath,
+    lineRange,
+    symbolOutline: outlineWithLines,
+    originalTokens: ev.rawTokens,
+    step: ev.msgStep,
+    decision: 'DEFER',
+    superseded: Boolean(ev.superseded),
+    supersededReason: ev.supersededReason ?? null,
+    evictionTier: ev.evictionTier || 'aged',
+  };
+  const stubText = formatAciRefStub(
+    {
+      uri: artifactUri,
+      ...putMeta,
+    },
+    putMeta,
+  );
+  const nonTextBlocks = (msg.content ?? []).filter((b) => b?.type !== 'text');
+  const stubMsg = { ...msg, content: [...nonTextBlocks, { type: 'text', text: stubText }] };
+  const stubMsgTokens = measureRequestComposition({ messages: [stubMsg] }).totalTokens;
+  const actualMsgTokens =
+    msgTokenCount != null && Number.isFinite(Number(msgTokenCount))
+      ? Math.max(0, Number(msgTokenCount))
+      : measureRequestComposition({ messages: [msg] }).totalTokens;
+  const savings = Math.max(0, actualMsgTokens - stubMsgTokens);
+  const shortSummary = buildCompactCandidateSummary(ev.rawText, { maxChars: 160 });
+
+  return {
+    descriptor: {
+      ref: ev.id,
+      id: ev.id,
+      refId: ev.id,
+      candidateId: ev.id,
+      toolCallId: msg.toolCallId || null,
+      uri: supportingUri || null,
+      messageIndex: index,
+      toolName: ev.toolName,
+      path: resolvedPath,
+      lineRange,
+      symbolOutline: outlineWithLines.slice(0, 8),
+      shortSummary,
+      excerpt: shortSummary,
+      tokens: actualMsgTokens,
+      rawTokens: ev.rawTokens,
+      stubTokens: stubMsgTokens,
+      savings,
+      chars: ev.chars,
+      ageSteps: ev.age,
+      superseded: Boolean(ev.superseded),
+      supersededReason: ev.supersededReason ?? null,
+      reason: ev.superseded ? (ev.supersededReason || 'superseded') : 'aged',
+      evictionTier: ev.superseded ? 'superseded' : 'aged',
+    },
+    stubMsg,
+    putMeta,
+    supportingUri,
+    artifactUri,
+  };
+}
+
+/**
+ * Extracts compact lightweight candidate metadata descriptors (~1k tokens total)
+ * suitable for read-only model-guided DTOC epoch adjudication.
+ */
+export function extractEpochAdjudicationCandidates(
+  messages = [],
+  {
+    aciStore = null,
+    compressibleTools = undefined,
+    minAgeSteps = undefined,
+    minChars = undefined,
+    supersededMinAgeSteps = undefined,
+    supersededMinChars = undefined,
+    currentStep = undefined,
+    singleStepTriggered = false,
+    singleStepBudget = DEFAULT_SINGLE_STEP_BUDGET,
+    keepRefs = [],
+    compressRefs = [],
+    activeMutationTargets = [],
+    dtocPolicy = CACHE_AWARE_V31_DTOC_POLICY,
+    recentEditShieldSteps = DEFAULT_DTOC_RECENT_EDIT_SHIELD_STEPS,
+    contractFiles = [],
+    onlySuperseded = false,
+    onlyAged = false,
+    splitStartIndex = 0,
+    firstCandidateIndex = undefined,
+    maxCandidates = 24,
+  } = {},
+) {
+  const srcMessages = Array.isArray(messages) ? messages : [];
+  const minIndex = Math.max(
+    0,
+    Number.isInteger(Number(firstCandidateIndex))
+      ? Number(firstCandidateIndex)
+      : Number.isInteger(Number(splitStartIndex))
+        ? Number(splitStartIndex)
+        : 0,
+  );
+  const candCtx = buildDtocCandidateContext(srcMessages, {
+    currentStep,
+    activeMutationTargets,
+    keepRefs,
+    compressRefs,
+    aciStore,
+  });
+  const descriptors = [];
+  for (let i = minIndex; i < srcMessages.length; i += 1) {
+    const m = srcMessages[i];
+    if (m?.role !== 'tool') continue;
+    const ev = evaluateToolMessageEligibility(m, {
+      index: i,
+      toolCallsById: candCtx.toolCallsById,
+      activeMutations: candCtx.activeMutations,
+      explicitActiveMutations: candCtx.explicitActiveMutations,
+      lastMutationStepByPath: candCtx.lastMutationStepByPath,
+      effectiveCurrentStep: candCtx.effectiveCurrentStep,
+      fallbackStep: candCtx.msgSteps[i],
+      compressibleTools,
+      minAgeSteps,
+      minChars,
+      supersededMinAgeSteps,
+      supersededMinChars,
+      singleStepTriggered,
+      singleStepBudget,
+      keepSet: candCtx.keepSet,
+      preferCompressSet: candCtx.preferCompressSet,
+      dtocPolicy,
+      recentEditShieldSteps,
+      contractFiles,
+      latestErrorIndex: candCtx.latestErrorIndex,
+      supersededAnalysis: candCtx.supersededAnalysis,
+      onlySuperseded,
+    });
+    if (!ev.eligible) continue;
+    if (onlyAged && ev.superseded) continue;
+    const msgTok = measureRequestComposition({ messages: [m] }).totalTokens;
+    const built = buildDtocCandidateDescriptor(m, ev, i, candCtx.supersededAnalysis, msgTok);
+    descriptors.push(built.descriptor);
+    if (descriptors.length >= maxCandidates) break;
+  }
+  return descriptors;
 }
 
 function buildDtocCandidateContext(
@@ -1283,22 +1717,6 @@ function buildDtocCandidateContext(
   };
 }
 
-function buildDtocTrialStubMessage(msg, ev) {
-  const stubText = formatAciRefStub(
-    {
-      uri: `artifact://${sha256HexLocal(ev.rawText)}`,
-      path: ev.rawFilePath || ev.targetPath,
-      lineRange: extractLineRangeLabel(ev.args, ev.rawText),
-      symbolOutline: [],
-      originalTokens: ev.rawTokens,
-      decision: 'DEFER',
-    },
-    { decision: 'DEFER' },
-  );
-  const nonTextBlocks = (msg.content ?? []).filter((b) => b?.type !== 'text');
-  return { ...msg, content: [...nonTextBlocks, { type: 'text', text: stubText }] };
-}
-
 function computeEmergencyTriggerFlag({
   epochState,
   hasCumulative,
@@ -1337,6 +1755,11 @@ function computeEpochTriggerState(
     currentStep = undefined,
     maxSteps = undefined,
     estRemainingSteps = undefined,
+    estHorizon = undefined,
+    observedCacheHitRate = 0,
+    currentPromptTokens = undefined,
+    hasUnverifiedEdits = undefined,
+    hasUnresolvedErrors = undefined,
     verificationCount = undefined,
     unverifiedSrcMutations = undefined,
     minAgeSteps = undefined,
@@ -1455,21 +1878,54 @@ function computeEpochTriggerState(
       compressRefs,
       aciStore,
     });
-    const v31MinPrompt = hasExplicitDtocMinPromptTokens
-      ? minPromptTokens
-      : DEFAULT_V31_MIN_PROMPT_TOKENS;
-    const v31MinSavings =
+    const explicitMinPrompt = hasExplicitDtocMinPromptTokens
+      ? Math.max(0, Number(dtocMinPromptTokens))
+      : 0;
+    const hasExplicitMinSavings =
       minNetSavingsTokens != null &&
       minNetSavingsTokens !== '' &&
-      Number.isFinite(Number(minNetSavingsTokens))
-        ? Math.max(0, Number(minNetSavingsTokens))
-        : DEFAULT_V31_MIN_NET_SAVINGS_TOKENS;
+      Number.isFinite(Number(minNetSavingsTokens));
+    const explicitMinSavings = hasExplicitMinSavings
+      ? Math.max(0, Number(minNetSavingsTokens))
+      : 0;
     const v31CooldownSteps =
       evictionCooldownSteps != null &&
       evictionCooldownSteps !== '' &&
       Number.isFinite(Number(evictionCooldownSteps))
         ? Math.max(0, Math.trunc(Number(evictionCooldownSteps)))
         : DEFAULT_V31_EVICTION_COOLDOWN_STEPS;
+
+    const rho = clampCacheHitRate(observedCacheHitRate);
+    const hasExplicitEstHorizon =
+      estHorizon != null &&
+      estHorizon !== '' &&
+      Number.isFinite(Number(estHorizon)) &&
+      Number(estHorizon) > 0;
+    const hasExplicitEstRemaining =
+      estRemainingSteps != null &&
+      estRemainingSteps !== '' &&
+      Number.isFinite(Number(estRemainingSteps)) &&
+      Number(estRemainingSteps) > 0;
+    const effectiveHorizon = hasExplicitEstHorizon
+      ? Number(estHorizon)
+      : hasExplicitEstRemaining
+        ? Number(estRemainingSteps)
+        : hasUnverifiedEdits !== undefined || hasUnresolvedErrors !== undefined
+          ? estimateDtocHorizon({
+              currentStep: candCtx.effectiveCurrentStep,
+              maxSteps,
+              hasUnverifiedEdits: Boolean(hasUnverifiedEdits),
+              hasUnresolvedErrors: Boolean(hasUnresolvedErrors),
+            })
+          : DEFAULT_ADAPTIVE_EPOCH_HORIZON;
+
+    const effectivePromptTokens =
+      currentPromptTokens != null &&
+      currentPromptTokens !== '' &&
+      Number.isFinite(Number(currentPromptTokens)) &&
+      Number(currentPromptTokens) > 0
+        ? Number(currentPromptTokens)
+        : tokensBefore;
 
     const emergencyTriggered = computeEmergencyTriggerFlag({
       epochState,
@@ -1490,12 +1946,15 @@ function computeEpochTriggerState(
         : Infinity;
     const cooldownPassed = stepsSinceLastEviction >= v31CooldownSteps;
 
-    if (tokensBefore < v31MinPrompt && !emergencyTriggered) {
+    // Honor dtocMinPromptTokens ONLY when explicitly configured by caller/test;
+    // static 48000 high wall is abolished so telemetry-driven DP k* governs by default.
+    if (explicitMinPrompt > 0 && tokensBefore < explicitMinPrompt && !emergencyTriggered) {
       return {
         srcMessages,
         dtocPolicy: policy,
-        dtocMinPromptTokens: v31MinPrompt,
-        minNetSavingsTokens: v31MinSavings,
+        dtocMinPromptTokens: explicitMinPrompt,
+        minNetSavingsTokens: explicitMinSavings,
+        explicitMinNetSavingsTokens: explicitMinSavings,
         evictionCooldownSteps: v31CooldownSteps,
         recentEditShieldSteps: effectiveShieldSteps,
         tokensBefore,
@@ -1514,8 +1973,19 @@ function computeEpochTriggerState(
         estimatedNetSavingsTokens: 0,
         supersededNetSavingsTokens: 0,
         combinedNetSavingsTokens: 0,
+        optimalSplitIndex: -1,
         firstCandidateIndex: -1,
+        observedCacheHitRate: rho,
+        estHorizon: effectiveHorizon,
+        currentPromptTokens: effectivePromptTokens,
+        netCacheAdjustedGain: 0,
+        suffixTokens: 0,
         invalidatedSuffixTokens: 0,
+        candidateSavings: 0,
+        rawThreshold: Number((effectivePromptTokens * 0.6).toFixed(4)),
+        agedCandidates: [],
+        hasAgedCandidates: false,
+        adjudicationCandidates: [],
         cooldownPassed,
         stepsSinceLastEviction,
         supersededTriggered: false,
@@ -1526,19 +1996,14 @@ function computeEpochTriggerState(
       };
     }
 
-    let tier1Count = 0;
-    let tier2Count = 0;
-    let firstCandidateIndex = -1;
-    const tier1Messages = [];
-    const combinedMessages = [];
+    const msgTokens = new Array(srcMessages.length);
+    const eligibleDescriptors = [];
 
     for (let idx = 0; idx < srcMessages.length; idx += 1) {
       const m = srcMessages[idx];
-      if (m?.role !== 'tool') {
-        tier1Messages.push(m);
-        combinedMessages.push(m);
-        continue;
-      }
+      const mTok = measureRequestComposition({ messages: [m] }).totalTokens;
+      msgTokens[idx] = mTok;
+      if (m?.role !== 'tool') continue;
       const ev = evaluateToolMessageEligibility(m, {
         index: idx,
         toolCallsById: candCtx.toolCallsById,
@@ -1562,65 +2027,78 @@ function computeEpochTriggerState(
         latestErrorIndex: candCtx.latestErrorIndex,
         supersededAnalysis: candCtx.supersededAnalysis,
       });
-      if (!ev.eligible) {
-        tier1Messages.push(m);
-        combinedMessages.push(m);
-        continue;
+      if (!ev.eligible) continue;
+      const built = buildDtocCandidateDescriptor(
+        m,
+        ev,
+        idx,
+        candCtx.supersededAnalysis,
+        mTok,
+      );
+      if (built.descriptor.savings > 0) {
+        eligibleDescriptors.push(built.descriptor);
       }
-      if (firstCandidateIndex === -1) firstCandidateIndex = idx;
-      const stubMsg = buildDtocTrialStubMessage(m, ev);
-      if (ev.superseded) {
-        tier1Count += 1;
-        tier1Messages.push(stubMsg);
-      } else {
-        tier2Count += 1;
-        tier1Messages.push(m);
-      }
-      combinedMessages.push(stubMsg);
     }
 
-    const invalidatedSuffixTokens =
-      firstCandidateIndex >= 0 && firstCandidateIndex + 1 < srcMessages.length
-        ? measureRequestComposition({
-            messages: srcMessages.slice(firstCandidateIndex + 1),
-          }).totalTokens
-        : 0;
+    const dp = solveOptimalEpochSplit({
+      messageTokens: msgTokens,
+      candidates: eligibleDescriptors,
+      observedCacheHitRate: rho,
+      estHorizon: effectiveHorizon,
+      currentPromptTokens: effectivePromptTokens,
+      minNetSavingsTokens: explicitMinSavings,
+    });
 
-    const tier1NetSavings =
-      tier1Count > 0
-        ? Math.max(
-            0,
-            tokensBefore -
-              measureRequestComposition({
-                system: systemPrompt,
-                tools,
-                messages: tier1Messages,
-              }).totalTokens,
-          )
-        : 0;
-    const combinedNetSavings =
-      tier1Count + tier2Count > 0
-        ? Math.max(
-            0,
-            tokensBefore -
-              measureRequestComposition({
-                system: systemPrompt,
-                tools,
-                messages: combinedMessages,
-              }).totalTokens,
-          )
-        : 0;
-
-    const hasCandidates = tier1Count + tier2Count > 0;
-    const isCriticalPressure = singleStepRatio >= 0.80 || emergencyTriggered;
-    const suffixAmortizationMinSavings = !isCriticalPressure
-      ? Math.ceil(invalidatedSuffixTokens * 0.35)
-      : 0;
-    const requiredNetSavingsTokens = Math.max(v31MinSavings, suffixAmortizationMinSavings);
-    const netSavingsMet = combinedNetSavings >= requiredNetSavingsTokens;
+    const hasCandidates = eligibleDescriptors.length > 0;
+    const totalEligibleSavings = eligibleDescriptors.reduce((sum, c) => sum + c.savings, 0);
     const triggered = emergencyTriggered
-      ? hasCandidates && combinedNetSavings > 0
-      : hasCandidates && cooldownPassed && netSavingsMet;
+      ? hasCandidates && totalEligibleSavings > 0
+      : dp.triggered && cooldownPassed;
+
+    const optimalSplitIndex = triggered
+      ? dp.triggered
+        ? dp.optimalSplitIndex
+        : eligibleDescriptors[0].messageIndex
+      : -1;
+    const firstCandidateIndex = optimalSplitIndex;
+
+    let candidateSavings = dp.candidateSavings;
+    let suffixTokens = dp.suffixTokens;
+    let netCacheAdjustedGain = dp.netCacheAdjustedGain;
+    let rawThreshold = dp.rawThreshold;
+
+    if (triggered && !dp.triggered && emergencyTriggered && optimalSplitIndex >= 0) {
+      let rawSuffixFromSplit = 0;
+      for (let j = optimalSplitIndex; j < msgTokens.length; j += 1) {
+        rawSuffixFromSplit += msgTokens[j];
+      }
+      candidateSavings = totalEligibleSavings;
+      suffixTokens = Math.max(0, rawSuffixFromSplit - candidateSavings);
+      const cacheDiscount = 0.9 * rho;
+      const multiStepFactor = 1 + Math.max(1, effectiveHorizon - 1) * (1 - cacheDiscount);
+      netCacheAdjustedGain = Number(
+        (candidateSavings * multiStepFactor - cacheDiscount * suffixTokens).toFixed(4),
+      );
+      rawThreshold = Number(
+        Math.max(effectivePromptTokens * 0.6, suffixTokens * rho).toFixed(4),
+      );
+    }
+
+    const activeCandidates =
+      triggered && optimalSplitIndex >= 0
+        ? eligibleDescriptors.filter((c) => c.messageIndex >= optimalSplitIndex)
+        : [];
+    const agedCandidates = activeCandidates.filter((c) => !c.superseded);
+    const supersededCandidates = activeCandidates.filter((c) => c.superseded);
+    const hasAgedCandidates = agedCandidates.length > 0;
+    const adjudicationCandidates = triggered ? activeCandidates : eligibleDescriptors;
+
+    const tier1NetSavings = (triggered
+      ? supersededCandidates
+      : eligibleDescriptors.filter((c) => c.superseded)
+    ).reduce((sum, c) => sum + c.savings, 0);
+    const combinedNetSavings = triggered ? candidateSavings : totalEligibleSavings;
+    const netSavingsMet = emergencyTriggered ? combinedNetSavings > 0 : dp.triggered;
 
     let highestCrossedWatermark = -1;
     if (triggered) {
@@ -1645,9 +2123,9 @@ function computeEpochTriggerState(
     return {
       srcMessages,
       dtocPolicy: policy,
-      dtocMinPromptTokens: v31MinPrompt,
-      minNetSavingsTokens: v31MinSavings,
-      requiredNetSavingsTokens,
+      dtocMinPromptTokens: explicitMinPrompt,
+      minNetSavingsTokens: explicitMinSavings,
+      explicitMinNetSavingsTokens: explicitMinSavings,
       evictionCooldownSteps: v31CooldownSteps,
       recentEditShieldSteps: effectiveShieldSteps,
       tokensBefore,
@@ -1661,17 +2139,28 @@ function computeEpochTriggerState(
       watermarkTriggered: triggered && highestCrossedWatermark > prevWatermark,
       singleStepTriggered: false,
       emergencyTriggered,
-      pressureTriggered: tokensBefore >= v31MinPrompt || emergencyTriggered,
+      pressureTriggered: triggered || emergencyTriggered,
       netSavingsMet,
       estimatedNetSavingsTokens: combinedNetSavings,
       supersededNetSavingsTokens: tier1NetSavings,
       combinedNetSavingsTokens: combinedNetSavings,
+      optimalSplitIndex,
       firstCandidateIndex,
-      invalidatedSuffixTokens,
+      observedCacheHitRate: rho,
+      estHorizon: effectiveHorizon,
+      currentPromptTokens: effectivePromptTokens,
+      netCacheAdjustedGain,
+      suffixTokens,
+      invalidatedSuffixTokens: suffixTokens,
+      candidateSavings,
+      rawThreshold,
+      agedCandidates,
+      hasAgedCandidates,
+      adjudicationCandidates,
       cooldownPassed,
       stepsSinceLastEviction,
-      supersededTriggered: triggered && tier1Count > 0,
-      trajectoryTriggered: triggered && tier2Count > 0,
+      supersededTriggered: triggered && supersededCandidates.length > 0,
+      trajectoryTriggered: triggered && agedCandidates.length > 0,
       currentStep: candCtx.effectiveCurrentStep,
       reason,
       triggered,
@@ -2198,11 +2687,36 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
     ...(state.evictionCooldownSteps !== undefined
       ? { evictionCooldownSteps: state.evictionCooldownSteps }
       : {}),
+    ...(state.optimalSplitIndex !== undefined
+      ? { optimalSplitIndex: state.optimalSplitIndex }
+      : {}),
     ...(state.firstCandidateIndex !== undefined
       ? { firstCandidateIndex: state.firstCandidateIndex }
       : {}),
+    ...(state.observedCacheHitRate !== undefined
+      ? { observedCacheHitRate: state.observedCacheHitRate }
+      : {}),
+    ...(state.estHorizon !== undefined ? { estHorizon: state.estHorizon } : {}),
+    ...(state.currentPromptTokens !== undefined
+      ? { currentPromptTokens: state.currentPromptTokens }
+      : {}),
+    ...(state.netCacheAdjustedGain !== undefined
+      ? { netCacheAdjustedGain: state.netCacheAdjustedGain }
+      : {}),
+    ...(state.suffixTokens !== undefined ? { suffixTokens: state.suffixTokens } : {}),
     ...(state.invalidatedSuffixTokens !== undefined
       ? { invalidatedSuffixTokens: state.invalidatedSuffixTokens }
+      : {}),
+    ...(state.candidateSavings !== undefined
+      ? { candidateSavings: state.candidateSavings }
+      : {}),
+    ...(state.rawThreshold !== undefined ? { rawThreshold: state.rawThreshold } : {}),
+    ...(state.agedCandidates !== undefined ? { agedCandidates: state.agedCandidates } : {}),
+    ...(state.hasAgedCandidates !== undefined
+      ? { hasAgedCandidates: state.hasAgedCandidates }
+      : {}),
+    ...(state.adjudicationCandidates !== undefined
+      ? { adjudicationCandidates: state.adjudicationCandidates }
       : {}),
     ...(state.supersededTriggered !== undefined
       ? { supersededTriggered: state.supersededTriggered }
@@ -2346,9 +2860,24 @@ export function evaluateToolMessageEligibility(
     ? isLatestProtectedError || (!superseded && isErrorToolMessage(msg, rawText))
     : isErrorToolMessage(msg, rawText) || (isPhaseV25 && latestErrorIndex >= 0 && index === latestErrorIndex);
 
+  const supportingUri =
+    keepSet.size > 0 || preferCompressSet.size > 0
+      ? extractSupportingUriFromText(rawText)
+      : null;
+  const computedArtifactUri =
+    keepSet.size > 0 || preferCompressSet.size > 0
+      ? supportingUri || `artifact://${sha256HexLocal(rawText)}`
+      : null;
+  const indexKey = String(index);
+  const altMsgKey = `msg_${index}`;
+
   const isPinnedKeep =
     (msg.toolCallId && keepSet.has(msg.toolCallId)) ||
     keepSet.has(fallbackMsgId) ||
+    keepSet.has(indexKey) ||
+    keepSet.has(altMsgKey) ||
+    (supportingUri && keepSet.has(supportingUri)) ||
+    (computedArtifactUri && keepSet.has(computedArtifactUri)) ||
     (rawFilePath && keepSet.has(rawFilePath)) ||
     (normRawPath && keepSet.has(normRawPath)) ||
     keepSet.has(targetPath) ||
@@ -2368,6 +2897,10 @@ export function evaluateToolMessageEligibility(
   const isPreferred =
     (msg.toolCallId && preferCompressSet.has(msg.toolCallId)) ||
     preferCompressSet.has(fallbackMsgId) ||
+    preferCompressSet.has(indexKey) ||
+    preferCompressSet.has(altMsgKey) ||
+    (supportingUri && preferCompressSet.has(supportingUri)) ||
+    (computedArtifactUri && preferCompressSet.has(computedArtifactUri)) ||
     (rawFilePath && preferCompressSet.has(rawFilePath)) ||
     (normRawPath && preferCompressSet.has(normRawPath)) ||
     preferCompressSet.has(targetPath) ||
@@ -2540,6 +3073,11 @@ export function compressMessagesEpoch(
     currentStep = undefined,
     maxSteps = undefined,
     estRemainingSteps = undefined,
+    estHorizon = undefined,
+    observedCacheHitRate = 0,
+    currentPromptTokens = undefined,
+    hasUnverifiedEdits = undefined,
+    hasUnresolvedErrors = undefined,
     singleStepTokens = undefined,
     verificationCount = undefined,
     unverifiedSrcMutations = undefined,
@@ -2568,6 +3106,11 @@ export function compressMessagesEpoch(
     currentStep,
     maxSteps,
     estRemainingSteps,
+    estHorizon,
+    observedCacheHitRate,
+    currentPromptTokens,
+    hasUnverifiedEdits,
+    hasUnresolvedErrors,
     verificationCount,
     unverifiedSrcMutations,
     minAgeSteps,
@@ -2595,6 +3138,40 @@ export function compressMessagesEpoch(
     emergencyTriggered,
   } = trigger;
 
+  const dpMetaFields = {
+    ...(trigger.optimalSplitIndex !== undefined
+      ? { optimalSplitIndex: trigger.optimalSplitIndex }
+      : {}),
+    ...(trigger.firstCandidateIndex !== undefined
+      ? { firstCandidateIndex: trigger.firstCandidateIndex }
+      : {}),
+    ...(trigger.observedCacheHitRate !== undefined
+      ? { observedCacheHitRate: trigger.observedCacheHitRate }
+      : {}),
+    ...(trigger.estHorizon !== undefined ? { estHorizon: trigger.estHorizon } : {}),
+    ...(trigger.currentPromptTokens !== undefined
+      ? { currentPromptTokens: trigger.currentPromptTokens }
+      : {}),
+    ...(trigger.netCacheAdjustedGain !== undefined
+      ? { netCacheAdjustedGain: trigger.netCacheAdjustedGain }
+      : {}),
+    ...(trigger.suffixTokens !== undefined ? { suffixTokens: trigger.suffixTokens } : {}),
+    ...(trigger.invalidatedSuffixTokens !== undefined
+      ? { invalidatedSuffixTokens: trigger.invalidatedSuffixTokens }
+      : {}),
+    ...(trigger.candidateSavings !== undefined
+      ? { candidateSavings: trigger.candidateSavings }
+      : {}),
+    ...(trigger.rawThreshold !== undefined ? { rawThreshold: trigger.rawThreshold } : {}),
+    ...(trigger.agedCandidates !== undefined ? { agedCandidates: trigger.agedCandidates } : {}),
+    ...(trigger.hasAgedCandidates !== undefined
+      ? { hasAgedCandidates: trigger.hasAgedCandidates }
+      : {}),
+    ...(trigger.adjudicationCandidates !== undefined
+      ? { adjudicationCandidates: trigger.adjudicationCandidates }
+      : {}),
+  };
+
   if (!trigger.triggered) {
     return {
       triggered: false,
@@ -2614,12 +3191,7 @@ export function compressMessagesEpoch(
       supersededTriggered: Boolean(trigger.supersededTriggered),
       projectedTotalTokens: trigger.projectedTotalTokens ?? null,
       estRemainingSteps: trigger.estRemainingSteps ?? null,
-      ...(trigger.firstCandidateIndex !== undefined
-        ? { firstCandidateIndex: trigger.firstCandidateIndex }
-        : {}),
-      ...(trigger.invalidatedSuffixTokens !== undefined
-        ? { invalidatedSuffixTokens: trigger.invalidatedSuffixTokens }
-        : {}),
+      ...dpMetaFields,
       compressedCount: 0,
       compressedRefs: [],
       messages: srcMessages,
@@ -2645,17 +3217,29 @@ export function compressMessagesEpoch(
   const onlySuperseded = Boolean(
     isTrajectoryV26 && trigger.supersededTriggered && !trigger.trajectoryTriggered,
   );
+  const splitStartIndex =
+    trigger.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY &&
+    Number.isInteger(trigger.firstCandidateIndex) &&
+    trigger.firstCandidateIndex >= 0
+      ? trigger.firstCandidateIndex
+      : 0;
 
-  const outMessages = srcMessages.map((m) => ({
-    ...m,
-    content: Array.isArray(m?.content) ? m.content.map((b) => ({ ...b })) : m?.content,
-  }));
+  // Strictly preserve messages [0 .. splitStartIndex - 1] 100% byte- and reference-identical for KV-Cache prefix reuse.
+  const outMessages = srcMessages.map((m, idx) =>
+    idx < splitStartIndex
+      ? m
+      : {
+          ...m,
+          content: Array.isArray(m?.content) ? m.content.map((b) => ({ ...b })) : m?.content,
+        },
+  );
 
   const stagedSuperseded = [];
   const stagedAged = [];
   const keptItems = [];
 
   for (let i = 0; i < outMessages.length; i += 1) {
+    if (i < splitStartIndex) continue;
     const m = outMessages[i];
     if (m?.role !== 'tool') continue;
 
@@ -2744,11 +3328,32 @@ export function compressMessagesEpoch(
   }).totalTokens;
   const netSavingsTokens = Math.max(0, tokensBefore - tokensAfterPreview);
 
-  const v31MinSavingsReq = trigger.requiredNetSavingsTokens ?? trigger.minNetSavingsTokens;
-  const v31AbortedSavings =
-    trigger.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY &&
-    (stagedCompressions.length === 0 ||
-      (emergencyTriggered ? netSavingsTokens <= 0 : netSavingsTokens < v31MinSavingsReq));
+  let v31AbortedSavings = false;
+  if (trigger.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY) {
+    if (stagedCompressions.length === 0 || netSavingsTokens <= 0) {
+      v31AbortedSavings = true;
+    } else if (!emergencyTriggered) {
+      const explicitMinReq = Number(trigger.explicitMinNetSavingsTokens ?? 0);
+      const actualSuffixTokens =
+        splitStartIndex >= 0 && splitStartIndex < outMessages.length
+          ? measureRequestComposition({ messages: outMessages.slice(splitStartIndex) }).totalTokens
+          : 0;
+      const rho = clampCacheHitRate(trigger.observedCacheHitRate);
+      const horizon = Number(trigger.estHorizon ?? DEFAULT_ADAPTIVE_EPOCH_HORIZON);
+      const promptTokens = Number(trigger.currentPromptTokens ?? tokensBefore);
+      const cacheDiscount = 0.9 * rho;
+      const multiStepFactor = 1 + Math.max(1, horizon - 1) * (1 - cacheDiscount);
+      const actualGain = netSavingsTokens * multiStepFactor - cacheDiscount * actualSuffixTokens;
+      const actualThreshold = Math.max(promptTokens * 0.6, actualSuffixTokens * rho);
+      if (
+        netSavingsTokens < explicitMinReq ||
+        actualGain <= 0 ||
+        horizon * netSavingsTokens <= actualThreshold
+      ) {
+        v31AbortedSavings = true;
+      }
+    }
+  }
   if (
     v31AbortedSavings ||
     ((trigger.dtocPolicy === PHASE_WATERMARK_V25_DTOC_POLICY ||
@@ -2773,12 +3378,7 @@ export function compressMessagesEpoch(
       supersededTriggered: Boolean(trigger.supersededTriggered),
       projectedTotalTokens: trigger.projectedTotalTokens ?? null,
       estRemainingSteps: trigger.estRemainingSteps ?? null,
-      ...(trigger.firstCandidateIndex !== undefined
-        ? { firstCandidateIndex: trigger.firstCandidateIndex }
-        : {}),
-      ...(trigger.invalidatedSuffixTokens !== undefined
-        ? { invalidatedSuffixTokens: trigger.invalidatedSuffixTokens }
-        : {}),
+      ...dpMetaFields,
       compressedCount: 0,
       compressedRefs: [],
       messages: srcMessages,
@@ -2922,12 +3522,7 @@ export function compressMessagesEpoch(
     supersededTriggered: Boolean(trigger.supersededTriggered),
     projectedTotalTokens: trigger.projectedTotalTokens ?? null,
     estRemainingSteps: trigger.estRemainingSteps ?? null,
-    ...(trigger.firstCandidateIndex !== undefined
-      ? { firstCandidateIndex: trigger.firstCandidateIndex }
-      : {}),
-    ...(trigger.invalidatedSuffixTokens !== undefined
-      ? { invalidatedSuffixTokens: trigger.invalidatedSuffixTokens }
-      : {}),
+    ...dpMetaFields,
     compressedCount: compressedRefs.length,
     compressedRefs,
     messages: outMessages,
@@ -3578,12 +4173,12 @@ export class ACIEngine {
       dtocMinPromptTokens !== '' &&
       Number.isFinite(Number(dtocMinPromptTokens));
     this._explicitDtocMinPromptTokens = hasExplicitMinPrompt
-      ? Math.max(1000, Number(dtocMinPromptTokens))
+      ? Math.max(0, Number(dtocMinPromptTokens))
       : undefined;
     this.dtocMinPromptTokens =
       this._explicitDtocMinPromptTokens ??
       (this.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY
-        ? DEFAULT_V31_MIN_PROMPT_TOKENS
+        ? 0
         : DEFAULT_DTOC_MIN_PROMPT_TOKENS);
     const hasExplicitSavings =
       minNetSavingsTokens !== undefined &&
@@ -3596,7 +4191,7 @@ export class ACIEngine {
     this.minNetSavingsTokens =
       this._explicitMinNetSavingsTokens ??
       (this.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY
-        ? DEFAULT_V31_MIN_NET_SAVINGS_TOKENS
+        ? 0
         : this.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY
           ? DEFAULT_V26_TRAJECTORY_MIN_NET_SAVINGS_TOKENS
           : DEFAULT_DTOC_MIN_NET_SAVINGS_TOKENS);
@@ -3651,6 +4246,7 @@ export class ACIEngine {
     this.admissionController = new PreInjectionAdmissionController({
       aciStore: this.aciStore,
       ledger: this.ledger,
+      contextWindow: this.contextWindow,
       admissionMinChars: this._explicitAdmissionMinChars,
       workingSetReadMaxChars: this._explicitWorkingSetReadMaxChars,
       maxSupervisorAdmissionCalls: this.maxSupervisorAdmissionCalls,
@@ -3670,18 +4266,44 @@ export class ACIEngine {
   }
 
   async admitToolBatch(executedBatch, options = {}) {
+    const resolvedStep =
+      options.currentStep !== undefined && options.currentStep !== null
+        ? options.currentStep
+        : options.step !== undefined && options.step !== null
+          ? options.step
+          : 0;
+    const resolvedContextWindow =
+      options.contextWindow !== undefined &&
+      options.contextWindow !== null &&
+      Number.isFinite(Number(options.contextWindow))
+        ? Number(options.contextWindow)
+        : this.contextWindow;
     return this.admissionController.admitBatch(executedBatch, {
+      ...options,
       supervisor: options.supervisor ?? this.supervisor,
       learnedGuidelines: options.learnedGuidelines ?? this.getGuidelines(),
-      ...(this._explicitAdmissionMinChars !== undefined
+      ...(this._explicitAdmissionMinChars !== undefined && options.admissionMinChars === undefined
         ? { admissionMinChars: this._explicitAdmissionMinChars }
         : {}),
-      ...(this._explicitWorkingSetReadMaxChars !== undefined
+      ...(this._explicitWorkingSetReadMaxChars !== undefined &&
+      options.workingSetReadMaxChars === undefined
         ? { workingSetReadMaxChars: this._explicitWorkingSetReadMaxChars }
         : {}),
       maxSupervisorAdmissionCalls:
         options.maxSupervisorAdmissionCalls ?? this.maxSupervisorAdmissionCalls,
-      ...options,
+      contextWindow: resolvedContextWindow,
+      currentStep: resolvedStep,
+      step: options.step ?? resolvedStep,
+      ...(options.currentPromptTokens !== undefined
+        ? { currentPromptTokens: options.currentPromptTokens }
+        : {}),
+      ...(options.hasUnverifiedEdits !== undefined
+        ? { hasUnverifiedEdits: Boolean(options.hasUnverifiedEdits) }
+        : {}),
+      ...(options.hasUnresolvedErrors !== undefined
+        ? { hasUnresolvedErrors: Boolean(options.hasUnresolvedErrors) }
+        : {}),
+      ...(options.estHorizon !== undefined ? { estHorizon: options.estHorizon } : {}),
     });
   }
 
