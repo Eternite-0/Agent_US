@@ -662,13 +662,15 @@ describe('SWE-bench Telemetry 3.2.1 (T1, T2, T3, --turn-timeout-ms, Supervisor D
     }
   });
 
-  test('Supervisor decoupling: deepseek-v4* & capability.reasoning trigger deterministic fallback when no distinct fast model exists', () => {
+  test('Supervisor decoupling: non-reasoning single models enable auto_epoch_main_model while strict reasoning models fall back deterministically', () => {
     assert.equal(isThinkingOrReasoningModel('deepseek-v4'), true);
     assert.equal(isThinkingOrReasoningModel('deepseek-v4.1-flash'), true);
     assert.equal(isThinkingOrReasoningModel('deepseek/deepseek-v4-chat'), true);
     assert.equal(isThinkingOrReasoningModel('custom-model', { reasoning: true }), true);
     assert.equal(isThinkingOrReasoningModel('deepseek-chat'), false);
 
+    // Non-reasoning single models return auto_epoch_main_model so stage='admission' auto-skips
+    // while stage='dtoc' epoch adjudication activates reusing mainModel.
     assert.deepEqual(
       resolveSupervisorExecutionConfig({
         arm: 'full_aci',
@@ -676,11 +678,11 @@ describe('SWE-bench Telemetry 3.2.1 (T1, T2, T3, --turn-timeout-ms, Supervisor D
         availableModels: ['deepseek-v4.1-flash'],
       }),
       {
-        enabled: false,
-        mode: 'off',
+        enabled: true,
+        mode: 'auto',
         model: null,
         admissionEnabled: true,
-        reason: 'reasoning_main_deterministic_fallback',
+        reason: 'auto_epoch_main_model',
       },
     );
 
@@ -691,13 +693,31 @@ describe('SWE-bench Telemetry 3.2.1 (T1, T2, T3, --turn-timeout-ms, Supervisor D
         availableModels: ['claude-sonnet-4-5'],
       }),
       {
-        enabled: false,
-        mode: 'off',
+        enabled: true,
+        mode: 'auto',
         model: null,
         admissionEnabled: true,
-        reason: 'no_distinct_fast_model_deterministic_fallback',
+        reason: 'auto_epoch_main_model',
       },
     );
+
+    // Strict thinking/reasoning single models still fall back to deterministic-only mode.
+    for (const reasoningModel of ['deepseek-reasoner', 'deepseek-r1', 'o3-mini']) {
+      assert.deepEqual(
+        resolveSupervisorExecutionConfig({
+          arm: 'full_aci',
+          mainModel: reasoningModel,
+          availableModels: [reasoningModel],
+        }),
+        {
+          enabled: false,
+          mode: 'off',
+          model: null,
+          admissionEnabled: true,
+          reason: 'reasoning_main_deterministic_fallback',
+        },
+      );
+    }
 
     assert.deepEqual(
       resolveSupervisorExecutionConfig({

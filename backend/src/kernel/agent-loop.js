@@ -1151,6 +1151,7 @@ export class AgentLoop {
               if (eligibleCandidates.length > 0) {
                 let keepRefs = [];
                 let compressRefs = [];
+                let epochAdjudicationSucceeded = false;
                 const isCacheAwareV31 = aci.engine.dtocPolicy === 'cache_aware_v31';
                 const isTrajectoryOnlyV26 = aci.engine.dtocPolicy === 'trajectory_eviction_v26';
                 // For `cache_aware_v31` (and `trajectory_eviction_v26`), invoke low-frequency
@@ -1184,7 +1185,7 @@ export class AgentLoop {
                   shouldInvokeEpochAdjudication &&
                   aciSupervisorEnabled &&
                   aci.supervisor &&
-                  dtocSupervisorCalls < 3
+                  dtocSupervisorCalls < 4
                 ) {
                   const supResolved = aci.supervisor.resolveModel?.(aciSupervisorConfigOverride, {
                     mainModel: aciMainModel,
@@ -1269,10 +1270,27 @@ export class AgentLoop {
                       fallback: supRes.fallback ?? null,
                       step: steps,
                     });
-                    keepRefs = Array.isArray(supRes.keepRefs) ? supRes.keepRefs : [];
-                    compressRefs = Array.isArray(supRes.compressRefs) ? supRes.compressRefs : [];
+                    if (supRes.ok === true && supRes.usedLlm === true && !supRes.fallback) {
+                      epochAdjudicationSucceeded = true;
+                      keepRefs = Array.isArray(supRes.keepRefs) ? supRes.keepRefs : [];
+                      compressRefs = Array.isArray(supRes.compressRefs) ? supRes.compressRefs : [];
+                    }
                   }
                 }
+                const epochSingleStepRatio = Number.isFinite(Number(epochProbe?.singleStepRatio))
+                  ? Number(epochProbe.singleStepRatio)
+                  : epochContextWindow > 0
+                    ? currentPromptTokens / epochContextWindow
+                    : 0;
+                const highPressureBypass = Boolean(
+                  epochSingleStepRatio >= 0.70 || epochProbe?.emergencyTriggered,
+                );
+                // Under cache_aware_v31, never blindly evict active non-superseded `aged`
+                // working-set files when LLM epoch adjudication did not run or failed unless
+                // under genuine high context pressure (>= 70%) or emergency budget rescue.
+                const onlySupersededGuard = Boolean(
+                  isCacheAwareV31 && !epochAdjudicationSucceeded && !highPressureBypass,
+                );
                 const compResult = aci.engine.compress(requestOptions.messages, {
                   currentStep: steps,
                   maxSteps,
@@ -1287,6 +1305,7 @@ export class AgentLoop {
                   hasUnresolvedErrors,
                   keepRefs,
                   compressRefs,
+                  onlySuperseded: onlySupersededGuard,
                   activeMutationTargets,
                   contractFiles,
                   verificationCount: reasoningTracker.verificationCount,

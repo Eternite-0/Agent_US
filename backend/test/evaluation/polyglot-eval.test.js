@@ -28,6 +28,7 @@ import {
   preparePolyglotWorkspace,
   renderPolyglotMarkdownReport,
   resolvePolyglotGradePlan,
+  resolvePolyglotSupervisorConfig,
   restoreProtectedTestFiles,
   runPolyglotExerciseMode,
   selectPolyglotSubset,
@@ -38,6 +39,9 @@ import {
   parsePolyglotCliArgs,
   runPolyglotCli,
 } from '../../scripts/benchmark-polyglot.mjs';
+import { ContextSupervisor, ACI_CONFIG_KEY } from '../../src/context/supervisor.js';
+import { AccountPool } from '../../src/pool.js';
+import { Store } from '../../src/store.js';
 
 function makeTempDir(prefix = 'polyglot-test-') {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1169,6 +1173,100 @@ describe('Aider Polyglot 6-language benchmark evaluation', () => {
       }
     } finally {
       rmSync(workRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('wires live full_aci single-model Polyglot runs to auto_epoch_main_model (skip admission, activate dtoc) while keeping dry-run deterministic', () => {
+    // Live full_aci single-model -> auto_epoch_main_model
+    const liveCfg = resolvePolyglotSupervisorConfig({
+      mode: 'full_aci',
+      targetModel: POLYGLOT_DEFAULT_MODEL,
+      dryRun: false,
+    });
+    assert.deepEqual(liveCfg, {
+      enabled: true,
+      mode: 'auto',
+      model: null,
+      admissionEnabled: true,
+      reason: 'auto_epoch_main_model',
+    });
+
+    // raw_full -> off & admission disabled
+    assert.deepEqual(
+      resolvePolyglotSupervisorConfig({
+        mode: 'raw_full',
+        targetModel: POLYGLOT_DEFAULT_MODEL,
+        dryRun: false,
+      }),
+      {
+        enabled: false,
+        mode: 'off',
+        model: null,
+        admissionEnabled: false,
+        reason: 'raw_full',
+      },
+    );
+
+    // dryRun=true or explicit deterministicAdmission=true stays deterministic
+    for (const opts of [
+      { mode: 'full_aci', targetModel: POLYGLOT_DEFAULT_MODEL, dryRun: true },
+      { mode: 'full_aci', targetModel: POLYGLOT_DEFAULT_MODEL, dryRun: false, deterministicAdmission: true },
+    ]) {
+      assert.deepEqual(resolvePolyglotSupervisorConfig(opts), {
+        enabled: false,
+        mode: 'off',
+        model: null,
+        admissionEnabled: true,
+        reason: 'deterministic',
+      });
+    }
+
+    // Verify with real Store + single-model AccountPool + ContextSupervisor
+    const tmp = makeTempDir('polyglot-sup-wire-');
+    const store = new Store(join(tmp, 'polyglot-sup.sqlite'));
+    const pool = new AccountPool(store, { root: tmp });
+    try {
+      pool.createAccount({
+        preset: 'custom-openai',
+        label: 'polyglot-single-model',
+        credential: 'sk-test-polyglot',
+        protocol: 'openai',
+        endpoint: 'https://example.invalid/v1',
+        models: [POLYGLOT_DEFAULT_MODEL],
+      });
+      pool.setDefaultModel(POLYGLOT_DEFAULT_MODEL);
+
+      const supExec = resolvePolyglotSupervisorConfig({
+        mode: 'full_aci',
+        targetModel: POLYGLOT_DEFAULT_MODEL,
+        dryRun: false,
+        targetPool: pool,
+      });
+      assert.equal(supExec.reason, 'auto_epoch_main_model');
+      store.setSetting(ACI_CONFIG_KEY, {
+        enabled: supExec.enabled,
+        mode: supExec.mode,
+        model: supExec.model,
+        admissionEnabled: supExec.admissionEnabled,
+      });
+
+      const supervisor = new ContextSupervisor({ store, pool });
+      const adm = supervisor.resolveModel(null, {
+        mainModel: POLYGLOT_DEFAULT_MODEL,
+        stage: 'admission',
+      });
+      assert.equal(adm.active, false);
+      assert.equal(adm.effectiveModel, null);
+
+      const dtoc = supervisor.resolveModel(null, {
+        mainModel: POLYGLOT_DEFAULT_MODEL,
+        stage: 'dtoc',
+      });
+      assert.equal(dtoc.active, true);
+      assert.equal(dtoc.effectiveModel, POLYGLOT_DEFAULT_MODEL);
+    } finally {
+      store.close();
+      rmSync(tmp, { recursive: true, force: true });
     }
   });
 });

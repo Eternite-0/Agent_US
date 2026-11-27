@@ -116,7 +116,7 @@ test('v3.1/4.1 constants, policy helpers, and ACIEngine adaptive defaults abolis
   assert.deepEqual([...CACHE_AWARE_V31_EPOCH_WATERMARKS], [0.78, 0.9]);
   assert.equal(DEFAULT_V31_MIN_PROMPT_TOKENS, 48000);
   assert.equal(DEFAULT_V31_MIN_NET_SAVINGS_TOKENS, 3500);
-  assert.equal(DEFAULT_V31_EVICTION_COOLDOWN_STEPS, 6);
+  assert.equal(DEFAULT_V31_EVICTION_COOLDOWN_STEPS, 10);
   assert.equal(DEFAULT_ADAPTIVE_EPOCH_HORIZON, 4);
   assert.ok(VALID_DTOC_POLICIES.includes(CACHE_AWARE_V31_DTOC_POLICY));
   assert.equal(normalizeDtocPolicy(CACHE_AWARE_V31_DTOC_POLICY), CACHE_AWARE_V31_DTOC_POLICY);
@@ -129,7 +129,7 @@ test('v3.1/4.1 constants, policy helpers, and ACIEngine adaptive defaults abolis
   assert.equal(v31Engine._explicitDtocMinPromptTokens, undefined);
   assert.equal(v31Engine.dtocMinPromptTokens, 0);
   assert.equal(v31Engine.minNetSavingsTokens, 0);
-  assert.equal(v31Engine.evictionCooldownSteps, 6);
+  assert.equal(v31Engine.evictionCooldownSteps, 10);
   assert.equal(v31Engine.workingSetReadMaxChars, 42000);
   assert.deepEqual(v31Engine.watermarks, [0.78, 0.9]);
 
@@ -257,7 +257,7 @@ test('v4.1 adaptive cache-aware DTOC: short low-savings tasks abstain without a 
   }
 });
 
-test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache, preserves [0..k*-1] byte-identically, supports keepRefs re-solve, 6-step cooldown, and shields active/contract/error/head', () => {
+test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache, preserves [0..k*-1] byte-identically, supports keepRefs re-solve, 10-step cooldown, and shields active/contract/error/head', () => {
   const storeDir = mkdtempSync(join(tmpdir(), 'aci31-epoch-'));
   const store = new Store(join(storeDir, 'engine.sqlite'));
   try {
@@ -301,19 +301,19 @@ test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache,
       ...makeToolStep('dp_early_small', 'read_file', { path: 'src/early_small.js' }, makeCodeModule('earlySmall', 35), { step: 2 }),
       ...makeToolStep('dp_spec_mid', 'read_file', { path: 'SPEC.md' }, `# SPEC\n${'Active contract invariant line.\n'.repeat(2400)}`, { step: 3 }),
       ...makeToolStep('dp_late_big', 'read_file', { path: 'src/late_big.js' }, makeCodeModule('lateBig', 280), { step: 4 }),
-      ...makeToolStep('dp_recent', 'read_file', { path: 'src/recent.js' }, makeCodeModule('recentLive', 40), { step: 9 }),
+      ...makeToolStep('dp_recent', 'read_file', { path: 'src/recent.js' }, makeCodeModule('recentLive', 40), { step: 10 }),
     ];
     const earlyIdx = dpSplitMsgs.findIndex((m) => m.toolCallId === 'dp_early_small');
     const lateIdx = dpSplitMsgs.findIndex((m) => m.toolCallId === 'dp_late_big');
 
     const coldProbe = engine.inspectEpoch(dpSplitMsgs, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0,
       estHorizon: 6,
     });
     const hotProbe = engine.inspectEpoch(dpSplitMsgs, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0.95,
       estHorizon: 6,
@@ -335,7 +335,7 @@ test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache,
       dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
     });
     const hotComp = hotEngine.compress(dpSplitMsgs, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0.95,
       estHorizon: 6,
@@ -359,7 +359,7 @@ test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache,
       dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
     });
     const keptCancel = keptEngine.compress(dpSplitMsgs, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0.95,
       estHorizon: 6,
@@ -384,7 +384,7 @@ test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache,
     assert.equal(pureDp.candidateSavings, 7940);
     assert.equal(pureDp.suffixTokens, 2060);
 
-    // 3) Full batch epoch with Tier-1 superseded + Tier-2 aged candidates, 6-step cooldown, and active/contract/error/head shields
+    // 3) Full batch epoch with Tier-1 superseded + Tier-2 aged candidates, 10-step cooldown, and active/contract/error/head shields
     const headCode = makeCodeModule('headBoot', 60);
     const specCode = `# Contract\n${'Strict spec invariant rule.\n'.repeat(160)}`;
     const tier1PreMut = makeCodeModule('tier1StaleA', 420);
@@ -404,22 +404,22 @@ test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache,
       ...makeToolStep('v_spec', 'read_file', { path: 'SPEC.md' }, specCode, { step: 2 }), // strict contract
       ...makeToolStep('v_t1_read', 'read_file', { path: 'src/stale.js' }, tier1PreMut, { step: 3 }), // Tier 1 superseded by edit
       ...makeToolStep('v_t1_err', 'bash', { command: 'node --test test/old.test.js' }, tier1OldErr, { isError: true, step: 4 }), // Tier 1 superseded by v_latest_err
-      ...makeToolStep('v_t2_a', 'read_file', { path: 'src/aged1.js' }, tier2Aged1, { step: 5 }), // Tier 2 aged
-      ...makeToolStep('v_t2_b', 'read_file', { path: 'src/aged2.js' }, tier2Aged2, { step: 6 }), // Tier 2 aged
-      ...makeToolStep('v_edit', 'edit_file', { path: 'src/stale.js' }, 'Edited src/stale.js', { step: 8 }), // recent edit (10 - 8 = 2 <= 4)
-      ...makeToolStep('v_recent_read', 'read_file', { path: 'src/stale.js' }, recentPostMut, { step: 9 }), // recent active read
-      ...makeToolStep('v_latest_err', 'bash', { command: 'node --test' }, latestErr, { isError: true, step: 10 }), // latest unresolved error
+      ...makeToolStep('v_t2_a', 'read_file', { path: 'src/aged1.js' }, tier2Aged1, { step: 4 }), // Tier 2 aged (age 8 >= 7)
+      ...makeToolStep('v_t2_b', 'read_file', { path: 'src/aged2.js' }, tier2Aged2, { step: 5 }), // Tier 2 aged (age 7 >= 7)
+      ...makeToolStep('v_edit', 'edit_file', { path: 'src/stale.js' }, 'Edited src/stale.js', { step: 10 }), // recent edit (12 - 10 = 2 <= 4)
+      ...makeToolStep('v_recent_read', 'read_file', { path: 'src/stale.js' }, recentPostMut, { step: 11 }), // recent active read
+      ...makeToolStep('v_latest_err', 'bash', { command: 'node --test' }, latestErr, { isError: true, step: 12 }), // latest unresolved error
     ];
 
     const adjCands = extractEpochAdjudicationCandidates(batchMsgs, {
-      currentStep: 10,
+      currentStep: 12,
       contractFiles: ['SPEC.md'],
     });
     assert.equal(adjCands.length, 4);
     assert.equal(adjCands.filter((c) => c.reason === 'aged').length, 2);
 
     const firstCandidateIdx = batchMsgs.findIndex((m) => m.toolCallId === 'v_t1_read');
-    const comp1 = engine.compress(batchMsgs, { currentStep: 10, contractFiles: ['SPEC.md'] });
+    const comp1 = engine.compress(batchMsgs, { currentStep: 12, contractFiles: ['SPEC.md'] });
     assert.equal(comp1.triggered, true);
     assert.equal(comp1.reason, CACHE_AWARE_V31_DTOC_POLICY);
     assert.equal(comp1.epoch, 1);
@@ -447,36 +447,36 @@ test('v4.1 cache-rate self-calibrated DP k*: shifts split point under hot cache,
     assert.ok(findText('v_recent_read').includes('recentActive_1_'));
     assert.ok(findText('v_latest_err').includes('latest unresolved failure'));
 
-    // 4) 6-step cooldown blocks eviction at step 15 (15 - 10 = 5 < 6)
+    // 4) 10-step cooldown blocks eviction at step 21 (21 - 12 = 9 < 10)
     const extraAged = makeCodeModule('extraWave', 900);
-    const step15Msgs = [
+    const step21Msgs = [
       ...comp1.messages,
-      ...makeToolStep('v_extra_read', 'read_file', { path: 'src/extra.js' }, extraAged, { step: 11 }),
-      ...makeToolStep('v_extra_edit', 'edit_file', { path: 'src/extra.js' }, 'Edited src/extra.js', { step: 12 }),
-      ...makeToolStep('v_extra_tail', 'read_file', { path: 'src/final.js' }, makeCodeModule('finalLive', 700), { step: 15 }),
+      ...makeToolStep('v_extra_read', 'read_file', { path: 'src/extra.js' }, extraAged, { step: 13 }),
+      ...makeToolStep('v_extra_edit', 'edit_file', { path: 'src/extra.js' }, 'Edited src/extra.js', { step: 14 }),
+      ...makeToolStep('v_extra_tail', 'read_file', { path: 'src/final.js' }, makeCodeModule('finalLive', 700), { step: 21 }),
     ];
-    const cooldownBlocked = engine.compress(step15Msgs, { currentStep: 15, contractFiles: ['SPEC.md'] });
+    const cooldownBlocked = engine.compress(step21Msgs, { currentStep: 21, contractFiles: ['SPEC.md'] });
     assert.equal(cooldownBlocked.triggered, false);
     assert.equal(cooldownBlocked.reason, 'eviction_cooldown');
     assert.equal(cooldownBlocked.compressedCount, 0);
 
-    // 5) At step 16 (16 - 10 = 6 >= 6), cooldown passes and Epoch 2 fires!
-    const step16Probe = engine.inspectEpoch(step15Msgs, { currentStep: 16, contractFiles: ['SPEC.md'] });
-    assert.equal(step16Probe.cooldownPassed, true);
-    assert.equal(step16Probe.stepsSinceLastEviction, 6);
-    const epoch2 = engine.compress(step15Msgs, { currentStep: 16, contractFiles: ['SPEC.md'] });
+    // 5) At step 22 (22 - 12 = 10 >= 10), cooldown passes and Epoch 2 fires!
+    const step22Probe = engine.inspectEpoch(step21Msgs, { currentStep: 22, contractFiles: ['SPEC.md'] });
+    assert.equal(step22Probe.cooldownPassed, true);
+    assert.equal(step22Probe.stepsSinceLastEviction, 10);
+    const epoch2 = engine.compress(step21Msgs, { currentStep: 22, contractFiles: ['SPEC.md'] });
     assert.equal(epoch2.triggered, true);
     assert.equal(epoch2.epoch, 2);
     assert.ok(epoch2.compressedRefs.some((r) => r.path === 'src/extra.js'));
 
     // Explicit evictionCooldownSteps override is respected
-    const customCooldownProbe = shouldTriggerAciEpoch(step15Msgs, {
+    const customCooldownProbe = shouldTriggerAciEpoch(step21Msgs, {
       dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
       dtocMinPromptTokens: 1000,
       minNetSavingsTokens: 1000,
       evictionCooldownSteps: 2,
-      epochState: { lastWatermark: -1, epochCount: 1, lastEvictionStep: 10 },
-      currentStep: 12,
+      epochState: { lastWatermark: -1, epochCount: 1, lastEvictionStep: 12 },
+      currentStep: 14,
     });
     assert.equal(customCooldownProbe.cooldownPassed, true);
     assert.equal(customCooldownProbe.triggered, true);

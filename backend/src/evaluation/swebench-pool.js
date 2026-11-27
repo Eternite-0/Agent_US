@@ -880,10 +880,11 @@ export function resolveLiveProviderConfig(opts = {}, env = process.env) {
 }
 
 /**
- * Returns true for thinking/reasoning models (e.g. deepseek-reasoner, deepseek-v4, r1, o1, o3, o4, thinking, qwq)
- * that must be decoupled from synchronous ACI admission supervisor calls.
+ * Returns true for strict thinking/reasoning models (e.g. deepseek-reasoner, r1, o1, o3, o4, thinking, qwq)
+ * aligned with `ContextSupervisor`'s `AUTO_SKIP_REASONING_RE`, excluding non-reasoning v4 models that
+ * can safely run low-frequency DTOC epoch adjudication.
  */
-export function isThinkingOrReasoningModel(modelId, capabilities = null) {
+function isStrictThinkingOrReasoningModel(modelId, capabilities = null) {
   if (capabilities && typeof capabilities === 'object' && capabilities.reasoning === true) {
     return true;
   }
@@ -892,9 +893,21 @@ export function isThinkingOrReasoningModel(modelId, capabilities = null) {
   return (
     REASONING_MODEL_TOKEN_RE.test(id) ||
     REASONING_MODEL_PREFIX_RE.test(id) ||
-    /deepseek-(?:r1|reasoner)/i.test(id) ||
-    /\bdeepseek-v4\b/i.test(id)
+    /deepseek-(?:r1|reasoner)/i.test(id)
   );
+}
+
+/**
+ * Returns true for thinking/reasoning models (e.g. deepseek-reasoner, deepseek-v4, r1, o1, o3, o4, thinking, qwq)
+ * that must be decoupled from synchronous ACI admission supervisor calls.
+ */
+export function isThinkingOrReasoningModel(modelId, capabilities = null) {
+  if (isStrictThinkingOrReasoningModel(modelId, capabilities)) {
+    return true;
+  }
+  const id = String(modelId ?? '').trim().toLowerCase();
+  if (!id) return false;
+  return /\bdeepseek-v4\b/i.test(id);
 }
 
 function collectFastSupervisorCandidateModels({ mainModel, availableModels = [], targetPool = null }) {
@@ -967,9 +980,13 @@ function collectFastSupervisorCandidateModels({ mainModel, availableModels = [],
 }
 
 /**
- * Computes the ACI ContextSupervisor configuration for a benchmark `(arm, mainModel)` run,
- * enforcing deterministic admission fallback whenever `mainModel` is a slow reasoning/thinking
- * model or no distinct lightweight non-reasoning side model exists in the pool.
+ * Computes the ACI ContextSupervisor configuration for a benchmark `(arm, mainModel)` run:
+ * - Binds a distinct healthy lightweight side model (`mode: 'custom'`) when available.
+ * - Falls back to deterministic-only (`mode: 'off'`) for strict reasoning/thinking main models
+ *   when no distinct lightweight side model exists.
+ * - Otherwise enables `mode: 'auto'` (`reason: 'auto_epoch_main_model'`) so `ContextSupervisor`
+ *   auto-skips per-step `stage: 'admission'` LLM calls while activating low-frequency `stage: 'dtoc'`
+ *   epoch adjudication reusing `mainModel`.
  */
 export function resolveSupervisorExecutionConfig({
   arm,
@@ -1033,13 +1050,21 @@ export function resolveSupervisorExecutionConfig({
     };
   }
 
+  if (isStrictThinkingOrReasoningModel(mainModel)) {
+    return {
+      enabled: false,
+      mode: 'off',
+      model: null,
+      admissionEnabled: true,
+      reason: 'reasoning_main_deterministic_fallback',
+    };
+  }
+
   return {
-    enabled: false,
-    mode: 'off',
+    enabled: true,
+    mode: 'auto',
     model: null,
     admissionEnabled: true,
-    reason: isThinkingOrReasoningModel(mainModel)
-      ? 'reasoning_main_deterministic_fallback'
-      : 'no_distinct_fast_model_deterministic_fallback',
+    reason: 'auto_epoch_main_model',
   };
 }

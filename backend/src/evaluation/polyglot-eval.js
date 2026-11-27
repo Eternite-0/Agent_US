@@ -2653,6 +2653,36 @@ export function resolvePolyglotProviderConfig(opts = {}, runtimeDeps = {}) {
   };
 }
 
+/**
+ * Resolves the ACI ContextSupervisor configuration for a Polyglot benchmark run.
+ * Live `full_aci` single-model runs keep `deterministicAdmission: false` so `stage: 'admission'`
+ * stays zero-latency while low-frequency `stage: 'dtoc'` epoch adjudication activates cleanly;
+ * synthetic `--dry-run` runs remain deterministic unless explicitly overridden.
+ */
+export function resolvePolyglotSupervisorConfig({
+  mode,
+  targetModel,
+  supervisorModel = null,
+  deterministicAdmission = false,
+  dryRun = false,
+  availableModels = null,
+  targetPool = null,
+} = {}) {
+  const models = Array.isArray(availableModels)
+    ? availableModels
+    : targetModel
+      ? [targetModel]
+      : [];
+  return resolveSupervisorExecutionConfig({
+    arm: mode,
+    mainModel: targetModel,
+    supervisorModel,
+    deterministicAdmission: Boolean(deterministicAdmission || dryRun),
+    availableModels: models,
+    targetPool,
+  });
+}
+
 async function runDirectAgentPolyglotMode({
   exercise,
   mode,
@@ -2664,6 +2694,8 @@ async function runDirectAgentPolyglotMode({
   maxSteps,
   timeoutMs,
   dryRun,
+  deterministicAdmission = false,
+  supervisorModel = null,
 }) {
   const stateDir = mkdtempSync(join(tmpdir(), `agent-us-polyglot-state-${mode}-`));
   const store = new Store(join(stateDir, 'polyglot.sqlite'));
@@ -2681,10 +2713,12 @@ async function runDirectAgentPolyglotMode({
   });
   pool.setDefaultModel(targetModel);
 
-  const supExec = resolveSupervisorExecutionConfig({
-    arm: mode,
-    mainModel: targetModel,
-    deterministicAdmission: true,
+  const supExec = resolvePolyglotSupervisorConfig({
+    mode,
+    targetModel,
+    supervisorModel,
+    deterministicAdmission,
+    dryRun,
     availableModels: [targetModel],
     targetPool: pool,
   });
@@ -3481,6 +3515,8 @@ export async function runPolyglotExerciseMode({
         maxSteps,
         timeoutMs: turnTimeoutMs,
         dryRun,
+        deterministicAdmission: Boolean(opts.deterministicAdmission),
+        supervisorModel: opts.supervisorModel ?? null,
       });
     } else if (normMode === 'claude_code') {
       agentOutcome = await runClaudeCodePolyglotMode({

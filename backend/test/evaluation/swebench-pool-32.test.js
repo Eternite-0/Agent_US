@@ -495,4 +495,184 @@ describe('SWE-bench Pool, Provider Inference & Supervisor Decoupling (WP3)', () 
       store.close();
     }
   });
+
+  test('Task 4.1.1 Section 1: single-model full_aci enables auto_epoch_main_model — skips stage=admission and activates stage=dtoc end-to-end', async () => {
+    const supCfg = resolveSupervisorExecutionConfig({
+      arm: 'full_aci',
+      mainModel: 'deepseek-v4.1-flash',
+    });
+    assert.deepEqual(supCfg, {
+      enabled: true,
+      mode: 'auto',
+      model: null,
+      admissionEnabled: true,
+      reason: 'auto_epoch_main_model',
+    });
+
+    // Also applies to non-reasoning single models with explicit availableModels list
+    assert.deepEqual(
+      resolveSupervisorExecutionConfig({
+        arm: 'full_aci',
+        mainModel: 'claude-sonnet-4-5',
+        availableModels: ['claude-sonnet-4-5'],
+      }),
+      {
+        enabled: true,
+        mode: 'auto',
+        model: null,
+        admissionEnabled: true,
+        reason: 'auto_epoch_main_model',
+      },
+    );
+
+    const dir = makeTmp('swe-sup-dtoc-auto-');
+    const store = new Store(join(dir, 'sup-dtoc.sqlite'));
+    const pool = new AccountPool(store, { root: dir });
+    try {
+      pool.createAccount({
+        preset: 'deepseek',
+        label: 'DS-Single',
+        credential: 'sk-test-v41',
+        models: ['deepseek-v4.1-flash'],
+      });
+      pool.setDefaultModel('deepseek-v4.1-flash');
+
+      // Re-resolve against live single-model AccountPool
+      const liveCfg = resolveSupervisorExecutionConfig({
+        arm: 'full_aci',
+        mainModel: 'deepseek-v4.1-flash',
+        availableModels: ['deepseek-v4.1-flash'],
+        targetPool: pool,
+      });
+      assert.deepEqual(liveCfg, {
+        enabled: true,
+        mode: 'auto',
+        model: null,
+        admissionEnabled: true,
+        reason: 'auto_epoch_main_model',
+      });
+
+      store.setSetting(ACI_CONFIG_KEY, {
+        enabled: liveCfg.enabled,
+        mode: liveCfg.mode,
+        model: liveCfg.model,
+        admissionEnabled: liveCfg.admissionEnabled,
+      });
+
+      const recordedCalls = [];
+      class RecordingDtocAdapter extends LlmAdapter {
+        async *stream(opts) {
+          recordedCalls.push({
+            model: opts.model,
+            tools: opts.tools,
+            system: opts.system,
+          });
+          yield {
+            type: 'text-delta',
+            index: 0,
+            text: JSON.stringify({
+              keepRefs: ['ref_active_spec'],
+              compressRefs: ['ref_explored_noise'],
+            }),
+          };
+          yield {
+            type: 'usage',
+            usage: { inputTokens: 420, outputTokens: 28 },
+          };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        }
+      }
+
+      const supervisor = new ContextSupervisor({
+        store,
+        pool,
+        adapter: new RecordingDtocAdapter(),
+      });
+
+      // 1) stage='admission' MUST auto-skip (zero per-step LLM latency!)
+      const admResolved = supervisor.resolveModel(liveCfg, {
+        mainModel: 'deepseek-v4.1-flash',
+        stage: 'admission',
+      });
+      assert.equal(admResolved.stage, 'admission');
+      assert.equal(admResolved.active, false);
+      assert.equal(admResolved.effectiveModel, null);
+
+      const decoyContent =
+        '<!-- DO NOT EDIT - ARCHIVED DECOY -->\n' +
+        'Legacy pricing snapshot line\n'.repeat(120);
+      const admBatch = await admitToolBatch(
+        [
+          {
+            tc: {
+              id: 'c_adm_1',
+              name: 'read_file',
+              arguments: JSON.stringify({ path: 'docs/legacy/pricing_archive.md' }),
+            },
+            parsedArgs: { path: 'docs/legacy/pricing_archive.md' },
+            output: decoyContent,
+            isError: false,
+          },
+        ],
+        {
+          query: 'Fix billing calculation edge case',
+          supervisor,
+          supervisorEnabled: true,
+          mainModel: 'deepseek-v4.1-flash',
+        },
+      );
+      assert.equal(
+        recordedCalls.length,
+        0,
+        'stage=admission must NOT invoke single-model mainModel over the wire',
+      );
+      assert.ok(admBatch.stats.tokensSaved > 0);
+
+      // 2) stage='dtoc' MUST activate reusing mainModel='deepseek-v4.1-flash'
+      const dtocResolved = supervisor.resolveModel(liveCfg, {
+        mainModel: 'deepseek-v4.1-flash',
+        stage: 'dtoc',
+      });
+      assert.equal(dtocResolved.stage, 'dtoc');
+      assert.equal(dtocResolved.active, true);
+      assert.equal(dtocResolved.effectiveModel, 'deepseek-v4.1-flash');
+
+      // 3) End-to-end evaluateEpoch triggers read-only (tools: []) model semantic adjudication
+      const epochRes = await supervisor.evaluateEpoch({
+        query: 'Fix billing calculation edge case in pricing engine',
+        mainModel: 'deepseek-v4.1-flash',
+        candidates: [
+          {
+            id: 'ref_active_spec',
+            path: 'src/pricing/engine.js',
+            toolName: 'read_file',
+            tokens: 1800,
+            ageSteps: 8,
+            symbolOutline: ['calculateDiscount', 'applyTax'],
+            shortSummary: 'Core pricing engine specification and active edit target',
+          },
+          {
+            id: 'ref_explored_noise',
+            path: 'src/cli/banner.js',
+            toolName: 'read_file',
+            tokens: 1600,
+            ageSteps: 10,
+            symbolOutline: ['renderBanner'],
+            shortSummary: 'Peripheral CLI banner helper explored earlier',
+          },
+        ],
+      });
+      assert.equal(epochRes.ok, true);
+      assert.equal(epochRes.usedLlm, true);
+      assert.equal(epochRes.stage, 'dtoc');
+      assert.equal(epochRes.model, 'deepseek-v4.1-flash');
+      assert.deepEqual(epochRes.keepRefs, ['ref_active_spec']);
+      assert.deepEqual(epochRes.compressRefs, ['ref_explored_noise']);
+      assert.equal(recordedCalls.length, 1);
+      assert.equal(recordedCalls[0].model, 'deepseek-v4.1-flash');
+      assert.deepEqual(recordedCalls[0].tools, []);
+    } finally {
+      store.close();
+    }
+  });
 });

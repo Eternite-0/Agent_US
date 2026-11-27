@@ -43,7 +43,8 @@ export const VALID_DTOC_POLICIES = Object.freeze([
 export const DEFAULT_DTOC_MIN_PROMPT_TOKENS = 24000;
 export const DEFAULT_V31_MIN_PROMPT_TOKENS = 48000;
 export const DEFAULT_V31_MIN_NET_SAVINGS_TOKENS = 3500;
-export const DEFAULT_V31_EVICTION_COOLDOWN_STEPS = 6;
+export const DEFAULT_V31_EVICTION_COOLDOWN_STEPS = 10;
+export const DEFAULT_V31_AGED_MIN_AGE_STEPS = 7;
 export const DEFAULT_ADAPTIVE_EPOCH_HORIZON = 4;
 export const DEFAULT_DTOC_PRESSURE_MIN_TOKENS = 28000;
 export const DEFAULT_DTOC_PRESSURE_RATIO = 0.65;
@@ -1358,6 +1359,8 @@ export function solveOptimalEpochSplit({
   estHorizon = DEFAULT_ADAPTIVE_EPOCH_HORIZON,
   currentPromptTokens = undefined,
   keepRefs = null,
+  compressRefs = null,
+  onlySuperseded = false,
   minNetSavingsTokens = 0,
 } = {}) {
   const msgToks =
@@ -1392,6 +1395,7 @@ export function solveOptimalEpochSplit({
       : 0;
 
   const keepSet = normalizeIdSet(keepRefs);
+  const compressSet = normalizeIdSet(compressRefs);
   const dedupByIndex = new Map();
   for (const raw of candidates ?? []) {
     if (!raw || typeof raw !== 'object') continue;
@@ -1400,6 +1404,10 @@ export function solveOptimalEpochSplit({
     const messageIndex = Number(rawIdx);
     if (messageIndex < 0 || (n > 0 && messageIndex >= n)) continue;
     if (candidateMatchesIdSet(raw, keepSet)) continue;
+    if (onlySuperseded && !raw.superseded) continue;
+    if (compressSet.size > 0 && !raw.superseded && !candidateMatchesIdSet(raw, compressSet)) {
+      continue;
+    }
     const rawTokens = Math.max(
       0,
       Number(raw.rawTokens ?? raw.tokens ?? (n > 0 ? msgToks[messageIndex] : 0) ?? 0),
@@ -1769,6 +1777,7 @@ function computeEpochTriggerState(
     compressibleTools = undefined,
     keepRefs = [],
     compressRefs = [],
+    onlySuperseded = false,
     activeMutationTargets = [],
     contractFiles = [],
     systemPrompt = '',
@@ -1783,7 +1792,12 @@ function computeEpochTriggerState(
   const effectiveCompressibleTools =
     compressibleTools ?? (useV26ToolRules ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
   const effectiveMinAgeSteps =
-    minAgeSteps ?? (useV26ToolRules ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
+    minAgeSteps ??
+    (isV31
+      ? DEFAULT_V31_AGED_MIN_AGE_STEPS
+      : isV26
+        ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1
+        : 3);
   const effectiveMinChars =
     minChars ?? (useV26ToolRules ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
   const effectiveSupersededMinAgeSteps =
@@ -1885,9 +1899,6 @@ function computeEpochTriggerState(
       minNetSavingsTokens != null &&
       minNetSavingsTokens !== '' &&
       Number.isFinite(Number(minNetSavingsTokens));
-    const explicitMinSavings = hasExplicitMinSavings
-      ? Math.max(0, Number(minNetSavingsTokens))
-      : 0;
     const v31CooldownSteps =
       evictionCooldownSteps != null &&
       evictionCooldownSteps !== '' &&
@@ -1927,6 +1938,13 @@ function computeEpochTriggerState(
         ? Number(currentPromptTokens)
         : tokensBefore;
 
+    const adaptiveMinNetSavings = Math.floor(
+      Math.max(effectivePromptTokens, Math.max(0, Number(contextWindow) || 0) * 0.12) * 0.14,
+    );
+    const effectiveV31MinNetSavings = hasExplicitMinSavings
+      ? Math.max(0, Number(minNetSavingsTokens))
+      : adaptiveMinNetSavings;
+
     const emergencyTriggered = computeEmergencyTriggerFlag({
       epochState,
       hasCumulative,
@@ -1953,8 +1971,9 @@ function computeEpochTriggerState(
         srcMessages,
         dtocPolicy: policy,
         dtocMinPromptTokens: explicitMinPrompt,
-        minNetSavingsTokens: explicitMinSavings,
-        explicitMinNetSavingsTokens: explicitMinSavings,
+        minNetSavingsTokens: effectiveV31MinNetSavings,
+        explicitMinNetSavingsTokens: effectiveV31MinNetSavings,
+        onlySuperseded: Boolean(onlySuperseded),
         evictionCooldownSteps: v31CooldownSteps,
         recentEditShieldSteps: effectiveShieldSteps,
         tokensBefore,
@@ -2026,6 +2045,7 @@ function computeEpochTriggerState(
         contractFiles,
         latestErrorIndex: candCtx.latestErrorIndex,
         supersededAnalysis: candCtx.supersededAnalysis,
+        onlySuperseded: Boolean(onlySuperseded),
       });
       if (!ev.eligible) continue;
       const built = buildDtocCandidateDescriptor(
@@ -2046,7 +2066,7 @@ function computeEpochTriggerState(
       observedCacheHitRate: rho,
       estHorizon: effectiveHorizon,
       currentPromptTokens: effectivePromptTokens,
-      minNetSavingsTokens: explicitMinSavings,
+      minNetSavingsTokens: effectiveV31MinNetSavings,
     });
 
     const hasCandidates = eligibleDescriptors.length > 0;
@@ -2124,8 +2144,9 @@ function computeEpochTriggerState(
       srcMessages,
       dtocPolicy: policy,
       dtocMinPromptTokens: explicitMinPrompt,
-      minNetSavingsTokens: explicitMinSavings,
-      explicitMinNetSavingsTokens: explicitMinSavings,
+      minNetSavingsTokens: effectiveV31MinNetSavings,
+      explicitMinNetSavingsTokens: effectiveV31MinNetSavings,
+      onlySuperseded: Boolean(onlySuperseded),
       evictionCooldownSteps: v31CooldownSteps,
       recentEditShieldSteps: effectiveShieldSteps,
       tokensBefore,
@@ -2718,6 +2739,7 @@ export function shouldTriggerAciEpoch(messages, options = {}) {
     ...(state.adjudicationCandidates !== undefined
       ? { adjudicationCandidates: state.adjudicationCandidates }
       : {}),
+    ...(state.onlySuperseded !== undefined ? { onlySuperseded: state.onlySuperseded } : {}),
     ...(state.supersededTriggered !== undefined
       ? { supersededTriggered: state.supersededTriggered }
       : {}),
@@ -2801,7 +2823,12 @@ export function evaluateToolMessageEligibility(
   const effectiveCompressibleTools =
     compressibleTools ?? (isV26OrV31 ? V26_COMPRESSIBLE_TOOLS : COMPRESSIBLE_TOOLS);
   const effectiveMinAgeSteps =
-    minAgeSteps ?? (isV26OrV31 ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 3);
+    minAgeSteps ??
+    (isCacheAwareV31
+      ? DEFAULT_V31_AGED_MIN_AGE_STEPS
+      : isTrajectoryV26
+        ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1
+        : 3);
   const effectiveMinChars =
     minChars ?? (isV26OrV31 ? DEFAULT_V26_AGED_MIN_CHARS : DEFAULT_DTOC_MIN_CHARS);
   const effectiveSupersededMinAgeSteps =
@@ -2915,9 +2942,19 @@ export function evaluateToolMessageEligibility(
   const meetsPreferred =
     isPreferred &&
     rawText.length >= thresholdChars &&
-    age >= (isPhaseV25 ? recentEditShieldSteps + 1 : isV26OrV31 && !superseded ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1 : 1);
+    age >=
+      (isPhaseV25
+        ? recentEditShieldSteps + 1
+        : isCacheAwareV31 && !superseded
+          ? thresholdAge
+          : isV26OrV31 && !superseded
+            ? DEFAULT_V26_ACTIVE_READ_PROTECT_AGE + 1
+            : 1);
 
   const blockedByTierFilter = Boolean(isV26OrV31 && onlySuperseded && !superseded);
+  const blockedByCompressRefsGate = Boolean(
+    isCacheAwareV31 && preferCompressSet.size > 0 && !superseded && !isPreferred,
+  );
 
   const eligible =
     isCompressibleTool &&
@@ -2928,6 +2965,7 @@ export function evaluateToolMessageEligibility(
     !isRecentShielded &&
     !isPinnedKeep &&
     !blockedByTierFilter &&
+    !blockedByCompressRefsGate &&
     (meetsSizeAndAge || isSingleStepOverflow || meetsPreferred);
 
   const reason = isHeadPrefixProtected
@@ -2939,8 +2977,12 @@ export function evaluateToolMessageEligibility(
         : isContractShielded
           ? 'contract_preserved'
           : blockedByTierFilter
-            ? 'aged_preserved_below_trajectory'
-            : 'recent_or_pinned';
+            ? isCacheAwareV31
+              ? 'aged_preserved_only_superseded'
+              : 'aged_preserved_below_trajectory'
+            : blockedByCompressRefsGate
+              ? 'aged_not_approved_by_model'
+              : 'recent_or_pinned';
 
   return {
     eligible,
@@ -3083,6 +3125,7 @@ export function compressMessagesEpoch(
     unverifiedSrcMutations = undefined,
     keepRefs = [],
     compressRefs = [],
+    onlySuperseded = false,
     activeMutationTargets = [],
     contractFiles = [],
     systemPrompt = '',
@@ -3120,6 +3163,7 @@ export function compressMessagesEpoch(
     compressibleTools,
     keepRefs,
     compressRefs,
+    onlySuperseded,
     activeMutationTargets,
     contractFiles,
     systemPrompt,
@@ -3170,6 +3214,7 @@ export function compressMessagesEpoch(
     ...(trigger.adjudicationCandidates !== undefined
       ? { adjudicationCandidates: trigger.adjudicationCandidates }
       : {}),
+    ...(trigger.onlySuperseded !== undefined ? { onlySuperseded: trigger.onlySuperseded } : {}),
   };
 
   if (!trigger.triggered) {
@@ -3214,8 +3259,9 @@ export function compressMessagesEpoch(
   });
   const nextEpoch = prevEpochCount + 1;
   const isTrajectoryV26 = trigger.dtocPolicy === TRAJECTORY_EVICTION_V26_DTOC_POLICY;
-  const onlySuperseded = Boolean(
-    isTrajectoryV26 && trigger.supersededTriggered && !trigger.trajectoryTriggered,
+  const effectiveOnlySuperseded = Boolean(
+    onlySuperseded ||
+      (isTrajectoryV26 && trigger.supersededTriggered && !trigger.trajectoryTriggered),
   );
   const splitStartIndex =
     trigger.dtocPolicy === CACHE_AWARE_V31_DTOC_POLICY &&
@@ -3265,7 +3311,7 @@ export function compressMessagesEpoch(
       contractFiles,
       latestErrorIndex: candCtx.latestErrorIndex,
       supersededAnalysis: candCtx.supersededAnalysis,
-      onlySuperseded,
+      onlySuperseded: effectiveOnlySuperseded,
     });
 
     if (ev.skipReason === 'empty_or_stub') continue;
@@ -3333,7 +3379,9 @@ export function compressMessagesEpoch(
     if (stagedCompressions.length === 0 || netSavingsTokens <= 0) {
       v31AbortedSavings = true;
     } else if (!emergencyTriggered) {
-      const explicitMinReq = Number(trigger.explicitMinNetSavingsTokens ?? 0);
+      const explicitMinReq = Number(
+        trigger.explicitMinNetSavingsTokens ?? trigger.minNetSavingsTokens ?? 0,
+      );
       const actualSuffixTokens =
         splitStartIndex >= 0 && splitStartIndex < outMessages.length
           ? measureRequestComposition({ messages: outMessages.slice(splitStartIndex) }).totalTokens

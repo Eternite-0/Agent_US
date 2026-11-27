@@ -581,26 +581,26 @@ test('3.2.1 cache_aware_v31: adaptive DP k* abolishes default 48k wall while hon
     assert.equal(floorRes.triggered, false);
     assert.equal(floorRes.reason, 'append_only_cache_floor_v31');
 
-    // 2) ~55k tokens with ~7k candidate savings before huge ~45k shielded suffix:
-    // default horizon (4 * 7k <= 0.6 * 55k) and hot cache (rho=0.95) abstain;
-    // high horizon + cold cache (rho=0) clears both DP inequalities!
+    // 2) ~54k tokens with ~7.7k candidate savings before huge ~42k shielded suffix:
+    // default horizon (4 * 7.7k <= 0.6 * 54k) and hot cache (rho=0.95) abstain;
+    // high horizon + cold cache (rho=0) clears 14% adaptive floor & DP inequalities!
     const msgsLowAmort = [
       { role: 'user', content: [{ type: 'text', text: 'Update modules' }] },
       ...makeToolStep('h2', 'read_file', { path: 'README.md' }, 'Intro\n'.repeat(20), { step: 1 }),
-      ...makeToolStep('c_small_aged', 'read_file', { path: 'src/small_aged.js' }, mkBlock('smallAged', 260), { step: 2 }), // ~7k tok savings
-      ...makeToolStep('s_spec', 'read_file', { path: 'SPEC.md' }, '# SPEC\n' + 'Contract rule line.\n'.repeat(8500), { step: 4 }), // huge shielded suffix (~45k tok)
-      ...makeToolStep('r_tail', 'read_file', { path: 'src/tail.js' }, mkBlock('tailLive', 120), { step: 8 }),
+      ...makeToolStep('c_small_aged', 'read_file', { path: 'src/small_aged.js' }, mkBlock('smallAged', 290), { step: 2 }), // ~7.7k tok savings (between 14% adaptive floor and 15% H=4 breakeven)
+      ...makeToolStep('s_spec', 'read_file', { path: 'SPEC.md' }, '# SPEC\n' + 'Contract rule line.\n'.repeat(8500), { step: 4 }), // huge shielded suffix (~42k tok)
+      ...makeToolStep('r_tail', 'read_file', { path: 'src/tail.js' }, mkBlock('tailLive', 120), { step: 9 }),
     ];
     const tokAmort = measureRequestComposition({ messages: msgsLowAmort }).totalTokens;
     assert.ok(tokAmort >= 48000 && tokAmort < 128000 * 0.80, `Expected 48k..102k tokens, got ${tokAmort}`);
-    const amortBlocked = engine.inspectEpoch(msgsLowAmort, { currentStep: 8, contractFiles: ['SPEC.md'] });
+    const amortBlocked = engine.inspectEpoch(msgsLowAmort, { currentStep: 9, contractFiles: ['SPEC.md'] });
     assert.ok(amortBlocked.combinedNetSavingsTokens >= 3500, `Expected >= 3500 savings, got ${amortBlocked.combinedNetSavingsTokens}`);
     assert.equal(amortBlocked.netSavingsMet, false);
     assert.equal(amortBlocked.triggered, false);
     assert.equal(amortBlocked.reason, 'insufficient_net_savings');
 
     const hotCacheBlocked = engine.inspectEpoch(msgsLowAmort, {
-      currentStep: 8,
+      currentStep: 9,
       contractFiles: ['SPEC.md'],
       estHorizon: 8,
       observedCacheHitRate: 0.95,
@@ -609,7 +609,7 @@ test('3.2.1 cache_aware_v31: adaptive DP k* abolishes default 48k wall while hon
     assert.equal(hotCacheBlocked.reason, 'insufficient_net_savings');
 
     const coldCacheAllowed = engine.inspectEpoch(msgsLowAmort, {
-      currentStep: 8,
+      currentStep: 9,
       contractFiles: ['SPEC.md'],
       estHorizon: 8,
       observedCacheHitRate: 0,

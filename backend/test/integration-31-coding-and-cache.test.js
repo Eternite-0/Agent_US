@@ -779,7 +779,7 @@ test('Integration 3.1(a): 12-step Python coding turn + 64-token prefix KV cache 
   );
 });
 
-test('Integration 3.1(b): cache_aware_v31 >48k amortized batch epoch (>=max(3500, 0.35*suffix) savings + 6-step cooldown + invalidatedSuffixTokens) and benchmark-swebench.mjs --dry-run subprocess', () => {
+test('Integration 3.1(b): cache_aware_v31 >48k amortized batch epoch (>=max(3500, 0.35*suffix) savings + 10-step cooldown + invalidatedSuffixTokens) and benchmark-swebench.mjs --dry-run subprocess', () => {
   // 1. cache_aware_v31 >48k amortized batch epoch verification
   const storeDir = mkdtempSync(join(tmpdir(), 'int31-dtoc-'));
   const store = new Store(join(storeDir, 'engine.sqlite'));
@@ -805,16 +805,16 @@ test('Integration 3.1(b): cache_aware_v31 >48k amortized batch epoch (>=max(3500
       ...makeEngineToolStep('s1', 'read_file', { path: 'src/stale_mod.py' }, mkBigPy('staleMod', 820), { step: 2 }),
       ...makeEngineToolStep('s2', 'read_file', { path: 'src/aged_a.py' }, mkBigPy('agedAlpha', 820), { step: 3 }),
       ...makeEngineToolStep('s3', 'read_file', { path: 'src/aged_b.py' }, mkBigPy('agedBeta', 820), { step: 4 }),
-      ...makeEngineToolStep('e1', 'edit_file', { path: 'src/stale_mod.py' }, 'Edited src/stale_mod.py', { step: 7 }),
-      ...makeEngineToolStep('r1', 'read_file', { path: 'src/stale_mod.py' }, mkBigPy('freshMod', 520), { step: 8 }),
+      ...makeEngineToolStep('e1', 'edit_file', { path: 'src/stale_mod.py' }, 'Edited src/stale_mod.py', { step: 9 }),
+      ...makeEngineToolStep('r1', 'read_file', { path: 'src/stale_mod.py' }, mkBigPy('freshMod', 520), { step: 10 }),
       ...makeEngineToolStep('t1', 'run_diagnostics', { kind: 'test' }, 'exitCode: 1\nAssertionError: active test fail\n', {
         isError: true,
-        step: 9,
+        step: 11,
       }),
     ];
     assert.ok(measureRequestComposition({ messages: msgs }).totalTokens >= 48000);
 
-    const epoch1 = engine.compress(msgs, { currentStep: 9 });
+    const epoch1 = engine.compress(msgs, { currentStep: 11 });
     assert.equal(epoch1.triggered, true);
     assert.equal(epoch1.reason, CACHE_AWARE_V31_DTOC_POLICY);
     assert.ok(epoch1.invalidatedSuffixTokens > 0);
@@ -826,17 +826,17 @@ test('Integration 3.1(b): cache_aware_v31 >48k amortized batch epoch (>=max(3500
 
     const wave2 = [
       ...epoch1.messages,
-      ...makeEngineToolStep('s4', 'read_file', { path: 'src/aged_c.py' }, mkBigPy('agedGamma', 1400), { step: 11 }),
-      ...makeEngineToolStep('e2', 'edit_file', { path: 'src/aged_c.py' }, 'Edited src/aged_c.py', { step: 12 }),
-      ...makeEngineToolStep('r2', 'read_file', { path: 'src/tail.py' }, mkBigPy('liveTail', 1400), { step: 14 }),
+      ...makeEngineToolStep('s4', 'read_file', { path: 'src/aged_c.py' }, mkBigPy('agedGamma', 1400), { step: 13 }),
+      ...makeEngineToolStep('e2', 'edit_file', { path: 'src/aged_c.py' }, 'Edited src/aged_c.py', { step: 14 }),
+      ...makeEngineToolStep('r2', 'read_file', { path: 'src/tail.py' }, mkBigPy('liveTail', 1400), { step: 20 }),
     ];
     assert.ok(measureRequestComposition({ messages: wave2 }).totalTokens >= 48000);
 
-    const blocked = engine.compress(wave2, { currentStep: 14 });
+    const blocked = engine.compress(wave2, { currentStep: 20 });
     assert.equal(blocked.triggered, false);
     assert.equal(blocked.reason, 'eviction_cooldown');
 
-    const epoch2 = engine.compress(wave2, { currentStep: 15 });
+    const epoch2 = engine.compress(wave2, { currentStep: 21 });
     assert.equal(epoch2.triggered, true);
     assert.equal(epoch2.epoch, 2);
   } finally {

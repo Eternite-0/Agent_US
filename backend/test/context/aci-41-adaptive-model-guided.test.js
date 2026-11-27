@@ -27,6 +27,8 @@ import {
 import {
   ACIEngine,
   CACHE_AWARE_V31_DTOC_POLICY,
+  DEFAULT_V31_AGED_MIN_AGE_STEPS,
+  DEFAULT_V31_EVICTION_COOLDOWN_STEPS,
   compressMessagesEpoch,
   expandContext,
   extractEpochAdjudicationCandidates,
@@ -638,7 +640,7 @@ test('Task 4.1 Section 2A: DP optimal split k* adapts to observedCacheHitRate (0
       ...makeToolStep('c_early', 'read_file', { path: 'src/early_small.js' }, earlySmallCode, { step: 2 }),
       ...makeToolStep('s_spec', 'read_file', { path: 'SPEC.md' }, hugeShieldedSpec, { step: 3 }),
       ...makeToolStep('c_late', 'read_file', { path: 'src/late_huge.js' }, lateHighGainCode, { step: 4 }),
-      ...makeToolStep('r_live', 'read_file', { path: 'src/live.js' }, recentTailCode, { step: 10 }),
+      ...makeToolStep('r_live', 'read_file', { path: 'src/live.js' }, recentTailCode, { step: 11 }),
     ];
 
     const earlyIdx = trajectory.findIndex((m) => m.toolCallId === 'c_early');
@@ -658,7 +660,7 @@ test('Task 4.1 Section 2A: DP optimal split k* adapts to observedCacheHitRate (0
       contextWindow: 128000,
     });
     const hotProbe = hotEngine.inspectEpoch(trajectory, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0.95,
       estHorizon: 6,
@@ -668,7 +670,7 @@ test('Task 4.1 Section 2A: DP optimal split k* adapts to observedCacheHitRate (0
     assert.equal(hotProbe.firstCandidateIndex, lateIdx);
 
     const hotComp = hotEngine.compress(trajectory, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0.95,
       estHorizon: 6,
@@ -696,7 +698,7 @@ test('Task 4.1 Section 2A: DP optimal split k* adapts to observedCacheHitRate (0
       contextWindow: 128000,
     });
     const coldProbe = coldEngine.inspectEpoch(trajectory, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0,
       estHorizon: 6,
@@ -706,7 +708,7 @@ test('Task 4.1 Section 2A: DP optimal split k* adapts to observedCacheHitRate (0
     assert.ok(coldProbe.optimalSplitIndex < hotProbe.optimalSplitIndex);
 
     const coldComp = coldEngine.compress(trajectory, {
-      currentStep: 10,
+      currentStep: 11,
       contractFiles: ['SPEC.md'],
       observedCacheHitRate: 0,
       estHorizon: 6,
@@ -772,7 +774,7 @@ test('Task 4.1 Section 2B: Short low-token tasks naturally abstain (0 triggers, 
       ...makeToolStep('m_h', 'read_file', { path: 'README.md' }, 'Overview\n'.repeat(15), { step: 1 }),
       ...makeToolStep('m_aged1', 'read_file', { path: 'src/aged_a.js' }, makeCodeModule('agedAlpha', 220), { step: 2 }),
       ...makeToolStep('m_aged2', 'read_file', { path: 'src/aged_b.js' }, makeCodeModule('agedBravo', 220), { step: 3 }),
-      ...makeToolStep('m_live', 'read_file', { path: 'src/active.js' }, makeCodeModule('activeMod', 60), { step: 9 }),
+      ...makeToolStep('m_live', 'read_file', { path: 'src/active.js' }, makeCodeModule('activeMod', 60), { step: 10 }),
     ];
     const medTokens = measureRequestComposition({ messages: medMsgs }).totalTokens;
     assert.ok(medTokens > 10000 && medTokens < 48000, `Expected medium <48k tokens, got ${medTokens}`);
@@ -785,7 +787,7 @@ test('Task 4.1 Section 2B: Short low-token tasks naturally abstain (0 triggers, 
       contextWindow: 128000,
     });
     const medComp = medEngine.compress(medMsgs, {
-      currentStep: 9,
+      currentStep: 10,
       observedCacheHitRate: 0.5,
       estHorizon: 5,
     });
@@ -981,7 +983,7 @@ test('Task 4.1 Section 3B: Closed-loop evaluateEpoch -> ACIEngine.compress exclu
       ...makeToolStep('aged_a', 'read_file', { path: 'src/critical_keep.js' }, agedA, { step: 2 }),
       ...makeToolStep('aged_b', 'read_file', { path: 'src/evict_beta.js' }, agedB, { step: 3 }),
       ...makeToolStep('aged_c', 'read_file', { path: 'src/evict_gamma.js' }, agedC, { step: 4 }),
-      ...makeToolStep('live_tail', 'read_file', { path: 'src/live.js' }, liveTail, { step: 10 }),
+      ...makeToolStep('live_tail', 'read_file', { path: 'src/live.js' }, liveTail, { step: 11 }),
     ];
 
     const idxA = messages.findIndex((m) => m.toolCallId === 'aged_a');
@@ -990,7 +992,7 @@ test('Task 4.1 Section 3B: Closed-loop evaluateEpoch -> ACIEngine.compress exclu
 
     // Step 1: Initial inspectEpoch triggers at k* = idxA and reports active aged candidates
     const initialProbe = engine.inspectEpoch(messages, {
-      currentStep: 10,
+      currentStep: 11,
       observedCacheHitRate: 0.4,
       estHorizon: 5,
     });
@@ -1002,7 +1004,7 @@ test('Task 4.1 Section 3B: Closed-loop evaluateEpoch -> ACIEngine.compress exclu
     // Step 2: Compact adjudication candidate extraction + ContextSupervisor.evaluateEpoch
     const adjCandidates = extractEpochAdjudicationCandidates(messages, {
       aciStore,
-      currentStep: 10,
+      currentStep: 11,
       dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
     });
     assert.ok(adjCandidates.some((c) => c.id === 'aged_a' && !c.superseded));
@@ -1036,7 +1038,7 @@ test('Task 4.1 Section 3B: Closed-loop evaluateEpoch -> ACIEngine.compress exclu
 
     // Step 3: Feed { keepRefs, compressRefs } into ACIEngine.compress -> re-solves k* to idxB!
     const comp = engine.compress(messages, {
-      currentStep: 10,
+      currentStep: 11,
       observedCacheHitRate: 0.4,
       estHorizon: 5,
       keepRefs: supRes.keepRefs,
@@ -1068,7 +1070,7 @@ test('Task 4.1 Section 3B: Closed-loop evaluateEpoch -> ACIEngine.compress exclu
       contextWindow: 128000,
     });
     const allKept = freshEngine.compress(messages, {
-      currentStep: 10,
+      currentStep: 11,
       observedCacheHitRate: 0.4,
       estHorizon: 5,
       keepRefs: ['aged_a', 'aged_b', 'aged_c'],
@@ -1207,7 +1209,7 @@ test('Task 4.1 Section 3C: Live DirectAgentRuntime closed loop skips DTOC LLM on
         return;
       }
 
-      // mode === 'aged': read alpha, beta, gamma at step 2 so all 3 reach age >= 3 together in Epoch 1
+      // mode === 'aged': read alpha, beta, gamma at step 2 so all 3 reach age >= 7 at step 9
       const agedPlan = [
         emitTool('a_h', 'read_file', { path: 'README.md' }),
         [
@@ -1219,6 +1221,9 @@ test('Task 4.1 Section 3C: Live DirectAgentRuntime closed loop skips DTOC LLM on
         emitTool('a_glob1', 'glob', { pattern: 'src/*.js' }),
         emitTool('a_glob2', 'glob', { pattern: 'README.md' }),
         emitTool('a_glob3', 'glob', { pattern: '*.md' }),
+        emitTool('a_glob4', 'glob', { pattern: 'src/alpha.js' }),
+        emitTool('a_glob5', 'glob', { pattern: 'src/beta.js' }),
+        emitTool('a_glob6', 'glob', { pattern: 'src/gamma.js' }),
         null,
       ];
       yield* emitStep(agedPlan[mainStep - 1] ?? null);
@@ -1291,8 +1296,8 @@ test('Task 4.1 Section 3C: Live DirectAgentRuntime closed loop skips DTOC LLM on
   const agedSettled = await waitForTurnTerminal(direct, agedSession.id, agedTurn.turn.id);
   assert.equal(agedSettled.state, 'completed');
   assert.ok(
-    dtocSupervisorCalls.length >= 1 && dtocSupervisorCalls.length <= 3,
-    `Active aged epoch must invoke DTOC supervisor (1..3 calls), got ${dtocSupervisorCalls.length}`,
+    dtocSupervisorCalls.length >= 1 && dtocSupervisorCalls.length <= 4,
+    `Active aged epoch must invoke DTOC supervisor (1..4 calls), got ${dtocSupervisorCalls.length}`,
   );
   assert.equal(dtocSupervisorCalls[0].model, 'deepseek-v4', 'DTOC adjudication must reuse mainModel deepseek-v4');
   assert.deepEqual(dtocSupervisorCalls[0].tools, []);
@@ -1314,5 +1319,626 @@ test('Task 4.1 Section 3C: Live DirectAgentRuntime closed loop skips DTOC LLM on
   assert.ok(
     textOf('a_gamma').startsWith('[ACI-REF '),
     'Non-protected aged candidate gamma.js (i >= k*) must be compressed into ACI-REF stub',
+  );
+});
+
+// ============================================================================
+// SECTION 4 (Task 4.1.1): onlySuperseded Protection, compressRefs Gating,
+//                         & Converged Epoch Frequency (Cooldown=10, Age=7, 14% Floor)
+// ============================================================================
+
+test('Task 4.1.1 Section 4A: Converged defaults (cooldown=10, aged minAgeSteps=7 vs superseded=0) and adaptive 14% minNetSavingsTokens floor', () => {
+  assert.equal(DEFAULT_V31_EVICTION_COOLDOWN_STEPS, 10);
+  assert.equal(DEFAULT_V31_AGED_MIN_AGE_STEPS, 7);
+
+  const storeDir = mkdtempSync(join(tmpdir(), 'aci411-freq-'));
+  const store = new Store(join(storeDir, 'engine.sqlite'));
+  try {
+    const engine = new ACIEngine({
+      store,
+      aciStore: new ReversibleContextStore(store),
+      ledger: new ContextEvidenceLedger(),
+      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
+      contextWindow: 128000,
+    });
+    assert.equal(engine.evictionCooldownSteps, 10);
+    assert.equal(engine._explicitMinNetSavingsTokens, undefined);
+
+    // 1) Default minAgeSteps = 7 protects active aged reads within the last 6 steps, while superseded is age 0!
+    const agedMsgs = [
+      { role: 'user', content: [{ type: 'text', text: 'Inspect active aged protection window' }] },
+      ...makeToolStep('f_h', 'read_file', { path: 'README.md' }, 'Overview\n'.repeat(12), { step: 1 }),
+      ...makeToolStep('f_aged', 'read_file', { path: 'src/aged_active.js' }, makeCodeModule('agedWin', 260), { step: 2 }),
+      ...makeToolStep('f_live', 'read_file', { path: 'src/live.js' }, makeCodeModule('liveWin', 40), { step: 8 }),
+    ];
+
+    // At step 8: age = 8 - 2 = 6 (< 7) -> strictly protected!
+    const probeAge6 = engine.inspectEpoch(agedMsgs, {
+      currentStep: 8,
+      observedCacheHitRate: 0,
+      estHorizon: 6,
+    });
+    assert.equal(probeAge6.triggered, false, 'Aged file at age=6 (<7) must be strictly protected');
+    assert.equal(probeAge6.hasAgedCandidates, false);
+    assert.equal(probeAge6.agedCandidates.length, 0);
+
+    // At step 9: age = 9 - 2 = 7 (>= 7) -> eligible & triggers!
+    const probeAge7 = engine.inspectEpoch(agedMsgs, {
+      currentStep: 9,
+      observedCacheHitRate: 0,
+      estHorizon: 6,
+    });
+    assert.equal(probeAge7.triggered, true, 'Aged file at age=7 (>=7) becomes eligible');
+    assert.equal(probeAge7.hasAgedCandidates, true);
+    assert.equal(probeAge7.agedCandidates.length, 1);
+    assert.equal(probeAge7.agedCandidates[0].id, 'f_aged');
+
+    // Explicit minAgeSteps override is honored
+    const explicitAgeProbe = engine.inspectEpoch(agedMsgs, {
+      currentStep: 8,
+      minAgeSteps: 5,
+      observedCacheHitRate: 0,
+      estHorizon: 6,
+    });
+    assert.equal(explicitAgeProbe.triggered, true, 'Explicit minAgeSteps=5 override must be honored');
+
+    // Superseded candidate remains age=0 and immediately evictable at same step!
+    const supAge0Msgs = [
+      { role: 'user', content: [{ type: 'text', text: 'Immediate superseded eviction at age 0' }] },
+      ...makeToolStep('s0_h', 'read_file', { path: 'README.md' }, 'Intro\n'.repeat(10), { step: 1 }),
+      ...makeToolStep('s0_read', 'read_file', { path: 'src/target.js' }, makeCodeModule('supZero', 220), { step: 8 }),
+      ...makeToolStep('s0_edit', 'edit_file', { path: 'src/target.js' }, 'Edited src/target.js', { step: 8 }),
+    ];
+    const supAge0Probe = engine.inspectEpoch(supAge0Msgs, {
+      currentStep: 8,
+      observedCacheHitRate: 0,
+      estHorizon: 6,
+    });
+    assert.equal(supAge0Probe.triggered, true, 'Superseded payload must remain age=0 and immediately evictable');
+    assert.equal(supAge0Probe.hasAgedCandidates, false);
+    assert.equal(supAge0Probe.supersededTriggered, true);
+
+    // 2) Adaptive minNetSavingsTokens = Math.floor(Math.max(effectivePromptTokens, contextWindow * 0.12) * 0.14)
+    // Low-prompt case: effectivePromptTokens < 128000 * 0.12 (15360) -> floor = Math.floor(15360 * 0.14) = 2150
+    const lowPromptMsgs = [
+      { role: 'user', content: [{ type: 'text', text: 'Small superseded payload below adaptive floor' }] },
+      ...makeToolStep('lp_h', 'read_file', { path: 'README.md' }, 'Intro\n'.repeat(10), { step: 1 }),
+      ...makeToolStep('lp_read', 'read_file', { path: 'src/small_sup.js' }, makeCodeModule('smallSup', 52), { step: 2 }), // ~1,500 tok savings (< 2150)
+      ...makeToolStep('lp_edit', 'edit_file', { path: 'src/small_sup.js' }, 'Edited src/small_sup.js', { step: 3 }),
+    ];
+    const lowPromptTok = measureRequestComposition({ messages: lowPromptMsgs }).totalTokens;
+    assert.ok(lowPromptTok < 128000 * 0.12, `Expected prompt < 15360, got ${lowPromptTok}`);
+    const expectedLowFloor = Math.floor(Math.max(lowPromptTok, 128000 * 0.12) * 0.14);
+    assert.equal(expectedLowFloor, 2150);
+
+    const lowFloorProbe = engine.inspectEpoch(lowPromptMsgs, {
+      currentStep: 4,
+      observedCacheHitRate: 0,
+      estHorizon: 8,
+    });
+    assert.equal(lowFloorProbe.minNetSavingsTokens, expectedLowFloor);
+    assert.ok(lowFloorProbe.candidateSavings > 1000 && lowFloorProbe.candidateSavings < expectedLowFloor);
+    assert.equal(
+      lowFloorProbe.triggered,
+      false,
+      'Candidate saving < 2150 tokens must be blocked by adaptive floor even when H_t * S > 0.6 * P_t',
+    );
+    assert.equal(lowFloorProbe.reason, 'insufficient_net_savings');
+
+    // Explicit minNetSavingsTokens: 0 override bypasses the adaptive floor cleanly
+    const explicitZeroFloor = engine.inspectEpoch(lowPromptMsgs, {
+      currentStep: 4,
+      observedCacheHitRate: 0,
+      estHorizon: 8,
+      minNetSavingsTokens: 0,
+    });
+    assert.equal(explicitZeroFloor.minNetSavingsTokens, 0);
+    assert.equal(explicitZeroFloor.triggered, true);
+
+    // Explicit constructor minNetSavingsTokens override is honored without masking default adaptive instances
+    const explicitCtorEngine = new ACIEngine({
+      store,
+      aciStore: new ReversibleContextStore(store),
+      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
+      contextWindow: 128000,
+      minNetSavingsTokens: 800,
+    });
+    const ctorOverrideProbe = explicitCtorEngine.inspectEpoch(lowPromptMsgs, {
+      currentStep: 4,
+      observedCacheHitRate: 0,
+      estHorizon: 8,
+    });
+    assert.equal(ctorOverrideProbe.minNetSavingsTokens, 800);
+    assert.equal(ctorOverrideProbe.triggered, true);
+
+    // Medium/high prompt case: effectivePromptTokens > contextWindow * 0.12 -> floor = Math.floor(P_t * 0.14)
+    const highPromptMsgs = [
+      { role: 'user', content: [{ type: 'text', text: 'Medium prompt scaling 14% floor' }] },
+      ...makeToolStep('hp_h', 'read_file', { path: 'README.md' }, 'Intro\n'.repeat(10), { step: 1 }),
+      ...makeToolStep('hp_spec', 'read_file', { path: 'SPEC.md' }, `# SPEC\n${'Active spec invariant line.\n'.repeat(4500)}`, { step: 2 }),
+      ...makeToolStep('hp_sup', 'read_file', { path: 'src/mid_sup.js' }, makeCodeModule('midSup', 130), { step: 3 }), // ~3,600 tok (< 14% of ~35k = ~4,900)
+      ...makeToolStep('hp_edit', 'edit_file', { path: 'src/mid_sup.js' }, 'Edited src/mid_sup.js', { step: 4 }),
+    ];
+    const highPromptTok = measureRequestComposition({ messages: highPromptMsgs }).totalTokens;
+    assert.ok(highPromptTok > 28000, `Expected >28k prompt tokens, got ${highPromptTok}`);
+    const expectedHighFloor = Math.floor(Math.max(highPromptTok, 128000 * 0.12) * 0.14);
+
+    const highFloorProbe = engine.inspectEpoch(highPromptMsgs, {
+      currentStep: 5,
+      contractFiles: ['SPEC.md'],
+      observedCacheHitRate: 0,
+      estHorizon: 10,
+    });
+    assert.equal(highFloorProbe.minNetSavingsTokens, expectedHighFloor);
+    assert.ok(highFloorProbe.candidateSavings > 2500 && highFloorProbe.candidateSavings < expectedHighFloor);
+    assert.equal(highFloorProbe.triggered, false, 'Savings below 14% of effectivePromptTokens must abstain');
+
+    // 3) Pure solveOptimalEpochSplit remains 100% backward-compatible (default minNetSavingsTokens = 0)
+    const pureSmallDp = solveOptimalEpochSplit({
+      messageTokens: [200, 1200, 300],
+      candidates: [{ messageIndex: 1, id: 'c1', rawTokens: 1200, stubTokens: 60, savings: 1140 }],
+      observedCacheHitRate: 0,
+      estHorizon: 4,
+      currentPromptTokens: 1700,
+    });
+    assert.equal(pureSmallDp.triggered, true, 'Direct solveOptimalEpochSplit default minNetSavingsTokens must remain 0');
+    assert.equal(pureSmallDp.optimalSplitIndex, 1);
+  } finally {
+    store.close?.();
+    rmDirSafe(storeDir);
+  }
+});
+
+test('Task 4.1.1 Section 4B: compressRefs strict gating (unmentioned aged preserved, superseded still evicted) and onlySuperseded protection in ACIEngine', () => {
+  const storeDir = mkdtempSync(join(tmpdir(), 'aci411-guard-unit-'));
+  const store = new Store(join(storeDir, 'engine.sqlite'));
+  try {
+    const supBody = makeCodeModule('supPayload', 180);
+    const agedABody = makeCodeModule('agedAlphaGuard', 180);
+    const agedBBody = makeCodeModule('agedBetaApproved', 200);
+    const agedCBody = makeCodeModule('agedGammaUnmentioned', 200);
+    const liveBody = makeCodeModule('liveTailGuard', 45);
+
+    const mixedMsgs = [
+      { role: 'user', content: [{ type: 'text', text: 'Guard active aged files while clearing superseded noise' }] },
+      ...makeToolStep('g_h', 'read_file', { path: 'README.md' }, 'Overview\n'.repeat(12), { step: 1 }),
+      ...makeToolStep('g_sup', 'read_file', { path: 'src/sup_target.js' }, supBody, { step: 2 }),
+      ...makeToolStep('g_aged_a', 'read_file', { path: 'src/aged_alpha.js' }, agedABody, { step: 2 }),
+      ...makeToolStep('g_aged_b', 'read_file', { path: 'src/aged_beta.js' }, agedBBody, { step: 2 }),
+      ...makeToolStep('g_aged_c', 'read_file', { path: 'src/aged_gamma.js' }, agedCBody, { step: 2 }),
+      ...makeToolStep('g_edit', 'edit_file', { path: 'src/sup_target.js' }, 'Edited src/sup_target.js', { step: 5 }),
+      ...makeToolStep('g_live', 'read_file', { path: 'src/live.js' }, liveBody, { step: 10 }),
+    ];
+
+    const findMsgText = (msgs, id) =>
+      msgs.find((m) => m.role === 'tool' && m.toolCallId === id)?.content?.[0]?.text ?? '';
+
+    // 1) Non-empty compressRefs=['g_aged_b'], keepRefs=['g_aged_a'], leaving g_aged_c unmentioned:
+    //    ONLY g_sup (superseded) + g_aged_b (model-approved) get compressed; g_aged_a & g_aged_c stay verbatim!
+    const gatedEngine = new ACIEngine({
+      store,
+      aciStore: new ReversibleContextStore(store),
+      ledger: new ContextEvidenceLedger(),
+      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
+      contextWindow: 128000,
+    });
+    const gatedComp = gatedEngine.compress(mixedMsgs, {
+      currentStep: 10,
+      observedCacheHitRate: 0.2,
+      estHorizon: 6,
+      keepRefs: ['g_aged_a'],
+      compressRefs: ['g_aged_b'],
+    });
+    assert.equal(gatedComp.triggered, true);
+    assert.equal(gatedComp.compressedCount, 2, 'Only superseded g_sup + model-approved g_aged_b may be compressed');
+    assert.ok(findMsgText(gatedComp.messages, 'g_sup').startsWith('[ACI-REF '));
+    assert.ok(findMsgText(gatedComp.messages, 'g_aged_b').startsWith('[ACI-REF '));
+    assert.equal(findMsgText(gatedComp.messages, 'g_aged_a'), agedABody, 'keepRefs item must stay verbatim');
+    assert.equal(
+      findMsgText(gatedComp.messages, 'g_aged_c'),
+      agedCBody,
+      'Unmentioned aged item must stay 100% verbatim when compressRefs is non-empty',
+    );
+    assert.equal(pairClosed(gatedComp.messages), true);
+
+    // Conflict: keepRefs wins over compressRefs, and DP solves strictly over filtered eligible set
+    const agedOnlyMsgs = [
+      { role: 'user', content: [{ type: 'text', text: 'Check DP split over model-approved aged subset' }] },
+      ...makeToolStep('ao_h', 'read_file', { path: 'README.md' }, 'Overview\n'.repeat(12), { step: 1 }),
+      ...makeToolStep('ao_a', 'read_file', { path: 'src/aged_alpha.js' }, agedABody, { step: 2 }),
+      ...makeToolStep('ao_b', 'read_file', { path: 'src/aged_beta.js' }, agedBBody, { step: 2 }),
+      ...makeToolStep('ao_c', 'read_file', { path: 'src/aged_gamma.js' }, agedCBody, { step: 2 }),
+      ...makeToolStep('ao_live', 'read_file', { path: 'src/live.js' }, liveBody, { step: 10 }),
+    ];
+    const idxAoC = agedOnlyMsgs.findIndex((m) => m.toolCallId === 'ao_c');
+    const conflictEngine = new ACIEngine({
+      store,
+      aciStore: new ReversibleContextStore(store),
+      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
+      contextWindow: 128000,
+    });
+    const conflictComp = conflictEngine.compress(agedOnlyMsgs, {
+      currentStep: 10,
+      observedCacheHitRate: 0.2,
+      estHorizon: 8,
+      keepRefs: ['ao_b'],
+      compressRefs: ['ao_b', 'ao_c'],
+    });
+    assert.equal(conflictComp.triggered, true);
+    assert.equal(conflictComp.optimalSplitIndex, idxAoC, 'DP must solve over filtered set {ao_c} -> k*=idxAoC');
+    assert.equal(conflictComp.compressedCount, 1);
+    assertPrefixByteIdentical(agedOnlyMsgs, conflictComp.messages, idxAoC, 'compressRefs-dp-split');
+    assert.equal(findMsgText(conflictComp.messages, 'ao_a'), agedABody);
+    assert.equal(findMsgText(conflictComp.messages, 'ao_b'), agedBBody);
+    assert.ok(findMsgText(conflictComp.messages, 'ao_c').startsWith('[ACI-REF '));
+
+    // 2) onlySuperseded: true on mixed trajectory -> evicts ONLY g_sup, protects 100% of aged files!
+    const onlySupEngine = new ACIEngine({
+      store,
+      aciStore: new ReversibleContextStore(store),
+      ledger: new ContextEvidenceLedger(),
+      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
+      contextWindow: 128000,
+    });
+    const onlySupProbe = onlySupEngine.inspectEpoch(mixedMsgs, {
+      currentStep: 10,
+      observedCacheHitRate: 0.2,
+      estHorizon: 8,
+      onlySuperseded: true,
+    });
+    assert.equal(onlySupProbe.triggered, true);
+    assert.equal(onlySupProbe.onlySuperseded, true);
+    assert.equal(onlySupProbe.hasAgedCandidates, false);
+    assert.equal(onlySupProbe.agedCandidates.length, 0);
+
+    const onlySupComp = onlySupEngine.compress(mixedMsgs, {
+      currentStep: 10,
+      observedCacheHitRate: 0.2,
+      estHorizon: 8,
+      onlySuperseded: true,
+    });
+    assert.equal(onlySupComp.triggered, true);
+    assert.equal(onlySupComp.compressedCount, 1);
+    assert.equal(onlySupComp.supersededEvictions, 1);
+    assert.ok(findMsgText(onlySupComp.messages, 'g_sup').startsWith('[ACI-REF '));
+    assert.equal(findMsgText(onlySupComp.messages, 'g_aged_a'), agedABody);
+    assert.equal(findMsgText(onlySupComp.messages, 'g_aged_b'), agedBBody);
+    assert.equal(findMsgText(onlySupComp.messages, 'g_aged_c'), agedCBody);
+
+    // 3) onlySuperseded: true on aged-only trajectory -> abstains with 0 compressions and unchanged epochCount
+    const agedOnlyGuardEngine = new ACIEngine({
+      store,
+      aciStore: new ReversibleContextStore(store),
+      dtocPolicy: CACHE_AWARE_V31_DTOC_POLICY,
+      contextWindow: 128000,
+    });
+    const agedOnlyComp = agedOnlyGuardEngine.compress(agedOnlyMsgs, {
+      currentStep: 10,
+      observedCacheHitRate: 0,
+      estHorizon: 8,
+      onlySuperseded: true,
+    });
+    assert.equal(agedOnlyComp.triggered, false);
+    assert.equal(agedOnlyComp.compressedCount, 0);
+    assert.equal(agedOnlyGuardEngine.epochState.epochCount, 0);
+    assert.equal(JSON.stringify(agedOnlyComp.messages), JSON.stringify(agedOnlyMsgs));
+  } finally {
+    store.close?.();
+    rmDirSafe(storeDir);
+  }
+});
+
+test('Task 4.1.1 Section 4C: DirectAgentRuntime enforces compressRefs gating, auto onlySuperseded on disabled/failed supervisor (<70%), high-pressure fallback (>=70%), and 4-call DTOC cap', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'aci411-rt-data-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'aci411-rt-work-'));
+  mkdirSync(join(workDir, 'src'), { recursive: true });
+
+  const fileSup = makeCodeModule('rtSupTarget', 280);
+  const fileAlpha = makeCodeModule('rtAlphaKeep', 240);
+  const fileBeta = makeCodeModule('rtBetaApprove', 240);
+  const fileGamma = makeCodeModule('rtGammaUnmentioned', 240);
+  const fileLive = makeCodeModule('rtLiveSmall', 35);
+  const fileW1 = makeCodeModule('rtWaveOne', 300);
+  const fileW2 = makeCodeModule('rtWaveTwo', 300);
+  const fileW3 = makeCodeModule('rtWaveThree', 300);
+  const fileW4 = makeCodeModule('rtWaveFour', 300);
+  const fileW5 = makeCodeModule('rtWaveFive', 300);
+
+  writeFileSync(join(workDir, 'README.md'), 'Project overview\n'.repeat(12), 'utf8');
+  writeFileSync(join(workDir, 'src', 'sup_target.js'), fileSup, 'utf8');
+  writeFileSync(join(workDir, 'src', 'alpha.js'), fileAlpha, 'utf8');
+  writeFileSync(join(workDir, 'src', 'beta.js'), fileBeta, 'utf8');
+  writeFileSync(join(workDir, 'src', 'gamma.js'), fileGamma, 'utf8');
+  writeFileSync(join(workDir, 'src', 'live.js'), fileLive, 'utf8');
+  writeFileSync(join(workDir, 'src', 'w1.js'), fileW1, 'utf8');
+  writeFileSync(join(workDir, 'src', 'w2.js'), fileW2, 'utf8');
+  writeFileSync(join(workDir, 'src', 'w3.js'), fileW3, 'utf8');
+  writeFileSync(join(workDir, 'src', 'w4.js'), fileW4, 'utf8');
+  writeFileSync(join(workDir, 'src', 'w5.js'), fileW5, 'utf8');
+
+  const store = new Store(join(dataDir, 'engine.sqlite'));
+  const pool = new AccountPool(store, { root: dataDir });
+  pool.createAccount({
+    preset: 'deepseek',
+    label: 'DS',
+    credential: 'sk-test-411-e2e',
+    models: ['deepseek-v4', 'compact-window-model'],
+  });
+  pool.setDefaultModel('deepseek-v4');
+
+  const origGetModelContextWindow = pool.getModelContextWindow.bind(pool);
+  pool.getModelContextWindow = (m) =>
+    m === 'compact-window-model' ? 14000 : origGetModelContextWindow(m);
+
+  let scenario = 'compress_refs';
+  let mainStep = 0;
+  const supCalls = [];
+  const snapshots = [];
+
+  class GuardLoopAdapter extends LlmAdapter {
+    async *stream(options) {
+      const isSupervisor = !Array.isArray(options.tools) || options.tools.length === 0;
+      if (isSupervisor) {
+        const payload = JSON.parse(String(options.messages?.[0]?.content?.[0]?.text ?? '{}'));
+        const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+        supCalls.push({
+          scenario,
+          model: options.model,
+          candidateIds: candidates.map((c) => c.id),
+        });
+        if (scenario === 'sup_fail_normal') {
+          yield { type: 'text-delta', index: 0, text: 'malformed non-json supervisor response' };
+          yield { type: 'usage', usage: { inputTokens: 120, outputTokens: 12 } };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+          return;
+        }
+        if (scenario === 'compress_refs') {
+          const alphaC = candidates.find((c) => String(c.path || '').includes('alpha.js'));
+          const betaC = candidates.find((c) => String(c.path || '').includes('beta.js'));
+          // Explicitly name alpha in keepRefs and ONLY beta in compressRefs (leaving gamma unmentioned!)
+          yield {
+            type: 'text-delta',
+            index: 0,
+            text: JSON.stringify({
+              keepRefs: alphaC ? [alphaC.id] : [],
+              compressRefs: betaC ? [betaC.id] : [],
+            }),
+          };
+          yield { type: 'usage', usage: { inputTokens: 200, outputTokens: 20 } };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+          return;
+        }
+        if (scenario === 'cap_4_calls') {
+          yield {
+            type: 'text-delta',
+            index: 0,
+            text: JSON.stringify({
+              keepRefs: [],
+              compressRefs: candidates.map((c) => c.id),
+            }),
+          };
+          yield { type: 'usage', usage: { inputTokens: 150, outputTokens: 16 } };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+          return;
+        }
+      }
+
+      mainStep += 1;
+      snapshots.push(structuredClone(options.messages ?? []));
+
+      const emitTool = (id, name, args, index = 0) => ({
+        type: 'block-end',
+        index,
+        block: { type: 'tool-call', id, name, arguments: JSON.stringify(args) },
+      });
+
+      const emitStep = async function* (tcs) {
+        const list = Array.isArray(tcs) ? tcs : tcs ? [tcs] : [];
+        if (list.length > 0) {
+          for (const tc of list) yield tc;
+          yield { type: 'usage', usage: { inputTokens: 5000, outputTokens: 30, cacheReadTokens: 0 } };
+          yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        } else {
+          yield { type: 'text-delta', index: 0, text: 'Scenario completed.' };
+          yield { type: 'usage', usage: { inputTokens: 5000, outputTokens: 16, cacheReadTokens: 0 } };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        }
+      };
+
+      if (scenario === 'cap_4_calls') {
+        // Stagger 5 aged file waves so each wave reaches age=7 in a separate epoch (>1 step cooldown):
+        // Note: initial prompt includes 1 priming assistant message, so step k tool results have msgStep = k + 1.
+        // w1 read at step 2 (msgStep 3) -> age 7 at step 10 (epoch 1, sup call #1)
+        // w2 read at step 4 (msgStep 5) -> age 7 at step 12 (epoch 2, sup call #2)
+        // w3 read at step 6 (msgStep 7) -> age 7 at step 14 (epoch 3, sup call #3)
+        // w4 read at step 8 (msgStep 9) -> age 7 at step 16 (epoch 4, sup call #4)
+        // w5 read at step 10 (msgStep 11) -> age 7 at step 18 (sup cap reached=4 -> auto onlySuperseded -> w5 preserved!)
+        const capPlan = [
+          emitTool('cap_h', 'read_file', { path: 'README.md' }), // step 1
+          emitTool('cap_w1', 'read_file', { path: 'src/w1.js' }), // step 2
+          emitTool('cap_g1', 'glob', { pattern: 'README.md' }), // step 3
+          emitTool('cap_w2', 'read_file', { path: 'src/w2.js' }), // step 4
+          emitTool('cap_g2', 'glob', { pattern: 'src/live.js' }), // step 5
+          emitTool('cap_w3', 'read_file', { path: 'src/w3.js' }), // step 6
+          emitTool('cap_g3', 'glob', { pattern: 'src/w1.js' }), // step 7
+          emitTool('cap_w4', 'read_file', { path: 'src/w4.js' }), // step 8
+          emitTool('cap_g4', 'glob', { pattern: 'src/w2.js' }), // step 9
+          emitTool('cap_w5', 'read_file', { path: 'src/w5.js' }), // step 10 (w1 age=7 -> call #1)
+          emitTool('cap_g5', 'glob', { pattern: 'src/w3.js' }), // step 11
+          emitTool('cap_g6', 'glob', { pattern: 'src/w4.js' }), // step 12 (w2 age=7 -> call #2)
+          emitTool('cap_g7', 'glob', { pattern: 'src/w5.js' }), // step 13
+          emitTool('cap_g8', 'glob', { pattern: 'src/*.js' }), // step 14 (w3 age=7 -> call #3)
+          emitTool('cap_g9', 'glob', { pattern: '*.md' }), // step 15
+          emitTool('cap_g10', 'glob', { pattern: 'src/alpha.js' }), // step 16 (w4 age=7 -> call #4)
+          emitTool('cap_g11', 'glob', { pattern: 'src/beta.js' }), // step 17
+          emitTool('cap_g12', 'glob', { pattern: 'src/gamma.js' }), // step 18 (w5 age=7 -> cap=4 -> onlySuperseded!)
+          null, // step 19
+        ];
+        yield* emitStep(capPlan[mainStep - 1] ?? null);
+        return;
+      }
+
+      if (scenario === 'high_pressure_disabled') {
+        // Prompt exceeds 70% of 14,000-token context window (> 9.8k tokens) when alpha/beta/gamma reach age=7 at step 10
+        const hiPlan = [
+          emitTool('hi_h', 'read_file', { path: 'README.md' }),
+          [
+            emitTool('hi_alpha', 'read_file', { path: 'src/alpha.js' }, 0),
+            emitTool('hi_beta', 'read_file', { path: 'src/beta.js' }, 1),
+            emitTool('hi_gamma', 'read_file', { path: 'src/gamma.js' }, 2),
+          ],
+          emitTool('hi_g1', 'glob', { pattern: 'README.md' }),
+          emitTool('hi_g2', 'glob', { pattern: 'src/live.js' }),
+          emitTool('hi_g3', 'glob', { pattern: 'src/alpha.js' }),
+          emitTool('hi_g4', 'glob', { pattern: 'src/beta.js' }),
+          emitTool('hi_g5', 'glob', { pattern: 'src/gamma.js' }),
+          emitTool('hi_g6', 'glob', { pattern: 'src/*.js' }),
+          emitTool('hi_g7', 'glob', { pattern: '*.md' }),
+          null, // step 10: alpha/beta/gamma reach age=7 under >=70% pressure
+        ];
+        yield* emitStep(hiPlan[mainStep - 1] ?? null);
+        return;
+      }
+
+      // Shared plan for compress_refs, sup_disabled_normal, and sup_fail_normal:
+      // Step 2 reads alpha, beta, gamma (msgStep=3, so all 3 reach age=7 at step 10).
+      // Step 8 reads sup_target.js and Step 9 edits sup_target.js so m_sup_read becomes superseded right at step 10
+      // alongside the aged alpha/beta/gamma candidates in the same Epoch 1!
+      const mixedPlan = [
+        emitTool('m_h', 'read_file', { path: 'README.md' }), // step 1
+        [
+          emitTool('m_alpha', 'read_file', { path: 'src/alpha.js' }, 0),
+          emitTool('m_beta', 'read_file', { path: 'src/beta.js' }, 1),
+          emitTool('m_gamma', 'read_file', { path: 'src/gamma.js' }, 2),
+        ], // step 2 (msgStep=3)
+        emitTool('m_live', 'read_file', { path: 'src/live.js' }), // step 3
+        emitTool('m_g1', 'glob', { pattern: 'README.md' }), // step 4
+        emitTool('m_g2', 'glob', { pattern: 'src/alpha.js' }), // step 5
+        emitTool('m_g3', 'glob', { pattern: 'src/beta.js' }), // step 6
+        emitTool('m_g4', 'glob', { pattern: 'src/gamma.js' }), // step 7
+        emitTool('m_sup_read', 'read_file', { path: 'src/sup_target.js' }), // step 8
+        emitTool('m_sup_edit', 'edit_file', {
+          path: 'src/sup_target.js',
+          target: 'rtSupTarget_fn_1_',
+          replacement: 'rtSupTarget_fn_1_patched_',
+        }), // step 9 (supersedes m_sup_read right before step 10!)
+        emitTool('m_g5', 'glob', { pattern: '*.md' }), // step 10 (DTOC evaluates both m_sup_read + aged alpha/beta/gamma!)
+        null, // step 11
+      ];
+      yield* emitStep(mixedPlan[mainStep - 1] ?? null);
+    }
+  }
+
+  const direct = new DirectAgentRuntime(store, pool, {
+    defaultWorkspace: workDir,
+    dataRoot: dataDir,
+    adapter: new GuardLoopAdapter(),
+    enableHeartbeat: false,
+  });
+
+  t.after(async () => {
+    await direct.close();
+    store.close();
+    rmDirSafe(dataDir);
+    rmDirSafe(workDir);
+  });
+
+  const runScenario = async (name, { model = 'deepseek-v4', supMode = 'auto', aciOptions = undefined } = {}) => {
+    // Restore sup_target.js cleanly before each run so edit_file matches
+    writeFileSync(join(workDir, 'src', 'sup_target.js'), fileSup, 'utf8');
+    scenario = name;
+    mainStep = 0;
+    supCalls.length = 0;
+    snapshots.length = 0;
+    direct.contextSupervisor.saveConfig({ enabled: supMode !== 'off', mode: supMode });
+
+    const sess = direct.createSession({
+      workspaceRoot: workDir,
+      permissionMode: 'workspace-write',
+      aciProfile: 'full_aci',
+      aciOptions: {
+        dtocMinPromptTokens: 0,
+        ...(aciOptions || {}),
+      },
+    });
+    const turn = direct.startTurn(sess.id, {
+      input: `Run Task 4.1.1 guard scenario ${name}`,
+      model,
+    });
+    const settled = await waitForTurnTerminal(direct, sess.id, turn.turn.id);
+    assert.equal(settled.state, 'completed', `Scenario ${name} failed: ${settled.error}`);
+    const lastMsgs = snapshots.at(-1) ?? [];
+    const textOf = (id) =>
+      lastMsgs
+        .find((m) => m.role === 'tool' && m.toolCallId === id)
+        ?.content?.find((b) => b.type === 'text')?.text ?? '';
+    return { textOf, supCalls: [...supCalls] };
+  };
+
+  // (a) Successful evaluateEpoch with non-empty compressRefs=['m_beta']:
+  //     m_sup_read (superseded) & m_beta (approved) compressed; m_alpha (keepRefs) & m_gamma (unmentioned) stay verbatim!
+  const resGated = await runScenario('compress_refs', { supMode: 'auto' });
+  assert.ok(resGated.supCalls.length >= 1, 'Expected DTOC supervisor adjudication call');
+  assert.ok(resGated.textOf('m_sup_read').startsWith('[ACI-REF '), 'Superseded read must be compressed');
+  assert.ok(resGated.textOf('m_beta').startsWith('[ACI-REF '), 'Model-approved compressRefs aged file must be compressed');
+  assert.ok(resGated.textOf('m_alpha').includes('rtAlphaKeep_fn_1_'), 'keepRefs aged file must stay verbatim');
+  assert.ok(
+    resGated.textOf('m_gamma').includes('rtGammaUnmentioned_fn_1_'),
+    'Unmentioned aged file must stay 100% verbatim when compressRefs is non-empty',
+  );
+
+  // (b) Supervisor explicitly disabled (mode='off') under normal pressure (<70%, not emergency):
+  //     automatically passes onlySuperseded: true -> m_sup_read evicted, 100% of aged files preserved!
+  const resDisabled = await runScenario('sup_disabled_normal', { supMode: 'off' });
+  assert.equal(resDisabled.supCalls.length, 0);
+  assert.ok(
+    resDisabled.textOf('m_sup_read').startsWith('[ACI-REF '),
+    'Deterministic superseded payload must still be evicted when supervisor is disabled',
+  );
+  assert.ok(resDisabled.textOf('m_alpha').includes('rtAlphaKeep_fn_1_'), 'Aged alpha must stay verbatim when supervisor disabled (<70%)');
+  assert.ok(resDisabled.textOf('m_beta').includes('rtBetaApprove_fn_1_'), 'Aged beta must stay verbatim when supervisor disabled (<70%)');
+  assert.ok(resDisabled.textOf('m_gamma').includes('rtGammaUnmentioned_fn_1_'), 'Aged gamma must stay verbatim when supervisor disabled (<70%)');
+
+  // (c) Supervisor malformed JSON fallback under normal pressure (<70%, not emergency):
+  //     automatically passes onlySuperseded: true -> m_sup_read evicted, 100% of aged files preserved!
+  const resFail = await runScenario('sup_fail_normal', { supMode: 'auto' });
+  assert.ok(resFail.supCalls.length >= 1, 'Expected failed supervisor attempt');
+  assert.ok(
+    resFail.textOf('m_sup_read').startsWith('[ACI-REF '),
+    'Superseded payload must still be evicted on supervisor fallback',
+  );
+  assert.ok(resFail.textOf('m_alpha').includes('rtAlphaKeep_fn_1_'), 'Aged alpha must stay verbatim on supervisor fallback (<70%)');
+  assert.ok(resFail.textOf('m_beta').includes('rtBetaApprove_fn_1_'), 'Aged beta must stay verbatim on supervisor fallback (<70%)');
+  assert.ok(resFail.textOf('m_gamma').includes('rtGammaUnmentioned_fn_1_'), 'Aged gamma must stay verbatim on supervisor fallback (<70%)');
+
+  // (d) High pressure (singleStepRatio >= 0.70 with 14k contextWindow) & supervisor disabled:
+  //     fallback eviction of aged files IS allowed to protect context window safety!
+  const resHi = await runScenario('high_pressure_disabled', {
+    model: 'compact-window-model',
+    supMode: 'off',
+  });
+  assert.equal(resHi.supCalls.length, 0);
+  const hiCompressedCount = ['hi_alpha', 'hi_beta', 'hi_gamma'].filter((id) =>
+    resHi.textOf(id).startsWith('[ACI-REF '),
+  ).length;
+  assert.ok(
+    hiCompressedCount >= 1,
+    `Under high pressure (>=70% contextWindow), fallback eviction must be allowed; compressed=${hiCompressedCount}`,
+  );
+
+  // (e) Per-turn dtocSupervisorCalls cap raised to 4:
+  //     4 aged waves invoke evaluateEpoch and compress, 5th wave hits cap=4 -> auto onlySuperseded preserves w5!
+  const resCap4 = await runScenario('cap_4_calls', {
+    supMode: 'auto',
+    aciOptions: { evictionCooldownSteps: 1 },
+  });
+  assert.equal(resCap4.supCalls.length, 4, `Per-turn DTOC supervisor call cap must be 4, got ${resCap4.supCalls.length}`);
+  assert.ok(resCap4.textOf('cap_w1').startsWith('[ACI-REF '), 'Wave 1 approved by supervisor call #1 must compress');
+  assert.ok(resCap4.textOf('cap_w2').startsWith('[ACI-REF '), 'Wave 2 approved by supervisor call #2 must compress');
+  assert.ok(resCap4.textOf('cap_w3').startsWith('[ACI-REF '), 'Wave 3 approved by supervisor call #3 must compress');
+  assert.ok(resCap4.textOf('cap_w4').startsWith('[ACI-REF '), 'Wave 4 approved by supervisor call #4 must compress');
+  assert.ok(
+    resCap4.textOf('cap_w5').includes('rtWaveFive_fn_1_'),
+    'Wave 5 after dtocSupervisorCalls >= 4 under normal pressure (<70%) must be preserved via onlySuperseded: true',
   );
 });
