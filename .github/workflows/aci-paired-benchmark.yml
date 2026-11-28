@@ -1,0 +1,189 @@
+name: Agent_US Reference ACI Paired SWE-bench
+
+on:
+  push:
+    branches:
+      - benchmark/aci-paired-20261128
+    paths:
+      - benchmark-trigger.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-us-aci-paired-paper50-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-matrix:
+    name: Verify API Secret and Prepare Shards
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.prep.outputs.matrix }}
+    steps:
+      - name: Verify existing benchmark API secret
+        shell: bash
+        env:
+          SWEBENCH_API_KEY: ${{ secrets.SWEBENCH_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWEBENCH_API_KEY:-}" ]; then
+            echo "::error title=Missing SWEBENCH_API_KEY::The existing Agent_US repository secret is not available to this workflow."
+            exit 1
+          fi
+          echo "SWEBENCH_API_KEY is configured (value intentionally not printed)."
+
+      - name: Prepare three deterministic shards
+        id: prep
+        shell: bash
+        run: |
+          echo 'matrix=[1,2,3]' >> "$GITHUB_OUTPUT"
+
+  run-shard:
+    name: Run Shard ${{ matrix.shard }}/3
+    needs: [prepare-matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Checkout Agent_US benchmark implementation
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        shell: bash
+        run: npm --prefix backend ci
+
+      - name: Run paired raw_full vs full_aci SWE-bench shard
+        shell: bash
+        env:
+          SWEBENCH_API_KEY: ${{ secrets.SWEBENCH_API_KEY }}
+          SWEBENCH_ENDPOINT: ${{ secrets.SWEBENCH_ENDPOINT }}
+          SWEBENCH_PROTOCOL: openai
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          node backend/scripts/benchmark-swebench.mjs \
+            --dataset hf:verified-mini \
+            --subset paper-50 \
+            --shard "${SHARD_INDEX}/3" \
+            --arms raw_full,full_aci \
+            --model deepseek-v4.1-flash \
+            --no-use-app-pool \
+            --docker-preset epoch \
+            --max-steps 60 \
+            --turn-timeout-ms 900000 \
+            --container-memory 3g \
+            --concurrency 1 \
+            --cleanup-images \
+            --resume \
+            --evaluate \
+            --output-dir "/tmp/swebench-out/shard-${SHARD_INDEX}"
+
+      - name: Upload shard evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swebench-aci-paired-shard-${{ matrix.shard }}
+          path: /tmp/swebench-out/shard-${{ matrix.shard }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  aggregate-report:
+    name: Aggregate Paired Results
+    needs: [prepare-matrix, run-shard]
+    if: always() && needs.prepare-matrix.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Agent_US benchmark implementation
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        shell: bash
+        run: npm --prefix backend ci
+
+      - name: Download shard evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: swebench-aci-paired-shard-*
+          path: /tmp/swebench-shards
+          merge-multiple: false
+
+      - name: Merge raw_full and full_aci results
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHARD_DIRS=()
+          while IFS= read -r -d '' dir; do
+            SHARD_DIRS+=("$dir")
+          done < <(find /tmp/swebench-shards -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+          if [ "${#SHARD_DIRS[@]}" -eq 0 ]; then
+            echo "::error::No shard artifacts were downloaded."
+            exit 1
+          fi
+          MERGE_SHARDS_ARG="$(IFS=,; echo "${SHARD_DIRS[*]}")"
+          node backend/scripts/benchmark-swebench.mjs \
+            --dataset hf:verified-mini \
+            --merge-shards "$MERGE_SHARDS_ARG" \
+            --arms raw_full,full_aci \
+            --model deepseek-v4.1-flash \
+            --subset paper-50 \
+            --output-dir /tmp/swebench-aci-paired-paper50 \
+            --export-latex
+
+      - name: Add benchmark summary and scope note
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## ACI Paired SWE-bench (paper-50)"
+            echo ""
+            echo "- Model: deepseek-v4.1-flash"
+            echo "- Arms: raw_full vs full_aci"
+            echo "- Shards: 3; max steps: 60"
+            echo "- Protocol: OpenAI-compatible; API key read from repository Secrets"
+            echo "- Scope: Agent_US reference implementation. This run does not execute the separately ported dsh-plugin-aci package."
+            echo ""
+            if [ -f /tmp/swebench-aci-paired-paper50/summary.md ]; then
+              cat /tmp/swebench-aci-paired-paper50/summary.md
+            else
+              echo "No merged summary was produced; inspect shard artifacts and job logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload merged paired benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swebench-aci-paired-paper50-report
+          path: /tmp/swebench-aci-paired-paper50
+          if-no-files-found: warn
+          retention-days: 30
