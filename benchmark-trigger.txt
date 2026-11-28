@@ -1,0 +1,2 @@
+One-off manual trigger for the Agent_US reference ACI paired SWE-bench paper-50 run.
+Configuration: DeepSeek V4.1 Flash; raw_full vs full_aci; 3 shards; 60 max steps; OpenAI-compatible protocol; no result auto-commit.
